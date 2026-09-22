@@ -130,7 +130,11 @@ impl Teacher for HashTeacher {
 /// flag with the wrong teacher. `Roster::from_json` accepts these
 /// characters, so the renderer (not the parser) is the enforcement point.
 fn md_cell(value: &str) -> String {
+    // Backslashes are escaped FIRST: an existing `\\|` would otherwise be
+    // emitted as `\\\\|`, and Markdown reads the doubled backslash as an
+    // escaped backslash — leaving the pipe live as a table delimiter.
     value
+        .replace('\\', "\\\\")
         .replace('`', "'")
         .replace(['\r', '\n'], " ")
         .replace('|', "\\|")
@@ -263,5 +267,34 @@ mod tests {
         assert!(data_row.contains("evil\\|teacher"), "{data_row}");
         assert!(data_row.contains("1.0 injected \\| row"), "{data_row}");
         assert!(table.lines().count() == 3, "no injected extra rows: {table}");
+    }
+
+    #[test]
+    fn roster_table_escapes_existing_backslash_pipe_pairs() {
+        // Regression (review thread 2026-09-22 18:27): a value containing a
+        // backslash immediately before a pipe (`evil\|teacher`) used to be
+        // emitted with an even backslash run before the pipe; Markdown then
+        // reads the doubled backslash as an escaped backslash and the pipe
+        // stays live as a table delimiter. Backslashes are now escaped
+        // first, so the emitted cell is `\\` (literal backslash) followed
+        // by `\|` (escaped pipe) — the pipe never becomes a delimiter.
+        let roster = Roster::from_json(
+            r#"{"teachers": [{"id": "evil\\|teacher", "version": "1.0", "tos_class": "open-weights"}]}"#,
+        )
+        .unwrap();
+        let table = roster.to_markdown_table();
+        let data_row = table
+            .lines()
+            .nth(2)
+            .unwrap_or_else(|| panic!("missing data row: {table}"));
+        assert!(
+            data_row.contains(r#"`evil\\\|teacher`"#),
+            "backslash doubled and pipe escaped in place: {data_row}"
+        );
+        assert_eq!(
+            data_row.matches('|').count(),
+            6,
+            "5 delimiters + 1 escaped content pipe: {data_row}"
+        );
     }
 }

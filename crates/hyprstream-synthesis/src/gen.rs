@@ -430,7 +430,7 @@ mod extraction {
         "Score the extraction readiness of this record.",
     ];
 
-    fn state(rng: &mut BenchRng) -> Entry {
+    fn state(rng: &mut BenchRng, doctype: Option<usize>) -> Entry {
         let vendor = pick(&VENDORS, rng.below(VENDORS.len() as u64) as usize);
         let number = 10_000 + rng.below(89_999);
         let currency = pick(&["USD", "EUR", "GBP"], rng.below(3) as usize);
@@ -444,12 +444,49 @@ mod extraction {
             let cents = 100 + rng.below(9_900_000);
             record.push(("total".to_owned(), Entry::Number(cents as f64 / 100.0)));
         }
+        // Type-discriminating evidence: the choice variant asks for the
+        // document type, so the record must carry state-derived evidence
+        // that determines the class (review thread 2026-09-22 18:27 —
+        // without it the correct answer reflects teacher priors, not the
+        // input, contaminating the extraction-choice training slice).
+        match doctype {
+            Some(0) => {
+                // invoice: line items + a payment demand date.
+                record.push((
+                    "line_items".to_owned(),
+                    Entry::Number((1 + rng.below(12)) as f64),
+                ));
+                record.push(("due_date".to_owned(), Entry::Str("2026-11-15".to_owned())));
+            }
+            Some(1) => {
+                // receipt: payment already settled.
+                record.push((
+                    "payment_method".to_owned(),
+                    Entry::Str(pick(&["card", "cash", "transfer"], rng.below(3) as usize).to_owned()),
+                ));
+                record.push(("paid".to_owned(), Entry::Bool(true)));
+            }
+            Some(2) => {
+                // purchase-order: buyer-issued ordering reference.
+                record.push(("po_number".to_owned(), Entry::Str(format!("PO-{number}"))));
+                record.push(("approver".to_owned(), Entry::Str("procurement".to_owned())));
+            }
+            Some(3) => {
+                // quote: non-binding price offer with a validity window.
+                record.push((
+                    "validity_days".to_owned(),
+                    Entry::Number((5 + rng.below(30)) as f64),
+                ));
+                record.push(("binding".to_owned(), Entry::Bool(false)));
+            }
+            _ => {}
+        }
         Entry::Map(record)
     }
 
     pub(super) fn noul(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
+        let state = state(&mut rng, None);
         SynthItem::new(
             SynthFamily::Extraction,
             seed,
@@ -470,8 +507,17 @@ mod extraction {
 
     pub(super) fn choice(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
-        let options = option_subset(&mut rng, &DOCTYPES, 2, 4)
+        // The correct class is state-derived: pick the true document type
+        // first, build the record with that type's discriminating evidence,
+        // and guarantee the true type is among the offered options.
+        let truth = rng.below(DOCTYPES.len() as u64) as usize;
+        let state = state(&mut rng, Some(truth));
+        let mut subset = option_subset(&mut rng, &DOCTYPES, 2, 4);
+        if !subset.contains(&truth) {
+            let slot = rng.below(subset.len() as u64) as usize;
+            subset[slot] = truth;
+        }
+        let options = subset
             .into_iter()
             .map(|i| ChoiceOption {
                 name: DOCTYPES[i].0.to_owned(),
@@ -491,7 +537,7 @@ mod extraction {
 
     pub(super) fn score(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
+        let state = state(&mut rng, None);
         let levels = 2 + rng.below(3) as usize; // 2..=4
         let rubrics = [
             "Key fields missing.",
