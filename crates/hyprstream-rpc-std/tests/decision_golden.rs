@@ -720,3 +720,166 @@ fn encode_rejects_invalid_distributions_and_empty_sets() {
         .expect("empty question set rejected at encode");
     assert_eq!(error, decision::EncodeError::EmptyQuestionSet);
 }
+
+/// Encode mirrors the decode-side authoring rules (review thread, 2026-09-21):
+/// the IR is public, so a directly-constructed `QuestionSet` with an empty
+/// question id, an empty choice option name, or duplicate option names is
+/// rejected at encode — the same messages `question_set_from_reader` rejects
+/// with EmptyQuestionId / EmptyChoiceOptionName / DuplicateChoiceOptionName.
+#[test]
+fn encode_rejects_empty_ids_and_bad_choice_option_names() {
+    let noul = |id: &str| hyprstream_decision::QuestionSpec {
+        id: id.to_owned(),
+        kind: hyprstream_decision::QuestionKind::Noul,
+        instructions: None,
+        body: hyprstream_decision::QuestionBody::Noul { criteria: None },
+    };
+    let choice = |id: &str, names: &[&str]| hyprstream_decision::QuestionSpec {
+        id: id.to_owned(),
+        kind: hyprstream_decision::QuestionKind::Choice,
+        instructions: None,
+        body: hyprstream_decision::QuestionBody::Choice {
+            options: names
+                .iter()
+                .map(|name| hyprstream_decision::ChoiceOption {
+                    name: (*name).to_owned(),
+                    rubric: None,
+                })
+                .collect(),
+        },
+    };
+
+    let mut set = QuestionSet { state: None, questions: vec![noul("")] };
+    let error = decision::question_set_to_message(&set)
+        .err()
+        .expect("empty question id rejected at encode");
+    assert_eq!(error, decision::EncodeError::EmptyQuestionId);
+
+    set.questions = vec![choice("q", &["", "b"])];
+    let error = decision::question_set_to_message(&set)
+        .err()
+        .expect("empty choice option name rejected at encode");
+    assert_eq!(error, decision::EncodeError::EmptyChoiceOptionName("q".into()));
+
+    set.questions = vec![choice("q", &["a", "b", "a"])];
+    let error = decision::question_set_to_message(&set)
+        .err()
+        .expect("duplicate choice option name rejected at encode");
+    assert_eq!(
+        error,
+        decision::EncodeError::DuplicateChoiceOptionName("q".into(), "a".into())
+    );
+
+    // The well-formed counterpart still encodes and decodes cleanly.
+    set.questions = vec![choice("q", &["a", "b"])];
+    let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encodes"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let decoded = decision::question_set_from_reader(
+        message
+            .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
+            .expect("root"),
+    )
+    .expect("decodes");
+    assert_eq!(
+        decoded.questions[0]
+            .body,
+        hyprstream_decision::QuestionBody::Choice {
+            options: vec![
+                hyprstream_decision::ChoiceOption { name: "a".into(), rubric: None },
+                hyprstream_decision::ChoiceOption { name: "b".into(), rubric: None },
+            ]
+        },
+    );
+}
+
+/// The conformal-set field is an explicit option wrapper (review thread,
+/// 2026-09-21): `none` (absent) and a present empty set stay distinct across
+/// the wire. A plain nullable List(Text) pointer reads an absent set as the
+/// default empty list, so a raw-API consumer rebuild turned None into
+/// Some(vec![]) — flipping the Arrow null semantics and failing abstained
+/// rows with AbstainedWithConformalSet.
+#[test]
+fn conformal_set_none_and_present_empty_stay_distinct() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+
+    // Absent set: decode gives None.
+    let absent = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.75 }),
+    )]);
+    let bytes =
+        wire_roundtrip(&decision::batch_to_message(&version, &[absent]).expect("encodes"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let reader = message
+        .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+        .expect("root");
+    let (_, rows) = decision::batch_from_reader(reader).expect("decodes");
+    assert_eq!(rows[0].answers["q"].conformal_set, None);
+
+    // Raw-API consumer rebuild that never touches the conformal-set field: the
+    // explicit option union defaults to none, so presence cannot be gained
+    // here (the nullable pointer read as an empty list and re-encoded
+    // present-empty under the old schema).
+    let mut rebuilt = capnp::message::Builder::new_default();
+    {
+        let mut root = rebuilt
+            .init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
+        root.set_version(reader.get_version().expect("version"))
+            .expect("copies");
+        let rows_builder = root.init_rows(1);
+        let answers = rows_builder.get(0).init_answers(1);
+        let mut answer = answers.get(0);
+        answer.set_question_id("q");
+        answer.init_value().set_noul(0.75);
+    }
+    let rebuilt_bytes = wire_roundtrip(&rebuilt);
+    let message = capnp::serialize::read_message(
+        &mut &rebuilt_bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let reader = message
+        .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+        .expect("root");
+    let (_, rows) = decision::batch_from_reader(reader).expect("decodes");
+    assert_eq!(
+        rows[0].answers["q"].conformal_set,
+        None,
+        "rebuild keeps the set absent"
+    );
+
+    // A present-but-empty set is preserved as Some(vec![]), not collapsed.
+    let mut present = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.75 }),
+    )]);
+    present
+        .answers
+        .get_mut("q")
+        .expect("answer")
+        .conformal_set = Some(Vec::new());
+    let bytes =
+        wire_roundtrip(&decision::batch_to_message(&version, &[present]).expect("encodes"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let reader = message
+        .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+        .expect("root");
+    let (_, rows) = decision::batch_from_reader(reader).expect("decodes");
+    assert_eq!(rows[0].answers["q"].conformal_set, Some(Vec::new()));
+}

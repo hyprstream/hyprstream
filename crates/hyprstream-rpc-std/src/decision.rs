@@ -13,6 +13,8 @@
 //! - `OptEntry.none` (key absent) and `some(Entry.null)` (explicit null) are
 //!   distinct, mirroring D3/D4.
 //! - `null` = abstained; an abstained answer must not carry a conformal set.
+//! - `conformalSet` is an explicit option wrapper: `none` (absent) and a
+//!   present empty set stay distinct across the wire.
 
 use hyprstream_decision::confidence::{check_distribution, DistributionError, PRODUCER_SUM_TOLERANCE};
 use hyprstream_decision::{
@@ -72,6 +74,17 @@ pub enum EncodeError {
     /// A question set with zero questions (the decoder rejects these).
     #[error("empty question set cannot be encoded")]
     EmptyQuestionSet,
+    /// An empty question id (the decoder rejects these; the IR is public, so
+    /// encode mirrors the rule for directly-constructed specs).
+    #[error("empty question id cannot be encoded")]
+    EmptyQuestionId,
+    /// An empty choice option name in question {0} (the decoder rejects these).
+    #[error("empty choice option name in question {0}")]
+    EmptyChoiceOptionName(String),
+    /// A repeated choice option name {1:?} in question {0} — labels must be
+    /// unique for argmax and conformal-set output (the decoder rejects these).
+    #[error("duplicate choice option name {1:?} in question {0}")]
+    DuplicateChoiceOptionName(String, String),
     /// A noul probability outside [0, 1] or not finite.
     #[error("noul probability out of range for question {0}: {1}")]
     NoulProbabilityOutOfRange(String, f32),
@@ -326,6 +339,29 @@ pub fn question_set_to_message(
     if set.questions.is_empty() {
         return Err(EncodeError::EmptyQuestionSet);
     }
+    // Encode mirrors the decode-side authoring-layer rules (get_question_spec):
+    // the IR is public, so a directly-constructed spec must not emit a message
+    // our own decoder rejects (EmptyQuestionId / EmptyChoiceOptionName /
+    // DuplicateChoiceOptionName).
+    for spec in &set.questions {
+        if spec.id.is_empty() {
+            return Err(EncodeError::EmptyQuestionId);
+        }
+        if let QuestionBody::Choice { options } = &spec.body {
+            let mut seen = std::collections::HashSet::with_capacity(options.len());
+            for option in options {
+                if option.name.is_empty() {
+                    return Err(EncodeError::EmptyChoiceOptionName(spec.id.clone()));
+                }
+                if !seen.insert(option.name.as_str()) {
+                    return Err(EncodeError::DuplicateChoiceOptionName(
+                        spec.id.clone(),
+                        option.name.clone(),
+                    ));
+                }
+            }
+        }
+    }
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::question_set::Builder<'_>>();
     set_opt_entry(root.reborrow().init_state(), set.state.as_ref());
@@ -424,10 +460,14 @@ pub fn batch_to_message(
                 answer_builder.reborrow().init_value(),
                 answer.value.as_ref(),
             );
-            if let Some(set) = &answer.conformal_set {
-                let mut list = answer_builder.init_conformal_set(set.len() as u32);
-                for (member_index, member) in set.iter().enumerate() {
-                    list.set(member_index as u32, member.as_str());
+            match &answer.conformal_set {
+                None => answer_builder.init_conformal_set().set_none(()),
+                Some(set) => {
+                    let mut members =
+                        answer_builder.init_conformal_set().init_some(set.len() as u32);
+                    for (member_index, member) in set.iter().enumerate() {
+                        members.set(member_index as u32, member.as_str());
+                    }
                 }
             }
         }
@@ -457,15 +497,16 @@ pub fn batch_from_reader(
         let mut answers = std::collections::BTreeMap::new();
         for answer in row.get_answers()?.iter() {
             let question_id = answer.get_question_id()?.to_str()?.to_owned();
-            let conformal_set = if answer.has_conformal_set() {
-                let set = answer.get_conformal_set()?;
-                let mut members = Vec::with_capacity(set.len() as usize);
-                for member in set.iter() {
-                    members.push(member?.to_str()?.to_owned());
+            let conformal_set = match answer.get_conformal_set()?.which()? {
+                decision_capnp::opt_conformal_set::None(()) => None,
+                decision_capnp::opt_conformal_set::Some(members) => {
+                    let members = members?;
+                    let mut set = Vec::with_capacity(members.len() as usize);
+                    for member in members.iter() {
+                        set.push(member?.to_str()?.to_owned());
+                    }
+                    Some(set)
                 }
-                Some(members)
-            } else {
-                None
             };
             let value = match answer.get_value()?.which()? {
                 decision_capnp::answer_value::Abstained(()) => {

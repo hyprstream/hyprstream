@@ -106,12 +106,25 @@ struct AnswerValue {
   }
 }
 
+# Optionality wrapper for a conformal prediction set: `none` = the row has no
+# set (the common v1 case). A plain nullable List(Text) pointer loses presence
+# on a consumer read-modify-write: an absent set reads as the default empty
+# list and re-encodes present-empty, silently flipping Arrow nulls to empty
+# lists and failing abstained rows. Same rationale as the calib OptionText
+# wrapper on VersionTriple.
+struct OptConformalSet {
+  union {
+    none @0 :Void;
+    some @1 :List(Text);
+  }
+}
+
 struct QuestionAnswer {
   questionId   @0 :Text;
   value        @1 :AnswerValue;
-  # Null pointer = no conformal set on this row (the common v1 case); an
-  # abstained answer must not carry a set.
-  conformalSet @2 :List(Text);
+  # Explicit option wrapper (OptConformalSet): none = no conformal set on this
+  # row (the common v1 case); an abstained answer must not carry a set.
+  conformalSet @2 :OptConformalSet;
 }
 
 # Batch-level version triple: question-set schema version, resolved model id,
