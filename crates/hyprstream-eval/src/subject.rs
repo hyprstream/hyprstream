@@ -216,11 +216,12 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 /// ties and leader gaps survive), with the share bounded below by
 /// `-min_component` so no component ever leaves [0, 1]; (3) as a last
 /// resort for vectors no uniform correction can reach (f32 sequential-sum
-/// granularity, e.g. exactly uniform high-cardinality ones), a
-/// single-component correction clamped into [0, 1] that preserves the D6
-/// argmax (shortfall bumps the EARLIEST maximal component — a unique
-/// winner there matches the earliest-index tie-break — overage shrinks
-/// the LATEST maximal one). Wire distributions are accepted at consumer
+/// granularity, e.g. near-uniform high-cardinality ones), a top-level
+/// correction that never changes the D6 argmax: a shortfall bumps the
+/// EARLIEST maximal component; an overage water-fills the maximal levels
+/// downward (equal shrinkage keeps them exactly tied, so the
+/// earliest-index tie-break keeps the winner — and no runner-up is ever
+/// crossed). Wire distributions are accepted at consumer
 /// tolerance; the producer-side IR and batch validators require the
 /// tighter producer tolerance, so the boundary normalizes on the way in.
 /// Also used for locally constructed distributions (TruthSubject's
@@ -269,25 +270,58 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
         return;
     }
     // Last resort (f32 sequential-sum granularity makes some vectors,
-    // e.g. exactly uniform high-cardinality ones, unreachable by uniform
-    // correction): correct one maximal component, preserving the D6
-    // argmax — a shortfall bumps the EARLIEST maximal component (a unique
-    // winner there matches the earliest-index tie-break), an overage
-    // shrinks the LATEST maximal one (the earliest tied maxima keep
-    // their win). The correction is clamped into [0, 1].
-    let residual = 1.0 - probabilities.iter().sum::<f32>();
-    let max = probabilities
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    #[allow(clippy::float_cmp)]
-    let index = if residual > 0.0 {
-        probabilities.iter().position(|p| *p == max)
-    } else {
-        probabilities.iter().rposition(|p| *p == max)
-    };
-    if let Some(index) = index {
-        probabilities[index] = (probabilities[index] + residual).clamp(0.0, 1.0);
+    // e.g. near-uniform high-cardinality ones, unreachable by uniform
+    // correction): correct the top WITHOUT ever changing the D6 argmax,
+    // re-evaluating the residual after every round (per-component f32
+    // rounding can overshoot a removal into a shortfall and vice versa).
+    // A shortfall bumps the EARLIEST maximal component (extending its
+    // lead can only keep its win). An overage WATER-FILLS the top levels
+    // downward: every maximal component shrinks by the same amount, so
+    // they stay exactly tied and the earliest-index tie-break keeps the
+    // argmax even when a level merges into the next (a single-component
+    // subtraction larger than the max/runner-up gap — observed on a
+    // consumer-valid 59-way near-uniform vector, residual −1.19e-6 vs
+    // gap 1.9e-9 — would flip the argmax to the runner-up).
+    for _ in 0..probabilities.len().saturating_add(8) {
+        let residual = 1.0 - probabilities.iter().sum::<f32>();
+        if residual == 0.0
+            || check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok()
+        {
+            return;
+        }
+        let max = probabilities
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if max <= 0.0 {
+            break;
+        }
+        if residual > 0.0 {
+            #[allow(clippy::float_cmp)]
+            if let Some(index) = probabilities.iter().position(|p| *p == max) {
+                probabilities[index] = (probabilities[index] + residual).clamp(0.0, 1.0);
+            }
+            continue;
+        }
+        // The highest level strictly below `max` (0.0 when none): the
+        // top group may sink to it but never below, so no runner-up is
+        // ever crossed.
+        let next = probabilities
+            .iter()
+            .copied()
+            .filter(|p| *p < max)
+            .fold(0.0f32, f32::max);
+        #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
+        let count = probabilities.iter().filter(|p| **p == max).count() as f32;
+        let remove = (-residual).min((max - next) * count);
+        if remove <= 0.0 {
+            break;
+        }
+        let per = remove / count;
+        #[allow(clippy::float_cmp)]
+        for p in probabilities.iter_mut().filter(|p| **p == max) {
+            *p -= per;
+        }
     }
 }
 
@@ -496,9 +530,13 @@ impl HttpSubject {
         }
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
-        let Some(resolved) = parsed.get("model").and_then(Value::as_str) else {
+        let Some(resolved) = parsed
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        else {
             return Err(EvalError::Http(
-                "response is missing the resolved `model` id the serving contract requires"
+                "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
                     .to_owned(),
             ));
         };
@@ -1055,5 +1093,34 @@ questions:
         // The early return leaves the already-valid vector untouched: the
         // zero stays exactly zero.
         assert_eq!(probabilities[0], 0.0);
+    }
+
+    #[test]
+    // The literals are the review-thread evidence values; f32 rounds them
+    // to the exact bit patterns at issue, so keep the full decimals.
+    #[allow(clippy::excessive_precision)]
+    fn normalization_overage_never_flips_the_argmax() {
+        // Consumer-valid 59-way near-uniform vector (sequential sum
+        // 0.9902): after division and the uniform-share step a residual of
+        // about −1.19e-6 remains — dwarfing the 1.9e-9 gap between the
+        // unique maximum (index 0) and the runner-up. Subtracting that
+        // residual from the maximum (the old fallback) flipped the argmax
+        // to index 1; the water-filling correction sinks the top levels
+        // together, keeping index 0 ahead (or exactly tied, which the
+        // earliest-index tie-break still awards to index 0).
+        let mut probabilities = vec![0.0167830512f32; 59];
+        probabilities[0] = 0.0167830531f32;
+        normalize_distribution(&mut probabilities);
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+            .unwrap();
+        assert!(
+            probabilities.iter().all(|p| (0.0..=1.0).contains(p)),
+            "no component may leave [0, 1]: {probabilities:?}"
+        );
+        assert_eq!(
+            confidence::argmax_index(&probabilities),
+            Some(0),
+            "normalization must not change the predicted label: {probabilities:?}"
+        );
     }
 }
