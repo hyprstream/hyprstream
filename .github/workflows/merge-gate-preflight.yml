@@ -103,6 +103,16 @@ jobs:
         echo "Preflighting PR #${{ needs.resolve-pr.outputs.number }} at ${{ needs.resolve-pr.outputs.sha }}"
         echo "${{ needs.resolve-pr.outputs.url }}"
 
+    # A candidate publisher may rely on a manually-dispatched preflight only
+    # when this controller's dispatch ref and the immutable PR head it resolved
+    # are identical. A concurrent PR push otherwise makes the run evidence for
+    # a different revision and it must fail rather than publish from it.
+    - name: Assert immutable dispatch SHA
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        set -euo pipefail
+        test "${{ needs.resolve-pr.outputs.sha }}" = "${{ github.sha }}"
+
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
       with:

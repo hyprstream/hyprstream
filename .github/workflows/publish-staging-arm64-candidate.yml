@@ -56,25 +56,25 @@ jobs:
           [[ "${EXPECTED_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
           test "${actual}" = "${GITHUB_SHA}"
           test "${actual}" = "${EXPECTED_SOURCE_SHA}"
-
-          verify_run() {
-            local run_id="$1"
-            local workflow_name="$2"
+          for run_id in "${OCI_VALIDATION_RUN_ID}" "${PREFLIGHT_RUN_ID}"; do
             [[ "${run_id}" =~ ^[0-9]+$ ]]
-            local run
-            run="$(curl --fail --silent --show-error \
+            curl --fail --silent --show-error \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
-            jq -e \
-              --arg workflow_name "${workflow_name}" \
-              --arg source_sha "${actual}" \
-              '.name == $workflow_name and .head_sha == $source_sha and .conclusion == "success"' \
-              <<<"${run}" >/dev/null
-          }
-
-          verify_run "${OCI_VALIDATION_RUN_ID}" 'OCI Runtime Image Validation'
-          verify_run "${PREFLIGHT_RUN_ID}" 'Merge-gate preflight'
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
+              >"${RUNNER_TEMP}/run-${run_id}.json"
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100" \
+              >"${RUNNER_TEMP}/run-${run_id}-jobs.json"
+          done
+          python3 .github/scripts/verify-staging-candidate-validation.py \
+            --source-sha "${actual}" \
+            --oci-run "${RUNNER_TEMP}/run-${OCI_VALIDATION_RUN_ID}.json" \
+            --oci-jobs "${RUNNER_TEMP}/run-${OCI_VALIDATION_RUN_ID}-jobs.json" \
+            --preflight-run "${RUNNER_TEMP}/run-${PREFLIGHT_RUN_ID}.json" \
+            --preflight-jobs "${RUNNER_TEMP}/run-${PREFLIGHT_RUN_ID}-jobs.json"
           printf 'Source: `%s`\nOCI validation: `%s`\nPreflight: `%s`\n' \
             "${actual}" "${OCI_VALIDATION_RUN_ID}" "${PREFLIGHT_RUN_ID}" >> "$GITHUB_STEP_SUMMARY"
 
