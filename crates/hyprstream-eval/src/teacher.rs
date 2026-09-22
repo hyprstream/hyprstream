@@ -22,6 +22,7 @@ use crate::subject::Subject;
 /// downstream, and [`TosClass::Unknown`] must be treated as the most
 /// restrictive class there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TosClass {
     /// Outputs may be redistributed in public/Apache artifacts.
     Distributable,
@@ -97,6 +98,11 @@ impl TeacherEnsemble {
         }
         let mut ids = std::collections::HashSet::new();
         for teacher in &teachers {
+            if teacher.id.is_empty() {
+                return Err(EvalError::InvalidInput(
+                    "a teacher id must be nonempty — it is the roster identity recorded in disclosure and provenance rows".to_owned(),
+                ));
+            }
             if !ids.insert(teacher.id.clone()) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate teacher id `{}`",
@@ -285,6 +291,37 @@ questions:
     #[tokio::test]
     async fn empty_roster_is_rejected() {
         assert!(TeacherEnsemble::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn tos_class_serializes_in_the_documented_wire_form() {
+        // The derived serde form must match `as_str` — JSON/TOML rosters and
+        // persisted provenance use the documented kebab-case values.
+        for class in [
+            TosClass::Distributable,
+            TosClass::InternalOnly,
+            TosClass::Unknown,
+        ] {
+            let serialized = serde_json::to_string(&class).unwrap();
+            assert_eq!(
+                serialized,
+                format!("\"{}\"", class.as_str()),
+                "serde form must match the documented wire form"
+            );
+            let roundtrip: TosClass = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(roundtrip, class);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_teacher_ids_are_rejected() {
+        // The id is the roster identity recorded in disclosure/provenance
+        // rows — an empty one makes outputs unattributable.
+        let error = TeacherEnsemble::new(vec![teacher("", 0)]).err().unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "empty teacher id must be InvalidInput, got {error:?}"
+        );
     }
 
     /// Abstains on every question.
