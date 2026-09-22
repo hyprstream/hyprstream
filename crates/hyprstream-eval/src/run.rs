@@ -337,6 +337,9 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
     use hyprstream_decision::spec::{QuestionBody, QuestionKind};
 
     let id = &question.id;
+    if question.id.is_empty() {
+        return Err("a question id must be nonempty".to_owned());
+    }
     if !question.kind.is_v1() {
         return Err(format!(
             "question `{id}` uses `{}`, reserved for profile v2",
