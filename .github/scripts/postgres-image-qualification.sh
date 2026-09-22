@@ -23,14 +23,28 @@ run_live_module() {
   local sentinel="$2"
   local log
   local passed
+  local cargo_status
+  local tee_status
+  local -a pipeline_status
   log="$(mktemp "${TMPDIR:-/tmp}/hyprstream-postgres-qualification.XXXXXX.log")"
   # The test modules share one disposable database and each initializes or
   # clears its tables. Run each module serially so their test fixtures cannot
   # race schema creation and turn a valid profile into a false failure.
-  if ! cargo test -p hyprstream --locked --lib --no-default-features \
+  # Capture the program statuses explicitly. `if ! pipeline` normalizes the
+  # failure to one, which otherwise hides an OOM/signal or a cache-permission
+  # failure on the native ARM builder. Neither status can contain the URL.
+  set +e
+  cargo test -p hyprstream --locked --lib --no-default-features \
       --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- "${filter}" \
-      --test-threads=1 2>&1 | tee "${log}"; then
+      --test-threads=1 2>&1 | tee "${log}"
+  pipeline_status=("${PIPESTATUS[@]}")
+  cargo_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
+  set -e
+  if (( cargo_status != 0 || tee_status != 0 )); then
     rm -f "${log}"
+    printf 'PostgreSQL qualification command failed filter=%s cargo_exit=%s tee_exit=%s\n' \
+      "${filter}" "${cargo_status}" "${tee_status}" >&2
     return 1
   fi
   if grep -Fq 'HYPRSTREAM_POSTGRES_TEST_URL_FILE unset' "${log}"; then

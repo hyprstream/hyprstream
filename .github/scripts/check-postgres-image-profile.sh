@@ -30,3 +30,7 @@ for source in Dockerfile .github/scripts/graviton-release-lanes.sh .github/workf
     exit 1
   fi
 done
+
+# Keep the qualification harness's redacted failure diagnostics executable;
+# this uses a cargo stub and is not PostgreSQL qualification evidence.
+bash .github/scripts/test-postgres-image-qualification.sh

@@ -169,6 +169,7 @@ jobs:
           podman build --target builder-cpu-arm64 --build-arg VARIANT=cpu-arm64 \
             -t "$POSTGRES_QUALIFICATION_BUILDER" -f Dockerfile .
           podman run --rm --network "$POSTGRES_QUALIFICATION_NETWORK" \
+            --user 0:0 \
             -v "$PWD":/build:Z -w /build \
             -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
             -v "$url_file":/run/hyprstream-test/postgres-url:ro,Z \
@@ -179,7 +180,13 @@ jobs:
             -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
             -e HYPRSTREAM_POSTGRES_TEST_URL_FILE=/run/hyprstream-test/postgres-url \
             "$POSTGRES_QUALIFICATION_BUILDER" \
-            bash -euo pipefail .github/scripts/postgres-image-qualification.sh
+            bash -euo pipefail -c '
+              test -r "$HYPRSTREAM_POSTGRES_TEST_URL_FILE"
+              install -d -m 0700 "$CARGO_TARGET_DIR"
+              test -w "$CARGO_TARGET_DIR"
+              printf "%s\\n" "OCI PostgreSQL qualification environment verified"
+              exec bash -euo pipefail .github/scripts/postgres-image-qualification.sh
+            '
 
       # ── Serving smoke test: the OAuth HTTP face ───────────────────────
       # Start the OAuth service inside the container and gate on what a bare
