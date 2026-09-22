@@ -157,6 +157,22 @@ pub enum EncodeError {
     /// (finite components in [0, 1], sum within D5 producer tolerance).
     #[error("invalid distribution for question {0}: {1}")]
     InvalidDistribution(String, DistributionError),
+    /// An answer distribution whose length cannot match any valid question
+    /// spec (choice: 2-255 options per D2, score: >= 2 levels per D1) —
+    /// the decoder rejects the same messages, so encode mirrors the rule.
+    #[error("answer distribution of {len} components cannot match a {kind} question ({question_id})")]
+    AnswerCardinalityOutOfRange {
+        /// The answer's question id.
+        question_id: String,
+        /// The invalid component count.
+        len: usize,
+        /// Which primitive the count cannot belong to.
+        kind: &'static str,
+    },
+    /// An answer row with an empty question id — the decoder rejects these,
+    /// so a successful encode must stay decodable by this module.
+    #[error("empty question id in an answer row cannot be encoded")]
+    EmptyAnswerQuestionId,
 }
 
 impl From<capnp::Error> for DecodeError {
@@ -582,6 +598,9 @@ pub fn batch_to_message(
         let row_builder = rows_builder.reborrow().get(row_index as u32);
         let mut answers = row_builder.init_answers(row.answers.len() as u32);
         for (answer_index, (question_id, answer)) in row.answers.iter().enumerate() {
+            if question_id.is_empty() {
+                return Err(EncodeError::EmptyAnswerQuestionId);
+            }
             if answer.value.is_none() && answer.conformal_set.is_some() {
                 return Err(EncodeError::AbstainedWithConformalSet(question_id.clone()));
             }
@@ -594,8 +613,31 @@ pub fn batch_to_message(
                         *p_true,
                     ));
                 }
-                Some(AnswerValue::Choice { probabilities })
-                | Some(AnswerValue::Score { probabilities }) => {
+                Some(AnswerValue::Choice { probabilities }) => {
+                    // A choice answer must be able to match a valid spec
+                    // (D2: 2-255 options); the decoder rejects the same
+                    // messages, so a successful encode stays decodable.
+                    if !(2..=255).contains(&probabilities.len()) {
+                        return Err(EncodeError::AnswerCardinalityOutOfRange {
+                            question_id: question_id.clone(),
+                            len: probabilities.len(),
+                            kind: "choice",
+                        });
+                    }
+                    check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).map_err(|error| {
+                        EncodeError::InvalidDistribution(question_id.clone(), error)
+                    })?;
+                }
+                Some(AnswerValue::Score { probabilities }) => {
+                    // A score answer must be able to match a valid spec
+                    // (D1: >= 2 levels).
+                    if probabilities.len() < 2 {
+                        return Err(EncodeError::AnswerCardinalityOutOfRange {
+                            question_id: question_id.clone(),
+                            len: probabilities.len(),
+                            kind: "score",
+                        });
+                    }
                     check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).map_err(|error| {
                         EncodeError::InvalidDistribution(question_id.clone(), error)
                     })?;

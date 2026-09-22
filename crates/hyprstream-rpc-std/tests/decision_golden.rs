@@ -974,6 +974,64 @@ fn encode_decode_reject_round6_contract_violations() {
     assert_eq!(decoded, set);
 }
 
+/// The encoder mirrors the decode-side answer rules (round 7): an empty
+/// BTreeMap key and distribution lengths no valid spec could match
+/// (choice 2-255, score >= 2) are rejected, so a successful encode stays
+/// decodable by this module.
+#[test]
+fn encode_rejects_unbindable_answers() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+
+    // Empty answer key.
+    let answer_row = row(vec![("", QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }))]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[answer_row]),
+        Err(decision::EncodeError::EmptyAnswerQuestionId)
+    ));
+
+    // One-component choice: no valid spec (D2 min 2) can match it.
+    let answer_row = row(vec![("q", answered_choice(&[1.0]))]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[answer_row]),
+        Err(decision::EncodeError::AnswerCardinalityOutOfRange {
+            len: 1,
+            kind: "choice",
+            ..
+        })
+    ));
+
+    // 256-component choice: beyond the D2 maximum.
+    let uniform = vec![1.0f32 / 256.0; 256];
+    let answer_row = row(vec![("q", answered_choice(&uniform))]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[answer_row]),
+        Err(decision::EncodeError::AnswerCardinalityOutOfRange {
+            len: 256,
+            kind: "choice",
+            ..
+        })
+    ));
+
+    // One-component score: below the D1 minimum of 2 levels.
+    let answer_row = row(vec![("q", answered_score(&[0.5]))]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[answer_row]),
+        Err(decision::EncodeError::AnswerCardinalityOutOfRange {
+            len: 1,
+            kind: "score",
+            ..
+        })
+    ));
+
+    // Valid answers still encode.
+    let answer_row = row(vec![("q", answered_choice(&[0.5, 0.5]))]);
+    assert!(decision::batch_to_message(&version, &[answer_row]).is_ok());
+}
+
 /// The decoder rejects unbindable answers: empty question ids and
 /// distribution lengths no valid spec could match (choice 2-255, score >= 2).
 #[test]
