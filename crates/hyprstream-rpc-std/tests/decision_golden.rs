@@ -974,6 +974,92 @@ fn encode_decode_reject_round6_contract_violations() {
     assert_eq!(decoded, set);
 }
 
+/// Conformal members must be labels the matched answer kind can produce
+/// (round 8): noul only accepts the derived `["false", "true"]` labels,
+/// score only decimal indices below the distribution length — decode and
+/// encode both reject anything else, and valid members pass.
+#[test]
+fn conformal_labels_are_validated_against_the_answer_kind() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+
+    // Encode: noul with an impossible member is rejected before emission.
+    let mut invalid = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.8 }),
+    )]);
+    invalid
+        .answers
+        .get_mut("q")
+        .expect("answer")
+        .conformal_set = Some(vec!["maybe".into()]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[invalid]),
+        Err(decision::EncodeError::ConformalLabelImpossible(_))
+    ));
+
+    // Encode: noul with a derived label passes.
+    let mut valid = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.8 }),
+    )]);
+    valid.answers.get_mut("q").expect("answer").conformal_set =
+        Some(vec!["true".into()]);
+    assert!(decision::batch_to_message(&version, &[valid]).is_ok());
+
+    // Decode: a score answer cannot carry an out-of-range decimal index.
+    let raw_score = |member: &str| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message
+                .init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
+            let mut triple = root.reborrow().init_version();
+            triple.set_schema("s");
+            triple.set_model("m");
+            triple.init_calib().set_none(());
+            let rows = root.init_rows(1);
+            let answers = rows.get(0).init_answers(1);
+            let mut answer = answers.get(0);
+            answer.set_question_id("q");
+            {
+                let value = answer.reborrow().init_value();
+                let mut levels = value.init_score(2);
+                levels.set(0, 0.7);
+                levels.set(1, 0.3);
+            }
+            let mut members = answer.init_conformal_set().init_some(1);
+            members.set(0, member);
+        }
+        wire_roundtrip(&message)
+    };
+    let decode = |bytes: &[u8]| {
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
+        let reader = message
+            .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+            .expect("root");
+        decision::batch_from_reader(reader)
+    };
+
+    let bytes = raw_score("2"); // 2-level score: valid indices are 0, 1
+    assert!(matches!(
+        decode(&bytes),
+        Err(decision::DecodeError::ConformalLabelImpossible(_))
+    ));
+    let bytes = raw_score("1");
+    let (_, rows) = decode(&bytes).expect("in-range index decodes");
+    assert_eq!(
+        rows[0].answers["q"].conformal_set,
+        Some(vec!["1".to_owned()])
+    );
+}
+
 /// The encoder mirrors the decode-side answer rules (round 7): an empty
 /// BTreeMap key and distribution lengths no valid spec could match
 /// (choice 2-255, score >= 2) are rejected, so a successful encode stays

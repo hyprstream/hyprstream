@@ -89,6 +89,12 @@ pub enum DecodeError {
         /// Which primitive the count cannot belong to.
         kind: &'static str,
     },
+    /// A conformal set member that no label of the matched answer kind can
+    /// produce (noul labels are derived `["false", "true"]`, score labels
+    /// are decimal indices of the distribution, choice names are
+    /// non-empty) — the row would only fail later in Arrow emission.
+    #[error("conformal set member impossible for the answer kind (question {0})")]
+    ConformalLabelImpossible(String),
 }
 
 /// Errors encoding IR into a `decision.capnp` message.
@@ -173,6 +179,10 @@ pub enum EncodeError {
     /// so a successful encode must stay decodable by this module.
     #[error("empty question id in an answer row cannot be encoded")]
     EmptyAnswerQuestionId,
+    /// A conformal set member that no label of the answer kind can produce
+    /// — the decoder rejects the same rows, so encode mirrors the rule.
+    #[error("conformal set member impossible for the answer kind (question {0})")]
+    ConformalLabelImpossible(String),
 }
 
 impl From<capnp::Error> for DecodeError {
@@ -574,6 +584,23 @@ fn set_answer_value(mut builder: decision_capnp::answer_value::Builder<'_>, valu
     }
 }
 
+/// Whether any conformal member is a label the matched answer kind cannot
+/// produce: noul labels are derived `["false", "true"]`, score labels are
+/// the decimal indices of the distribution, choice labels are non-empty
+/// option names. Members failing this cannot bind to any valid question and
+/// would only fail later in Arrow emission.
+fn has_impossible_conformal_label(members: &[String], value: &AnswerValue) -> bool {
+    match value {
+        AnswerValue::Noul { .. } => members.iter().any(|m| m != "false" && m != "true"),
+        AnswerValue::Score { probabilities } => members.iter().any(|m| {
+            m.parse::<usize>()
+                .map(|index| index >= probabilities.len())
+                .unwrap_or(true)
+        }),
+        AnswerValue::Choice { .. } => members.iter().any(String::is_empty),
+    }
+}
+
 /// Encode a decision batch (version triple + rows) as a `DecisionBatch` message.
 ///
 /// Answers are emitted keyed by question id (capnp has no map type); rows are
@@ -650,6 +677,11 @@ pub fn batch_to_message(
                 answer_builder.reborrow().init_value(),
                 answer.value.as_ref(),
             );
+            if let (Some(members), Some(value)) = (&answer.conformal_set, &answer.value) {
+                if has_impossible_conformal_label(members, value) {
+                    return Err(EncodeError::ConformalLabelImpossible(question_id.clone()));
+                }
+            }
             match &answer.conformal_set {
                 None => answer_builder.init_conformal_set().set_none(()),
                 Some(set) => {
@@ -748,6 +780,11 @@ pub fn batch_from_reader(
                     Some(AnswerValue::Score { probabilities })
                 }
             };
+            if let (Some(members), Some(value)) = (&conformal_set, &value) {
+                if has_impossible_conformal_label(members, value) {
+                    return Err(DecodeError::ConformalLabelImpossible(question_id));
+                }
+            }
             answers.insert(question_id, QuestionAnswer { value, conformal_set });
         }
         rows.push(AnswerRow { answers });
