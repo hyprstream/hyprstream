@@ -144,16 +144,19 @@ impl TeacherEnsemble {
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
-            let answer_row =
-                teacher
-                    .subject
-                    .decide(set, state, row)
-                    .await
-                    .map_err(|error| EvalError::Subject {
-                        model: teacher.subject.model_id().to_owned(),
-                        item_id: item_id.to_owned(),
-                        message: error.to_string(),
-                    })?;
+            // Bind provenance to THIS response: reading resolved_model_id
+            // after decide races with a concurrent ensemble/run sharing the
+            // subject (its response can overwrite the resolved slot in
+            // between), persisting raw targets under the wrong model id.
+            let (answer_row, resolved) = teacher
+                .subject
+                .decide_with_version(set, state, row)
+                .await
+                .map_err(|error| EvalError::Subject {
+                    model: teacher.subject.model_id().to_owned(),
+                    item_id: item_id.to_owned(),
+                    message: error.to_string(),
+                })?;
             // Teacher rows are averaged raw: a malformed row (missing answer,
             // wrong cardinality, non-normalized distribution) would silently
             // corrupt the ensemble, so apply the same ingest rules as runs.
@@ -166,7 +169,7 @@ impl TeacherEnsemble {
             teacher_answers.push(TeacherAnswer {
                 teacher_id: teacher.id.clone(),
                 tos_class: teacher.tos_class,
-                model_id: teacher.subject.resolved_model_id(),
+                model_id: resolved,
                 row: answer_row,
             });
         }

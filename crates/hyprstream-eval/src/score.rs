@@ -434,24 +434,36 @@ pub fn flip_rate_with_labels(
         if bases.is_empty() {
             continue;
         }
+        // Bench-shaped groups (cyclic rotations of one choice item) give
+        // every rotation its own question id and label order, so question
+        // ids are unique across the group and the single base is the only
+        // possible comparison. Set-shaped groups repeat question ids across
+        // rows — there, only a same-question base is a valid comparison.
+        let bench_shaped = {
+            let mut seen = std::collections::BTreeSet::new();
+            members
+                .iter()
+                .all(|member| seen.insert(member.question_id.as_str()))
+        };
         let mut counted = false;
         for member in members.iter().filter(|member| member.id != base_id) {
-            // The base for THIS member: with several base observations (a
-            // multi-question set run) match the member's own question —
+            // The base for THIS member: match the member's own question —
             // pooling across questions compares against another question's
-            // label space and reports spurious flips. With exactly one base
-            // (bench item groups) rotations carry their own question ids
-            // and label orders, and compare against that base.
-            let base = if let [base] = bases.as_slice() {
-                *base
-            } else {
-                let Some(base) = bases
-                    .iter()
-                    .find(|base| base.question_id == member.question_id)
-                else {
-                    continue;
-                };
+            // label space and reports spurious flips (e.g. when the base row
+            // answered q1 but abstained on q2, an answered rotated q2 member
+            // has no base prediction and must be SKIPPED, not compared
+            // against the q1 base). The single-base fallback applies only to
+            // bench-shaped groups, where rotations carry their own question
+            // ids and label orders.
+            let base = if let Some(base) = bases
+                .iter()
+                .find(|base| base.question_id == member.question_id)
+            {
                 base
+            } else if bench_shaped && bases.len() == 1 {
+                &bases[0]
+            } else {
+                continue;
             };
             let Some(base_label) = label_of(base) else {
                 continue;
