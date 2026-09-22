@@ -51,7 +51,10 @@ if PATH="${test_root}:${PATH}" \
   exit 1
 fi
 grep -F 'cargo_exit=137 tee_exit=0' "${test_root}/failure.log" >/dev/null
-! grep -F 'private-password' "${test_root}/failure.log"
+if grep -Fq 'private-password' "${test_root}/failure.log"; then
+  echo 'qualification failure diagnostic exposed the fixture credential' >&2
+  exit 1
+fi
 
 # A passing libtest result with an opt-in skip is never database evidence.
 cat > "${test_root}/cargo" <<'EOF'
