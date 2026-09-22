@@ -387,7 +387,22 @@ fn balancing_uses_the_fitted_correction_map() {
     let plain = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
     let neutral = run(&small_config(), &refs, &firewall(), &identity).unwrap();
     assert_eq!(plain.to_jsonl(false), neutral.to_jsonl(false));
-    assert_eq!(plain.stats, neutral.stats);
+    // The selection must be identical, while the audit trail now records
+    // which temperatures were applied (identity vs none) — compare the
+    // selection fields, not the whole stats struct.
+    assert_eq!(plain.rows, neutral.rows);
+    assert_eq!(plain.stats.label_histogram, neutral.stats.label_histogram);
+    assert_eq!(plain.stats.accepted, neutral.stats.accepted);
+    assert_eq!(plain.stats.label_deferred, neutral.stats.label_deferred);
+    assert!(plain.stats.correction_temperatures.is_empty());
+    let expected_identity: std::collections::BTreeMap<String, f64> = identity
+        .iter()
+        .map(|(teacher, temperature)| (teacher.clone(), *temperature))
+        .collect();
+    assert_eq!(
+        neutral.stats.correction_temperatures,
+        expected_identity
+    );
 
     // Strongly sharpening one teacher changes the ensemble argmax, so the
     // recorded labels must follow the corrected average. The expected
@@ -439,12 +454,38 @@ fn synth_stats_audit_trail_serializes_to_json() {
                 count: 1,
             },
         ],
+        correction_temperatures: std::collections::BTreeMap::from([
+            ("sim-a".to_owned(), 0.8),
+            ("sim-b".to_owned(), 1.2),
+        ]),
         ..SynthStats::default()
     };
     let text = serde_json::to_string(&stats).expect("audit trail serializes");
     assert!(text.contains("\"label_histogram\""));
+    assert!(text.contains("\"correction_temperatures\""));
     let back: SynthStats = serde_json::from_str(&text).expect("audit trail round-trips");
     assert_eq!(back, stats);
+}
+
+#[test]
+fn applied_correction_temperatures_are_recorded() {
+    // Regression (review thread 2026-09-22 20:58): corrections change the
+    // argmax the label policy defers on, but were absent from the audit
+    // trail — two runs with identical configs and different corrections
+    // produced different corpora with identical recorded provenance. The
+    // applied temperatures are now part of SynthStats, so the selection
+    // decision is reproducible from the corpus alone.
+    let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
+    let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
+    let sharpened = HashMap::from([("sim-a".to_owned(), 0.05)]);
+    let corpus = run(&small_config(), &refs, &firewall(), &sharpened).unwrap();
+    assert_eq!(
+        corpus.stats.correction_temperatures.get("sim-a"),
+        Some(&0.05),
+        "applied temperatures recorded verbatim"
+    );
+    let uncorrected = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
+    assert!(uncorrected.stats.correction_temperatures.is_empty());
 }
 
 #[test]

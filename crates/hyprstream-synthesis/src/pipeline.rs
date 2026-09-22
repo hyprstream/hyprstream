@@ -219,6 +219,7 @@ pub fn run(
         }
     }
     stats.label_histogram = LabelCount::rows_from(labels.histogram());
+    stats.correction_temperatures = temperatures.iter().map(|(teacher, t)| (teacher.clone(), *t)).collect();
     corpus.stats = stats;
     Ok(corpus)
 }

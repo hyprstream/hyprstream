@@ -78,15 +78,22 @@ mod triage {
         "MoQ streaming plane",
         "git2db model registry",
     ];
-    const ISSUES: [&str; 8] = [
-        "intermittent checksum failures",
-        "a sudden latency regression",
-        "an authentication loop",
-        "missing adapter files",
-        "a stalled download",
-        "unexpected restarts",
-        "garbled streamed output",
-        "a billing discrepancy",
+    // Each issue maps to the team that owns it — the correct route is
+    // state-derived, so every offered subset can contain a valid label
+    // (review thread 2026-09-22 20:58).
+    const ISSUES: [(&str, usize); 12] = [
+        ("intermittent checksum failures", 1),
+        ("a sudden latency regression", 1),
+        ("an authentication loop", 1),
+        ("unexpected restarts", 1),
+        ("garbled streamed output", 1),
+        ("a billing discrepancy", 0),
+        ("an unexpected subscription charge", 0),
+        ("a refund that never arrived", 0),
+        ("a lost shipment", 2),
+        ("a delivery stuck in transit", 2),
+        ("an account lockout after a tenant transfer", 3),
+        ("a question about upgrading the plan", 4),
     ];
     const TEAMS: [(&str, [&str; 2]); 5] = [
         (
@@ -141,19 +148,22 @@ mod triage {
         "Score the urgency of this report.",
     ];
 
-    fn state(rng: &mut BenchRng) -> Entry {
+    fn state(rng: &mut BenchRng) -> (Entry, usize) {
         let ticket = 1000 + rng.below(90_000);
         let product = pick(&PRODUCTS, rng.below(PRODUCTS.len() as u64) as usize);
-        let issue = pick(&ISSUES, rng.below(ISSUES.len() as u64) as usize);
+        let (issue, team) = ISSUES[rng.below(ISSUES.len() as u64) as usize];
         let hours = 1 + rng.below(72);
-        Entry::Str(format!(
-            "Ticket #{ticket}: {issue} with the {product}. Customer first reported it {hours} hours ago."
-        ))
+        (
+            Entry::Str(format!(
+                "Ticket #{ticket}: {issue} with the {product}. Customer first reported it {hours} hours ago."
+            )),
+            team,
+        )
     }
 
     pub(super) fn noul(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
+        let (state, _team) = state(&mut rng);
         SynthItem::new(
             SynthFamily::Triage,
             seed,
@@ -176,8 +186,14 @@ mod triage {
 
     pub(super) fn choice(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
-        let options = option_subset(&mut rng, &TEAMS, 2, 4)
+        let (state, truth) = state(&mut rng);
+        // The state-derived owning team must be among the offered options.
+        let mut subset = option_subset(&mut rng, &TEAMS, 2, 4);
+        if !subset.contains(&truth) {
+            let slot = rng.below(subset.len() as u64) as usize;
+            subset[slot] = truth;
+        }
+        let options = subset
             .into_iter()
             .map(|i| ChoiceOption {
                 name: TEAMS[i].0.to_owned(),
@@ -197,7 +213,7 @@ mod triage {
 
     pub(super) fn score(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
+        let (state, _team) = state(&mut rng);
         let levels = 2 + rng.below(4) as usize; // 2..=5
         let rubrics = [
             "No customer impact.",
@@ -233,6 +249,9 @@ mod triage {
 mod compliance {
     use super::*;
 
+    // Policy -> policy-area index (see AREAS): the choice truth is
+    // state-derived, so the rendered Policy/Action pair is area-coherent.
+    const POLICY_AREA: [usize; 6] = [0, 1, 2, 3, 0, 3];
     const POLICIES: [&str; 6] = [
         "Customer data must be deleted within 30 days of account closure.",
         "Production access requires an approved change ticket.",
@@ -241,6 +260,8 @@ mod compliance {
         "Vendor contracts must be stored in the document system.",
         "On-call handoffs must be acknowledged in writing.",
     ];
+    // Action -> policy-area index (see AREAS).
+    const ACTION_AREA: [usize; 8] = [0, 1, 2, 3, 0, 3, 2, 1];
     const ACTIONS: [&str; 8] = [
         "An engineer wiped the account archive 45 days after closure.",
         "A contractor logged into production with a shared key.",
@@ -297,15 +318,28 @@ mod compliance {
         "Score the policy exposure of this case.",
     ];
 
-    fn state(rng: &mut BenchRng) -> Entry {
-        let policy = pick(&POLICIES, rng.below(POLICIES.len() as u64) as usize);
-        let action = pick(&ACTIONS, rng.below(ACTIONS.len() as u64) as usize);
-        Entry::Str(format!("Policy: {policy}\nAction: {action}"))
+    fn state(rng: &mut BenchRng) -> (Entry, usize) {
+        // The case's policy area is state-derived; within the requested
+        // area the policy and action are drawn coherently so the pair is
+        // about the same rule (review thread 2026-09-22 20:58).
+        let area = rng.below(AREAS.len() as u64) as usize;
+        let policies: Vec<usize> = (0..POLICIES.len())
+            .filter(|i| POLICY_AREA[*i] == area)
+            .collect();
+        let actions: Vec<usize> = (0..ACTIONS.len())
+            .filter(|i| ACTION_AREA[*i] == area)
+            .collect();
+        let policy = POLICIES[policies[rng.below(policies.len() as u64) as usize]];
+        let action = ACTIONS[actions[rng.below(actions.len() as u64) as usize]];
+        (
+            Entry::Str(format!("Policy: {policy}\nAction: {action}")),
+            area,
+        )
     }
 
     pub(super) fn noul(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
+        let (state, _area) = state(&mut rng);
         SynthItem::new(
             SynthFamily::Compliance,
             seed,
@@ -319,8 +353,14 @@ mod compliance {
 
     pub(super) fn choice(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
-        let options = option_subset(&mut rng, &AREAS, 2, 4)
+        let (state, truth) = state(&mut rng);
+        // The state-derived policy area must be among the offered options.
+        let mut subset = option_subset(&mut rng, &AREAS, 2, 4);
+        if !subset.contains(&truth) {
+            let slot = rng.below(subset.len() as u64) as usize;
+            subset[slot] = truth;
+        }
+        let options = subset
             .into_iter()
             .map(|i| ChoiceOption {
                 name: AREAS[i].0.to_owned(),
@@ -340,7 +380,7 @@ mod compliance {
 
     pub(super) fn score(seed: u64, paraphrase: u32) -> SynthItem {
         let mut rng = BenchRng::new(seed);
-        let state = state(&mut rng);
+        let (state, _area) = state(&mut rng);
         let levels = 2 + rng.below(4) as usize;
         let rubrics = [
             "No exposure.",

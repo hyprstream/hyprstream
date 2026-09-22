@@ -255,7 +255,8 @@ impl LabelCount {
 }
 
 /// Run statistics (also the audit trail for label control + dedup).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// (`Eq` is not derivable: recorded correction temperatures are f64.)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SynthStats {
     /// Items generated before any filtering.
     pub generated: usize,
@@ -269,6 +270,12 @@ pub struct SynthStats {
     /// cardinality, label) — the audit trail for label control + dedup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_histogram: Vec<LabelCount>,
+    /// The teacher correction temperatures applied during the run (sorted
+    /// by teacher id). Corrections change the corrected average and hence
+    /// the argmax the label policy defers on — recorded so the selection
+    /// decision is reproducible and auditable from the corpus alone.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub correction_temperatures: std::collections::BTreeMap<String, f64>,
 }
 
 /// A synthesized corpus plus run statistics.
