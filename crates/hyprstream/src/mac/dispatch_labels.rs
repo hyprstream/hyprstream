@@ -66,6 +66,15 @@ pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
 /// real serialized requests and pins these values to the schema; changing the
 /// union order fails CI rather than silently relabeling the dispatch plane.
 pub mod policy_methods {
+    /// `check` — an authenticated service asks the PolicyService to evaluate
+    /// its own authorization request. The handler derives caller identity and
+    /// domain from the verified envelope; this declaration adds no anonymous
+    /// or tokenless exception.
+    pub const CHECK: u16 = 0;
+    /// `issueToken` — PolicyService mints a session-bound credential. Its
+    /// schema declares `internal:pq-hybrid`; only the verified hybrid OAuth
+    /// authority receives the corresponding scoped dispatch clearance.
+    pub const ISSUE_TOKEN: u16 = 1;
     /// `getPolicy` — read the local control-plane policy.
     pub const GET_POLICY: u16 = 3;
     /// `applyTemplate` — install a reviewed bootstrap template.
@@ -101,6 +110,19 @@ pub mod policy_methods {
 pub const BOOTSTRAP_SERVICE_CLEARANCE: SecurityLabel = SecurityLabel {
     level: Level::Internal,
     assurance: Assurance::Classical,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Schema-declared label of `PolicyRequest.issueToken`.
+///
+/// The issuing authority crosses a signing boundary and is explicitly marked
+/// `$dispatchMac("internal:pq-hybrid")` in `policy.capnp`; it is therefore not
+/// a floor-labelled bootstrap operation. The only staging caller cleared for
+/// this row is `service:oauth`, whose verified hybrid envelope is additionally
+/// checked by the regular PolicyService authorization and issuance guards.
+pub const OAUTH_ISSUANCE_LABEL: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::PqHybrid,
     compartments: CompartmentSet::EMPTY,
 };
 
@@ -393,6 +415,18 @@ impl MacDispatchPep for DeclaredDispatchPep {
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
     DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::CHECK },
+        method_name: "check",
+        label: SecurityLabel::bottom(),
+        justification: "authenticated declared services mediate PolicyService authorization checks; the handler derives subject and domain from the verified envelope and Casbin retains the federation decision",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ISSUE_TOKEN },
+        method_name: "issueToken",
+        label: OAUTH_ISSUANCE_LABEL,
+        justification: "the OAuth authority mints a session-bound credential through the schema-declared internal:pq-hybrid signing boundary; only a verified hybrid service:oauth envelope can dominate this row, while PolicyService retains target-tenant policy:IssueToken/manage, subject, tenant, audience, scope, session, client, confirmation, and signing checks",
+    },
+    DispatchMethodPolicy {
         id: DispatchMethodId { service: "policy", method: policy_methods::GET_POLICY },
         method_name: "getPolicy",
         label: SecurityLabel::bottom(),
@@ -500,9 +534,8 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
     },
     ServiceSubjectClearance {
         service: "oauth",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "login/session issuance is how identity standing is \
-             acquired at all; oauth registers its key at boot",
+        clearance: OAUTH_ISSUANCE_LABEL,
+        justification: "the verified hybrid OAuth authority performs the declared internal:pq-hybrid session-token issuance boundary; its exact typed row and PolicyService authorization remain mandatory",
     },
     ServiceSubjectClearance {
         service: "policy",
@@ -557,9 +590,12 @@ mod tests {
         let table = DeclaredDispatchTable::production();
 
         // The fresh boot graph declares the local PolicyService control-plane
-        // operations plus registration and renewal. Every declared row resolves
-        // to the intended typed label — the lattice floor, deliberate and reviewed.
+        // operations plus authenticated authorization checks, registration,
+        // and renewal. Every declared row resolves to the intended typed label
+        // — the lattice floor, deliberate and reviewed.
         let expected: &[(u16, &str)] = &[
+            (policy_methods::CHECK, "check"),
+            (policy_methods::ISSUE_TOKEN, "issueToken"),
             (policy_methods::GET_POLICY, "getPolicy"),
             (policy_methods::APPLY_TEMPLATE, "applyTemplate"),
             (policy_methods::APPLY_DRAFT, "applyDraft"),
@@ -579,10 +615,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("declared row for policy.{name} must resolve"));
             assert_eq!(row.method_name, *name);
             assert_eq!(row.id.service, "policy");
+            let expected_label = if *method == policy_methods::ISSUE_TOKEN {
+                OAUTH_ISSUANCE_LABEL
+            } else {
+                SecurityLabel::bottom()
+            };
             assert_eq!(
                 row.label,
-                SecurityLabel::bottom(),
-                "bootstrap-critical row {name} stays at the floor (reachable under narrow-to-floor)"
+                expected_label,
+                "declared row {name} must retain its reviewed schema/bootstrap label"
             );
             assert!(!row.justification.is_empty());
         }
@@ -605,7 +646,12 @@ mod tests {
             ]
         );
         for row in table.clearances() {
-            assert_eq!(row.clearance, BOOTSTRAP_SERVICE_CLEARANCE);
+            let expected_clearance = if row.service == "oauth" {
+                OAUTH_ISSUANCE_LABEL
+            } else {
+                BOOTSTRAP_SERVICE_CLEARANCE
+            };
+            assert_eq!(row.clearance, expected_clearance);
             assert_eq!(
                 table.service_clearance(row.service),
                 Some(row.clearance),
@@ -615,11 +661,17 @@ mod tests {
             for method in table.methods() {
                 let ctx = SecurityContext::from_clearance(
                     row.clearance,
-                    hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical,
+                    if row.service == "oauth" {
+                        hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid
+                    } else {
+                        hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical
+                    },
                 );
-                assert!(
+                let expected = row.service == "oauth" || method.id.method != policy_methods::ISSUE_TOKEN;
+                assert_eq!(
                     ctx.can_access(&method.label),
-                    "declared clearance for {} must dominate declared label {} ({})",
+                    expected,
+                    "only verified hybrid service:oauth may dominate issueToken; {} against {} ({})",
                     row.service,
                     method.label,
                     method.method_name
@@ -748,6 +800,49 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_oauth_policy_methods_require_exact_declared_hybrid_authority() {
+        let pep = production_pep();
+        let oauth = service_subject_ctx("oauth", 0x66);
+
+        // The PAR registration path is an authenticated service:oauth call to
+        // PolicyRequest.check (union ordinal zero). It must resolve through
+        // the normal declared-service PEP, not a tokenless policy exception.
+        assert_eq!(
+            pep.check(&oauth, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Permit,
+            "verified service:oauth must reach the declared policy.check leaf"
+        );
+
+        // The real production client test below verifies a hybrid envelope;
+        // this classical fixture intentionally cannot dominate issueToken's
+        // schema-declared internal:pq-hybrid label.
+        assert_eq!(
+            pep.check(&oauth, "policy", Some(&[policy_methods::ISSUE_TOKEN])),
+            MacDecision::Deny(MacDenyReason::FloorDeny),
+            "a classical envelope must not reach the PQ-hybrid token issuer"
+        );
+
+        // The same floor-labelled object remains unavailable to an
+        // undeclared service, a non-service subject, and a keyless callback.
+        // Adding the row therefore cannot fabricate an anonymous clearance.
+        let ghost = service_subject_ctx("ghost", 0x67);
+        assert_eq!(
+            pep.check(&ghost, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let user = user_subject_ctx();
+        assert_eq!(
+            pep.check(&user, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let callback = EnvelopeContext::from_callback_service(1, "oauth");
+        assert_eq!(
+            pep.check(&callback, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+    }
+
+    #[test]
     fn permit_requires_the_deliberate_service_clearance_not_the_anonymous_floor() {
         let pep = production_pep();
 
@@ -845,6 +940,40 @@ mod tests {
     #[test]
     fn declared_policy_discriminants_match_the_serialized_schema() {
         use capnp::message::Builder;
+
+        // check
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut check = req.reborrow().init_check();
+            check.set_subject("service:oauth");
+            check.set_domain("");
+            check.set_resource("federation:register:https://signup.example.test");
+            check.set_operation("check");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::CHECK,
+            "the declared check discriminant must match the schema union ordinal"
+        );
+
+        // issueToken
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_issue_token();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ISSUE_TOKEN,
+            "the declared issueToken discriminant must match the schema union ordinal"
+        );
 
         // getPolicy
         let mut message = Builder::new_default();
