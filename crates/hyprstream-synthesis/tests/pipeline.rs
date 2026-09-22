@@ -57,8 +57,8 @@ fn small_config() -> SynthConfig {
 fn pipeline_is_bit_deterministic() {
     let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
-    let a = run(&small_config(), &refs, &firewall()).unwrap();
-    let b = run(&small_config(), &refs, &firewall()).unwrap();
+    let a = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
+    let b = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
     assert_eq!(a.to_jsonl(false), b.to_jsonl(false));
     assert_eq!(a.stats, b.stats);
 }
@@ -73,7 +73,7 @@ fn label_histogram_is_recorded_under_unlimited_policy() {
         label_policy: LabelPolicy::Unlimited,
         ..small_config()
     };
-    let corpus = run(&config, &refs, &firewall()).unwrap();
+    let corpus = run(&config, &refs, &firewall(), &HashMap::new()).unwrap();
     assert!(!corpus.stats.label_histogram.is_empty());
     let total: usize = corpus.stats.label_histogram.values().sum();
     assert_eq!(total, corpus.stats.accepted);
@@ -86,7 +86,7 @@ fn reconstructed_specs_pass_the_arrow_identifier_contract() {
     // grammar ([A-Za-z_][A-Za-z0-9_]*) must accept every one of them.
     let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
-    let corpus = run(&small_config(), &refs, &firewall()).unwrap();
+    let corpus = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
     assert!(!corpus.rows.is_empty());
     for row in &corpus.rows {
         let spec = row.question_spec().unwrap();
@@ -166,7 +166,7 @@ fn mandatory_augmentation_closure() {
     let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
     let config = small_config();
-    let corpus = run(&config, &refs, &firewall()).unwrap();
+    let corpus = run(&config, &refs, &firewall(), &HashMap::new()).unwrap();
     let mut groups: HashMap<&str, Vec<&hyprstream_synthesis::CorpusRow>> = HashMap::new();
     for row in &corpus.rows {
         groups.entry(row.group.as_str()).or_default().push(row);
@@ -225,7 +225,7 @@ fn raw_teacher_vectors_are_persisted_with_provenance() {
         ("sim-b", TosClass::ApiDistillationPermitted),
     ]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
-    let corpus = run(&small_config(), &refs, &firewall()).unwrap();
+    let corpus = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
     assert!(!corpus.rows.is_empty());
     for row in &corpus.rows {
         assert_eq!(row.teachers.len(), 2, "{}: every teacher answered", row.id);
@@ -250,7 +250,7 @@ fn distributability_flag_gates_publishable_export() {
         ("sim-encumbered", TosClass::ApiProhibited),
     ]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
-    let corpus = run(&small_config(), &refs, &firewall()).unwrap();
+    let corpus = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
     assert!(!corpus.rows.is_empty());
     assert!(
         corpus.rows.iter().all(|row| !row.distributable),
@@ -272,7 +272,7 @@ fn label_control_balances_argmax_histogram() {
         label_policy: LabelPolicy::Balanced { slack: 1 },
         ..small_config()
     };
-    let corpus = run(&config, &refs, &firewall()).unwrap();
+    let corpus = run(&config, &refs, &firewall(), &HashMap::new()).unwrap();
     // Within each (kind, cardinality) bucket, label counts differ by at most
     // slack + 1 (deferral can leave the minimum trailing by one).
     let mut buckets: HashMap<(String, usize), Vec<usize>> = HashMap::new();
@@ -300,7 +300,7 @@ fn firewall_rejects_gate_families_and_manifest_collisions() {
     // Every accepted row passes both firewalls (re-check against the raw set).
     let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
-    let corpus = run(&small_config(), &refs, &fw).unwrap();
+    let corpus = run(&small_config(), &refs, &fw, &HashMap::new()).unwrap();
     for row in &corpus.rows {
         assert!(!fw.gate_families().contains(&row.family));
         assert!(!fw.is_contaminated_hash(&row.blake3));
@@ -318,14 +318,14 @@ fn zero_base_items_and_duplicate_teacher_ids_are_rejected() {
         ..small_config()
     };
     assert!(matches!(
-        run(&zero, &refs, &firewall()),
+        run(&zero, &refs, &firewall(), &HashMap::new()),
         Err(SynthError::ZeroBaseItems)
     ));
 
     let (dupes, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
     let dupe_refs: Vec<&dyn Teacher> = vec![&dupes[0], &dupes[0]];
     assert!(matches!(
-        run(&small_config(), &dupe_refs, &firewall()),
+        run(&small_config(), &dupe_refs, &firewall(), &HashMap::new()),
         Err(SynthError::DuplicateTeacherId(id)) if id == "sim-a"
     ));
 }
@@ -339,7 +339,7 @@ fn paraphrase_variants_below_two_is_a_config_error() {
         ..small_config()
     };
     assert!(matches!(
-        run(&config, &refs, &firewall()),
+        run(&config, &refs, &firewall(), &HashMap::new()),
         Err(SynthError::BadParaphraseVariants(1))
     ));
 }
@@ -352,7 +352,7 @@ fn ensemble_fallbacks_work_on_pipeline_rows() {
         ("sim-c", TosClass::OpenWeights),
     ]);
     let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
-    let corpus = run(&small_config(), &refs, &firewall()).unwrap();
+    let corpus = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
     let row = corpus.rows.first().unwrap();
     let mean = corrected_average(row, &HashMap::new()).unwrap();
     assert!((mean.iter().sum::<f64>() - 1.0).abs() < 1e-6);
@@ -363,4 +363,136 @@ fn ensemble_fallbacks_work_on_pipeline_rows() {
     for id in &kept {
         assert!(row.teachers.iter().any(|answer| &answer.id == id));
     }
+}
+
+#[test]
+fn balancing_uses_the_fitted_correction_map() {
+    // Regression (review): label control used to balance the uncorrected
+    // average even though training distills the temperature-corrected one —
+    // with non-unit P0.5 temperatures a corpus could be reported as balanced
+    // while skewed under its actual training targets. The fitted correction
+    // map is now threaded into the balancing calculation.
+    let (teachers, _) = ensemble(&[
+        ("sim-a", TosClass::OpenWeights),
+        ("sim-b", TosClass::OpenWeights),
+        ("sim-c", TosClass::OpenWeights),
+    ]);
+    let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
+
+    // An identity map (all T = 1.0) must be exactly the empty map.
+    let identity: HashMap<String, f64> = ["sim-a", "sim-b", "sim-c"]
+        .iter()
+        .map(|id| ((*id).to_owned(), 1.0))
+        .collect();
+    let plain = run(&small_config(), &refs, &firewall(), &HashMap::new()).unwrap();
+    let neutral = run(&small_config(), &refs, &firewall(), &identity).unwrap();
+    assert_eq!(plain.to_jsonl(false), neutral.to_jsonl(false));
+    assert_eq!(plain.stats, neutral.stats);
+
+    // Strongly sharpening one teacher changes the ensemble argmax, so the
+    // recorded labels must follow the corrected average. The expected
+    // histogram is rebuilt independently from the persisted raw vectors.
+    let sharpened = HashMap::from([("sim-a".to_owned(), 0.05)]);
+    let corrected = run(&small_config(), &refs, &firewall(), &sharpened).unwrap();
+    assert_eq!(corrected.rows.len(), plain.rows.len());
+    let mut expected: HashMap<(String, usize, usize), usize> = HashMap::new();
+    for row in &corrected.rows {
+        let mean = corrected_average(row, &sharpened).unwrap();
+        *expected
+            .entry((row.kind.clone(), row.cardinality(), argmax_label(&mean)))
+            .or_default() += 1;
+    }
+    assert_eq!(corrected.stats.label_histogram, expected);
+    assert_ne!(
+        corrected.stats.label_histogram, plain.stats.label_histogram,
+        "sharpening a teacher must flip at least one recorded label"
+    );
+}
+
+#[test]
+fn invalid_correction_maps_are_rejected_upfront() {
+    let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
+    let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
+    let ghost = HashMap::from([("ghost".to_owned(), 1.0)]);
+    assert!(matches!(
+        run(&small_config(), &refs, &firewall(), &ghost),
+        Err(SynthError::UnknownCorrectionTeacher(id)) if id == "ghost"
+    ));
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let map = HashMap::from([("sim-a".to_owned(), bad)]);
+        assert!(
+            matches!(
+                run(&small_config(), &refs, &firewall(), &map),
+                Err(SynthError::BadCorrectionTemperature(id)) if id == "sim-a"
+            ),
+            "temperature {bad} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn cli_rejects_unknown_arguments() {
+    // Regression (review): argument handling used to search for known flags
+    // and ignore the rest, so a typo'd flag silently reverted to defaults —
+    // a misspelled --publishable-only would silently export encumbered rows.
+    let bin = env!("CARGO_BIN_EXE_hyprstream-synthesis");
+    let dir = std::env::temp_dir();
+    let roster_path = dir.join("p13-test-roster.json");
+    std::fs::write(
+        &roster_path,
+        r#"{"teachers":[{"id":"sim","version":"simulated","tos_class":"open-weights"}]}"#,
+    )
+    .unwrap();
+    let roster = roster_path.to_str().unwrap();
+    let manifest = manifest_path().to_str().unwrap().to_owned();
+    for bad_args in [
+        vec![
+            "run",
+            "--roster",
+            roster,
+            "--manifest",
+            &manifest,
+            "--confg",
+            "tuned.json",
+        ],
+        vec![
+            "run",
+            "--roster",
+            roster,
+            "--manifest",
+            &manifest,
+            "--publishable",
+        ],
+        vec!["run", "--roster", roster, "--manifest", &manifest, "stray"],
+        vec!["run", "--roster"],
+        vec!["roster-md", "--roster", roster, "--verbse"],
+    ] {
+        let out = std::process::Command::new(bin)
+            .args(&bad_args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "args {bad_args:?} must be rejected, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The correctly-spelled flags still pass validation.
+    let good = std::process::Command::new(bin)
+        .args([
+            "run",
+            "--roster",
+            roster,
+            "--manifest",
+            &manifest,
+            "--publishable-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        good.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&good.stderr)
+    );
 }

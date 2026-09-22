@@ -16,6 +16,7 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -61,6 +62,32 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
+/// Reject any argument that is not a recognized flag or a consumed flag
+/// value. A typo such as `--confg tuned.json` must fail loud, never silently
+/// revert to the default configuration — and a misspelled
+/// `--publishable-only` must never silently export encumbered rows.
+fn reject_unknown_args(
+    args: &[String],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if bool_flags.contains(&arg) {
+            index += 1;
+        } else if value_flags.contains(&arg) {
+            if index + 1 >= args.len() {
+                return Some(format!("{arg} requires a value"));
+            }
+            index += 2;
+        } else {
+            return Some(format!("unrecognized argument {arg}"));
+        }
+    }
+    None
+}
+
 fn load_roster(args: &[String]) -> Option<Roster> {
     let path = flag_value(args, "--roster")?;
     let text = match std::fs::read_to_string(path) {
@@ -80,6 +107,10 @@ fn load_roster(args: &[String]) -> Option<Roster> {
 }
 
 fn roster_md(args: &[String]) -> i32 {
+    if let Some(err) = reject_unknown_args(args, &["--roster"], &[]) {
+        eprintln!("roster-md: {err}");
+        return 2;
+    }
     match load_roster(args) {
         Some(roster) => {
             print!("{}", roster.to_markdown_table());
@@ -93,6 +124,14 @@ fn roster_md(args: &[String]) -> i32 {
 }
 
 fn synthesize(args: &[String]) -> i32 {
+    if let Some(err) = reject_unknown_args(
+        args,
+        &["--roster", "--manifest", "--config", "--out"],
+        &["--publishable-only"],
+    ) {
+        eprintln!("run: {err}");
+        return 2;
+    }
     let Some(roster) = load_roster(args) else {
         eprintln!("run requires --roster <roster.json>");
         return 1;
@@ -141,7 +180,9 @@ fn synthesize(args: &[String]) -> i32 {
         .iter()
         .map(|teacher| teacher as &dyn hyprstream_synthesis::Teacher)
         .collect();
-    let corpus = match run(&config, &teachers, &firewall) {
+    // No fitted P0.5 corrections exist at dry-run time (the simulated
+    // stand-ins are temperature-neutral), so the correction map is empty.
+    let corpus = match run(&config, &teachers, &firewall, &HashMap::new()) {
         Ok(corpus) => corpus,
         Err(err) => {
             eprintln!("synthesis failed: {err}");

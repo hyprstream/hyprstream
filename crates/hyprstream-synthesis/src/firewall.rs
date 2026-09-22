@@ -147,7 +147,6 @@ impl Firewall {
     /// the embedded pin and [`EXPECTED_DISCLOSURE_BLAKE3`].
     pub fn load(path: &Path) -> Result<Self, FirewallError> {
         let bytes = std::fs::read(path).map_err(FirewallError::Io)?;
-        let digest = blake3_hex(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         let manifest = Manifest::from_json(&text).map_err(FirewallError::Parse)?;
         if let Some(disclosure_path) = disclosure_path_for(path, &manifest) {
@@ -158,21 +157,24 @@ impl Firewall {
                 return Err(FirewallError::DisclosureDigestMismatch { found });
             }
         }
-        Self::from_verified_parts(manifest, digest)
+        Self::from_verified_bytes(&bytes)
     }
 
-    /// Build from an already-parsed manifest plus its file digest. The pins
-    /// are still verified — constructing a firewall that does not match the
-    /// frozen vob-1.1 pins is an error, never a silent pass.
-    pub fn from_verified_parts(
-        manifest: Manifest,
-        manifest_blake3: String,
-    ) -> Result<Self, FirewallError> {
+    /// Build from the manifest's canonical bytes. The digest is derived from
+    /// the bytes themselves — never accepted as a separate caller-supplied
+    /// argument, so a modified manifest (e.g. `items`/`families` cleared)
+    /// cannot be paired with the frozen digest to disable the contamination
+    /// checks. The pins are still verified: constructing a firewall that does
+    /// not match the frozen vob-1.1 pins is an error, never a silent pass.
+    pub fn from_verified_bytes(manifest_bytes: &[u8]) -> Result<Self, FirewallError> {
+        let manifest_blake3 = blake3_hex(manifest_bytes);
         if manifest_blake3 != EXPECTED_MANIFEST_BLAKE3 {
             return Err(FirewallError::ManifestDigestMismatch {
                 found: manifest_blake3,
             });
         }
+        let text = String::from_utf8_lossy(manifest_bytes);
+        let manifest = Manifest::from_json(&text).map_err(FirewallError::Parse)?;
         if manifest.release != EXPECTED_RELEASE {
             return Err(FirewallError::ReleaseMismatch {
                 found: manifest.release,
@@ -261,21 +263,37 @@ mod tests {
 
     #[test]
     fn digest_mismatch_fails_closed() {
-        let text = std::fs::read_to_string(committed_manifest_path()).unwrap();
-        let manifest = Manifest::from_json(&text).unwrap();
         assert!(matches!(
-            Firewall::from_verified_parts(manifest, "f".repeat(64)),
+            Firewall::from_verified_bytes(b"tampered manifest bytes"),
+            Err(FirewallError::ManifestDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn digest_is_derived_from_the_supplied_bytes() {
+        // Regression (review): the constructor used to take the manifest and
+        // its digest as separate arguments, so a caller could pair a cleared
+        // manifest (no items, no gate families — both contamination checks
+        // disabled) with the frozen digest. The digest is now derived from
+        // the canonical bytes, so that pairing is unrepresentable.
+        let text = std::fs::read_to_string(committed_manifest_path()).unwrap();
+        let mut manifest = Manifest::from_json(&text).unwrap();
+        manifest.items.clear();
+        manifest.families.clear();
+        let tampered = serde_json::to_vec(&manifest).unwrap();
+        assert!(matches!(
+            Firewall::from_verified_bytes(&tampered),
             Err(FirewallError::ManifestDigestMismatch { .. })
         ));
     }
 
     #[test]
     fn known_manifest_hash_is_flagged() {
-        let text = std::fs::read_to_string(committed_manifest_path()).unwrap();
+        let bytes = std::fs::read(committed_manifest_path()).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
         let manifest = Manifest::from_json(&text).unwrap();
         let first = manifest.items[0].blake3.clone();
-        let firewall =
-            Firewall::from_verified_parts(manifest, EXPECTED_MANIFEST_BLAKE3.to_owned()).unwrap();
+        let firewall = Firewall::from_verified_bytes(&bytes).unwrap();
         assert!(firewall.is_contaminated_hash(&first));
         assert!(!firewall.is_contaminated_hash(&"e".repeat(64)));
     }
@@ -303,9 +321,10 @@ mod tests {
     fn disclosure_file_is_read_and_verified_at_load() {
         // Regression (review): checking only the manifest's embedded
         // disclosure digest let a drifted or deleted DISCLOSURE.md pass.
-        let committed =
-            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../hyprstream-bench/DISCLOSURE.md"))
-                .unwrap();
+        let committed = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hyprstream-bench/DISCLOSURE.md"),
+        )
+        .unwrap();
 
         let good = staged_layout(Some(&committed));
         Firewall::load(&good.join("crates/hyprstream-bench/manifest/vob-1.1.manifest.json"))

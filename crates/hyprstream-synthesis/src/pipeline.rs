@@ -50,6 +50,10 @@ pub enum SynthError {
     ZeroBaseItems,
     /// Two roster teachers share an id.
     DuplicateTeacherId(String),
+    /// A correction temperature referenced a teacher id outside the roster.
+    UnknownCorrectionTeacher(String),
+    /// A correction temperature was non-finite or non-positive.
+    BadCorrectionTemperature(String),
     /// A generated item hit a firewall (fail-closed: the run aborts — a
     /// contaminated generator must be fixed, not filtered around).
     Firewall(FirewallViolation),
@@ -77,6 +81,15 @@ impl std::fmt::Display for SynthError {
             Self::DuplicateTeacherId(id) => {
                 write!(f, "duplicate teacher roster id {id}")
             }
+            Self::UnknownCorrectionTeacher(id) => {
+                write!(f, "correction temperature references non-roster teacher {id}")
+            }
+            Self::BadCorrectionTemperature(id) => {
+                write!(
+                    f,
+                    "correction temperature for teacher {id} is not finite and positive"
+                )
+            }
             Self::Firewall(violation) => write!(f, "firewall violation: {violation}"),
             Self::BadTeacherAnswer { teacher, item } => write!(
                 f,
@@ -92,11 +105,17 @@ impl std::error::Error for SynthError {}
 const PRODUCER_SUM_TOLERANCE: f32 = 1e-6;
 
 /// Run the pipeline. `teachers` is the roster order; every item is answered
-/// by every teacher and all raw vectors are persisted.
+/// by every teacher and all raw vectors are persisted. `temperatures` is the
+/// fitted P0.5 correction map (roster id → temperature): label control must
+/// balance against the **same corrected average that training later
+/// distills**, so the map is applied to the balancing calculation as well —
+/// pass an empty map only when no corrections have been fitted (e.g. the
+/// simulated CLI dry-run).
 pub fn run(
     config: &SynthConfig,
     teachers: &[&dyn Teacher],
     firewall: &Firewall,
+    temperatures: &HashMap<String, f64>,
 ) -> Result<Corpus, SynthError> {
     if !(2..=PARAPHRASES).contains(&config.paraphrase_variants) {
         return Err(SynthError::BadParaphraseVariants(
@@ -112,6 +131,17 @@ pub fn run(
     for teacher in teachers {
         if !roster_ids.insert(teacher.pin().id.as_str()) {
             return Err(SynthError::DuplicateTeacherId(teacher.pin().id.clone()));
+        }
+    }
+    // Corrections must name roster teachers and be usable: a stray id or a
+    // non-finite/non-positive temperature would otherwise surface mid-run (or
+    // never, on a run whose rows all defer) instead of failing fast.
+    for (id, temperature) in temperatures {
+        if !roster_ids.contains(id.as_str()) {
+            return Err(SynthError::UnknownCorrectionTeacher(id.clone()));
+        }
+        if !temperature.is_finite() || *temperature <= 0.0 {
+            return Err(SynthError::BadCorrectionTemperature(id.clone()));
         }
     }
     let provenance = Provenance {
@@ -164,8 +194,12 @@ pub fn run(
                             CorpusRow::from_item(&item, teachers, answers, provenance.clone());
                         // The label histogram is recorded under every policy
                         // (the audit trail must not depend on whether control
-                        // is on); only the deferral is policy-gated.
-                        let mean = corrected_average(&row, &HashMap::new()).map_err(|_| {
+                        // is on); only the deferral is policy-gated. The mean
+                        // is the temperature-corrected average — the same
+                        // distribution training distills — so a corpus reported
+                        // as balanced is balanced under its actual training
+                        // targets.
+                        let mean = corrected_average(&row, temperatures).map_err(|_| {
                             SynthError::BadTeacherAnswer {
                                 teacher: "ensemble".to_owned(),
                                 item: item.id.clone(),
