@@ -10,26 +10,23 @@ readonly PROFILE_SOURCES=(
   .github/scripts/postgres-image-qualification.sh
 )
 
-for source in "${PROFILE_SOURCES[@]}"; do
-  rg -Fqx "${FEATURES}" <(rg -o --no-filename 'otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb' "${source}") || {
-    echo "staging Postgres image profile missing from ${source}" >&2
-    exit 1
-  }
-done
+# Python is part of the pinned builder; ripgrep is not. Use one parser for
+# exact profile presence and the feature-selection rejection in every source.
+python3 - "${FEATURES}" "${PROFILE_SOURCES[@]}" <<'PYTHON'
+import re
+import sys
+from pathlib import Path
 
-# The production artifact must compile with no defaults and cannot select the
-# PGlite-bearing credential-pds feature. The negative gate intentionally tests
-# a feature-less failure and is not an artifact producer, so it is excluded.
-for source in Dockerfile .github/scripts/graviton-release-lanes.sh .github/workflows/graviton-build-validate.yml; do
-  rg -F -- '--no-default-features' "${source}" >/dev/null || {
-    echo "${source} can build the artifact with default features" >&2
-    exit 1
-  }
-  if rg -P -- '--features(?:\s+|=)[^#\n]*credential-pds(?!-postgres)' "${source}" >/dev/null; then
-    echo "${source} selects the PGlite credential-pds feature" >&2
-    exit 1
-  fi
-done
+features, *sources = sys.argv[1:]
+for source in sources:
+    text = Path(source).read_text()
+    if features not in text:
+        sys.exit(f"staging Postgres image profile missing from {source}")
+    if "--no-default-features" not in text:
+        sys.exit(f"{source} can build the artifact with default features")
+    if re.search(r"--features(?:\s+|=)[^#\n]*credential-pds(?!-postgres)", text):
+        sys.exit(f"{source} selects the PGlite credential-pds feature")
+PYTHON
 
 # Keep the qualification harness's redacted failure diagnostics executable;
 # this uses a cargo stub and is not PostgreSQL qualification evidence.

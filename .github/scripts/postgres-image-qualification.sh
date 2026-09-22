@@ -36,7 +36,7 @@ run_live_module() {
   set +e
   cargo test -p hyprstream --locked --lib --no-default-features \
       --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- "${filter}" \
-      --test-threads=1 2>&1 | tee "${log}"
+      --test-threads=1 --show-output 2>&1 | tee "${log}"
   pipeline_status=("${PIPESTATUS[@]}")
   cargo_status="${pipeline_status[0]}"
   tee_status="${pipeline_status[1]}"
