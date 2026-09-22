@@ -29,7 +29,7 @@ use hyprstream_core::auth::identity_store::BootstrapPubkey;
 use hyprstream_core::auth::service_jwt::issue_or_load_service_jwt;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
-use hyprstream_rpc_std::policy_client::{RegisterServiceKey, ResolveServiceKey};
+use hyprstream_rpc_std::policy_client::{PolicyCheck, RegisterServiceKey, ResolveServiceKey};
 use hyprstream_core::services::PolicyService;
 use hyprstream_rpc_std::policy_client::PolicyClient;
 use hyprstream_rpc::auth::mac::global_mac_dispatch_pep;
@@ -47,6 +47,7 @@ use hyprstream_service::{InprocManager, ServiceManager as _};
 const POLICY_ROOT_KEY: [u8; 32] = [0x52; 32];
 const DISCOVERY_KEY: [u8; 32] = [0x42; 32];
 const GHOST_CLIENT_KEY: [u8; 32] = [0x43; 32];
+const OAUTH_KEY: [u8; 32] = [0x44; 32];
 const ISSUER: &str = "http://127.0.0.1:6791";
 
 /// Install this binary's process-wide hybrid trust view: envelope signature
@@ -63,7 +64,7 @@ fn install_crypto() {
         ));
     }
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY] {
+    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -108,6 +109,39 @@ fn mint_service_jwt(
         Some(&hyprstream_core::mac::dispatch_labels::BOOTSTRAP_SERVICE_CLEARANCE),
     )
     .expect("mint service JWT")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<()> {
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+
+    let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+    let oauth_key = SigningKey::from_bytes(&OAUTH_KEY);
+    let creds = tempfile::TempDir::new()?;
+    let oauth_jwt = mint_service_jwt(&creds, "oauth", &ca_jwt_key, &oauth_key);
+    let tag = format!("mac-policy-check-{}", uuid::Uuid::new_v4());
+    let client = spawn_policy_and_client(&tag, &oauth_key, Some(oauth_jwt)).await?;
+
+    // This is the same authenticated PolicyClient check used by OAuth PAR
+    // registration. Empty wire subject/domain are deliberate: PolicyService
+    // derives them from the verified service envelope before Casbin evaluates
+    // the federation registration resource.
+    let allowed = client
+        .check(&PolicyCheck {
+            subject: String::new(),
+            domain: String::new(),
+            resource: "federation:register:https://signup.example.test".to_owned(),
+            operation: "check".to_owned(),
+        })
+        .await?;
+    assert!(allowed, "the permissive real PolicyService handler must run");
+    assert!(
+        global_mac_dispatch_pep().is_some(),
+        "the production dispatch PEP must remain installed after policy.check"
+    );
+    Ok(())
 }
 
 /// The PolicyService's JWT key source, wired the way the service factory wires

@@ -66,6 +66,11 @@ pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
 /// real serialized requests and pins these values to the schema; changing the
 /// union order fails CI rather than silently relabeling the dispatch plane.
 pub mod policy_methods {
+    /// `check` — an authenticated service asks the PolicyService to evaluate
+    /// its own authorization request. The handler derives caller identity and
+    /// domain from the verified envelope; this declaration adds no anonymous
+    /// or tokenless exception.
+    pub const CHECK: u16 = 0;
     /// `getPolicy` — read the local control-plane policy.
     pub const GET_POLICY: u16 = 3;
     /// `applyTemplate` — install a reviewed bootstrap template.
@@ -393,6 +398,12 @@ impl MacDispatchPep for DeclaredDispatchPep {
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
     DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::CHECK },
+        method_name: "check",
+        label: SecurityLabel::bottom(),
+        justification: "authenticated declared services mediate PolicyService authorization checks; the handler derives subject and domain from the verified envelope and Casbin retains the federation decision",
+    },
+    DispatchMethodPolicy {
         id: DispatchMethodId { service: "policy", method: policy_methods::GET_POLICY },
         method_name: "getPolicy",
         label: SecurityLabel::bottom(),
@@ -557,9 +568,11 @@ mod tests {
         let table = DeclaredDispatchTable::production();
 
         // The fresh boot graph declares the local PolicyService control-plane
-        // operations plus registration and renewal. Every declared row resolves
-        // to the intended typed label — the lattice floor, deliberate and reviewed.
+        // operations plus authenticated authorization checks, registration,
+        // and renewal. Every declared row resolves to the intended typed label
+        // — the lattice floor, deliberate and reviewed.
         let expected: &[(u16, &str)] = &[
+            (policy_methods::CHECK, "check"),
             (policy_methods::GET_POLICY, "getPolicy"),
             (policy_methods::APPLY_TEMPLATE, "applyTemplate"),
             (policy_methods::APPLY_DRAFT, "applyDraft"),
@@ -748,6 +761,40 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_oauth_policy_check_permits_without_anonymous_clearance() {
+        let pep = production_pep();
+        let oauth = service_subject_ctx("oauth", 0x66);
+
+        // The PAR registration path is an authenticated service:oauth call to
+        // PolicyRequest.check (union ordinal zero). It must resolve through
+        // the normal declared-service PEP, not a tokenless policy exception.
+        assert_eq!(
+            pep.check(&oauth, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Permit,
+            "verified service:oauth must reach the declared policy.check leaf"
+        );
+
+        // The same floor-labelled object remains unavailable to an
+        // undeclared service, a non-service subject, and a keyless callback.
+        // Adding the row therefore cannot fabricate an anonymous clearance.
+        let ghost = service_subject_ctx("ghost", 0x67);
+        assert_eq!(
+            pep.check(&ghost, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let user = user_subject_ctx();
+        assert_eq!(
+            pep.check(&user, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let callback = EnvelopeContext::from_callback_service(1, "oauth");
+        assert_eq!(
+            pep.check(&callback, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+    }
+
+    #[test]
     fn permit_requires_the_deliberate_service_clearance_not_the_anonymous_floor() {
         let pep = production_pep();
 
@@ -845,6 +892,25 @@ mod tests {
     #[test]
     fn declared_policy_discriminants_match_the_serialized_schema() {
         use capnp::message::Builder;
+
+        // check
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut check = req.reborrow().init_check();
+            check.set_subject("service:oauth");
+            check.set_domain("");
+            check.set_resource("federation:register:https://signup.example.test");
+            check.set_operation("check");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::CHECK,
+            "the declared check discriminant must match the schema union ordinal"
+        );
 
         // getPolicy
         let mut message = Builder::new_default();
