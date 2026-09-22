@@ -410,9 +410,22 @@ pub fn flip_rate_with_labels(
     labels_of: impl Fn(&str) -> Option<Vec<String>>,
 ) -> FlipRate {
     let mut groups: BTreeMap<&str, Vec<&crate::run::Observation>> = BTreeMap::new();
+    // Run shape per group, over ALL observations (abstained included):
+    // bench-shaped groups (cyclic rotations of one choice item) give every
+    // rotation its own question id, so observation count == distinct
+    // question count. Set-shaped groups repeat question ids across rows —
+    // counting only ANSWERED observations would misread a partial set
+    // response (base answered q1 only, rotation answered q2 only) as
+    // bench-shaped and enable the cross-question fallback.
+    let mut shapes: BTreeMap<&str, (usize, std::collections::BTreeSet<&str>)> = BTreeMap::new();
     for obs in observations {
-        if let (Some(group), Some(_)) = (&obs.group, &obs.probabilities) {
-            groups.entry(group.as_str()).or_default().push(obs);
+        if let Some(group) = &obs.group {
+            let shape = shapes.entry(group.as_str()).or_default();
+            shape.0 += 1;
+            shape.1.insert(obs.question_id.as_str());
+            if obs.probabilities.is_some() {
+                groups.entry(group.as_str()).or_default().push(obs);
+            }
         }
     }
     let label_of = |obs: &crate::run::Observation| -> Option<String> {
@@ -436,16 +449,14 @@ pub fn flip_rate_with_labels(
             continue;
         }
         // Bench-shaped groups (cyclic rotations of one choice item) give
-        // every rotation its own question id and label order, so question
-        // ids are unique across the group and the single base is the only
-        // possible comparison. Set-shaped groups repeat question ids across
-        // rows — there, only a same-question base is a valid comparison.
-        let bench_shaped = {
-            let mut seen = std::collections::BTreeSet::new();
-            members
-                .iter()
-                .all(|member| seen.insert(member.question_id.as_str()))
-        };
+        // every rotation its own question id and label order, so the
+        // observation count equals the distinct question count and the
+        // single base is the only possible comparison. Set-shaped groups
+        // repeat question ids across rows — there, only a same-question
+        // base is a valid comparison.
+        let bench_shaped = shapes
+            .get(base_id)
+            .is_some_and(|(observations, questions)| *observations == questions.len());
         let mut counted = false;
         for member in members.iter().filter(|member| member.id != base_id) {
             // The base for THIS member: match the member's own question —
