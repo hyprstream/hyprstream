@@ -109,7 +109,22 @@ questions:
                 model: "decision-0.8b@w0".into(),
                 calib: None,
             },
-            rows: vec![row(vec![("tone", answered_choice(&[0.08, 0.92, 0.0]))])],
+            // Second row: answered with a conformal prediction set (our
+            // superset extra; the schema-v1 reserved column) so the
+            // conformalSet <-> Arrow conformance is actually exercised
+            // (r3 review nit 3). The set names only labels of this question
+            // and contains the argmax label, as conformal sets do.
+            rows: vec![
+                row(vec![("tone", answered_choice(&[0.08, 0.92, 0.0]))]),
+                row(vec![(
+                    "tone",
+                    {
+                        let mut answer = answered_choice(&[0.5, 0.3, 0.2]);
+                        answer.conformal_set = Some(vec!["formal".into(), "casual".into()]);
+                        answer
+                    },
+                )]),
+            ],
         },
         // primitives/score — docs worked example 0×0.0 + 1×0.70 + 2×0.30 = 1.30,
         // confidence 0.55. A null level exercises D3 on the score side.
@@ -201,6 +216,30 @@ fn arrow_label(batch: &arrow_array::RecordBatch, id: &str, row: usize) -> Option
     } else {
         Some(column.value(row).to_owned())
     }
+}
+
+/// Extract the conformal set of row `row` from the `{id}.conformal_set`
+/// list<utf8> column. `None` = the whole list is null (no set on this row).
+fn arrow_conformal_set(
+    batch: &arrow_array::RecordBatch,
+    id: &str,
+    row: usize,
+) -> Option<Vec<String>> {
+    let column = batch
+        .column_by_name(&format!("{id}.conformal_set"))
+        .unwrap_or_else(|| panic!("missing {id}.conformal_set column"))
+        .as_any()
+        .downcast_ref::<arrow_array::ListArray>()
+        .expect("conformal_set column is list<utf8>");
+    if column.is_null(row) {
+        return None;
+    }
+    let values = column.value(row);
+    let values = values
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("conformal_set elements are Utf8");
+    Some((0..values.len()).map(|i| values.value(i).to_owned()).collect())
 }
 
 fn utf8_column(batch: &arrow_array::RecordBatch, name: &str, row: usize) -> Option<String> {
@@ -321,6 +360,12 @@ fn check_golden_vector(vector: &GoldenVector) {
             let decoded_answer = &decoded_row.answers[&question.id];
             let arrow_probs = arrow_probabilities(&batch, &question.id, row_index);
             let arrow_label = arrow_label(&batch, &question.id, row_index);
+            assert_eq!(
+                arrow_conformal_set(&batch, &question.id, row_index),
+                decoded_answer.conformal_set,
+                "{}: capnp-decoded conformal set ≡ Arrow conformal column (row {row_index})",
+                vector.name
+            );
             match (&decoded_answer.value, &source_row.answers[&question.id].value) {
                 (None, None) => {
                     assert_eq!(
@@ -882,4 +927,82 @@ fn conformal_set_none_and_present_empty_stay_distinct() {
         .expect("root");
     let (_, rows) = decision::batch_from_reader(reader).expect("decodes");
     assert_eq!(rows[0].answers["q"].conformal_set, Some(Vec::new()));
+}
+
+/// Decode-side distribution validation (r3 review probe 2 follow-up): the
+/// decoder applies the CONSUMER sum tolerance — a wire batch the producer
+/// contract would reject (sum 1.001) still decodes into IR (the Arrow
+/// consumer surface accepts it downstream), while a grossly invalid one
+/// (sum 1.8) is rejected here instead of entering the IR silently.
+#[test]
+fn decode_applies_consumer_tolerance_to_distributions() {
+    let version = VersionTriple {
+        schema: "s".into(),
+        model: "m".into(),
+        calib: None,
+    };
+
+    // Build a DecisionBatch wire message directly (bypassing the producer
+    // encoder) so the decoder's own contract is what is under test.
+    let raw_batch_bytes = |probs: &[f32]| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message
+                .init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
+            let mut triple = root.reborrow().init_version();
+            triple.set_schema("s");
+            triple.set_model("m");
+            triple.init_calib().set_none(());
+            let rows = root.init_rows(1);
+            let answers = rows.get(0).init_answers(1);
+            let mut answer = answers.get(0);
+            answer.set_question_id("q");
+            let mut list = answer.init_value().init_choice(probs.len() as u32);
+            for (index, p) in probs.iter().enumerate() {
+                list.set(index as u32, *p);
+            }
+        }
+        wire_roundtrip(&message)
+    };
+    let decode = |bytes: &[u8]| {
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
+        let reader = message
+            .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+            .expect("root");
+        decision::batch_from_reader(reader)
+    };
+
+    // Grossly invalid: rejected at decode.
+    let bytes = raw_batch_bytes(&[0.9, 0.9]);
+    let error = decode(&bytes)
+        .expect_err("sum 1.8 rejected at decode");
+    assert!(matches!(error, decision::DecodeError::InvalidDistribution(_, _)));
+
+    // Sum 1.001: outside the producer tolerance (1e-6) — batch_to_message
+    // rejects the same IR — but inside the consumer tolerance (1e-2), so the
+    // decoder accepts it. The two surfaces intentionally differ (D5).
+    let borderline = vec![0.5005f32, 0.5005f32];
+    let source = row(vec![(
+        "q",
+        QuestionAnswer::answered(AnswerValue::Choice {
+            probabilities: borderline.clone(),
+        }),
+    )]);
+    assert!(matches!(
+        decision::batch_to_message(&version, &[source]),
+        Err(decision::EncodeError::InvalidDistribution(_, _))
+    ));
+
+    let bytes = raw_batch_bytes(&borderline);
+    let (_, rows) = decode(&bytes).expect("consumer-tolerance sum decodes");
+    assert_eq!(
+        rows[0].answers["q"].value,
+        Some(AnswerValue::Choice {
+            probabilities: vec![0.5005, 0.5005]
+        })
+    );
 }

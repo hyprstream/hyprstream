@@ -15,8 +15,12 @@
 //! - `null` = abstained; an abstained answer must not carry a conformal set.
 //! - `conformalSet` is an explicit option wrapper: `none` (absent) and a
 //!   present empty set stay distinct across the wire.
+//! - Decode enforces the CONSUMER distribution tolerance (looser than the
+//!   encoder's PRODUCER tolerance), mirroring the Arrow consumer surface.
 
-use hyprstream_decision::confidence::{check_distribution, DistributionError, PRODUCER_SUM_TOLERANCE};
+use hyprstream_decision::confidence::{
+    check_distribution, DistributionError, CONSUMER_SUM_TOLERANCE, PRODUCER_SUM_TOLERANCE,
+};
 use hyprstream_decision::{
     AnswerRow, AnswerValue, ChoiceOption, Entry, NoulCriteria, QuestionAnswer, QuestionBody,
     QuestionKind, QuestionSet, QuestionSpec, VersionTriple,
@@ -61,6 +65,13 @@ pub enum DecodeError {
     /// A question set with zero questions (authoring requires >= 1).
     #[error("empty question set on the wire")]
     EmptyQuestionSet,
+    /// A choice/score distribution violating the consumer contract (finite
+    /// components in [0, 1], sum within the D5 consumer tolerance). The
+    /// decoder applies the CONSUMER tolerance — looser than the producer
+    /// tolerance the encoder enforces — so nothing reaches the IR that the
+    /// Arrow surface would reject downstream.
+    #[error("invalid distribution on the wire for question {0}: {1}")]
+    InvalidDistribution(String, DistributionError),
 }
 
 /// Errors encoding IR into a `decision.capnp` message.
@@ -522,14 +533,18 @@ pub fn batch_from_reader(
                     Some(AnswerValue::Noul { p_true })
                 }
                 decision_capnp::answer_value::Choice(probabilities) => {
-                    Some(AnswerValue::Choice {
-                        probabilities: probabilities?.iter().collect(),
-                    })
+                    let probabilities: Vec<f32> = probabilities?.iter().collect();
+                    check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE).map_err(
+                        |error| DecodeError::InvalidDistribution(question_id.clone(), error),
+                    )?;
+                    Some(AnswerValue::Choice { probabilities })
                 }
                 decision_capnp::answer_value::Score(probabilities) => {
-                    Some(AnswerValue::Score {
-                        probabilities: probabilities?.iter().collect(),
-                    })
+                    let probabilities: Vec<f32> = probabilities?.iter().collect();
+                    check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE).map_err(
+                        |error| DecodeError::InvalidDistribution(question_id.clone(), error),
+                    )?;
+                    Some(AnswerValue::Score { probabilities })
                 }
             };
             answers.insert(question_id, QuestionAnswer { value, conformal_set });
