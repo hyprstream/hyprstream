@@ -266,14 +266,21 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/api/identity/register",
             post(identity_registration::register_self_service),
         )
-        .route(
-            "/api/identity/intake",
-            post(identity_registration::intake_federated_identity),
-        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             identity_registration::require_registration_session,
-        ));
+        ))
+        .merge(
+            Router::new()
+                .route(
+                    "/api/identity/intake",
+                    post(identity_registration::intake_federated_identity),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    identity_registration::require_local_intake_session,
+                )),
+        );
 
     // ── DID-document routes ──────────────────────────────────────────────────────
     // Public, secret-free GET endpoints (did:web + atproto handle resolution).
