@@ -922,3 +922,74 @@ async fn flip_rate_is_none_when_no_group_contributes() {
         "no permutation groups: unmeasured, never a fake 0.0"
     );
 }
+
+#[tokio::test]
+async fn truth_subject_anchors_per_row_truths_in_set_runs() {
+    // A set run applies the same question to rows with different truths;
+    // the question-level truth map alone would emit the same one-hot for
+    // every row (scoring at chance). with_row_truth keys the anchor by
+    // (row, question), restoring the perfectly-accurate anchor.
+    let question = noul_item().question; // id "val_q", cardinality 2
+    let row = |id: &str, truth: usize| hyprstream_eval::EvalRow {
+        id: id.into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        truth: std::collections::BTreeMap::from([("val_q".to_owned(), truth)]),
+    };
+    let set = hyprstream_eval::EvalSet {
+        name: "t".into(),
+        schema_version: "v1".into(),
+        questions: vec![question],
+        rows: vec![row("r1", 0), row("r2", 1)],
+    };
+    let subject = TruthSubject::new("truth-rows")
+        .with_row_truth(0, "val_q", 0)
+        .with_row_truth(1, "val_q", 1);
+    let output = Harness.run_set(&set, &subject).await.unwrap();
+    let report = score_run(&output, &ScoreConfig::default()).unwrap();
+    assert_eq!(
+        report.accuracy,
+        Some(1.0),
+        "row-keyed truth must anchor every row perfectly"
+    );
+}
+
+#[test]
+fn flip_rate_never_compares_across_questions_in_partial_set_groups() {
+    // Partial set response: the base row answered q1 only, the rotated row
+    // answered q2 only. Among ANSWERED observations the question ids are
+    // unique — classifying the shape from answered-only observations (the
+    // old behavior) misreads this as a bench group and compares the q2
+    // member against the unrelated q1 base (a spurious flip). With the
+    // abstentions included the group is set-shaped, and the q2 member has
+    // no same-question base: nothing is measured.
+    use hyprstream_eval::{flip_rate_with_labels, Observation};
+    let obs = |id: &str, question_id: &str, probabilities: Option<Vec<f32>>| Observation {
+        id: id.into(),
+        question_id: question_id.into(),
+        kind: hyprstream_decision::QuestionKind::Choice,
+        family: None,
+        stratum: None,
+        group: Some("g".into()),
+        probabilities,
+        truth: None,
+    };
+    let observations = vec![
+        obs("g", "q1", Some(vec![0.8, 0.1, 0.1])),
+        obs("g", "q2", None), // base row abstained on q2
+        obs("g-p1", "q1", None), // rotated row abstained on q1
+        obs("g-p1", "q2", Some(vec![0.1, 0.8, 0.1])),
+    ];
+    let labels_of = |question_id: &str| -> Option<Vec<String>> {
+        match question_id {
+            "q1" => Some(vec!["a".into(), "b".into(), "c".into()]),
+            "q2" => Some(vec!["x".into(), "y".into(), "z".into()]),
+            _ => None,
+        }
+    };
+    let flip = flip_rate_with_labels(&observations, labels_of);
+    assert_eq!(flip.groups, 0, "no same-question base/member pair exists");
+    assert_eq!(flip.flip_rate, 0.0);
+}

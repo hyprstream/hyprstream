@@ -615,14 +615,12 @@ fn hash_distribution(key: &[u8], cardinality: usize) -> Vec<f32> {
     let draws: Vec<f64> = (0..cardinality as u64).map(|i| draw(key, i)).collect();
     let total: f64 = draws.iter().sum();
     let mut probabilities: Vec<f32> = draws.iter().map(|d| (d / total) as f32).collect();
-    let sum: f32 = probabilities.iter().sum();
-    if let Some((max_index, _)) = probabilities
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-    {
-        probabilities[max_index] += 1.0 - sum;
-    }
+    // The same order-preserving normalization the wire and teacher paths
+    // use: applying the whole residual to the maximum (the old approach)
+    // can cross the runner-up when the negative residual exceeds the
+    // max/runner-up gap, changing the deterministic baseline's predicted
+    // label and corrupting accuracy/flip measurements.
+    normalize_distribution(&mut probabilities);
     probabilities
 }
 
@@ -667,11 +665,15 @@ impl Subject for HashSubject {
 /// the perfectly-calibrated, perfectly-accurate anchor arm. Truth is supplied
 /// at construction as a map from question id (or item id, via the harness's
 /// per-item sets) to the correct label index; questions without a truth entry
-/// are answered uniformly rather than guessed.
+/// are answered uniformly rather than guessed. Set runs can apply the same
+/// question to rows with DIFFERENT truths: [`TruthSubject::with_row_truth`]
+/// keys an entry by (row index, question id) and takes precedence over the
+/// question-level entry for that row.
 #[derive(Debug, Clone, Default)]
 pub struct TruthSubject {
     model_id: String,
     truth: std::collections::HashMap<String, usize>,
+    row_truth: std::collections::HashMap<(usize, String), usize>,
 }
 
 impl TruthSubject {
@@ -680,12 +682,22 @@ impl TruthSubject {
         Self {
             model_id: model_id.into(),
             truth: std::collections::HashMap::new(),
+            row_truth: std::collections::HashMap::new(),
         }
     }
 
     /// Record the correct label index for a question id.
     pub fn with_truth(mut self, question_id: impl Into<String>, index: usize) -> Self {
         self.truth.insert(question_id.into(), index);
+        self
+    }
+
+    /// Record the correct label index for a question on ONE ROW of a set
+    /// run (the `row` argument of `decide`). Without this, every row gets
+    /// the question-level entry — the "perfectly accurate" anchor would
+    /// score at chance on a set whose rows have different truths.
+    pub fn with_row_truth(mut self, row: usize, question_id: impl Into<String>, index: usize) -> Self {
+        self.row_truth.insert((row, question_id.into()), index);
         self
     }
 }
@@ -700,13 +712,17 @@ impl Subject for TruthSubject {
         &self,
         set: &QuestionSet,
         _state: &Entry,
-        _row: usize,
+        row: usize,
     ) -> Result<AnswerRow, EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             let cardinality = question.cardinality();
             let mut probabilities = vec![0.0f32; cardinality];
-            match self.truth.get(&question.id) {
+            let configured = self
+                .row_truth
+                .get(&(row, question.id.clone()))
+                .or_else(|| self.truth.get(&question.id));
+            match configured {
                 Some(&index) if index < cardinality => probabilities[index] = 1.0,
                 // A configured-but-invalid truth is NOT the same as no
                 // truth: silently degrading the documented perfectly
@@ -1122,5 +1138,40 @@ questions:
             Some(0),
             "normalization must not change the predicted label: {probabilities:?}"
         );
+    }
+
+    #[test]
+    fn hash_distribution_preserves_the_raw_argmax() {
+        // The deterministic baseline's distributions must survive
+        // normalization with their predicted label intact: applying the
+        // whole residual to the maximum (the old approach) could cross the
+        // runner-up, and max_by would pick the LAST of an exact tie.
+        for cardinality in [2usize, 3, 17, 59, 78] {
+            for seed in 0..200u64 {
+                let key = format!("argmax-invariant\x00{cardinality}\x00{seed}");
+                let draws: Vec<f64> =
+                    (0..cardinality as u64).map(|i| draw(key.as_bytes(), i)).collect();
+                let total: f64 = draws.iter().sum();
+                let raw: Vec<f32> = draws.iter().map(|d| (d / total) as f32).collect();
+                // Raw draws are continuous — ties have measure zero — so a
+                // plain max identifies the intended winner.
+                let raw_argmax = raw
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map(|(index, _)| index);
+                let normalized = hash_distribution(key.as_bytes(), cardinality);
+                confidence::check_distribution(
+                    &normalized,
+                    confidence::PRODUCER_SUM_TOLERANCE,
+                )
+                .unwrap();
+                assert_eq!(
+                    confidence::argmax_index(&normalized),
+                    raw_argmax,
+                    "cardinality {cardinality} seed {seed}: normalization changed the label"
+                );
+            }
+        }
     }
 }
