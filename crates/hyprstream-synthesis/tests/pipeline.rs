@@ -142,6 +142,8 @@ fn cli_rejects_malformed_config_values() {
         r#"{"base_item_per_family":5}"#,
         r#"{"base_items_per_family":0}"#,
         r#"{"unknown_key":1}"#,
+        r#"{"label_policy":"unlimited","label_slack":"high"}"#,
+        r#"{"label_slack":false}"#,
     ] {
         let out = run_with(bad);
         assert_eq!(
@@ -303,6 +305,29 @@ fn firewall_rejects_gate_families_and_manifest_collisions() {
         assert!(!fw.gate_families().contains(&row.family));
         assert!(!fw.is_contaminated_hash(&row.blake3));
     }
+}
+
+#[test]
+fn zero_base_items_and_duplicate_teacher_ids_are_rejected() {
+    // Regression (review): the public pipeline API must fail loud on
+    // zero-sized runs and on duplicate roster ids, not just the CLI parser.
+    let (teachers, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
+    let refs: Vec<&dyn Teacher> = teachers.iter().map(|t| t as &dyn Teacher).collect();
+    let zero = SynthConfig {
+        base_items_per_family: 0,
+        ..small_config()
+    };
+    assert!(matches!(
+        run(&zero, &refs, &firewall()),
+        Err(SynthError::ZeroBaseItems)
+    ));
+
+    let (dupes, _) = ensemble(&[("sim-a", TosClass::OpenWeights)]);
+    let dupe_refs: Vec<&dyn Teacher> = vec![&dupes[0], &dupes[0]];
+    assert!(matches!(
+        run(&small_config(), &dupe_refs, &firewall()),
+        Err(SynthError::DuplicateTeacherId(id)) if id == "sim-a"
+    ));
 }
 
 #[test]

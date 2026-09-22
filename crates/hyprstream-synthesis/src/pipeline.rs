@@ -45,6 +45,11 @@ impl Default for SynthConfig {
 pub enum SynthError {
     /// `paraphrase_variants` outside `2..=PARAPHRASES`.
     BadParaphraseVariants(u32),
+    /// `base_items_per_family` of 0 (a zero-sized run would write an empty
+    /// corpus while reporting success).
+    ZeroBaseItems,
+    /// Two roster teachers share an id.
+    DuplicateTeacherId(String),
     /// A generated item hit a firewall (fail-closed: the run aborts — a
     /// contaminated generator must be fixed, not filtered around).
     Firewall(FirewallViolation),
@@ -65,6 +70,13 @@ impl std::fmt::Display for SynthError {
                 f,
                 "paraphrase_variants must be in 2..={PARAPHRASES} (paraphrase augmentation is mandatory, S6b1); got {n}"
             ),
+            Self::ZeroBaseItems => write!(
+                f,
+                "base_items_per_family must be at least 1 (zero-sized run)"
+            ),
+            Self::DuplicateTeacherId(id) => {
+                write!(f, "duplicate teacher roster id {id}")
+            }
             Self::Firewall(violation) => write!(f, "firewall violation: {violation}"),
             Self::BadTeacherAnswer { teacher, item } => write!(
                 f,
@@ -90,6 +102,17 @@ pub fn run(
         return Err(SynthError::BadParaphraseVariants(
             config.paraphrase_variants,
         ));
+    }
+    if config.base_items_per_family == 0 {
+        return Err(SynthError::ZeroBaseItems);
+    }
+    // Roster ids key the persisted per-teacher vectors and the correction
+    // map; a duplicate id would make rows and corrections indistinguishable.
+    let mut roster_ids = HashSet::new();
+    for teacher in teachers {
+        if !roster_ids.insert(teacher.pin().id.as_str()) {
+            return Err(SynthError::DuplicateTeacherId(teacher.pin().id.clone()));
+        }
     }
     let provenance = Provenance {
         generator: format!("hyprstream-synthesis {}", env!("CARGO_PKG_VERSION")),

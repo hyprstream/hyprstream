@@ -208,10 +208,13 @@ fn parse_config(text: &str) -> Option<SynthConfig> {
     let get_u32 = |key: &str, default: u32| -> Option<u32> {
         u32::try_from(get_u64(key, u64::from(default))?).ok()
     };
+    // label_slack is validated whenever present, even if balancing is off —
+    // a malformed value must fail loud regardless of the selected policy.
+    let label_slack = get_u64("label_slack", 1)?;
     let policy = match value.get("label_policy") {
         None => LabelPolicy::Unlimited,
         Some(serde_json::Value::String(s)) if s == "balanced" => LabelPolicy::Balanced {
-            slack: usize::try_from(get_u64("label_slack", 1)?).ok()?,
+            slack: usize::try_from(label_slack).ok()?,
         },
         Some(serde_json::Value::String(s)) if s == "unlimited" => LabelPolicy::Unlimited,
         // Unknown or non-string policies fail loud — silently dropping label
