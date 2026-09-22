@@ -77,6 +77,9 @@ pub mod list_record;
 pub mod mst;
 pub mod name_record;
 pub mod placement;
+#[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
+pub mod pgsql_kv;
+pub mod rds;
 pub mod record;
 pub mod repo_authority;
 pub mod tid;

@@ -1805,11 +1805,20 @@ async fn install_process_production_resolver(
     if config.quic.iroh_required() {
         hyprstream_rpc::moq_stream::require_native_iroh();
     }
+    // The records-role binding selects the accepted-state authority backend
+    // inside the discovery crate: a configured RDS Postgres store must serve
+    // the production resolver, roster, and bootstrap endpoints (not only the
+    // app PdsRecordStore) — with no local RocksDB fallback on error.
+    let records = config
+        .rds
+        .resolved_from_env()
+        .context("failed to resolve the records-role binding")?;
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,
         config.cluster_remote_node,
         config.quic.iroh_required(),
+        &records,
     )
     .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(

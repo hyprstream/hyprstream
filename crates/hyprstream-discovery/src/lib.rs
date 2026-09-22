@@ -43,10 +43,11 @@ pub use state_store::{
     DiscoveryState, DiscoveryStateBackend, DiscoveryStateConfig, MemoryStateConfig,
     TieredStateConfig, ValkeyStateConfig,
 };
-// The checkpointed PDS store reads its accepted-state authority directly from
-// RocksDB, so it only compiles when the `rocksdb` feature carries the
-// dependency (the dependency itself stays target-gated to non-wasm32).
-#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]
+// The checkpointed PDS store reads its accepted-state authority from the
+// local RocksDB store (`rocksdb` feature) or the networked RDS Postgres store
+// (`postgres` feature, selected by the resolved `[rds]` binding at bootstrap).
+// Both dependencies stay target-gated to non-wasm32.
+#[cfg(all(any(feature = "rocksdb", feature = "postgres"), not(target_arch = "wasm32")))]
 mod checkpointed_pds;
 
 /// Create the empty checkpoint store for an explicitly provisioned fresh node.

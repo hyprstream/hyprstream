@@ -861,6 +861,7 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
         hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles,
         false,
         true,
+        &hyprstream_pds::rds::RdsConfig::default(),
     ))?;
     assert!(
         hyprstream_discovery::native_network_required(),

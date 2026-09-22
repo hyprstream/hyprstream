@@ -248,11 +248,7 @@ impl PdsRecordStore {
     /// `readonly = false` selects the publisher posture.
     #[cfg(feature = "pds-postgres")]
     pub fn open_postgres(rds: &crate::config::RdsConfig, readonly: bool) -> AnyResult<Self> {
-        let url = rds.read_url()?;
-        let root_cert_file = rds
-            .root_cert_file()
-            .ok_or_else(|| anyhow!("RDS root_cert_file not configured"))?;
-        let kv = super::pds_record_pg::PgKv::connect(&url, root_cert_file, &rds.cell_id)?;
+        let kv = rds.connect_kv()?;
         Ok(Self {
             backing: RecordBacking::Postgres { kv, readonly },
             at9p_acceptance_identity: None,

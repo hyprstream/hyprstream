@@ -1328,10 +1328,11 @@ impl DiscoveryService {
     #[cfg(not(target_arch = "wasm32"))]
     // Without `rocksdb` every authority arm fails closed before any use, so
     // the remainder of this body is intentionally unreachable there.
-    #[cfg_attr(not(feature = "rocksdb"), allow(unreachable_code, unused_variables))]
+    #[cfg_attr(not(any(feature = "rocksdb", feature = "postgres")), allow(unreachable_code, unused_variables))]
     fn bootstrap_authenticated_process(
         authority: ProcessBootstrapAuthority,
         discovery_client: hyprstream_rpc_std::discovery_client::DiscoveryClient,
+        records: &hyprstream_pds::rds::RdsConfig,
     ) -> Result<()> {
         let authority = {
             let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
@@ -1350,18 +1351,18 @@ impl DiscoveryService {
             ProcessAcceptanceIdentity::Test(_) => None,
         };
         let source: Arc<dyn AcceptedStateSource> = match authority.acceptance_identity {
-            #[cfg(feature = "rocksdb")]
-            ProcessAcceptanceIdentity::Deployment(identity) => Arc::new(
-                crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
-                    &authority.store_path,
-                    identity,
-                )?.with_network_bootstrap(authority.network_required),
-            ),
-            // Fail closed: without the `rocksdb` feature there is no concrete
+            #[cfg(any(feature = "rocksdb", feature = "postgres"))]
+            ProcessAcceptanceIdentity::Deployment(identity) => crate::checkpointed_pds::open_deployment_accepted_state_source(
+                &authority.store_path,
+                identity,
+                records,
+                authority.network_required,
+            )?,
+            // Fail closed: without a concrete store backend there is no
             // accepted-state authority — never a silent empty resolver.
-            #[cfg(not(feature = "rocksdb"))]
+            #[cfg(not(any(feature = "rocksdb", feature = "postgres")))]
             ProcessAcceptanceIdentity::Deployment(_) => anyhow::bail!(
-                "checkpointed PDS accepted-state authority requires the `rocksdb` feature"
+                "checkpointed PDS accepted-state authority requires the `rocksdb` or `postgres` feature"
             ),
             #[cfg(all(test, feature = "rocksdb"))]
             ProcessAcceptanceIdentity::Test(identity) => Arc::new(
@@ -3631,12 +3632,13 @@ fn install_local_discovery_client(
 #[cfg(not(target_arch = "wasm32"))]
 // Without `rocksdb` the accepted-state authority construction fails closed,
 // leaving the verifier binding unused in that configuration.
-#[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
+#[cfg_attr(not(any(feature = "rocksdb", feature = "postgres")), allow(unused_variables))]
 pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     trust_source: crate::DeploymentTrustSource,
     remote_node: bool,
     network_required: bool,
+    records: &hyprstream_pds::rds::RdsConfig,
 ) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
@@ -3661,16 +3663,16 @@ pub async fn bootstrap_deployment_process(
                     #[cfg(test)]
                     ProcessAcceptanceIdentity::Test(_) => anyhow::bail!("native bootstrap requires deployment authority"),
                 };
-                #[cfg(feature = "rocksdb")]
-                let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
-                    &authority.store_path, verifier.clone(),
-                )?.with_network_bootstrap(true));
-                // Fail closed: without the `rocksdb` feature there is no
-                // concrete accepted-state authority to bootstrap against.
-                #[cfg(not(feature = "rocksdb"))]
+                #[cfg(any(feature = "rocksdb", feature = "postgres"))]
+                let source = crate::checkpointed_pds::open_deployment_accepted_state_source(
+                    &authority.store_path, verifier.clone(), records, true,
+                )?;
+                // Fail closed: without a concrete store backend there is no
+                // accepted-state authority to bootstrap against.
+                #[cfg(not(any(feature = "rocksdb", feature = "postgres")))]
                 let source: Arc<dyn AcceptedStateSource> =
                     Err(anyhow::anyhow!(
-                        "checkpointed PDS accepted-state authority requires the `rocksdb` feature"
+                        "checkpointed PDS accepted-state authority requires the `rocksdb` or `postgres` feature"
                     ))?;
                 // Authenticate the fixed bootstrap roles now, but defer I/O:
                 // Discovery and Policy have not necessarily bound yet.
@@ -3772,7 +3774,7 @@ pub async fn bootstrap_deployment_process(
             }
         }
     };
-    DiscoveryService::bootstrap_authenticated_process(authority, discovery_client)
+    DiscoveryService::bootstrap_authenticated_process(authority, discovery_client, records)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -6992,6 +6994,7 @@ mod resolver_tests {
             DiscoveryService::bootstrap_authenticated_process(
                 authority,
                 hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                &hyprstream_pds::rds::RdsConfig::default(),
             )
             .expect("install process resolver");
             assert!(production_rpc_client("model", signing, None).is_ok());
@@ -7052,6 +7055,7 @@ mod resolver_tests {
                             DiscoveryService::bootstrap_authenticated_process(
                                 authority,
                                 hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                                &hyprstream_pds::rds::RdsConfig::default(),
                             )
                         })
                         .is_ok()
@@ -7093,6 +7097,7 @@ mod resolver_tests {
             let first = DiscoveryService::bootstrap_authenticated_process(
                 authority,
                 hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                &hyprstream_pds::rds::RdsConfig::default(),
             )
             .expect_err("missing checkpoint store unexpectedly installed");
             assert!(first.to_string().contains("failed to open"));
@@ -9610,6 +9615,66 @@ mod eager_resolver_regression {
             "OsOwnedFiles arm must NOT call for_local_bootstrap (eager resolver), \
              got:\n{}",
             arm_block,
+        );
+    }
+}
+
+
+// ============================================================================
+// Regression: PostgreSQL accepted-state authority selection (#staging-resolver)
+// ============================================================================
+//
+// The accepted-state authority must follow the deployment's resolved records
+// binding: a configured `[rds]` PostgreSQL store serves the production
+// resolver, roster, bootstrap endpoints, and browser currentness — with no
+// local RocksDB fallback on error. These structural pins keep both
+// construction callsites and the browser-currentness read path on the shared
+// selection helper; the live behavior is covered by
+// `checkpointed_pds::pg_tests` against a scratch database.
+
+#[cfg(test)]
+mod pg_authority_wiring {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn both_bootstrap_callsites_select_the_records_binding_backend() {
+        let source = include_str!("service.rs");
+        let production = source
+            .split("// ============================================================================\n// Regression: PostgreSQL accepted-state authority selection")
+            .next()
+            .expect("production source before this regression module");
+
+        // The public bootstrap entry point takes the resolved records binding.
+        assert!(
+            production.contains(
+                "pub async fn bootstrap_deployment_process(\n    signing_key: SigningKey,\n    trust_source: crate::DeploymentTrustSource,\n    remote_node: bool,\n    network_required: bool,\n    records: &hyprstream_pds::rds::RdsConfig,\n) -> Result<()>"
+            ),
+            "bootstrap_deployment_process must take the resolved records binding"
+        );
+
+        // Both concrete-source construction callsites go through the shared
+        // selection helper — no direct RocksDB-only constructor remains.
+        assert_eq!(
+            production.matches("open_deployment_accepted_state_source(").count(),
+            2,
+            "exactly the network-required bootstrap arm and the install tail              must construct the accepted-state source"
+        );
+        assert!(
+            !production.contains("CheckpointedPdsAcceptedStateSource::open("),
+            "no callsite may bypass the records-binding selection helper"
+        );
+
+        // The installed process resolver carries the selected source...
+        assert!(
+            production.contains("accepted_state_source: source,"),
+            "the production resolver must carry the selected accepted-state source"
+        );
+        // ...and browser currentness reads through that installed resolver.
+        assert!(
+            production.contains(
+                "pub fn production_browser_currentness_verifier() -> Result<Arc<dyn BrowserCurrentnessVerifier>> {\n    let resolver = PRODUCTION_RESOLVER"
+            ),
+            "browser currentness must read through the installed production resolver"
         );
     }
 }

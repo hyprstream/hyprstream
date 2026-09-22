@@ -297,7 +297,7 @@ pay = ["ledger", "dep:hyprstream-pay"]
 # configured the Postgres store is selected and is FATAL-on-unavailable —
 # never a silent local fallback. Honors D2 (signed bytes verbatim as
 # authoritative source-of-truth; SQL rows are a projection-free KV shell).
-pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls"]
+pds-postgres = ["hyprstream-pds/postgres", "hyprstream-discovery/postgres"]  # Records + accepted-state authority on RDS Postgres (#1257); the KV/TLS/pool layer lives in hyprstream-pds
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
@@ -308,6 +308,7 @@ hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 [dev-dependencies]
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 hyprstream-discovery = { path = "../hyprstream-discovery", features = ["test-fixtures"] }
+hyprstream-pds = { path = "../hyprstream-pds", features = ["postgres-test-connect"] }  # scratch-DB live tests (NoTls, test-only)
 # Test-only: the e2e_inference integration suite drives torch devices
 # directly (DevicePool/LayerDeviceMap planning + GPU smoke tests over the
 # full service stack). The runtime dependency edge is gone (Wave B: tch
