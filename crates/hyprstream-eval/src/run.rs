@@ -233,6 +233,18 @@ impl Harness {
                     message,
                 }
             })?;
+            // An empty resolved id is no provenance at all: a set run would
+            // only fail later in BatchSink::persist_run, and item reports
+            // would carry the blank id. Reject it at capture, whatever the
+            // subject implementation (HTTP responses are already required
+            // to carry a nonempty `model`).
+            if resolved.is_empty() {
+                return Err(EvalError::InvalidInput(format!(
+                    "subject `{}` resolved an empty model id on row `{}` — a run requires model provenance",
+                    subject.model_id(),
+                    row.id
+                )));
+            }
             match &pinned_model {
                 None => pinned_model = Some(resolved),
                 Some(pinned) if *pinned != resolved => {
@@ -319,6 +331,13 @@ impl Harness {
                     item_id: item.id.clone(),
                     message: error.to_string(),
                 })?;
+            if resolved.is_empty() {
+                return Err(EvalError::InvalidInput(format!(
+                    "subject `{}` resolved an empty model id on item `{}` — a run requires model provenance",
+                    subject.model_id(),
+                    item.id
+                )));
+            }
             match &pinned_model {
                 None => pinned_model = Some(resolved),
                 Some(pinned) if *pinned != resolved => {
