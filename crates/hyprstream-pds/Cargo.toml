@@ -15,6 +15,8 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 # Error handling.
 anyhow = { workspace = true }
+# RdsConfig serde derives (the records-role TOML/env binding type lives here).
+serde = { workspace = true }
 # at9p capsule CIDs use the shared CIDv1/multihash API from the resolver/RPC
 # layer instead of duplicating multicodec or BLAKE3-512 encoding locally.
 hyprstream-rpc = { path = "../hyprstream-rpc" }
@@ -63,6 +65,9 @@ tokio = { workspace = true }
 tokio-test = { workspace = true }
 # Tracing init helper (git2db logs; harmless if already initialized).
 tracing-subscriber = { workspace = true }
+# Adversarial TLS peer fixtures for the pgsql_kv connector tests.
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true, default-features = false, features = ["ring"] }
 
 # E7 (#421) two-node federation harness — adds the Iroh-loopback transport seam
 # on top of the E1 content-addressing deps. Two independent in-process nodes
@@ -79,6 +84,31 @@ iroh = { workspace = true }
 [lints]
 workspace = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[features]
+# Networked Postgres KV shell for the PDS record store and the discovery
+# accepted-state authority (#1257). Verify-full TLS, file-only credentials,
+# fail-closed. Native-only.
+postgres = [
+    "dep:tokio",
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:urlencoding",
+    "dep:num_cpus",
+]
+# TEST-ONLY NoTls scratch-database connect for downstream integration tests.
+# Never enabled by any production feature or dependency edge.
+postgres-test-connect = ["postgres"]
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+tokio = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+urlencoding = { workspace = true, optional = true }
+num_cpus = { workspace = true, optional = true }

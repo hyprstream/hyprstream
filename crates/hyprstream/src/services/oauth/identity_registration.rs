@@ -1176,6 +1176,7 @@ impl HostedAccountGenesisSigner for CallerGenesisSigner<'_> {
 #[derive(Debug)]
 pub(super) enum IdentityApiError {
     Unauthenticated,
+    LocalAuthorityRequired,
     Forbidden,
     RateLimited,
     ResolveRateLimited,
@@ -1193,6 +1194,11 @@ impl IntoResponse for IdentityApiError {
                 StatusCode::UNAUTHORIZED,
                 "authentication_required",
                 "Authenticated caller required",
+            ),
+            Self::LocalAuthorityRequired => (
+                StatusCode::FORBIDDEN,
+                "local_authority_required",
+                "A server-verified local account is required",
             ),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
@@ -1275,6 +1281,39 @@ pub(super) async fn require_registration_session(
     let Some(session) = session else {
         return IdentityApiError::Unauthenticated.into_response();
     };
+    let caller = match AuthenticatedIdentityCaller::new(session.username) {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
+    };
+    request.extensions_mut().insert(caller);
+    next.run(request).await
+}
+
+/// Require the local authority that the ATProto session-exchange admission
+/// derived from the authority-owned hosted-account binding. Registration keeps
+/// its separate onboarding policy: intake is the existing protected action
+/// that must never be authorized merely by a federated browser session.
+pub(super) async fn require_local_intake_session(
+    State(state): State<Arc<OAuthState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let session = match session::extract_session_id(request.headers()) {
+        Some(session_id) => state.sessions.get(&session_id).await,
+        None => None,
+    };
+    let Some(session) = session else {
+        return IdentityApiError::Unauthenticated.into_response();
+    };
+    let local_atproto_session = session.auth_method == "atproto"
+        && session.atproto_did.as_deref() == Some(session.username.as_str())
+        && session
+            .verified_tenant
+            .as_deref()
+            .is_some_and(|tenant| !tenant.is_empty());
+    if !local_atproto_session {
+        return IdentityApiError::LocalAuthorityRequired.into_response();
+    }
     let caller = match AuthenticatedIdentityCaller::new(session.username) {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
@@ -2369,7 +2408,10 @@ mod tests {
         let session_id = fixture
             .state
             .sessions
-            .create("did:web:member.example".to_owned(), "local".to_owned())
+            .create_atproto(
+                "did:web:member.example".to_owned(),
+                Some("accounts.example.com".to_owned()),
+            )
             .await;
         let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
             .oneshot(post(

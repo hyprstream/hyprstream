@@ -73,7 +73,6 @@ FROM pubkeys WHERE username = $1 ORDER BY fingerprint
 /// **No `Debug` impl** — `database_url` carries a password. Logging or
 /// debug-formatting this struct would leak the credential (metal v1.1 §4).
 #[derive(Clone)]
-#[allow(dead_code)] // wired once services/factories.rs gains a postgres selector
 pub struct PostgresUserStoreConfig {
     /// libpq connection string read from the role-scoped URL file.
     /// Contains `sslmode=verify-full`.
@@ -176,7 +175,6 @@ impl PostgresUserStoreConfig {
 /// [`PgliteUserStore`](super::PgliteUserStore). Only the I/O seam differs:
 /// deadpool-postgres pooled connections + TLS, and tokio-postgres's
 /// `Row::try_get` API.
-#[allow(dead_code)] // wired once services/factories.rs gains a postgres selector
 pub struct PostgresUserStore {
     pool: Pool,
     cipher: Option<ColumnCipher>,
@@ -186,6 +184,22 @@ pub struct PostgresUserStore {
 impl super::user_store::private::Sealed for PostgresUserStore {}
 
 impl PostgresUserStore {
+    /// Open the RDS-backed account store through the production admission
+    /// boundary. Both the file-backed verify-full configuration and the
+    /// deployment envelope-encryption material are mandatory; failure occurs
+    /// before OAuth can receive a store handle and never falls back to PGlite.
+    pub(crate) async fn open_admitted(
+        _permit: &super::production_user_store::ProductionStorePermit,
+    ) -> Result<Self> {
+        let cipher = ColumnCipher::from_deployment_env()
+            .context("load deployment UserStore encryption configuration")?;
+        let config = PostgresUserStoreConfig::from_env()
+            .context("load RDS Postgres UserStore configuration")?;
+        Self::connect(config, cipher)
+            .await
+            .context("open encrypted RDS Postgres credential store")
+    }
+
     /// Open a production PostgresUserStore with at-rest envelope encryption.
     ///
     /// Runs the idempotent `USERSTORE_SCHEMA` migration on every boot. The
@@ -1616,7 +1630,10 @@ mod tests {
 
     async fn fresh(url: &str) -> PostgresUserStore {
         let cfg = PostgresUserStoreConfig::from_url(url);
-        let store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
+        let mut store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
+        // Only the local test transport is plaintext. Exercise the same
+        // encrypted value columns required by the production schema.
+        store.cipher = Some(ColumnCipher::new(Arc::new(TestDekSealer)));
         {
             let client = store.pool.get().await.unwrap();
             client.execute("DELETE FROM users", &[]).await.unwrap();
@@ -1898,6 +1915,17 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].fingerprint, fp);
         assert_eq!(keys[0].label.as_deref(), Some("laptop"));
+        let stored_label: Vec<u8> = store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query_one("SELECT label FROM pubkeys WHERE fingerprint=$1", &[&fp])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(stored_label.starts_with(b"HSC1"));
+        assert_ne!(stored_label.as_slice(), b"laptop");
         assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
         assert!(keys[0].pq_pubkey.is_none());
         assert_eq!(

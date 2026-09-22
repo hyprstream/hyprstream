@@ -266,14 +266,21 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/api/identity/register",
             post(identity_registration::register_self_service),
         )
-        .route(
-            "/api/identity/intake",
-            post(identity_registration::intake_federated_identity),
-        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             identity_registration::require_registration_session,
-        ));
+        ))
+        .merge(
+            Router::new()
+                .route(
+                    "/api/identity/intake",
+                    post(identity_registration::intake_federated_identity),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    identity_registration::require_local_intake_session,
+                )),
+        );
 
     // ── DID-document routes ──────────────────────────────────────────────────────
     // Public, secret-free GET endpoints (did:web + atproto handle resolution).
@@ -870,8 +877,12 @@ impl Spawnable for OAuthService {
             // credential-store boundary. Account-store construction failure
             // fails closed; no caller can inject a raw backend here.
             let credentials_config = crate::config::HyprConfig::load()
-                .map(|c| c.credentials)
-                .unwrap_or_default();
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "failed to load production credential configuration: {error}"
+                    ))
+                })?
+                .credentials;
             let (user_store, device_store_opt) =
                 crate::auth::ProductionUserStore::open_with_device_store(
                     &credentials_dir,
@@ -1176,14 +1187,17 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
-            // The token store is decoupled from the account backend: a pglite
-            // UserStore does not imply a pglite TokenStore — refresh tokens
-            // always go to RocksDB or Valkey.
+            // The token store is decoupled from the account backend: neither
+            // PGlite nor RDS Postgres UserStore implements a token store.
+            // Refresh tokens always go to RocksDB or Valkey.
             #[cfg(feature = "rocksdb")]
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
-                // Pglite account store falls through to RocksDB for tokens.
-                CredentialsBackend::Pglite | CredentialsBackend::Rocksdb => {
+                // Relational account stores deliberately fall through to
+                // RocksDB for durable OAuth refresh tokens.
+                CredentialsBackend::Pglite
+                | CredentialsBackend::Postgres
+                | CredentialsBackend::Rocksdb => {
                     #[cfg(feature = "rocksdb")]
                     {
                         match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
