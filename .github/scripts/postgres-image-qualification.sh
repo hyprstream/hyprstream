@@ -20,8 +20,30 @@ readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-pos
 # module move or an empty filter cannot silently turn this into a green skip.
 run_live_module() {
   local filter="$1"
-  cargo test -p hyprstream --locked --lib --no-default-features \
-    --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- "${filter}"
+  local log
+  local passed
+  log="$(mktemp "${TMPDIR:-/tmp}/hyprstream-postgres-qualification.XXXXXX.log")"
+  # The test modules share one disposable database and each initializes or
+  # clears its tables. Run each module serially so their test fixtures cannot
+  # race schema creation and turn a valid profile into a false failure.
+  if ! cargo test -p hyprstream --locked --lib --no-default-features \
+      --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- "${filter}" \
+      --test-threads=1 2>&1 | tee "${log}"; then
+    rm -f "${log}"
+    return 1
+  fi
+  if grep -Fq 'HYPRSTREAM_POSTGRES_TEST_URL_FILE unset' "${log}"; then
+    rm -f "${log}"
+    echo "PostgreSQL qualification skipped ${filter}" >&2
+    return 1
+  fi
+  passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed;.*$/\1/p' "${log}" | tail -n 1)"
+  rm -f "${log}"
+  if [[ ! "${passed}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PostgreSQL qualification ran no tests for ${filter}" >&2
+    return 1
+  fi
+  printf 'postgres-qualification filter=%s passed=%s\n' "${filter}" "${passed}"
 }
 
 run_live_module 'auth::postgres_store::tests::'
