@@ -1630,7 +1630,10 @@ mod tests {
 
     async fn fresh(url: &str) -> PostgresUserStore {
         let cfg = PostgresUserStoreConfig::from_url(url);
-        let store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
+        let mut store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
+        // Only the local test transport is plaintext. Exercise the same
+        // encrypted value columns required by the production schema.
+        store.cipher = Some(ColumnCipher::new(Arc::new(TestDekSealer)));
         {
             let client = store.pool.get().await.unwrap();
             client.execute("DELETE FROM users", &[]).await.unwrap();
@@ -1912,6 +1915,17 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].fingerprint, fp);
         assert_eq!(keys[0].label.as_deref(), Some("laptop"));
+        let stored_label: Vec<u8> = store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query_one("SELECT label FROM pubkeys WHERE fingerprint=$1", &[&fp])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(stored_label.starts_with(b"HSC1"));
+        assert_ne!(stored_label.as_slice(), b"laptop");
         assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
         assert!(keys[0].pq_pubkey.is_none());
         assert_eq!(
