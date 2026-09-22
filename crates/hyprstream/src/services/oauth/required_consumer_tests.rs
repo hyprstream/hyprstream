@@ -511,6 +511,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
             hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles,
             false,
             true,
+            &hyprstream_pds::rds::RdsConfig::default(),
         )
         .await?;
         assert!(hyprstream_discovery::native_network_required());

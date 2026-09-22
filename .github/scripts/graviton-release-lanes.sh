@@ -73,7 +73,13 @@ run_phase "native release build" cargo build --release
 # contract/unit tests. Live DB tests skip themselves green unless
 # HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
 run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
-run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds
+# The KV shell and RDS contract tests live in hyprstream-pds (pgsql_kv:: and
+# rds::tests::); the resolver-side Postgres accepted-state authority tests
+# live in hyprstream-discovery (checkpointed_pds::pg_tests::). The app crate
+# keeps the store-level PG tests (services::discovery::pg_tests::).
+run_phase "pds-postgres contract tests" cargo test -p hyprstream --locked --lib --features pds-postgres -- services::discovery::pg_tests::
+run_phase "hyprstream-pds postgres contract tests" cargo test -p hyprstream-pds --locked --lib --features postgres -- pgsql_kv:: rds::tests::
+run_phase "discovery postgres authority contract tests" cargo test -p hyprstream-discovery --locked --lib --features postgres,rocksdb -- checkpointed_pds::
 
 # Prove the production credential profile is causal: omitting it must fail the
 # build, never silently skip the deployable target. Compile-only and negative

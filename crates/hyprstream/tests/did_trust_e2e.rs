@@ -286,7 +286,7 @@ async fn did_anchored_bootstrap_boots_end_to_end() {
     hyprstream_discovery::initialize_deployment_checkpoint_store()
         .expect("fresh test deployment must provision its checkpoint store");
     let node_key = SigningKey::from_bytes(&[0x56; 32]);
-    hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true, false)
+    hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true, false, &hyprstream_pds::rds::RdsConfig::default())
         .await
         .expect("DID-anchored bootstrap must boot against the real serving side");
 

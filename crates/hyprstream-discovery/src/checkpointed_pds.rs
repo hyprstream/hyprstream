@@ -6,7 +6,9 @@ use anyhow::{bail, Context as _, Result};
 use hyprstream_pds::at9p::h512;
 use hyprstream_pds::at9p_duplicity::{AcceptedAt9pState, Watermark};
 use hyprstream_pds::at9p_gate::DID_AT9P_PREFIX;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "rocksdb")]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
@@ -23,6 +25,7 @@ const AT9P_CHECKPOINT_PAYLOAD_LEN: usize = 8 + 8 + 64 + 1 + 64;
 const AT9P_CHECKPOINT_LEN: usize = AT9P_CHECKPOINT_PAYLOAD_LEN + ED25519_SIGNATURE_LEN;
 const AT9P_CHECKPOINT_AAD: &[u8] = b"hyprstream-at9p-monotonic-checkpoint/1";
 
+#[cfg(feature = "rocksdb")]
 pub(super) struct CheckpointedPdsAcceptedStateSource {
     path: PathBuf,
     acceptance_identity: Arc<dyn AcceptanceVerifier>,
@@ -46,6 +49,7 @@ impl AcceptanceVerifier for ed25519_dalek::VerifyingKey {
     }
 }
 
+#[cfg(feature = "rocksdb")]
 impl CheckpointedPdsAcceptedStateSource {
     pub(super) fn open(
         path: &Path,
@@ -106,6 +110,175 @@ impl CheckpointedPdsAcceptedStateSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PostgreSQL (RDS) backend — the same verified envelopes in the shared `pds_kv`
+// BYTEA shell. Compiled only with the `postgres` feature.
+// ---------------------------------------------------------------------------
+
+/// Accepted-state authority over the networked RDS Postgres store, selected
+/// when the deployment's `[rds]` binding is configured. Uses the same
+/// `hyprstream_pds::pgsql_kv::PgKv` connection/TLS/pool layer as the app
+/// record store and the same [`verify_state_pair`] verifier as the RocksDB
+/// reader — no divergent verification.
+#[cfg(feature = "postgres")]
+pub(super) struct CheckpointedPgAcceptedStateSource {
+    kv: hyprstream_pds::pgsql_kv::PgKv,
+    acceptance_identity: Arc<dyn AcceptanceVerifier>,
+    network_bootstrap: bool,
+}
+
+#[cfg(feature = "postgres")]
+impl CheckpointedPgAcceptedStateSource {
+    /// READ-ONLY connect to the provisioned records store. FATAL on any error
+    /// (including an unprovisioned store): a configured PostgreSQL authority
+    /// never falls back to the local RocksDB store, and resolver startup never
+    /// recreates security history.
+    pub(super) fn connect(
+        records: &hyprstream_pds::rds::RdsConfig,
+        acceptance_identity: crate::service::RegistryDeploymentVerifier,
+    ) -> Result<Self> {
+        let kv = records
+            .connect_kv_readonly()
+            .context("failed to open checkpointed PDS Postgres store")?;
+        Ok(Self {
+            kv,
+            acceptance_identity: Arc::new(acceptance_identity),
+            network_bootstrap: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn connect_test(
+        kv: hyprstream_pds::pgsql_kv::PgKv,
+        acceptance_identity: ed25519_dalek::VerifyingKey,
+    ) -> Self {
+        Self {
+            kv,
+            acceptance_identity: Arc::new(acceptance_identity),
+            network_bootstrap: false,
+        }
+    }
+
+    pub(super) fn with_network_bootstrap(mut self, required: bool) -> Self {
+        self.network_bootstrap = required;
+        self
+    }
+
+    /// The snapshot pair read for one subject — the Postgres counterpart of
+    /// `load_at9p_state_from_db`'s `rocksdb::DB::snapshot()` (one read-only
+    /// REPEATABLE READ transaction inside `get_batch`).
+    fn load_state(&self, subject: &str) -> Result<Option<AcceptedAt9pState>> {
+        let mut values = self
+            .kv
+            .get_batch(&[state_key(subject), checkpoint_key(subject)])
+            .context("checkpointed PDS Postgres read failed")?;
+        let checkpoint = values.pop().flatten();
+        let envelope = values.pop().flatten();
+        verify_state_pair(subject, envelope, checkpoint, self.acceptance_identity.as_ref())
+    }
+
+    fn bootstrap_states(&self) -> Result<Vec<AcceptedAt9pState>> {
+        let state_prefix = b"at9p-state\0".to_vec();
+        let state_upper = hyprstream_pds::pgsql_kv::prefix_upper_bound(&state_prefix)
+            .ok_or_else(|| anyhow::anyhow!("at9p state prefix has no upper bound"))?;
+        let checkpoint_prefix = b"at9p-checkpoint\0".to_vec();
+        let checkpoint_upper = hyprstream_pds::pgsql_kv::prefix_upper_bound(&checkpoint_prefix)
+            .ok_or_else(|| anyhow::anyhow!("at9p checkpoint prefix has no upper bound"))?;
+        let snap = self
+            .kv
+            .read_snapshot(&[(state_prefix, state_upper), (checkpoint_prefix, checkpoint_upper)], &[])
+            .context("checkpointed PDS Postgres snapshot read failed")?;
+        let mut ranges = snap.ranges.into_iter();
+        let (states, checkpoints) = match (ranges.next(), ranges.next()) {
+            (Some(states), Some(checkpoints)) => (states, checkpoints),
+            _ => bail!("RDS read_snapshot returned fewer ranges than requested"),
+        };
+        let checkpoints: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            checkpoints.into_iter().collect();
+        let mut out = Vec::new();
+        for (key, envelope) in states {
+            let Some(subject) = key.strip_prefix(b"at9p-state\0".as_slice()) else { continue; };
+            let subject = std::str::from_utf8(subject)?;
+            let checkpoint = checkpoints.get(checkpoint_key(subject).as_slice()).cloned();
+            if let Some(state) =
+                verify_state_pair(subject, Some(envelope), checkpoint, self.acceptance_identity.as_ref())?
+            {
+                out.push(state);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl super::service::AcceptedStateSource for CheckpointedPgAcceptedStateSource {
+    fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
+        let subject = did
+            .strip_prefix(DID_AT9P_PREFIX)
+            .ok_or_else(|| anyhow::anyhow!("identifier is not did:at9p: {did:?}"))?;
+        let state = self.load_state(subject)?;
+        if let Some(state) = &state {
+            anyhow::ensure!(state.did == did, "accepted at9p state DID mismatch");
+        }
+        Ok(state)
+    }
+
+    fn accepted_states(&self) -> Result<Vec<AcceptedAt9pState>> {
+        self.bootstrap_states()
+    }
+
+    fn bootstrap_endpoints(&self, service_name: &str) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
+        if !self.network_bootstrap || !matches!(service_name, "discovery" | "policy") {
+            return Ok(None);
+        }
+        let key = hyprstream_service::global_trust_store().resolve_one(service_name)
+            .ok_or_else(|| anyhow::anyhow!("trusted bootstrap {service_name} response key is missing"))?;
+        super::service::project_bootstrap_endpoint(&self.bootstrap_states()?, service_name, &key)
+            .map(|endpoint| Some(vec![endpoint]))
+    }
+}
+
+/// Select the deployment's accepted-state authority backend from the resolved
+/// records-role binding. A configured PostgreSQL binding selects the networked
+/// store and FAILS CLOSED on any error — there is never a silent local
+/// fallback (a local store that missed the accepted-state history would
+/// silently deny every deployment identity). Unconfigured keeps the local
+/// RocksDB checkpoint store.
+#[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
+pub(super) fn open_deployment_accepted_state_source(
+    store_path: &Path,
+    identity: crate::service::RegistryDeploymentVerifier,
+    records: &hyprstream_pds::rds::RdsConfig,
+    network_bootstrap: bool,
+) -> Result<Arc<dyn super::service::AcceptedStateSource>> {
+    if records.is_configured() {
+        #[cfg(feature = "postgres")]
+        {
+            return Ok(Arc::new(
+                CheckpointedPgAcceptedStateSource::connect(records, identity)?
+                    .with_network_bootstrap(network_bootstrap),
+            ));
+        }
+        #[cfg(not(feature = "postgres"))]
+        bail!(
+            "records RDS Postgres is configured but this binary lacks the discovery `postgres` feature;              refusing to silently fall back to the local store"
+        );
+    }
+    #[cfg(feature = "rocksdb")]
+    {
+        Ok(Arc::new(
+            CheckpointedPdsAcceptedStateSource::open(store_path, identity)?
+                .with_network_bootstrap(network_bootstrap),
+        ))
+    }
+    #[cfg(not(feature = "rocksdb"))]
+    {
+        // Fail closed: without `rocksdb` there is no local concrete authority.
+        let _ = store_path;
+        bail!("checkpointed PDS accepted-state authority requires the `rocksdb` feature")
+    }
+}
+
 /// RocksDB key for the first-boot provisioning marker.
 ///
 /// Written by [`initialize_deployment_store`] (and any other path that creates
@@ -117,6 +290,7 @@ impl CheckpointedPdsAcceptedStateSource {
 /// (store freshly provisioned, no accepted state written yet) from a
 /// steady-state store that lost its data. The QUIC startup gate reads it via
 /// [`PdsRecordStore::first_boot_pending`] in the app crate.
+#[cfg(feature = "rocksdb")]
 pub const FIRST_BOOT_KEY: &[u8] = b"first-boot-pending";
 
 /// Explicitly create the empty checkpoint store for a newly provisioned
@@ -127,6 +301,7 @@ pub const FIRST_BOOT_KEY: &[u8] = b"first-boot-pending";
 /// this as a genuine first boot (defer-eligible) rather than data loss. The
 /// registry deletes the key (in the same RocksDB batch as the first
 /// accepted-state commit) once provisioning completes.
+#[cfg(feature = "rocksdb")]
 pub(crate) fn initialize_deployment_store() -> Result<()> {
     let path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     anyhow::ensure!(
@@ -147,6 +322,7 @@ pub(crate) fn initialize_deployment_store() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "rocksdb")]
 impl super::service::AcceptedStateSource for CheckpointedPdsAcceptedStateSource {
     fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
         self.accepted_state(did)
@@ -178,6 +354,7 @@ struct At9pCheckpoint {
     envelope_digest: [u8; 64],
 }
 
+#[cfg(feature = "rocksdb")]
 fn readonly_opts() -> rocksdb::Options {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(false);
@@ -209,6 +386,7 @@ fn checkpoint_message(subject: &str, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "rocksdb")]
 fn load_at9p_state_from_db(
     db: &rocksdb::DB,
     subject: &str,
@@ -217,6 +395,19 @@ fn load_at9p_state_from_db(
     let snapshot = db.snapshot();
     let envelope = snapshot.get(state_key(subject))?;
     let checkpoint = snapshot.get(checkpoint_key(subject))?;
+    verify_state_pair(subject, envelope, checkpoint, identity)
+}
+
+/// The backend-independent half of accepted-state reads: both stores hand the
+/// state envelope and monotonic checkpoint read from ONE snapshot to this
+/// verifier. There is exactly one verification path; a new backend never
+/// re-implements it.
+fn verify_state_pair(
+    subject: &str,
+    envelope: Option<Vec<u8>>,
+    checkpoint: Option<Vec<u8>>,
+    identity: &dyn AcceptanceVerifier,
+) -> Result<Option<AcceptedAt9pState>> {
     match (envelope, checkpoint) {
         (None, None) => Ok(None),
         (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
@@ -406,7 +597,7 @@ fn decode_state_body(subject: &str, bytes: &[u8]) -> Result<AcceptedAt9pState> {
     Ok(state)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rocksdb"))]
 pub(super) fn write_test_state(path: &Path, state: &AcceptedAt9pState, identity: &ed25519_dalek::SigningKey) -> Result<()> {
     let audit = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
     let (envelope, checkpoint) = tests::encode_fixture(state, identity, &audit);
@@ -423,7 +614,7 @@ pub(super) fn write_test_state(path: &Path, state: &AcceptedAt9pState, identity:
 /// Remove one accepted state from the test store — the store-wipe half of a
 /// simulated service-identity re-initialization (#1652 churn tests: the
 /// successor state is then written by [`write_test_state`]).
-#[cfg(test)]
+#[cfg(all(test, feature = "rocksdb"))]
 pub(super) fn remove_test_state(path: &Path, state: &AcceptedAt9pState) -> Result<()> {
     let mut options = rocksdb::Options::default();
     options.create_if_missing(true);
@@ -435,7 +626,7 @@ pub(super) fn remove_test_state(path: &Path, state: &AcceptedAt9pState) -> Resul
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rocksdb"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -447,7 +638,7 @@ mod tests {
     };
     use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
 
-    fn accepted_state() -> AcceptedAt9pState {
+    pub(super) fn accepted_state() -> AcceptedAt9pState {
         let signing = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
         let (pq_signing, pq_verifying) = ml_dsa_generate_keypair();
         let keys = HybridKeyPair::new(
@@ -596,6 +787,245 @@ mod tests {
         assert!(
             rejected.is_err(),
             "caller-selected checkpoint identity accepted"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Postgres authority tests: the resolver-side reader against a real scratch
+// database (HYPRSTREAM_POSTGRES_TEST_URL_FILE), plus the fail-closed selection
+// contract that needs no database at all.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "postgres", feature = "rocksdb"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod pg_tests {
+    use super::tests::{accepted_state, encode_fixture};
+    use super::*;
+    use crate::service::AcceptedStateSource as _;
+    use hyprstream_pds::pgsql_kv::PgKv;
+
+    /// Read the test database URL from a FILE, never from a direct env var
+    /// (metal v1.1 acceptance check 1 — the password never transits the
+    /// process environment).
+    fn test_url() -> Option<String> {
+        let path = std::env::var_os("HYPRSTREAM_POSTGRES_TEST_URL_FILE")?;
+        let url = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read test URL file {}: {e}", path.to_string_lossy()));
+        let url = url.trim();
+        assert!(!url.is_empty(), "test URL file is empty");
+        Some(url.to_owned())
+    }
+
+    macro_rules! require_db {
+        () => {{
+            let Some(url) = test_url() else {
+                eprintln!(
+                    "skipping checkpointed PDS Postgres test: \
+                     HYPRSTREAM_POSTGRES_TEST_URL_FILE unset"
+                );
+                return;
+            };
+            url
+        }};
+    }
+
+    fn deployment_verifier(seed: u8) -> (ed25519_dalek::SigningKey, crate::service::RegistryDeploymentVerifier) {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pq = hyprstream_crypto::pq::ml_dsa_sk_from_seed(&[seed; 32]);
+        let verifier = crate::service::RegistryDeploymentVerifier::for_test_deployment_root(&ed, &pq)
+            .expect("test deployment verifier");
+        (ed, verifier)
+    }
+
+    /// Run test-side DDL against the scratch server over a direct NoTls
+    /// connection (database lifecycle for the unprovisioned gate).
+    fn with_direct_connection(url: &str, ddl: impl Fn(tokio_postgres::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("ddl runtime");
+        rt.block_on(async move {
+            let config: tokio_postgres::Config = url.parse().expect("ddl URL parses");
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .expect("ddl connect");
+            let handle = tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("ddl connection error: {e}");
+                }
+            });
+            ddl(client).await;
+            handle.await.expect("ddl connection join");
+        });
+    }
+
+    /// The repro's causal chain: accepted state written to PostgreSQL by the
+    /// writer path is served read-only by the resolver authority — same
+    /// envelopes, same checkpoint pairing, same verifier.
+    #[test]
+    fn live_pg_authority_serves_writer_committed_state() {
+        let url = require_db!();
+        let (identity, _) = deployment_verifier(0x61);
+        let audit = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let state = accepted_state();
+        let (envelope, checkpoint) = encode_fixture(&state, &identity, &audit);
+
+        // Writer posture: migrates and commits the pair.
+        let writer = PgKv::connect_test(&url, "test-cell").expect("writer connect");
+        writer.put(&state_key(&state.subject_cid512), &envelope).expect("write state");
+        writer.put(&checkpoint_key(&state.subject_cid512), &checkpoint).expect("write checkpoint");
+        drop(writer);
+
+        // Resolver posture: read-only, no migration.
+        let reader = CheckpointedPgAcceptedStateSource::connect_test(
+            PgKv::connect_test_readonly(&url).expect("readonly connect"),
+            identity.verifying_key(),
+        );
+        let recovered = reader
+            .accepted_state(&state.did)
+            .expect("read accepted state")
+            .expect("state present");
+        assert_eq!(recovered.watermark(), state.watermark());
+        let roster = reader.accepted_states().expect("roster read");
+        assert!(
+            roster.iter().any(|s| s.subject_cid512 == state.subject_cid512),
+            "roster must include the writer-committed state"
+        );
+
+        // The verifier is binding: a caller-selected wrong identity rejects.
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        let rejected = CheckpointedPgAcceptedStateSource::connect_test(
+            PgKv::connect_test_readonly(&url).expect("readonly connect"),
+            wrong.verifying_key(),
+        )
+        .accepted_state(&state.did);
+        assert!(rejected.is_err(), "caller-selected checkpoint identity accepted");
+    }
+
+    /// A state envelope without its monotonic checkpoint is torn security
+    /// state — the reader must refuse it, exactly like the RocksDB reader.
+    #[test]
+    fn live_pg_authority_rejects_torn_pair() {
+        let url = require_db!();
+        let (identity, _) = deployment_verifier(0x64);
+        let audit = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]);
+        let state = accepted_state();
+        let (envelope, _) = encode_fixture(&state, &identity, &audit);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let subject = format!("torn-{}-{nanos}", std::process::id());
+        let writer = PgKv::connect_test(&url, "test-cell").expect("writer connect");
+        writer.put(&state_key(&subject), &envelope).expect("write lone state");
+
+        let reader = CheckpointedPgAcceptedStateSource::connect_test(
+            PgKv::connect_test_readonly(&url).expect("readonly connect"),
+            identity.verifying_key(),
+        );
+        let error = match reader.accepted_state(&format!("did:at9p:{subject}")) {
+            Ok(_) => panic!("torn pair must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("without its monotonic checkpoint"),
+            "unexpected error: {error}"
+        );
+
+        // Isolation: the lone fixture row lives under the roster-enumerated
+        // `at9p-state\0` prefix on a shared scratch database, and serial
+        // execution alone does not remove persisted fixtures — a later roster
+        // read would trip on the torn subject. Remove it explicitly.
+        with_direct_connection(&url, |client| {
+            let key = state_key(&subject);
+            Box::pin(async move {
+                client
+                    .execute("DELETE FROM pds_kv WHERE key = $1", &[&key])
+                    .await
+                    .expect("cleanup delete");
+            })
+        });
+    }
+
+    /// Resolver startup never recreates history: an unprovisioned database
+    /// (no pds_kv at all) fails the read-only connect closed.
+    #[test]
+    fn live_pg_authority_fails_closed_when_unprovisioned() {
+        let url = require_db!();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let scratch = format!("pg_unprovisioned_{}_{nanos}", std::process::id());
+        // A genuinely empty scratch database on the same server: the shared
+        // test database keeps its provisioned pds_kv.
+        with_direct_connection(&url, |client| {
+            let scratch = scratch.clone();
+            Box::pin(async move {
+                client
+                    .execute(&format!("CREATE DATABASE {scratch}"), &[])
+                    .await
+                    .expect("create unprovisioned scratch database");
+            })
+        });
+        let (base, query) = match url.split_once('?') {
+            Some((base, query)) => (base, format!("?{query}")),
+            None => (url.as_str(), String::new()),
+        };
+        let (head, _) = base.rsplit_once('/').expect("test URL has a database path");
+        let scoped = format!("{head}/{scratch}{query}");
+        let error = match PgKv::connect_test_readonly(&scoped) {
+            Ok(_) => panic!("unprovisioned read-only connect unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("not provisioned"),
+            "unexpected error: {error:#}"
+        );
+        with_direct_connection(&url, |client| {
+            let scratch = scratch.clone();
+            Box::pin(async move {
+                client
+                    .execute(&format!("DROP DATABASE {scratch}"), &[])
+                    .await
+                    .expect("drop unprovisioned scratch database");
+            })
+        });
+    }
+
+    /// Fail-closed selection: a configured RDS binding that cannot be read
+    /// must error WITHOUT creating or consulting the local RocksDB store.
+    #[test]
+    fn configured_postgres_selection_never_falls_back_to_local() {
+        let (_ed, verifier) = deployment_verifier(0x66);
+        let dir = tempfile::tempdir().expect("tempdir");
+        // url_file unreadable → the binding is configured but broken.
+        let records = hyprstream_pds::rds::RdsConfig {
+            url_file: Some(dir.path().join("missing-records-url")),
+            root_cert_file: Some(dir.path().join("missing-rds-ca.pem")),
+            cell_id: "test-cell".to_owned(),
+        };
+        assert!(records.is_configured());
+        let local_store = dir.path().join("pds-store");
+        let error = match open_deployment_accepted_state_source(
+            &local_store,
+            verifier,
+            &records,
+            false,
+        ) {
+            Ok(_) => panic!("a broken configured PostgreSQL binding unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("RDS url_file"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !local_store.exists(),
+            "the failed configured-Postgres path created a local store"
         );
     }
 }

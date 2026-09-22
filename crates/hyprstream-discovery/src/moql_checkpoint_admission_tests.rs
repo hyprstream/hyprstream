@@ -312,6 +312,7 @@ async fn roundtrip() -> Result<()> {
     DiscoveryService::bootstrap_authenticated_process(
         bootstrap,
         hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+        &hyprstream_pds::rds::RdsConfig::default(),
     )?;
     let authority = production_moql_accepted_state_authority()?;
     // #1652: the tenant resolver is DERIVED from the live roster source
