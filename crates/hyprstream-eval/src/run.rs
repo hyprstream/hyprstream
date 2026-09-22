@@ -205,6 +205,11 @@ impl Harness {
         }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
+        // Pin the resolved model id from the FIRST response: an HTTP subject
+        // re-resolves its alias per response, and a rolling deploy mid-run
+        // would otherwise stamp every row with the LAST resolved version,
+        // mislabeling the earlier rows.
+        let mut pinned_model: Option<String> = None;
         for (row_index, row) in set.rows.iter().enumerate() {
             let answers = subject
                 .decide(&question_set, &row.state, row_index)
@@ -214,6 +219,16 @@ impl Harness {
                     item_id: row.id.clone(),
                     message: error.to_string(),
                 })?;
+            let resolved = subject.resolved_model_id();
+            match &pinned_model {
+                None => pinned_model = Some(resolved),
+                Some(pinned) if *pinned != resolved => {
+                    return Err(EvalError::InvalidInput(format!(
+                        "model version changed mid-run: `{pinned}` then `{resolved}` (rolling deploy?) — rerun against a stable deployment"
+                    )));
+                }
+                Some(_) => {}
+            }
             for question in &set.questions {
                 let probabilities = answers
                     .answers
@@ -235,7 +250,7 @@ impl Harness {
         }
         let version = VersionTriple {
             schema: set.schema_version.clone(),
-            model: subject.resolved_model_id(),
+            model: pinned_model.unwrap_or_else(|| subject.resolved_model_id()),
             calib: None,
         };
         let batch = schema.build_batch(&version, &rows)?;
@@ -277,6 +292,7 @@ impl Harness {
             }
         }
         let mut observations = Vec::with_capacity(items.len());
+        let mut pinned_model: Option<String> = None;
         for (row_index, item) in items.iter().enumerate() {
             let set = QuestionSet {
                 state: Some(item.state.clone()),
@@ -290,6 +306,16 @@ impl Harness {
                     item_id: item.id.clone(),
                     message: error.to_string(),
                 })?;
+            let resolved = subject.resolved_model_id();
+            match &pinned_model {
+                None => pinned_model = Some(resolved),
+                Some(pinned) if *pinned != resolved => {
+                    return Err(EvalError::InvalidInput(format!(
+                        "model version changed mid-run: `{pinned}` then `{resolved}` (rolling deploy?) — rerun against a stable deployment"
+                    )));
+                }
+                Some(_) => {}
+            }
             validate_answer_row(&item.question, &answers).map_err(|message| {
                 EvalError::InvalidAnswer {
                     question_id: item.question.id.clone(),
@@ -314,7 +340,7 @@ impl Harness {
         }
         let version = VersionTriple {
             schema: "items".to_owned(),
-            model: subject.resolved_model_id(),
+            model: pinned_model.unwrap_or_else(|| subject.resolved_model_id()),
             calib: None,
         };
         Ok(RunOutput {

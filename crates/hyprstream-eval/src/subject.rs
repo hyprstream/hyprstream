@@ -187,15 +187,21 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
     ])
 }
 
-/// Renormalize an accepted distribution to producer tolerance, in three
-/// stages: divide through; then an order-preserving uniform-share
-/// correction (monotone in f32, so ties and leader gaps survive); then, as
-/// a last resort for vectors no uniform correction can reach (f32
-/// sequential-sum granularity, e.g. exactly uniform high-cardinality
-/// ones), a single-component correction that preserves the D6 argmax
-/// (shortfall bumps the EARLIEST maximal component — a unique winner
-/// there matches the earliest-index tie-break — overage shrinks the
-/// LATEST maximal one). Wire distributions are accepted at consumer
+/// Renormalize an accepted distribution to producer tolerance, in stages:
+/// (0) if the input ALREADY passes producer tolerance, return untouched —
+/// dividing a valid vector by its sum can push it out of tolerance again
+/// (f32 division rounding, e.g. a 49-way vector whose sequential sum is
+/// 0.9999996 divides up to 1.0000012, after which the uniform-share
+/// correction would drive a zero component NEGATIVE); (1) divide through;
+/// (2) an order-preserving uniform-share correction (monotone in f32, so
+/// ties and leader gaps survive), with the share bounded below by
+/// `-min_component` so no component ever leaves [0, 1]; (3) as a last
+/// resort for vectors no uniform correction can reach (f32 sequential-sum
+/// granularity, e.g. exactly uniform high-cardinality ones), a
+/// single-component correction clamped into [0, 1] that preserves the D6
+/// argmax (shortfall bumps the EARLIEST maximal component — a unique
+/// winner there matches the earliest-index tie-break — overage shrinks
+/// the LATEST maximal one). Wire distributions are accepted at consumer
 /// tolerance; the producer-side IR and batch validators require the
 /// tighter producer tolerance, so the boundary normalizes on the way in.
 /// Also used for locally constructed distributions (TruthSubject's
@@ -204,6 +210,12 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
+    // Stage 0: a producer-valid input is already fine — normalizing it
+    // further can push it out of tolerance AND below zero (see the doc
+    // comment's 49-way example).
+    if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
+        return;
+    }
     let sum: f32 = probabilities.iter().sum();
     if sum > 0.0 {
         for p in probabilities.iter_mut() {
@@ -217,10 +229,18 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     // is monotone in f32, so ties stay ties and no leader can cross its
     // runner-up (a single-component correction by a large residual could
     // flip the argmax when two leading probabilities are closer than the
-    // residual — observed on a consumer-valid 41-way vector).
+    // residual — observed on a consumer-valid 41-way vector). The share is
+    // bounded below by `-min_component` so no component can go negative.
     let residual = 1.0 - probabilities.iter().sum::<f32>();
     #[allow(clippy::cast_precision_loss)]
-    let share = residual / probabilities.len().max(1) as f32;
+    let mut share = residual / probabilities.len().max(1) as f32;
+    if share < 0.0 {
+        let min_component = probabilities
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        share = share.max(-min_component);
+    }
     if share != 0.0 {
         for p in probabilities.iter_mut() {
             *p += share;
@@ -235,7 +255,7 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     // argmax — a shortfall bumps the EARLIEST maximal component (a unique
     // winner there matches the earliest-index tie-break), an overage
     // shrinks the LATEST maximal one (the earliest tied maxima keep
-    // their win).
+    // their win). The correction is clamped into [0, 1].
     let residual = 1.0 - probabilities.iter().sum::<f32>();
     let max = probabilities
         .iter()
@@ -248,7 +268,7 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
         probabilities.iter().rposition(|p| *p == max)
     };
     if let Some(index) = index {
-        probabilities[index] += residual;
+        probabilities[index] = (probabilities[index] + residual).clamp(0.0, 1.0);
     }
 }
 
@@ -948,5 +968,45 @@ questions:
             .unwrap();
         // Renormalization must not reorder or skew: both components ~1/2.
         assert!(probabilities.iter().all(|p| (*p - 0.5).abs() < 1e-3));
+    }
+
+    #[test]
+    fn producer_valid_wire_distribution_is_not_renormalized_negative() {
+        // 48 options at 1/48 plus one exact zero: the f32 sequential sum is
+        // 0.9999996 — already inside producer tolerance. Dividing through by
+        // that sum (the old behavior) pushed the sum to 1.0000012, and the
+        // uniform-share correction then drove the zero component NEGATIVE.
+        let mut yaml = String::from("questions:\n  pick:\n    type: choice\n    criteria:\n");
+        let mut wire = serde_json::Map::new();
+        for i in 0..49 {
+            let name = format!("o{i:02}");
+            yaml.push_str(&format!("      {name}: ~\n"));
+            wire.insert(
+                name,
+                if i == 0 {
+                    serde_json::json!(0.0)
+                } else {
+                    serde_json::json!(1.0f64 / 48.0)
+                },
+            );
+        }
+        let set = author::parse_yaml(&yaml).unwrap();
+        let question = set.question("pick").unwrap();
+        let parsed = parse_answer(
+            question,
+            &serde_json::json!({"type": "choice", "probabilities": wire}),
+        )
+        .unwrap();
+        let probabilities = parsed.value.as_ref().unwrap().probabilities();
+        assert_eq!(probabilities.len(), 49);
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+            .unwrap();
+        assert!(
+            probabilities.iter().all(|p| (0.0..=1.0).contains(p)),
+            "no component may leave [0, 1]: {probabilities:?}"
+        );
+        // The early return leaves the already-valid vector untouched: the
+        // zero stays exactly zero.
+        assert_eq!(probabilities[0], 0.0);
     }
 }
