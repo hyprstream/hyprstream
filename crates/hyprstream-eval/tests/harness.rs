@@ -618,3 +618,132 @@ async fn run_items_rejects_an_empty_question_id_before_the_subject() {
     );
     assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+/// Resolves to `v1` on the first decide and `v2` on every later one — a
+/// rolling deploy landing mid-run.
+struct VersionFlipSubject(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl Subject for VersionFlipSubject {
+    fn model_id(&self) -> &str {
+        "version-flip"
+    }
+
+    fn resolved_model_id(&self) -> String {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) <= 1 {
+            "v1".to_owned()
+        } else {
+            "v2".to_owned()
+        }
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            answers.insert(
+                question.id.clone(),
+                QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
+            );
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn run_items_errors_when_the_model_version_changes_mid_run() {
+    // The version triple stamps ONE resolved id on every row; a subject that
+    // re-resolves its alias to a new version mid-run (rolling deploy) must
+    // fail loudly instead of mislabeling the earlier rows.
+    let mut second = noul_item();
+    second.id = "val-2".into();
+    let items = vec![noul_item(), second];
+    let error = Harness
+        .run_items(&items, &VersionFlipSubject(std::sync::atomic::AtomicUsize::new(0)))
+        .await
+        .err()
+        .unwrap();
+    match error {
+        hyprstream_eval::EvalError::InvalidInput(message) => {
+            assert!(
+                message.contains("v1") && message.contains("v2"),
+                "the error must name both versions, got: {message}"
+            );
+        }
+        other => panic!("mid-run version change must be InvalidInput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn run_set_errors_when_the_model_version_changes_mid_run() {
+    let question = noul_item().question;
+    let row = |id: &str| hyprstream_eval::EvalRow {
+        id: id.into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        truth: std::collections::BTreeMap::new(),
+    };
+    let set = hyprstream_eval::EvalSet {
+        name: "t".into(),
+        schema_version: "v1".into(),
+        questions: vec![question],
+        rows: vec![row("r1"), row("r2")],
+    };
+    let error = Harness
+        .run_set(&set, &VersionFlipSubject(std::sync::atomic::AtomicUsize::new(0)))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "mid-run version change must be InvalidInput, got {error:?}"
+    );
+}
+
+#[test]
+fn flip_rate_compares_each_question_against_its_own_base() {
+    // A multi-question EvalSet answers EVERY question on every row, and rows
+    // of one permutation group share the group id — so the base row (id ==
+    // group id) contributes one base observation PER QUESTION. Each rotated
+    // row's observation must be compared against its own question's base:
+    // comparing q2's label against q1's base label (the old behavior) reports
+    // a spurious flip rate. Here both questions are individually label-stable
+    // across the rotation, so the flip rate is exactly 0.
+    use hyprstream_eval::{flip_rate_with_labels, Observation};
+    let obs = |id: &str, question_id: &str, probabilities: Vec<f32>| Observation {
+        id: id.into(),
+        question_id: question_id.into(),
+        kind: hyprstream_decision::QuestionKind::Choice,
+        family: None,
+        stratum: None,
+        group: Some("g".into()),
+        probabilities: Some(probabilities),
+        truth: None,
+    };
+    let observations = vec![
+        // Base row: q1 argmax "a" (index 0), q2 argmax "y" (index 1).
+        obs("g", "q1", vec![0.8, 0.1, 0.1]),
+        obs("g", "q2", vec![0.1, 0.8, 0.1]),
+        // Rotated row, probabilities in canonical label order: both
+        // questions answer the same label as on the base row.
+        obs("g-p1", "q1", vec![0.8, 0.1, 0.1]),
+        obs("g-p1", "q2", vec![0.1, 0.8, 0.1]),
+    ];
+    let labels_of = |question_id: &str| -> Option<Vec<String>> {
+        match question_id {
+            "q1" => Some(vec!["a".into(), "b".into(), "c".into()]),
+            "q2" => Some(vec!["x".into(), "y".into(), "z".into()]),
+            _ => None,
+        }
+    };
+    let flip = flip_rate_with_labels(&observations, labels_of);
+    assert_eq!(flip.groups, 1);
+    assert_eq!(flip.flip_rate, 0.0);
+}

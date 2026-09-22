@@ -395,8 +395,14 @@ fn breakdown(
 
 /// Option-order flip rate across permutation groups. Within a group the base
 /// member is the one whose id equals the group id; every other member's
-/// argmax **label** must equal the base's. Members without labels resolvable
-/// through their question are skipped — the caller supplies each
+/// argmax **label** must equal its base's. A multi-question `EvalSet` answers
+/// EVERY question on the base row, so the group holds one base observation
+/// per question — each member is then compared against the base observation
+/// of its OWN question (comparing against another question's base label
+/// would report spurious flips). A single-question (bench item) group has
+/// exactly one base; cyclic rotations carry their own question ids and
+/// label orders, and compare against that one base. Members without labels
+/// resolvable through their question are skipped — the caller supplies each
 /// observation's canonical labels via `labels_of`.
 pub fn flip_rate_with_labels(
     observations: &[crate::run::Observation],
@@ -420,14 +426,36 @@ pub fn flip_rate_with_labels(
         if members.len() < 2 {
             continue;
         }
-        let Some(base) = members.iter().find(|obs| obs.id == base_id) else {
+        let bases: Vec<&crate::run::Observation> = members
+            .iter()
+            .filter(|obs| obs.id == base_id)
+            .copied()
+            .collect();
+        if bases.is_empty() {
             continue;
-        };
-        let Some(base_label) = label_of(base) else {
-            continue;
-        };
+        }
         let mut counted = false;
         for member in members.iter().filter(|member| member.id != base_id) {
+            // The base for THIS member: with several base observations (a
+            // multi-question set run) match the member's own question —
+            // pooling across questions compares against another question's
+            // label space and reports spurious flips. With exactly one base
+            // (bench item groups) rotations carry their own question ids
+            // and label orders, and compare against that base.
+            let base = if let [base] = bases.as_slice() {
+                *base
+            } else {
+                let Some(base) = bases
+                    .iter()
+                    .find(|base| base.question_id == member.question_id)
+                else {
+                    continue;
+                };
+                base
+            };
+            let Some(base_label) = label_of(base) else {
+                continue;
+            };
             if let Some(label) = label_of(member) {
                 used += 1;
                 counted = true;
