@@ -55,7 +55,7 @@ pub mod labelctl;
 pub mod pipeline;
 pub mod teacher;
 
-pub use corpus::{Corpus, CorpusRow, Provenance, SynthStats, TeacherAnswer};
+pub use corpus::{Corpus, CorpusRow, LabelCount, Provenance, SynthStats, TeacherAnswer};
 pub use family::SynthFamily;
 pub use firewall::{Firewall, FirewallError, FirewallViolation};
 pub use item::SynthItem;

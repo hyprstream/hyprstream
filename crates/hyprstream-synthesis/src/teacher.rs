@@ -123,6 +123,19 @@ impl Teacher for HashTeacher {
     }
 }
 
+/// Escape a roster value for interpolation into a Markdown table cell:
+/// an unescaped `|` splits the cell, a newline splits the row, and a
+/// backtick closes the code span — any of which lets a hostile roster id
+/// or version re-associate the displayed ToS class and distributability
+/// flag with the wrong teacher. `Roster::from_json` accepts these
+/// characters, so the renderer (not the parser) is the enforcement point.
+fn md_cell(value: &str) -> String {
+    value
+        .replace('`', "'")
+        .replace(['\r', '\n'], " ")
+        .replace('|', "\\|")
+}
+
 /// A teacher roster: the out-of-band human-authorized list of teachers with
 /// their ToS classes, mirrored into `DISCLOSURE.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,9 +161,9 @@ impl Roster {
             let _ = writeln!(
                 out,
                 "| `{}` | `{}` | `{}` | {} |",
-                pin.id,
-                pin.version,
-                pin.tos_class.as_str(),
+                md_cell(&pin.id),
+                md_cell(&pin.version),
+                md_cell(pin.tos_class.as_str()),
                 pin.tos_class.is_distributable()
             );
         }
@@ -222,5 +235,33 @@ mod tests {
         let table = roster.to_markdown_table();
         assert!(table.contains("api-prohibited"));
         assert!(table.contains("| `sim-b` |"));
+    }
+
+    #[test]
+    fn roster_table_escapes_table_breaking_values() {
+        // Regression (review thread 2026-09-22): Roster::from_json accepts
+        // ids and versions containing `|` or newlines; rendered unescaped
+        // they add columns or rows, so the displayed ToS class and
+        // distributability can appear associated with the wrong teacher.
+        let roster = Roster::from_json(
+            r#"{"teachers": [{"id": "evil|teacher", "version": "1.0\ninjected | row", "tos_class": "open-weights"}]}"#,
+        )
+        .unwrap();
+        let table = roster.to_markdown_table();
+        let data_row = table
+            .lines()
+            .nth(2)
+            .unwrap_or_else(|| panic!("missing data row: {table}"));
+        // Unescaping the cells must leave exactly the 4-column delimiter
+        // count (5 pipes for one data row).
+        let unescaped = data_row.replace("\\|", "");
+        assert_eq!(
+            unescaped.matches('|').count(),
+            5,
+            "escaped cells keep the 4-column row intact: {data_row}"
+        );
+        assert!(data_row.contains("evil\\|teacher"), "{data_row}");
+        assert!(data_row.contains("1.0 injected \\| row"), "{data_row}");
+        assert!(table.lines().count() == 3, "no injected extra rows: {table}");
     }
 }

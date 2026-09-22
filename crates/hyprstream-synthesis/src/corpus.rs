@@ -217,6 +217,43 @@ impl CorpusRow {
     }
 }
 
+/// One label-histogram row: the JSON-compatible projection of the internal
+/// `(kind, cardinality, label)` → count map (serde_json object keys must be
+/// strings, so the tuple-keyed map cannot serialize as JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelCount {
+    /// Question kind (noul/choice/score).
+    pub kind: String,
+    /// Cardinality of the question.
+    pub cardinality: usize,
+    /// The label index.
+    pub label: usize,
+    /// Accepted rows carrying this label.
+    pub count: usize,
+}
+
+impl LabelCount {
+    /// Deterministically ordered rows from the internal tuple-keyed
+    /// histogram (sorted by kind, then cardinality, then label).
+    pub(crate) fn rows_from(
+        histogram: &std::collections::HashMap<(String, usize, usize), usize>,
+    ) -> Vec<Self> {
+        let mut rows: Vec<Self> = histogram
+            .iter()
+            .map(|((kind, cardinality, label), count)| Self {
+                kind: kind.clone(),
+                cardinality: *cardinality,
+                label: *label,
+                count: *count,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            (&a.kind, a.cardinality, a.label).cmp(&(&b.kind, b.cardinality, b.label))
+        });
+        rows
+    }
+}
+
 /// Run statistics (also the audit trail for label control + dedup).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynthStats {
@@ -228,8 +265,10 @@ pub struct SynthStats {
     pub dedup_dropped: usize,
     /// Items deferred by label-distribution control.
     pub label_deferred: usize,
-    /// The final label histogram: `(kind, cardinality, label)` → count.
-    pub label_histogram: std::collections::HashMap<(String, usize, usize), usize>,
+    /// The final label histogram as JSON-compatible rows (sorted by kind,
+    /// cardinality, label) — the audit trail for label control + dedup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_histogram: Vec<LabelCount>,
 }
 
 /// A synthesized corpus plus run statistics.

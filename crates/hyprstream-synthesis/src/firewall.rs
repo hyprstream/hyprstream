@@ -164,20 +164,21 @@ impl Firewall {
         })?;
         let disclosure_bytes =
             std::fs::read(&disclosure_path).map_err(FirewallError::DisclosureIo)?;
-        let found = blake3_hex(&disclosure_bytes);
-        if found != EXPECTED_DISCLOSURE_BLAKE3 || found != manifest.disclosure.blake3 {
-            return Err(FirewallError::DisclosureDigestMismatch { found });
-        }
-        Self::from_verified_bytes(&bytes)
+        Self::from_verified_bytes(&bytes, &disclosure_bytes)
     }
 
-    /// Build from the manifest's canonical bytes. The digest is derived from
-    /// the bytes themselves — never accepted as a separate caller-supplied
-    /// argument, so a modified manifest (e.g. `items`/`families` cleared)
-    /// cannot be paired with the frozen digest to disable the contamination
-    /// checks. The pins are still verified: constructing a firewall that does
+    /// Build from the manifest's canonical bytes AND the actual DISCLOSURE
+    /// text. Both digests are derived from the bytes themselves — never
+    /// accepted as separate caller-supplied arguments — so a modified
+    /// manifest (e.g. `items`/`families` cleared) cannot be paired with the
+    /// frozen digest to disable the contamination checks, and a drifted or
+    /// deleted disclosure cannot be papered over by the manifest's embedded
+    /// pin. The pins are still verified: constructing a firewall that does
     /// not match the frozen vob-1.1 pins is an error, never a silent pass.
-    pub fn from_verified_bytes(manifest_bytes: &[u8]) -> Result<Self, FirewallError> {
+    pub fn from_verified_bytes(
+        manifest_bytes: &[u8],
+        disclosure_bytes: &[u8],
+    ) -> Result<Self, FirewallError> {
         let manifest_blake3 = blake3_hex(manifest_bytes);
         if manifest_blake3 != EXPECTED_MANIFEST_BLAKE3 {
             return Err(FirewallError::ManifestDigestMismatch {
@@ -191,9 +192,12 @@ impl Firewall {
                 found: manifest.release,
             });
         }
-        if manifest.disclosure.blake3 != EXPECTED_DISCLOSURE_BLAKE3 {
+        let found_disclosure = blake3_hex(disclosure_bytes);
+        if found_disclosure != EXPECTED_DISCLOSURE_BLAKE3
+            || found_disclosure != manifest.disclosure.blake3
+        {
             return Err(FirewallError::DisclosureDigestMismatch {
-                found: manifest.disclosure.blake3,
+                found: found_disclosure,
             });
         }
         Ok(Self {
@@ -275,7 +279,7 @@ mod tests {
     #[test]
     fn digest_mismatch_fails_closed() {
         assert!(matches!(
-            Firewall::from_verified_bytes(b"tampered manifest bytes"),
+            Firewall::from_verified_bytes(b"tampered manifest bytes", b"disclosure"),
             Err(FirewallError::ManifestDigestMismatch { .. })
         ));
     }
@@ -293,20 +297,44 @@ mod tests {
         manifest.families.clear();
         let tampered = serde_json::to_vec(&manifest).unwrap();
         assert!(matches!(
-            Firewall::from_verified_bytes(&tampered),
+            Firewall::from_verified_bytes(&tampered, b"disclosure"),
             Err(FirewallError::ManifestDigestMismatch { .. })
         ));
+    }
+
+    fn committed_disclosure_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../hyprstream-bench/DISCLOSURE.md")
     }
 
     #[test]
     fn known_manifest_hash_is_flagged() {
         let bytes = std::fs::read(committed_manifest_path()).unwrap();
+        let disclosure = std::fs::read(committed_disclosure_path()).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         let manifest = Manifest::from_json(&text).unwrap();
         let first = manifest.items[0].blake3.clone();
-        let firewall = Firewall::from_verified_bytes(&bytes).unwrap();
+        let firewall = Firewall::from_verified_bytes(&bytes, &disclosure).unwrap();
         assert!(firewall.is_contaminated_hash(&first));
         assert!(!firewall.is_contaminated_hash(&"e".repeat(64)));
+    }
+
+    #[test]
+    fn constructor_requires_the_real_disclosure_bytes() {
+        // Regression (review thread 2026-09-22): the public in-memory
+        // constructor used to trust the manifest's embedded disclosure
+        // digest without ever seeing the DISCLOSURE text, so a deleted or
+        // drifted DISCLOSURE.md still produced a firewall that
+        // `pipeline::run` accepted. The disclosure bytes are now an
+        // argument and are hashed against both pins.
+        let bytes = std::fs::read(committed_manifest_path()).unwrap();
+        let error = match Firewall::from_verified_bytes(&bytes, b"drifted disclosure") {
+            Err(error) => error,
+            Ok(_) => panic!("drifted disclosure accepted"),
+        };
+        assert!(matches!(
+            error,
+            FirewallError::DisclosureDigestMismatch { .. }
+        ));
     }
 
     /// Copy the frozen artifacts into a `crates/hyprstream-bench` layout

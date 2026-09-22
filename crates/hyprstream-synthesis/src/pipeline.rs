@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use hyprstream_decision::QuestionKind;
 
-use crate::corpus::{Corpus, CorpusRow, Provenance, SynthStats};
+use crate::corpus::{Corpus, CorpusRow, LabelCount, Provenance, SynthStats};
 use crate::ensemble::{argmax_label, corrected_average};
 use crate::family::SynthFamily;
 use crate::firewall::{Firewall, FirewallViolation};
@@ -218,7 +218,7 @@ pub fn run(
             }
         }
     }
-    stats.label_histogram = labels.histogram().clone();
+    stats.label_histogram = LabelCount::rows_from(labels.histogram());
     corpus.stats = stats;
     Ok(corpus)
 }

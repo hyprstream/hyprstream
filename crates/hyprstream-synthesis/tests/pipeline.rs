@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use hyprstream_decision::QuestionKind;
-use hyprstream_synthesis::corpus::Corpus;
+use hyprstream_synthesis::corpus::{Corpus, LabelCount, SynthStats};
 use hyprstream_synthesis::ensemble::{
     argmax_label, corrected_average, drop_worst_teachers, spread,
 };
@@ -75,7 +75,7 @@ fn label_histogram_is_recorded_under_unlimited_policy() {
     };
     let corpus = run(&config, &refs, &firewall(), &HashMap::new()).unwrap();
     assert!(!corpus.stats.label_histogram.is_empty());
-    let total: usize = corpus.stats.label_histogram.values().sum();
+    let total: usize = corpus.stats.label_histogram.iter().map(|row| row.count).sum();
     assert_eq!(total, corpus.stats.accepted);
 }
 
@@ -276,11 +276,11 @@ fn label_control_balances_argmax_histogram() {
     // Within each (kind, cardinality) bucket, label counts differ by at most
     // slack + 1 (deferral can leave the minimum trailing by one).
     let mut buckets: HashMap<(String, usize), Vec<usize>> = HashMap::new();
-    for ((kind, cardinality, _label), count) in &corpus.stats.label_histogram {
+    for row in &corpus.stats.label_histogram {
         buckets
-            .entry((kind.clone(), *cardinality))
+            .entry((row.kind.clone(), row.cardinality))
             .or_default()
-            .push(*count);
+            .push(row.count);
     }
     for (bucket, counts) in &buckets {
         let max = counts.iter().max().copied().unwrap_or(0);
@@ -402,11 +402,49 @@ fn balancing_uses_the_fitted_correction_map() {
             .entry((row.kind.clone(), row.cardinality(), argmax_label(&mean)))
             .or_default() += 1;
     }
-    assert_eq!(corrected.stats.label_histogram, expected);
+    let got: HashMap<(String, usize, usize), usize> = corrected
+        .stats
+        .label_histogram
+        .iter()
+        .map(|row| ((row.kind.clone(), row.cardinality, row.label), row.count))
+        .collect();
+    assert_eq!(got, expected);
     assert_ne!(
         corrected.stats.label_histogram, plain.stats.label_histogram,
         "sharpening a teacher must flip at least one recorded label"
     );
+}
+
+#[test]
+fn synth_stats_audit_trail_serializes_to_json() {
+    // Regression (review thread 2026-09-22): the label histogram was a
+    // tuple-keyed map, which serde_json cannot serialize (object keys must
+    // be strings) — the advertised SynthStats audit trail was unpersistable.
+    // Rows keep the audit trail JSON-compatible and deterministically
+    // ordered.
+    let stats = SynthStats {
+        generated: 3,
+        accepted: 3,
+        label_histogram: vec![
+            LabelCount {
+                kind: "choice".to_owned(),
+                cardinality: 2,
+                label: 0,
+                count: 2,
+            },
+            LabelCount {
+                kind: "noul".to_owned(),
+                cardinality: 2,
+                label: 1,
+                count: 1,
+            },
+        ],
+        ..SynthStats::default()
+    };
+    let text = serde_json::to_string(&stats).expect("audit trail serializes");
+    assert!(text.contains("\"label_histogram\""));
+    let back: SynthStats = serde_json::from_str(&text).expect("audit trail round-trips");
+    assert_eq!(back, stats);
 }
 
 #[test]
