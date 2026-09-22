@@ -993,3 +993,48 @@ fn flip_rate_never_compares_across_questions_in_partial_set_groups() {
     assert_eq!(flip.groups, 0, "no same-question base/member pair exists");
     assert_eq!(flip.flip_rate, 0.0);
 }
+
+#[tokio::test]
+async fn run_items_rejects_an_empty_resolved_model_id() {
+    // Any subject (in-process ones included) can resolve to an empty id;
+    // pinning it would produce a run with no model provenance that only
+    // fails later at persistence — reject it at capture instead.
+    let items = vec![noul_item()];
+    let error = Harness
+        .run_items(&items, &TruthSubject::new(""))
+        .await
+        .err()
+        .unwrap();
+    match error {
+        hyprstream_eval::EvalError::InvalidInput(message) => {
+            assert!(
+                message.contains("empty model id"),
+                "the error must name the problem: {message}"
+            );
+        }
+        other => panic!("an empty resolved id must be InvalidInput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn agreement_summary_is_unmeasured_without_samples() {
+    // No ensemble outputs (every candidate filtered/failed): the mean is
+    // absent — a 0.0 would read as measured total teacher disagreement.
+    let empty = hyprstream_eval::agreement_summary(&[]);
+    assert_eq!(empty.mean_argmax_agreement, None);
+    assert!(empty.per_item.is_empty());
+    // …and Some once any item produced an ensemble result.
+    let ensemble = hyprstream_eval::TeacherEnsemble::new(vec![hyprstream_eval::Teacher {
+        id: "t1".into(),
+        tos_class: hyprstream_eval::TosClass::InternalOnly,
+        subject: Box::new(FreshPerResponseSubject),
+    }])
+    .unwrap();
+    let set = QuestionSet {
+        state: None,
+        questions: vec![noul_item().question],
+    };
+    let output = ensemble.decide(&set, &Entry::Null, 0, "item-1").await.unwrap();
+    let summary = hyprstream_eval::agreement_summary(&[("item-1".to_owned(), output)]);
+    assert_eq!(summary.mean_argmax_agreement, Some(1.0));
+}

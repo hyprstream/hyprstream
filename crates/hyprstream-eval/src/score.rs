@@ -101,8 +101,10 @@ pub struct FlipRate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsembleAgreement {
     /// Mean per-item argmax agreement (fraction of teachers matching the
-    /// ensemble argmax), averaged over items and questions.
-    pub mean_argmax_agreement: f64,
+    /// ensemble argmax), averaged over items and questions. `None` when
+    /// there are no samples (an empty outputs slice) — unmeasured, never a
+    /// fake 0.0 (which would read as measured total disagreement).
+    pub mean_argmax_agreement: Option<f64>,
     /// Per-item agreement values (reporting/distribution input).
     pub per_item: Vec<(String, f64)>,
 }
@@ -527,7 +529,10 @@ pub fn score_bench_run(
     Ok(report)
 }
 
-/// Summarize teacher-ensemble agreement over per-item outputs.
+/// Summarize teacher-ensemble agreement over per-item outputs. The mean is
+/// `None` when `outputs` is empty (no agreement samples — e.g. every
+/// candidate item was filtered or failed): unmeasured must never read as
+/// measured total disagreement.
 pub fn agreement_summary(outputs: &[(String, EnsembleOutput)]) -> EnsembleAgreement {
     let per_item: Vec<(String, f64)> = outputs
         .iter()
@@ -540,8 +545,7 @@ pub fn agreement_summary(outputs: &[(String, EnsembleOutput)]) -> EnsembleAgreem
     let mean_argmax_agreement =
         hyprstream_calibration::protocol::macro_average(
             &per_item.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
-        )
-        .unwrap_or(0.0);
+        );
     EnsembleAgreement {
         mean_argmax_agreement,
         per_item,
