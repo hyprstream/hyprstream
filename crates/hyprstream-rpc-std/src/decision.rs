@@ -72,6 +72,23 @@ pub enum DecodeError {
     /// Arrow surface would reject downstream.
     #[error("invalid distribution on the wire for question {0}: {1}")]
     InvalidDistribution(String, DistributionError),
+    /// An answer row with an empty question id — it cannot bind to any
+    /// valid question (decoded question sets categorically reject empty
+    /// ids).
+    #[error("empty question id in an answer row on the wire")]
+    EmptyAnswerQuestionId,
+    /// An answer distribution whose cardinality cannot match any valid
+    /// question spec (choice: 2-255 options per D2, score: >= 2 levels per
+    /// D1) — malformed wire data must not enter the IR.
+    #[error("answer distribution of {len} components cannot match a {kind} question ({question_id})")]
+    AnswerCardinalityOutOfRange {
+        /// The answer's question id.
+        question_id: String,
+        /// The invalid component count.
+        len: usize,
+        /// Which primitive the count cannot belong to.
+        kind: &'static str,
+    },
 }
 
 /// Errors encoding IR into a `decision.capnp` message.
@@ -96,6 +113,43 @@ pub enum EncodeError {
     /// unique for argmax and conformal-set output (the decoder rejects these).
     #[error("duplicate choice option name {1:?} in question {0}")]
     DuplicateChoiceOptionName(String, String),
+    /// A spec's `kind` disagrees with its body union. The decoder rejects
+    /// the mismatched tag, and downstream Arrow emission consults `kind`,
+    /// so the encoder refuses to silently rewrite it (exact round trip).
+    #[error("kind tag {tag} does not match the body union of question {question_id}")]
+    KindBodyMismatch {
+        /// The question carrying the mismatch.
+        question_id: String,
+        /// The stale explicit kind tag.
+        tag: String,
+    },
+    /// A repeated question id — answers bind by id, so duplicates are
+    /// ambiguous and the Arrow schema rejects them.
+    #[error("duplicate question id {0}")]
+    DuplicateQuestionId(String),
+    /// A choice question outside the D2 range of 2–255 options.
+    #[error("choice question {question_id} has {len} options (D2 requires 2-255)")]
+    ChoiceCardinalityOutOfRange {
+        /// The offending question.
+        question_id: String,
+        /// The invalid option count.
+        len: usize,
+    },
+    /// A score question with fewer than the D1 minimum of 2 levels.
+    #[error("score question {question_id} has {len} levels (D1 requires >= 2)")]
+    ScoreLevelCountInvalid {
+        /// The offending question.
+        question_id: String,
+        /// The invalid level count.
+        len: usize,
+    },
+    /// A non-finite `Entry::Number` anywhere in the set — the IR guarantees
+    /// finite numbers, and non-finite values have no canonical JSON text.
+    #[error("non-finite Entry::Number in the question set (question: {question:?})")]
+    NonFiniteEntryNumber {
+        /// The question containing the entry (None = the shared state).
+        question: Option<String>,
+    },
     /// A noul probability outside [0, 1] or not finite.
     #[error("noul probability out of range for question {0}: {1}")]
     NoulProbabilityOutOfRange(String, f32),
@@ -343,6 +397,40 @@ fn get_question_spec(
     })
 }
 
+/// Recursively reject non-finite `Entry::Number` values: the IR guarantees
+/// finite numbers, and a non-finite value has no canonical JSON text, so it
+/// cannot survive the canonical serialization the model-facing pipeline
+/// depends on.
+fn validate_entry_finite(
+    entry: Option<&Entry>,
+    question_id: Option<&str>,
+) -> Result<(), EncodeError> {
+    let entry = match entry {
+        Some(entry) => entry,
+        None => return Ok(()),
+    };
+    match entry {
+        Entry::Number(value) if !value.is_finite() => {
+            Err(EncodeError::NonFiniteEntryNumber {
+                question: question_id.map(str::to_owned),
+            })
+        }
+        Entry::Seq(items) => {
+            for item in items {
+                validate_entry_finite(Some(item), question_id)?;
+            }
+            Ok(())
+        }
+        Entry::Map(pairs) => {
+            for (_, value) in pairs {
+                validate_entry_finite(Some(value), question_id)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Encode a question set as a `QuestionSet` message.
 pub fn question_set_to_message(
     set: &QuestionSet,
@@ -350,25 +438,74 @@ pub fn question_set_to_message(
     if set.questions.is_empty() {
         return Err(EncodeError::EmptyQuestionSet);
     }
-    // Encode mirrors the decode-side authoring-layer rules (get_question_spec):
-    // the IR is public, so a directly-constructed spec must not emit a message
-    // our own decoder rejects (EmptyQuestionId / EmptyChoiceOptionName /
-    // DuplicateChoiceOptionName).
+    // Encode mirrors the decode-side authoring-layer rules (get_question_spec)
+    // and the D1/D2 cardinality contract: the IR is public, so a
+    // directly-constructed spec must not emit a message our own decoder
+    // rejects — or one whose explicit `kind` disagrees with its body, which
+    // would make the IR and the wire disagree after a round trip
+    // (EmptyQuestionId / DuplicateQuestionId / KindBodyMismatch /
+    // ChoiceCardinalityOutOfRange / ScoreLevelCountInvalid /
+    // EmptyChoiceOptionName / DuplicateChoiceOptionName /
+    // NonFiniteEntryNumber).
+    validate_entry_finite(set.state.as_ref(), None)?;
+    let mut seen_ids = std::collections::HashSet::with_capacity(set.questions.len());
     for spec in &set.questions {
         if spec.id.is_empty() {
             return Err(EncodeError::EmptyQuestionId);
         }
-        if let QuestionBody::Choice { options } = &spec.body {
-            let mut seen = std::collections::HashSet::with_capacity(options.len());
-            for option in options {
-                if option.name.is_empty() {
-                    return Err(EncodeError::EmptyChoiceOptionName(spec.id.clone()));
+        if !seen_ids.insert(spec.id.as_str()) {
+            return Err(EncodeError::DuplicateQuestionId(spec.id.clone()));
+        }
+        let derived_kind = match &spec.body {
+            QuestionBody::Noul { .. } => QuestionKind::Noul,
+            QuestionBody::Choice { .. } => QuestionKind::Choice,
+            QuestionBody::Score { .. } => QuestionKind::Score,
+        };
+        if spec.kind != derived_kind {
+            return Err(EncodeError::KindBodyMismatch {
+                question_id: spec.id.clone(),
+                tag: format!("{:?}", spec.kind),
+            });
+        }
+        validate_entry_finite(spec.instructions.as_ref(), Some(&spec.id))?;
+        match &spec.body {
+            QuestionBody::Noul { criteria } => {
+                if let Some(criteria) = criteria {
+                    validate_entry_finite(criteria.on_true.as_ref(), Some(&spec.id))?;
+                    validate_entry_finite(criteria.on_false.as_ref(), Some(&spec.id))?;
                 }
-                if !seen.insert(option.name.as_str()) {
-                    return Err(EncodeError::DuplicateChoiceOptionName(
-                        spec.id.clone(),
-                        option.name.clone(),
-                    ));
+            }
+            QuestionBody::Choice { options } => {
+                let count = options.len();
+                if !(2..=255).contains(&count) {
+                    return Err(EncodeError::ChoiceCardinalityOutOfRange {
+                        question_id: spec.id.clone(),
+                        len: count,
+                    });
+                }
+                let mut seen_names = std::collections::HashSet::with_capacity(count);
+                for option in options {
+                    if option.name.is_empty() {
+                        return Err(EncodeError::EmptyChoiceOptionName(spec.id.clone()));
+                    }
+                    if !seen_names.insert(option.name.as_str()) {
+                        return Err(EncodeError::DuplicateChoiceOptionName(
+                            spec.id.clone(),
+                            option.name.clone(),
+                        ));
+                    }
+                    validate_entry_finite(option.rubric.as_ref(), Some(&spec.id))?;
+                }
+            }
+            QuestionBody::Score { levels } => {
+                if levels.len() < 2 {
+                    return Err(EncodeError::ScoreLevelCountInvalid {
+                        question_id: spec.id.clone(),
+                        len: levels.len(),
+                    });
+                }
+                for level in levels {
+                    validate_entry_finite(level.as_ref(), Some(&spec.id))?;
                 }
             }
         }
@@ -508,6 +645,9 @@ pub fn batch_from_reader(
         let mut answers = std::collections::BTreeMap::new();
         for answer in row.get_answers()?.iter() {
             let question_id = answer.get_question_id()?.to_str()?.to_owned();
+            if question_id.is_empty() {
+                return Err(DecodeError::EmptyAnswerQuestionId);
+            }
             let conformal_set = match answer.get_conformal_set()?.which()? {
                 decision_capnp::opt_conformal_set::None(()) => None,
                 decision_capnp::opt_conformal_set::Some(members) => {
@@ -534,6 +674,16 @@ pub fn batch_from_reader(
                 }
                 decision_capnp::answer_value::Choice(probabilities) => {
                     let probabilities: Vec<f32> = probabilities?.iter().collect();
+                    // A choice answer must be able to match a valid spec
+                    // (D2: 2-255 options); anything else is malformed wire
+                    // data and must not enter the IR.
+                    if !(2..=255).contains(&probabilities.len()) {
+                        return Err(DecodeError::AnswerCardinalityOutOfRange {
+                            question_id,
+                            len: probabilities.len(),
+                            kind: "choice",
+                        });
+                    }
                     check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE).map_err(
                         |error| DecodeError::InvalidDistribution(question_id.clone(), error),
                     )?;
@@ -541,6 +691,15 @@ pub fn batch_from_reader(
                 }
                 decision_capnp::answer_value::Score(probabilities) => {
                     let probabilities: Vec<f32> = probabilities?.iter().collect();
+                    // A score answer must be able to match a valid spec
+                    // (D1: >= 2 levels).
+                    if probabilities.len() < 2 {
+                        return Err(DecodeError::AnswerCardinalityOutOfRange {
+                            question_id,
+                            len: probabilities.len(),
+                            kind: "score",
+                        });
+                    }
                     check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE).map_err(
                         |error| DecodeError::InvalidDistribution(question_id.clone(), error),
                     )?;

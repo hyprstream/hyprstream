@@ -674,10 +674,12 @@ fn calib_none_is_distinct_from_empty_string() {
 
 /// Encode-side guards mirror the decode-side ones: an abstained answer with a
 /// conformal set is rejected instead of emitting a message the decoder would
-/// refuse, and the wire kind tag is derived from the body even when a
-/// directly-constructed spec carries a conflicting `kind`.
+/// refuse, and a spec whose explicit `kind` disagrees with its body is
+/// rejected rather than silently rewritten — `DecisionSchema` and
+/// `validated_distribution` consult `kind`, so a rewritten tag would make
+/// the IR and the wire disagree after the round trip.
 #[test]
-fn encode_rejects_abstained_with_conformal_set_and_derives_kind_from_body() {
+fn encode_rejects_abstained_with_conformal_set_and_kind_mismatch() {
     let version = VersionTriple {
         schema: "s".into(),
         model: "m".into(),
@@ -693,7 +695,7 @@ fn encode_rejects_abstained_with_conformal_set_and_derives_kind_from_body() {
         decision::EncodeError::AbstainedWithConformalSet("q".into())
     );
 
-    // kind tag follows the body, not a stale denormalized field.
+    // kind/body disagreement is rejected instead of rewritten.
     let mut set: QuestionSet = hyprstream_decision::parse_yaml(
         r#"
 questions:
@@ -703,19 +705,13 @@ questions:
     )
     .expect("parses");
     set.questions[0].kind = hyprstream_decision::QuestionKind::Score;
-    let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encode"));
-    let message = capnp::serialize::read_message(
-        &mut &bytes[..],
-        capnp::message::ReaderOptions::new(),
-    )
-    .expect("parses");
-    let decoded = decision::question_set_from_reader(
-        message
-            .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
-            .expect("root"),
-    )
-    .expect("derived tag keeps the message decodable");
-    assert_eq!(decoded.questions[0].kind, hyprstream_decision::QuestionKind::Noul);
+    let error = decision::question_set_to_message(&set)
+        .err()
+        .expect("kind/body mismatch rejected at encode");
+    assert!(matches!(
+        error,
+        decision::EncodeError::KindBodyMismatch { .. }
+    ));
 }
 
 /// Encode-side distribution validation: NaN noul, out-of-range components,
@@ -839,6 +835,210 @@ fn encode_rejects_empty_ids_and_bad_choice_option_names() {
             ]
         },
     );
+}
+
+/// Round-6 encode/decode validation (review threads 2026-09-22 15:04/15:23):
+/// duplicate question ids, D1/D2 cardinalities, non-finite entry numbers,
+/// unbindable answers (empty ids, impossible vector lengths) are rejected at
+/// the boundary instead of entering the IR.
+#[test]
+fn encode_decode_reject_round6_contract_violations() {
+    let noul = |id: &str| hyprstream_decision::QuestionSpec {
+        id: id.to_owned(),
+        kind: hyprstream_decision::QuestionKind::Noul,
+        instructions: None,
+        body: hyprstream_decision::QuestionBody::Noul { criteria: None },
+    };
+    let choice = |id: &str, names: &[&str]| hyprstream_decision::QuestionSpec {
+        id: id.to_owned(),
+        kind: hyprstream_decision::QuestionKind::Choice,
+        instructions: None,
+        body: hyprstream_decision::QuestionBody::Choice {
+            options: names
+                .iter()
+                .map(|name| hyprstream_decision::ChoiceOption {
+                    name: (*name).to_owned(),
+                    rubric: None,
+                })
+                .collect(),
+        },
+    };
+    let score = |id: &str, levels: usize| hyprstream_decision::QuestionSpec {
+        id: id.to_owned(),
+        kind: hyprstream_decision::QuestionKind::Score,
+        instructions: None,
+        body: hyprstream_decision::QuestionBody::Score {
+            levels: vec![None; levels],
+        },
+    };
+
+    // Duplicate question ids are ambiguous (answers bind by id).
+    let set = QuestionSet {
+        state: None,
+        questions: vec![noul("q"), noul("q")],
+    };
+    assert!(matches!(
+        decision::question_set_to_message(&set),
+        Err(decision::EncodeError::DuplicateQuestionId(_))
+    ));
+
+    // Choice cardinality: D2 requires 2-255 options.
+    let set = QuestionSet {
+        state: None,
+        questions: vec![choice("q", &["only"])],
+    };
+    assert!(matches!(
+        decision::question_set_to_message(&set),
+        Err(decision::EncodeError::ChoiceCardinalityOutOfRange { len: 1, .. })
+    ));
+    let set = QuestionSet {
+        state: None,
+        questions: vec![choice(
+            "q",
+            &(0..256)
+                .map(|i| Box::leak(format!("o{i}").into_boxed_str()) as &str)
+                .collect::<Vec<_>>(),
+        )],
+    };
+    assert!(matches!(
+        decision::question_set_to_message(&set),
+        Err(decision::EncodeError::ChoiceCardinalityOutOfRange { len: 256, .. })
+    ));
+
+    // Score cardinality: D1 requires >= 2 levels.
+    let set = QuestionSet {
+        state: None,
+        questions: vec![score("q", 1)],
+    };
+    assert!(matches!(
+        decision::question_set_to_message(&set),
+        Err(decision::EncodeError::ScoreLevelCountInvalid { len: 1, .. })
+    ));
+
+    // Non-finite Entry::Number anywhere (state, rubric) is rejected.
+    let set = QuestionSet {
+        state: Some(Entry::Number(f64::NAN)),
+        questions: vec![noul("q")],
+    };
+    assert!(matches!(
+        decision::question_set_to_message(&set),
+        Err(decision::EncodeError::NonFiniteEntryNumber { question: None })
+    ));
+    let set = QuestionSet {
+        state: None,
+        questions: vec![hyprstream_decision::QuestionSpec {
+            id: "q".into(),
+            kind: hyprstream_decision::QuestionKind::Choice,
+            instructions: None,
+            body: hyprstream_decision::QuestionBody::Choice {
+                options: vec![
+                    hyprstream_decision::ChoiceOption {
+                        name: "a".into(),
+                        rubric: Some(Entry::Map(vec![(
+                            "rate".to_owned(),
+                            Entry::Number(f64::INFINITY),
+                        )])),
+                    },
+                    hyprstream_decision::ChoiceOption {
+                        name: "b".into(),
+                        rubric: None,
+                    },
+                ],
+            },
+        }],
+    };
+    assert!(matches!(
+        decision::question_set_to_message(&set),
+        Err(decision::EncodeError::NonFiniteEntryNumber {
+            question: Some(_)
+        })
+    ));
+
+    // A well-formed set still round-trips exactly (all validations pass).
+    let set = QuestionSet {
+        state: Some(Entry::Number(1.5)),
+        questions: vec![choice("q", &["a", "b"]), score("s", 3)],
+    };
+    let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encodes"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
+    let decoded = decision::question_set_from_reader(
+        message
+            .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
+            .expect("root"),
+    )
+    .expect("decodes");
+    assert_eq!(decoded, set);
+}
+
+/// The decoder rejects unbindable answers: empty question ids and
+/// distribution lengths no valid spec could match (choice 2-255, score >= 2).
+#[test]
+fn decode_rejects_unbindable_answers() {
+    let raw_batch = |question_id: &str, probs: &[f32]| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut root = message
+                .init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
+            let mut triple = root.reborrow().init_version();
+            triple.set_schema("s");
+            triple.set_model("m");
+            triple.init_calib().set_none(());
+            let rows = root.init_rows(1);
+            let answers = rows.get(0).init_answers(1);
+            let mut answer = answers.get(0);
+            answer.set_question_id(question_id);
+            let mut list = answer.init_value().init_choice(probs.len() as u32);
+            for (index, p) in probs.iter().enumerate() {
+                list.set(index as u32, *p);
+            }
+        }
+        wire_roundtrip(&message)
+    };
+    let decode = |bytes: &[u8]| {
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
+        let reader = message
+            .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
+            .expect("root");
+        decision::batch_from_reader(reader)
+    };
+
+    // Empty answer question id: cannot bind to any valid question.
+    let bytes = raw_batch("", &[0.5, 0.5]);
+    assert!(matches!(
+        decode(&bytes),
+        Err(decision::DecodeError::EmptyAnswerQuestionId)
+    ));
+
+    // One-component choice: no valid spec (D2 min 2) can match it.
+    let bytes = raw_batch("q", &[1.0]);
+    assert!(matches!(
+        decode(&bytes),
+        Err(decision::DecodeError::AnswerCardinalityOutOfRange {
+            len: 1,
+            kind: "choice",
+            ..
+        })
+    ));
+
+    // 256-component choice: beyond the D2 maximum of 255.
+    let uniform = vec![1.0f32 / 256.0; 256];
+    let bytes = raw_batch("q", &uniform);
+    assert!(matches!(
+        decode(&bytes),
+        Err(decision::DecodeError::AnswerCardinalityOutOfRange {
+            len: 256,
+            kind: "choice",
+            ..
+        })
+    ));
 }
 
 /// The conformal-set field is an explicit option wrapper (review thread,
