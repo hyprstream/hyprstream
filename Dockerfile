@@ -396,7 +396,10 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
 # Note: --no-default-features excludes systemd (not needed in containers).
-# credential-pds is mandatory for the production encrypted UserStore boundary.
+# The staging production profile uses the encrypted networked account store and
+# the networked PDS record store.  It intentionally excludes credential-pds,
+# which selects PGlite, while retaining RocksDB for the independent anonymous
+# device/refresh-token store.
 # Cache mounts:
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
@@ -414,7 +417,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
+    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb \
     && mkdir -p /out \
     && cp "${CARGO_TARGET_DIR:-/build/target}/release/hyprstream" /out/hyprstream
 
