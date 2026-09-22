@@ -1,0 +1,124 @@
+name: Publish staging arm64 runtime candidate
+
+# This workflow must first land on the default branch for GitHub to expose its
+# workflow_dispatch trigger. After that, an operator may dispatch it against a
+# reviewed branch ref. It publishes exactly one digest-pinned, arm64 runtime
+# candidate; it never moves main, latest, edge, or release tags.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_source_sha:
+        description: Exact reviewed 40-hex source SHA selected by the dispatch ref
+        required: true
+        type: string
+      oci_validation_run_id:
+        description: Successful exact-SHA OCI Runtime Image Validation run ID
+        required: true
+        type: string
+      preflight_run_id:
+        description: Successful exact-SHA Merge-gate preflight run ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+concurrency:
+  group: staging-arm64-candidate-${{ inputs.expected_source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 90
+    env:
+      PODMAN_ROOT: /mnt/hypr-ci-cache/podman-staging-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+      PODMAN_RUNROOT: /mnt/hypr-ci-cache/podman-staging-candidate-run-${{ github.run_id }}-${{ github.run_attempt }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      OCI_VALIDATION_RUN_ID: ${{ inputs.oci_validation_run_id }}
+      PREFLIGHT_RUN_ID: ${{ inputs.preflight_run_id }}
+      IMAGE: ghcr.io/hyprstream/hyprstream
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify reviewed source and successful exact-SHA gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          [[ "${EXPECTED_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "${actual}" = "${GITHUB_SHA}"
+          test "${actual}" = "${EXPECTED_SOURCE_SHA}"
+
+          verify_run() {
+            local run_id="$1"
+            local workflow_name="$2"
+            [[ "${run_id}" =~ ^[0-9]+$ ]]
+            local run
+            run="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+            jq -e \
+              --arg workflow_name "${workflow_name}" \
+              --arg source_sha "${actual}" \
+              '.name == $workflow_name and .head_sha == $source_sha and .conclusion == "success"' \
+              <<<"${run}" >/dev/null
+          }
+
+          verify_run "${OCI_VALIDATION_RUN_ID}" 'OCI Runtime Image Validation'
+          verify_run "${PREFLIGHT_RUN_ID}" 'Merge-gate preflight'
+          printf 'Source: `%s`\nOCI validation: `%s`\nPreflight: `%s`\n' \
+            "${actual}" "${OCI_VALIDATION_RUN_ID}" "${PREFLIGHT_RUN_ID}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to Container Registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${REGISTRY_TOKEN}" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and verify native arm64 runtime candidate
+        id: build
+        run: |
+          set -euo pipefail
+          candidate="${IMAGE}:staging-sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-cpu-arm64"
+          mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+          podman --root "${PODMAN_ROOT}" --runroot "${PODMAN_RUNROOT}" build \
+            --target runtime \
+            --build-arg VARIANT=cpu-arm64 \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${candidate}" \
+            -f Dockerfile \
+            .
+          test "$(podman --root "${PODMAN_ROOT}" --runroot "${PODMAN_RUNROOT}" \
+            image inspect --format '{{.Config.User}}' "${candidate}")" = '65532:65532'
+          test "$(podman --root "${PODMAN_ROOT}" --runroot "${PODMAN_RUNROOT}" \
+            image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "${candidate}")" = "${GITHUB_SHA}"
+          echo "candidate=${candidate}" >> "$GITHUB_OUTPUT"
+
+      - name: Push immutable staging candidate and record digest
+        id: push
+        env:
+          CANDIDATE: ${{ steps.build.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          digest_file="${RUNNER_TEMP}/staging-arm64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.digest"
+          podman --root "${PODMAN_ROOT}" --runroot "${PODMAN_RUNROOT}" push \
+            --digestfile "${digest_file}" "${CANDIDATE}"
+          digest="$(cat "${digest_file}")"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          podman manifest inspect "${CANDIDATE}@${digest}" >/dev/null
+          printf 'Candidate: `%s@%s`\n' "${CANDIDATE}" "${digest}" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up candidate build storage
+        if: always()
+        run: |
+          podman --root "${PODMAN_ROOT}" --runroot "${PODMAN_RUNROOT}" system reset --force || true
