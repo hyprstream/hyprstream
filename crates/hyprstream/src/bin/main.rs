@@ -383,13 +383,10 @@ fn load_config(path: Option<&std::path::Path>) -> Result<HyprConfig> {
         }
         None => {
             info!("Loading config from default locations");
-            match HyprConfig::load() {
-                Ok(config) => Ok(config),
-                Err(e) => {
-                    info!("No config file found ({}), using defaults", e);
-                    Ok(HyprConfig::default())
-                }
-            }
+            // Optional files and defaults are handled inside load(). A load
+            // error means invalid configuration, not an absent file; replacing
+            // it with defaults can silently change the selected account store.
+            HyprConfig::load().context("Failed to load default-location configuration")
         }
     }
 }
@@ -5689,6 +5686,44 @@ mod native_launcher {
             !hyprstream_rpc::paths::service_pid_file(missing_supervisor).exists(),
             "a never-ready child must not publish a PID file"
         );
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod config_load_failure_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_config_never_defaults_account_selection() -> Result<()> {
+        const CHILD: &str = "HYPRSTREAM_CONFIG_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir()?;
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("HYPRSTREAM__") {
+                    child.env_remove(key);
+                }
+            }
+            let status = child.args([
+                "--exact", "config_load_failure_tests::invalid_config_never_defaults_account_selection",
+                "--nocapture",
+            ])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres")
+                .env("HYPRSTREAM__OAUTH__PORT", "invalid-port")
+                .status()?;
+            anyhow::ensure!(status.success(), "invalid configuration child failed");
+            return Ok(());
+        }
+        let error = match load_config(None) {
+            Ok(_) => anyhow::bail!("invalid port discarded PostgreSQL selection"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("Failed to load default-location configuration"));
         Ok(())
     }
 }

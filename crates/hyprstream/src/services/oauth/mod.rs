@@ -877,8 +877,12 @@ impl Spawnable for OAuthService {
             // credential-store boundary. Account-store construction failure
             // fails closed; no caller can inject a raw backend here.
             let credentials_config = crate::config::HyprConfig::load()
-                .map(|c| c.credentials)
-                .unwrap_or_default();
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "failed to load production credential configuration: {error}"
+                    ))
+                })?
+                .credentials;
             let (user_store, device_store_opt) =
                 crate::auth::ProductionUserStore::open_with_device_store(
                     &credentials_dir,

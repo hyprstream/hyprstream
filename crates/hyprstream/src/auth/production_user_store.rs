@@ -7,9 +7,7 @@
 
 use super::UserStore;
 use crate::config::{CredentialsBackend, CredentialsConfig, HyprConfig};
-use anyhow::Result;
-#[cfg(feature = "pglite")]
-use anyhow::Context;
+use anyhow::{Context, Result};
 use std::{ops::Deref, path::Path, sync::Arc};
 
 /// Opaque handle proving that an account store passed production admission.
@@ -77,8 +75,8 @@ impl ProductionUserStore {
     /// admission boundary.
     pub async fn open(credentials_dir: &Path) -> Result<Self> {
         let config = HyprConfig::load()
-            .map(|config| config.credentials)
-            .unwrap_or_default();
+            .context("failed to load production credential configuration")?
+            .credentials;
         Self::open_with_config(credentials_dir, &config).await
     }
 
@@ -259,6 +257,40 @@ impl EncryptedUserStoreBackend for super::PostgresUserStore {}
 #[cfg(all(test, feature = "encrypted-account-admission"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_config_never_defaults_account_selection() -> Result<()> {
+        const CHILD: &str = "HYPRSTREAM_STORE_CONFIG_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir()?;
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("HYPRSTREAM__") {
+                    child.env_remove(key);
+                }
+            }
+            let status = child.args([
+                "--exact", "auth::production_user_store::tests::invalid_config_never_defaults_account_selection",
+                "--nocapture",
+            ])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres")
+                .env("HYPRSTREAM__OAUTH__PORT", "invalid-port")
+                .status()?;
+            anyhow::ensure!(status.success(), "invalid credential configuration child failed");
+            return Ok(());
+        }
+        let credentials = tempfile::tempdir()?;
+        let error = match ProductionUserStore::open(credentials.path()).await {
+            Ok(_) => anyhow::bail!("invalid configuration opened an account store"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("failed to load production credential configuration"));
+        assert_eq!(std::fs::read_dir(credentials.path())?.count(), 0);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn production_boundary_rejects_plaintext_backends_before_opening_storage() -> Result<()> {
