@@ -187,21 +187,20 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
     ])
 }
 
-/// Renormalize an accepted distribution to producer tolerance: divide
-/// through, then — only if the divided vector still misses the f32
-/// sequential-sum tolerance — correct one maximal component by the
-/// residual. The correction preserves the D6 argmax on purpose: dumping
-/// the residual on an arbitrary maximum (or every correction landing on
-/// the last tied component) can turn a rounded tie (seven options at
-/// 0.1429) into a unique winner at the wrong index. A shortfall bumps the
-/// EARLIEST maximal component (a unique winner there matches the
-/// earliest-index tie-break); an overage shrinks the LATEST maximal
-/// component (the earliest tied maxima keep their win). Wire
-/// distributions are accepted at consumer tolerance; the producer-side IR
-/// and batch validators require the tighter producer tolerance, so the
-/// boundary normalizes on the way in. Also used for locally constructed
-/// distributions (TruthSubject's uniform fallback, teacher ensemble
-/// averages) that must satisfy the same producer tolerance.
+/// Renormalize an accepted distribution to producer tolerance, in three
+/// stages: divide through; then an order-preserving uniform-share
+/// correction (monotone in f32, so ties and leader gaps survive); then, as
+/// a last resort for vectors no uniform correction can reach (f32
+/// sequential-sum granularity, e.g. exactly uniform high-cardinality
+/// ones), a single-component correction that preserves the D6 argmax
+/// (shortfall bumps the EARLIEST maximal component — a unique winner
+/// there matches the earliest-index tie-break — overage shrinks the
+/// LATEST maximal one). Wire distributions are accepted at consumer
+/// tolerance; the producer-side IR and batch validators require the
+/// tighter producer tolerance, so the boundary normalizes on the way in.
+/// Also used for locally constructed distributions (TruthSubject's
+/// uniform fallback, teacher ensemble averages) that must satisfy the
+/// same producer tolerance.
 pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
@@ -214,6 +213,29 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
         return;
     }
+    // Order-preserving correction: adding the same share to every component
+    // is monotone in f32, so ties stay ties and no leader can cross its
+    // runner-up (a single-component correction by a large residual could
+    // flip the argmax when two leading probabilities are closer than the
+    // residual — observed on a consumer-valid 41-way vector).
+    let residual = 1.0 - probabilities.iter().sum::<f32>();
+    #[allow(clippy::cast_precision_loss)]
+    let share = residual / probabilities.len().max(1) as f32;
+    if share != 0.0 {
+        for p in probabilities.iter_mut() {
+            *p += share;
+        }
+    }
+    if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
+        return;
+    }
+    // Last resort (f32 sequential-sum granularity makes some vectors,
+    // e.g. exactly uniform high-cardinality ones, unreachable by uniform
+    // correction): correct one maximal component, preserving the D6
+    // argmax — a shortfall bumps the EARLIEST maximal component (a unique
+    // winner there matches the earliest-index tie-break), an overage
+    // shrinks the LATEST maximal one (the earliest tied maxima keep
+    // their win).
     let residual = 1.0 - probabilities.iter().sum::<f32>();
     let max = probabilities
         .iter()
@@ -824,6 +846,51 @@ questions:
             hyprstream_decision::confidence::argmax_index(&probabilities),
             Some(0),
             "D6: earliest index"
+        );
+    }
+
+    #[test]
+    fn wire_normalization_preserves_a_near_tied_argmax() {
+        // Consumer-valid 41-way response summing to 1.0045794 with two
+        // leading probabilities 4e-8 apart: a single-component residual
+        // correction (-1.1e-4) would cross the runner-up and flip the D6
+        // argmax; the order-preserving correction must not.
+        let options = (0..41)
+            .map(|i| hyprstream_decision::spec::ChoiceOption {
+                name: format!("o{i}"),
+                rubric: None,
+            })
+            .collect();
+        let question = QuestionSpec {
+            id: "wide41".into(),
+            kind: hyprstream_decision::QuestionKind::Choice,
+            instructions: None,
+            body: QuestionBody::Choice { options },
+        };
+        let rest = (1.0045794f64 - 0.02450203 - 0.02450199) / 39.0;
+        let mut map = serde_json::Map::new();
+        map.insert("o0".to_owned(), serde_json::json!(0.02450203));
+        map.insert("o1".to_owned(), serde_json::json!(0.02450199));
+        for i in 2..41 {
+            map.insert(format!("o{i}"), serde_json::json!(rest));
+        }
+        let parsed = parse_answer(
+            &question,
+            &serde_json::json!({"type": "choice", "probabilities": map}),
+        )
+        .unwrap();
+        let probabilities = parsed.value.as_ref().unwrap().probabilities();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+            .unwrap();
+        assert!(
+            probabilities[0] > probabilities[1],
+            "the leader gap must survive normalization: {:?}",
+            &probabilities[..2]
+        );
+        assert_eq!(
+            hyprstream_decision::confidence::argmax_index(&probabilities),
+            Some(0),
+            "D6 argmax must not flip"
         );
     }
 

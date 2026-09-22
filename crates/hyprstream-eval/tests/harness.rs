@@ -600,3 +600,21 @@ async fn unmeasured_breakdown_metrics_are_absent_not_zero() {
         assert_eq!(bucket.accuracy, None, "stratum {}", bucket.key);
     }
 }
+
+#[tokio::test]
+async fn run_items_rejects_an_empty_question_id_before_the_subject() {
+    // The authoring layer requires nonempty ids; a programmatically built
+    // empty id must fail the shared preflight, not reach a subject (an
+    // HTTP subject would get a wire-level rejection instead — the
+    // preflight must be consistent across subject implementations).
+    let mut item = noul_item();
+    item.question.id = String::new();
+    let items = vec![item];
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_items(&items, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "empty question id must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
