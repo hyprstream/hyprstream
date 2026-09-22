@@ -51,6 +51,25 @@ pub trait Subject: Send + Sync {
     fn resolved_model_id(&self) -> String {
         self.model_id().to_owned()
     }
+
+    /// Decide one row and return the model version bound to THAT response.
+    /// Runs stamp one version on every row, so the version must come from
+    /// the same exchange as the answers: reading `resolved_model_id` after
+    /// `decide` races with another concurrent run sharing this subject (its
+    /// response can overwrite the resolved slot in between). The default
+    /// implementation composes the two and is correct for subjects whose
+    /// resolved id never changes; `HttpSubject` overrides it to return the
+    /// version from its own response.
+    async fn decide_with_version(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        row: usize,
+    ) -> Result<(AnswerRow, String), EvalError> {
+        let answers = self.decide(set, state, row).await?;
+        let resolved = self.resolved_model_id();
+        Ok((answers, resolved))
+    }
 }
 
 /// Ordered JSON for the request wire. serde_json's own `Map` is a BTreeMap in
@@ -442,27 +461,15 @@ impl HttpSubject {
     pub fn requested_model(&self) -> &str {
         &self.model
     }
-}
-
-#[async_trait]
-impl Subject for HttpSubject {
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-
-    fn resolved_model_id(&self) -> String {
-        self.resolved
-            .read()
-            .clone()
-            .unwrap_or_else(|| self.model.clone())
-    }
-
-    async fn decide(
+    /// POST one decide request, returning the parsed answers and the model
+    /// version THIS response resolved to (when the server reported one).
+    /// The version travels with the answers so a concurrent run sharing
+    /// this subject cannot overwrite the resolved slot in between.
+    async fn post(
         &self,
         set: &QuestionSet,
         state: &Entry,
-        _row: usize,
-    ) -> Result<AnswerRow, EvalError> {
+    ) -> Result<(AnswerRow, Option<String>), EvalError> {
         let body = request_body(set, state, &self.model);
         let response = self
             .client
@@ -486,10 +493,48 @@ impl Subject for HttpSubject {
         }
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
-        if let Some(model) = parsed.get("model").and_then(Value::as_str) {
-            *self.resolved.write() = Some(model.to_owned());
+        let resolved = parsed
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(model) = &resolved {
+            *self.resolved.write() = Some(model.clone());
         }
-        parse_response_answers(set, &parsed)
+        Ok((parse_response_answers(set, &parsed)?, resolved))
+    }
+}
+
+#[async_trait]
+impl Subject for HttpSubject {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn resolved_model_id(&self) -> String {
+        self.resolved
+            .read()
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, EvalError> {
+        Ok(self.post(set, state).await?.0)
+    }
+
+    async fn decide_with_version(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        _row: usize,
+    ) -> Result<(AnswerRow, String), EvalError> {
+        let (answers, resolved) = self.post(set, state).await?;
+        let resolved = resolved.unwrap_or_else(|| self.resolved_model_id());
+        Ok((answers, resolved))
     }
 }
 

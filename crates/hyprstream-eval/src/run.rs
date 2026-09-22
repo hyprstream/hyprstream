@@ -156,13 +156,15 @@ pub struct RunOutput {
 pub struct Harness;
 
 impl Harness {
-    /// Run an [`EvalSet`] against a subject: one `decide` per row, answers
-    /// validated by the Arrow batch builder (kind/cardinality/producer
-    /// tolerance are enforced there — a malformed subject fails loudly), plus
-    /// the observation stream. The decision schema and every row's truth keys
-    /// are validated **before** the first subject call (an HTTP-backed model
-    /// bills per row). The version triple records the subject's **resolved**
-    /// model id after the run (HTTP alias resolution).
+    /// Run an [`EvalSet`] against a subject: one `decide` per row, each row's
+    /// answers validated immediately after its call (presence, kind,
+    /// cardinality, producer tolerance, abstention/conformal-set invariants —
+    /// the same rules the Arrow batch builder enforces), plus the observation
+    /// stream. The decision schema and every row's truth keys are validated
+    /// **before** the first subject call (an HTTP-backed model bills per
+    /// row). The version triple records the subject's **resolved** model id
+    /// from the first response (HTTP alias resolution); a response resolving
+    /// to a different version mid-run (rolling deploy) fails the run.
     pub async fn run_set(
         &self,
         set: &EvalSet,
@@ -208,18 +210,29 @@ impl Harness {
         // Pin the resolved model id from the FIRST response: an HTTP subject
         // re-resolves its alias per response, and a rolling deploy mid-run
         // would otherwise stamp every row with the LAST resolved version,
-        // mislabeling the earlier rows.
+        // mislabeling the earlier rows. The version is read from the same
+        // exchange as the answers (`decide_with_version`) so a concurrent
+        // run sharing the subject cannot overwrite it in between.
         let mut pinned_model: Option<String> = None;
         for (row_index, row) in set.rows.iter().enumerate() {
-            let answers = subject
-                .decide(&question_set, &row.state, row_index)
+            let (answers, resolved) = subject
+                .decide_with_version(&question_set, &row.state, row_index)
                 .await
                 .map_err(|error| EvalError::Subject {
                     model: subject.model_id().to_owned(),
                     item_id: row.id.clone(),
                     message: error.to_string(),
                 })?;
-            let resolved = subject.resolved_model_id();
+            // Validate THIS row's answers before requesting the next one: a
+            // malformed answer is a deterministic failure, and with an
+            // HTTP-backed subject every subsequent row is a billed call
+            // (build_batch would only report it after the whole run).
+            validate_set_answer_row(&question_set, &answers).map_err(|message| {
+                EvalError::InvalidAnswer {
+                    question_id: row.id.clone(),
+                    message,
+                }
+            })?;
             match &pinned_model {
                 None => pinned_model = Some(resolved),
                 Some(pinned) if *pinned != resolved => {
@@ -298,15 +311,14 @@ impl Harness {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
             };
-            let answers = subject
-                .decide(&set, &item.state, row_index)
+            let (answers, resolved) = subject
+                .decide_with_version(&set, &item.state, row_index)
                 .await
                 .map_err(|error| EvalError::Subject {
                     model: subject.model_id().to_owned(),
                     item_id: item.id.clone(),
                     message: error.to_string(),
                 })?;
-            let resolved = subject.resolved_model_id();
             match &pinned_model {
                 None => pinned_model = Some(resolved),
                 Some(pinned) if *pinned != resolved => {

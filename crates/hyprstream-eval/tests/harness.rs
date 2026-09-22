@@ -747,3 +747,65 @@ fn flip_rate_compares_each_question_against_its_own_base() {
     assert_eq!(flip.groups, 1);
     assert_eq!(flip.flip_rate, 0.0);
 }
+
+/// Answers row 0 correctly and omits the answer on every later row.
+struct MalformedOnSecondRowSubject(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl Subject for MalformedOnSecondRowSubject {
+    fn model_id(&self) -> &str {
+        "malformed-second"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        _row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut answers = std::collections::BTreeMap::new();
+        if call == 0 {
+            for question in &set.questions {
+                answers.insert(
+                    question.id.clone(),
+                    QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
+                );
+            }
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn run_set_validates_each_row_before_requesting_the_next() {
+    // A malformed answer on row 1 is a deterministic failure: with an
+    // HTTP-backed subject every later row is a billed call, so the run must
+    // stop there instead of validating only at build_batch after the loop.
+    let question = noul_item().question;
+    let row = |id: &str| hyprstream_eval::EvalRow {
+        id: id.into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        truth: std::collections::BTreeMap::new(),
+    };
+    let set = hyprstream_eval::EvalSet {
+        name: "t".into(),
+        schema_version: "v1".into(),
+        questions: vec![question],
+        rows: vec![row("r1"), row("r2"), row("r3")],
+    };
+    let subject = MalformedOnSecondRowSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_set(&set, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
+        "malformed row must be InvalidAnswer, got {error:?}"
+    );
+    assert_eq!(
+        subject.0.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "row 3 must not be requested after row 2 failed validation"
+    );
+}

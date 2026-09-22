@@ -129,6 +129,26 @@ async fn http_subject_records_the_resolved_model_id() {
 }
 
 #[tokio::test]
+async fn decide_with_version_binds_the_version_to_its_own_response() {
+    // Runs stamp one version on every row; the version must come from the
+    // same exchange as the answers, not from a shared mutable slot a
+    // concurrent run could overwrite in between.
+    let (address, server) = serve_stub().await;
+    let subject = HttpSubject::new(
+        format!("http://{address}"),
+        "jev-stub-latest",
+        "eval-harness",
+    );
+    let (answers, resolved) = subject
+        .decide_with_version(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .await
+        .unwrap();
+    assert_eq!(resolved, hyprstream_decision_stub::mock::STUB_MODEL_VERSION);
+    assert_eq!(answers.answers.len(), fixture().questions.len());
+    server.abort();
+}
+
+#[tokio::test]
 async fn wire_preserves_declared_option_order_end_to_end() {
     // The mock's distributions are a hash of the canonical question
     // serialization, which is option-order sensitive. If the harness's
