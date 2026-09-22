@@ -905,3 +905,20 @@ fn flip_rate_skips_members_whose_question_the_base_row_abstained_on() {
     assert_eq!(flip.groups, 1);
     assert_eq!(flip.flip_rate, 0.0);
 }
+
+#[tokio::test]
+async fn flip_rate_is_none_when_no_group_contributes() {
+    // No permutation groups: the robustness result is UNMEASURED and must
+    // stay None — a `Some(0.0)` would read as computed permutation-robustness.
+    let mut items: Vec<EvalItem> = small_items().iter().take(5).map(EvalItem::from).collect();
+    for item in &mut items {
+        item.group = None;
+    }
+    let subject = truth_subject_for(&items);
+    let output = Harness.run_items(&items, &subject).await.unwrap();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    assert!(
+        report.flip_rate.is_none(),
+        "no permutation groups: unmeasured, never a fake 0.0"
+    );
+}

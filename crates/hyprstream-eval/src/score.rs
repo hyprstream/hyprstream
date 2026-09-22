@@ -131,10 +131,11 @@ pub struct ScoreReport {
     /// Per-stratum breakdown.
     pub by_stratum: Vec<BreakdownMetrics>,
     /// Option-order flip rate over permutation groups. `None` = **not
-    /// computed** (labels were not available to the scorer — see
-    /// [`flip_rate_with_labels`]); `Some` with `flip_rate == 0.0` = computed,
-    /// no flips. The distinction matters: an uncomputed rate must never be
-    /// misread as permutation-robustness.
+    /// computed** (labels were not available to the scorer, or no group
+    /// contributed a base/member pair — see [`flip_rate_with_labels`]);
+    /// `Some` with `flip_rate == 0.0` = computed, no flips. The distinction
+    /// matters: an uncomputed rate must never be misread as
+    /// permutation-robustness.
     pub flip_rate: Option<FlipRate>,
     /// Overall abstention rate.
     pub abstention_rate: f64,
@@ -495,19 +496,23 @@ pub fn flip_rate_with_labels(
 /// with each item's own labels. (`score_run` cannot reconstruct labels from
 /// observations alone — indices rotate under permutation, so index comparison
 /// would report spurious flips, S6b1 — and therefore reports `flip_rate:
-/// None`, "not computed".)
+/// None`, "not computed".) The flip rate stays `None` when no permutation
+/// group contributed a base/member pair (no groups, all-abstained bases, …)
+/// — an unmeasured robustness result must never look like a computed
+/// zero-flip result.
 pub fn score_bench_run(
     output: &RunOutput,
     items: &[crate::run::EvalItem],
     config: &ScoreConfig,
 ) -> Result<ScoreReport, EvalError> {
     let mut report = score_run(output, config)?;
-    report.flip_rate = Some(flip_rate_with_labels(&output.observations, |question_id| {
+    let flip = flip_rate_with_labels(&output.observations, |question_id| {
         items
             .iter()
             .find(|item| item.question.id == question_id)
             .map(|item| item.question.labels())
-    }));
+    });
+    report.flip_rate = (flip.groups > 0).then_some(flip);
     Ok(report)
 }
 
