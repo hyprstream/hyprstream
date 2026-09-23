@@ -16,6 +16,13 @@
 # the browser conformance phases live in the test job.
 set -euo pipefail
 
+# This is the exact feature set embedded in the staging OCI artifact. Keep
+# PGlite's credential-pds feature out of this binary; networked Postgres is
+# the account and PDS store, while RocksDB remains only for device/refresh
+# persistence. The OCI runtime job exercises this same profile against a real
+# disposable PostgreSQL instance.
+readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb'
+
 bash "$(dirname "${BASH_SOURCE[0]}")/verify-libtorch.sh"
 
 # The rust toolchain lives under root's home in the image; the workflow made
@@ -57,9 +64,14 @@ run_phase() {
   return "${status}"
 }
 
-# Default features (parity with the former x86 gate); libtorch is the image's
-# aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
-run_phase "native release build" cargo build --release
+run_phase "staging Postgres image-profile contract" \
+  bash .github/scripts/check-postgres-image-profile.sh
+
+# The image profile, not default features: libtorch is the image's aarch64
+# wheel at /opt/libtorch, so NO download-libtorch feature here.
+run_phase "native staging Postgres image-profile release build" \
+  cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features \
+    --features "${STAGING_POSTGRES_IMAGE_FEATURES}"
 
 # The `metrics` standalone profile (DuckDB-backed; mutually exclusive with the
 # default PGlite build at link time) was removed from the required gate on
@@ -68,17 +80,13 @@ run_phase "native release build" cargo build --release
 # coverage continues in .github/workflows/metrics-profile-nightly.yml; restore
 # both phases here if the metrics service becomes production.
 
-# The RDS-backed PDS record store (#1257) is feature-gated and absent from
-# the default-feature build above; check its full target set and run its
-# contract/unit tests. Live DB tests skip themselves green unless
-# HYPRSTREAM_POSTGRES_TEST_URL_FILE points at a scratch database.
-run_phase "pds-postgres feature check" cargo check -p hyprstream --locked --all-targets --features pds-postgres
-# Fail a lane when its filter selects zero tests: libtest exits 0 on "0
-# filtered in", so a renamed or moved module would otherwise pass vacuously.
-# The --list probe reuses the already-built test binary (no extra compile).
-# The probe's cargo exit is captured before any pipeline and surfaced as-is:
-# a nonzero probe (e.g. failed test build) fails the lane even if the output
-# still contains test lines.
+# The RDS-backed PDS record store (#1257) is feature-gated. Fail a lane when
+# its filter selects zero tests: libtest exits 0 on "0 filtered in", so a
+# renamed or moved module would otherwise pass vacuously. The --list probe
+# reuses the already-built test binary (no extra compile). The probe's cargo
+# exit is captured before any pipeline and surfaced as-is: a nonzero probe
+# (e.g. failed test build) fails the lane even if the output still contains
+# test lines.
 assert_tests_selected() {
   local label="$1"
   shift
@@ -99,6 +107,19 @@ assert_tests_selected() {
   fi
   echo "${label}: ${selected} tests selected"
 }
+
+# Check the whole embedded image profile and its deterministic contracts. The
+# live-Postgres qualification is intentionally separate in the OCI merge-group
+# job: these tests may skip when no database URL file is supplied and cannot
+# serve as live database evidence.
+run_phase "staging Postgres image-profile feature check" \
+  cargo check -p hyprstream --locked --all-targets --no-default-features \
+    --features "${STAGING_POSTGRES_IMAGE_FEATURES}"
+image_pg_test_args=(-p hyprstream --locked --lib --no-default-features \
+    --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- \
+    services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds)
+assert_tests_selected "staging Postgres image-profile contract tests" "${image_pg_test_args[@]}"
+run_phase "staging Postgres image-profile contract tests" cargo test "${image_pg_test_args[@]}"
 
 # The KV shell and RDS contract tests live in hyprstream-pds (pgsql_kv:: and
 # rds::tests::); the resolver-side Postgres accepted-state authority tests
