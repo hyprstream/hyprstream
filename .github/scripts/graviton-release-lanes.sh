@@ -117,7 +117,7 @@ run_phase "staging Postgres image-profile feature check" \
     --features "${STAGING_POSTGRES_IMAGE_FEATURES}"
 image_pg_test_args=(-p hyprstream --locked --lib --no-default-features \
     --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- \
-    services::pds_record_pg:: services::discovery::pg_tests:: config::tests::rds)
+    services::pds_record_rocksdb::pg_tests:: config::tests::rds)
 assert_tests_selected "staging Postgres image-profile contract tests" "${image_pg_test_args[@]}"
 run_phase "staging Postgres image-profile contract tests" cargo test "${image_pg_test_args[@]}"
 
