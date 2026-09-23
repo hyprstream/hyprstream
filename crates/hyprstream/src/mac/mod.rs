@@ -264,10 +264,20 @@ mod production_dispatch_tests {
             pep.check(&policy, "policy", Some(&[17])),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
         );
+        // Ordinal 0 is now the declared `check` row (added by the staged
+        // policy dispatch work): the tokenless policy CA is its sanctioned
+        // caller, so the exact-authority requirement shows up as Permit while
+        // every other service stays denied (asserted above for registry).
+        // Undeclared ordinals must still deny; one is pinned below.
         assert_eq!(
             pep.check(&policy, "policy", Some(&[0])),
+            MacDecision::Permit,
+            "the tokenless policy authority reaches its own declared check row",
+        );
+        assert_eq!(
+            pep.check(&policy, "policy", Some(&[2])),
             MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
-            "policy check must not report the root authority's access as another user's result",
+            "undeclared ordinals keep denying; the root authority's access must not be reported as another user's result",
         );
     }
 }
