@@ -1,14 +1,12 @@
 //! Coverage-gated MAC activation control and verified-subject context cache.
 //!
-//! The reference monitor is always present.  The operator control only selects
-//! which subject context it receives:
-//! - [`MacActivationMode::FloorOnly`] uses the anonymous floor;
-//! - [`MacActivationMode::IdentityAware`] uses a context derived from verified
-//!   `Claims × VerifiedKeyMaterial`.
-//!
-//! Widening is refused unless the supplied genesis report is complete.  No
-//! startup path calls [`MacActivationControl::widen_identity_aware`]
-//! automatically; narrowing is always available.
+//! The reference monitor is always present.  The process defaults to
+//! [`MacActivationMode::IdentityAware`] (standard IAM: the verified subject
+//! context from `Claims × VerifiedKeyMaterial`).  The operator can narrow to
+//! [`MacActivationMode::FloorOnly`] as a killswitch via
+//! [`MacActivationControl::narrow_to_floor`], and can re-widen with
+//! [`MacActivationControl::widen_identity_aware`] once the genesis report
+//! evidence is complete.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -107,7 +105,11 @@ pub struct MacActivationControl {
 impl Default for MacActivationControl {
     fn default() -> Self {
         Self {
-            mode: AtomicU8::new(FLOOR_ONLY),
+            // Default to IdentityAware: the runtime boots with the verified
+            // subject context from the envelope (standard IAM). FloorOnly
+            // remains available as a deliberate killswitch via
+            // `narrow_to_floor()`.
+            mode: AtomicU8::new(IDENTITY_AWARE),
             unverified_attach_transports: RwLock::new(BTreeSet::new()),
         }
     }
