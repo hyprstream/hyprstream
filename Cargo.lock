@@ -7723,6 +7723,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-synthesis"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hyprstream-bench",
+ "hyprstream-decision",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
