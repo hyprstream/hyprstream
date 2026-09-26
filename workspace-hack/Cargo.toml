@@ -33,6 +33,8 @@ bytes = { version = "1", features = ["serde"] }
 capnp = { version = "0.24", features = ["unaligned"] }
 chrono = { version = "0.4", features = ["serde"] }
 cipher = { version = "0.4", default-features = false, features = ["block-padding", "zeroize"] }
+clap = { version = "4", features = ["derive"] }
+clap_builder = { version = "4", default-features = false, features = ["color", "help", "std", "suggestions", "usage"] }
 compact_str = { version = "0.9", features = ["serde"] }
 concurrent-queue = { version = "2" }
 const-oid-93f6ce9d446188ac = { package = "const-oid", version = "0.10", default-features = false, features = ["db"] }
@@ -204,6 +206,8 @@ capnp = { version = "0.24", features = ["unaligned"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 cipher = { version = "0.4", default-features = false, features = ["block-padding", "zeroize"] }
+clap = { version = "4", features = ["derive"] }
+clap_builder = { version = "4", default-features = false, features = ["color", "help", "std", "suggestions", "usage"] }
 compact_str = { version = "0.9", features = ["serde"] }
 concurrent-queue = { version = "2" }
 const-oid-93f6ce9d446188ac = { package = "const-oid", version = "0.10", default-features = false, features = ["db"] }
