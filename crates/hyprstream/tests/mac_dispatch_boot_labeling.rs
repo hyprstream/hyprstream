@@ -52,6 +52,7 @@ const OAUTH_KEY: [u8; 32] = [0x44; 32];
 const BROWSER_KEY: [u8; 32] = [0x45; 32];
 const REGISTRY_KEY: [u8; 32] = [0x46; 32];
 const REGISTRATION_KEY: [u8; 32] = [0x47; 32];
+const OAUTH_RELAY_KEY: [u8; 32] = [0x48; 32];
 const ISSUER: &str = "http://127.0.0.1:6791";
 
 /// Exercise the installed production PEP over every actual generated leaf,
@@ -116,7 +117,7 @@ fn install_crypto() {
         ));
     }
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY, BROWSER_KEY, REGISTRY_KEY, REGISTRATION_KEY] {
+    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY, BROWSER_KEY, REGISTRY_KEY, REGISTRATION_KEY, OAUTH_RELAY_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -342,8 +343,8 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
     assert_eq!(claims.tenant.as_deref(), Some(tenant));
     assert_eq!(claims.client_id.as_deref(), Some("cold-signup-browser"));
 
-    // A signed, hybrid service still cannot override the fixture's explicit
-    // policy denial for token issuance. MAC clearance is not a scope grant.
+    // A signed, hybrid service is not an issuance authority, even with the
+    // permissive/legacy policy used here. No fixture-specific deny rule.
     let discovery_key = SigningKey::from_bytes(&DISCOVERY_KEY);
     let discovery_credentials = tempfile::TempDir::new()?;
     let discovery_jwt = mint_service_jwt(
@@ -371,11 +372,75 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
             client_id: Some("cold-signup-browser".to_owned()),
         })
         .await;
-    let error = denied.expect_err("the explicit policy denial must prevent token issuance");
+    let error = denied.expect_err("ordinary service clearance must not grant token issuance");
     assert!(
-        format!("{error:?}").contains("Unauthorized"),
-        "token issuance must fail at the policy authorization boundary: {error:?}"
+        format!("{error:?}").contains("dispatch denied"),
+        "token issuance must fail at the principal dispatch boundary: {error:?}"
     );
+    Ok(())
+}
+
+/// Real OAuth authorization hook + real Policy RPC with production base rules.
+/// A local service cannot borrow the OAuth deputy's account-management grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oauth_management_preserves_caller_authority_over_local_transport() -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+    use hyprstream_core::services::generated::oauth_client::OauthHandler;
+    use hyprstream_core::services::oauth::{rpc_handler::OAuthRpcHandler, state::OAuthState};
+    use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let relay = SigningKey::from_bytes(&OAUTH_RELAY_KEY);
+    hyprstream_service::global_trust_store().insert(relay.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("oauth".to_owned()).collect(),
+        subject: Some("service:oauth".to_owned()), jwt: None, expires_at: 0, attested_by: None,
+    });
+    let dir = tempfile::TempDir::new()?;
+    let tag = format!("oauth-management-policy-{}", uuid::Uuid::new_v4());
+    let manager = Arc::new(PolicyManager::new(dir.path().join("policies")).await?);
+    let verifier = PolicyService::new(
+        manager, Arc::new(root.clone()), TokenConfig::default(),
+        Arc::new(tokio::sync::RwLock::new(git2db::Git2DB::open(dir.path().join("registry")).await?)),
+        TransportConfig::inproc(&tag),
+    ).with_jwt_key_source(cluster_key_source(&ca));
+    let mut contexts = Vec::new();
+    for (name, bytes, allowed) in [("discovery", DISCOVERY_KEY, false), ("oauth", OAUTH_KEY, true)] {
+        let key = SigningKey::from_bytes(&bytes);
+        let credentials = tempfile::TempDir::new()?;
+        let token = mint_service_jwt(&credentials, name, &ca, &key);
+        let envelope = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(Vec::new()).with_jwt_token(token), &key,
+        );
+        // Explicit local provenance fixture; JWT/cnf/issuer/audience/clearance
+        // are checked by the production verifier, not injected as test claims.
+        let mut ctx = EnvelopeContext::from_verified_as_system(&envelope);
+        verifier.verify_claims(&mut ctx).await?;
+        assert_eq!(ctx.claims().map(|claims| claims.sub.as_str()), Some(format!("service:{name}").as_str()));
+        contexts.push((ctx, allowed));
+    }
+    let _handle = InprocManager::new().spawn(Box::new(verifier)).await?;
+    let endpoint = format!("inproc://{tag}");
+    let policy = PolicyClient::for_local_endpoint_bootstrap(&endpoint, relay.clone(), root.verifying_key(), None)?;
+    // Unused in this authorization-only fixture; no Discovery request occurs.
+    let discovery = DiscoveryClient::for_local_endpoint_bootstrap(&endpoint, relay.clone(), root.verifying_key(), None)?;
+    let state = OAuthState::new(&hyprstream_core::config::OAuthConfig::default(), policy, discovery, relay.verifying_key().to_bytes());
+    let handler = OAuthRpcHandler::new(Arc::new(state), TransportConfig::inproc("unused-oauth-handler"), relay);
+    for (ctx, allowed) in contexts {
+        for resource in ["oauth:AddPubkey", "oauth:RemoveUser"] {
+            let result = handler.authorize(&ctx, resource, "manage").await;
+            assert_eq!(result.is_ok(), allowed, "caller {} on {resource}: {result:?}", ctx.subject());
+            if !allowed {
+                assert!(format!("{:?}", result.unwrap_err()).contains("Unauthorized OAuth user management operation"),
+                    "negative case must reach the policy decision, not fail on transport or credential verification");
+            }
+        }
+    }
+    assert!(handler.authorize(&EnvelopeContext::from_callback_service(1, "oauth"), "oauth:AddPubkey", "manage").await.is_err(),
+        "locality without an upstream credential must not borrow deputy authority");
     Ok(())
 }
 
@@ -465,7 +530,6 @@ async fn spawn_policy_and_client(
         git2db::Git2DB::open(policy_dir.path()).await?,
     ));
     let policy_manager = PolicyManager::permissive().await?;
-    policy_manager.add_policy_with_domain("service:discovery", "*", "policy:IssueToken", "manage", "deny").await?;
     let policy_service = PolicyService::new(
         Arc::new(policy_manager),
         Arc::new(root_key.clone()),

@@ -156,7 +156,8 @@ impl TrustStore {
                 anyhow::ensure!(attestation.expires_at >= existing.expires_at, "stale service registration");
                 if attestation.expires_at == existing.expires_at {
                     anyhow::ensure!(
-                        existing.jwt == attestation.jwt && existing.attested_by == attestation.attested_by,
+                        existing.jwt == attestation.jwt
+                            && existing.attested_by.is_none_or(|authority| Some(authority) == attestation.attested_by),
                         "equal-expiry service registration has conflicting authority"
                     );
                 }
@@ -419,6 +420,28 @@ mod tests {
             assert_eq!(published[0].verifying_key, key);
             assert_eq!(published[0].attestation.expires_at, expires);
         }
+    }
+
+    #[test]
+    fn service_registration_completes_locally_seeded_authority() -> anyhow::Result<()> {
+        let store = TrustStore::new();
+        let (_, key) = random_key();
+        let mut seeded = make_attestation(&["model"], chrono::Utc::now().timestamp() + 3600);
+        seeded.jwt = Some("verified-fixture-credential".to_owned());
+        // Same-process boot seeds the credential before Policy verifies the
+        // registration. Missing authority is incomplete, not conflicting.
+        store.insert(key, seeded.clone());
+        let mut certified = seeded;
+        certified.attested_by = Some([7; 32]);
+        for _ in 0..2 {
+            store.publish_service_registration(key, "model", certified.clone())?;
+            let retained = store.get(&key).ok_or_else(|| anyhow::anyhow!("registration missing"))?;
+            assert_eq!(retained.attested_by, certified.attested_by);
+            assert_eq!(retained.jwt, certified.jwt);
+            assert_eq!(retained.scopes, certified.scopes);
+            assert_eq!(retained.expires_at, certified.expires_at);
+        }
+        Ok(())
     }
 
     #[test]

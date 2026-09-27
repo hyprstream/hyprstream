@@ -58,6 +58,21 @@ impl MacDispatchPep for GeneratedDispatchPep {
         let Some(row) = method.and_then(|path| self.rows.get(service_domain)?.get(path)) else {
             return MacDecision::Deny(MacDenyReason::UnlabeledObject);
         };
+        // Hybrid enrollment authenticates a workload; it is not permission to
+        // mint credentials for other principals. Keep the issuing-service
+        // boundary explicit even if a retained policy has the old service:*
+        // IssueToken grant. Human callers still require downstream policy.
+        if service_domain == "policy"
+            && method == Some(&[super::dispatch_labels::policy_methods::ISSUE_TOKEN][..])
+        {
+            let subject = ctx.subject();
+            if subject.name().is_some_and(|name| name.starts_with("service:"))
+                && (subject.is_federated()
+                    || !matches!(subject.name(), Some("service:oauth" | "service:policy")))
+            {
+                return MacDecision::Deny(MacDenyReason::NoClearance);
+            }
+        }
         if row.authentication == AuthenticationRequirement::UnauthenticatedAllowed {
             // Validation requires exactly SYSTEM_LOW, an explicit public reason
             // and an unauthenticated-capable signature policy. The dispatch

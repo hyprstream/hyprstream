@@ -83,8 +83,8 @@ impl OauthHandler for OAuthRpcHandler {
     async fn authorize(
         &self,
         ctx: &EnvelopeContext,
-        _resource: &str,
-        _operation: &str,
+        resource: &str,
+        operation: &str,
     ) -> Result<()> {
         // This handler is restricted to the authenticated local control plane.
         // Subject names (including JWT-derived `system` / `service:*`) cannot
@@ -93,6 +93,23 @@ impl OauthHandler for OAuthRpcHandler {
             ctx.is_local_caller(),
             "OAuth user management requires an authenticated local service boundary"
         );
+        // Locality is transport provenance, not account-management authority.
+        // Relay the verified caller credential, never ask as this OAuth deputy
+        // (whose own grant permits account administration). Policy derives the
+        // subject and tenant from that credential, not request body fields.
+        let bearer = ctx.jwt_token().ok_or_else(|| {
+            anyhow!("OAuth user management requires a verified caller bearer")
+        })?;
+        let allowed = self.state.policy_client.clone()
+            .with_delegated_bearer(bearer.to_owned())
+            .check(&hyprstream_rpc_std::policy_client::PolicyCheck {
+                subject: String::new(),
+                domain: String::new(),
+                resource: resource.to_owned(),
+                operation: operation.to_owned(),
+            })
+            .await?;
+        anyhow::ensure!(allowed, "Unauthorized OAuth user management operation");
         Ok(())
     }
 

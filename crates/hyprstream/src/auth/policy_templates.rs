@@ -74,8 +74,9 @@ impl ServiceGrouping {
 pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // PolicyService: CA — issues tokens, manages policy rules, assigns roles
     ServicePolicyRule { subject: "service:policy", domain: "*", resource: "*", action: "*", effect: "allow" },
-    // Token issuance: any service can call PolicyService::issueToken (capnp type name = IssueToken)
-    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:IssueToken", action: "manage", effect: "allow" },
+    // User-token issuance belongs to OAuth, not every enrolled workload.
+    // Service credential renewal uses its separately verified renewal path.
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:IssueToken", action: "manage", effect: "allow" },
     // Credential revocation publication: only the OAuth revocation authority
     // (the RFC 7009 endpoint) may publish to the canonical store.
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RevokeCredential", action: "manage", effect: "allow" },
@@ -90,6 +91,9 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // credentials; anonymous/end-user callers may not.
     ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:CheckSession", action: "query", effect: "allow" },
     // Services that perform policy authorization checks
+    // OAuth account-management RPC relays the verified upstream caller to
+    // Policy; this admits the relay, not the caller's requested operation.
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:PolicyCheck", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
