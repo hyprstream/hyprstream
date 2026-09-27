@@ -3165,9 +3165,9 @@ fn main() -> Result<()> {
                     // 9P translator PEP (see `mac::genesis`).
                     let mac_gate = hyprstream_core::mac::GenesisGate::production();
                     mac_gate.log_report();
-                    // Installation is activation-ready but remains floor-only.
-                    // Only the explicit G1-G7 operator control may widen it.
-                    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+                    // IdentityAware is the default. Refuse startup if the
+                    // generated dispatch inventory is incomplete or invalid.
+                    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
 
                     if foreground || standalone {
                         // --foreground requires a service name or --services list;

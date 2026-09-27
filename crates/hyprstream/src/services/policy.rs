@@ -2803,13 +2803,13 @@ impl PolicyHandler for PolicyService {
         // Store in trust store (key-centric: the key IS the identity)
         {
             let trust = hyprstream_service::global_trust_store();
-            trust.insert(vk, hyprstream_service::Attestation {
+            trust.publish_service_registration(vk, &data.service_name, hyprstream_service::Attestation {
                 scopes: std::iter::once(data.service_name.clone()).collect(),
                 subject: None,
                 jwt: Some(data.service_jwt.clone()),
                 expires_at: claims.exp,
                 attested_by: Some(self.signing_key.verifying_key().to_bytes()),
-            });
+            })?;
         }
 
         info!(service = %data.service_name, caller = %caller, "Registered service verifying key");

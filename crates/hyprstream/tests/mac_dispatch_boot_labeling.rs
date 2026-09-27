@@ -10,9 +10,8 @@
 //!    `UnlabeledObject` and without a fabricated anonymous/public clearance
 //!    (the caller presents a verified CA-signed service identity, and the PEP
 //!    requires the declared service clearance).
-//! 2. The causal twin — the identical caller and service with an undeclared
-//!    leaf (`resolveServiceKey`) — denies `UnlabeledObject` before handler
-//!    entry, and the PEP remains installed afterwards.
+//! 2. Other schema-declared leaves resolve through the same full inventory;
+//!    unknown paths still deny before handler entry.
 //! 3. A call to an undeclared service domain from the same declared caller
 //!    denies before handler entry (handler invocation counter stays zero).
 
@@ -50,7 +49,58 @@ const POLICY_ROOT_KEY: [u8; 32] = [0x52; 32];
 const DISCOVERY_KEY: [u8; 32] = [0x42; 32];
 const GHOST_CLIENT_KEY: [u8; 32] = [0x43; 32];
 const OAUTH_KEY: [u8; 32] = [0x44; 32];
+const BROWSER_KEY: [u8; 32] = [0x45; 32];
+const REGISTRY_KEY: [u8; 32] = [0x46; 32];
+const REGISTRATION_KEY: [u8; 32] = [0x47; 32];
 const ISSUER: &str = "http://127.0.0.1:6791";
+
+/// Exercise the installed production PEP over every actual generated leaf,
+/// including nested Registry paths, with a user rather than service subject.
+/// Signature/JWT verification is exercised separately through real RPC below;
+/// these explicit context fixtures isolate the mandatory label decision.
+#[test]
+fn generated_dispatch_accepts_verified_user_clearance_without_service_prefix() -> Result<()> {
+    use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason};
+    use hyprstream_rpc::proof::policy::{collect_generated_rows, AuthenticationRequirement};
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let pep = global_mac_dispatch_pep().unwrap();
+    let hybrid = SigningKey::from_bytes(&DISCOVERY_KEY).verifying_key();
+    let classical = SigningKey::from_bytes(&[0xA5; 32]).verifying_key();
+    let rows = collect_generated_rows()?;
+    let registry: Vec<_> = rows.iter().filter(|row| row.service == "registry").collect();
+    assert!(registry.iter().any(|row| row.leaf_path.len() == 3));
+    assert!(registry.iter().any(|row| row.symbolic_path == "list"));
+    for row in registry {
+        assert_eq!(row.authentication, AuthenticationRequirement::CredentialRequired);
+        let claims = hyprstream_rpc::auth::Claims::new("browser-user".to_owned(), 1, i64::MAX)
+            .with_clearance(row.target_label);
+        let context = |signer, claims| EnvelopeContext::for_test_authenticated_subject_with_claims(
+            hyprstream_rpc::Subject::new("browser-user"), "staging-test", signer, claims,
+        );
+        assert_eq!(pep.check(&context(hybrid, claims.clone()), row.service, Some(row.leaf_path)), MacDecision::Permit,
+            "verified user must reach declared {}", row.symbolic_path);
+        assert_eq!(pep.check(&context(classical, claims), row.service, Some(row.leaf_path)), MacDecision::Deny(MacDenyReason::FloorDeny),
+            "a JWT cannot upgrade classical envelope assurance");
+        let absent = hyprstream_rpc::auth::Claims::new("browser-user".to_owned(), 1, i64::MAX);
+        let low = absent.clone().with_clearance(hyprstream_rpc::auth::mac::SecurityLabel::bottom());
+        assert_eq!(pep.check(&context(hybrid, low), row.service, Some(row.leaf_path)), MacDecision::Deny(MacDenyReason::FloorDeny));
+        assert_eq!(pep.check(&context(hybrid, absent), row.service, Some(row.leaf_path)), MacDecision::Deny(MacDenyReason::NoClearance));
+        if row.leaf_path.len() > 1 {
+            assert_eq!(pep.check(&bearerless_context(hybrid), row.service, Some(&row.leaf_path[..row.leaf_path.len() - 1])), MacDecision::Deny(MacDenyReason::UnlabeledObject));
+        }
+    }
+    let bearerless = EnvelopeContext::for_test_authenticated_subject(hyprstream_rpc::Subject::new("browser-user"), hybrid);
+    for (service, path) in [("registry", &[u16::MAX][..]), ("registry", &[0, 0][..]), ("/registry", &[0][..]), ("policy", &[u16::MAX][..])] {
+        assert_eq!(pep.check(&bearerless, service, Some(path)), MacDecision::Deny(MacDenyReason::UnlabeledObject));
+    }
+    assert_eq!(pep.check(&bearerless, "registry", None), MacDecision::Deny(MacDenyReason::UnlabeledObject));
+    Ok(())
+}
+
+fn bearerless_context(signer: ed25519_dalek::VerifyingKey) -> EnvelopeContext {
+    EnvelopeContext::for_test_authenticated_subject(hyprstream_rpc::Subject::new("browser-user"), signer)
+}
 
 /// Install this binary's process-wide hybrid trust view: envelope signature
 /// verification (Hybrid policy) with the PQ anchors of the fixture keys.
@@ -66,7 +116,7 @@ fn install_crypto() {
         ));
     }
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY] {
+    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY, BROWSER_KEY, REGISTRY_KEY, REGISTRATION_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -147,9 +197,74 @@ async fn register_active_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_user_registry_rpc_passes_and_missing_clearance_or_wrong_signer_deny() -> Result<()> {
+    use hyprstream_core::services::RegistryService;
+    use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
+    use hyprstream_rpc_std::registry_client::RegistryClient;
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+    let ca_pq = derive_mesh_mldsa_key(&ca_jwt_key);
+    let user_key = SigningKey::from_bytes(&BROWSER_KEY);
+    let registry_key = SigningKey::from_bytes(&REGISTRY_KEY);
+    // Relay authorization comes from the enrolled service key, not the
+    // browser's bearer or a caller-supplied subject string.
+    hyprstream_service::global_trust_store().insert(registry_key.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("registry".to_owned()).collect(),
+        subject: Some("service:registry".to_owned()),
+        jwt: None,
+        expires_at: 0,
+        attested_by: None,
+    });
+    let tag = format!("mac-user-registry-{}", uuid::Uuid::new_v4());
+    let policy = spawn_policy_and_client(&format!("{tag}-policy"), &registry_key, None).await?;
+    let data = tempfile::TempDir::new()?;
+    let registry = RegistryService::new(data.path(), policy, TransportConfig::inproc(&tag), registry_key.clone())
+        .await?
+        .with_jwt_key_source(cluster_key_source(&ca_jwt_key));
+    let _handle = InprocManager::new().spawn(Box::new(registry)).await?;
+    let sid = format!("registry-browser-{}", uuid::Uuid::new_v4());
+    register_active_session(ISSUER, &sid, "browser-user", "staging-test").await?;
+    let now = chrono::Utc::now().timestamp();
+    let base = hyprstream_rpc::auth::Claims::new("browser-user".to_owned(), now, now + 300)
+        .with_issuer(ISSUER.to_owned())
+        .with_audience(Some(ISSUER.to_owned()))
+        .with_tenant("staging-test".to_owned())
+        .with_client_id("staging-browser-test")
+        .with_sid(sid)
+        .with_scope(Some("query:registry:*".to_owned()))
+        .with_cnf_jwk(user_key.verifying_key().as_bytes());
+    let cleared = base.clone().with_clearance(SecurityLabel::new(Level::Internal, Assurance::PqHybrid, CompartmentSet::EMPTY));
+    let mint = |claims: &hyprstream_rpc::auth::Claims| {
+        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &ca_pq, &ca_jwt_key)
+    };
+    let token = mint(&cleared);
+    let client = |key, token| RegistryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"), key, registry_key.verifying_key(), token,
+    );
+    let listed = client(user_key.clone(), Some(token.clone()))?.list().await?;
+    let persisted = git2db::Git2DB::open(data.path()).await?;
+    let mut expected: Vec<_> = persisted.list().filter(|repo| repo.name.as_ref().is_some_and(|name| !name.is_empty())).map(|repo| repo.id.to_string()).collect();
+    let mut actual: Vec<_> = listed.iter().map(|repo| repo.id.clone()).collect();
+    expected.sort();
+    actual.sort();
+    assert_eq!(actual, expected, "RPC returns the fixture registry, including its bootstrap repositories");
+    for (key, bearer) in [
+        (user_key.clone(), None),
+        (user_key, Some(mint(&base))),
+        (SigningKey::from_bytes(&OAUTH_KEY), Some(token)),
+    ] {
+        let error = client(key, bearer)?.list().await.expect_err("invalid caller must not list Registry");
+        assert!(format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED), "uniform denial: {error:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<()> {
     install_crypto();
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -182,38 +297,9 @@ async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_boundary() -> Result<()> {
     install_crypto();
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
-
-    // The production PEP is activation-controlled and every process starts
-    // FloorOnly: the anonymous-floor subject context can dominate the floor
-    // `check` row but can never dominate the schema-declared Internal/PqHybrid
-    // `issueToken` row, even with a perfect service clearance. Widen the
-    // operator control identity-aware for this test (the same mechanism the
-    // mac_enforcing_gate T8 contract exercises) and narrow on drop. This
-    // synthetic evidence tests the control mechanism only; production staging
-    // activation stays an operator gate.
-    let coverage = hyprstream_rpc::auth::mac::GenesisReport {
-        labeled: vec!["policy.issueToken".to_owned()],
-        unlabeled: Vec::new(),
-        ill_formed: Vec::new(),
-    };
-    let evidence = hyprstream_rpc::auth::mac::MacActivationEvidence {
-        genesis: &coverage,
-        mediation_integrity_g2: true,
-        denial_handling_g4: true,
-        observability_g5: true,
-        runbook_signoff_g6: true,
-        revocation_reload_g7: true,
-    };
-    hyprstream_rpc::auth::mac::global_mac_activation_control()
-        .widen_identity_aware(&evidence)?;
-    struct NarrowOnDrop;
-    impl Drop for NarrowOnDrop {
-        fn drop(&mut self) {
-            hyprstream_rpc::auth::mac::global_mac_activation_control().narrow_to_floor();
-        }
-    }
-    let _narrow = NarrowOnDrop;
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    // Use the production IdentityAware default. Do not mutate process-global
+    // activation under parallel tests or manufacture coverage evidence.
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -256,9 +342,8 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
     assert_eq!(claims.tenant.as_deref(), Some(tenant));
     assert_eq!(claims.client_id.as_deref(), Some("cold-signup-browser"));
 
-    // A signed, hybrid bootstrap service with no scoped token-issuer
-    // clearance cannot borrow OAuth's authority. The uniform dispatch denial
-    // occurs before the handler, so it cannot mint or expose its policy state.
+    // A signed, hybrid service still cannot override the fixture's explicit
+    // policy denial for token issuance. MAC clearance is not a scope grant.
     let discovery_key = SigningKey::from_bytes(&DISCOVERY_KEY);
     let discovery_credentials = tempfile::TempDir::new()?;
     let discovery_jwt = mint_service_jwt(
@@ -286,10 +371,10 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
             client_id: Some("cold-signup-browser".to_owned()),
         })
         .await;
-    let error = denied.expect_err("a non-OAuth service must not reach issueToken");
+    let error = denied.expect_err("the explicit policy denial must prevent token issuance");
     assert!(
-        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
-        "non-OAuth issueToken must fail at the uniform dispatch boundary: {error:?}"
+        format!("{error:?}").contains("Unauthorized"),
+        "token issuance must fail at the policy authorization boundary: {error:?}"
     );
     Ok(())
 }
@@ -379,8 +464,10 @@ async fn spawn_policy_and_client(
     let git2db = Arc::new(tokio::sync::RwLock::new(
         git2db::Git2DB::open(policy_dir.path()).await?,
     ));
+    let policy_manager = PolicyManager::permissive().await?;
+    policy_manager.add_policy_with_domain("service:discovery", "*", "policy:IssueToken", "manage", "deny").await?;
     let policy_service = PolicyService::new(
-        Arc::new(PolicyManager::permissive().await?),
+        Arc::new(policy_manager),
         Arc::new(root_key.clone()),
         TokenConfig::default(),
         git2db,
@@ -403,7 +490,7 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
     install_crypto();
 
     // The exact production install seam `service start` runs (main.rs).
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
     assert!(
         global_mac_dispatch_pep().is_some(),
         "the production dispatch PEP must be installed"
@@ -411,7 +498,9 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
-    let discovery_key = SigningKey::from_bytes(&DISCOVERY_KEY);
+    // Other parallel tests mint different credentials for their discovery
+    // caller. Keep this fresh registration key out of their identity cache.
+    let discovery_key = SigningKey::from_bytes(&REGISTRATION_KEY);
     let creds = tempfile::TempDir::new()?;
     let discovery_jwt = mint_service_jwt(
         &creds,
@@ -447,28 +536,28 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
         "the dispatch PEP must remain installed after a permit"
     );
 
-    // Causal twin: identical caller, identical service, undeclared leaf.
-    // `resolveServiceKey` is a real policy method (discriminant 17) that this
-    // slice deliberately does NOT declare — declaration, not schema, is the
-    // authority. It must deny before handler entry. Per the v16 §14.2
-    // uniform-denial rule the wire error is opaque ("dispatch denied") so the
-    // response cannot leak which gate fired; the specific UnlabeledObject
-    // reason is asserted at the PEP unit level (mac::dispatch_labels and
-    // mac::cas_pep tests) and in the audit trail.
-    let undeclared = client
+    // verify_claims cached this same JWT before the handler ran. Registration
+    // must complete that entry's service scope even at identical expiry.
+    let published = client.resolve_service_key(&ResolveServiceKey {
+        service_name: "discovery".to_owned(),
+    }).await?;
+    assert!(published.keys.iter().any(|candidate| candidate.verifying_key == discovery_key.verifying_key().as_bytes()));
+
+    // The schema, not a partial second table, now declares this leaf. The
+    // same authenticated caller reaches the real resolution handler. Asking
+    // for an unregistered name must produce the handler's missing-key result,
+    // not the old incomplete-table dispatch denial.
+    let resolved = client
         .resolve_service_key(&ResolveServiceKey {
-            service_name: "registry".to_owned(),
+            service_name: "not-enrolled-in-fixture".to_owned(),
         })
         .await;
-    let error = undeclared.expect_err("undeclared leaf must deny");
-    assert!(
-        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
-        "undeclared leaf must deny through the uniform dispatch denial, got: {error:?}"
-    );
+    let error = resolved.expect_err("unregistered name has no resolution");
+    assert!(format!("{error:?}").contains("service key 'not-enrolled-in-fixture' not registered"), "must reach resolution rather than dispatch denial: {error:?}");
 
     assert!(
         global_mac_dispatch_pep().is_some(),
-        "the dispatch PEP must remain installed after a deny"
+        "the dispatch PEP must remain installed after key resolution"
     );
     Ok(())
 }
@@ -525,7 +614,7 @@ impl RequestService for CountingEchoService {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undeclared_service_domain_denies_before_handler_entry() -> Result<()> {
     install_crypto();
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
