@@ -114,9 +114,9 @@ pub use te::{
     SubjectType, TeEvaluator, TeMatrix, TeRule,
 };
 
-/// Install the mandatory RPC-dispatch PEP in its activation-ready, floor-only
-/// state.  The coverage-gated operator control selects identity-aware contexts;
-/// installing this monitor does not perform that widening.
+/// Install the mandatory RPC-dispatch PEP using the process activation control.
+/// Verified identity-aware contexts are the default; explicit incident
+/// narrowing remains available without removing the monitor.
 ///
 /// The object-label resolver is the typed dispatch table (#1499): declared
 /// `(service, leaf/method)` rows plus deliberate service subject clearances.
@@ -150,7 +150,12 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
         service_domain: &str,
         method: Option<&[u16]>,
     ) -> hyprstream_rpc::auth::mac::MacDecision {
-        let is_local_policy_control_plane = service_domain == "policy"
+        let is_local_policy_check = service_domain == "policy"
+            && method == Some(&[policy_methods::CHECK][..])
+            && ctx.jwt_token().is_none()
+            && !ctx.subject().is_federated()
+            && ctx.subject().name() == Some("service:policy");
+        let is_local_policy_control_plane = is_local_policy_check || (service_domain == "policy"
             && matches!(
                 method,
                 Some([
@@ -164,7 +169,7 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
                         | policy_methods::ADD_GROUPING
                         | policy_methods::REMOVE_GROUPING
                 ])
-            );
+            ));
         if is_local_policy_control_plane {
             if !(ctx.jwt_token().is_none()
                 && !ctx.subject().is_federated()
@@ -262,7 +267,7 @@ mod production_dispatch_tests {
         );
         assert_eq!(
             pep.check(&policy, "policy", Some(&[17])),
-            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
         );
         // Ordinal 0 is now the declared `check` row (added by the staged
         // policy dispatch work): the tokenless policy CA is its sanctioned
@@ -276,7 +281,7 @@ mod production_dispatch_tests {
         );
         assert_eq!(
             pep.check(&policy, "policy", Some(&[2])),
-            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject),
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoClearance),
             "undeclared ordinals keep denying; the root authority's access must not be reported as another user's result",
         );
     }

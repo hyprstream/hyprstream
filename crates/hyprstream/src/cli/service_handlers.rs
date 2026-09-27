@@ -12,6 +12,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::info;
 
+/// Reconcile the published local service roster before runtime startup.
+pub fn handle_service_reconcile_enrollment(config: &crate::config::HyprConfig) -> Result<()> {
+    let secrets = crate::config::HyprConfig::resolve_secrets_dir_for(Some(config))?;
+    let count = crate::auth::service_enrollment::reconcile_existing_services(
+        &secrets, &config.oauth.issuer_url(), chrono::Utc::now().timestamp(),
+    )?;
+    info!(services = count, "Reconciled retained service enrollment and credentials");
+    Ok(())
+}
+
 /// Persist requested built-in templates into the same policy store loaded by
 /// PolicyService, without starting a resolver or loading service credentials.
 pub async fn handle_service_provision_policy_templates(

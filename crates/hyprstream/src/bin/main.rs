@@ -2344,6 +2344,16 @@ type NativeAnnouncementFirstResult =
 type NativeAnnouncementFirstTx =
     Option<std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>>>;
 
+/// Use the current authority projection's service JWT for envelope identity.
+fn native_announcement_bearer(
+    announcement: &hyprstream_rpc_std::discovery_client::ServiceAnnouncement,
+) -> anyhow::Result<String> {
+    announcement.service_jwt.as_ref()
+        .filter(|token| !token.trim().is_empty())
+        .cloned()
+        .context("Native announcement requires a service JWT as its RPC bearer")
+}
+
 /// The required first result covers both fresh-authority projection and the
 /// Discovery publication. An authority error must not bypass the handshake.
 async fn publish_native_announcement_attempt<F, Fut>(
@@ -3011,7 +3021,17 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── `service ensure-key` early dispatch ─────────────────────────────────
+    // ── Offline service-authority provisioning ─────────────────────────────
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if sub_m.subcommand_name() == Some("reconcile-enrollment") {
+            return hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(&config);
+        }
+        if sub_m.subcommand_name() == Some("ensure-node-authority") {
+            let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
+            return hyprstream_core::auth::service_enrollment::ensure_node_authority(&secrets);
+        }
+    }
+
     // Key materialization for provisioning/keygen units: it must work on a
     // fresh install (before any bootstrap-pubkeys exist) and must not start
     // any services, so dispatch before the registry bootstrap below — same
@@ -3630,25 +3650,24 @@ fn main() -> Result<()> {
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
-                                                        let client = match if hyprstream_discovery::native_network_required() {
-                                                            hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, request.signing_key.clone(), None)
-                                                        } else {
-                                                            hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
-                                                                &discovery_transport,
-                                                                request.signing_key.clone(),
-                                                                request.discovery_verifying_key,
-                                                                None,
-                                                            )
-                                                        } {
-                                                            Ok(client) => client,
-                                                            Err(error) => {
-                                                                tracing::warn!("Failed to build DiscoveryClient: {error}");
-                                                                if let Some(tx) = announce_tx {
-                                                                    if let Some(tx) = tx.lock().take() {
-                                                                        let _ = tx.send(Err(error.to_string()));
-                                                                    }
-                                                                }
-                                                                return;
+                                                        let signing_key = request.signing_key.clone();
+                                                        let discovery_verifying_key = request.discovery_verifying_key;
+                                                        // Resolve a fresh client for EACH authority projection.
+                                                        // The body JWT alone does not authenticate the envelope,
+                                                        // and retaining a client would retain an expired bearer
+                                                        // across credential renewal.
+                                                        let make_client = |announcement: &hyprstream_rpc_std::discovery_client::ServiceAnnouncement| {
+                                                            let token = native_announcement_bearer(announcement)?;
+                                                            if hyprstream_discovery::native_network_required() {
+                                                                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(
+                                                                    &hyprstream_discovery::ProductionRpcClientProvider,
+                                                                    signing_key.clone(), Some(token),
+                                                                )
+                                                            } else {
+                                                                hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
+                                                                    &discovery_transport, signing_key.clone(),
+                                                                    discovery_verifying_key, Some(token),
+                                                                )
                                                             }
                                                         };
                                                         if service_name == "policy"
@@ -3663,9 +3682,10 @@ fn main() -> Result<()> {
                                                                     // Re-read signed current state and the exact service
                                                                     // key's credential on every attempt, before any dial.
                                                                     let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
-                                                                    let client = &client;
+                                                                    let client = announcement.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(&make_client);
                                                                     async move {
                                                                         let announcement = announcement?;
+                                                                        let client = client?;
                                                                         let jwt_expiry = announcement.service_jwt.as_deref()
                                                                             .and_then(hyprstream_core::auth::identity_store::decode_jwt_exp_raw)
                                                                             .and_then(|seconds| seconds.checked_mul(1_000))
@@ -3708,9 +3728,9 @@ fn main() -> Result<()> {
                                                             || {
                                                                 let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
                                                                 let announce_tx = announce_tx.as_ref().map(std::sync::Arc::clone);
-                                                                let client = &client;
+                                                                let client = announcement.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(&make_client);
                                                                 publish_native_announcement_attempt(announcement, announce_tx, move |announcement| async move {
-                                                                    client.announce(&announcement).await.map(|_| ())
+                                                                    client?.announce(&announcement).await.map(|_| ())
                                                                 })
                                                             },
                                                         )
@@ -4093,6 +4113,13 @@ fn main() -> Result<()> {
                         Some(ctx.config()),
                         &name,
                     )?;
+                }
+                ServiceAction::ReconcileEnrollment => {
+                    hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(ctx.config())?;
+                }
+                ServiceAction::EnsureNodeAuthority => {
+                    let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(ctx.config()))?;
+                    hyprstream_core::auth::service_enrollment::ensure_node_authority(&secrets)?;
                 }
                 ServiceAction::ProvisionPolicyTemplates { template } => {
                     let models_dir = config_for_service.models_dir().clone();
@@ -5271,6 +5298,12 @@ mod native_announcement_wiring {
                         Ok(announcement), announce_tx.as_ref().map(std::sync::Arc::clone),
                         move |announcement| async move {
                             assert_eq!(announcement.service_jwt, Some(format!("jwt-{i}")));
+                            assert_eq!(super::native_announcement_bearer(&announcement).unwrap(), format!("jwt-{i}"));
+                            let mut missing = announcement.clone();
+                            missing.service_jwt = None;
+                            assert!(super::native_announcement_bearer(&missing).is_err());
+                            missing.service_jwt = Some(" ".into());
+                            assert!(super::native_announcement_bearer(&missing).is_err());
                             assert_eq!(announcement.expires_at_unix_ms, 1000 + i as i64);
                             cycle_tx.send(announcement.accepted_state_epoch).expect("test receiver is live");
                             Ok(())
