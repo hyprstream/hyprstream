@@ -1309,6 +1309,26 @@ pub trait RequestService: 'static {
             anyhow::bail!("at+jwt credential missing required client_id");
         }
 
+        // Service credentials are also published as verification-key
+        // attestations. Possession of one therefore cannot authorize a relay
+        // to impersonate its holder, even when that relay may forward users.
+        // Keep this before publishing any authenticated identity on context.
+        if delegated && verified.sub.starts_with("service:") {
+            use subtle::ConstantTimeEq as _;
+            let holder_matches = if let Some(expected) = verified.cnf_key_bytes() {
+                bool::from(expected.ct_eq(&ctx.cnf))
+            } else if let Some(jkt) = verified.cnf_jkt() {
+                let signer_jkt = crate::auth::jwk_thumbprint(
+                    &crate::auth::JwkThumbprintInput::Ed25519 { x: &ctx.cnf },
+                );
+                bool::from(signer_jkt.as_bytes().ct_eq(jkt.as_bytes()))
+            } else {
+                false
+            };
+            anyhow::ensure!(holder_matches,
+                "delegated service credential requires its bound holder signer");
+        }
+
         // Store verified claims on context for downstream use
         if verified.sub == UNAUTHENTICATED_DID_SENTINEL {
             tracing::warn!("Rejected JWT whose subject is the reserved unauthenticated sentinel");
@@ -1962,6 +1982,35 @@ mod empty_iss_gate_tests {
             .expect("the pinned relay may delegate a bearer for re-verification");
         assert_eq!(ctx.subject().name(), Some("alice"));
         assert_eq!(ctx.jwt_token(), Some(token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn delegated_public_service_credential_requires_holder_proof() {
+        let (mut svc, ca) = mock_service();
+        let holder = SigningKey::from_bytes(&[21u8; 32]);
+        let relay = SigningKey::from_bytes(&[22u8; 32]);
+        svc.relay = Some(relay.verifying_key().to_bytes());
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::Claims::new("service:policy".to_owned(), now, now + 300)
+            .with_cnf_jwk(&holder.verifying_key().to_bytes());
+        let token = crate::auth::jwt::encode_service_jwt(&claims, &ca);
+
+        // The credential itself is valid when presented by its holder.
+        let mut direct = ctx_with_token(token.clone(), true);
+        direct.cnf = holder.verifying_key().to_bytes();
+        svc.verify_claims(&mut direct).await.expect("valid holder credential");
+        assert_eq!(direct.subject().name(), Some("service:policy"));
+
+        // Service WITs are distributed as key attestations. Relay admission
+        // cannot turn knowledge of one into proof of the attested private key.
+        let mut replay = ctx_with_token(token.clone(), true);
+        replay.jwt_token = None;
+        replay.delegation_token = Some(token);
+        replay.cnf = relay.verifying_key().to_bytes();
+        let error = svc.verify_claims(&mut replay).await.expect_err(
+            "an admitted relay must not impersonate a published service credential's holder");
+        assert!(error.to_string().contains("requires its bound holder signer"));
+        assert!(replay.claims().is_none(), "rejected relay must not acquire verified claims");
     }
 
     #[tokio::test]

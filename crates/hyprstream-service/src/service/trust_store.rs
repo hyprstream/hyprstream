@@ -154,11 +154,14 @@ impl TrustStore {
                     "service registration conflicts with retained key identity"
                 );
                 anyhow::ensure!(attestation.expires_at >= existing.expires_at, "stale service registration");
+                anyhow::ensure!(
+                    existing.attested_by.is_none_or(|authority| Some(authority) == attestation.attested_by),
+                    "service registration conflicts with retained authority"
+                );
                 if attestation.expires_at == existing.expires_at {
                     anyhow::ensure!(
-                        existing.jwt == attestation.jwt
-                            && existing.attested_by.is_none_or(|authority| Some(authority) == attestation.attested_by),
-                        "equal-expiry service registration has conflicting authority"
+                        existing.jwt == attestation.jwt,
+                        "equal-expiry service registration has conflicting credential"
                     );
                 }
                 entry.insert(attestation);
@@ -483,6 +486,41 @@ mod tests {
         invalid.jwt = None;
         assert!(store.publish_service_registration(key, "model", invalid).is_err());
         assert!(store.get(&key).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn service_registration_renewal_preserves_certified_authority() -> anyhow::Result<()> {
+        let (_, key) = random_key();
+        let expires = chrono::Utc::now().timestamp() + 3600;
+        for retained_expiry in [expires, expires - 7200] {
+            let store = TrustStore::new();
+            let mut retained = make_attestation(&["model"], retained_expiry);
+            retained.jwt = Some("original-credential".to_owned());
+            retained.attested_by = Some([7; 32]);
+            store.insert(key, retained.clone());
+
+            let mut renewed = retained.clone();
+            renewed.expires_at = expires + 3600;
+            renewed.jwt = Some("renewed-credential".to_owned());
+            renewed.attested_by = Some([8; 32]);
+            assert!(store.publish_service_registration(key, "model", renewed.clone()).is_err());
+            // Public get intentionally hides expired entries; inspect retained
+            // storage here to prove the rejected replacement did not mutate it.
+            let unchanged = store.inner.get(&key).ok_or_else(|| anyhow::anyhow!("retained authority lost"))?.clone();
+            assert_eq!(unchanged.attested_by, retained.attested_by);
+            assert_eq!(unchanged.jwt, retained.jwt);
+            assert_eq!(unchanged.expires_at, retained.expires_at);
+            assert_eq!(unchanged.scopes, retained.scopes);
+
+            // Renewal may change the credential/expiry, but not its root.
+            renewed.attested_by = retained.attested_by;
+            store.publish_service_registration(key, "model", renewed.clone())?;
+            let updated = store.get(&key).ok_or_else(|| anyhow::anyhow!("renewal missing"))?;
+            assert_eq!(updated.attested_by, retained.attested_by);
+            assert_eq!(updated.jwt, renewed.jwt);
+            assert_eq!(updated.expires_at, renewed.expires_at);
+        }
         Ok(())
     }
 

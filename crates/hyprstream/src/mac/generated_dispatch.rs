@@ -59,11 +59,13 @@ impl MacDispatchPep for GeneratedDispatchPep {
             return MacDecision::Deny(MacDenyReason::UnlabeledObject);
         };
         // Hybrid enrollment authenticates a workload; it is not permission to
-        // mint credentials for other principals. Keep the issuing-service
+        // mint credentials or administer sessions for other principals. Keep the issuing-service
         // boundary explicit even if a retained policy has the old service:*
         // IssueToken grant. Human callers still require downstream policy.
         if service_domain == "policy"
-            && method == Some(&[super::dispatch_labels::policy_methods::ISSUE_TOKEN][..])
+            && matches!(row.symbolic_path,
+                "issueToken" | "registerSession" | "revokeSession"
+                    | "revokeCredential" | "exchangeDelegated" | "exchangeWit")
         {
             let subject = ctx.subject();
             if subject.name().is_some_and(|name| name.starts_with("service:"))

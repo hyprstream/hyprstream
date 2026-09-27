@@ -99,6 +99,34 @@ fn generated_dispatch_accepts_verified_user_clearance_without_service_prefix() -
     Ok(())
 }
 
+#[test]
+fn generated_dispatch_restricts_all_credential_authority_leaves() -> Result<()> {
+    use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason};
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let pep = global_mac_dispatch_pep().unwrap();
+    let signer = SigningKey::from_bytes(&DISCOVERY_KEY).verifying_key();
+    let names = ["issueToken", "registerSession", "revokeSession", "revokeCredential", "exchangeDelegated", "exchangeWit"];
+    let rows = hyprstream_rpc::proof::policy::collect_generated_rows()?;
+    for name in names {
+        let row = rows.iter().find(|row| row.service == "policy" && row.symbolic_path == name)
+            .ok_or_else(|| anyhow::anyhow!("missing authority leaf {name}"))?;
+        for (subject, allowed) in [("service:discovery", false), ("service:mcp", false),
+            ("service:registry", false), ("service:unknown", false),
+            ("service:oauth", true), ("service:policy", true)] {
+            let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), 1, i64::MAX)
+                .with_clearance(row.target_label);
+            let context = EnvelopeContext::for_test_authenticated_subject_with_claims(
+                hyprstream_rpc::Subject::new(subject), "staging-test", signer, claims,
+            );
+            assert_eq!(pep.check(&context, "policy", Some(row.leaf_path)),
+                if allowed { MacDecision::Permit } else { MacDecision::Deny(MacDenyReason::NoClearance) },
+                "{subject} on {name}");
+        }
+    }
+    Ok(())
+}
+
 fn bearerless_context(signer: ed25519_dalek::VerifyingKey) -> EnvelopeContext {
     EnvelopeContext::for_test_authenticated_subject(hyprstream_rpc::Subject::new("browser-user"), signer)
 }
@@ -408,7 +436,7 @@ async fn oauth_management_preserves_caller_authority_over_local_transport() -> R
         TransportConfig::inproc(&tag),
     ).with_jwt_key_source(cluster_key_source(&ca));
     let mut contexts = Vec::new();
-    for (name, bytes, allowed) in [("discovery", DISCOVERY_KEY, false), ("oauth", OAUTH_KEY, true)] {
+    for (name, bytes, allowed) in [("discovery", DISCOVERY_KEY, false), ("oauth", OAUTH_RELAY_KEY, true)] {
         let key = SigningKey::from_bytes(&bytes);
         let credentials = tempfile::TempDir::new()?;
         let token = mint_service_jwt(&credentials, name, &ca, &key);
@@ -420,8 +448,33 @@ async fn oauth_management_preserves_caller_authority_over_local_transport() -> R
         let mut ctx = EnvelopeContext::from_verified_as_system(&envelope);
         verifier.verify_claims(&mut ctx).await?;
         assert_eq!(ctx.claims().map(|claims| claims.sub.as_str()), Some(format!("service:{name}").as_str()));
-        contexts.push((ctx, allowed));
+        // RPC deliberately redacts verifier errors to the uniform denial.
+        // The verifier unit regression asserts the precise holder mismatch.
+        contexts.push((ctx, allowed, Some("dispatch denied")));
     }
+    // A user bearer is not a public service attestation: the admitted OAuth
+    // relay must still carry it to a real Policy decision as the user, never
+    // borrowing its own account-management grant.
+    let user_key = SigningKey::from_bytes(&BROWSER_KEY);
+    let sid = format!("oauth-management-user-{}", uuid::Uuid::new_v4());
+    register_active_session(ISSUER, &sid, "unprivileged-user", "staging-test").await?;
+    let now = chrono::Utc::now().timestamp();
+    let claims = hyprstream_rpc::auth::Claims::new("unprivileged-user".to_owned(), now, now + 300)
+        .with_issuer(ISSUER.to_owned())
+        .with_audience(Some(ISSUER.to_owned()))
+        .with_tenant("staging-test".to_owned())
+        .with_client_id("oauth-management-test")
+        .with_sid(sid)
+        .with_cnf_jwk(user_key.verifying_key().as_bytes());
+    let token = hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+        &claims, &derive_mesh_mldsa_key(&ca), &ca,
+    );
+    let envelope = SignedEnvelope::new_signed(
+        RequestEnvelope::anonymous(Vec::new()).with_jwt_token(token), &user_key,
+    );
+    let mut user_ctx = EnvelopeContext::from_verified_as_system(&envelope);
+    verifier.verify_claims(&mut user_ctx).await?;
+    contexts.push((user_ctx, false, Some("Unauthorized OAuth user management operation")));
     let _handle = InprocManager::new().spawn(Box::new(verifier)).await?;
     let endpoint = format!("inproc://{tag}");
     let policy = PolicyClient::for_local_endpoint_bootstrap(&endpoint, relay.clone(), root.verifying_key(), None)?;
@@ -429,13 +482,13 @@ async fn oauth_management_preserves_caller_authority_over_local_transport() -> R
     let discovery = DiscoveryClient::for_local_endpoint_bootstrap(&endpoint, relay.clone(), root.verifying_key(), None)?;
     let state = OAuthState::new(&hyprstream_core::config::OAuthConfig::default(), policy, discovery, relay.verifying_key().to_bytes());
     let handler = OAuthRpcHandler::new(Arc::new(state), TransportConfig::inproc("unused-oauth-handler"), relay);
-    for (ctx, allowed) in contexts {
+    for (ctx, allowed, expected_denial) in contexts {
         for resource in ["oauth:AddPubkey", "oauth:RemoveUser"] {
             let result = handler.authorize(&ctx, resource, "manage").await;
             assert_eq!(result.is_ok(), allowed, "caller {} on {resource}: {result:?}", ctx.subject());
             if !allowed {
-                assert!(format!("{:?}", result.unwrap_err()).contains("Unauthorized OAuth user management operation"),
-                    "negative case must reach the policy decision, not fail on transport or credential verification");
+                let error = format!("{:?}", result.unwrap_err());
+                assert!(error.contains(expected_denial.unwrap()), "wrong denial boundary: {error}");
             }
         }
     }
