@@ -864,13 +864,10 @@ impl WorkflowHandler for WorkflowService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> AnyhowResult<()> {
         if let Some(ref auth_fn) = self.authorize_fn {
             let subject = ctx.subject().to_string();
-            let domain = ctx.domain()?;
             let allowed = auth_fn(
-                subject.clone(),
-                domain,
+                ctx.clone(),
                 resource.to_owned(),
                 operation.to_owned(),
-                ctx.jwt_token().map(str::to_owned),
             )
             .await
             .unwrap_or_else(|e| {

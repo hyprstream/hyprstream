@@ -452,6 +452,7 @@ pub fn generate_body_decoder(service_name: &str, resolved: &ResolvedSchema) -> T
 /// produce an unlabeled runtime row.
 pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema) -> TokenStream {
     let leaves = collect_method_leaves(resolved);
+    let decode_fn = format_ident!("decode_{}_request_body", to_snake_case(&to_pascal_case(service_name)));
 
     let label_map = match InitialLabelMap::load() {
         Ok(map) => map,
@@ -620,6 +621,7 @@ pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema
             hyprstream_rpc::proof::policy::GeneratedMethodPolicyProvider {
                 service: #service_name,
                 rows_fn: method_policy_rows,
+                decode_fn: #decode_fn,
             }
         }
     }

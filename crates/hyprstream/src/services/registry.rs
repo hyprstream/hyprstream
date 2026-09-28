@@ -1801,11 +1801,12 @@ impl RegistryHandler for RegistryService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {
@@ -1826,7 +1827,18 @@ impl RegistryHandler for RegistryService {
         };
 
         let subject = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        // Registry is node-global (as in authorize above). A verified local
+        // service WIT is not a hosted-account tenant. Tenant-bound callers
+        // still require their verified tenant; never widen a user to '*'.
+        let caller = ctx.subject();
+        let domain = if ctx.verified_tenant().is_none() && ctx.claims().is_some()
+            && !caller.is_federated()
+            && caller.name().is_some_and(|name| name.starts_with("service:"))
+        {
+            "*".to_owned()
+        } else {
+            ctx.domain()?
+        };
         let mut result = Vec::with_capacity(repos.len());
 
         for repo in &repos {
@@ -1841,11 +1853,12 @@ impl RegistryHandler for RegistryService {
                 resource: resource.clone(),
                 operation: "query".to_owned(),
             };
-            let permitted = crate::services::policy::check_with_verified_bearer(
+            let permitted = crate::services::policy::check_with_holder_evidence(
                 &self.policy_client,
                 &request,
                 ctx.jwt_token(),
                 &ctx.subject(),
+                ctx.original_holder_evidence(),
             )
             .await
             .unwrap_or_else(|e| {

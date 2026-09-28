@@ -1296,11 +1296,12 @@ impl McpHandler for McpService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let result = crate::services::policy::check_with_verified_bearer(
+        let result = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await;
         match result {

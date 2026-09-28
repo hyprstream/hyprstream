@@ -527,6 +527,16 @@ fn to_scheduling_op(op: hyprstream_rpc_std::discovery_client::SelectorOp) -> sch
 /// provides a `PolicyAuthProvider` that wraps `PolicyClient`.
 #[async_trait(?Send)]
 pub trait AuthorizationProvider: Send + Sync {
+    /// Verified ingress context, including original holder evidence for
+    /// service-mediated checks. Policy-backed providers override this seam.
+    async fn check_context(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<bool> {
+        self.check(&ctx.subject().to_string(), "*", resource, operation, ctx.jwt_token()).await
+    }
+
+    async fn check_batch_context(&self, ctx: &EnvelopeContext, resources: &[String], operation: &str) -> Result<Vec<bool>> {
+        self.check_batch(&ctx.subject().to_string(), "*", resources, operation, ctx.jwt_token()).await
+    }
+
     /// One bounded authorization vector; implementations may amortize RPC
     /// overhead but must retain one decision per resource in input order.
     async fn check_batch(
@@ -7313,7 +7323,7 @@ impl DiscoveryHandler for DiscoveryService {
         if let Some(ref auth) = self.auth_provider {
             let subject = ctx.subject().to_string();
             let allowed = auth
-                .check(&subject, "*", resource, operation, ctx.jwt_token())
+                .check_context(ctx, resource, operation)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!("Discovery auth check failed for {}: {}", subject, e);
@@ -7985,8 +7995,7 @@ impl DiscoveryHandler for DiscoveryService {
                     let resources: Vec<_> = nodes.iter()
                         .map(|node| format!("placement:candidate:{node}")).collect();
                     let decisions = match &self.auth_provider {
-                        Some(auth) => auth.check_batch(&ctx.subject().to_string(), "*",
-                            &resources, "query", ctx.jwt_token()).await?,
+                        Some(auth) => auth.check_batch_context(ctx, &resources, "query").await?,
                         None => vec![true; resources.len()],
                     };
                     anyhow::ensure!(decisions.len() == nodes.len(), "invalid authorization decision count");

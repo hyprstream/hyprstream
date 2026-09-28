@@ -1044,6 +1044,10 @@ fn generate_data_field_reader(
                 let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(#dt::new(v.to_string())) } }, }
             }
+            CapnpType::Data if field.domain_type.is_some() => {
+                let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+                quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(#dt::new(v.to_vec())) } }, }
+            }
             CapnpType::Text => {
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(v.to_string()) } }, }
             }
@@ -1193,6 +1197,11 @@ fn generate_data_field_reader_inner(
 
     match ct {
         CapnpType::Void => quote! { #rust_name: (), },
+        // Field-level byte newtypes retain their redacted Debug implementation.
+        CapnpType::Data if field.domain_type.is_some() => {
+            let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+            quote! { #rust_name: #dt::new(reader.#getter_name()?.to_vec()), }
+        }
         // Field-level `$domainType` newtype over `Text`: read via `Type::new(String)`.
         CapnpType::Text if field.domain_type.is_some() => {
             let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
@@ -1418,6 +1427,40 @@ mod field_domain_type_tests {
             out.contains("plain : String"),
             "expected plain Text field to remain String, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn data_domain_type_handles_required_and_optional_sensitive_bytes() {
+        for optional in [false, true] {
+            let mut field = text_field("evidence", Some("hyprstream_rpc::sensitive::SensitiveBytes"));
+            field.type_name = "Data".into();
+            field.optional = optional;
+            let schema = data_only_schema(StructDef {
+                name: "Evidence".into(),
+                fields: vec![field],
+                has_union: false,
+                domain_type: None,
+                origin_file: None,
+                data_words: 0,
+                pointer_words: 1,
+                discriminant_count: 0,
+                discriminant_offset: 0,
+                union_arms: vec![],
+            });
+            let out = generate_data_structs(&ResolvedSchema::from(&schema), "policy", None).to_string();
+            let expected = if optional {
+                "evidence : Option < hyprstream_rpc :: sensitive :: SensitiveBytes >"
+            } else {
+                "evidence : hyprstream_rpc :: sensitive :: SensitiveBytes"
+            };
+            assert!(out.contains(expected), "wrong field type: {out}");
+            assert!(out.contains("hyprstream_rpc :: sensitive :: SensitiveBytes :: new"), "missing wrapper construction: {out}");
+            assert!(out.contains("set_evidence"), "missing wire writer: {out}");
+            assert!(out.contains("to_vec"), "missing owned wire bytes: {out}");
+            if optional {
+                assert!(out.contains("is_empty"), "missing absent-data sentinel: {out}");
+            }
+        }
     }
 
     /// Struct-level `$domainType` must keep its existing behavior (it does not turn the

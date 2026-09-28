@@ -290,10 +290,39 @@ pub struct GeneratedMethodPolicyProvider {
     pub service: &'static str,
     /// Builder for the service's complete generated row set.
     pub rows_fn: fn() -> Vec<GeneratedMethodPolicyRow>,
+    /// The same bounded body decoder used by this service's dispatch.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub decode_fn: fn(&[u8]) -> Result<crate::service::DecodedRequestBody>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(GeneratedMethodPolicyProvider);
+
+/// Bind a mediated query's operation to the original signed request leaf.
+/// This does not authenticate the body or grant authority: callers must first
+/// verify the holder transcript, credential, target, freshness and replay.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn verify_mediated_operation(service: &str, signed_body: &[u8], operation: &str) -> Result<()> {
+    let mut providers = inventory::iter::<GeneratedMethodPolicyProvider>
+        .into_iter()
+        .filter(|provider| provider.service == service);
+    let provider = providers.next().ok_or_else(|| anyhow::anyhow!("unknown mediated service"))?;
+    anyhow::ensure!(providers.next().is_none(), "ambiguous mediated service");
+    let body = (provider.decode_fn)(signed_body)?;
+    let leaf = body.leaf_path().ok_or_else(|| anyhow::anyhow!("missing mediated method leaf"))?;
+    let rows = (provider.rows_fn)();
+    validate_generated_rows(&rows)?;
+    anyhow::ensure!(rows.iter().all(|row| row.service == service), "mediated provider namespace mismatch");
+    let row = rows.iter().find(|row| row.leaf_path == leaf)
+        .ok_or_else(|| anyhow::anyhow!("unknown mediated method leaf"))?;
+    anyhow::ensure!(
+        row.authentication == AuthenticationRequirement::CredentialRequired
+            && !row.scope_exempt && !row.scope_action.is_empty()
+            && row.scope_action == operation,
+        "mediated operation does not match an authenticated scoped method"
+    );
+    Ok(())
+}
 
 /// Validate one complete generated row set (v16 §6.1 build gates).
 ///

@@ -59,6 +59,15 @@ struct RequestEnvelope {
   responseKemRecipient @9 :Data $optional;  # #1044: fresh per-call HyKEM recipient for the unary response (distinct from stream KEM material)
   serviceDomain @10 :Text $optional;  # #1044: canonical destination service, authenticated inside the sealed request
   proofCwt @11 :Data $optional;  # v16 proof CWT (application/vnd.hyprstream.proof+cwt)
+  # Purpose-separated holder proof for read-only mediated authorization.
+  # Not a v16 dispatch proof or a credential. Encrypted with the request.
+  authorizationWitness @12 :Data $optional;
+}
+
+# Only Policy.checkMediated consumes this evidence. Never a dispatch envelope.
+struct AuthorizationQueryEvidence {
+  request @0 :RequestEnvelope;
+  signer @1 :Data $fixedSize(32);
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes

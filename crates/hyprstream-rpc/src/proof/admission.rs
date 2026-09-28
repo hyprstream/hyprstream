@@ -116,6 +116,21 @@ pub struct ProofReplayKey {
     pub request_id: RequestId,
 }
 
+/// A read-only authorization query derived from one holder-signed request.
+/// Separate from dispatch admission: list handlers may check several resources
+/// for one request, but the same derived query is admitted only once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MediatedQueryReplayKey {
+    pub signer_thumbprint: [u8; 32],
+    pub request_id: u64,
+    /// Legacy envelope IDs are client-local counters; the signed random nonce
+    /// distinguishes fresh requests from different clients using one holder.
+    pub request_nonce: [u8; 16],
+    pub mediator: String,
+    pub resource: String,
+    pub operation: String,
+}
+
 /// The outcome of a replay admission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofAdmissionResult {
@@ -174,6 +189,16 @@ pub trait ProofReplayStore: Send + Sync {
         key: &ProofReplayKey,
         expires_at: u64,
     ) -> ProofAdmissionResult;
+
+    /// Dedicated mediated-query domain. Backends that do not implement this
+    /// atomic admission deny; they must never silently reuse dispatch keys.
+    fn check_and_insert_mediated(
+        &self,
+        _key: &MediatedQueryReplayKey,
+        _expires_at: u64,
+    ) -> ProofAdmissionResult {
+        ProofAdmissionResult::Failed
+    }
 }
 
 /// In-memory replay store for a deployment with exactly one verifier instance.
@@ -190,6 +215,7 @@ pub trait ProofReplayStore: Send + Sync {
 pub struct InMemoryProofReplayStore {
     authenticated: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
     unattributed: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
+    mediated: parking_lot::Mutex<ExpiryMap<MediatedQueryReplayKey>>,
     max_per_partition: usize,
 }
 
@@ -201,6 +227,7 @@ impl InMemoryProofReplayStore {
         Self {
             authenticated: Default::default(),
             unattributed: Default::default(),
+            mediated: Default::default(),
             max_per_partition,
         }
     }
@@ -230,6 +257,18 @@ impl ProofReplayStore for InMemoryProofReplayStore {
         let now = current_unix_seconds();
         let max = self.max_per_partition;
         self.lock(partition).admit(key, expires_at, max, now)
+    }
+
+    fn check_and_insert_mediated(
+        &self,
+        key: &MediatedQueryReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        let now = current_unix_seconds();
+        if expires_at <= now {
+            return ProofAdmissionResult::Failed;
+        }
+        self.mediated.lock().admit(key, expires_at, self.max_per_partition, now)
     }
 }
 
@@ -348,6 +387,23 @@ pub fn admit_request_proof(
     store.check_and_insert(partition, key, expires_at)
 }
 
+/// Admit a bounded mediated query under the installed store's topology.
+pub fn admit_mediated_query(
+    store: &dyn ProofReplayStore,
+    key: &MediatedQueryReplayKey,
+    expires_at: u64,
+) -> ProofAdmissionResult {
+    if !store.owns_namespace(&key.signer_thumbprint)
+        || key.mediator.is_empty() || key.mediator.len() > 128
+        || key.resource.is_empty() || key.resource.len() > 4096
+        || key.operation.is_empty() || key.operation.len() > 128
+        || expires_at <= current_unix_seconds()
+    {
+        return ProofAdmissionResult::Failed;
+    }
+    store.check_and_insert_mediated(key, expires_at)
+}
+
 // ---------------------------------------------------------------------------
 // Process-global challenge manager
 // ---------------------------------------------------------------------------
@@ -403,6 +459,31 @@ mod tests {
 
     fn far_future() -> u64 {
         current_unix_seconds() + 3_600
+    }
+
+    #[test]
+    fn mediated_queries_are_distinct_bounded_and_not_dispatch_replays() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(2);
+        let query = MediatedQueryReplayKey {
+            signer_thumbprint: [1; 32], request_id: 7, request_nonce: [2; 16],
+            mediator: "registry".into(), resource: "registry:List".into(), operation: "query".into(),
+        };
+        assert_eq!(admit_mediated_query(&store, &query, far_future()), ProofAdmissionResult::Admitted);
+        assert_eq!(admit_mediated_query(&store, &query, far_future()), ProofAdmissionResult::Replayed);
+        let other_resource = MediatedQueryReplayKey { resource: "model:one".into(), ..query.clone() };
+        assert_eq!(admit_mediated_query(&store, &other_resource, far_future()), ProofAdmissionResult::Admitted);
+        let fresh = MediatedQueryReplayKey { request_id: 8, ..query.clone() };
+        assert_eq!(admit_mediated_query(&store, &fresh, far_future()), ProofAdmissionResult::Failed);
+        // Saturation does not evict an accepted record or consume dispatch capacity.
+        assert_eq!(admit_mediated_query(&store, &query, far_future()), ProofAdmissionResult::Replayed);
+        assert_eq!(admit_request_proof(&store, ProofDisposition::Authenticated, &key(1, 7), far_future()), ProofAdmissionResult::Admitted);
+        let empty = InMemoryProofReplayStore::single_verifier_instance(4);
+        assert_eq!(admit_mediated_query(&empty, &query, current_unix_seconds()), ProofAdmissionResult::Failed);
+        assert_eq!(admit_mediated_query(&empty, &query, far_future()), ProofAdmissionResult::Admitted);
+        let distinct_client_request = MediatedQueryReplayKey { request_nonce: [3; 16], ..query.clone() };
+        assert_eq!(admit_mediated_query(&empty, &distinct_client_request, far_future()), ProofAdmissionResult::Admitted);
+        let oversized = MediatedQueryReplayKey { resource: "x".repeat(4097), ..query };
+        assert_eq!(admit_mediated_query(&empty, &oversized, far_future()), ProofAdmissionResult::Failed);
     }
 
     /// The expiry-ordered reclamation admits a new record once an old one has

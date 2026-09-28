@@ -9,7 +9,7 @@ use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc_std::policy_client::{
     ErrorInfo, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, IssueToken, IssueTokenProfile,
+    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, MediatedPolicyCheck, IssueToken, IssueTokenProfile,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
@@ -46,6 +46,27 @@ pub(crate) async fn check_with_verified_bearer(
     bearer: Option<&str>,
     upstream_subject: &Subject,
 ) -> Result<bool> {
+    check_with_holder_evidence(client, request, bearer, upstream_subject, None).await
+}
+
+/// Service credentials are holder-bound, not transferable bearer authority.
+/// Authenticate the mediator with its own primary credential and prove the
+/// original service caller with the signed request received at ingress.
+pub(crate) async fn check_with_holder_evidence(
+    client: &hyprstream_rpc_std::policy_client::PolicyClient,
+    request: &PolicyCheck,
+    bearer: Option<&str>,
+    upstream_subject: &Subject,
+    evidence: Option<&[u8]>,
+) -> Result<bool> {
+    if bearer.is_some() && !upstream_subject.is_federated()
+        && upstream_subject.name().is_some_and(|name| name.starts_with("service:"))
+    {
+        let evidence = evidence.ok_or_else(|| anyhow!("service-mediated policy check requires original holder evidence"))?;
+        return client.check_mediated(&MediatedPolicyCheck {
+            evidence: evidence.to_vec().into(), resource: request.resource.clone(), operation: request.operation.clone(),
+        }).await;
+    }
     match bearer {
         Some(token) => client
             .clone()
@@ -1195,6 +1216,35 @@ impl PolicyHandler for PolicyService {
             allowed.push(matches!(result, PolicyResponseVariant::CheckResult(true)));
         }
         Ok(PolicyResponseVariant::CheckBatchResult(PolicyCheckBatchResult { allowed }))
+    }
+
+    async fn handle_check_mediated(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &MediatedPolicyCheck,
+    ) -> Result<PolicyResponseVariant> {
+        let mediator = ctx.subject();
+        anyhow::ensure!(ctx.claims().is_some() && !mediator.is_federated(), "authenticated local mediator required");
+        let service = mediator.name().and_then(|name| name.strip_prefix("service:"))
+            .ok_or_else(|| anyhow!("service mediator required"))?;
+        anyhow::ensure!(self.accept_delegated_bearer(&ctx.cnf), "mediator is not admitted for policy queries");
+        // The original request is not a local transport call to Policy. Use
+        // the network provenance constructor, then the normal credential
+        // verifier; never grant the empty-issuer/local system shortcuts.
+        let mut holder = EnvelopeContext::from_mediated_evidence(&data.evidence, service, &data.operation)?;
+        self.verify_claims(&mut holder).await?;
+        let holder_subject = holder.subject();
+        anyhow::ensure!(holder.claims().is_some() && !holder_subject.is_federated()
+            && holder_subject.name().is_some_and(|name| name.starts_with("service:")),
+            "mediated evidence must identify a verified service holder");
+        holder.admit_mediated_query(service, &data.resource, &data.operation)?;
+        let domain = self.request_domain(&holder)?;
+        let allowed = self.policy_manager.check_with_domain(
+            &holder_subject.to_string(), &domain, &data.resource, &data.operation,
+        ).await;
+        holder.audit_authz(&data.resource, &data.operation, allowed);
+        Ok(PolicyResponseVariant::CheckMediatedResult(allowed))
     }
 
     async fn handle_check(

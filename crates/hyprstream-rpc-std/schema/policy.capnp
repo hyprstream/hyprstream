@@ -13,6 +13,7 @@ using import "/annotations.capnp".dispatchPublic;
 using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
+using import "/annotations.capnp".domainType;
 using Opt = import "/optional.capnp";
 
 # Unified policy request with union discriminator (follows RegistryRequest pattern)
@@ -146,7 +147,24 @@ struct PolicyRequest {
     # consume-once). WS-E calls this for a derived AsOriginator dispatch.
     exchangeDelegated @28 :ExchangeDelegated
       $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
+
+    # Read-only decision about a holder whose original request is independently
+    # verified by Policy. The mediator remains the authenticated RPC caller;
+    # this operation never mints or installs the holder's identity. Resources
+    # may cross service prefixes (e.g. Registry filters model permissions), but
+    # the holder, mediator target, and operation must be proved, not asserted.
+    checkMediated @29 :MediatedPolicyCheck
+      $scopeExempt("authorization query verifies holder evidence and mediator admission internally; requiring the queried authority here would be circular")
+      $dispatchMac("internal:pq-hybrid");
   }
+}
+
+struct MediatedPolicyCheck {
+  # Bounded original signed request, never a credential alone. No nested
+  # mediation; the implementation must verify the original target and holder.
+  evidence @0 :Data $domainType("hyprstream_rpc::sensitive::SensitiveBytes");
+  resource @1 :Text;
+  operation @2 :Text;
 }
 
 # Authorization check parameters
@@ -368,6 +386,7 @@ struct PolicyResponse {
 
     # Minted delegated at+jwt/wit from exchangeDelegated (fresh jti).
     exchangeDelegatedResult @29 :TokenInfo;
+    checkMediatedResult @30 :Bool;
   }
 }
 

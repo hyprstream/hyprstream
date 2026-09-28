@@ -20,20 +20,53 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::warn;
 
+/// Maximum serialized holder evidence accepted by mediated authorization.
+const MAX_MEDIATED_EVIDENCE_BYTES: usize = crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+
+/// Original signed material is sensitive; Debug must never expose it.
+#[derive(Clone)]
+struct MediatedEvidence(Arc<[u8]>);
+
+impl std::fmt::Debug for MediatedEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediatedEvidence([REDACTED])")
+    }
+}
+
+impl MediatedEvidence {
+    fn from_envelope(envelope: &SignedEnvelope) -> Option<Self> {
+        // Never represent recovered plaintext as an outer ciphertext signature.
+        if envelope.encrypted_envelope.is_some() {
+            return crate::authorization_witness::package(&envelope.envelope, &envelope.cnf)
+                .map(|bytes| Self(bytes.into()));
+        }
+        if !crate::envelope::mediated_request_fits(&envelope.envelope)
+            || envelope.cose.len() > MAX_MEDIATED_EVIDENCE_BYTES
+            || envelope.pq_kem_ciphertext.as_ref().is_some_and(|bytes| bytes.len() > MAX_MEDIATED_EVIDENCE_BYTES)
+        {
+            return None;
+        }
+        let mut message = capnp::message::Builder::new_default();
+        envelope.write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder<'_>>());
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        (bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES).then(|| Self(bytes.into()))
+    }
+}
+
 /// Authorization callback for policy checks.
 ///
-/// Parameters: (subject, domain, resource, operation) -> allowed.
+/// Parameters: (verified ingress context, resource, operation) -> allowed.
+/// Carry the original evidence with the context; a subject string and bearer
+/// alone cannot prove a service holder's request to a mediator.
 /// Services store this and call it from their `authorize()` handler method.
 /// The concrete implementation typically wraps `PolicyClient::check_policy()`.
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<
     dyn Fn(
+            EnvelopeContext,
             String,
             String,
-            String,
-            String,
-            Option<String>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>>
         + Send
         + Sync,
@@ -164,6 +197,7 @@ pub struct EnvelopeContext {
 
     /// v16 proof CWT bytes, if present on the verified envelope.
     pub(crate) envelope_proof_cwt: Option<Vec<u8>>,
+    original_holder_evidence: Option<MediatedEvidence>,
 
     /// Browser-only method commitment independently checked by generated
     /// service dispatch after the sealed transcript is recovered.
@@ -182,6 +216,54 @@ pub struct EnvelopeContext {
 }
 
 impl EnvelopeContext {
+    /// Verify the original holder's hybrid transcript without granting local
+    /// transport provenance. Credential verification is still mandatory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_mediated_evidence(evidence: &[u8], mediator_service: &str, operation: &str) -> Result<Self> {
+        if crate::authorization_witness::is_witness_evidence(evidence) {
+            let (request, signer) = crate::authorization_witness::verify(evidence, mediator_service)?;
+            crate::proof::policy::verify_mediated_operation(mediator_service, &request.payload, operation)?;
+            return Ok(Self::from_authenticated_request(&request, signer, Some(MediatedEvidence(evidence.to_vec().into()))));
+        }
+        let signed = crate::envelope::verify_mediated_envelope_evidence(evidence, mediator_service)?;
+        crate::proof::policy::verify_mediated_operation(mediator_service, &signed.envelope.payload, operation)?;
+        Ok(Self::from_verified(&signed))
+    }
+
+    /// Bounded original signed request for a read-only mediated Policy query.
+    /// Possession of these bytes is not an identity grant; the receiver must
+    /// independently verify holder, credential, target, method and freshness.
+    pub fn original_holder_evidence(&self) -> Option<&[u8]> {
+        self.original_holder_evidence.as_ref().map(|evidence| evidence.0.as_ref())
+    }
+
+    /// Record a verified holder's derived authorization query, independently
+    /// of the request's original dispatch admission. No default local store:
+    /// startup must install the topology-qualified replay backend.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn admit_mediated_query(&self, mediator: &str, resource: &str, operation: &str) -> Result<()> {
+        use crate::proof::admission::{global_proof_replay_store, admit_mediated_query, MediatedQueryReplayKey, ProofAdmissionResult};
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(self.claims().is_some() && self.original_holder_evidence.is_some(), "verified holder evidence required");
+        anyhow::ensure!(self.service_domain.as_deref() == Some(mediator), "mediator target mismatch");
+        // Envelope iat is milliseconds and its age boundary is inclusive.
+        // Retain through that last accepted millisecond, rounding up to the
+        // replay store's exclusive seconds boundary, never down.
+        let last_valid_ms = self.request_iat.checked_add(crate::envelope::MAX_TIMESTAMP_AGE_MS)
+            .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?;
+        let expires_at = u64::try_from(last_valid_ms.div_euclid(1000).checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?)?;
+        let key = MediatedQueryReplayKey {
+            signer_thumbprint: Sha256::digest(self.cnf).into(),
+            request_id: self.request_id,
+            request_nonce: self.request_nonce,
+            mediator: mediator.to_owned(), resource: resource.to_owned(), operation: operation.to_owned(),
+        };
+        let store = global_proof_replay_store().ok_or_else(|| anyhow::anyhow!("no mediated replay backend installed"))?;
+        anyhow::ensure!(admit_mediated_query(store, &key, expires_at) == ProofAdmissionResult::Admitted, "mediated query replay admission denied");
+        Ok(())
+    }
+
     /// Create context from a verified SignedEnvelope (AnySigner path).
     ///
     /// `key_derived_subject` is `Anonymous`. Use `from_verified_as_system()` for
@@ -190,23 +272,30 @@ impl EnvelopeContext {
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
+        Self::from_authenticated_request(&envelope.envelope, envelope.cnf, MediatedEvidence::from_envelope(envelope))
+    }
+
+    // Only callers that verified either the envelope or the purpose-bound
+    // witness may use this. Credential verification is still mandatory.
+    fn from_authenticated_request(envelope: &crate::envelope::RequestEnvelope, cnf: [u8; 32], evidence: Option<MediatedEvidence>) -> Self {
         Self {
-            request_id: envelope.request_id(),
+            request_id: envelope.request_id,
             claims: None,
             verified_tenant: None,
-            jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
-            delegation_token: envelope.envelope.delegation_token.clone(),
+            jwt_token: envelope.jwt_token().map(ToOwned::to_owned),
+            delegation_token: envelope.delegation_token.clone(),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
-            cnf: envelope.cnf,
-            envelope_wit_hash: envelope.envelope.wth,
-            client_dh_public: envelope.envelope.client_dh_public,
-            client_kem_public: envelope.envelope.client_kem_public.clone(),
-            request_iat: envelope.envelope.iat,
-            request_nonce: envelope.envelope.nonce,
-            response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
-            service_domain: envelope.envelope.service_domain.clone(),
-            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
+            cnf,
+            envelope_wit_hash: envelope.wth,
+            client_dh_public: envelope.client_dh_public,
+            client_kem_public: envelope.client_kem_public.clone(),
+            request_iat: envelope.iat,
+            request_nonce: envelope.nonce,
+            response_kem_recipient: envelope.response_kem_recipient.clone(),
+            service_domain: envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.proof_cwt.clone(),
+            original_holder_evidence: evidence,
             browser_method_discriminator: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
@@ -236,6 +325,7 @@ impl EnvelopeContext {
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
             envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
+            original_holder_evidence: MediatedEvidence::from_envelope(envelope),
             browser_method_discriminator: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
@@ -269,6 +359,7 @@ impl EnvelopeContext {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
@@ -316,6 +407,7 @@ impl EnvelopeContext {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -469,6 +561,7 @@ impl EnvelopeContext {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }
@@ -1751,6 +1844,7 @@ mod empty_iss_gate_tests {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             is_local_caller,
         }
@@ -2011,6 +2105,36 @@ mod empty_iss_gate_tests {
             "an admitted relay must not impersonate a published service credential's holder");
         assert!(error.to_string().contains("requires its bound holder signer"));
         assert!(replay.claims().is_none(), "rejected relay must not acquire verified claims");
+    }
+
+    #[tokio::test]
+    async fn delegated_service_thumbprint_requires_holder_and_missing_binding_denies() {
+        let (mut svc, ca) = mock_service();
+        let holder = SigningKey::from_bytes(&[23u8; 32]).verifying_key().to_bytes();
+        let foreign = SigningKey::from_bytes(&[24u8; 32]).verifying_key().to_bytes();
+        let now = chrono::Utc::now().timestamp();
+        let base = Claims::new("service:policy".to_owned(), now, now + 300);
+        for (claims, signer, allowed) in [
+            (base.clone().with_cnf_jkt(&holder), holder, true),
+            (base.clone().with_cnf_jkt(&holder), foreign, false),
+            (base, holder, false),
+        ] {
+            svc.relay = Some(signer);
+            let token = crate::auth::jwt::encode_service_jwt(&claims, &ca);
+            let mut ctx = ctx_with_token(token.clone(), true);
+            ctx.jwt_token = None;
+            ctx.delegation_token = Some(token);
+            ctx.cnf = signer;
+            let result = svc.verify_claims(&mut ctx).await;
+            if allowed {
+                result.expect("thumbprint-bound holder must remain accepted");
+                assert_eq!(ctx.subject().name(), Some("service:policy"));
+            } else {
+                let error = result.expect_err("foreign or unbound service delegation must deny");
+                assert!(error.to_string().contains("requires its bound holder signer"), "{error:#}");
+                assert!(ctx.claims().is_none(), "rejected delegation must publish no claims");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2576,6 +2700,7 @@ mod ipc_key_identity_tests {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
@@ -2879,6 +3004,7 @@ mod accounting_audit_tests {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             is_local_caller: true,
         }
@@ -2938,6 +3064,7 @@ mod accounting_audit_tests {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         };
@@ -3007,6 +3134,7 @@ mod accounting_audit_tests {
             response_kem_recipient: None,
             service_domain: None,
             envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
             is_local_caller: false,
         }

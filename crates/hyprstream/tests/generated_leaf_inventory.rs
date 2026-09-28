@@ -108,6 +108,32 @@ fn malformed_bodies_do_not_decode() {
     assert!(decode_registry_request_body(&[]).is_err());
 }
 
+#[test]
+fn mediated_operation_is_bound_to_the_generated_signed_leaf() {
+    let mut request = capnp::message::Builder::new_default();
+    request.init_root::<registry_capnp::registry_request::Builder>().set_list(());
+    let body = to_bytes(&request);
+    policy::verify_mediated_operation("registry", &body, "query").unwrap();
+    assert!(policy::verify_mediated_operation("registry", &body, "manage").is_err());
+    assert!(policy::verify_mediated_operation("registry", &body, "").is_err());
+    assert!(policy::verify_mediated_operation("unknown", &body, "query").is_err());
+    assert!(policy::verify_mediated_operation("registry", b"invalid", "query").is_err());
+
+    let mut scoped = capnp::message::Builder::new_default();
+    scoped.init_root::<registry_capnp::registry_request::Builder>()
+        .init_repo().set_list_worktrees(());
+    policy::verify_mediated_operation("registry", &to_bytes(&scoped), "query").unwrap();
+    assert!(policy::verify_mediated_operation("registry", &to_bytes(&scoped), "manage").is_err());
+
+    // Public queries and nested mediation are not scoped caller operations.
+    let mut public = capnp::message::Builder::new_default();
+    public.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>().init_check();
+    assert!(policy::verify_mediated_operation("policy", &to_bytes(&public), "query").is_err());
+    let mut nested = capnp::message::Builder::new_default();
+    nested.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>().init_check_mediated();
+    assert!(policy::verify_mediated_operation("policy", &to_bytes(&nested), "query").is_err());
+}
+
 /// Every derivable leaf resolves a generated inventory row, symbolically
 /// named for review, and the complete linked inventory validates + installs.
 #[test]
