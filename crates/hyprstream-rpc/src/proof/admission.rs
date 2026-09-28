@@ -387,16 +387,28 @@ pub fn admit_request_proof(
     store.check_and_insert(partition, key, expires_at)
 }
 
+/// Validate mediated-query dimensions on borrowed values, before any owned
+/// copy is materialized for the replay key (Sol finding: resource/operation
+/// were copied ahead of these checks).
+pub fn validate_mediated_query_dimensions(
+    mediator: &str,
+    resource: &str,
+    operation: &str,
+) -> Result<()> {
+    anyhow::ensure!(!mediator.is_empty() && mediator.len() <= 128, "mediated mediator name out of bounds");
+    anyhow::ensure!(!resource.is_empty() && resource.len() <= 4096, "mediated resource out of bounds");
+    anyhow::ensure!(!operation.is_empty() && operation.len() <= 128, "mediated operation out of bounds");
+    Ok(())
+}
+
 /// Admit a bounded mediated query under the installed store's topology.
 pub fn admit_mediated_query(
     store: &dyn ProofReplayStore,
     key: &MediatedQueryReplayKey,
     expires_at: u64,
 ) -> ProofAdmissionResult {
-    if !store.owns_namespace(&key.signer_thumbprint)
-        || key.mediator.is_empty() || key.mediator.len() > 128
-        || key.resource.is_empty() || key.resource.len() > 4096
-        || key.operation.is_empty() || key.operation.len() > 128
+    if validate_mediated_query_dimensions(&key.mediator, &key.resource, &key.operation).is_err()
+        || !store.owns_namespace(&key.signer_thumbprint)
         || expires_at <= current_unix_seconds()
     {
         return ProofAdmissionResult::Failed;

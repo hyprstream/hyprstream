@@ -877,10 +877,28 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             // This unverified subject inspection only selects extra proof
             // emission; it grants no authority. Policy verifies the credential
             // and holder independently. User delegation remains unchanged.
-            if envelope.delegation_token.is_none() && envelope.jwt_token()
+            //
+            // Two shapes carry a service credential here:
+            // - direct: the caller's own IdJag (signer == credential holder);
+            // - relay: an authorized relay (e.g. Model) forwards a service
+            //   credential it authenticated at its own ingress via
+            //   `delegation_token`, and this signer vouches for the exact
+            //   credential/body/target binding downstream. The relay shape is
+            // only produced from a verified upstream context — a stolen
+            // credential cannot traverse the relay's ingress (cnf binding),
+            // and downstream admission + Policy's target/holder checks close
+            // the loop. A relayed USER credential emits nothing.
+            let direct_service_credential = envelope.delegation_token.is_none()
+                && envelope
+                    .jwt_token()
+                    .and_then(|token| crate::auth::decode_unverified(token).ok())
+                    .is_some_and(|claims| claims.sub.starts_with("service:"));
+            let relayed_service_credential = envelope
+                .delegation_token
+                .as_deref()
                 .and_then(|token| crate::auth::decode_unverified(token).ok())
-                .is_some_and(|claims| claims.sub.starts_with("service:"))
-            {
+                .is_some_and(|claims| claims.sub.starts_with("service:"));
+            if direct_service_credential || relayed_service_credential {
                 envelope.authorization_witness = Some(
                     crate::authorization_witness::sign(&envelope, &self.signer).await?,
                 );

@@ -6,9 +6,32 @@
 #[serde(transparent)]
 pub struct SensitiveBytes(Vec<u8>);
 
+/// Domain types over wire `Data` enforce their own byte budget at decode,
+/// before any owned copy is materialized by generated readers.
+pub trait BoundedWireBytes: Sized {
+    fn from_wire_bytes(bytes: &[u8]) -> anyhow::Result<Self>;
+}
+
 impl SensitiveBytes {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
+    }
+
+}
+
+impl BoundedWireBytes for SensitiveBytes {
+    /// Bounded wire decode: reject before any owned copy when the peer sent
+    /// more than the mediated-evidence cap. The outer envelope frame has its
+    /// own (larger) bound; this enforces the stated evidence budget at the
+    /// field boundary so generated dispatch never materializes an oversized
+    /// buffer ahead of verification.
+    fn from_wire_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        use crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+        anyhow::ensure!(
+            bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES,
+            "sensitive wire bytes exceed the mediated evidence cap"
+        );
+        Ok(Self(bytes.to_vec()))
     }
 }
 
@@ -41,5 +64,15 @@ mod tests {
         let value = SensitiveBytes::new(b"secret-credential".to_vec());
         assert_eq!(format!("{value:?}"), "SensitiveBytes([REDACTED])");
         assert_eq!(&*value, b"secret-credential");
+    }
+
+    #[test]
+    fn wire_decode_rejects_oversized_before_copy() {
+        use crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+        use super::BoundedWireBytes;
+        let oversized = vec![0u8; MAX_MEDIATED_EVIDENCE_BYTES + 1];
+        assert!(SensitiveBytes::from_wire_bytes(&oversized).is_err());
+        let exact = vec![0u8; MAX_MEDIATED_EVIDENCE_BYTES];
+        assert!(SensitiveBytes::from_wire_bytes(&exact).is_ok());
     }
 }

@@ -604,3 +604,59 @@ fn scope_exempt_mutator_is_explicitly_classified() {
         assert_eq!(lookup(public).mutation_semantics, None, "{public}");
     }
 }
+
+
+/// Sol finding 2: the generated required-Data reader must reject evidence
+/// above the mediated-evidence cap at the field boundary — BEFORE any owned
+/// copy — while exactly-at-limit evidence decodes.
+#[test]
+fn mediated_check_evidence_reader_enforces_cap_before_copy() {
+    use hyprstream_rpc::capnp::FromCapnp;
+    use hyprstream_rpc::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+    use hyprstream_rpc_std::policy_capnp::policy_request;
+    use policy_request::Which;
+
+    let build = |evidence_len: usize| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let req = message.init_root::<policy_request::Builder>();
+            let mut mediated = req.init_check_mediated();
+            mediated.set_evidence(&vec![0u8; evidence_len]);
+            mediated.set_resource("registry");
+            mediated.set_operation("query");
+        }
+        to_bytes(&message)
+    };
+
+    // Over the cap: the typed read denies at the field boundary.
+    let oversized = build(MAX_MEDIATED_EVIDENCE_BYTES + 1);
+    let message = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&oversized),
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("capnp frame decodes");
+    let req = message.get_root::<policy_request::Reader>().unwrap();
+    let Which::CheckMediated(v) = req.which().unwrap() else {
+        panic!("expected checkMediated variant");
+    };
+    let v = v.expect("typed variant reader");
+    assert!(
+        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v).is_err(),
+        "oversized evidence must be rejected before the owned copy"
+    );
+
+    // Exactly at the cap: the typed read succeeds.
+    let exact = build(MAX_MEDIATED_EVIDENCE_BYTES);
+    let message = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&exact),
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("capnp frame decodes");
+    let req = message.get_root::<policy_request::Reader>().unwrap();
+    let Which::CheckMediated(v) = req.which().unwrap() else {
+        panic!("expected checkMediated variant");
+    };
+    let v = v.expect("typed variant reader");
+    <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
+        .expect("exactly-at-cap evidence must decode");
+}

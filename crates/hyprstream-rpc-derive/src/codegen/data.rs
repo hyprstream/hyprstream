@@ -1046,7 +1046,9 @@ fn generate_data_field_reader(
             }
             CapnpType::Data if field.domain_type.is_some() => {
                 let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
-                quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(#dt::new(v.to_vec())) } }, }
+                // Bounded decode: the domain type enforces its own wire cap
+                // BEFORE any owned copy is materialized.
+                quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(<#dt as hyprstream_rpc::sensitive::BoundedWireBytes>::from_wire_bytes(v)?) } }, }
             }
             CapnpType::Text => {
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(v.to_string()) } }, }
@@ -1198,9 +1200,12 @@ fn generate_data_field_reader_inner(
     match ct {
         CapnpType::Void => quote! { #rust_name: (), },
         // Field-level byte newtypes retain their redacted Debug implementation.
+        // Bounded decode: the domain type enforces its own wire cap BEFORE any
+        // owned copy is materialized (Sol finding: checkMediated evidence was
+        // copied ahead of the 64 KiB verification bound).
         CapnpType::Data if field.domain_type.is_some() => {
             let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
-            quote! { #rust_name: #dt::new(reader.#getter_name()?.to_vec()), }
+            quote! { #rust_name: <#dt as hyprstream_rpc::sensitive::BoundedWireBytes>::from_wire_bytes(reader.#getter_name()?)?, }
         }
         // Field-level `$domainType` newtype over `Text`: read via `Type::new(String)`.
         CapnpType::Text if field.domain_type.is_some() => {

@@ -2337,8 +2337,14 @@ pub const MAX_MEDIATED_EVIDENCE_BYTES: usize = 64 * 1024;
 /// The final serialized frame is capped separately, including framing overhead.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn mediated_request_fits(request: &RequestEnvelope) -> bool {
-    let Some(credential) = request.jwt_token() else { return false; };
-    if request.delegation_token.is_some() {
+    // Exactly one credential may be bound: the holder's own IdJag (direct
+    // mediated query) or the relayed service credential an admitted relay
+    // vouches for (authorization-relay). Dual credentials deny; a credential
+    // absent from both fields denies.
+    let direct = request.jwt_token();
+    let relayed = request.delegation_token.as_deref();
+    let Some(credential) = direct.or(relayed) else { return false; };
+    if direct.is_some() && relayed.is_some() {
         return false;
     }
     let mut remaining = MAX_MEDIATED_EVIDENCE_BYTES;

@@ -19,9 +19,12 @@ const EVIDENCE_MAGIC: &[u8; 8] = b"HAQW1\0\0\0";
 // Fixed-width integers/hashes, and an explicitly length-prefixed target, give
 // one unambiguous transcript. The witness itself is excluded to avoid cycles.
 fn transcript(request: &RequestEnvelope, signer: &[u8; 32], expires: i64) -> Result<Vec<u8>> {
+    // Exactly one credential may be bound. A direct presentation binds the
+    // caller's own IdJag; an authorized relay binds the relayed service
+    // credential it authenticated at its own ingress and now vouches for.
     ensure!(
-        request.delegation_token.is_none(),
-        "nested delegated witness denied"
+        request.jwt_token().is_none() || request.delegation_token.is_none(),
+        "ambiguous dual-credential witness denied"
     );
     let target = request
         .service_domain
@@ -31,6 +34,7 @@ fn transcript(request: &RequestEnvelope, signer: &[u8; 32], expires: i64) -> Res
     let target_len = u16::try_from(target.len())?;
     let credential = request
         .jwt_token()
+        .or(request.delegation_token.as_deref())
         .ok_or_else(|| anyhow!("witness credential missing"))?;
     let mut bytes = Vec::with_capacity(160 + target.len());
     bytes.extend_from_slice(PURPOSE);
@@ -119,6 +123,52 @@ fn verify_with_store(
     mediator: &str,
     store: Option<&dyn crate::envelope::PqTrustStore>,
 ) -> Result<(RequestEnvelope, [u8; 32])> {
+    let (request, signer) = verify_transcript_bindings(bytes, store)?;
+    ensure!(
+        request.service_domain.as_deref() == Some(mediator),
+        "witness target mismatch"
+    );
+    Ok((request, signer))
+}
+
+/// Verify an authorized relay's vouching witness for a relayed service
+/// credential. Identical to [`verify`] except the target==mediator comparison
+/// is intentionally absent here: the vouching relay signs the request it is
+/// about to send downstream, so the downstream service is the TARGET, not the
+/// mediator that will later present this evidence to Policy. The target
+/// binding is enforced where the mediator identity is known — Policy verifies
+/// the embedded request's `service_domain` against the authenticated
+/// `checkMediated` caller, and the relay's own ingress admission
+/// (`accept_delegated_bearer`) is checked before this function is consulted.
+/// The caller must additionally assert `signer == envelope signer` and
+/// `embedded credential == presented delegation_token`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn verify_relay_vouching(bytes: &[u8]) -> Result<(RequestEnvelope, [u8; 32])> {
+    let store = crate::envelope::global_pq_store();
+    verify_relay_vouching_with_store(bytes, store.as_deref())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_relay_vouching_with_store(
+    bytes: &[u8],
+    store: Option<&dyn crate::envelope::PqTrustStore>,
+) -> Result<(RequestEnvelope, [u8; 32])> {
+    let (request, signer) = verify_transcript_bindings(bytes, store)?;
+    ensure!(
+        request.jwt_token().is_none() && request.delegation_token.is_some(),
+        "relay vouching requires a relayed (delegated) service credential"
+    );
+    Ok((request, signer))
+}
+
+/// Shared witness verification: size/magic/canonical decode, witness presence
+/// and size, expiry/freshness, transcript reconstruction, PQ anchor resolution
+/// and composite verification. Target comparison is the caller's policy.
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_transcript_bindings(
+    bytes: &[u8],
+    store: Option<&dyn crate::envelope::PqTrustStore>,
+) -> Result<(RequestEnvelope, [u8; 32])> {
     ensure!(
         bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES,
         "mediated evidence too large"
@@ -134,10 +184,6 @@ fn verify_with_store(
     let root = message.get_root::<crate::common_capnp::authorization_query_evidence::Reader>()?;
     let signer: [u8; 32] = root.get_signer()?.try_into()?;
     let request = RequestEnvelope::read_from(root.get_request()?)?;
-    ensure!(
-        request.service_domain.as_deref() == Some(mediator),
-        "witness target mismatch"
-    );
     let witness = request
         .authorization_witness
         .as_ref()
@@ -171,6 +217,7 @@ fn verify_with_store(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use crate::envelope::{KeyedPqTrustStore, SignedEnvelope};
     use crate::node_identity::derive_mesh_mldsa_key;
     use crate::signer::LocalSigner;
@@ -289,6 +336,103 @@ mod tests {
             .is_err());
         assert!(crate::proof::parser::ParsedProof::parse(witness).is_err());
         assert!(crate::auth::decode_unverified(&String::from_utf8_lossy(witness)).is_err());
+        Ok(())
+    }
+
+    /// An authorized relay (e.g. Model) signs a witness over a relayed service
+    /// credential (delegation_token) bound to the exact downstream body and
+    /// target. The vouching signer is the RELAY, not the credential holder:
+    /// verification resolves the RELAY's enrolled PQ anchor, and any
+    /// substitution of signer, credential, body or nonce denies.
+    #[tokio::test]
+    async fn relay_witness_binds_vouching_signer_credential_body_and_rejects_substitution() -> Result<()> {
+        let relay = SigningKey::from_bytes(&[0xA1; 32]);
+        let foreign = SigningKey::from_bytes(&[0xA2; 32]);
+        let mut store = KeyedPqTrustStore::new();
+        for key in [&relay, &foreign] {
+            let pq = crate::crypto::pq::ml_dsa_vk_from_bytes(
+                &crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(key)),
+            )?;
+            store.bind(key.verifying_key().to_bytes(), &pq);
+        }
+        let credential = "service:tenant-client-witness-jwt";
+        let mut request = RequestEnvelope::new(b"downstream inference body".to_vec())
+            .with_delegation_token(credential.to_owned())
+            .with_service_domain("inference")?;
+        request.authorization_witness = Some(sign(&request, &LocalSigner::new(relay.clone())).await?);
+        let relay_pub = relay.verifying_key().to_bytes();
+        let bytes = package(&request, &relay_pub).ok_or_else(|| anyhow!("fixture evidence missing"))?;
+
+        // The relay vouching verifies without a mediator name (the target
+        // binding is enforced by Policy against the authenticated caller).
+        let (decoded, signer) = verify_relay_vouching_with_store(&bytes, Some(&store))?;
+        assert_eq!(signer, relay_pub);
+        assert_eq!(decoded.delegation_token.as_deref(), Some(credential));
+        assert_eq!(decoded.payload, b"downstream inference body");
+
+        // A foreign signer header over the same request denies (the anchor
+        // resolves but the composite signature was computed by the relay).
+        let foreign_bytes = {
+            let mut message = capnp::message::Builder::new_default();
+            let mut root =
+                message.init_root::<crate::common_capnp::authorization_query_evidence::Builder>();
+            root.set_signer(&foreign.verifying_key().to_bytes());
+            request.write_to(&mut root.init_request());
+            let mut bytes = EVIDENCE_MAGIC.to_vec();
+            bytes.extend_from_slice(&capnp::serialize::write_message_to_words(&message));
+            bytes
+        };
+        assert!(verify_relay_vouching_with_store(&foreign_bytes, Some(&store)).is_err());
+
+        // A witness minted by the foreign key over the same request denies.
+        let mut forged = request.clone();
+        forged.authorization_witness =
+            Some(sign(&forged, &LocalSigner::new(foreign.clone())).await?);
+        assert!(
+            package(&forged, &relay_pub)
+                .map(|b| verify_relay_vouching_with_store(&b, Some(&store)).is_err())
+                .unwrap_or(true),
+            "a non-relay signature must not verify as relay vouching"
+        );
+
+        // Credential substitution denies (transcript commits the credential).
+        let mut swapped = request.clone();
+        swapped.delegation_token = Some("service:other-tenant-jwt".to_owned());
+        assert!(verify_relay_vouching_with_store(&bytes, Some(&store))
+            .map(|(req, _)| req.delegation_token != swapped.delegation_token)
+            .is_ok());
+        let mut tampered = request.clone();
+        tampered.payload.push(0);
+        let tampered_bytes = {
+            let mut message = capnp::message::Builder::new_default();
+            let mut root =
+                message.init_root::<crate::common_capnp::authorization_query_evidence::Builder>();
+            root.set_signer(&relay_pub);
+            tampered.write_to(&mut root.init_request());
+            let mut bytes = EVIDENCE_MAGIC.to_vec();
+            bytes.extend_from_slice(&capnp::serialize::write_message_to_words(&message));
+            bytes
+        };
+        assert!(verify_relay_vouching_with_store(&tampered_bytes, Some(&store)).is_err());
+
+        // Stripped witness denies.
+        let mut stripped = request.clone();
+        stripped.authorization_witness = None;
+        let stripped_bytes = {
+            let mut message = capnp::message::Builder::new_default();
+            let mut root =
+                message.init_root::<crate::common_capnp::authorization_query_evidence::Builder>();
+            root.set_signer(&relay_pub);
+            stripped.write_to(&mut root.init_request());
+            let mut bytes = EVIDENCE_MAGIC.to_vec();
+            bytes.extend_from_slice(&capnp::serialize::write_message_to_words(&message));
+            bytes
+        };
+        assert!(verify_relay_vouching_with_store(&stripped_bytes, Some(&store)).is_err());
+
+        // Policy-side target binding still works for the same evidence.
+        assert!(verify_with_store(&bytes, "inference", Some(&store)).is_ok());
+        assert!(verify_with_store(&bytes, "registry", Some(&store)).is_err());
         Ok(())
     }
 }

@@ -53,6 +53,36 @@ impl MediatedEvidence {
     }
 }
 
+/// Whether an admitted relay's vouching witness proves the relayed service
+/// credential binding for this context. Only sound after the signer has passed
+/// this service's `accept_delegated_bearer` admission (checked when the
+/// delegated bearer is accepted, before claims verification).
+fn relay_vouching_proves_credential(ctx: &EnvelopeContext) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(evidence) = ctx.original_holder_evidence() else {
+            return false;
+        };
+        if !crate::authorization_witness::is_witness_evidence(evidence) {
+            return false;
+        }
+        let Ok((request, signer)) = crate::authorization_witness::verify_relay_vouching(evidence)
+        else {
+            return false;
+        };
+        // The vouching signer must be the verified envelope signer, and the
+        // vouched credential must be exactly the presented delegation token.
+        signer == ctx.cnf && request.delegation_token.as_deref() == ctx.delegation_token.as_deref()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Relay vouching is a server-side (native) verification; the browser
+        // build never verifies delegated service credentials.
+        let _ = ctx;
+        false
+    }
+}
+
 /// Authorization callback for policy checks.
 ///
 /// Parameters: (verified ingress context, resource, operation) -> allowed.
@@ -242,9 +272,12 @@ impl EnvelopeContext {
     /// startup must install the topology-qualified replay backend.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn admit_mediated_query(&self, mediator: &str, resource: &str, operation: &str) -> Result<()> {
-        use crate::proof::admission::{global_proof_replay_store, admit_mediated_query, MediatedQueryReplayKey, ProofAdmissionResult};
+        use crate::proof::admission::{global_proof_replay_store, admit_mediated_query, validate_mediated_query_dimensions, MediatedQueryReplayKey, ProofAdmissionResult};
         use sha2::{Digest, Sha256};
         anyhow::ensure!(self.claims().is_some() && self.original_holder_evidence.is_some(), "verified holder evidence required");
+        // Reject oversized dimensions on the borrowed values before building
+        // the owned replay key.
+        validate_mediated_query_dimensions(mediator, resource, operation)?;
         anyhow::ensure!(self.service_domain.as_deref() == Some(mediator), "mediator target mismatch");
         // Envelope iat is milliseconds and its age boundary is inclusive.
         // Retain through that last accepted millisecond, rounding up to the
@@ -1406,6 +1439,14 @@ pub trait RequestService: 'static {
         // attestations. Possession of one therefore cannot authorize a relay
         // to impersonate its holder, even when that relay may forward users.
         // Keep this before publishing any authenticated identity on context.
+        //
+        // Sole exception: an admitted relay (checked below against this
+        // service's `accept_delegated_bearer` admission) vouches for the exact
+        // relayed credential and downstream body with a relay witness signed
+        // by the envelope signer's enrolled hybrid key. The witness proves the
+        // signer committed to this credential+body+target binding after
+        // verifying its own upstream ingress; Policy re-verifies the embedded
+        // credential, holder, target-against-mediator and replay admission.
         if delegated && verified.sub.starts_with("service:") {
             use subtle::ConstantTimeEq as _;
             let holder_matches = if let Some(expected) = verified.cnf_key_bytes() {
@@ -1418,8 +1459,9 @@ pub trait RequestService: 'static {
             } else {
                 false
             };
-            anyhow::ensure!(holder_matches,
-                "delegated service credential requires its bound holder signer");
+            if !holder_matches && !relay_vouching_proves_credential(ctx) {
+                anyhow::bail!("delegated service credential requires its bound holder signer");
+            }
         }
 
         // Store verified claims on context for downstream use
@@ -2135,6 +2177,140 @@ mod empty_iss_gate_tests {
                 assert!(ctx.claims().is_none(), "rejected delegation must publish no claims");
             }
         }
+    }
+
+    /// Sol finding 1 causal test: a tenant-bound service caller relayed by an
+    /// admitted relay (Model → Inference shape). The relay vouches with a
+    /// witness over the exact credential/body/target; the holder rule accepts
+    /// that vouching. A relayed credential WITHOUT a valid vouching witness
+    /// still denies, and no claims are published on denial.
+    ///
+    /// Store race: `install_verify_config` is first-write-wins per process.
+    /// When this test owns the install (always true under nextest/CI, and in
+    /// filtered local runs) the strong positive property is asserted; when a
+    /// prior test's store is in force the witness anchor cannot resolve, so
+    /// the fail-closed denial path is asserted instead.
+    #[tokio::test]
+    async fn relayed_tenant_service_credential_requires_admitted_relay_witness() {
+        use crate::envelope::{install_verify_config, KeyedPqTrustStore};
+        use crate::node_identity::derive_mesh_mldsa_key;
+        use crate::crypto::pq::ml_dsa_vk_from_bytes;
+        use crate::crypto::pq::ml_dsa_sk_to_vk_bytes;
+
+        let (mut svc, ca) = mock_service();
+        let holder = SigningKey::from_bytes(&[0xB1; 32]); // tenant-bound caller key
+        let relay_key = SigningKey::from_bytes(&[0xB2; 32]); // the Model relay
+        let relay_pub = relay_key.verifying_key().to_bytes();
+        svc.relay = Some(relay_pub);
+
+        // Bind the relay's hybrid anchor; win or lose the install race.
+        let mut store = KeyedPqTrustStore::new();
+        let pq = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&relay_key)))
+            .expect("relay pq anchor derivation");
+        store.bind(relay_pub, &pq);
+        let owned_install = install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(std::sync::Arc::new(store)),
+        })
+        .is_ok();
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("service:tenant-client".to_owned(), now, now + 300)
+            .with_cnf_jwk(&holder.verifying_key().to_bytes());
+        let token = crate::auth::jwt::encode_service_jwt(&claims, &ca);
+
+        let mut request = crate::envelope::RequestEnvelope::new(b"downstream body".to_vec())
+            .with_delegation_token(token.clone())
+            .with_service_domain("inference")
+            .expect("fixture relay request");
+        request.authorization_witness = Some(
+            crate::authorization_witness::sign(
+                &request,
+                &crate::signer::LocalSigner::new(relay_key.clone()),
+            )
+            .await
+            .expect("fixture relay witness"),
+        );
+        let evidence = crate::authorization_witness::package(&request, &relay_pub)
+            .expect("relay evidence missing");
+
+        let mut ctx = ctx_with_token(String::new(), /* is_local_caller */ true);
+        ctx.jwt_token = None;
+        ctx.delegation_token = Some(token);
+        ctx.cnf = relay_pub;
+        ctx.request_iat = request.iat;
+        ctx.request_nonce = request.nonce;
+        ctx.service_domain = request.service_domain.clone();
+        ctx.original_holder_evidence = Some(crate::service::svc::MediatedEvidence(evidence.as_slice().into()));
+
+        let result = svc.verify_claims(&mut ctx).await;
+        if owned_install {
+            result.expect("admitted relay witness must vouch the relayed tenant credential");
+            assert_eq!(ctx.subject().name(), Some("service:tenant-client"));
+
+            // Credential substitution: a DIFFERENT presented token than the
+            // vouched one must deny even under an admitted relay.
+            let other = {
+                let claims = Claims::new("service:tenant-client".to_owned(), now, now + 300)
+                    .with_cnf_jwk(&holder.verifying_key().to_bytes());
+                crate::auth::jwt::encode_service_jwt(&claims, &ca)
+            };
+            let mut swapped = ctx_with_token(String::new(), true);
+            swapped.jwt_token = None;
+            swapped.delegation_token = Some(other);
+            swapped.cnf = relay_pub;
+            swapped.request_iat = request.iat;
+            swapped.request_nonce = request.nonce;
+            swapped.service_domain = request.service_domain.clone();
+            swapped.original_holder_evidence =
+                Some(crate::service::svc::MediatedEvidence(evidence.as_slice().into()));
+            let error = svc
+                .verify_claims(&mut swapped)
+                .await
+                .expect_err("witness vouches a different credential; must deny");
+            assert!(
+                error.to_string().contains("requires its bound holder signer"),
+                "{error:#}"
+            );
+            assert!(swapped.claims().is_none());
+        } else {
+            let error = result.expect_err("unresolvable witness anchor must deny closed");
+            assert!(
+                error.to_string().contains("requires its bound holder signer")
+                    || error.to_string().contains("witness"),
+                "{error:#}"
+            );
+            assert!(ctx.claims().is_none());
+        }
+    }
+
+    /// The same relayed credential WITHOUT the vouching witness denies even
+    /// from an admitted relay signer: the witness is the relay's commitment,
+    /// not a formality.
+    #[tokio::test]
+    async fn relayed_tenant_service_credential_denies_without_witness() {
+        let (mut svc, ca) = mock_service();
+        let holder = SigningKey::from_bytes(&[0xC1; 32]);
+        let relay_pub = SigningKey::from_bytes(&[0xC2; 32]).verifying_key().to_bytes();
+        svc.relay = Some(relay_pub);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("service:tenant-client".to_owned(), now, now + 300)
+            .with_cnf_jwk(&holder.verifying_key().to_bytes());
+        let token = crate::auth::jwt::encode_service_jwt(&claims, &ca);
+        let mut ctx = ctx_with_token(String::new(), /* is_local_caller */ true);
+        ctx.jwt_token = None;
+        ctx.delegation_token = Some(token);
+        ctx.cnf = relay_pub;
+
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("admitted relay without a vouching witness must deny");
+        assert!(
+            error.to_string().contains("requires its bound holder signer"),
+            "{error:#}"
+        );
+        assert!(ctx.claims().is_none(), "denied relay must publish no claims");
     }
 
     #[tokio::test]
