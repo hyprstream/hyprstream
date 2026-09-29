@@ -36,6 +36,7 @@ use hyprstream_rpc_std::policy_client::{
     ResolveServiceKey, SessionKeyRef, SessionKeyRefContent,
 };
 use hyprstream_service::{InprocManager, ServiceManager as _};
+use hyprstream_rpc::service::{Continuation, DecodedRequestBody, EnvelopeContext, RequestService};
 
 const POLICY_ROOT_KEY: [u8; 32] = [0x52; 32];
 const OAUTH_KEY: [u8; 32] = [0x44; 32];
@@ -307,6 +308,125 @@ fn mint_user_token(
 }
 
 
+
+// ── Test-only admission observation probe ─────────────────────────────
+
+#[derive(Clone)]
+struct ProbeCounters {
+    admission_denials: Arc<std::sync::atomic::AtomicUsize>,
+    published_claims: Arc<std::sync::atomic::AtomicUsize>,
+    handler_entries: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ProbeCounters {
+    fn new() -> Self {
+        Self {
+            admission_denials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            published_claims: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            handler_entries: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+    fn admission_denials(&self) -> usize {
+        self.admission_denials.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn published_claims(&self) -> usize {
+        self.published_claims.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn handler_entries(&self) -> usize {
+        self.handler_entries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct AdmissionProbe {
+    inner: PolicyService,
+    observed_signer: [u8; 32],
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    counters: ProbeCounters,
+}
+
+#[async_trait::async_trait(?Send)]
+impl RequestService for AdmissionProbe {
+    fn decode_request_body(&self, signed_body: &[u8]) -> anyhow::Result<DecodedRequestBody> {
+        RequestService::decode_request_body(&self.inner, signed_body)
+    }
+    async fn handle_request(&self, ctx: &EnvelopeContext, body: &DecodedRequestBody) -> Result<(Vec<u8>, Option<Continuation>)> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) && ctx.cnf == self.observed_signer {
+            self.counters.handler_entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        RequestService::handle_request(&self.inner, ctx, body).await
+    }
+    fn name(&self) -> &str { RequestService::name(&self.inner) }
+    fn transport(&self) -> &TransportConfig { RequestService::transport(&self.inner) }
+    fn signing_key(&self) -> SigningKey { RequestService::signing_key(&self.inner) }
+    fn expected_audience(&self) -> Option<&str> { RequestService::expected_audience(&self.inner) }
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        RequestService::jwt_key_source(&self.inner)
+    }
+    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+        RequestService::resolve_key_subject(&self.inner, signer_pubkey)
+    }
+    fn cache_key_binding(&self, vk: ed25519_dalek::VerifyingKey, subject: &str, jwt: &str, expires_at: i64) {
+        RequestService::cache_key_binding(&self.inner, vk, subject, jwt, expires_at);
+    }
+    fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+        RequestService::accept_delegated_bearer(&self.inner, signer_pubkey)
+    }
+    fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        RequestService::build_error_payload(&self.inner, request_id, error)
+    }
+    async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
+        let result = RequestService::verify_claims(&self.inner, ctx).await;
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) && ctx.cnf == self.observed_signer {
+            if result.is_err() && result.as_ref().unwrap_err().to_string().contains("not an authorized relay") {
+                self.counters.admission_denials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if ctx.claims().is_some() {
+                self.counters.published_claims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        result
+    }
+}
+
+async fn spawn_policy_with_probe(
+    tag: &str,
+    observed_signer: [u8; 32],
+    counters: ProbeCounters,
+) -> Result<(PolicyClient, Arc<std::sync::atomic::AtomicBool>)> {
+    let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+    let rules = tempfile::TempDir::new()?;
+    let manager = Arc::new(PolicyManager::new(rules.path().join("policies")).await?);
+    let policy_dir = tempfile::TempDir::new()?;
+    let git2db = Arc::new(tokio::sync::RwLock::new(
+        git2db::Git2DB::open(policy_dir.path()).await?,
+    ));
+    let policy_service = PolicyService::new(
+        manager,
+        Arc::new(root_key.clone()),
+        TokenConfig::default(),
+        git2db,
+        TransportConfig::inproc(tag),
+    )
+    .with_jwt_key_source(cluster_key_source(&ca_jwt_key));
+    let probe = AdmissionProbe {
+        inner: policy_service,
+        observed_signer,
+        armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        counters,
+    };
+    let armed = Arc::clone(&probe.armed);
+    let mgr = InprocManager::new();
+    let _handle = mgr.spawn(Box::new(probe)).await?;
+    let client = PolicyClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"),
+        SigningKey::from_bytes(&POLICY_ROOT_KEY),
+        root_key.verifying_key(),
+        None,
+    )?;
+    Ok((client, armed))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()> {
     install_crypto();
@@ -559,7 +679,13 @@ async fn registered_non_relay_admitted_service_delegated_user_denies_on_wire() -
     let registered_wit = mint_service_jwt(&credentials, "relayg1", &ca_jwt_key, &registered_key);
 
     let tag = format!("relay-g1-policy-{}", uuid::Uuid::new_v4());
-    let _policy = spawn_policy(&tag).await?;
+    let counters = ProbeCounters::new();
+    let (_policy_client, armed) = spawn_policy_with_probe(
+        &tag,
+        registered_key.verifying_key().to_bytes(),
+        counters.clone(),
+    )
+    .await?;
 
     // Register "relayg1" (CA-signed, cnf-bound) exactly like the production
     // path. SERVICE_BASE_POLICIES contains NO policy:PolicyCheck/check grant
@@ -609,6 +735,10 @@ async fn registered_non_relay_admitted_service_delegated_user_denies_on_wire() -
     let active = direct.check_session(&check_session).await?;
     assert!(active, "registered signer direct check_session must succeed");
 
+    // Arm the probe: count admission denials and claims publication from
+    // this point forward. The direct control is complete and successful.
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
     // DELEGATED negative: the SAME signer + SAME method, but the bearer is a
     // delegated USER token instead of the signer's own WIT. The
     // relay-admission gate (accept_delegated_bearer) must deny it because
@@ -626,16 +756,21 @@ async fn registered_non_relay_admitted_service_delegated_user_denies_on_wire() -
             "a registered but non-relay-admitted service must not complete a delegated-user check_session",
         );
     // Uniform pre-handler boundary (production error preserved).
-    // Boundary layering: the wire-level denial is the uniform production
-    // error; the specific relay-admission gate is unit-covered by
-    // delegated_bearer_is_denied_by_default (svc.rs), which asserts the
-    // exact accept_delegated_bearer rejection at the verifier boundary.
-    // Together these prove: (1) the wire denies before handler/claims, and
-    // (2) the internal gate is the admission check, not a transport failure.
     assert!(
         error.to_string().contains("dispatch denied"),
-        "expected the uniform pre-handler denial on the real encrypted path, got: {error:?}"
+        "expected uniform pre-handler denial: {error:?}",
     );
+
+    // Observation counters prove the admission gate fired and no claims or
+    // handler entries occurred. The specific gate is the
+    // accept_delegated_bearer admission denial in verify_claims.
+    assert!(
+        counters.admission_denials() >= 1,
+        "admission denial counter must be >= 1, got {}",
+        counters.admission_denials(),
+    );
+    assert_eq!(counters.published_claims(), 0, "no claims may be published");
+    assert_eq!(counters.handler_entries(), 0, "no handler entry may occur");
 
     hop.shutdown().await?;
     Ok(())
