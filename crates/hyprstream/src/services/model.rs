@@ -3864,6 +3864,54 @@ mod tests {
         )
     }
 
+    fn resolve_gitdir_reference(
+        reference_file: &std::path::Path,
+        gitfile_format: bool,
+    ) -> Result<std::path::PathBuf> {
+        let contents = std::fs::read_to_string(reference_file)?;
+        let reference = if gitfile_format {
+            contents
+                .strip_prefix("gitdir: ")
+                .ok_or_else(|| anyhow!("fixture Git file is malformed"))?
+        } else {
+            contents.as_str()
+        }
+        .trim();
+        anyhow::ensure!(
+            !reference.is_empty() && !reference.contains(['\n', '\r']),
+            "fixture Git link is malformed"
+        );
+        let path = std::path::PathBuf::from(reference);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            reference_file
+                .parent()
+                .ok_or_else(|| anyhow!("fixture Git link has no parent"))?
+                .join(path)
+        };
+        Ok(resolved.canonicalize()?)
+    }
+
+    fn validate_restart_fixture_worktree_link(
+        repo: &std::path::Path,
+        worktree: &std::path::Path,
+    ) -> Result<()> {
+        let admin_worktree = repo.join("worktrees").join("main");
+        let expected_gitfile = worktree.join(".git");
+        anyhow::ensure!(expected_gitfile.is_file(), "fixture main worktree has no Git file");
+        anyhow::ensure!(
+            resolve_gitdir_reference(&admin_worktree.join("gitdir"), false)?
+                == expected_gitfile.canonicalize()?,
+            "fixture repository main worktree does not name the isolated StoragePaths worktree"
+        );
+        anyhow::ensure!(
+            resolve_gitdir_reference(&expected_gitfile, true)? == admin_worktree.canonicalize()?,
+            "isolated StoragePaths worktree does not link back to fixture repository main"
+        );
+        Ok(())
+    }
+
     /// A guest-provisioned, local-only fixture for the real restart acceptance
     /// test.  The repository must be bare and its linked `main` worktree must
     /// already be the XDG-isolated path that `StoragePaths` resolves.  The test
@@ -3912,10 +3960,7 @@ mod tests {
                     }),
                 "fixture must provide config.json, tokenizer.json, and safetensors weights"
             );
-            anyhow::ensure!(
-                repo.join("worktrees").join("main").canonicalize()? == worktree.canonicalize()?,
-                "fixture repository main worktree must be the isolated StoragePaths worktree"
-            );
+            validate_restart_fixture_worktree_link(&repo, &worktree)?;
 
             // The test uses only deterministic test-local keys. Classical is
             // sufficient for this in-process synthetic guest; production
@@ -4026,6 +4071,82 @@ mod tests {
                 _policy_base: policy_base,
             })
         }
+    }
+
+    #[test]
+    fn restart_fixture_gitdir_backlink_requires_expected_checkout() -> Result<()> {
+        fn git(args: &[&str]) -> Result<()> {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .status()
+                .map_err(|error| anyhow!("temporary Git fixture command did not start: {error}"))?;
+            anyhow::ensure!(
+                status.success(),
+                "temporary Git fixture command failed: git {args:?}"
+            );
+            Ok(())
+        }
+
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        let repo = temp.path().join("fixture.git");
+        let expected_checkout = temp.path().join("isolated/models/worktrees/main");
+        let other_checkout = temp.path().join("other-worktree");
+        let source_arg = source
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary source path is not UTF-8"))?;
+        let repo_arg = repo
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary bare repository path is not UTF-8"))?;
+        let expected_arg = expected_checkout
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary expected checkout path is not UTF-8"))?;
+        let other_arg = other_checkout
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary mismatched checkout path is not UTF-8"))?;
+
+        git(&["init", "-b", "main", source_arg])?;
+        git(&["-C", source_arg, "config", "user.name", "restart-fixture-test"])?;
+        git(&[
+            "-C",
+            source_arg,
+            "config",
+            "user.email",
+            "restart-fixture-test@example.invalid",
+        ])?;
+        std::fs::write(source.join("fixture.txt"), "fixture\n")?;
+        git(&["-C", source_arg, "add", "fixture.txt"])?;
+        git(&["-C", source_arg, "commit", "-m", "temporary fixture"])?;
+        git(&["clone", "--bare", source_arg, repo_arg])?;
+        std::fs::create_dir_all(
+            expected_checkout
+                .parent()
+                .ok_or_else(|| anyhow!("temporary expected checkout has no parent"))?,
+        )?;
+        git(&["--git-dir", repo_arg, "worktree", "add", expected_arg, "main"])?;
+        git(&[
+            "--git-dir",
+            repo_arg,
+            "worktree",
+            "add",
+            "-b",
+            "other",
+            other_arg,
+            "main",
+        ])?;
+
+        validate_restart_fixture_worktree_link(&repo, &expected_checkout)?;
+        let mismatch = match validate_restart_fixture_worktree_link(&repo, &other_checkout) {
+            Ok(()) => anyhow::bail!("a different linked checkout must be rejected"),
+            Err(error) => error,
+        };
+        anyhow::ensure!(
+            mismatch
+                .to_string()
+                .contains("does not name the isolated StoragePaths worktree"),
+            "mismatched checkout error must identify the administrative backlink"
+        );
+        Ok(())
     }
 
     fn assert_restart_order_holder(
