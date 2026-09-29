@@ -243,6 +243,7 @@ valkey = ["dep:fred"]  # Enable legacy Valkey/Redis-backed user and token stores
 discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery state
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
+postgres-replay = ["postgres"]  # Durable proof and mediated replay admission on shared Postgres
 encrypted-account-admission = []  # Mandatory source-level policy: no plaintext account UserStore in production
 # Local RocksDB persistence (same shape as the `valkey` precedent): the
 # legacy RocksDbUserStore/DeviceStore, the OAuth refresh-token store, and the
