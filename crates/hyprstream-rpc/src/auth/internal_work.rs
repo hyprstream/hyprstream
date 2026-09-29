@@ -509,16 +509,27 @@ mod tests {
         assert!(err.to_string().contains("typ"), "{err:#}");
     }
 
+    // K3 B1 (4064c6bf review): tests that would touch the PROCESS-GLOBAL
+    // replay cache or its capacity OnceLock are isolated — either on a private
+    // ReplayState serialized exactly like the global path (one mutex held
+    // across check-and-insert), or in a forked child process for the
+    // once-only configuration assertion. A sibling's forged future `now` must
+    // not be able to purge another test's in-flight admission, and one test's
+    // OnceLock write must not make another's once-only configure fail.
+    // Assertions themselves are unchanged.
+
     #[test]
     fn jti_is_single_use_and_expired_entries_are_reclaimed() {
+        // Isolated state: sibling tests sharing the global cache (or forging
+        // clock values) cannot purge these entries mid-test.
+        let mut state = ReplayState::new(8);
         let now = chrono::Utc::now().timestamp();
-        let id = format!("jti-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        assert!(admit_internal_work_jti_once(&id, now + 60, now));
-        assert!(!admit_internal_work_jti_once(&id, now + 60, now), "replay must deny");
+        let id = "jti-single-use".to_owned();
+        assert!(admit_once_in(&mut state, &id, now + 60, now));
+        assert!(!admit_once_in(&mut state, &id, now + 60, now), "replay must deny");
         // Past its exp the entry is reclaimed, so a fresh order with the same
         // id (impossible for a real mint, but proves the release) admits again.
-        assert!(admit_internal_work_jti_once(&id, now + 120, now + 61));
+        assert!(admit_once_in(&mut state, &id, now + 120, now + 61));
     }
 
     #[test]
@@ -558,8 +569,13 @@ mod tests {
 
     #[test]
     fn jti_concurrent_duplicate_admission_is_exactly_once() {
-        // The process-global path holds its lock across check-and-insert, so
-        // racing duplicates must yield exactly one admission.
+        // The admission path holds ONE mutex across check-and-insert (the
+        // global wrapper does; this isolated fixture serializes identically),
+        // so racing duplicates must yield exactly one admission. The state is
+        // private to this test: no sibling test can purge its in-flight
+        // entries with a forged clock (K3 B1b).
+        let state = parking_lot::Mutex::new(ReplayState::new(64));
+        let state = std::sync::Arc::new(state);
         let now = chrono::Utc::now().timestamp();
         let id = format!(
             "jti-concurrent-{}",
@@ -568,11 +584,17 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let exp = now + 60;
+        let exp = now + 600;
         let handles: Vec<_> = (0..8)
             .map(|_| {
+                let state = std::sync::Arc::clone(&state);
                 let id = id.clone();
-                std::thread::spawn(move || admit_internal_work_jti_once(&id, exp, now))
+                std::thread::spawn(move || {
+                    // Same shape as admit_internal_work_jti_once: the mutex is
+                    // held across check-and-insert (atomic exactly-once).
+                    let mut guard = state.lock();
+                    admit_once_in(&mut guard, &id, exp, now)
+                })
             })
             .collect();
         let successes = handles
@@ -581,10 +603,15 @@ mod tests {
             .filter(|admitted| *admitted)
             .count();
         assert_eq!(successes, 1, "exactly one racing admission may win");
+        assert_eq!(
+            state.lock().by_jti.len(),
+            1,
+            "the winning admission is the only entry"
+        );
     }
 
     #[test]
-    fn replay_capacity_configuration_is_validated_and_fail_closed() {
+    fn replay_capacity_validation_and_zero_capacity_fail_closed() {
         // Validation: zero and absurd caps are invalid.
         assert!(validate_replay_capacity(0).is_err());
         assert!(validate_replay_capacity(MAX_REPLAY_CAPACITY + 1).is_err());
@@ -595,8 +622,47 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         assert!(!admit_once_in(&mut state, "any", now + 60, now));
         assert!(state.by_jti.is_empty());
-        // Deployment configuration is once-only (second call is refused).
+    }
+
+    /// K3 B1a: the once-only `configure_internal_work_replay_capacity`
+    /// assertion mutates the process-global OnceLock, so it runs in a forked
+    /// child test process where the lock is fresh (same pattern as the
+    /// inference drain child tests). The parent only verifies the child's
+    /// exit status — no assertion is weakened, both configure outcomes are
+    /// still asserted in the child.
+    #[test]
+    fn replay_capacity_once_only_configuration_child() {
+        if std::env::var("HYPRSTREAM_S1_CONFIG_CHILD").is_err() {
+            return; // parent run: only the child below exercises this body
+        }
+        // Fresh process: the OnceLock is unconfigured, so the first validated
+        // call must succeed and the second must be refused.
         assert!(configure_internal_work_replay_capacity(DEFAULT_REPLAY_CAPACITY).is_ok());
         assert!(configure_internal_work_replay_capacity(1).is_err());
+        assert_eq!(
+            *CONFIGURED_CAPACITY.get().expect("configured in child"),
+            DEFAULT_REPLAY_CAPACITY
+        );
+    }
+
+    #[test]
+    fn replay_capacity_once_only_configuration_is_child_process_isolated() {
+        let executable = std::env::current_exe().expect("test executable");
+        let mut child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "auth::internal_work::tests::replay_capacity_once_only_configuration_child",
+                "--nocapture",
+            ])
+            .env("HYPRSTREAM_S1_CONFIG_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn config child");
+        let status = child.wait().expect("child wait");
+        assert!(
+            status.success(),
+            "once-only configuration child must pass: {status}"
+        );
     }
 }

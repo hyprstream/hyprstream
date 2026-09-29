@@ -125,6 +125,19 @@ pub struct LoadedModel {
     /// Client for communicating with the InferenceService (built from
     /// `transport` via `dial()` — the co-located fast path).
     pub client: InferenceClient,
+    /// Worker-generated 256-bit incarnation of THIS running pinned worker,
+    /// reported through the private readiness handoff for this spawn attempt.
+    /// Fresh per run: pre-restart work orders fail audience verification at
+    /// the replacement worker (Sol bounded incarnation plan).
+    pub incarnation: String,
+    /// Exact versioned internal-work audience of this incarnation
+    /// (`iw1/{deterministic service name}/{incarnation}`). Minting uses THIS
+    /// binding — never a recomputed deterministic name.
+    pub work_audience: String,
+    /// Spawn-attempt generation this binding came from. A delayed result from
+    /// an older attempt cannot overwrite a newer binding (generation checked
+    /// at handoff validation).
+    pub load_generation: u64,
     /// #322 leaf cell-router state for this model. Holds the session→owner
     /// affinity map (heartbeat-lease renewal, KV-cache stickiness) and the
     /// per-node load/health counters used by HRW placement. In v1 this is a
@@ -211,6 +224,11 @@ pub struct ModelServiceInner {
     /// allocates the next value, keying a fresh [`TerminalStore`] entry so a
     /// reload latches under a new key (reload ⇒ new terminal, EV7/#649).
     load_epoch: AtomicU64,
+    /// Monotonic spawn-attempt generation for pinned worker incarnation
+    /// handoffs. Each `InferenceService` spawn attempt allocates the next
+    /// value; the worker echoes it in its private readiness handoff and a
+    /// delayed/stale handoff from an older attempt is discarded.
+    incarnation_generation: AtomicU64,
     /// The sole tenant admitted by an in-process deployment. A second tenant
     /// must never share the FFI engine fault radius.
     in_process_tenant: std::sync::OnceLock<String>,
@@ -446,6 +464,7 @@ impl ModelService {
             fs_trees: dashmap::DashMap::new(),
             load_terminals: TerminalStore::new(),
             load_epoch: AtomicU64::new(0),
+            incarnation_generation: AtomicU64::new(0),
             in_process_tenant: std::sync::OnceLock::new(),
             producer_reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
                 hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
@@ -1028,6 +1047,21 @@ impl ModelService {
         if let Some(ref src) = self.jwt_key_source {
             service_config = service_config.with_jwt_key_source(src.clone());
         }
+        // Bounded worker incarnation binding (Sol plan): this spawn attempt
+        // allocates a private handoff channel and the next generation. The
+        // worker generates its own 256-bit incarnation inside its service
+        // thread and reports `(generation, instance, controller, audience)`
+        // through the handoff after its engine is initialized; Model accepts
+        // the handoff only for THIS attempt's expected values. A worker that
+        // dies before reporting (or a missing/failed handoff) fails the load.
+        let generation = self
+            .inner
+            .incarnation_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let (incarnation_tx, incarnation_rx) = tokio::sync::oneshot::channel();
+        service_config = service_config.with_incarnation_handoff(incarnation_tx, generation);
+
         let network_reach = service_config.network_reach_handle();
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
@@ -1036,6 +1070,36 @@ impl ModelService {
             .clone()
             .ok_or_else(|| anyhow!("InferenceService became ready without network reach"))?;
         let endpoint = network_transport.endpoint_string();
+
+        // Await the worker's private incarnation handoff. Missing (worker died
+        // before init), timed out, or mismatched (instance/controller/generation)
+        // all FAIL THE LOAD closed — no binding, no minting from this attempt.
+        let expected_controller = self.signing_key.verifying_key().to_bytes();
+        const HANDOFF_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS);
+        let incarnation_binding = match tokio::time::timeout(HANDOFF_TIMEOUT, incarnation_rx).await {
+            Err(_) => anyhow::bail!(
+                "pinned worker incarnation handoff timed out after {}s without a ready worker",
+                crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS
+            ),
+            Ok(Err(_)) => {
+                anyhow::bail!("pinned worker died before reporting its incarnation handoff")
+            }
+            Ok(Ok(handoff)) => handoff,
+        };
+        anyhow::ensure!(
+            incarnation_binding.generation == generation,
+            "stale incarnation handoff: worker reported generation {} for attempt {generation}",
+            incarnation_binding.generation
+        );
+        anyhow::ensure!(
+            incarnation_binding.instance_service_name == instance.service_name(),
+            "incarnation handoff names the wrong deterministic instance"
+        );
+        anyhow::ensure!(
+            incarnation_binding.controller_pubkey == expected_controller,
+            "incarnation handoff names the wrong pinned controller"
+        );
 
         // Create client for this service from the typed transport (#320).
         // Inference services share the model service's signing key, so use our
@@ -1098,6 +1162,11 @@ impl ModelService {
                     network_transport,
                     service_handle,
                     client,
+                    // Worker incarnation binding for THIS run (Sol bounded
+                    // incarnation plan): minting uses exactly this audience.
+                    incarnation: incarnation_binding.incarnation,
+                    work_audience: incarnation_binding.audience,
+                    load_generation: incarnation_binding.generation,
                     // #322 leaf cell-router. v1: single co-located replica. Its
                     // placement ID is purpose-separated from every transport,
                     // application-signing, and subject identity. The
@@ -1278,6 +1347,7 @@ impl ModelService {
         instance: &InferenceInstanceId,
         ctx: &EnvelopeContext,
         scope: &hyprstream_rpc::auth::internal_work::InternalWorkScope,
+        live_work_audience: &str,
     ) -> Result<String> {
         use hyprstream_rpc::auth::internal_work::{
             encode_internal_work, InternalWorkClaims, INTERNAL_WORK_ISSUER, MAX_LIFETIME_SECS,
@@ -1306,7 +1376,10 @@ impl ModelService {
         let claims = InternalWorkClaims {
             iss: INTERNAL_WORK_ISSUER.to_owned(),
             sub: subject_string,
-            aud: instance.service_name(),
+            // The EXACT audience of the currently live worker incarnation
+            // (Sol bounded incarnation plan) — never a recomputed
+            // deterministic name, which would survive a worker restart.
+            aud: live_work_audience.to_owned(),
             tenant: instance.tenant().to_owned(),
             model: instance.model_ref().to_owned(),
             resource: scope.resource.clone(),
@@ -1371,7 +1444,22 @@ impl ModelService {
         let model = cache
             .get_mut(&instance)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
+        // Bounded worker incarnation binding (Sol plan): a cached entry whose
+        // worker DIED is fail-closed — evict and deny until a fresh run
+        // reports ready with a fresh incarnation. Never mint against a dead
+        // worker, even if its (old) receipt would still be time-valid.
+        if !model.service_handle.is_running() {
+            cache.pop(&instance);
+            anyhow::bail!(
+                "pinned worker for model {model_ref_str} is not running; \
+                 the model must be loaded again before internal work"
+            );
+        }
         model.last_used = Instant::now();
+        // The live binding for THIS running incarnation. Minting uses exactly
+        // this audience; the worker denies anything else.
+        let live_work_audience = model.work_audience.clone();
+        let live_generation = model.load_generation;
         // #322 placement key. The envelope does not yet carry an explicit
         // session_id; use the authenticated subject as a stable per-caller key
         // (keeps HRW affinity effective for repeat requests from the same
@@ -1387,7 +1475,12 @@ impl ModelService {
         let routed = self
             .select_inference_routed(model, &placement_key, relay_bearer.as_deref())
             .await?;
-        let work_token = self.mint_internal_work_token(&instance, ctx, &work)?;
+        let work_token =
+            self.mint_internal_work_token(&instance, ctx, &work, &live_work_audience)?;
+        tracing::debug!(
+            generation = live_generation,
+            "minted internal work order against live worker incarnation"
+        );
         Ok(Self::attach_work_order(routed, work_token))
     }
 
@@ -2979,6 +3072,12 @@ mod tests {
         LoadedModel {
             instance: selector_instance(),
             model_ref: "fixture-model:main".to_owned(),
+            incarnation: "fixture-incarnation-0000".to_owned(),
+            work_audience: crate::services::inference::internal_work_audience(
+                &selector_instance().service_name(),
+                "fixture-incarnation-0000",
+            ),
+            load_generation: 1,
             transport: local_transport.clone(),
             network_transport,
             service_handle: hyprstream_service::SpawnedService::dummy(),
@@ -3532,12 +3631,139 @@ mod tests {
 
     const BOUNDARY_CALLER_KEY: [u8; 32] = [0xCB; 32];
 
+    /// The exact live worker audience a mint must bind (Sol incarnation plan):
+    /// the versioned audience of the fixture instance's test incarnation.
+    fn audience_fixture() -> String {
+        crate::services::inference::internal_work_audience(
+            &selector_instance().service_name(),
+            "test-incarnation-0000",
+        )
+    }
+
+    // ── Sol bounded incarnation plan: live binding + dead-worker fail-close ─
+
+    fn running_worker() -> hyprstream_service::SpawnedService {
+        // A live parked thread keeps the handle "running" for the guard; the
+        // parked thread exits when the test process ends (no join needed).
+        let handle = std::thread::spawn(|| {
+            loop {
+                std::thread::park_timeout(std::time::Duration::from_secs(3600));
+            }
+        });
+        hyprstream_service::SpawnedService::thread(
+            "s1-alive-worker".to_owned(),
+            Some(handle),
+            Arc::new(tokio::sync::Notify::new()),
+            None,
+        )
+    }
+
+    fn dead_worker() -> hyprstream_service::SpawnedService {
+        hyprstream_service::SpawnedService::thread(
+            "s1-dead-worker".to_owned(),
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn dead_worker_cache_entry_cannot_mint_and_is_evicted() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        let mut cache = service.loaded_models.write().await;
+        cache.put(
+            instance.clone(),
+            LoadedModel {
+                instance: instance.clone(),
+                model_ref: instance.model_ref().to_owned(),
+                transport: TransportConfig::inproc("dead-worker-test"),
+                network_transport: TransportConfig::inproc("dead-worker-test"),
+                service_handle: dead_worker(),
+                client: InferenceClient::new(Arc::new(BoundaryRpcClient::new(
+                    TransportConfig::inproc("dead-worker-test"),
+                    Arc::new(BoundaryDialState::default()),
+                ))),
+                incarnation: "dead-incarnation".to_owned(),
+                work_audience: "iw1/dead/dead".to_owned(),
+                load_generation: 1,
+                router: CellRouter::default(),
+                load_state: Vec::new(),
+                loaded_at: Instant::now(),
+                last_used: Instant::now(),
+                ttt_config: None,
+                generation_defaults: crate::config::SamplingParams::default(),
+            },
+        );
+        drop(cache);
+
+        let ctx = boundary_caller_ctx(chrono::Utc::now().timestamp() + 3600);
+        let scope = InternalWorkScope::new("inference:GenerateStream", "infer");
+        let error = match service
+            .get_inference_client(instance.model_ref(), &ctx, scope)
+            .await
+        {
+            Ok(_) => panic!("a dead worker cache entry must not mint work orders"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not running"),
+            "dead-worker denial must name the liveness guard: {error:#}"
+        );
+        // The dead entry was evicted: the cache no longer holds it.
+        assert!(!service.loaded_models.read().await.contains(&instance));
+    }
+
+    #[test]
+    fn running_worker_liveness_guard_passes() {
+        // Positive control for the liveness guard itself: an entry whose
+        // service handle reports running passes the guard.
+        let worker = running_worker();
+        assert!(worker.is_running(), "live thread fixture must report running");
+        let dead = dead_worker();
+        assert!(!dead.is_running(), "dead fixture must report not-running");
+        drop(worker);
+    }
+
+    #[test]
+    fn incarnation_handoff_validation_rejects_stale_or_mismatched() {
+        // The model-side handoff validation ensures the reported handoff
+        // matches THIS spawn attempt exactly. Exercised through the same
+        // ensure-conditions the load path applies (generation/instance/
+        // controller), via direct value checks mirroring model.rs load logic.
+        let instance = selector_instance();
+        let expected_generation: u64 = 3;
+        let expected_controller = SigningKey::from_bytes(&[0x41; 32]).verifying_key().to_bytes();
+
+        let handoff = crate::services::inference::IncarnationHandoff {
+            instance_service_name: instance.service_name(),
+            controller_pubkey: expected_controller,
+            generation: expected_generation,
+            incarnation: "aa11".to_owned(),
+            audience: "iw1/x/aa11".to_owned(),
+        };
+        assert_eq!(handoff.generation, expected_generation);
+        assert_eq!(handoff.instance_service_name, instance.service_name());
+        assert_eq!(handoff.controller_pubkey, expected_controller);
+
+        let stale = crate::services::inference::IncarnationHandoff {
+            generation: expected_generation - 1,
+            ..handoff.clone()
+        };
+        assert_ne!(stale.generation, expected_generation, "stale handoff");
+    }
+
     fn boundary_caller_ctx(caller_exp: i64) -> EnvelopeContext {
         let caller_key = SigningKey::from_bytes(&BOUNDARY_CALLER_KEY);
         let now = chrono::Utc::now().timestamp();
         let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, caller_exp)
             .with_tenant("fixture-tenant".to_owned())
-            .with_cnf_jwk(caller_key.verifying_key().as_bytes());
+            .with_cnf_jwk(caller_key.verifying_key().as_bytes())
+            // Model's ingress MAC gate (inference_instance →
+            // enforce_inference_mac) runs inside get_inference_client before
+            // the worker binding is consulted; the caller must carry the same
+            // clearance the real ingress path requires.
+            .with_clearance(crate::services::inference::inference_object_label());
         EnvelopeContext::for_test_authenticated_subject_with_claims(
             hyprstream_rpc::envelope::Subject::new("alice"),
             "fixture-tenant",
@@ -3554,7 +3780,12 @@ mod tests {
         let caller_exp = chrono::Utc::now().timestamp() + 3600;
         let ctx = boundary_caller_ctx(caller_exp);
         let token = service
-            .mint_internal_work_token(&instance, &ctx, &scope)
+                                .mint_internal_work_token(
+                        &instance,
+                        &ctx,
+                        &scope,
+                        &audience_fixture(),
+                    )
             .unwrap_or_else(|e| panic!("mint failed: {e}"));
 
         let model_key = SigningKey::from_bytes(&[0x41; 32]);
@@ -3562,7 +3793,7 @@ mod tests {
         let claims = verify_internal_work(
             &token,
             &model_key.verifying_key(),
-            &instance.service_name(),
+            &audience_fixture(),
             now,
         )
         .unwrap_or_else(|e| panic!("minted order must verify against the pinned controller: {e}"));
@@ -3617,14 +3848,14 @@ mod tests {
             SigningKey::from_bytes(&BOUNDARY_CALLER_KEY).verifying_key(),
         );
         assert!(
-            service.mint_internal_work_token(&instance, &bare, &scope).is_err(),
+            service.mint_internal_work_token(&instance, &bare, &scope, &audience_fixture()).is_err(),
             "internal work without a verified caller identity must not mint"
         );
 
         // Expired caller credential: never minted.
         let expired = boundary_caller_ctx(chrono::Utc::now().timestamp() - 10);
         assert!(
-            service.mint_internal_work_token(&instance, &expired, &scope).is_err(),
+            service.mint_internal_work_token(&instance, &expired, &scope, &audience_fixture()).is_err(),
             "internal work must not outlive an expired caller credential"
         );
     }

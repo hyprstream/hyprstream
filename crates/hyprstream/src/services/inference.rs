@@ -2822,12 +2822,13 @@ struct InferenceZmqAdapter {
     signing_key: SigningKey,
     expected_audience: Option<String>,
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
-    /// Opaque per-instance service name — the audience a controller's
-    /// internal work order must name.
-    instance_service_name: String,
     /// Model reference binding; `None` ⇒ internal work orders are never
     /// admitted (standalone direct-caller service, fail-closed).
     instance_model_ref: Option<String>,
+    /// EXACT versioned internal-work audience of THIS worker incarnation
+    /// (`iw1/{service name}/{worker-generated incarnation}`). Work orders
+    /// naming anything else are denied.
+    instance_audience: String,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2900,7 +2901,7 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
         let claims = hyprstream_rpc::auth::internal_work::verify_internal_work(
             token,
             &self.service.controller_pubkey,
-            &self.instance_service_name,
+            &self.instance_audience,
             now,
         )?;
         anyhow::ensure!(
@@ -2945,6 +2946,36 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     }
 }
 
+/// Private per-attempt readiness handoff from the worker to its owning
+/// ModelService (Sol bounded incarnation plan). The worker generates its own
+/// 256-bit incarnation inside its service thread and reports the exact
+/// versioned audience plus the spawn-attempt identity through this channel —
+/// never via a request, resolver record, or cached deterministic name.
+#[derive(Clone)]
+pub struct IncarnationHandoff {
+    /// The deterministic instance name this worker was spawned for.
+    pub instance_service_name: String,
+    /// The pinned controller (Model) key this worker was configured with.
+    pub controller_pubkey: [u8; 32],
+    /// The spawn-attempt generation the ModelService allocated.
+    pub generation: u64,
+    /// Worker-generated 256-bit incarnation (hex-encoded).
+    pub incarnation: String,
+    /// Exact versioned internal-work audience:
+    /// `iw1/{instance_service_name}/{incarnation}`.
+    pub audience: String,
+}
+
+/// Seconds a ModelService waits for the worker's incarnation handoff after
+/// the spawner reports readiness. Missing readiness fails the load closed.
+pub const INCARNATION_HANDOFF_TIMEOUT_SECS: u64 = 30;
+
+/// The versioned internal-work audience for one worker incarnation.
+/// Exact-comparison string: no fallback to the deterministic name alone.
+pub(crate) fn internal_work_audience(service_name: &str, incarnation: &str) -> String {
+    format!("iw1/{service_name}/{incarnation}")
+}
+
 /// Configuration for spawning an InferenceService.
 ///
 /// This struct holds all parameters needed to initialize an InferenceService.
@@ -2975,6 +3006,12 @@ pub struct InferenceServiceConfig {
     /// internal work orders (`iw+jwt`); absent (standalone service) ⇒ it never
     /// accepts them, fail-closed.
     model_ref: Option<String>,
+    /// Private per-attempt readiness handoff: the worker reports its
+    /// worker-generated incarnation here after its engine is initialized.
+    /// `None` (or a dropped sender) ⇒ the owning load attempt fails closed.
+    incarnation_handoff: Option<tokio::sync::oneshot::Sender<IncarnationHandoff>>,
+    /// Spawn-attempt generation echoed in the handoff for staleness checks.
+    attempt_generation: u64,
     /// ModelService key allowed to bridge local calls into this tenant.
     controller_pubkey: VerifyingKey,
     /// Network reach published after the engine and Iroh endpoint are ready.
@@ -3027,6 +3064,8 @@ impl InferenceServiceConfig {
             jwt_key_source: None,
             tenant_domain: "local".to_owned(),
             model_ref: None,
+            incarnation_handoff: None,
+            attempt_generation: 0,
             controller_pubkey: server_pubkey,
             network_reach: Arc::new(parking_lot::RwLock::new(None)),
             producer_reach_config: Arc::new(parking_lot::RwLock::new(
@@ -3064,6 +3103,20 @@ impl InferenceServiceConfig {
     #[must_use]
     pub fn with_model_ref(mut self, model_ref: impl Into<String>) -> Self {
         self.model_ref = Some(model_ref.into());
+        self
+    }
+
+    /// Attach this spawn attempt's private incarnation handoff. The worker
+    /// sends its worker-generated incarnation + audience + attempt identity
+    /// after its engine is initialized; the owner awaits it after readiness.
+    #[must_use]
+    pub fn with_incarnation_handoff(
+        mut self,
+        sender: tokio::sync::oneshot::Sender<IncarnationHandoff>,
+        attempt_generation: u64,
+    ) -> Self {
+        self.incarnation_handoff = Some(sender);
+        self.attempt_generation = attempt_generation;
         self
     }
 
@@ -3511,6 +3564,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 jwt_key_source,
                 tenant_domain,
                 model_ref: model_ref_binding,
+                incarnation_handoff,
+                attempt_generation,
                 controller_pubkey,
                 network_reach,
                 producer_reach_config,
@@ -3589,14 +3644,54 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("inference init: {e}"))?;
+
+                    // Sol bounded incarnation plan: the WORKER generates its
+                    // own fresh 256-bit incarnation inside this service
+                    // thread, after the engine is initialized and before the
+                    // request adapter exists. The versioned audience is stored
+                    // on the adapter for its entire run and reported to the
+                    // owner through the private per-attempt handoff. Never
+                    // accepted from a request, resolver record, or cached name.
+                    let incarnation_bytes = [
+                        hyprstream_rpc::envelope::generate_nonce(),
+                        hyprstream_rpc::envelope::generate_nonce(),
+                    ]
+                    .concat();
+                    let incarnation = hex::encode(incarnation_bytes);
+                    let instance_audience =
+                        internal_work_audience(&instance_service_name, &incarnation);
+                    match incarnation_handoff {
+                        Some(sender) => sender
+                            .send(IncarnationHandoff {
+                                instance_service_name: instance_service_name.clone(),
+                                controller_pubkey: controller_pubkey.to_bytes(),
+                                generation: attempt_generation,
+                                incarnation,
+                                audience: instance_audience.clone(),
+                            })
+                            .map_err(|_| {
+                                anyhow::anyhow!(
+                                    "incarnation handoff receiver dropped by the owner;                                      refusing to serve internal work from an unbound worker"
+                                )
+                            })?,
+                        // A pinned instance without a handoff receiver has no
+                        // owner awaiting its binding — fail closed.
+                        None if model_ref_binding.is_some() => {
+                            anyhow::bail!(
+                                "pinned instance has no incarnation handoff receiver; refusing to serve"
+                            )
+                        }
+                        None => {}
+                    }
+
                     Ok(InferenceZmqAdapter {
                         service,
                         transport: adapter_transport,
                         signing_key: svc_signing_key,
                         expected_audience,
                         jwt_key_source,
-                        instance_service_name,
                         instance_model_ref: model_ref_binding,
+                        instance_audience,
                     })
                 },
                 nonce_cache,
@@ -4903,6 +4998,9 @@ mod single_service_boundary_tests {
 
     /// Build a real adapter over an unloaded engine (no weights needed: these
     /// tests never execute generation) with a DEAD policy transport.
+    /// The test incarnation bound into every default fixture adapter.
+    const TEST_INCARNATION: &str = "test-incarnation-0000";
+
     fn boundary_adapter(
         controller: &SigningKey,
         instance_service_name: &str,
@@ -4917,6 +5015,7 @@ mod single_service_boundary_tests {
             model,
             with_model_binding,
             None,
+            TEST_INCARNATION,
         )
     }
 
@@ -4927,6 +5026,7 @@ mod single_service_boundary_tests {
         model: &str,
         with_model_binding: bool,
         delta_pool: Option<Arc<DeltaPool>>,
+        incarnation: &str,
     ) -> InferenceZmqAdapter {
         let service = InferenceService {
             inner: Arc::new(InferenceServiceInner {
@@ -4965,8 +5065,8 @@ mod single_service_boundary_tests {
             signing_key: controller.clone(),
             expected_audience: None,
             jwt_key_source: None,
-            instance_service_name: instance_service_name.to_owned(),
             instance_model_ref: with_model_binding.then(|| model.to_owned()),
+            instance_audience: internal_work_audience(instance_service_name, incarnation),
         }
     }
 
@@ -4987,7 +5087,7 @@ mod single_service_boundary_tests {
         InternalWorkClaims {
             iss: INTERNAL_WORK_ISSUER.to_owned(),
             sub: subject_string.to_owned(),
-            aud: instance_service_name.to_owned(),
+            aud: internal_work_audience(instance_service_name, TEST_INCARNATION),
             tenant: TENANT.to_owned(),
             model: MODEL.to_owned(),
             resource: "inference:GenerateStream".to_owned(),
@@ -5449,6 +5549,113 @@ mod single_service_boundary_tests {
         );
     }
 
+    // ── Sol bounded incarnation plan: worker incarnation binding ────────────
+    //
+    // The work-order audience is now `iw1/{instance}/{worker incarnation}`.
+    // These tests prove: a token minted for incarnation A is DENIED at a
+    // worker incarnation B of the SAME deterministic instance/tenant/model;
+    // a token for B is admitted at B; a second submission of the same receipt
+    // is denied through the JTI gate; and standalone instances still deny.
+
+    #[tokio::test]
+    async fn incarnation_a_token_denied_at_worker_incarnation_b() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter_a = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            None,
+            "incarnation-aaaa",
+        );
+        let adapter_b = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            None,
+            "incarnation-bbbb",
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_work_claims_for_subject(
+            &controller,
+            &instance.service_name(),
+            now,
+            "alice",
+        );
+        // A's token binds EXACTLY A's versioned audience.
+        claims.aud = internal_work_audience(&instance.service_name(), "incarnation-aaaa");
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        adapter_a
+            .verify_claims(&mut ctx)
+            .await
+            .expect("A token admits at A");
+        // The same receipt is DENIED at incarnation B — pre-restart receipts
+        // do not survive a worker replacement.
+        let mut ctx_b = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let error = adapter_b
+            .verify_claims(&mut ctx_b)
+            .await
+            .expect_err("A token must fail at worker incarnation B");
+        assert!(error.to_string().contains("audience"), "{error:#}");
+        assert!(ctx_b.internal_work().is_none());
+
+        // B's own receipt admits at B through the same real path.
+        let mut b_claims = fixture_work_claims_for_subject(
+            &controller,
+            &instance.service_name(),
+            now,
+            "alice",
+        );
+        b_claims.aud = internal_work_audience(&instance.service_name(), "incarnation-bbbb");
+        b_claims.jti = format!("{}-b", b_claims.jti);
+        let mut ctx_b2 = ctx_with_work(encode_internal_work(&b_claims, &controller), &controller);
+        adapter_b
+            .verify_claims(&mut ctx_b2)
+            .await
+            .expect("B token admits at B");
+    }
+
+    #[tokio::test]
+    async fn duplicate_incarnation_receipt_denies_through_jti_gate() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            None,
+            "incarnation-cccc",
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_work_claims_for_subject(
+            &controller,
+            &instance.service_name(),
+            now,
+            "alice",
+        );
+        claims.aud = internal_work_audience(&instance.service_name(), "incarnation-cccc");
+        let token = encode_internal_work(&claims, &controller);
+        // Same jti, same aud, same everything: first submission admitted,
+        // second submission denied through the JTI gate INSIDE one incarnation.
+        let mut first = ctx_with_work(token.clone(), &controller);
+        adapter
+            .verify_claims(&mut first)
+            .await
+            .expect("first submission admitted");
+        let mut second = ctx_with_work(token, &controller);
+        let error = adapter
+            .verify_claims(&mut second)
+            .await
+            .expect_err("second submission of one receipt must deny");
+        assert!(error.to_string().contains("replay"), "{error:#}");
+    }
+
     // ── Sol S1: distinct callers keep subject-keyed TTT state separate ─────
     //
     // Admission installs the EXACT resolved subject (proven at the real
@@ -5498,6 +5705,7 @@ mod single_service_boundary_tests {
             MODEL,
             true,
             Some(Arc::clone(&pool)),
+            "test-incarnation-0000",
         );
 
         let caller_a = "user:alice";
