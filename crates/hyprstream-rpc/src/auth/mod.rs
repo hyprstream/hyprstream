@@ -17,6 +17,7 @@ pub mod composite;
 pub mod credential;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod federation;
+pub mod internal_work;
 pub mod jti_blocklist;
 pub mod jwt;
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,6 +77,11 @@ pub use jwt::{
     decode_with_any_key_lenient, decode_with_key, encode, encode_service_jwt, header_alg,
     header_kid, is_rfc9068_access_token_type, jwk_thumbprint, parse_composite_dispatch,
     parse_protected_header,
+};
+pub use internal_work::{
+    InternalWorkClaims, InternalWorkContext, InternalWorkScope, INTERNAL_WORK_ISSUER,
+    INTERNAL_WORK_JWT_TYP, MAX_IAT_SKEW_SECS, MAX_LIFETIME_SECS, admit_internal_work_jti_once,
+    encode_internal_work, verify_internal_work,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use jwt::decode_with_federation_candidates;

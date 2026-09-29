@@ -203,6 +203,12 @@ pub struct EnvelopeContext {
     /// service dispatch after the sealed transcript is recovered.
     pub(crate) browser_method_discriminator: Option<u16>,
 
+    /// Verified internal execution work order (`iw+jwt`, single-service
+    /// Model→Inference boundary). Set ONLY by `verify_claims` after the
+    /// service's `verify_internal_work_bearer` hook authenticated the token
+    /// against its pinned controller; never populated from wire data alone.
+    pub(crate) internal_work: Option<crate::auth::internal_work::InternalWorkContext>,
+
     /// Whether this request originated from a genuine in-process / IPC caller
     /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
     /// (the `AnySigner` plane used by ZMQ-QUIC / iroh / WebTransport).
@@ -300,6 +306,7 @@ impl EnvelopeContext {
             envelope_proof_cwt: envelope.proof_cwt.clone(),
             original_holder_evidence: evidence,
             browser_method_discriminator: None,
+            internal_work: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
         }
@@ -330,6 +337,7 @@ impl EnvelopeContext {
             envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
             original_holder_evidence: MediatedEvidence::from_envelope(envelope),
             browser_method_discriminator: None,
+            internal_work: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
         }
@@ -364,6 +372,7 @@ impl EnvelopeContext {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
         }
@@ -412,6 +421,7 @@ impl EnvelopeContext {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         }
     }
@@ -566,6 +576,7 @@ impl EnvelopeContext {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         }
     }
@@ -708,6 +719,16 @@ impl EnvelopeContext {
     /// Check if request has user context
     pub fn has_user_context(&self) -> bool {
         self.claims.is_some()
+    }
+
+    /// The verified internal execution work order, when this request crossed a
+    /// pinned single-service execution boundary (Model → its Inference
+    /// subprocessor). `None` for every direct caller; a service MUST treat its
+    /// presence as "the controller already authorized this exact operation" —
+    /// never as bearer delegation.
+    #[must_use]
+    pub fn internal_work(&self) -> Option<&crate::auth::internal_work::InternalWorkContext> {
+        self.internal_work.as_ref()
     }
 
     /// Get the client's ephemeral DH public key (if present).
@@ -1030,6 +1051,26 @@ pub trait RequestService: 'static {
         false
     }
 
+    /// Verify an `iw+jwt` internal execution work order presented as the
+    /// direct JWT (single-service Model→Inference boundary, user-approved D5).
+    ///
+    /// The generic pipeline rejects this token type at EVERY service by
+    /// default; only a service operating a pinned execution boundary overrides
+    /// this hook. The override must authenticate the token against the PINNED
+    /// controller key and bind it to the exact instance/tenant/model/operation
+    /// admitted. On `Ok` the pipeline installs the original-caller identity
+    /// (subject, tenant, claims snapshot) and the
+    /// [`InternalWorkContext`](crate::auth::internal_work::InternalWorkContext)
+    /// on the context; the work order is never a bearer anywhere else.
+    async fn verify_internal_work_bearer(
+        &self,
+        _ctx: &EnvelopeContext,
+        _token: &str,
+        _protected: &crate::auth::ProtectedHeader,
+    ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
+        anyhow::bail!("internal work bearer is not accepted by this service")
+    }
+
     /// E2E JWT verification with unified key source.
     ///
     /// Called by `process_request` after envelope signature verification.
@@ -1078,6 +1119,59 @@ pub trait RequestService: 'static {
             return Ok(());
         };
 
+        // Parse the protected JOSE header once with duplicate detection. All
+        // dispatch and primitive verification below consumes this exact value.
+        let protected = crate::auth::parse_protected_header(&token)
+            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
+
+        // Internal execution work order (single-service Model→Inference
+        // boundary). Routed to the per-service hook BEFORE the CA key source
+        // and the generic credential grammar: the hook verifies against the
+        // PINNED controller key (never the CA source), and its DEFAULT denies —
+        // so only a service that explicitly operates a pinned execution
+        // boundary can admit this type, and every other service fails closed
+        // here (and again at its own grammar below for any unknown typ). Never
+        // treated as delegation.
+        if protected.typ == crate::auth::internal_work::INTERNAL_WORK_JWT_TYP {
+            let work = self
+                .verify_internal_work_bearer(ctx, &token, &protected)
+                .await?;
+            use std::str::FromStr as _;
+            let subject = crate::envelope::Subject::from_str(&work.sub)?;
+            anyhow::ensure!(
+                subject.name() != Some(UNAUTHENTICATED_DID_SENTINEL),
+                "internal work bearer subject is the reserved unauthenticated sentinel"
+            );
+            anyhow::ensure!(
+                !subject.is_anonymous(),
+                "internal work bearer requires an authenticated original subject"
+            );
+            let caller = work.caller.clone();
+            ctx.verified_tenant = Some(work.tenant.clone());
+            ctx.claims = Some(caller);
+            ctx.jwt_subject = Some(subject.clone());
+            ctx.internal_work = Some(crate::auth::internal_work::InternalWorkContext {
+                subject,
+                owner_did: work.owner_did.clone(),
+                resource: work.resource.clone(),
+                operation: work.operation.clone(),
+                tenant: work.tenant.clone(),
+                model: work.model.clone(),
+                jti: work.jti.clone(),
+            });
+            tracing::info!(
+                target: "audit",
+                subject = %ctx.subject(),
+                resource = %work.resource,
+                action = %work.operation,
+                decision = "allow",
+                request_id = ctx.request_id,
+                via = "model-internal-work",
+                "internal work admission"
+            );
+            return Ok(());
+        }
+
         // Get key source — if not configured, JWT verification is disabled
         let key_source = match self.jwt_key_source() {
             Some(ks) => ks,
@@ -1109,10 +1203,6 @@ pub trait RequestService: 'static {
             anyhow::bail!("empty JWT issuer is only accepted from in-process callers");
         }
 
-        // Parse the protected JOSE header once with duplicate detection. All
-        // dispatch and primitive verification below consumes this exact value.
-        let protected = crate::auth::parse_protected_header(&token)
-            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
         anyhow::ensure!(
             crate::auth::is_rfc9068_access_token_type(&protected.typ) || protected.typ == "wit+jwt",
             "unsupported JWT typ"
@@ -1760,6 +1850,9 @@ mod empty_iss_gate_tests {
         policy: crate::crypto::CryptoPolicy,
         relay: Option<[u8; 32]>,
         cached_subjects: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        /// Pinned controller key for `iw+jwt` internal work admission
+        /// (mirrors the Inference subprocessor adapter shape).
+        internal_controller: Option<ed25519_dalek::VerifyingKey>,
     }
 
     #[async_trait(?Send)]
@@ -1816,6 +1909,35 @@ mod empty_iss_gate_tests {
         fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
             self.relay.as_ref() == Some(signer_pubkey)
         }
+        async fn verify_internal_work_bearer(
+            &self,
+            ctx: &EnvelopeContext,
+            token: &str,
+            _protected: &crate::auth::ProtectedHeader,
+        ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
+            let controller = self
+                .internal_controller
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("internal work bearer is not accepted by this service"))?;
+            anyhow::ensure!(
+                ctx.cnf == controller.to_bytes(),
+                "internal work bearer envelope was not signed by the pinned controller"
+            );
+            let now = chrono::Utc::now().timestamp();
+            let claims = crate::auth::internal_work::verify_internal_work(
+                token,
+                controller,
+                "mock-instance-1",
+                now,
+            )?;
+            anyhow::ensure!(
+                crate::auth::internal_work::admit_internal_work_jti_once(
+                    &claims.jti, claims.exp, now,
+                ),
+                "internal work token jti was already admitted (replay)"
+            );
+            Ok(claims)
+        }
         fn cache_key_binding(
             &self,
             _verifying_key: ed25519_dalek::VerifyingKey,
@@ -1849,6 +1971,7 @@ mod empty_iss_gate_tests {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller,
         }
     }
@@ -1881,6 +2004,7 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
         };
         (svc, ca)
     }
@@ -2162,6 +2286,7 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -2200,6 +2325,7 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -2239,6 +2365,7 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -2317,6 +2444,7 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -2432,6 +2560,7 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Hybrid,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
         };
         let now = chrono::Utc::now().timestamp();
         // Local-issuer credentials must carry a credential ID (jti is a
@@ -2705,6 +2834,7 @@ mod ipc_key_identity_tests {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
         }
@@ -3009,6 +3139,7 @@ mod accounting_audit_tests {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: true,
         }
     }
@@ -3069,6 +3200,7 @@ mod accounting_audit_tests {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         };
         let records = capture(|| {
@@ -3139,6 +3271,7 @@ mod accounting_audit_tests {
             envelope_proof_cwt: None,
             original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         }
     }
@@ -3325,5 +3458,265 @@ mod browser_method_commitment_tests {
         let ctx = EnvelopeContext::from_callback_service(7, "model");
         ctx.ensure_browser_method(u16::MAX)
             .expect("non-browser carriers have no method commitment to compare");
+    }
+}
+
+
+/// Internal execution work order (`iw+jwt`) routing tests — the
+/// single-service Model→Inference boundary's GENERIC pipeline half.
+///
+/// The default service posture is deny: `iw+jwt` is authority at NO service
+/// unless it explicitly operates a pinned execution boundary. The accepting
+/// shape here mirrors the Inference subprocessor adapter (pinned controller
+/// key + instance audience + single-use jti) and proves the pipeline installs
+/// the ORIGINAL caller identity on the context.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod internal_work_routing_tests {
+    use super::*;
+    use crate::auth::internal_work::{
+        encode_internal_work, InternalWorkClaims, INTERNAL_WORK_ISSUER,
+    };
+    use ed25519_dalek::SigningKey;
+    use parking_lot::Mutex as PlMutex;
+
+    const CONTROLLER: [u8; 32] = [0xC7; 32];
+    const STRANGER: [u8; 32] = [0xC9; 32];
+
+    struct BoundaryMockService {
+        signing_key: SigningKey,
+        transport: TransportConfig,
+        key_source: std::sync::Arc<dyn crate::auth::JwtKeySource>,
+        internal_controller: Option<ed25519_dalek::VerifyingKey>,
+        _cached: std::sync::Arc<PlMutex<Vec<String>>>,
+    }
+
+    impl BoundaryMockService {
+        fn without_boundary() -> Self {
+            Self {
+                signing_key: SigningKey::from_bytes(&[8u8; 32]),
+                transport: TransportConfig::inproc("boundary-mock"),
+                key_source: std::sync::Arc::new(crate::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
+                    "http://127.0.0.1:1".to_owned(),
+                )),
+                internal_controller: None,
+                _cached: std::sync::Arc::default(),
+            }
+        }
+
+        fn with_controller(controller: &SigningKey) -> Self {
+            Self {
+                internal_controller: Some(controller.verifying_key()),
+                ..Self::without_boundary()
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RequestService for BoundaryMockService {
+        async fn handle_request(
+            &self,
+            _ctx: &EnvelopeContext,
+            _body: &crate::service::DecodedRequestBody,
+        ) -> Result<(Vec<u8>, Option<Continuation>)> {
+            Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
+        }
+        fn name(&self) -> &str {
+            "boundary-mock"
+        }
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+        fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
+            Some(self.key_source.clone())
+        }
+        fn require_cnf_binding(&self) -> bool {
+            false
+        }
+        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
+            None
+        }
+        async fn verify_internal_work_bearer(
+            &self,
+            ctx: &EnvelopeContext,
+            token: &str,
+            _protected: &crate::auth::ProtectedHeader,
+        ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
+            let controller = self.internal_controller.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("internal work bearer is not accepted by this service")
+            })?;
+            anyhow::ensure!(
+                ctx.cnf == controller.to_bytes(),
+                "internal work bearer envelope was not signed by the pinned controller"
+            );
+            let now = chrono::Utc::now().timestamp();
+            let claims = crate::auth::internal_work::verify_internal_work(
+                token,
+                controller,
+                "mock-instance-1",
+                now,
+            )?;
+            anyhow::ensure!(
+                crate::auth::internal_work::admit_internal_work_jti_once(
+                    &claims.jti, claims.exp, now,
+                ),
+                "internal work token jti was already admitted (replay)"
+            );
+            Ok(claims)
+        }
+    }
+
+    fn fixture_claims(controller: &SigningKey, aud: &str, now: i64) -> InternalWorkClaims {
+        let caller = crate::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            .with_tenant("tenant-a".to_owned());
+        InternalWorkClaims {
+            iss: INTERNAL_WORK_ISSUER.to_owned(),
+            sub: "alice".to_owned(),
+            aud: aud.to_owned(),
+            tenant: "tenant-a".to_owned(),
+            model: "qwen3:main".to_owned(),
+            resource: "inference:generateStream".to_owned(),
+            operation: "infer".to_owned(),
+            iat: now,
+            exp: now + 60,
+            jti: format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos(),
+            ),
+            cnf: InternalWorkClaims::controller_cnf(&controller.verifying_key()),
+            owner_did: Some("did:key:z6Mktest".to_owned()),
+            caller,
+        }
+    }
+
+    fn ctx_with_internal_token(token: String, cnf: [u8; 32]) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 1,
+            claims: None,
+            verified_tenant: None,
+            jwt_token: Some(token),
+            delegation_token: None,
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            cnf,
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
+            browser_method_discriminator: None,
+            internal_work: None,
+            is_local_caller: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_work_denied_at_default_service() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::without_boundary();
+        let mut ctx = ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("iw+jwt must deny at a service that operates no execution boundary");
+        assert!(error.to_string().contains("not accepted"), "{error:#}");
+        assert!(ctx.claims().is_none(), "no claims may publish on denial");
+        assert!(ctx.internal_work().is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_work_admits_original_caller_at_pinned_boundary() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("the pinned controller's work order must be admitted");
+        assert_eq!(ctx.subject().name(), Some("alice"), "original caller identity");
+        assert_eq!(ctx.verified_tenant(), Some("tenant-a"));
+        assert_eq!(
+            ctx.claims().map(|c| c.sub.as_str()),
+            Some("alice"),
+            "caller claims snapshot installed for subject-dependent semantics"
+        );
+        let work = ctx.internal_work().expect("work order installed");
+        assert_eq!(work.resource, "inference:generateStream");
+        assert_eq!(work.operation, "infer");
+        assert_eq!(work.tenant, "tenant-a");
+        assert_eq!(work.model, "qwen3:main");
+        assert_eq!(work.owner_did.as_deref(), Some("did:key:z6Mktest"));
+    }
+
+    #[tokio::test]
+    async fn internal_work_rejected_from_foreign_envelope_signer() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let stranger = SigningKey::from_bytes(&STRANGER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::with_controller(&controller);
+        // The token is genuine — but the ENVELOPE was signed by a stranger.
+        let mut ctx = ctx_with_internal_token(token, stranger.verifying_key().to_bytes());
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a stolen work order cannot be replayed under a foreign signer");
+        assert!(error.to_string().contains("pinned controller"), "{error:#}");
+        assert!(ctx.claims().is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_work_replayed_jti_denies_on_second_admission() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::with_controller(&controller);
+        let admit = |token: String| {
+            ctx_with_internal_token(token, controller.verifying_key().to_bytes())
+        };
+        let mut first = admit(token.clone());
+        svc.verify_claims(&mut first)
+            .await
+            .expect("first admission of a fresh work order");
+        let mut second = admit(token);
+        let error = svc
+            .verify_claims(&mut second)
+            .await
+            .expect_err("the same work order jti must not admit twice");
+        assert!(error.to_string().contains("replay"), "{error:#}");
+        assert!(second.claims().is_none(), "no claims on replay denial");
     }
 }

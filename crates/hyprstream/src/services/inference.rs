@@ -2274,6 +2274,32 @@ fn map_adaptation_strategy(
 #[async_trait::async_trait(?Send)]
 impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+        // Single-service boundary (user-approved D5): controller internal work
+        // was authorized at Model ingress — Model is the authority for this
+        // leg. The worker re-checks the mandatory MAC floor against the
+        // caller-claims snapshot carried in the verified work order and
+        // requires the exact bound operation coordinate, but makes NO Policy
+        // call: it is a subprocessor, not an independent authority domain.
+        if let Some(work) = ctx.internal_work() {
+            anyhow::ensure!(
+                work.resource == resource && work.operation == operation,
+                "internal work order does not authorize {operation} on {resource}"
+            );
+            enforce_inference_mac(ctx, &self.object_label)?;
+            tracing::info!(
+                target: "hyprstream.mac.audit",
+                decision = "allow",
+                subject = %work.subject,
+                resource = %resource,
+                action = %operation,
+                request_id = ctx.request_id,
+                plane = "rpc",
+                via = "model-internal-work",
+                controller = hex::encode(self.controller_pubkey.as_bytes()),
+                "authorization decision"
+            );
+            return Ok(());
+        }
         let subject = ctx.subject();
         let domain = self.authorization_domain(ctx)?;
         enforce_inference_mac(ctx, &self.object_label)?;
@@ -2331,8 +2357,16 @@ impl InferenceHandler for InferenceService {
         // authorization label (e.g. "alice"), not a DID and never a ledger
         // principal; the self-certifying DID is derived from the same verified
         // envelope (svc.rs / the enforcer's S1 model). Anonymous ⇒ `None`.
+        //
+        // Single-service boundary: on controller internal work the envelope
+        // signer is the PINNED CONTROLLER, so the spend owner comes from the
+        // verified work order's original-caller DID; only direct callers fall
+        // back to their own signer DID.
         #[cfg(feature = "ledger")]
-        let owner_did = ctx.authenticated_pairwise_did().map(|d| d.as_str().to_owned());
+        let owner_did = ctx
+            .internal_work()
+            .and_then(|work| work.owner_did.clone())
+            .or_else(|| ctx.authenticated_pairwise_did().map(|d| d.as_str().to_owned()));
         #[cfg(not(feature = "ledger"))]
         let owner_did: Option<String> = None;
         let (stream_id, server_pubkey, broadcast_path, reach, pending) =
@@ -2788,6 +2822,12 @@ struct InferenceZmqAdapter {
     signing_key: SigningKey,
     expected_audience: Option<String>,
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+    /// Opaque per-instance service name — the audience a controller's
+    /// internal work order must name.
+    instance_service_name: String,
+    /// Model reference binding; `None` ⇒ internal work orders are never
+    /// admitted (standalone direct-caller service, fail-closed).
+    instance_model_ref: Option<String>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2833,6 +2873,51 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     }
     fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
         signer_pubkey == &self.service.controller_pubkey.to_bytes()
+    }
+
+    /// Single-service boundary admission (user-approved D5): the pinned
+    /// allocated instance executes only its controller's internal work orders,
+    /// bound to THIS instance/tenant/model and one exact operation.
+    ///
+    /// Fail-closed on: missing instance binding (standalone service), a foreign
+    /// envelope signer, wrong audience/tenant/model, expired/oversized/replayed
+    /// tokens, and missing caller snapshots. Verified against the PINNED
+    /// controller key — never against the CA key source.
+    async fn verify_internal_work_bearer(
+        &self,
+        ctx: &EnvelopeContext,
+        token: &str,
+        _protected: &hyprstream_rpc::auth::ProtectedHeader,
+    ) -> anyhow::Result<hyprstream_rpc::auth::internal_work::InternalWorkClaims> {
+        let instance_model_ref = self.instance_model_ref.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("standalone inference accepts no internal work bearer")
+        })?;
+        anyhow::ensure!(
+            ctx.cnf == self.service.controller_pubkey.to_bytes(),
+            "internal work bearer envelope was not signed by the pinned controller"
+        );
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::internal_work::verify_internal_work(
+            token,
+            &self.service.controller_pubkey,
+            &self.instance_service_name,
+            now,
+        )?;
+        anyhow::ensure!(
+            claims.tenant == self.service.tenant_domain,
+            "internal work token tenant does not match this instance binding"
+        );
+        anyhow::ensure!(
+            claims.model == *instance_model_ref,
+            "internal work token model does not match this instance binding"
+        );
+        anyhow::ensure!(
+            hyprstream_rpc::auth::internal_work::admit_internal_work_jti_once(
+                &claims.jti, claims.exp, now,
+            ),
+            "internal work token jti was already admitted (replay)"
+        );
+        Ok(claims)
     }
 
     /// Resolve a verified mesh-peer signer key to its per-host subject (#328).
@@ -2885,6 +2970,11 @@ pub struct InferenceServiceConfig {
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// Tenant binding inherited from the authority-verified ModelService call.
     tenant_domain: String,
+    /// Model reference this instance serves, when spawned as a pinned
+    /// Model-subprocessor instance. Present ⇒ the instance accepts controller
+    /// internal work orders (`iw+jwt`); absent (standalone service) ⇒ it never
+    /// accepts them, fail-closed.
+    model_ref: Option<String>,
     /// ModelService key allowed to bridge local calls into this tenant.
     controller_pubkey: VerifyingKey,
     /// Network reach published after the engine and Iroh endpoint are ready.
@@ -2936,6 +3026,7 @@ impl InferenceServiceConfig {
             expected_audience: None,
             jwt_key_source: None,
             tenant_domain: "local".to_owned(),
+            model_ref: None,
             controller_pubkey: server_pubkey,
             network_reach: Arc::new(parking_lot::RwLock::new(None)),
             producer_reach_config: Arc::new(parking_lot::RwLock::new(
@@ -2964,6 +3055,15 @@ impl InferenceServiceConfig {
         self.service_name = service_name;
         self.tenant_domain = tenant_domain;
         self.controller_pubkey = controller_pubkey;
+        self
+    }
+
+    /// Bind the model reference this pinned instance serves. Present ⇒
+    /// controller internal work orders (`iw+jwt`) are admissible; absent ⇒
+    /// they are never admitted (standalone direct-caller service).
+    #[must_use]
+    pub fn with_model_ref(mut self, model_ref: impl Into<String>) -> Self {
+        self.model_ref = Some(model_ref.into());
         self
     }
 
@@ -3410,6 +3510,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 expected_audience,
                 jwt_key_source,
                 tenant_domain,
+                model_ref: model_ref_binding,
                 controller_pubkey,
                 network_reach,
                 producer_reach_config,
@@ -3421,6 +3522,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 draining,
             } = *self;
             let adapter_transport = transport.clone();
+            // Instance audience for controller internal work orders (`iw+jwt`).
+            let instance_service_name = service_name.clone();
 
             let lifecycle_ready = Arc::clone(&network_ready);
             let lifecycle_draining = Arc::clone(&draining);
@@ -3492,6 +3595,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         signing_key: svc_signing_key,
                         expected_audience,
                         jwt_key_source,
+                        instance_service_name,
+                        instance_model_ref: model_ref_binding,
                     })
                 },
                 nonce_cache,
@@ -4704,5 +4809,408 @@ mod tests {
             assert!(res.is_none(), "{res:?}");
             assert_eq!(available(&handle, "did:web:alice").await, 1000);
         }
+    }
+}
+
+
+/// User-approved single-service Model→Inference boundary (D5) — causal tests.
+///
+/// These exercise the REAL changed boundaries without a live engine:
+/// - the adapter's `verify_internal_work_bearer` hook through the REAL generic
+///   `verify_claims` pipeline (typ routing, pinned-controller signature,
+///   instance/tenant/model binding, freshness, replay);
+/// - the REAL `InferenceHandler::authorize` internal-work branch (exact
+///   operation binding, MAC floor on the carried claims, and — via a dead
+///   Policy transport — proof that the worker consults NO Policy on the
+///   internal leg).
+///
+/// The spawned-engine transport leg remains covered only by the GPU-gated
+/// `e2e_inference` suite; that facet is reported as untested in the receipt.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod single_service_boundary_tests {
+    use super::*;
+
+    use crate::runtime::inference_profile::InferenceInstanceId;
+    use hyprstream_rpc::auth::internal_work::{
+        encode_internal_work, InternalWorkClaims, INTERNAL_WORK_ISSUER,
+    };
+    use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+
+    const CONTROLLER_KEY: [u8; 32] = [0xC7; 32];
+    const STRANGER_KEY: [u8; 32] = [0xC9; 32];
+    const TENANT: &str = "tenant-boundary";
+    const MODEL: &str = "boundary-model:main";
+
+    /// A policy transport that fails loudly if dialed. The internal leg must
+    /// never consult Policy — an `Ok` from `authorize` IS the causal proof.
+    struct DeadPolicyRpc;
+
+    #[async_trait::async_trait]
+    impl hyprstream_rpc::RpcClient for DeadPolicyRpc {
+        async fn call(&self, _payload: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_for_service(&self, _service_domain: &str, _payload: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_for_service_with_method(
+            &self, _service_domain: &str, _method_discriminator: u16, _payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_with_options(
+            &self, _payload: Vec<u8>, _options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_with_options_for_service(
+            &self, _service_domain: &str, _payload: Vec<u8>, _options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_streaming(
+            &self, _payload: Vec<u8>, _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_streaming_for_service(
+            &self, _service_domain: &str, _payload: Vec<u8>, _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_streaming_for_service_with_method(
+            &self, _service_domain: &str, _method_discriminator: u16,
+            _payload: Vec<u8>, _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn open_stream(
+            &self, _payload: Vec<u8>,
+        ) -> Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn open_stream_from_info(
+            &self, _stream_info: hyprstream_rpc::stream_info::StreamInfo,
+            _client_secret: [u8; 32], _client_pubkey: [u8; 32],
+        ) -> Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        fn next_id(&self) -> u64 {
+            1
+        }
+    }
+
+    /// Build a real adapter over an unloaded engine (no weights needed: these
+    /// tests never execute generation) with a DEAD policy transport.
+    fn boundary_adapter(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        tenant: &str,
+        model: &str,
+        with_model_binding: bool,
+    ) -> InferenceZmqAdapter {
+        let service = InferenceService {
+            inner: Arc::new(InferenceServiceInner {
+                engine: parking_lot::RwLock::new(
+                    create_engine(&RuntimeConfig::default())
+                        .expect("engine construction (no weights)"),
+                ),
+                model_path: PathBuf::from("/nonexistent"),
+                session_id: parking_lot::RwLock::new(None),
+                runtime_handle: Handle::current(),
+                stream_channel: None,
+                server_pubkey: controller.verifying_key(),
+                signing_key: controller.clone(),
+                nonce_cache: Arc::new(InMemoryNonceCache::new()),
+                policy_client: PolicyClient::new(Arc::new(DeadPolicyRpc)),
+                ttt_trainer: None,
+                tokenizer: None,
+                delta_pool: None,
+                base_delta: Mutex::new(None),
+                fs: None,
+                transport: hyprstream_rpc::transport::TransportConfig::inproc("boundary-test"),
+                lora_generation: Arc::new(AtomicU64::new(0)),
+                tenant_domain: tenant.to_owned(),
+                controller_pubkey: controller.verifying_key(),
+                network_ready: Arc::new(AtomicBool::new(true)),
+                draining: Arc::new(AtomicBool::new(false)),
+                shutdown: Arc::new(tokio::sync::Notify::new()),
+                #[cfg(feature = "ledger")]
+                ledger: parking_lot::RwLock::new(None),
+                object_label: inference_object_label(),
+            }),
+        };
+        InferenceZmqAdapter {
+            service,
+            transport: hyprstream_rpc::transport::TransportConfig::inproc("boundary-test"),
+            signing_key: controller.clone(),
+            expected_audience: None,
+            jwt_key_source: None,
+            instance_service_name: instance_service_name.to_owned(),
+            instance_model_ref: with_model_binding.then(|| model.to_owned()),
+        }
+    }
+
+    fn fixture_work_claims(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        now: i64,
+    ) -> InternalWorkClaims {
+        InternalWorkClaims {
+            iss: INTERNAL_WORK_ISSUER.to_owned(),
+            sub: "alice".to_owned(),
+            aud: instance_service_name.to_owned(),
+            tenant: TENANT.to_owned(),
+            model: MODEL.to_owned(),
+            resource: "inference:generateStream".to_owned(),
+            operation: "infer".to_owned(),
+            iat: now,
+            exp: now + 60,
+            jti: format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ),
+            cnf: InternalWorkClaims::controller_cnf(&controller.verifying_key()),
+            owner_did: Some("did:key:z6Mkboundary".to_owned()),
+            caller: hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+                .with_tenant(TENANT.to_owned())
+                // The MAC floor the worker enforces on the internal leg — the
+                // same clearance Model's ingress gate required of the caller.
+                .with_clearance(inference_object_label()),
+        }
+    }
+
+    /// Context fixture shaped like the production AnySigner bridge: the
+    /// envelope signer (`cnf`) is the controller, the bearer is the minted
+    /// work order.
+    fn ctx_with_work(token: String, controller: &SigningKey) -> EnvelopeContext {
+        let envelope = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(Vec::new()).with_jwt_token(token),
+            controller,
+        );
+        EnvelopeContext::from_verified_as_system(&envelope)
+    }
+
+    #[tokio::test]
+    async fn internal_work_admits_through_real_verify_claims_and_authorize() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0)
+            .expect("fixture instance");
+        let adapter = boundary_adapter(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+        );
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_work_claims(&controller, &instance.service_name(), now),
+            &controller,
+        );
+        let mut ctx = ctx_with_work(token, &controller);
+
+        // The REAL generic pipeline routes `iw+jwt` into the adapter hook.
+        adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect("controller work order must pass the real verify_claims routing");
+        let work = ctx.internal_work().expect("work order installed");
+        assert_eq!(work.resource, "inference:generateStream");
+        assert_eq!(work.operation, "infer");
+        assert_eq!(ctx.verified_tenant(), Some(TENANT));
+        assert_eq!(ctx.claims().map(|c| c.sub.as_str()), Some("alice"));
+
+        // The REAL per-method PEP accepts the exact bound coordinate with the
+        // policy transport DEAD — causal proof of non-consultation.
+        InferenceHandler::authorize(&adapter.service, &ctx, "inference:generateStream", "infer")
+            .await
+            .expect("internal work authorizes exactly its bound operation");
+        // The original caller subject the work order carries (on the
+        // production AnySigner bridge — the only serving plane — ctx.subject()
+        // resolves to exactly this; proven at the svc.rs routing test).
+        assert_eq!(ctx.internal_work().expect("work order").subject.name(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn internal_work_rejects_wrong_instance_tenant_model_and_standalone() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let now = chrono::Utc::now().timestamp();
+
+        // Wrong audience (a DIFFERENT allocated instance).
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let mut ctx = ctx_with_work(
+            encode_internal_work(
+                &fixture_work_claims(&controller, "inference-other-instance", now),
+                &controller,
+            ),
+            &controller,
+        );
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a work order for another instance must deny");
+        assert!(err.to_string().contains("audience"), "{err:#}");
+
+        // Wrong tenant binding: the instance is bound to TENANT while the work
+        // order claims a different tenant.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let mut claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        claims.tenant = "tenant-other".to_owned();
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a work order for another tenant must deny");
+        assert!(err.to_string().contains("tenant"), "{err:#}");
+
+        // Wrong model binding: the instance serves MODEL while the work order
+        // claims a different model.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let mut claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        claims.model = "model-other:main".to_owned();
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a work order for another model must deny");
+        assert!(err.to_string().contains("model"), "{err:#}");
+
+        // Standalone instance (no model binding): internal work never admitted.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, false);
+        let claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a standalone instance accepts no internal work");
+        assert!(err.to_string().contains("standalone"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn internal_work_rejects_foreign_controller_expired_and_replayed() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let stranger = SigningKey::from_bytes(&STRANGER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let now = chrono::Utc::now().timestamp();
+
+        // A foreign controller minting for our instance: signature fails
+        // against the PINNED key.
+        let mut ctx = ctx_with_work(
+            encode_internal_work(
+                &fixture_work_claims(&stranger, &instance.service_name(), now),
+                &stranger,
+            ),
+            &stranger,
+        );
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a foreign controller cannot mint for a pinned instance");
+        assert!(err.to_string().contains("pinned controller"), "{err:#}");
+
+        // Expired work order.
+        let mut expired = fixture_work_claims(&controller, &instance.service_name(), now);
+        expired.exp = now - 1;
+        let mut ctx = ctx_with_work(encode_internal_work(&expired, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("expired work orders deny");
+        assert!(err.to_string().contains("expired"), "{err:#}");
+
+        // Oversized lifetime (forged exp beyond the hard bound).
+        let mut long = fixture_work_claims(&controller, &instance.service_name(), now);
+        long.exp = now + 60 * 60;
+        let mut ctx = ctx_with_work(encode_internal_work(&long, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("oversized lifetimes deny");
+        assert!(err.to_string().contains("maximum internal lifetime"), "{err:#}");
+
+        // Replay: the same jti admitted twice.
+        let claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        let token = encode_internal_work(&claims, &controller);
+        let mut first = ctx_with_work(token.clone(), &controller);
+        adapter
+            .verify_claims(&mut first)
+            .await
+            .expect("first admission succeeds");
+        let mut second = ctx_with_work(token, &controller);
+        let err = adapter
+            .verify_claims(&mut second)
+            .await
+            .expect_err("the same work order cannot be admitted twice");
+        assert!(err.to_string().contains("replay"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn internal_work_authorize_denies_unbound_operations() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_work_claims(&controller, &instance.service_name(), now),
+            &controller,
+        );
+        let mut ctx = ctx_with_work(token, &controller);
+        adapter.verify_claims(&mut ctx).await.expect("admitted");
+
+        // A different operation on the same resource is NOT authorized by this
+        // work order — Model authorized exactly one operation.
+        let err = InferenceHandler::authorize(&adapter.service, &ctx, "inference:tttZero", "manage")
+            .await
+            .expect_err("work order does not authorize other operations");
+        assert!(err.to_string().contains("does not authorize"), "{err:#}");
+
+        // The same operation on a different resource is NOT authorized either.
+        let err = InferenceHandler::authorize(&adapter.service, &ctx, "inference:embed", "infer")
+            .await
+            .expect_err("work order does not authorize other resources");
+        assert!(err.to_string().contains("does not authorize"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn direct_caller_path_still_requires_policy_on_dead_transport() {
+        // Control: a NON-internal caller on the same service still goes through
+        // Policy — the dead transport must deny, proving the internal branch
+        // (not a blanket bypass) is what skipped Policy above.
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        // NOT the internal-work path (no internal_work on ctx). A
+        // clearance-bearing fixture reaches the Policy dial.
+        let mut label_claims = hyprstream_rpc::auth::Claims::new(
+            "alice".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3600,
+        )
+        .with_tenant(TENANT.to_owned());
+        label_claims.clearance = Some(crate::mac::genesis::SitePolicy::conservative()
+            .label_for("/srv/inference").into());
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("alice"),
+            TENANT,
+            controller.verifying_key(),
+            label_claims,
+        );
+        let err = InferenceHandler::authorize(&adapter.service, &ctx, "inference:generateStream", "infer")
+            .await
+            .expect_err("direct callers still require the Policy decision");
+        assert!(
+            err.to_string().contains("policy must not be dialed")
+                || err.to_string().contains("Unauthorized")
+                || err.to_string().contains("denying"),
+            "expected the dead-policy denial, got: {err:#}"
+        );
     }
 }

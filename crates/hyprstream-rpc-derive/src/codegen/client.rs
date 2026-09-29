@@ -1033,6 +1033,21 @@ pub fn generate_client(
                 self
             }
 
+            /// Set this client's DIRECT bearer for every call.
+            ///
+            /// Unlike [`Self::with_delegated_bearer`], the token travels as the
+            /// envelope's own JWT — the caller is asserting the token as ITS
+            /// verified credential, and the receiving service's holder/cnf
+            /// binding applies against this client's signing key. Used for
+            /// caller-authored credentials (e.g. the Model→Inference
+            /// `iw+jwt` internal work order); never for relaying a foreign
+            /// holder's token.
+            #[must_use]
+            pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
+                self.call_options.jwt = Some(token.into());
+                self
+            }
+
             /// Get the next request ID.
             pub fn next_id(&self) -> u64 {
                 self.client.next_id()
