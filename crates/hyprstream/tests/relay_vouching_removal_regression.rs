@@ -41,6 +41,7 @@ const POLICY_ROOT_KEY: [u8; 32] = [0x52; 32];
 const OAUTH_KEY: [u8; 32] = [0x44; 32];
 const RELAY_MODEL_KEY: [u8; 32] = [0x61; 32];
 const USER_KEY: [u8; 32] = [0x62; 32];
+const OUTSIDER_KEY: [u8; 32] = [0x77; 32];
 const ISSUER: &str = "http://127.0.0.1:6791";
 
 fn install_crypto() {
@@ -55,7 +56,11 @@ fn install_crypto() {
         ));
     }
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [POLICY_ROOT_KEY, OAUTH_KEY, RELAY_MODEL_KEY, USER_KEY] {
+    // OUTSIDER_KEY is anchored ONLY as a PQ identity (so its envelopes verify
+    // and the test reaches the relay-admission boundary); it receives NO
+    // trust-store attestation and registers NO service, so relay admission
+    // still denies — which is the boundary this suite exercises.
+    for bytes in [POLICY_ROOT_KEY, OAUTH_KEY, RELAY_MODEL_KEY, USER_KEY, OUTSIDER_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -475,7 +480,7 @@ async fn non_admitted_relay_delegated_bearer_denies_at_dispatch() -> Result<()> 
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
-    let outsider = SigningKey::from_bytes(&[0x77; 32]);
+    let outsider = SigningKey::from_bytes(&OUTSIDER_KEY);
     let victim = SigningKey::from_bytes(&[0x78; 32]);
 
     let credentials = tempfile::TempDir::new()?;
@@ -493,12 +498,6 @@ async fn non_admitted_relay_delegated_bearer_denies_at_dispatch() -> Result<()> 
         .policy_client(&outsider, policy_vk, Some(victim_wit.clone()))
         .await?
         .with_delegated_bearer(victim_wit);
-    // A non-admitted relay can never complete the RPC: admission fails inside
-    // claims verification (accept_delegated_bearer), which surfaces either as
-    // the serialized denial or as a closed transport before any response. The
-    // gate this test pins is that the call cannot succeed; the exact
-    // serialized admission-denial string is unit-covered
-    // (delegated_bearer_is_denied_by_default).
     let error = intruder
         .check(&PolicyCheck {
             subject: String::new(),
@@ -507,12 +506,10 @@ async fn non_admitted_relay_delegated_bearer_denies_at_dispatch() -> Result<()> 
             operation: "manage".to_owned(),
         })
         .await
-        .expect_err("a non-admitted relay must not complete an authenticated RPC");
+        .expect_err("a non-admitted relay must be denied at the admission gate");
     assert!(
-        error.to_string().contains("dispatch denied")
-            || error.to_string().contains("not an authorized relay")
-            || error.to_string().contains("Message ends prematurely"),
-        "unexpected error shape: {error:?}"
+        error.to_string().contains("not an authorized relay"),
+        "expected the relay-admission denial, got: {error:?}"
     );
 
     hop.shutdown().await?;
