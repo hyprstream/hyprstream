@@ -1136,15 +1136,33 @@ pub trait RequestService: 'static {
             let work = self
                 .verify_internal_work_bearer(ctx, &token, &protected)
                 .await?;
-            use std::str::FromStr as _;
-            let subject = crate::envelope::Subject::from_str(&work.sub)?;
+            // Sol S1 (MED): work.sub is the ALREADY-RESOLVED subject string
+            // that Model verified at ingress (`ctx.subject().to_string()`).
+            // Install the typed subject from that exact string — NEVER
+            // re-normalize through the legacy `Subject::from_str`, which
+            // strips `local:`/`token:`/`peer:`/`user:` prefixes and silently
+            // changes the principal (cross-principal subject-keyed TTT state
+            // and mis-audit at the worker). Do not apply `Subject::validate`
+            // here either: it rejects `:` for legitimate service subjects and
+            // federated subjects have their own grammar.
             anyhow::ensure!(
-                subject.name() != Some(UNAUTHENTICATED_DID_SENTINEL),
-                "internal work bearer subject is the reserved unauthenticated sentinel"
+                !work.sub.is_empty(),
+                "internal work bearer subject is empty"
             );
             anyhow::ensure!(
-                !subject.is_anonymous(),
-                "internal work bearer requires an authenticated original subject"
+                work.sub != "anonymous",
+                "internal work bearer subject is the anonymous marker"
+            );
+            anyhow::ensure!(
+                work.sub != UNAUTHENTICATED_DID_SENTINEL,
+                "internal work bearer subject is the reserved unauthenticated sentinel"
+            );
+            let subject = crate::envelope::Subject::new(&work.sub);
+            // The installed typed identity must round-trip to the exact
+            // verified string (newtype Display is the string itself).
+            anyhow::ensure!(
+                subject.to_string() == work.sub,
+                "internal work bearer subject installation is not exact"
             );
             // Snapshot/subject coherence (K3 finding m1): the pinned
             // controller authored both fields; require them to agree so
@@ -3700,6 +3718,117 @@ mod internal_work_routing_tests {
             .expect_err("a stolen work order cannot be replayed under a foreign signer");
         assert!(error.to_string().contains("pinned controller"), "{error:#}");
         assert!(ctx.claims().is_none());
+    }
+
+    // ── Sol S1: the resolved subject must survive admission EXACTLY ────────
+    //
+    // Model mints work.sub from the ALREADY-RESOLVED ctx.subject().to_string()
+    // of the verified caller envelope. The legacy `Subject::from_str` parser
+    // strips `local:`/`token:`/`peer:`/`user:` prefixes, so re-normalizing
+    // here silently changed the principal (cross-principal state keyed at the
+    // worker and mis-audit). These tests drive the REAL `verify_claims` in the
+    // AnySigner serving shape (anonymous key-derived subject, so
+    // `ctx.subject()` is exactly the installed jwt_subject).
+
+    fn work_ctx_with_subject(token: String, cnf: [u8; 32]) -> EnvelopeContext {
+        ctx_with_internal_token(token, cnf)
+    }
+
+    #[tokio::test]
+    async fn sol_s1_prefixed_subject_survives_internal_work_admission_exactly() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+        claims.sub = "user:alice".to_owned();
+        claims.caller.sub = "user:alice".to_owned();
+        let token = encode_internal_work(&claims, &controller);
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("the pinned controller's work order must be admitted");
+        // The EXACT resolved identity — no legacy prefix normalization.
+        assert_eq!(ctx.subject(), crate::envelope::Subject::new("user:alice"));
+        assert_eq!(ctx.subject().name(), Some("user:alice"));
+        assert_eq!(ctx.internal_work().expect("work order").subject, ctx.subject());
+        assert_eq!(ctx.claims().map(|c| c.sub.as_str()), Some("user:alice"));
+        assert_eq!(ctx.verified_tenant(), Some("tenant-a"));
+    }
+
+    #[tokio::test]
+    async fn sol_s1_all_legacy_prefix_families_preserve_exact_identity() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let svc = BoundaryMockService::with_controller(&controller);
+        for subject_string in ["token:bob", "local:carol", "peer:dave", "user:dave#2"] {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+            claims.sub = subject_string.to_owned();
+            claims.caller.sub = subject_string.to_owned();
+            claims.jti = format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let token = encode_internal_work(&claims, &controller);
+            let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+            svc.verify_claims(&mut ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{subject_string} must be admitted: {error:#}"));
+            assert_eq!(
+                ctx.subject(),
+                crate::envelope::Subject::new(subject_string),
+                "{subject_string} identity must survive admission verbatim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sol_s1_bare_subject_remains_compatible() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let claims = fixture_claims(&controller, "mock-instance-1", now); // sub "alice"
+        let token = encode_internal_work(&claims, &controller);
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("bare subject stays admitted");
+        assert_eq!(ctx.subject(), crate::envelope::Subject::new("alice"));
+    }
+
+    #[tokio::test]
+    async fn sol_s1_empty_anonymous_and_sentinel_subjects_deny() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let svc = BoundaryMockService::with_controller(&controller);
+        for bad in ["", "anonymous", UNAUTHENTICATED_DID_SENTINEL] {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+            claims.sub = bad.to_owned();
+            claims.caller.sub = bad.to_owned();
+            claims.jti = format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let token = encode_internal_work(&claims, &controller);
+            let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+            let error = svc
+                .verify_claims(&mut ctx)
+                .await
+                .expect_err("a subject-less work order must deny");
+            assert!(
+                !error.to_string().is_empty(),
+                "denial must carry the reason for {bad:?}"
+            );
+            assert!(ctx.claims().is_none());
+            assert!(ctx.internal_work().is_none());
+        }
     }
 
     #[tokio::test]

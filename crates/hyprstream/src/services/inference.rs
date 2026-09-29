@@ -4910,6 +4910,24 @@ mod single_service_boundary_tests {
         model: &str,
         with_model_binding: bool,
     ) -> InferenceZmqAdapter {
+        boundary_adapter_with_pool(
+            controller,
+            instance_service_name,
+            tenant,
+            model,
+            with_model_binding,
+            None,
+        )
+    }
+
+    fn boundary_adapter_with_pool(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        tenant: &str,
+        model: &str,
+        with_model_binding: bool,
+        delta_pool: Option<Arc<DeltaPool>>,
+    ) -> InferenceZmqAdapter {
         let service = InferenceService {
             inner: Arc::new(InferenceServiceInner {
                 engine: parking_lot::RwLock::new(
@@ -4926,7 +4944,7 @@ mod single_service_boundary_tests {
                 policy_client: PolicyClient::new(Arc::new(DeadPolicyRpc)),
                 ttt_trainer: None,
                 tokenizer: None,
-                delta_pool: None,
+                delta_pool,
                 base_delta: Mutex::new(None),
                 fs: None,
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("boundary-test"),
@@ -4957,9 +4975,18 @@ mod single_service_boundary_tests {
         instance_service_name: &str,
         now: i64,
     ) -> InternalWorkClaims {
+        fixture_work_claims_for_subject(controller, instance_service_name, now, "alice")
+    }
+
+    fn fixture_work_claims_for_subject(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        now: i64,
+        subject_string: &str,
+    ) -> InternalWorkClaims {
         InternalWorkClaims {
             iss: INTERNAL_WORK_ISSUER.to_owned(),
-            sub: "alice".to_owned(),
+            sub: subject_string.to_owned(),
             aud: instance_service_name.to_owned(),
             tenant: TENANT.to_owned(),
             model: MODEL.to_owned(),
@@ -4977,7 +5004,7 @@ mod single_service_boundary_tests {
             ),
             cnf: InternalWorkClaims::controller_cnf(&controller.verifying_key()),
             owner_did: Some("did:key:z6Mkboundary".to_owned()),
-            caller: hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            caller: hyprstream_rpc::auth::Claims::new(subject_string.to_owned(), now, now + 3600)
                 .with_tenant(TENANT.to_owned())
                 // The MAC floor the worker enforces on the internal leg — the
                 // same clearance Model's ingress gate required of the caller.
@@ -5420,5 +5447,173 @@ mod single_service_boundary_tests {
             error.to_string().contains("does not authorize"),
             "expected the exact-match PEP denial, got: {error:#}"
         );
+    }
+
+    // ── Sol S1: distinct callers keep subject-keyed TTT state separate ─────
+    //
+    // Admission installs the EXACT resolved subject (proven at the real
+    // verify_claims seam by the svc.rs Sol S1 regressions; the production
+    // LocalServiceBridge serves AnySigner, where ctx.subject() IS the
+    // installed jwt_subject). This test proves the DOWNSTREAM half: the
+    // subject-keyed TTT operations key on those exact typed identities at the
+    // real DeltaPool and real handler code, so `user:alice` and `alice` never
+    // share adaptation state.
+    #[tokio::test]
+    async fn sol_s1_distinct_callers_keep_subject_keyed_ttt_state_separate() {
+        use hyprstream_rpc::envelope::Subject;
+
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        // Real subject-keyed pool (CPU device reached through the engine trait
+        // without naming the tch type).
+        let device = create_engine(&RuntimeConfig::default())
+            .expect("engine construction (no weights)")
+            .device();
+        let snapshots_dir = std::env::temp_dir().join(format!(
+            "sol-s1-delta-pool-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        // Module dims for the default target modules — blank delta creation
+        // allocates LoRA matrices per (layer, module) against these dims.
+        let module_dims = std::collections::HashMap::from([
+            ("q_proj".to_owned(), (16usize, 16usize)),
+            ("v_proj".to_owned(), (16usize, 16usize)),
+        ]);
+        let pool = Arc::new(DeltaPool::new(
+            crate::training::TenantDeltaConfig::default(),
+            module_dims,
+            device,
+            None,
+            snapshots_dir,
+            None,
+            2,
+        ));
+        let adapter = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            Some(Arc::clone(&pool)),
+        );
+
+        let caller_a = "user:alice";
+        let caller_b = "alice";
+
+        // A's TTT state is seeded exactly like adaptation state would be after
+        // A's own training steps: subject-keyed at the real pool.
+        let subject_a = Subject::new(caller_a);
+        let delta_a = pool.get_or_create(&subject_a).expect("seed caller A delta");
+        delta_a.lock().accumulated_steps = 7;
+
+        // Admit BOTH callers' work orders through the real adapter hook, then
+        // check the typed identities the admission installed.
+        async fn admit(
+            adapter: &InferenceZmqAdapter,
+            controller: &SigningKey,
+            instance_service_name: &str,
+            subject_string: &str,
+        ) -> EnvelopeContext {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = fixture_work_claims_for_subject(
+                controller,
+                instance_service_name,
+                now,
+                subject_string,
+            );
+            claims.resource = "inference:GetDeltaStatus".to_owned();
+            claims.operation = "query".to_owned();
+            let mut ctx = ctx_with_work(encode_internal_work(&claims, controller), controller);
+            adapter
+                .verify_claims(&mut ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{subject_string} must be admitted: {error:#}"));
+            ctx
+        }
+        let ctx_a = admit(&adapter, &controller, &instance.service_name(), caller_a).await;
+        let ctx_b = admit(&adapter, &controller, &instance.service_name(), caller_b).await;
+        assert_eq!(
+            ctx_a.internal_work().expect("A work order").subject,
+            Subject::new(caller_a),
+            "caller A identity must install verbatim"
+        );
+        assert_eq!(
+            ctx_b.internal_work().expect("B work order").subject,
+            Subject::new(caller_b),
+            "caller B identity must install verbatim"
+        );
+
+        // Handler contexts carrying the EXACT typed identities admission just
+        // installed (the svc.rs Sol S1 regressions prove real `verify_claims`
+        // installs these on the AnySigner serving plane, where ctx.subject()
+        // is the installed identity; this fixture's FixedSigner constructor
+        // cannot express that shape, so the identity enters here explicitly
+        // instead of being shadowed by `system`).
+        let handler_ctx = |subject_string: &str| {
+            let now = chrono::Utc::now().timestamp();
+            let caller_claims = hyprstream_rpc::auth::Claims::new(
+                subject_string.to_owned(),
+                now,
+                now + 3600,
+            )
+            .with_tenant(TENANT.to_owned());
+            EnvelopeContext::for_test_authenticated_subject_with_claims(
+                Subject::new(subject_string),
+                TENANT,
+                controller.verifying_key(),
+                caller_claims,
+            )
+        };
+        let handler_ctx_a = handler_ctx(caller_a);
+        let handler_ctx_b = handler_ctx(caller_b);
+
+        // B's REAL generated handler reads ctx.subject() and must NOT observe
+        // A's subject-keyed adaptation state.
+        let status_b = InferenceHandler::handle_get_delta_status(
+            &adapter.service,
+            &handler_ctx_b,
+            1,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("B delta status failed: {error:#}"));
+        match status_b {
+            InferenceResponseVariant::GetDeltaStatusResult(status) => {
+                assert!(
+                    !status.exists,
+                    "caller B must not see caller A's subject-keyed delta"
+                );
+            }
+            other => panic!("expected GetDeltaStatusResult, got {other:?}"),
+        }
+
+        // B's reset operation (real handler) must not touch A's keyed state.
+        InferenceHandler::handle_ttt_zero(&adapter.service, &handler_ctx_b, 2)
+            .await
+            .unwrap_or_else(|error| panic!("B tttZero failed: {error:#}"));
+        let delta_a_after = pool.get(&subject_a).expect("A delta survives B's reset");
+        assert_eq!(
+            delta_a_after.lock().accumulated_steps,
+            7,
+            "A's accumulated TTT steps must be untouched by caller B's operations"
+        );
+
+        // And A's own status view observes exactly A's state.
+        let status_a = InferenceHandler::handle_get_delta_status(
+            &adapter.service,
+            &handler_ctx_a,
+            3,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("A delta status failed: {error:#}"));
+        match status_a {
+            InferenceResponseVariant::GetDeltaStatusResult(status) => {
+                assert!(status.exists, "A observes its own delta");
+                assert_eq!(status.accumulated_steps, 7);
+            }
+            other => panic!("expected GetDeltaStatusResult, got {other:?}"),
+        }
     }
 }
