@@ -1042,13 +1042,35 @@ fn generate_data_field_reader(
             // Optional field-level `$domainType` newtype over `Text`: empty → None, else `Some(Type::new(..))`.
             CapnpType::Text if field.domain_type.is_some() => {
                 let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
-                quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(#dt::new(v.to_string())) } }, }
+                match field.max_len {
+                    Some(n) => {
+                        let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(n));
+                        quote! { #rust_name: {
+                            let v = reader.#getter_name()?.to_str()?;
+                            if v.is_empty() { None } else {
+                                anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                                Some(#dt::new(v.to_string()))
+                            }
+                        }, }
+                    }
+                    None => quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(#dt::new(v.to_string())) } }, },
+                }
             }
             CapnpType::Data if field.domain_type.is_some() => {
                 let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
                 // Bounded decode: the domain type enforces its own wire cap
                 // BEFORE any owned copy is materialized.
                 quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(<#dt as hyprstream_rpc::sensitive::BoundedWireBytes>::from_wire_bytes(v)?) } }, }
+            }
+            CapnpType::Text if field.max_len.is_some() => {
+                let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(field.max_len.unwrap_or(0)));
+                quote! { #rust_name: {
+                    let v = reader.#getter_name()?.to_str()?;
+                    if v.is_empty() { None } else {
+                        anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                        Some(v.to_string())
+                    }
+                }, }
             }
             CapnpType::Text => {
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(v.to_string()) } }, }
@@ -1208,9 +1230,30 @@ fn generate_data_field_reader_inner(
             quote! { #rust_name: <#dt as hyprstream_rpc::sensitive::BoundedWireBytes>::from_wire_bytes(reader.#getter_name()?)?, }
         }
         // Field-level `$domainType` newtype over `Text`: read via `Type::new(String)`.
+        // `$maxLen(N)` bounds the decoded value at the borrowed reader, before
+        // any owned String is allocated (bounded preallocation).
         CapnpType::Text if field.domain_type.is_some() => {
             let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
-            quote! { #rust_name: #dt::new(reader.#getter_name()?.to_str()?.to_string()), }
+            match field.max_len {
+                Some(n) => {
+                    let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(n));
+                    quote! { #rust_name: {
+                        let v = reader.#getter_name()?.to_str()?;
+                        anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                        #dt::new(v.to_string())
+                    }, }
+                }
+                None => quote! { #rust_name: #dt::new(reader.#getter_name()?.to_str()?.to_string()), },
+            }
+        }
+        CapnpType::Text if field.max_len.is_some() => {
+            let n = field.max_len.unwrap_or(0);
+            let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(n));
+            quote! { #rust_name: {
+                let v = reader.#getter_name()?.to_str()?;
+                anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                v.to_string()
+            }, }
         }
         CapnpType::Text => quote! { #rust_name: reader.#getter_name()?.to_str()?.to_string(), },
         CapnpType::Data if field.fixed_size.is_some() => {
@@ -1367,6 +1410,7 @@ mod field_domain_type_tests {
             type_name: "Text".into(),
             description: String::new(),
             fixed_size: None,
+            max_len: None,
             optional: false,
             slot_offset: 0,
             section: FieldSection::Pointer,
@@ -1459,9 +1503,13 @@ mod field_domain_type_tests {
                 "evidence : hyprstream_rpc :: sensitive :: SensitiveBytes"
             };
             assert!(out.contains(expected), "wrong field type: {out}");
-            assert!(out.contains("hyprstream_rpc :: sensitive :: SensitiveBytes :: new"), "missing wrapper construction: {out}");
+            // The generated reader now decodes Data domain types through the
+            // BoundedWireBytes cap (owned copy only after the bound check).
+            assert!(
+                out.contains("BoundedWireBytes") && out.contains("from_wire_bytes"),
+                "missing bounded wire decode: {out}"
+            );
             assert!(out.contains("set_evidence"), "missing wire writer: {out}");
-            assert!(out.contains("to_vec"), "missing owned wire bytes: {out}");
             if optional {
                 assert!(out.contains("is_empty"), "missing absent-data sentinel: {out}");
             }

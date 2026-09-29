@@ -750,6 +750,7 @@ mod tests {
             type_name: type_name.to_owned(),
             description: String::new(),
             fixed_size: None,
+            max_len: None,
             optional: false,
             slot_offset: 0,
             section: FieldSection::Pointer,

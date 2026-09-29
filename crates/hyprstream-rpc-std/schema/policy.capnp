@@ -9,6 +9,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".mutationSemantics;
+using import "/annotations.capnp".maxLen;
 using import "/annotations.capnp".dispatchPublic;
 using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
@@ -163,8 +164,10 @@ struct MediatedPolicyCheck {
   # Bounded original signed request, never a credential alone. No nested
   # mediation; the implementation must verify the original target and holder.
   evidence @0 :Data $domainType("hyprstream_rpc::sensitive::SensitiveBytes");
-  resource @1 :Text;
-  operation @2 :Text;
+  # $maxLen mirrors the mediated-query dimension validator: rejected at the
+  # borrowed reader before any owned String is allocated.
+  resource @1 :Text $maxLen(4096);
+  operation @2 :Text $maxLen(128);
 }
 
 # Authorization check parameters

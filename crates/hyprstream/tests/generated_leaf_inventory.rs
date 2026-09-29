@@ -660,3 +660,44 @@ fn mediated_check_evidence_reader_enforces_cap_before_copy() {
     <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
         .expect("exactly-at-cap evidence must decode");
 }
+
+/// Sol MED-2 (Text half): `$maxLen` bounds resource/operation at the borrowed
+/// reader — oversized values reject before any owned String is allocated, and
+/// each exact boundary decodes.
+#[test]
+fn mediated_check_text_fields_enforce_maxlen_before_copy() {
+    use hyprstream_rpc::capnp::FromCapnp;
+    use hyprstream_rpc_std::policy_capnp::policy_request;
+    use policy_request::Which;
+
+    let build = |resource_len: usize, operation_len: usize| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let req = message.init_root::<policy_request::Builder>();
+            let mut mediated = req.init_check_mediated();
+            mediated.set_evidence(&vec![0u8; 16]);
+            mediated.set_resource("a".repeat(resource_len).as_str());
+            mediated.set_operation("b".repeat(operation_len).as_str());
+        }
+        to_bytes(&message)
+    };
+
+    let read = |bytes: &[u8]| -> anyhow::Result<hyprstream_rpc_std::policy_client::MediatedPolicyCheck> {
+        let message = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(bytes),
+            capnp::message::ReaderOptions::new(),
+        )?;
+        let req = message.get_root::<policy_request::Reader>()?;
+        let Which::CheckMediated(v) = req.which()? else {
+            panic!("expected checkMediated variant");
+        };
+        let v = v?;
+        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
+    };
+
+    // resource over 4096 / operation over 128: rejected at the reader.
+    assert!(read(&build(4097, 1)).is_err(), "oversized resource must reject");
+    assert!(read(&build(1, 129)).is_err(), "oversized operation must reject");
+    // Each exact boundary decodes.
+    assert!(read(&build(4096, 128)).is_ok(), "at-boundary resource+operation must decode");
+}

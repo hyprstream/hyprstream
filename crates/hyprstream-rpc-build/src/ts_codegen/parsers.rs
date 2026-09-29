@@ -2023,6 +2023,7 @@ struct EmbedImagesResponse {
                 type_name: "List(GhostStruct)".to_owned(),
                 description: String::new(),
                 fixed_size: None,
+                max_len: None,
                 optional: false,
                 slot_offset: 0,
                 section: FieldSection::Pointer,

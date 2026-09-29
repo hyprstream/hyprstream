@@ -129,6 +129,7 @@ fn parse_cgr(
     let optional_id = find_annotation_id(&nodes, &node_map, "optional");
     let serde_rename_id = find_annotation_id(&nodes, &node_map, "serdeRename");
     let doc_example_id = find_annotation_id(&nodes, &node_map, "docExample");
+    let max_len_id = find_annotation_id(&nodes, &node_map, "maxLen");
 
     let pascal = to_pascal_case(service_name);
     let request_name = format!("{pascal}Request");
@@ -143,6 +144,7 @@ fn parse_cgr(
         param_desc_id,
         domain_type_id,
         fixed_size_id,
+        max_len_id,
         optional_id,
         serde_rename_id,
     )?;
@@ -1332,6 +1334,7 @@ struct FieldAnnotationIds {
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    max_len_id: Option<u64>,
     optional_id: Option<u64>,
     serde_rename_id: Option<u64>,
     domain_type_id: Option<u64>,
@@ -1377,6 +1380,10 @@ fn field_def_from_slot(
         field.get_annotations().map_err(|e| format!("{e}"))?,
         ann.fixed_size_id,
     );
+    let max_len = extract_annotation_u32(
+        field.get_annotations().map_err(|e| format!("{e}"))?,
+        ann.max_len_id,
+    );
 
     let optional = has_annotation(
         field.get_annotations().map_err(|e| format!("{e}"))?,
@@ -1414,6 +1421,7 @@ fn field_def_from_slot(
         type_name,
         description,
         fixed_size,
+        max_len,
         optional,
         slot_offset,
         section,
@@ -1566,6 +1574,7 @@ fn extract_struct_from_node(
     param_desc_id: Option<u64>,
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    max_len_id: Option<u64>,
     optional_id: Option<u64>,
     serde_rename_id: Option<u64>,
     origin_file: Option<String>,
@@ -1608,6 +1617,7 @@ fn extract_struct_from_node(
         mcp_desc_id,
         param_desc_id,
         fixed_size_id,
+        max_len_id,
         optional_id,
         serde_rename_id,
         domain_type_id,
@@ -1672,6 +1682,7 @@ fn extract_struct_from_node(
                     type_name: "Group".into(),
                     description,
                     fixed_size,
+                    max_len: None,
                     optional,
                     slot_offset: 0,
                     section: FieldSection::Group,
@@ -1704,6 +1715,7 @@ fn extract_struct_from_node(
                 mcp_desc_id,
                 param_desc_id,
                 fixed_size_id,
+                max_len_id,
                 optional_id,
                 serde_rename_id,
                 domain_type_id,
@@ -1741,6 +1753,7 @@ fn extract_all_structs(
     param_desc_id: Option<u64>,
     domain_type_id: Option<u64>,
     fixed_size_id: Option<u64>,
+    max_len_id: Option<u64>,
     optional_id: Option<u64>,
     serde_rename_id: Option<u64>,
 ) -> Result<Vec<StructDef>, String> {
@@ -1763,6 +1776,7 @@ fn extract_all_structs(
             param_desc_id,
             domain_type_id,
             fixed_size_id,
+            max_len_id,
             optional_id,
             serde_rename_id,
             None,
@@ -1844,6 +1858,7 @@ fn extract_all_structs(
                         param_desc_id,
                         domain_type_id,
                         fixed_size_id,
+                        max_len_id,
                         optional_id,
                         serde_rename_id,
                         Some(origin),
