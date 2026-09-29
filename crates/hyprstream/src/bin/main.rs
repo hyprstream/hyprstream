@@ -2051,7 +2051,12 @@ impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayS
 /// here instead — the same trait, a different substrate. Installing this one
 /// across several instances would silently weaken "admitted once per domain"
 /// to "once per node", so the log line below states the guarantee in force.
-fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>, config: Option<&HyprConfig>) {
+/// The optional shared-postgres implementation uses a durable admission table
+/// and role-scoped, CA-pinned PostgreSQL connection.
+fn install_proof_admission(
+    oauth: Option<&hyprstream_core::config::OAuthConfig>,
+    config: Option<&HyprConfig>,
+) {
     use hyprstream_rpc::proof::admission::{
         set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
         ProofReplayStore, ReplayDomainGuarantee,
@@ -2179,6 +2184,7 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
                 }
             }
         }
+        Some("shared-postgres") => Some(ReplayDomainGuarantee::LinearizableSharedStore),
         Some(other) => {
             tracing::error!(
                 "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
@@ -2191,7 +2197,8 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
         None => {
             tracing::warn!(
                 "no HYPRSTREAM_REPLAY_ADMISSION_DOMAIN declared; proof replay admission \
-                 is not installed and proof-bearing requests will deny. Set \
+                 is not installed and proof-bearing requests will deny. Declare \
+                 'shared-postgres' for a configured shared replay database, or \
                  'single-verifier-instance' only when this node is the sole verifier \
                  for its service domain."
             );
@@ -2295,16 +2302,30 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
         (ReplayDomainGuarantee::SingleVerifierInstance, None) => Box::new(
             InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
         ),
+        (ReplayDomainGuarantee::LinearizableSharedStore, None) => {
+            #[cfg(feature = "postgres-replay")]
+            {
+                match hyprstream_core::auth::postgres_replay::PostgresProofReplayStore::from_env() {
+                    Ok(store) => Box::new(store),
+                    Err(error) => {
+                        tracing::error!("shared Postgres replay admission unavailable; admission denies: {error:#}");
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(feature = "postgres-replay"))]
+            {
+                tracing::error!("shared-postgres replay mode requires the postgres-replay build feature; admission denies");
+                return;
+            }
+        }
         (other, _) => {
             tracing::error!("no replay store implementation for {other:?}; admission denies");
             return;
         }
     };
     if set_global_proof_replay_store(store).is_ok() {
-        tracing::info!(
-            "proof replay store installed: operator-declared {guarantee:?}, \
-             {REPLAY_CAPACITY_PER_PARTITION} records per partition"
-        );
+        tracing::info!("proof replay store installed: operator-declared {guarantee:?}");
     }
 }
 
