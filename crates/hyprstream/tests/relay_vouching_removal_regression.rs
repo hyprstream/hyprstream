@@ -32,8 +32,8 @@ use hyprstream_rpc::node_identity::{derive_mesh_mldsa_key, derive_purpose_key};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc_std::policy_client::{
-    IssueToken, IssueTokenProfile, PolicyCheck, PolicyClient, RegisterServiceKey,
-    ResolveServiceKey,
+    CheckSession, IssueToken, IssueTokenProfile, PolicyCheck, PolicyClient, RegisterServiceKey,
+    ResolveServiceKey, SessionKeyRef, SessionKeyRefContent,
 };
 use hyprstream_service::{InprocManager, ServiceManager as _};
 
@@ -42,6 +42,7 @@ const OAUTH_KEY: [u8; 32] = [0x44; 32];
 const RELAY_MODEL_KEY: [u8; 32] = [0x61; 32];
 const USER_KEY: [u8; 32] = [0x62; 32];
 const OUTSIDER_KEY: [u8; 32] = [0x77; 32];
+const G1_FIXTURE_KEY: [u8; 32] = [0x91; 32];
 const ISSUER: &str = "http://127.0.0.1:6791";
 
 fn install_crypto() {
@@ -60,7 +61,10 @@ fn install_crypto() {
     // and the test reaches the relay-admission boundary); it receives NO
     // trust-store attestation and registers NO service, so relay admission
     // still denies — which is the boundary this suite exercises.
-    for bytes in [POLICY_ROOT_KEY, OAUTH_KEY, RELAY_MODEL_KEY, USER_KEY, OUTSIDER_KEY] {
+    // G1_FIXTURE_KEY (0x91, registered "relayg1", deliberately NOT relay-admitted) is PQ-anchored as
+    // an identity substrate so its envelopes VERIFY — its denial must come from the relay-admission
+    // gate, not from a missing PQ anchor.
+    for bytes in [POLICY_ROOT_KEY, OAUTH_KEY, RELAY_MODEL_KEY, USER_KEY, OUTSIDER_KEY, G1_FIXTURE_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -507,14 +511,130 @@ async fn non_admitted_relay_delegated_bearer_denies_at_dispatch() -> Result<()> 
         })
         .await
         .expect_err("a non-admitted relay must be denied at the admission gate");
-    // The unregistered signer is denied by the whole-dispatch admission
-    // enforcement BEFORE claims verification — the operator-required
-    // dispatch-level check, not merely the accept_delegated_bearer callback.
-    // The deeper verifier-level boundary is unit-covered by
+    // The unregistered signer is denied on the real dispatch path before any
+    // handler entry (uniform production boundary). The specific denying gate
+    // is deliberately not attributed from the outside — the production error
+    // is uniform by design; the verifier-level boundary is unit-covered by
     // delegated_bearer_is_denied_by_default.
     assert!(
         error.to_string().contains("dispatch denied"),
-        "expected the whole-dispatch admission denial for the unregistered signer, got: {error:?}"
+        "expected the uniform pre-handler denial for the unregistered signer, got: {error:?}"
+    );
+
+    hop.shutdown().await?;
+    Ok(())
+}
+
+/// G1 wire-level contrast (relay-ADMISSION isolation, per root correction):
+///
+/// Two independent controls prove the denial below is the relay-admission
+/// gate and not a foreign-credential or transport failure:
+/// - POSITIVE direct control: the SAME signer (holder-bound primary WIT,
+///   PQ-anchored, registered) makes a successful policy:CheckSession query
+///   over the SAME native encrypted hop — proving signer validity, transport,
+///   and its own identity work end-to-end.
+/// - The signer's service ("relayg1") holds NO `policy:PolicyCheck`/`check`
+///   grant in SERVICE_BASE_POLICIES, so the real PolicyService
+///   `accept_delegated_bearer` (policy.rs) returns false for it: this is the
+///   relay-admission boundary, distinct from the foreign-credential holder
+///   failure the harvested-WIT case covers.
+/// The delegated-USER-token call from this signer must therefore deny
+/// pre-handler with the uniform production error; no claims publication.
+///
+/// Limitation stated per root instruction: the production dispatch error is
+/// uniform by design, so the test additionally asserts the POSITIVE control
+/// to isolate the gate contrast — it does not attribute the internal cause
+/// from the denied call alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registered_non_relay_admitted_service_delegated_user_denies_on_wire() -> Result<()> {
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+
+    let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+    let registered_key = SigningKey::from_bytes(&[0x91; 32]); // registered service signer, NOT relay-admitted
+    let user_key = SigningKey::from_bytes(&USER_KEY);
+
+    let credentials = tempfile::TempDir::new()?;
+    let registered_wit = mint_service_jwt(&credentials, "relayg1", &ca_jwt_key, &registered_key);
+
+    let tag = format!("relay-g1-policy-{}", uuid::Uuid::new_v4());
+    let _policy = spawn_policy(&tag).await?;
+
+    // Register "relayg1" (CA-signed, cnf-bound) exactly like the production
+    // path. SERVICE_BASE_POLICIES contains NO policy:PolicyCheck/check grant
+    // for service:relayg1, so accept_delegated_bearer denies it as a relay.
+    let registered_client = PolicyClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"), registered_key.clone(), root_key.verifying_key(),
+        Some(registered_wit.clone()),
+    )?;
+    registered_client
+        .register_service_key(&RegisterServiceKey {
+            service_name: "relayg1".to_owned(),
+            verifying_key: registered_key.verifying_key().as_bytes().to_vec(),
+            service_jwt: registered_wit.clone(),
+        })
+        .await?;
+    hyprstream_service::global_trust_store().insert(
+        registered_key.verifying_key(),
+        hyprstream_service::Attestation {
+            scopes: std::iter::once("relayg1".to_owned()).collect(),
+            subject: Some("service:relayg1".to_owned()),
+            jwt: None,
+            expires_at: 0,
+            attested_by: None,
+        },
+    );
+
+    let hop = native_hop(&tag, &root_key, &registered_key).await?;
+    let policy_vk = root_key.verifying_key();
+
+    // IDENTICAL PAYLOAD for both contrasts: policy:CheckSession/query is a
+    // service:* query grant in base policies, so the direct control proves
+    // the signer/transport/identity pipeline works for THIS exact method.
+    // Only the bearer delegation differs in the negative case.
+    let sid = format!("relay-g1-sid-{}", uuid::Uuid::new_v4());
+    register_active_session(ISSUER, &sid, "alice", "staging-test").await?;
+
+    // POSITIVE direct control: the same signer presents its OWN primary WIT.
+    let direct = hop
+        .policy_client(&registered_key, policy_vk, Some(registered_wit.clone()))
+        .await?;
+    let check_session = CheckSession {
+        session: SessionKeyRef {
+            issuer: ISSUER.into(),
+            content: SessionKeyRefContent::OidcSid(sid.clone()),
+        },
+    };
+    let active = direct.check_session(&check_session).await?;
+    assert!(active, "registered signer direct check_session must succeed");
+
+    // DELEGATED negative: the SAME signer + SAME method, but the bearer is a
+    // delegated USER token instead of the signer's own WIT. The
+    // relay-admission gate (accept_delegated_bearer) must deny it because
+    // service:relayg1 has no policy:PolicyCheck/check grant in
+    // SERVICE_BASE_POLICIES.
+    let user_token = mint_user_token(&ca_jwt_key, &user_key, &sid)?;
+    let delegated = hop
+        .policy_client(&registered_key, policy_vk, Some(registered_wit.clone()))
+        .await?
+        .with_delegated_bearer(user_token);
+    let error = delegated
+        .check_session(&check_session)
+        .await
+        .expect_err(
+            "a registered but non-relay-admitted service must not complete a delegated-user check_session",
+        );
+    // Uniform pre-handler boundary (production error preserved).
+    // Boundary layering: the wire-level denial is the uniform production
+    // error; the specific relay-admission gate is unit-covered by
+    // delegated_bearer_is_denied_by_default (svc.rs), which asserts the
+    // exact accept_delegated_bearer rejection at the verifier boundary.
+    // Together these prove: (1) the wire denies before handler/claims, and
+    // (2) the internal gate is the admission check, not a transport failure.
+    assert!(
+        error.to_string().contains("dispatch denied"),
+        "expected the uniform pre-handler denial on the real encrypted path, got: {error:?}"
     );
 
     hop.shutdown().await?;
