@@ -675,7 +675,7 @@ fn mediated_check_text_fields_enforce_maxlen_before_copy() {
         {
             let req = message.init_root::<policy_request::Builder>();
             let mut mediated = req.init_check_mediated();
-            mediated.set_evidence(&vec![0u8; 16]);
+            mediated.set_evidence(&[0u8; 16]);
             mediated.set_resource("a".repeat(resource_len).as_str());
             mediated.set_operation("b".repeat(operation_len).as_str());
         }
