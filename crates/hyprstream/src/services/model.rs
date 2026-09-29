@@ -4054,9 +4054,79 @@ mod tests {
         Ok(())
     }
 
+    /// Test-only observer for the one server-side denial class that identifies
+    /// an old worker order at its replacement.  It retains only a boolean: no
+    /// bearer, subject, audience, request ID, or formatted event is kept.
+    #[derive(Clone)]
+    struct RestartAudienceDenialProbe {
+        seen: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RestartAudienceDenialProbe {
+        fn install() -> Result<Arc<std::sync::atomic::AtomicBool>> {
+            use tracing_subscriber::prelude::*;
+
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let subscriber = tracing_subscriber::registry().with(Self {
+                seen: Arc::clone(&seen),
+            });
+            // The prescribed invocation is one ignored test in its own
+            // process (`--exact --test-threads=1`). A global dispatcher is
+            // necessary because the real worker dispatches on its own service
+            // task; a thread-local subscriber would not observe that task.
+            tracing::subscriber::set_global_default(subscriber).map_err(|_| {
+                anyhow!(
+                    "restart acceptance requires an isolated test process without a preinstalled tracing subscriber"
+                )
+            })?;
+            Ok(seen)
+        }
+    }
+
+    struct RestartAudienceDenialVisitor<'a> {
+        seen: &'a std::sync::atomic::AtomicBool,
+    }
+
+    impl RestartAudienceDenialVisitor<'_> {
+        fn record_message(&self, field: &tracing::field::Field, message: &str) {
+            if field.name() == "message"
+                && message.contains("claims verification failed")
+                && message.contains("audience")
+            {
+                self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl tracing::field::Visit for RestartAudienceDenialVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.record_message(field, &format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.record_message(field, value);
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for RestartAudienceDenialProbe
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "hyprstream_rpc::service::dispatch" {
+                event.record(&mut RestartAudienceDenialVisitor { seen: &self.seen });
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires the sealed local CPU-model repository and isolated XDG guest fixture"]
     async fn real_cpu_worker_restart_rejects_old_order_and_preserves_holders() -> Result<()> {
+        let audience_denial = RestartAudienceDenialProbe::install()?;
         let fixture = RestartAcceptanceFixture::from_guest_env().await?;
         let caller_a_key = SigningKey::from_bytes(&[0xA1; 32]);
         let caller_b_key = SigningKey::from_bytes(&[0xB1; 32]);
@@ -4104,8 +4174,9 @@ mod tests {
             "reload must install a fresh worker-generated incarnation");
 
         // This is the causal assertion: B receives A's real captured bearer
-        // through generated dispatch. Verification must fail on B's audience,
-        // before the `hasLora` handler can return a success value.
+        // through generated dispatch. Its client response stays uniformly
+        // opaque, while the in-process test probe records only the server-side
+        // audience-denial class before the `hasLora` handler can succeed.
         let replay_error = match worker_b
             .with_bearer(std::mem::take(&mut *old_order))
             .has_lora()
@@ -4115,8 +4186,12 @@ mod tests {
             Err(error) => error,
         };
         anyhow::ensure!(
-            replay_error.to_string().contains("audience"),
-            "old order must fail the replacement worker audience check, got: {replay_error:#}"
+            replay_error.to_string() == hyprstream_rpc::service::dispatch::DISPATCH_DENIED,
+            "old order must receive the uniform dispatch denial"
+        );
+        anyhow::ensure!(
+            audience_denial.load(std::sync::atomic::Ordering::SeqCst),
+            "replacement worker must classify the old order as an audience mismatch"
         );
 
         // Fresh A work succeeds at B and carries the same original holder.
