@@ -1146,6 +1146,13 @@ pub trait RequestService: 'static {
                 !subject.is_anonymous(),
                 "internal work bearer requires an authenticated original subject"
             );
+            // Snapshot/subject coherence (K3 finding m1): the pinned
+            // controller authored both fields; require them to agree so
+            // audit and subject-keyed state are provably consistent.
+            anyhow::ensure!(
+                work.caller.sub == work.sub,
+                "internal work caller snapshot subject disagrees with the work-order subject"
+            );
             let caller = work.caller.clone();
             ctx.verified_tenant = Some(work.tenant.clone());
             ctx.claims = Some(caller);
@@ -3693,6 +3700,31 @@ mod internal_work_routing_tests {
             .expect_err("a stolen work order cannot be replayed under a foreign signer");
         assert!(error.to_string().contains("pinned controller"), "{error:#}");
         assert!(ctx.claims().is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_work_snapshot_subject_disagreement_denies() {
+        // K3 finding m1: the controller authors both the subject and the
+        // caller snapshot; production mints them identical (resolved form),
+        // and admission enforces the coherence so audit and subject-keyed
+        // state cannot diverge.
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+        claims.caller.sub = "someone-else".to_owned();
+        let token = encode_internal_work(&claims, &controller);
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("an incoherent snapshot must deny");
+        assert!(
+            error.to_string().contains("snapshot subject disagrees"),
+            "{error:#}"
+        );
+        assert!(ctx.claims().is_none());
+        assert!(ctx.internal_work().is_none());
     }
 
     #[tokio::test]

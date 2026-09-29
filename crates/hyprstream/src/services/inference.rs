@@ -4963,7 +4963,7 @@ mod single_service_boundary_tests {
             aud: instance_service_name.to_owned(),
             tenant: TENANT.to_owned(),
             model: MODEL.to_owned(),
-            resource: "inference:generateStream".to_owned(),
+            resource: "inference:GenerateStream".to_owned(),
             operation: "infer".to_owned(),
             iat: now,
             exp: now + 60,
@@ -5021,14 +5021,14 @@ mod single_service_boundary_tests {
             .await
             .expect("controller work order must pass the real verify_claims routing");
         let work = ctx.internal_work().expect("work order installed");
-        assert_eq!(work.resource, "inference:generateStream");
+        assert_eq!(work.resource, "inference:GenerateStream");
         assert_eq!(work.operation, "infer");
         assert_eq!(ctx.verified_tenant(), Some(TENANT));
         assert_eq!(ctx.claims().map(|c| c.sub.as_str()), Some("alice"));
 
         // The REAL per-method PEP accepts the exact bound coordinate with the
         // policy transport DEAD — causal proof of non-consultation.
-        InferenceHandler::authorize(&adapter.service, &ctx, "inference:generateStream", "infer")
+        InferenceHandler::authorize(&adapter.service, &ctx, "inference:GenerateStream", "infer")
             .await
             .expect("internal work authorizes exactly its bound operation");
         // The original caller subject the work order carries (on the
@@ -5211,6 +5211,214 @@ mod single_service_boundary_tests {
                 || err.to_string().contains("Unauthorized")
                 || err.to_string().contains("denying"),
             "expected the dead-policy denial, got: {err:#}"
+        );
+    }
+
+    // ── REAL generated-dispatch coverage (K3 findings B1/B2) ────────────────
+    //
+    // The earlier boundary tests called `authorize` directly with
+    // hand-written coordinates, so mint and PEP agreed with each other while
+    // both disagreed with the generated dispatch grammar (camelCase mint vs
+    // PascalCase dispatch; Text variants embedding the payload). These tests
+    // close that gap: each mints through the Model grammar helper, admits
+    // through the REAL `verify_claims` + adapter hook, and then drives the
+    // REAL generated `dispatch_inference` over a real capnp request body —
+    // one forwarded operation per dispatch variant class (Void, Text,
+    // struct).
+
+    use crate::services::generated::inference_client::dispatch_inference;
+
+    /// Serialize a real `InferenceRequest` wire body for the given variant.
+    fn encoded_request(build: impl FnOnce(&mut hyprstream_rpc_std::inference_capnp::inference_request::Builder<'_>)) -> Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request = message.init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            request.set_id(42);
+            build(&mut request);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Mint a work order with the PRODUCTION grammar coordinate and admit it
+    /// through the real pipeline, returning the dispatch-ready context.
+    async fn admitted_ctx(
+        adapter: &InferenceZmqAdapter,
+        controller: &SigningKey,
+        instance_service_name: &str,
+        resource: String,
+        operation: &str,
+    ) -> Result<EnvelopeContext> {
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_work_claims(controller, instance_service_name, now);
+        claims.resource = resource;
+        claims.operation = operation.to_owned();
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, controller), controller);
+        adapter.verify_claims(&mut ctx).await?;
+        Ok(ctx)
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_void_variant_has_lora_succeeds_through_full_chain() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        // The EXACT coordinate the production mint emits (Model grammar
+        // helper), which must equal what generated dispatch enforces.
+        let resource = crate::services::model::ModelService::inference_dispatch_resource("hasLora");
+        assert_eq!(resource, "inference:HasLora");
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            resource,
+            "query",
+        )
+        .await
+        .expect("work order must pass the real verify_claims routing");
+
+        let payload = encoded_request(|request| {
+            request.set_has_lora(());
+        })
+        .expect("encode hasLora");
+        let decoded = crate::services::generated::inference_client::decode_inference_request_body(&payload)
+            .expect("decode hasLora");
+        // The REAL generated dispatch: PEP + handler + serialization.
+        let (response, continuation) = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(pair) => pair,
+            Err(error) => panic!("real dispatch of a correctly-scoped work order must reach the handler: {error:#}"),
+        };
+        assert!(continuation.is_none());
+        let parsed = hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+            .expect("parse hasLora response");
+        match parsed {
+            InferenceResponseVariant::HasLoraResult(has) => {
+                assert!(!has, "unloaded engine reports no adapter");
+            }
+            other => panic!("expected HasLoraResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_text_variant_load_lora_binds_exact_payload_coordinate() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        // K3 finding B2: Text-payload variants dispatch as
+        // `inference:{payload}` — the production mint binds the exact
+        // adapter path, so the payload below must match.
+        let path = "probe/adapters/k3";
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            format!("inference:{path}"),
+            "write",
+        )
+        .await
+        .expect("payload-bound work order must pass the real verify_claims routing");
+
+        let payload = encoded_request(|request| {
+            request.set_load_lora(path);
+        })
+        .expect("encode loadLora");
+        let decoded = crate::services::generated::inference_client::decode_inference_request_body(&payload)
+            .expect("decode loadLora");
+        let (response, _continuation) = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(pair) => pair,
+            Err(error) => panic!("real dispatch must pass the PEP for the payload-bound coordinate: {error:#}"),
+        };
+        // The handler runs and fails on the FIXTURE's missing path containment
+        // (post-PEP), never on authorization.
+        let parsed = hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+            .expect("parse loadLora response");
+        match parsed {
+            InferenceResponseVariant::Error(info) => {
+                assert!(
+                    !info.message.contains("does not authorize")
+                        && !info.message.contains("UNAUTHORIZED"),
+                    "handler error must be post-PEP, got: {}",
+                    info.message
+                );
+                assert!(
+                    info.message.contains("FsOps not available"),
+                    "expected the fixture's path-containment handler error, got: {}",
+                    info.message
+                );
+            }
+            other => panic!("expected the handler Error variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_struct_variant_generate_stream_reaches_handler_after_pep() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("generateStream"),
+            "infer",
+        )
+        .await
+        .expect("work order must pass the real verify_claims routing");
+
+        let payload = encoded_request(|request| {
+            request.reborrow().init_generate_stream();
+        })
+        .expect("encode generateStream");
+        let decoded = crate::services::generated::inference_client::decode_inference_request_body(&payload)
+            .expect("decode generateStream");
+        // Streaming arms propagate handler errors: the PEP must pass and the
+        // handler must fail on the missing caller ephemeral pubkey (this
+        // fixture carries none) — K3's own control observation. The Ok
+        // payload is not Debug, so match instead of expect_err.
+        let error = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(_) => panic!("struct variant must reach the handler after the PEP"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("ephemeral pubkey"),
+            "expected the post-PEP handler error, got: {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("does not authorize"),
+            "the PEP must not deny a correctly-scoped work order"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_denies_when_mint_grammar_and_dispatch_disagree() {
+        // Guard the B1 fix itself: a camelCase coordinate (the old, wrong
+        // grammar) must still deny at the REAL dispatch.
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            "inference:hasLora".to_owned(),
+            "query",
+        )
+        .await
+        .expect("admission is coordinate-agnostic; the PEP compares");
+        let payload = encoded_request(|request| {
+            request.set_has_lora(());
+        })
+        .expect("encode hasLora");
+        let decoded = crate::services::generated::inference_client::decode_inference_request_body(&payload)
+            .expect("decode hasLora");
+        let error = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(_) => panic!("the stale camelCase grammar must keep denying"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "expected the exact-match PEP denial, got: {error:#}"
         );
     }
 }
