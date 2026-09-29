@@ -244,39 +244,144 @@ pub fn verify_internal_work(
 }
 
 // ── bounded single-use jti admission ────────────────────────────────────────
+//
+// Bot finding 4135785121 (P2, PR-introduced): the original cache was a fixed
+// 10,000-entry `HashMap` with a whole-map `retain` on every admission and
+// fail-closed saturation — capping aggregate steady-state admission near
+// 83/s at a 120 s lifetime. This cache reclaims in EXPIRY ORDER (amortized
+// O(1) per admission: each entry is inserted once and purged once), carries
+// a validated deployment-configurable capacity, and preserves atomic
+// single-use admission under the same mutex. Expired entries are the ONLY
+// ones reclaimed; a cache full of unexpired entries fails closed.
 
-const JTI_CACHE_CAPACITY: usize = 10_000;
+/// Default capacity when the deployment does not configure one.
+const DEFAULT_REPLAY_CAPACITY: usize = 10_000;
 
-fn jti_cache() -> &'static parking_lot::Mutex<HashMap<String, i64>> {
-    static CACHE: OnceLock<parking_lot::Mutex<HashMap<String, i64>>> = OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+/// Upper sanity bound for a configured capacity (reject absurd values).
+const MAX_REPLAY_CAPACITY: usize = 100_000_000;
+
+/// Environment override read once on first cache use. Invalid or zero values
+/// are FAIL-CLOSED: admission denies while the misconfiguration persists.
+const REPLAY_CAPACITY_ENV: &str = "HYPRSTREAM_INTERNAL_WORK_REPLAY_CAPACITY";
+
+/// Validate a requested replay-cache capacity.
+pub fn validate_replay_capacity(capacity: usize) -> Result<usize, String> {
+    if capacity == 0 {
+        Err("internal work replay capacity must be at least 1".to_owned())
+    } else if capacity > MAX_REPLAY_CAPACITY {
+        Err(format!(
+            "internal work replay capacity {capacity} exceeds the sanity bound {MAX_REPLAY_CAPACITY}"
+        ))
+    } else {
+        Ok(capacity)
+    }
+}
+
+/// Configure the deployment replay-cache capacity (validated, once-only —
+/// it must be set before the first admission materializes the cache).
+pub fn configure_internal_work_replay_capacity(capacity: usize) -> Result<(), String> {
+    let validated = validate_replay_capacity(capacity)?;
+    CONFIGURED_CAPACITY
+        .set(validated)
+        .map_err(|_| "internal work replay capacity was already configured".to_owned())
+}
+
+static CONFIGURED_CAPACITY: OnceLock<usize> = OnceLock::new();
+
+/// The effective capacity: explicit configuration, else a validated
+/// environment override, else the default. An invalid environment value
+/// yields 0, which fails every admission closed (see [`admit_once_in`]).
+fn effective_capacity() -> usize {
+    *CONFIGURED_CAPACITY.get_or_init(|| {
+        match std::env::var(REPLAY_CAPACITY_ENV) {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(parsed) => validate_replay_capacity(parsed).unwrap_or_else(|e| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tracing::error!(
+                        "invalid {REPLAY_CAPACITY_ENV}={raw:?}: {e} — internal work admission FAILS CLOSED"
+                    );
+                    0
+                }),
+                Err(_) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tracing::error!(
+                        "invalid {REPLAY_CAPACITY_ENV}={raw:?}: not a usize — internal work admission FAILS CLOSED"
+                    );
+                    0
+                }
+            },
+            Err(_) => DEFAULT_REPLAY_CAPACITY,
+        }
+    })
+}
+
+/// Bounded single-use replay state with expiry-ordered reclamation.
+struct ReplayState {
+    /// jti -> expiry (authoritative membership).
+    by_jti: HashMap<String, i64>,
+    /// (expiry, jti) — ordered so expired entries reclaim from the front.
+    by_expiry: std::collections::BTreeSet<(i64, String)>,
+    capacity: usize,
+}
+
+impl ReplayState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            by_jti: HashMap::new(),
+            by_expiry: std::collections::BTreeSet::new(),
+            capacity,
+        }
+    }
+}
+
+/// The admission decision over one bounded state (isolated for tests).
+///
+/// Order of operations is the SECURITY contract: purge expired first, then
+/// duplicate check, then saturation check. Expired entries are the only ones
+/// reclaimed; a cache whose capacity is entirely unexpired entries fails
+/// closed. The caller holds the lock across the whole decision, so
+/// check-and-insert is atomic (exactly-once under concurrency).
+fn admit_once_in(state: &mut ReplayState, jti: &str, exp: i64, now: i64) -> bool {
+    let capacity = state.capacity;
+    if capacity == 0 {
+        return false; // invalid/unsized configuration: fail closed
+    }
+    // Expiry-ordered reclamation: every entry with exp <= now leaves, front
+    // first. Amortized O(1): an entry is purged at most once.
+    while let Some(front) = state.by_expiry.first().cloned() {
+        let (entry_exp, entry_jti) = &front;
+        if entry_exp > &now {
+            break;
+        }
+        state.by_expiry.remove(&front);
+        state.by_jti.remove(entry_jti);
+    }
+    if state.by_jti.contains_key(jti) {
+        return false;
+    }
+    if state.by_jti.len() >= capacity {
+        return false; // full of UNEXPIRED entries: fail closed, never evict
+    }
+    state.by_jti.insert(jti.to_owned(), exp);
+    state.by_expiry.insert((exp, jti.to_owned()));
+    true
+}
+
+fn jti_cache() -> &'static parking_lot::Mutex<ReplayState> {
+    static CACHE: OnceLock<parking_lot::Mutex<ReplayState>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        parking_lot::Mutex::new(ReplayState::new(effective_capacity()))
+    })
 }
 
 /// Admit a work-order `jti` exactly once. Entries expire at the token's own
-/// `exp`; the cache is capacity-bounded and fails closed when full. This is
-/// worker-local defense in depth ON TOP of the envelope replay gates, not a
-/// replacement for them.
+/// `exp`; the cache reclaims in expiry order, is capacity-bounded
+/// (deployment-configurable), and fails closed when full of unexpired
+/// entries or misconfigured. This is worker-local defense in depth ON TOP of
+/// the envelope replay gates, not a replacement for them.
 pub fn admit_internal_work_jti_once(jti: &str, exp: i64, now: i64) -> bool {
     let mut cache = jti_cache().lock();
     admit_once_in(&mut cache, jti, exp, now)
-}
-
-/// The admission decision over one bounded map (isolated for tests).
-fn admit_once_in(
-    cache: &mut HashMap<String, i64>,
-    jti: &str,
-    exp: i64,
-    now: i64,
-) -> bool {
-    cache.retain(|_, entry_exp| *entry_exp > now);
-    if cache.contains_key(jti) {
-        return false;
-    }
-    if cache.len() >= JTI_CACHE_CAPACITY {
-        return false;
-    }
-    cache.insert(jti.to_owned(), exp);
-    true
 }
 
 #[cfg(test)]
@@ -405,23 +510,93 @@ mod tests {
     }
 
     #[test]
-    fn jti_is_single_use_and_cache_is_bounded() {
+    fn jti_is_single_use_and_expired_entries_are_reclaimed() {
         let now = chrono::Utc::now().timestamp();
         let id = format!("jti-{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         assert!(admit_internal_work_jti_once(&id, now + 60, now));
         assert!(!admit_internal_work_jti_once(&id, now + 60, now), "replay must deny");
-        // Past its exp the entry is purged, so a fresh order with the same id
-        // (impossible for a real mint, but proves the release) admits again.
+        // Past its exp the entry is reclaimed, so a fresh order with the same
+        // id (impossible for a real mint, but proves the release) admits again.
         assert!(admit_internal_work_jti_once(&id, now + 120, now + 61));
-        // Capacity bound fails closed — decided against an ISOLATED map so the
-        // process-global admission cache is not poisoned for sibling tests.
-        let mut isolated: HashMap<String, i64> = HashMap::new();
-        let mut i = 0u64;
-        while isolated.len() < JTI_CACHE_CAPACITY {
-            isolated.insert(format!("fill-{i}"), now + 3600);
-            i += 1;
+    }
+
+    #[test]
+    fn jti_saturation_of_unexpired_entries_fails_closed_without_eviction() {
+        let mut state = ReplayState::new(4);
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..4 {
+            assert!(
+                admit_once_in(&mut state, &format!("sat-{i}"), now + 600, now),
+                "fill up to capacity"
+            );
         }
-        assert!(!admit_once_in(&mut isolated, "overflow", now + 60, now));
+        // Full of UNEXPIRED entries: admission denies and nothing is evicted.
+        assert!(!admit_once_in(&mut state, "overflow", now + 600, now));
+        assert_eq!(state.by_jti.len(), 4);
+        assert!(state.by_jti.contains_key("sat-0"), "unexpired entry retained");
+    }
+
+    #[test]
+    fn jti_reclamation_is_expiry_ordered_and_never_evicts_unexpired() {
+        // Insert OUT of expiry order: sat-late (furthest) first, sat-early last.
+        let mut state = ReplayState::new(2);
+        let now = chrono::Utc::now().timestamp();
+        assert!(admit_once_in(&mut state, "sat-late", now + 600, now));
+        assert!(admit_once_in(&mut state, "sat-early", now + 60, now));
+        assert_eq!(state.by_jti.len(), 2, "capacity reached");
+        // Nothing is expired yet: a new admission fails closed, unexpired kept.
+        assert!(!admit_once_in(&mut state, "new", now + 60, now));
+        assert!(state.by_jti.contains_key("sat-late"));
+        // Advance past ONLY the earliest expiry: exactly it is reclaimed and
+        // the admission succeeds — order comes from expiry, not insertion.
+        assert!(admit_once_in(&mut state, "new", now + 60, now + 61));
+        assert!(!state.by_jti.contains_key("sat-early"), "expired entry reclaimed");
+        assert!(state.by_jti.contains_key("sat-late"), "unexpired entry never evicted");
+        assert!(state.by_jti.contains_key("new"));
+    }
+
+    #[test]
+    fn jti_concurrent_duplicate_admission_is_exactly_once() {
+        // The process-global path holds its lock across check-and-insert, so
+        // racing duplicates must yield exactly one admission.
+        let now = chrono::Utc::now().timestamp();
+        let id = format!(
+            "jti-concurrent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let exp = now + 60;
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let id = id.clone();
+                std::thread::spawn(move || admit_internal_work_jti_once(&id, exp, now))
+            })
+            .collect();
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission thread"))
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(successes, 1, "exactly one racing admission may win");
+    }
+
+    #[test]
+    fn replay_capacity_configuration_is_validated_and_fail_closed() {
+        // Validation: zero and absurd caps are invalid.
+        assert!(validate_replay_capacity(0).is_err());
+        assert!(validate_replay_capacity(MAX_REPLAY_CAPACITY + 1).is_err());
+        assert_eq!(validate_replay_capacity(1).unwrap(), 1);
+        assert_eq!(validate_replay_capacity(MAX_REPLAY_CAPACITY).unwrap(), MAX_REPLAY_CAPACITY);
+        // A zero-capacity state is fail-closed: no admission, no eviction.
+        let mut state = ReplayState::new(0);
+        let now = chrono::Utc::now().timestamp();
+        assert!(!admit_once_in(&mut state, "any", now + 60, now));
+        assert!(state.by_jti.is_empty());
+        // Deployment configuration is once-only (second call is refused).
+        assert!(configure_internal_work_replay_capacity(DEFAULT_REPLAY_CAPACITY).is_ok());
+        assert!(configure_internal_work_replay_capacity(1).is_err());
     }
 }

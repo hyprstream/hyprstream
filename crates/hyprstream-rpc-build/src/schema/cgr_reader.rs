@@ -1344,6 +1344,23 @@ struct FieldAnnotationIds {
 ///
 /// Shared by the struct-field loop and the union-arm group-leaf loop so the two
 /// can't drift in how they resolve type names, sections, offsets, and annotations.
+/// Schema-contract error marker for a `$maxLen(0)` violation. compile_schemas
+/// promotes parse errors carrying this marker to a hard build failure (the
+/// maxLen contract says the build fails), while generic parse errors stay
+/// non-fatal warnings.
+pub const MAXLEN_ZERO_CONTRACT_ERROR: &str = "$maxLen(0) is invalid";
+
+/// Validate the `$maxLen` annotation for one field: absent or positive is
+/// valid; zero is a contract violation named for the offending field.
+fn validate_max_len(field_name: &str, max_len: Option<u32>) -> Result<(), String> {
+    match max_len {
+        Some(0) => Err(format!(
+            "field '{field_name}': {MAXLEN_ZERO_CONTRACT_ERROR} \u{2014} the maximum decoded length must be at least 1 (annotations.capnp maxLen contract)"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn field_def_from_slot(
     field: capnp::schema_capnp::field::Reader,
     slot: capnp::schema_capnp::field::slot::Reader,
@@ -1384,6 +1401,11 @@ fn field_def_from_slot(
         field.get_annotations().map_err(|e| format!("{e}"))?,
         ann.max_len_id,
     );
+    // Bot finding 4136451007 (P2): the maxLen contract (annotations.capnp)
+    // declares 0 invalid — "the build fails if a schema sets maxLen(0)".
+    // Reject at parse time with a FIELD-NAMED schema error; fixedSize(0)
+    // semantics elsewhere are untouched.
+    validate_max_len(&field_name, max_len)?;
 
     let optional = has_annotation(
         field.get_annotations().map_err(|e| format!("{e}"))?,
@@ -2478,5 +2500,37 @@ mod mandatory_mutation_policy_tests {
 
         let plain_read = variant("list", "query", "");
         validate_mandatory_mutation_policy("registry", &[plain_read], &[]).unwrap();
+    }
+
+    // ── Bot finding 4136451007: $maxLen(0) contract enforcement ────────────
+    //
+    // annotations.capnp: "0 is invalid; the build fails if a schema sets
+    // maxLen(0)". The validation must name the offending FIELD and must not
+    // touch fixedSize(0) semantics (validated elsewhere).
+
+    #[test]
+    fn maxlen_zero_is_rejected_with_field_named_schema_error() {
+        let error = match validate_max_len("policyText", Some(0)) {
+            Err(error) => error,
+            Ok(()) => panic!("maxLen(0) violates the schema contract"),
+        };
+        assert!(error.contains("field 'policyText'"), "field-named: {error:#}");
+        assert!(error.contains(MAXLEN_ZERO_CONTRACT_ERROR), "{error:#}");
+        assert!(error.contains("at least 1"), "{error:#}");
+    }
+
+    #[test]
+    fn maxlen_positive_and_absent_are_valid() {
+        assert!(validate_max_len("policyText", Some(1)).is_ok(), "lower bound");
+        assert!(validate_max_len("policyText", Some(u32::MAX)).is_ok());
+        assert!(validate_max_len("policyText", None).is_ok(), "annotation absent");
+    }
+
+    #[test]
+    fn maxlen_validation_is_scoped_to_max_len_only() {
+        // The helper receives ONLY the maxLen value: a fixedSize(0) field with
+        // a valid (or absent) maxLen is untouched by this validation.
+        assert!(validate_max_len("fixedSizeZeroField", None).is_ok());
+        assert!(validate_max_len("fixedSizeZeroField", Some(64)).is_ok());
     }
 }
