@@ -502,7 +502,7 @@ fn pool_err(e: deadpool_postgres::PoolError) -> anyhow::Error {
 /// - Host is a nonempty DNS hostname (no Unix-socket fallback)
 /// - Exactly one query parameter named `sslmode` with value `verify-full`
 /// - No other `sslmode` values (`disable`, `prefer`, `require`, `verify-ca`)
-fn validate_pg_url(raw: &str) -> Result<()> {
+pub(crate) fn validate_pg_url(raw: &str) -> Result<()> {
     let url = Url::parse(raw).context("credentials URL is not a valid URL")?;
     ensure!(
         url.scheme() == "postgresql" || url.scheme() == "postgres",
@@ -582,7 +582,7 @@ fn validate_pg_url(raw: &str) -> Result<()> {
 fn build_pool_config(database_url: &str) -> Result<PoolConfig> {
     let url = Url::parse(database_url).context("re-parsing validated credentials URL")?;
     let mut cfg = PoolConfig::new();
-    cfg.host = url.host_str().map(|h| h.to_owned());
+    cfg.host = url.host_str().map(str::to_owned);
     cfg.port = url.port();
     let username = url.username();
     if !username.is_empty() {
@@ -597,11 +597,10 @@ fn build_pool_config(database_url: &str) -> Result<PoolConfig> {
     }
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
-            "sslmode" | "sslrootcert" => { /* handled by connector */ }
             "application_name" => {
                 cfg.application_name = Some(value.into_owned());
             }
-            _ => {}
+            _ => { /* sslmode, sslrootcert, and unknown options are not sent to the driver */ }
         }
     }
     cfg.ssl_mode = Some(SslMode::Require);
@@ -711,6 +710,19 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
     let ca_file = config.and_then(|config| config.ca_file.as_deref());
     let max_connections = config.map(|config| config.max_connections);
     Ok(assemble_pool(cfg, ca_file, max_connections)?.pool)
+}
+
+/// Reuse the production CA-pinned, hostname-verifying pool for the replay role.
+/// The caller supplies a role-scoped URL read from a credential file.
+pub(crate) fn build_replay_pool(
+    database_url: &str,
+    ca_file: &std::path::Path,
+    max_connections: usize,
+) -> Result<Pool> {
+    ensure!(max_connections > 0, "replay pool size must be positive");
+    validate_pg_url(database_url)?;
+    let cfg = build_pool_config(database_url)?;
+    Ok(assemble_pool(cfg, Some(ca_file), Some(max_connections))?.pool)
 }
 
 /// Percent-decode a password extracted from a `url::Url` (the `password()`
