@@ -60,6 +60,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
+#[cfg(test)]
+use zeroize::Zeroizing;
 
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
@@ -239,6 +241,12 @@ pub struct ModelServiceInner {
     producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
     /// Service-scoped MoQ origin populated by the outer service spawner.
     moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
+    /// Test-only, in-memory capture of the most recently minted direct work
+    /// order. This deliberately does not exist in production builds: a work
+    /// order must never become an observable RPC value, log field, file, or
+    /// environment value merely to support restart acceptance coverage.
+    #[cfg(test)]
+    test_work_order_capture: Mutex<Option<Zeroizing<String>>>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -470,7 +478,26 @@ impl ModelService {
                 hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
             )),
             moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(test)]
+            test_work_order_capture: Mutex::new(None),
         })})
+    }
+
+    /// Retain a direct work order only for an in-crate test. The production
+    /// Model→Inference boundary still attaches the bearer directly to the
+    /// generated client and never exposes it to a caller.
+    #[cfg(test)]
+    async fn capture_test_work_order(&self, work_order: &str) {
+        let mut capture = self.test_work_order_capture.lock().await;
+        *capture = Some(Zeroizing::new(work_order.to_owned()));
+    }
+
+    /// Consume the in-memory test capture. Keeping the value move-only avoids
+    /// a durable test transcript and makes each assertion explicitly own the
+    /// short-lived secret it needs to replay against the replacement worker.
+    #[cfg(test)]
+    async fn take_test_work_order(&self) -> Option<Zeroizing<String>> {
+        self.test_work_order_capture.lock().await.take()
     }
 
     /// Set the expected JWT audience for token validation.
@@ -1481,6 +1508,8 @@ impl ModelService {
             .await?;
         let work_token =
             self.mint_internal_work_token(&instance, ctx, &work, &live_work_audience)?;
+        #[cfg(test)]
+        self.capture_test_work_order(&work_token).await;
         tracing::debug!(
             generation = live_generation,
             "minted internal work order against live worker incarnation"
@@ -3815,6 +3844,299 @@ mod tests {
             caller_key.verifying_key(),
             claims,
         )
+    }
+
+    fn restart_acceptance_caller_ctx(
+        subject: &str,
+        caller_key: &SigningKey,
+        tenant: &str,
+    ) -> EnvelopeContext {
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
+            .with_tenant(tenant.to_owned())
+            .with_cnf_jwk(caller_key.verifying_key().as_bytes())
+            .with_clearance(crate::services::inference::inference_object_label());
+        EnvelopeContext::for_test_authenticated_subject_with_claims(
+            hyprstream_rpc::envelope::Subject::new(subject),
+            tenant,
+            caller_key.verifying_key(),
+            claims,
+        )
+    }
+
+    /// A guest-provisioned, local-only fixture for the real restart acceptance
+    /// test.  The repository must be bare and its linked `main` worktree must
+    /// already be the XDG-isolated path that `StoragePaths` resolves.  The test
+    /// never clones, downloads, or copies model weights.
+    struct RestartAcceptanceFixture {
+        model: ModelService,
+        model_key: SigningKey,
+        model_ref: String,
+        instance: InferenceInstanceId,
+        _registry_handle: hyprstream_service::SpawnedService,
+        _policy_handle: hyprstream_service::SpawnedService,
+        _registry_base: tempfile::TempDir,
+        _policy_base: tempfile::TempDir,
+    }
+
+    impl RestartAcceptanceFixture {
+        async fn from_guest_env() -> Result<Self> {
+            use hyprstream_rpc::crypto::CryptoPolicy;
+            use hyprstream_rpc::envelope::{install_verify_config, EnvelopeVerifyConfig};
+            use hyprstream_service::ServiceManager as _;
+
+            let repo = std::path::PathBuf::from(std::env::var(
+                "HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_REPO",
+            ).map_err(|_| anyhow!(
+                "HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_REPO must name the sealed local bare model repository"
+            ))?);
+            anyhow::ensure!(repo.is_dir(), "restart acceptance model repository is not a directory");
+            let model_name = std::env::var("HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_NAME")
+                .unwrap_or_else(|_| "restart-acceptance-fixture".to_owned());
+            let instance_name = std::env::var("HYPRSTREAM_INSTANCE").map_err(|_| anyhow!(
+                "HYPRSTREAM_INSTANCE must be set to an isolated synthetic-guest namespace"
+            ))?;
+            anyhow::ensure!(
+                instance_name.starts_with("restart-acceptance-"),
+                "HYPRSTREAM_INSTANCE must use the restart-acceptance-* isolated namespace"
+            );
+
+            let storage = crate::storage::StoragePaths::new()?;
+            let worktree = storage.worktree_path(&model_name, "main")?;
+            anyhow::ensure!(worktree.is_dir(), "fixture main worktree is absent");
+            anyhow::ensure!(
+                worktree.join("config.json").is_file()
+                    && worktree.join("tokenizer.json").is_file()
+                    && std::fs::read_dir(&worktree)?.flatten().any(|entry| {
+                        entry.file_name().to_string_lossy().ends_with(".safetensors")
+                    }),
+                "fixture must provide config.json, tokenizer.json, and safetensors weights"
+            );
+            anyhow::ensure!(
+                repo.join("worktrees").join("main").canonicalize()? == worktree.canonicalize()?,
+                "fixture repository main worktree must be the isolated StoragePaths worktree"
+            );
+
+            // The test uses only deterministic test-local keys. Classical is
+            // sufficient for this in-process synthetic guest; production
+            // enrollment and credentials are deliberately not involved.
+            let _ = install_verify_config(EnvelopeVerifyConfig {
+                policy: CryptoPolicy::Classical,
+                pq_store: None,
+            });
+            let _ = hyprstream_rpc::envelope::install_response_verify_config(
+                hyprstream_rpc::envelope::ResponseVerifyConfig {
+                    policy: CryptoPolicy::Classical,
+                    pq_store: None,
+                },
+            );
+            let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+                hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+            );
+
+            let tag = hex::encode(hyprstream_rpc::envelope::generate_nonce());
+            let policy_key = SigningKey::from_bytes(&[0x91; 32]);
+            let registry_key = SigningKey::from_bytes(&[0x92; 32]);
+            let model_key = SigningKey::from_bytes(&[0x93; 32]);
+            hyprstream_service::global_trust_store().insert(
+                registry_key.verifying_key(),
+                hyprstream_service::Attestation {
+                    scopes: std::collections::HashSet::new(),
+                    subject: Some("service:registry".to_owned()),
+                    jwt: None,
+                    expires_at: 0,
+                    attested_by: None,
+                },
+            );
+
+            let policy_base = tempfile::TempDir::new()?;
+            let policy_manager = Arc::new(crate::auth::PolicyManager::permissive().await?);
+            let policy_endpoint = format!("inproc://restart-acceptance-policy-{tag}");
+            let policy_service = crate::services::PolicyService::new(
+                policy_manager,
+                Arc::new(policy_key.clone()),
+                crate::config::TokenConfig::default(),
+                Arc::new(RwLock::new(git2db::Git2DB::open(policy_base.path()).await?)),
+                TransportConfig::inproc(&policy_endpoint),
+            );
+            let manager = hyprstream_service::InprocManager::new();
+            let policy_handle = manager.spawn(Box::new(policy_service)).await?;
+
+            let registry_base = tempfile::TempDir::new()?;
+            let repo_id = git2db::RepoId::new();
+            {
+                let mut registry_store = git2db::Git2DB::open(registry_base.path()).await?;
+                registry_store
+                    .register(repo_id.clone())
+                    .name(model_name.as_str())
+                    .worktree_path(&repo)
+                    .url(String::new())
+                    .exec()
+                    .await?;
+            }
+            let registry_endpoint = format!("inproc://restart-acceptance-registry-{tag}");
+            let registry_policy = PolicyClient::for_local_endpoint_bootstrap(
+                &policy_endpoint,
+                registry_key.clone(),
+                policy_key.verifying_key(),
+                None,
+            )?;
+            let registry_service = crate::services::RegistryService::new(
+                registry_base.path(),
+                registry_policy,
+                TransportConfig::inproc(&registry_endpoint),
+                registry_key.clone(),
+            )
+            .await?;
+            let registry_handle = manager.spawn(Box::new(registry_service)).await?;
+            let registry = RegistryClient::for_local_endpoint_bootstrap(
+                &registry_endpoint,
+                model_key.clone(),
+                registry_key.verifying_key(),
+                None,
+            )?;
+
+            let model_policy = PolicyClient::for_local_endpoint_bootstrap(
+                &policy_endpoint,
+                model_key.clone(),
+                policy_key.verifying_key(),
+                None,
+            )?;
+            let mut config = ModelServiceConfig::default();
+            config.inference_deployment.compute = InferenceCompute::Cpu;
+            let model = ModelService::new(
+                config,
+                model_key.clone(),
+                model_policy,
+                registry,
+                TransportConfig::inproc(format!("restart-acceptance-model-{tag}")),
+                TransportConfig::inproc(policy_endpoint),
+            )
+            .await?;
+            let model_ref = format!("{model_name}:main");
+            let instance = InferenceInstanceId::new("restart-acceptance-tenant", &model_ref, 0)?;
+            Ok(Self {
+                model,
+                model_key,
+                model_ref,
+                instance,
+                _registry_handle: registry_handle,
+                _policy_handle: policy_handle,
+                _registry_base: registry_base,
+                _policy_base: policy_base,
+            })
+        }
+    }
+
+    fn assert_restart_order_holder(
+        order: &str,
+        controller: &SigningKey,
+        audience: &str,
+        subject: &str,
+        caller_key: &SigningKey,
+    ) -> Result<()> {
+        let claims = verify_internal_work(
+            order,
+            &controller.verifying_key(),
+            audience,
+            chrono::Utc::now().timestamp(),
+        )?;
+        anyhow::ensure!(claims.sub == subject && claims.caller.sub == subject);
+        anyhow::ensure!(claims.tenant == "restart-acceptance-tenant");
+        anyhow::ensure!(claims.resource == "inference:HasLora" && claims.operation == "query");
+        anyhow::ensure!(
+            claims.owner_did.as_deref()
+                == Some(hyprstream_rpc::identity::Did::from_ed25519(
+                    &caller_key.verifying_key().to_bytes(),
+                ).as_str()),
+            "work order owner DID must remain bound to the verified caller"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the sealed local CPU-model repository and isolated XDG guest fixture"]
+    async fn real_cpu_worker_restart_rejects_old_order_and_preserves_holders() -> Result<()> {
+        let fixture = RestartAcceptanceFixture::from_guest_env().await?;
+        let caller_a_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let caller_b_key = SigningKey::from_bytes(&[0xB1; 32]);
+        let caller_a = restart_acceptance_caller_ctx(
+            "restart-caller-a",
+            &caller_a_key,
+            "restart-acceptance-tenant",
+        );
+        let caller_b = restart_acceptance_caller_ctx(
+            "restart-caller-b",
+            &caller_b_key,
+            "restart-acceptance-tenant",
+        );
+        let scope = ModelService::inference_scope("hasLora", "query");
+
+        // A is a real CPU Model load, then the normal Model forwarding path.
+        fixture.model.load_model(&fixture.instance, None, None).await?;
+        let (audience_a, incarnation_a) = {
+            let cache = fixture.model.loaded_models.read().await;
+            let loaded = cache.peek(&fixture.instance)
+                .ok_or_else(|| anyhow!("worker A missing after successful load"))?;
+            (loaded.work_audience.clone(), loaded.incarnation.clone())
+        };
+        let a_client = fixture.model.get_inference_client(&fixture.model_ref, &caller_a, scope.clone()).await?;
+        let mut old_order = fixture.model.take_test_work_order().await
+            .ok_or_else(|| anyhow!("test-only capture missed worker A work order"))?;
+        assert_restart_order_holder(&old_order, &fixture.model_key, &audience_a, "restart-caller-a", &caller_a_key)?;
+        let _ = a_client.has_lora().await?;
+
+        // Model's actual unload owns the cached SpawnedService stop/join. A
+        // subsequent load creates B through the same production init closure.
+        fixture.model.unload_model(&fixture.instance).await?;
+        anyhow::ensure!(
+            !fixture.model.loaded_models.read().await.contains(&fixture.instance),
+            "unload must remove worker A before B is created"
+        );
+        fixture.model.load_model(&fixture.instance, None, None).await?;
+        let (audience_b, incarnation_b, worker_b) = {
+            let cache = fixture.model.loaded_models.read().await;
+            let loaded = cache.peek(&fixture.instance)
+                .ok_or_else(|| anyhow!("worker B missing after successful reload"))?;
+            (loaded.work_audience.clone(), loaded.incarnation.clone(), loaded.client.clone())
+        };
+        anyhow::ensure!(audience_a != audience_b && incarnation_a != incarnation_b,
+            "reload must install a fresh worker-generated incarnation");
+
+        // This is the causal assertion: B receives A's real captured bearer
+        // through generated dispatch. Verification must fail on B's audience,
+        // before the `hasLora` handler can return a success value.
+        let replay_error = match worker_b
+            .with_bearer(std::mem::take(&mut *old_order))
+            .has_lora()
+            .await
+        {
+            Ok(_) => anyhow::bail!("worker B accepted worker A's order"),
+            Err(error) => error,
+        };
+        anyhow::ensure!(
+            replay_error.to_string().contains("audience"),
+            "old order must fail the replacement worker audience check, got: {replay_error:#}"
+        );
+
+        // Fresh A work succeeds at B and carries the same original holder.
+        let b_client_for_a = fixture.model.get_inference_client(&fixture.model_ref, &caller_a, scope.clone()).await?;
+        let fresh_a_order = fixture.model.take_test_work_order().await
+            .ok_or_else(|| anyhow!("test-only capture missed worker B fresh order"))?;
+        assert_restart_order_holder(&fresh_a_order, &fixture.model_key, &audience_b, "restart-caller-a", &caller_a_key)?;
+        let _ = b_client_for_a.has_lora().await?;
+
+        // Caller B gets a different holder-bound order; it cannot inherit A's
+        // subject, caller snapshot, or pairwise owner DID.
+        let b_client_for_b = fixture.model.get_inference_client(&fixture.model_ref, &caller_b, scope).await?;
+        let fresh_b_order = fixture.model.take_test_work_order().await
+            .ok_or_else(|| anyhow!("test-only capture missed caller B order"))?;
+        assert_restart_order_holder(&fresh_b_order, &fixture.model_key, &audience_b, "restart-caller-b", &caller_b_key)?;
+        anyhow::ensure!(fresh_a_order != fresh_b_order, "distinct caller requests require distinct work orders");
+        let _ = b_client_for_b.has_lora().await?;
+
+        fixture.model.unload_model(&fixture.instance).await?;
+        Ok(())
     }
 
     #[tokio::test]
