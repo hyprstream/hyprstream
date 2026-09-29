@@ -507,9 +507,14 @@ async fn non_admitted_relay_delegated_bearer_denies_at_dispatch() -> Result<()> 
         })
         .await
         .expect_err("a non-admitted relay must be denied at the admission gate");
+    // The unregistered signer is denied by the whole-dispatch admission
+    // enforcement BEFORE claims verification — the operator-required
+    // dispatch-level check, not merely the accept_delegated_bearer callback.
+    // The deeper verifier-level boundary is unit-covered by
+    // delegated_bearer_is_denied_by_default.
     assert!(
-        error.to_string().contains("not an authorized relay"),
-        "expected the relay-admission denial, got: {error:?}"
+        error.to_string().contains("dispatch denied"),
+        "expected the whole-dispatch admission denial for the unregistered signer, got: {error:?}"
     );
 
     hop.shutdown().await?;
