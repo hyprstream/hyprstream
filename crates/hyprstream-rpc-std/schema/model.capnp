@@ -315,14 +315,14 @@ struct GenerationDefaults {
   doSample      @6 :Opt.OptionBool;
 }
 
-# Status entry for a single model (loaded or loading)
+# Status entry for a single model (loaded, loading, or unloading)
 # Absence from the list means unloaded.
 struct ModelStatusEntry {
   modelRef   @0 :Text;
-  status     @1 :Text;    # "loaded" | "loading"
-  reach      @2 :List(TransportConfig);  # network reach (#320); empty while loading or if co-located-only
-  loadedAt   @3 :Int64;   # ms elapsed since load (0 if loading)
-  lastUsed   @4 :Int64;   # ms elapsed since last use (0 if loading)
+  status     @1 :Text;    # "loaded" | "loading" | "unloading"
+  reach      @2 :List(TransportConfig);  # network reach (#320); empty while transitioning or if co-located-only
+  loadedAt   @3 :Int64;   # ms elapsed since load (0 while transitioning)
+  lastUsed   @4 :Int64;   # ms elapsed since last use (0 while transitioning)
   onlineTrainingConfig @5 :OnlineTrainingConfig;
   generationDefaults   @6 :GenerationDefaults;
 }

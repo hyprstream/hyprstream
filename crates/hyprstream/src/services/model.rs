@@ -53,13 +53,15 @@ use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
 use lru::LruCache;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
+#[cfg(test)]
+use zeroize::Zeroizing;
 
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
@@ -188,7 +190,21 @@ pub struct ModelServiceInner {
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<InferenceInstanceId, LoadedModel>>,
     /// Models currently being loaded (accepted but not yet in LRU cache)
-    pending_loads: Mutex<HashSet<InferenceInstanceId>>,
+    pending_loads: parking_lot::Mutex<HashMap<InferenceInstanceId, u64>>,
+    /// Models whose cache entry has been removed and whose worker teardown is
+    /// still in progress. This survives cancellation of the caller awaiting
+    /// `unload_model`, so a replacement load cannot race a draining worker.
+    unloading_models: Mutex<HashSet<InferenceInstanceId>>,
+    /// Serializes admission of a new load with the transition that reserves an
+    /// existing worker for teardown. The guard covers the unloading check,
+    /// cache observation, and pending-load insertion as one decision.
+    load_unload_gate: Mutex<()>,
+    /// Serializes lifecycle event delivery. It is deliberately separate from
+    /// lifecycle admission: a successful unload acquires this order before
+    /// releasing its slot, preventing a later loaded event from overtaking the
+    /// listener-visible unloaded completion without holding admission locks
+    /// across network/event delivery.
+    lifecycle_event_publish_gate: Mutex<()>,
     /// Service configuration
     config: ModelServiceConfig,
     /// Ed25519 signing key for creating InferenceClients
@@ -239,6 +255,16 @@ pub struct ModelServiceInner {
     producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
     /// Service-scoped MoQ origin populated by the outer service spawner.
     moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
+    /// Test-only, in-memory capture of the most recently minted direct work
+    /// order. This deliberately does not exist in production builds: a work
+    /// order must never become an observable RPC value, log field, file, or
+    /// environment value merely to support restart acceptance coverage.
+    #[cfg(test)]
+    test_work_order_capture: Mutex<Option<Zeroizing<String>>>,
+    /// Test-only ordering witness: successful unload clears admission before
+    /// making its `model.unloaded` event visible.
+    #[cfg(test)]
+    before_unloaded_event: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -252,6 +278,50 @@ pub struct ModelServiceInner {
 /// list, health, info, and other requests during long GPU weight transfers.
 pub struct ModelService {
     inner: Arc<ModelServiceInner>,
+}
+
+/// Result of the gated admission used by the non-blocking load RPC path.
+///
+/// Only `Accepted` owns a continuation and a pending reservation. An
+/// already-loaded or already-pending request is a read/deduplication fast path
+/// and must not create a second load attempt.
+enum InterceptedLoadAdmission {
+    Loaded { reach: Vec<WireTransportConfig> },
+    Pending,
+    Accepted(InterceptedLoadReservation),
+}
+
+/// Owns an intercepted load's pending marker from admission through either
+/// continuation completion or cancellation. The marker uses a tiny synchronous
+/// mutex deliberately: `Drop` must be able to roll it back if serialization or
+/// the continuation handoff is cancelled before the future is ever polled.
+struct InterceptedLoadReservation {
+    inner: Arc<ModelServiceInner>,
+    instance: InferenceInstanceId,
+    attempt: u64,
+    active: bool,
+}
+
+impl InterceptedLoadReservation {
+    fn new(inner: Arc<ModelServiceInner>, instance: InferenceInstanceId, attempt: u64) -> Self {
+        Self { inner, instance, attempt, active: true }
+    }
+
+    fn release(&mut self) {
+        if self.active {
+            let mut pending = self.inner.pending_loads.lock();
+            if pending.get(&self.instance) == Some(&self.attempt) {
+                pending.remove(&self.instance);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for InterceptedLoadReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 fn admit_in_process_tenant(
@@ -450,7 +520,10 @@ impl ModelService {
 
         Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
-            pending_loads: Mutex::new(HashSet::new()),
+            pending_loads: parking_lot::Mutex::new(HashMap::new()),
+            unloading_models: Mutex::new(HashSet::new()),
+            load_unload_gate: Mutex::new(()),
+            lifecycle_event_publish_gate: Mutex::new(()),
             config,
             signing_key,
             policy_client,
@@ -470,7 +543,28 @@ impl ModelService {
                 hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
             )),
             moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(test)]
+            test_work_order_capture: Mutex::new(None),
+            #[cfg(test)]
+            before_unloaded_event: Mutex::new(None),
         })})
+    }
+
+    /// Retain a direct work order only for an in-crate test. The production
+    /// Model→Inference boundary still attaches the bearer directly to the
+    /// generated client and never exposes it to a caller.
+    #[cfg(test)]
+    async fn capture_test_work_order(&self, work_order: &str) {
+        let mut capture = self.test_work_order_capture.lock().await;
+        *capture = Some(Zeroizing::new(work_order.to_owned()));
+    }
+
+    /// Consume the in-memory test capture. Keeping the value move-only avoids
+    /// a durable test transcript and makes each assertion explicitly own the
+    /// short-lived secret it needs to replay against the replacement worker.
+    #[cfg(test)]
+    async fn take_test_work_order(&self) -> Option<Zeroizing<String>> {
+        self.test_work_order_capture.lock().await.take()
     }
 
     /// Set the expected JWT audience for token validation.
@@ -557,6 +651,59 @@ impl ModelService {
             epoch,
         };
         let _ = self.load_terminals.latch(key, terminal);
+    }
+
+    /// Atomically admit the intercepted (non-blocking) load path with unload's
+    /// reservation and cache transition. `Accepted` reserves `pending_loads`
+    /// before the response is sent; an unload that arrives afterwards rejects
+    /// against that reservation rather than invalidating an accepted request.
+    async fn reserve_intercepted_load(
+        &self,
+        instance: &InferenceInstanceId,
+    ) -> Result<InterceptedLoadAdmission> {
+        self.admit_instance(instance)?;
+        let _load_unload_gate = self.load_unload_gate.lock().await;
+        self.ensure_not_unloading(instance).await?;
+
+        {
+            let mut cache = self.loaded_models.write().await;
+            if let Some(model) = cache.get_mut(instance) {
+                model.last_used = Instant::now();
+                return Ok(InterceptedLoadAdmission::Loaded {
+                    reach: Self::model_reach(&model.network_transport),
+                });
+            }
+        }
+
+        let mut pending = self.pending_loads.lock();
+        if pending.contains_key(instance) {
+            return Ok(InterceptedLoadAdmission::Pending);
+        }
+
+        let attempt = self.allocate_load_epoch();
+        pending.insert(instance.clone(), attempt);
+        Ok(InterceptedLoadAdmission::Accepted(InterceptedLoadReservation::new(
+            Arc::clone(&self.inner),
+            instance.clone(),
+            attempt,
+        )))
+    }
+
+    /// Execute one previously admitted intercepted load. Its pending reservation
+    /// was created under `load_unload_gate`; unload rejects against that marker
+    /// until this continuation has finished and released it.
+    async fn run_intercepted_load(
+        &self,
+        instance: &InferenceInstanceId,
+        max_context: Option<u32>,
+        kv_quant: Option<KVQuantType>,
+        mut reservation: InterceptedLoadReservation,
+    ) -> Result<String> {
+        let epoch = reservation.attempt;
+        let result = self.load_model_inner(instance, max_context, kv_quant).await;
+        reservation.release();
+        self.latch_load_terminal(instance, epoch, &result);
+        result
     }
 
     /// Build an instance key only from the authority-verified tenant binding.
@@ -909,6 +1056,11 @@ impl ModelService {
     ) -> Result<String> {
         self.admit_instance(instance)?;
         let model_ref_str = instance.model_ref();
+        // A load's admission decision is atomic with unload's reservation and
+        // cache removal. Without this guard, a load could observe "not
+        // unloading", then begin after the old worker has been removed.
+        let load_unload_gate = self.load_unload_gate.lock().await;
+        self.ensure_not_unloading(instance).await?;
         // Check if already loaded
         {
             let mut cache = self.loaded_models.write().await;
@@ -921,26 +1073,28 @@ impl ModelService {
 
         // Atomically check-and-insert into pending_loads (prevents duplicate GPU loads
         // when multiple requests arrive during the ~40s load window).
-        // HashSet::insert returns false if the value was already present.
+        // HashMap::insert is guarded by contains_key so a direct attempt owns
+        // the epoch stored beside its pending marker.
+        let epoch;
         {
-            let mut pending = self.pending_loads.lock().await;
-            if !pending.insert(instance.clone()) {
+            let mut pending = self.pending_loads.lock();
+            if pending.contains_key(instance) {
                 anyhow::bail!(
                     "Model {} is already being loaded — please retry shortly",
                     model_ref_str
                 );
             }
+            epoch = self.allocate_load_epoch();
+            pending.insert(instance.clone(), epoch);
         }
+        drop(load_unload_gate);
 
-        // EV7/#649: this is a genuine new load attempt (past the already-loaded
-        // and already-pending fast paths) — allocate a fresh epoch so its
-        // terminal latches under a new key (reload ⇒ new terminal).
-        let epoch = self.allocate_load_epoch();
-
+        // EV7/#649: the gated pending insertion allocated this genuine load's
+        // fresh epoch, so its terminal latches under a new key on completion.
         let result = self.load_model_inner(instance, max_context, kv_quant).await;
 
         // Always remove from pending, whether load succeeded or failed
-        self.pending_loads.lock().await.remove(instance);
+        self.pending_loads.lock().remove(instance);
 
         // EV7/#649: latch the retained terminal (Loaded / LoadFailed) for this
         // load attempt — the host-side retain a late `load --wait` reads.
@@ -964,15 +1118,23 @@ impl ModelService {
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
         // Get model path from registry
+        #[cfg(test)]
+        crate::services::restart_diag::phase("registry.get_by_name.enter");
         let tracked = self.registry.get_by_name(model_ref.name()).await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.name(), e))?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("registry.get_by_name.done");
         let repo_client = self.registry.repo(&tracked.id);
 
         let branch_name = match &model_ref.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
             _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
         };
+        #[cfg(test)]
+        crate::services::restart_diag::phase("registry.list_worktrees.enter");
         let worktrees = repo_client.list_worktrees().await?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("registry.list_worktrees.done");
         if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
             return Err(anyhow!("worktree for {}:{} not found", model_ref.name(), branch_name));
         }
@@ -1063,8 +1225,12 @@ impl ModelService {
         service_config = service_config.with_incarnation_handoff(incarnation_tx, generation);
 
         let network_reach = service_config.network_reach_handle();
+        #[cfg(test)]
+        crate::services::restart_diag::phase("inference.spawn.enter");
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("inference.spawn.done");
         let network_transport = network_reach
             .read()
             .clone()
@@ -1077,6 +1243,8 @@ impl ModelService {
         let expected_controller = self.signing_key.verifying_key().to_bytes();
         const HANDOFF_TIMEOUT: std::time::Duration =
             std::time::Duration::from_secs(crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS);
+        #[cfg(test)]
+        crate::services::restart_diag::phase("incarnation.handoff.enter");
         let incarnation_binding = match tokio::time::timeout(HANDOFF_TIMEOUT, incarnation_rx).await {
             Err(_) => anyhow::bail!(
                 "pinned worker incarnation handoff timed out after {}s without a ready worker",
@@ -1087,6 +1255,8 @@ impl ModelService {
             }
             Ok(Ok(handoff)) => handoff,
         };
+        #[cfg(test)]
+        crate::services::restart_diag::phase("incarnation.handoff.done");
         anyhow::ensure!(
             incarnation_binding.generation == generation,
             "stale incarnation handoff: worker reported generation {} for attempt {generation}",
@@ -1199,29 +1369,121 @@ impl ModelService {
         Ok(endpoint)
     }
 
-    /// Unload a model
+    async fn ensure_not_unloading(&self, instance: &InferenceInstanceId) -> Result<()> {
+        anyhow::ensure!(
+            !self.unloading_models.lock().await.contains(instance),
+            "Model {} is unloading — please retry after teardown completes",
+            instance.model_ref(),
+        );
+        Ok(())
+    }
+
+    /// Unload a model.
+    ///
+    /// The teardown is owned by an internal task before this method awaits its
+    /// result. Dropping an RPC continuation therefore cannot leave an absent
+    /// cache entry while the old worker's thread still drains in the
+    /// background: the instance remains in `unloading_models` until a
+    /// successful shutdown/join. An ambiguous stop error retains that
+    /// reservation fail-closed.
     async fn unload_model(&self, instance: &InferenceInstanceId) -> Result<()> {
-        let model_ref_str = instance.model_ref();
-        let mut cache = self.loaded_models.write().await;
-        if let Some((_, mut model)) = cache.pop_entry(instance) {
-            info!("Unloading model {}", model_ref_str);
-            let _ = model.service_handle.stop().await;
-            let model_name = model_ref_str.split(':').next().unwrap_or(model_ref_str);
-            let scope = format!("serve:model:{}", model_name);
-            let event = crate::events::EventEnvelope::new(
-                crate::events::EventSource::Model,
-                scope.clone(),
-                crate::events::EventPayload::ModelUnloaded {
-                    model_ref: model_ref_str.to_owned(),
-                },
-            );
-            if let Ok(payload) = serde_json::to_vec(&event) {
-                let _ = self.event_publisher.publish("lifecycle", "unloaded", &payload).await;
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let inner = Arc::clone(&self.inner);
+        let instance = instance.clone();
+
+        tokio::spawn(async move {
+            let result = Self::unload_model_owned(Arc::clone(&inner), &instance).await;
+            if let Err(Err(error)) = completion_tx.send(result) {
+                warn!(
+                    model = %instance.model_ref(),
+                    error = %error,
+                    "model unload caller cancelled; owned teardown completed with an error"
+                );
             }
-            Ok(())
-        } else {
-            Err(anyhow!("Model {} is not loaded", model_ref_str))
+        });
+
+        completion_rx
+            .await
+            .map_err(|_| anyhow!("model unload task exited before reporting completion"))?
+    }
+
+    async fn unload_model_owned(
+        inner: Arc<ModelServiceInner>,
+        instance: &InferenceInstanceId,
+    ) -> Result<()> {
+        let model_ref_str = instance.model_ref().to_owned();
+        let (model, pending_load) = {
+            let load_unload_gate = inner.load_unload_gate.lock().await;
+            let mut unloading = inner.unloading_models.lock().await;
+            let inserted = unloading.insert(instance.clone());
+            drop(unloading);
+            anyhow::ensure!(
+                inserted,
+                "Model {} is already unloading",
+                model_ref_str,
+            );
+            let model = {
+                let mut cache = inner.loaded_models.write().await;
+                cache.pop_entry(instance).map(|(_, model)| model)
+            };
+            let pending_load = if model.is_none() {
+                inner.pending_loads.lock().contains_key(instance)
+            } else {
+                false
+            };
+            drop(load_unload_gate);
+            (model, pending_load)
+        };
+
+        let Some(mut model) = model else {
+            if pending_load {
+                inner.unloading_models.lock().await.remove(instance);
+                anyhow::bail!("Model {} is loading", model_ref_str);
+            }
+            inner.unloading_models.lock().await.remove(instance);
+            anyhow::bail!("Model {} is not loaded", model_ref_str);
+        };
+
+        info!("Unloading model {}", model_ref_str);
+        if let Err(error) = model.service_handle.stop().await {
+            // `SpawnedService::stop` can report a join-task failure after the
+            // handle has moved to `spawn_blocking`; that does not establish
+            // that the worker thread ended. Keep the reservation fail-closed
+            // rather than admitting a replacement alongside an ambiguous old
+            // worker. A process-level recovery can clear this poisoned state.
+            warn!(
+                model = %model_ref_str,
+                error = %error,
+                "model unload stop failed; retaining unload reservation"
+            );
+            return Err(anyhow!(
+                "failed to stop model {} before unload: {error}",
+                model_ref_str
+            ));
         }
+        // Acquire delivery order before releasing admission. A successful join
+        // proves the worker is gone, so a listener may reload immediately; its
+        // later loaded event must wait behind this unloaded completion, but no
+        // lifecycle admission lock is held across the publish await.
+        let _event_publish_gate = inner.lifecycle_event_publish_gate.lock().await;
+        inner.unloading_models.lock().await.remove(instance);
+        #[cfg(test)]
+        if let Some(before_publish) = inner.before_unloaded_event.lock().await.take() {
+            let _ = before_publish.send(());
+        }
+        let model_name = model_ref_str.split(':').next().unwrap_or(&model_ref_str);
+        let scope = format!("serve:model:{}", model_name);
+        let event = crate::events::EventEnvelope::new(
+            crate::events::EventSource::Model,
+            scope.clone(),
+            crate::events::EventPayload::ModelUnloaded {
+                model_ref: model_ref_str.clone(),
+            },
+        );
+        if let Ok(payload) = serde_json::to_vec(&event) {
+            let _ = inner.event_publisher.publish("lifecycle", "unloaded", &payload).await;
+        }
+        Ok(())
     }
 
     /// Convert a TTTConfig to a generated OnlineTrainingConfig wire type.
@@ -1249,28 +1511,72 @@ impl ModelService {
         }
     }
 
-    /// Return status entries for all known models (loaded + loading).
+    /// Return status entries for all known models (loaded, loading, and unloading).
     /// Absence from this list means unloaded.
     async fn model_status_all(&self, verified_tenant: &str) -> Vec<GenModelStatusEntry> {
-        let cache = self.loaded_models.read().await;
-        let pending = self.pending_loads.lock().await;
-        let mut entries: Vec<GenModelStatusEntry> = cache
+        // Take the same gate as load admission and unload reservation, then
+        // snapshot every lifecycle store. A reservation is authoritative even
+        // during the small inner-load interval where the cache and pending set
+        // are both populated.
+        let _load_unload_gate = self.load_unload_gate.lock().await;
+        let unloading: HashSet<_> = self
+            .unloading_models
+            .lock()
+            .await
             .iter()
-            .filter(|(instance, _)| instance.tenant() == verified_tenant)
-            .map(|(_, model)| GenModelStatusEntry {
-                model_ref: model.model_ref.clone(),
-                status: "loaded".to_owned(),
-                reach: Self::model_reach(&model.network_transport),
-                loaded_at: model.loaded_at.elapsed().as_millis() as i64,
-                last_used: model.last_used.elapsed().as_millis() as i64,
-                online_training_config: model.ttt_config.as_ref()
-                    .map(Self::ttt_config_to_wire)
-                    .unwrap_or_default(),
-                generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
-            })
+            .filter(|instance| instance.tenant() == verified_tenant)
+            .cloned()
             .collect();
-        for instance in pending.iter().filter(|instance| instance.tenant() == verified_tenant) {
-            if !cache.contains(instance) {
+        let (mut entries, loaded): (Vec<_>, HashSet<_>) = {
+            let cache = self.loaded_models.read().await;
+            (
+                cache
+                    .iter()
+                    .filter(|(instance, _)| {
+                        instance.tenant() == verified_tenant && !unloading.contains(*instance)
+                    })
+                    .map(|(_, model)| GenModelStatusEntry {
+                        model_ref: model.model_ref.clone(),
+                        status: "loaded".to_owned(),
+                        reach: Self::model_reach(&model.network_transport),
+                        loaded_at: model.loaded_at.elapsed().as_millis() as i64,
+                        last_used: model.last_used.elapsed().as_millis() as i64,
+                        online_training_config: model.ttt_config.as_ref()
+                            .map(Self::ttt_config_to_wire)
+                            .unwrap_or_default(),
+                        generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
+                    })
+                    .collect(),
+                cache
+                    .iter()
+                    .filter(|(instance, _)| {
+                        instance.tenant() == verified_tenant && !unloading.contains(*instance)
+                    })
+                    .map(|(instance, _)| instance.clone())
+                    .collect(),
+            )
+        };
+        for instance in &unloading {
+            entries.push(GenModelStatusEntry {
+                model_ref: instance.model_ref().to_owned(),
+                status: "unloading".to_owned(),
+                reach: Vec::new(),
+                loaded_at: 0,
+                last_used: 0,
+                online_training_config: GenOnlineTrainingConfig::default(),
+                generation_defaults: GenGenerationDefaults::default(),
+            });
+        }
+        let pending: HashSet<_> = {
+            self.pending_loads
+                .lock()
+                .keys()
+                .filter(|instance| instance.tenant() == verified_tenant)
+                .cloned()
+                .collect()
+        };
+        for instance in &pending {
+            if !loaded.contains(instance) && !unloading.contains(instance) {
                 entries.push(GenModelStatusEntry {
                     model_ref: instance.model_ref().to_owned(),
                     status: "loading".to_owned(),
@@ -1287,22 +1593,36 @@ impl ModelService {
 
     /// Return status entry for a specific model ref (0 or 1 element).
     async fn model_status_single(&self, instance: &InferenceInstanceId) -> Vec<GenModelStatusEntry> {
-        let cache = self.loaded_models.read().await;
-        if let Some(model) = cache.peek(instance) {
+        let _load_unload_gate = self.load_unload_gate.lock().await;
+        if self.unloading_models.lock().await.contains(instance) {
             return vec![GenModelStatusEntry {
                 model_ref: instance.model_ref().to_owned(),
-                status: "loaded".to_owned(),
-                reach: Self::model_reach(&model.network_transport),
-                loaded_at: model.loaded_at.elapsed().as_millis() as i64,
-                last_used: model.last_used.elapsed().as_millis() as i64,
-                online_training_config: model.ttt_config.as_ref()
-                    .map(Self::ttt_config_to_wire)
-                    .unwrap_or_default(),
-                generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
+                status: "unloading".to_owned(),
+                reach: Vec::new(),
+                loaded_at: 0,
+                last_used: 0,
+                online_training_config: GenOnlineTrainingConfig::default(),
+                generation_defaults: GenGenerationDefaults::default(),
             }];
         }
-        let pending = self.pending_loads.lock().await;
-        if pending.contains(instance) {
+        {
+            let cache = self.loaded_models.read().await;
+            if let Some(model) = cache.peek(instance) {
+                return vec![GenModelStatusEntry {
+                    model_ref: instance.model_ref().to_owned(),
+                    status: "loaded".to_owned(),
+                    reach: Self::model_reach(&model.network_transport),
+                    loaded_at: model.loaded_at.elapsed().as_millis() as i64,
+                    last_used: model.last_used.elapsed().as_millis() as i64,
+                    online_training_config: model.ttt_config.as_ref()
+                        .map(Self::ttt_config_to_wire)
+                        .unwrap_or_default(),
+                    generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
+                }];
+            }
+        }
+        let pending = self.pending_loads.lock();
+        if pending.contains_key(instance) {
             vec![GenModelStatusEntry {
                 model_ref: instance.model_ref().to_owned(),
                 status: "loading".to_owned(),
@@ -1481,6 +1801,8 @@ impl ModelService {
             .await?;
         let work_token =
             self.mint_internal_work_token(&instance, ctx, &work, &live_work_audience)?;
+        #[cfg(test)]
+        self.capture_test_work_order(&work_token).await;
         tracing::debug!(
             generation = live_generation,
             "minted internal work order against live worker incarnation"
@@ -2082,7 +2404,7 @@ impl ModelService {
         SyntheticTree::new(SyntheticNode::DynamicDir {
             list: Box::new(move || {
                 let cache = inner_list.loaded_models.blocking_read();
-                let pending = inner_list.pending_loads.blocking_lock();
+                let pending = inner_list.pending_loads.lock();
                 let mut entries: Vec<DirEntry> = cache
                     .iter()
                     .filter(|(instance, _)| instance.tenant() == list_tenant)
@@ -2094,7 +2416,7 @@ impl ModelService {
                     })
                     .collect();
                 for instance in pending
-                    .iter()
+                    .keys()
                     .filter(|instance| instance.tenant() == list_tenant)
                 {
                     if !cache.contains(instance) {
@@ -2340,54 +2662,45 @@ impl crate::services::RequestService for ModelService {
             // This interception runs before generated dispatch, so derive the
             // instance only from the already-verified tenant in the envelope.
             let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
-            self.admit_instance(&instance)?;
-            // Fast path: if already loaded or already loading, return immediately
-            {
-                let mut cache = self.loaded_models.write().await;
-                if let Some(model) = cache.get_mut(&instance) {
-                    model.last_used = Instant::now();
-                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                        LoadedModelResponse {
-                            model_ref: load_data.model_ref.clone(),
-                            reach: Self::model_reach(&model.network_transport),
-                        },
-                    ))?;
-                    return Ok((response, None));
-                }
-            }
-            // If already being loaded by another request, return the reach
-            // without spawning a duplicate continuation
-            {
-                let pending = self.pending_loads.lock().await;
-                if pending.contains(&instance) {
-                    debug!("Model {} already being loaded, deduplicating", load_data.model_ref);
-                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                        LoadedModelResponse {
-                            model_ref: load_data.model_ref.clone(),
-                            reach: Vec::new(),
-                        },
-                    ))?;
-                    return Ok((response, None));
-                }
-            }
-
-            // Slow path: return "accepted" immediately, load in continuation
             let model_ref = load_data.model_ref.clone();
+            let reservation = match self.reserve_intercepted_load(&instance).await? {
+                InterceptedLoadAdmission::Loaded { reach } => {
+                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                        LoadedModelResponse { model_ref, reach },
+                    ))?;
+                    return Ok((response, None));
+                }
+                InterceptedLoadAdmission::Pending => {
+                    debug!("Model {} already being loaded, deduplicating", model_ref);
+                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                        LoadedModelResponse { model_ref, reach: Vec::new() },
+                    ))?;
+                    return Ok((response, None));
+                }
+                InterceptedLoadAdmission::Accepted(reservation) => reservation,
+            };
+
+            // The accepted response is sent only after the shared gate has
+            // reserved `pending_loads`. Transfer its attempt-scoped RAII guard
+            // into the continuation *before* response signing/serialization:
+            // if that fallible response path returns early, dropping this
+            // continuation synchronously releases only this attempt's marker.
             info!("Load request accepted for {} (async)", model_ref);
-
-            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                LoadedModelResponse {
-                    model_ref: model_ref.clone(),
-                    reach: Vec::new(),
-                },
-            ))?;
-
+            let response_model_ref = model_ref.clone();
             let service = self.clone(); // Arc clone — cheap, 'static
             let (load_max_context, load_kv_quant) = load_data.to_load_params();
             let continuation: crate::services::Continuation = Box::pin(async move {
                 let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                 let scope = format!("serve:model:{}", model_name);
-                match service.load_model(&instance, load_max_context, load_kv_quant).await {
+                match service
+                    .run_intercepted_load(
+                        &instance,
+                        load_max_context,
+                        load_kv_quant,
+                        reservation,
+                    )
+                    .await
+                {
                     Ok(endpoint) => {
                         info!("Model {} loaded successfully at {}", model_ref, endpoint);
                         let event = crate::events::EventEnvelope::new(
@@ -2399,6 +2712,7 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
+                            let _event_publish_gate = service.lifecycle_event_publish_gate.lock().await;
                             let _ = service.event_publisher.publish("lifecycle", "loaded", &payload).await;
                             debug!("Published model.loaded event");
                         }
@@ -2414,11 +2728,16 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
+                            let _event_publish_gate = service.lifecycle_event_publish_gate.lock().await;
                             let _ = service.event_publisher.publish("lifecycle", "failed", &payload).await;
                         }
                     }
                 }
             });
+
+            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                LoadedModelResponse { model_ref: response_model_ref, reach: Vec::new() },
+            ))?;
 
             return Ok((response, Some(continuation)));
         }
@@ -3712,6 +4031,358 @@ mod tests {
         )
     }
 
+    fn blocking_unload_worker(
+        armed: std::sync::mpsc::Sender<()>,
+        shutdown_observed: tokio::sync::oneshot::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> hyprstream_service::SpawnedService {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let worker_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("build blocking-unload runtime: {error}"));
+            runtime.block_on(async move {
+                let notified = worker_shutdown.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                armed
+                    .send(())
+                    .unwrap_or_else(|error| panic!("signal blocking worker readiness: {error}"));
+                notified.await;
+                let _ = shutdown_observed.send(());
+                release.notified().await;
+            });
+        });
+        hyprstream_service::SpawnedService::thread(
+            "s1-blocking-unload-worker".to_owned(),
+            Some(handle),
+            shutdown,
+            None,
+        )
+    }
+
+    fn panicking_unload_worker() -> hyprstream_service::SpawnedService {
+        let handle = std::thread::spawn(|| {
+            panic!("test worker panics before join")
+        });
+        hyprstream_service::SpawnedService::thread(
+            "s1-panicking-unload-worker".to_owned(),
+            Some(handle),
+            Arc::new(tokio::sync::Notify::new()),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancelled_unload_keeps_instance_reserved_until_thread_join() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        let local_state = Arc::new(BoundaryDialState::default());
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut model = selector_loaded_model(Vec::new(), local_state);
+        model.service_handle = blocking_unload_worker(
+            armed_tx,
+            shutdown_observed_tx,
+            Arc::clone(&release),
+        );
+        service.loaded_models.write().await.put(instance.clone(), model);
+        // This is the real inner-load/outer-load handoff overlap: a worker is
+        // visible in the cache while the load reservation still exists. The
+        // unloading worker below blocks its join so both status APIs must
+        // prefer the reservation for the whole drain interval.
+        service.pending_loads.lock().insert(instance.clone(), 1);
+
+        tokio::task::spawn_blocking(move || {
+            armed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| anyhow!("blocking worker did not arm: {error}"))
+        })
+        .await
+        .unwrap_or_else(|error| panic!("wait for blocking worker readiness task: {error}"))
+        .unwrap_or_else(|error| panic!("wait for blocking worker readiness: {error}"));
+
+        let unload_service = service.clone();
+        let unload_instance = instance.clone();
+        let caller = tokio::spawn(async move {
+            unload_service.unload_model(&unload_instance).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_observed_rx)
+            .await
+            .unwrap_or_else(|_| panic!("unload did not notify the blocking worker"))
+            .unwrap_or_else(|error| panic!("blocking worker dropped shutdown observation: {error}"));
+
+        caller.abort();
+        assert!(
+            matches!(caller.await, Err(error) if error.is_cancelled()),
+            "the caller task must be cancelled while owned teardown continues"
+        );
+        assert!(
+            service.unloading_models.lock().await.contains(&instance),
+            "cancellation must retain the unloading reservation until join completes"
+        );
+        assert!(
+            !service.loaded_models.read().await.contains(&instance),
+            "the cache must not expose a worker after its shutdown begins"
+        );
+        let (all_status, single_status) = tokio::join!(
+            service.model_status_all(instance.tenant()),
+            service.model_status_single(&instance),
+        );
+        assert_eq!(
+            all_status
+                .iter()
+                .filter(|entry| entry.model_ref == instance.model_ref())
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unloading"],
+            "all-status must retain an unloading worker after its caller is cancelled"
+        );
+        assert_eq!(
+            single_status
+                .iter()
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unloading"],
+            "single-status must not report the draining worker as absent"
+        );
+        let error = match service.load_model(&instance, None, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a replacement load must not race the draining worker"),
+        };
+        assert!(
+            error.to_string().contains("is unloading"),
+            "replacement denial must disclose only lifecycle state: {error:#}"
+        );
+
+        // In production the outer load completion clears this marker. Keep the
+        // worker drain blocked but model that completion before asserting final
+        // status absence below.
+        service.pending_loads.lock().remove(&instance);
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !service.unloading_models.lock().await.contains(&instance) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("owned teardown did not clear its reservation after join"));
+        let (all_status, single_status) = tokio::join!(
+            service.model_status_all(instance.tenant()),
+            service.model_status_single(&instance),
+        );
+        assert!(
+            all_status.is_empty() && single_status.is_empty(),
+            "status absence is permitted only after teardown releases its reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn unloading_reservation_precedes_loaded_and_pending_status_snapshot() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+
+        // `load_model_inner` publishes the cache entry before outer
+        // `load_model` clears this reservation. If unload reserves and pops in
+        // that interval, both sets are deliberately present: teardown is the
+        // authoritative lifecycle state, never a second loading attempt.
+        service.loaded_models.write().await.put(
+            instance.clone(),
+            selector_loaded_model(Vec::new(), Arc::new(BoundaryDialState::default())),
+        );
+        service.pending_loads.lock().insert(instance.clone(), 1);
+        service.unloading_models.lock().await.insert(instance.clone());
+
+        let (all_status, single_status) = tokio::join!(
+            service.model_status_all(instance.tenant()),
+            service.model_status_single(&instance),
+        );
+        assert_eq!(
+            all_status
+                .iter()
+                .filter(|entry| entry.model_ref == instance.model_ref())
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unloading"],
+            "list status must not let pending_loads conceal an active teardown"
+        );
+        assert_eq!(
+            single_status
+                .iter()
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unloading"],
+            "single status must not let pending_loads conceal an active teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn intercepted_load_reservation_rejects_unload_before_continuation_runs() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+
+        // Force the former check-to-response gap: handler admission reserves a
+        // pending load, then unload attempts to win before the continuation is
+        // polled. Both transitions use `load_unload_gate`, so the unload must
+        // fail closed and leave the accepted continuation as sole owner.
+        let reservation = match service.reserve_intercepted_load(&instance).await {
+            Ok(InterceptedLoadAdmission::Accepted(reservation)) => reservation,
+            Ok(_) => panic!("fixture load must receive a new accepted reservation"),
+            Err(error) => panic!("fixture load admission failed: {error:#}"),
+        };
+        let unload_error = match service.unload_model(&instance).await {
+            Err(error) => error,
+            Ok(()) => panic!("unload must not cancel an accepted pending load"),
+        };
+        assert!(
+            unload_error.to_string().contains("is loading"),
+            "unload must reject against the accepted pending reservation: {unload_error:#}"
+        );
+        assert!(
+            service.pending_loads.lock().contains_key(&instance),
+            "the continuation must retain ownership of the accepted reservation"
+        );
+        assert!(
+            !service.unloading_models.lock().await.contains(&instance),
+            "a rejected unload must not leave a false teardown reservation"
+        );
+
+        // The selector fixture fails normal model resolution immediately; this
+        // drives the continuation's ordinary failure completion without
+        // starting a worker and proves it releases its own reservation.
+        assert!(
+            service
+                .run_intercepted_load(&instance, None, None, reservation)
+                .await
+                .is_err(),
+            "fixture resolution must reach the continuation failure path"
+        );
+        assert!(
+            !service.pending_loads.lock().contains_key(&instance),
+            "continuation completion must release its accepted reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_intercepted_load_reservation_rolls_back_pending_marker() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+
+        // This is the response-serialization / unpolled-continuation failure
+        // path: admission succeeded, the continuation owns its guard, but the
+        // response path drops that continuation before its first poll. Drop
+        // must synchronously remove the marker so neither status nor a later
+        // admission sees a permanent false load.
+        let reservation = match service.reserve_intercepted_load(&instance).await {
+            Ok(InterceptedLoadAdmission::Accepted(reservation)) => reservation,
+            Ok(_) => panic!("fixture load must receive a new accepted reservation"),
+            Err(error) => panic!("fixture load admission failed: {error:#}"),
+        };
+        assert!(service.pending_loads.lock().contains_key(&instance));
+        let unpolled: crate::services::Continuation = Box::pin(async move {
+            let _reservation = reservation;
+            std::future::pending::<()>().await;
+        });
+        drop(unpolled);
+        assert!(
+            !service.pending_loads.lock().contains_key(&instance),
+            "dropping an unpolled accepted continuation must roll back pending"
+        );
+
+        // A late Drop from an earlier handoff must not erase a newer attempt
+        // for the same instance. This is the attempt identity contract, not a
+        // best-effort instance-wide cleanup.
+        let stale = InterceptedLoadReservation::new(Arc::clone(&service.inner), instance.clone(), 7);
+        service.pending_loads.lock().insert(instance.clone(), 8);
+        drop(stale);
+        assert_eq!(
+            service.pending_loads.lock().get(&instance),
+            Some(&8),
+            "a stale guard must release only its own attempt marker"
+        );
+        service.pending_loads.lock().remove(&instance);
+        let retry = service.reserve_intercepted_load(&instance).await;
+        assert!(
+            matches!(retry, Ok(InterceptedLoadAdmission::Accepted(_))),
+            "a later load must not deduplicate against a dropped reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_unload_releases_admission_before_unloaded_event() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        service.loaded_models.write().await.put(
+            instance.clone(),
+            selector_loaded_model(Vec::new(), Arc::new(BoundaryDialState::default())),
+        );
+        let (before_publish_tx, before_publish_rx) = tokio::sync::oneshot::channel();
+        *service.before_unloaded_event.lock().await = Some(before_publish_tx);
+
+        let unload_service = service.clone();
+        let unload_instance = instance.clone();
+        let unload = tokio::spawn(async move { unload_service.unload_model(&unload_instance).await });
+        before_publish_rx
+            .await
+            .unwrap_or_else(|error| panic!("unload did not reach event boundary: {error}"));
+
+        assert!(
+            !service.unloading_models.lock().await.contains(&instance),
+            "successful join must release admission before model.unloaded is published"
+        );
+        let reload = service.reserve_intercepted_load(&instance).await;
+        assert!(
+            matches!(reload, Ok(InterceptedLoadAdmission::Accepted(_))),
+            "an event-driven reload must be admitted after a successful join"
+        );
+        unload
+            .await
+            .unwrap_or_else(|error| panic!("unload task panicked: {error}"))
+            .unwrap_or_else(|error| panic!("dummy worker unload failed: {error:#}"));
+    }
+
+    #[tokio::test]
+    async fn unload_stop_error_retains_instance_reservation() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        let local_state = Arc::new(BoundaryDialState::default());
+        let mut model = selector_loaded_model(Vec::new(), local_state);
+        model.service_handle = panicking_unload_worker();
+        service.loaded_models.write().await.put(instance.clone(), model);
+
+        let error = match service.unload_model(&instance).await {
+            Err(error) => error,
+            Ok(()) => panic!("a thread join panic must make unload fail"),
+        };
+        assert!(
+            error.to_string().contains("failed to stop model"),
+            "unload must return the stop failure: {error:#}"
+        );
+        assert!(
+            service.unloading_models.lock().await.contains(&instance),
+            "an ambiguous stop failure must retain the replacement-load reservation"
+        );
+        assert!(
+            !service.loaded_models.read().await.contains(&instance),
+            "a failed stop must not expose the popped worker as live"
+        );
+        let error = match service.load_model(&instance, None, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("a failed stop must not admit a replacement worker"),
+        };
+        assert!(
+            error.to_string().contains("is unloading"),
+            "replacement denial must remain a lifecycle-only message: {error:#}"
+        );
+    }
+
     #[tokio::test]
     async fn dead_worker_cache_entry_cannot_mint_and_is_evicted() {
         let service = selector_model_service().await;
@@ -3815,6 +4486,739 @@ mod tests {
             caller_key.verifying_key(),
             claims,
         )
+    }
+
+    fn restart_acceptance_caller_ctx(
+        subject: &str,
+        caller_key: &SigningKey,
+        tenant: &str,
+    ) -> EnvelopeContext {
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
+            .with_tenant(tenant.to_owned())
+            .with_cnf_jwk(caller_key.verifying_key().as_bytes())
+            .with_clearance(crate::services::inference::inference_object_label());
+        EnvelopeContext::for_test_authenticated_subject_with_claims(
+            hyprstream_rpc::envelope::Subject::new(subject),
+            tenant,
+            caller_key.verifying_key(),
+            claims,
+        )
+    }
+
+    fn resolve_gitdir_reference(
+        reference_file: &std::path::Path,
+        gitfile_format: bool,
+    ) -> Result<std::path::PathBuf> {
+        let contents = std::fs::read_to_string(reference_file)?;
+        let reference = if gitfile_format {
+            contents
+                .strip_prefix("gitdir: ")
+                .ok_or_else(|| anyhow!("fixture Git file is malformed"))?
+        } else {
+            contents.as_str()
+        }
+        .trim();
+        anyhow::ensure!(
+            !reference.is_empty() && !reference.contains(['\n', '\r']),
+            "fixture Git link is malformed"
+        );
+        let path = std::path::PathBuf::from(reference);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            reference_file
+                .parent()
+                .ok_or_else(|| anyhow!("fixture Git link has no parent"))?
+                .join(path)
+        };
+        Ok(resolved.canonicalize()?)
+    }
+
+    fn validate_restart_fixture_worktree_link(
+        repo: &std::path::Path,
+        worktree: &std::path::Path,
+    ) -> Result<()> {
+        let admin_worktree = repo.join("worktrees").join("main");
+        let expected_gitfile = worktree.join(".git");
+        anyhow::ensure!(expected_gitfile.is_file(), "fixture main worktree has no Git file");
+        anyhow::ensure!(
+            resolve_gitdir_reference(&admin_worktree.join("gitdir"), false)?
+                == expected_gitfile.canonicalize()?,
+            "fixture repository main worktree does not name the isolated StoragePaths worktree"
+        );
+        anyhow::ensure!(
+            resolve_gitdir_reference(&expected_gitfile, true)? == admin_worktree.canonicalize()?,
+            "isolated StoragePaths worktree does not link back to fixture repository main"
+        );
+        Ok(())
+    }
+
+    /// A guest-provisioned, local-only fixture for the real restart acceptance
+    /// test.  The repository must be bare and its linked `main` worktree must
+    /// already be the XDG-isolated path that `StoragePaths` resolves.  The test
+    /// never clones, downloads, or copies model weights.
+    struct RestartAcceptanceFixture {
+        model: ModelService,
+        model_key: SigningKey,
+        model_ref: String,
+        instance: InferenceInstanceId,
+        _auth: RestartAuthServices,
+    }
+
+    const RESTART_FIXTURE_ISSUER: &str = "http://127.0.0.1:6791";
+
+    /// Shared by the guest acceptance and the focused dispatch regression.
+    /// Own the spawned services for as long as either test uses their clients.
+    struct RestartAuthServices {
+        model_key: SigningKey,
+        policy_key: SigningKey,
+        registry_key: SigningKey,
+        model_token: String,
+        policy_endpoint: String,
+        registry_endpoint: String,
+        policy_transport: TransportConfig,
+        jwt_source: Arc<hyprstream_rpc::auth::ClusterKeySource>,
+        _registry_handle: hyprstream_service::SpawnedService,
+        _policy_handle: hyprstream_service::SpawnedService,
+        _registry_base: tempfile::TempDir,
+        _policy_base: tempfile::TempDir,
+        _credentials: tempfile::TempDir,
+    }
+
+    fn restart_acceptance_inproc_endpoint(kind: &str, tag: &str) -> (TransportConfig, String) {
+        let transport = TransportConfig::inproc(format!("restart-acceptance-{kind}-{tag}"));
+        let uri = transport.endpoint_string();
+        (transport, uri)
+    }
+
+    fn install_restart_fixture_auth(keys: &[SigningKey]) -> Result<()> {
+        use hyprstream_rpc::crypto::CryptoPolicy;
+        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore, ResponseVerifyConfig};
+
+        let _ = hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+            hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(10_000),
+        ));
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let mut pq_store = KeyedPqTrustStore::new();
+        for key in keys {
+            let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(key);
+            let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+                &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+            )?;
+            pq_store.bind(key.verifying_key().to_bytes(), &pq_vk);
+        }
+        let pq_store = Arc::new(pq_store);
+        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
+            policy: CryptoPolicy::Hybrid,
+            pq_store: Some(pq_store.clone()),
+        })?;
+        hyprstream_rpc::envelope::install_response_verify_config(ResponseVerifyConfig {
+            policy: CryptoPolicy::Hybrid,
+            pq_store: Some(pq_store),
+        })?;
+        crate::mac::install_production_rpc_dispatch_pep()?;
+        anyhow::ensure!(
+            hyprstream_rpc::auth::mac::global_mac_dispatch_pep().is_some(),
+            "restart fixture has no production dispatch PEP"
+        );
+        Ok(())
+    }
+
+    fn restart_fixture_service_jwt(
+        credentials: &tempfile::TempDir,
+        name: &str,
+        ca: &SigningKey,
+        key: &SigningKey,
+    ) -> Result<String> {
+        let bootstrap = crate::auth::identity_store::BootstrapPubkey::for_service_key(key)?;
+        crate::auth::service_jwt::issue_or_load_service_jwt(
+            credentials.path(),
+            name,
+            ca,
+            &bootstrap,
+            RESTART_FIXTURE_ISSUER,
+            chrono::Utc::now().timestamp(),
+            Some(&crate::mac::dispatch_labels::BOOTSTRAP_SERVICE_CLEARANCE),
+        )
+    }
+
+    impl RestartAuthServices {
+        async fn new(repo: &std::path::Path, model_name: &str) -> Result<Self> {
+            use hyprstream_service::ServiceManager as _;
+
+            let tag = hex::encode(hyprstream_rpc::envelope::generate_nonce());
+            let policy_key = SigningKey::from_bytes(&[0x91; 32]);
+            let registry_key = SigningKey::from_bytes(&[0x92; 32]);
+            let model_key = SigningKey::from_bytes(&[0x93; 32]);
+            // The fourth key is anchored only for the wrong-holder regression:
+            // its denial must be a credential binding failure, not a missing PQ anchor.
+            let wrong_holder = SigningKey::from_bytes(&[0x94; 32]);
+            install_restart_fixture_auth(&[
+                policy_key.clone(), registry_key.clone(), model_key.clone(), wrong_holder,
+            ])?;
+            let ca = hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
+            let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+            let jwt_source = Arc::new(
+                hyprstream_rpc::auth::ClusterKeySource::new(ca.verifying_key(), RESTART_FIXTURE_ISSUER.to_owned())
+                    .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq)),
+            );
+            let credentials = tempfile::TempDir::new()?;
+            let model_token = restart_fixture_service_jwt(&credentials, "model", &ca, &model_key)?;
+            let registry_token = restart_fixture_service_jwt(&credentials, "registry", &ca, &registry_key)?;
+            for (key, name) in [(&policy_key, "policy"), (&registry_key, "registry")] {
+                hyprstream_service::global_trust_store().insert(
+                    key.verifying_key(),
+                    hyprstream_service::Attestation {
+                        scopes: std::iter::once(name.to_owned()).collect(),
+                        subject: Some(format!("service:{name}")),
+                        jwt: None,
+                        expires_at: 0,
+                        attested_by: None,
+                    },
+                );
+            }
+
+            let policy_base = tempfile::TempDir::new()?;
+            let policy_manager = Arc::new(crate::auth::PolicyManager::permissive().await?);
+            let (policy_transport, policy_endpoint) = restart_acceptance_inproc_endpoint("policy", &tag);
+            let policy_service = crate::services::PolicyService::new(
+                policy_manager,
+                Arc::new(policy_key.clone()),
+                crate::config::TokenConfig::default(),
+                Arc::new(RwLock::new(git2db::Git2DB::open(policy_base.path()).await?)),
+                policy_transport.clone(),
+            ).with_jwt_key_source(jwt_source.clone());
+            crate::services::restart_diag::phase("policy.spawn.enter");
+            let manager = hyprstream_service::InprocManager::new();
+            let policy_handle = manager.spawn(Box::new(policy_service)).await?;
+            crate::services::restart_diag::phase("policy.spawn.done");
+
+            let registry_base = tempfile::TempDir::new()?;
+            {
+                let mut registry_store = git2db::Git2DB::open(registry_base.path()).await?;
+                registry_store.register(git2db::RepoId::new())
+                    .name(model_name)
+                    .worktree_path(repo)
+                    .url(String::new())
+                    .exec().await?;
+            }
+            let (registry_transport, registry_endpoint) = restart_acceptance_inproc_endpoint("registry", &tag);
+            let registry_policy = PolicyClient::for_local_endpoint_bootstrap(
+                &policy_endpoint, registry_key.clone(), policy_key.verifying_key(), Some(registry_token),
+            )?;
+            let registry_service = crate::services::RegistryService::new(
+                registry_base.path(), registry_policy, registry_transport, registry_key.clone(),
+            ).await?
+                .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
+                .with_jwt_key_source(jwt_source.clone());
+            crate::services::restart_diag::phase("registry.spawn.enter");
+            let registry_handle = manager.spawn(Box::new(registry_service)).await?;
+            crate::services::restart_diag::phase("registry.spawn.done");
+            Ok(Self {
+                model_key, policy_key, registry_key, model_token,
+                policy_endpoint, registry_endpoint, policy_transport, jwt_source,
+                _registry_handle: registry_handle, _policy_handle: policy_handle,
+                _registry_base: registry_base, _policy_base: policy_base, _credentials: credentials,
+            })
+        }
+
+        fn model_registry_client(&self) -> Result<RegistryClient> {
+            RegistryClient::for_local_endpoint_bootstrap(
+                &self.registry_endpoint,
+                self.model_key.clone(),
+                self.registry_key.verifying_key(),
+                Some(self.model_token.clone()),
+            )
+        }
+
+        fn model_policy_client(&self) -> Result<PolicyClient> {
+            PolicyClient::for_local_endpoint_bootstrap(
+                &self.policy_endpoint,
+                self.model_key.clone(),
+                self.policy_key.verifying_key(),
+                Some(self.model_token.clone()),
+            )
+        }
+    }
+
+    #[test]
+    fn restart_acceptance_inproc_endpoints_match_client_dial_names() {
+        for kind in ["policy", "registry"] {
+            let (server, uri) = restart_acceptance_inproc_endpoint(kind, "fixture");
+            assert_eq!(
+                server.endpoint,
+                TransportConfig::from_endpoint(&uri).endpoint,
+                "{kind} server registration and client dial must use the same name"
+            );
+            assert_eq!(uri, format!("inproc://restart-acceptance-{kind}-fixture"));
+        }
+    }
+
+    struct ClassicalRestartSigner(SigningKey);
+
+    #[async_trait::async_trait]
+    impl hyprstream_rpc::transport_traits::Signer for ClassicalRestartSigner {
+        fn pubkey(&self) -> [u8; 32] {
+            self.0.verifying_key().to_bytes()
+        }
+
+        async fn sign(&self, bytes: &[u8]) -> Result<[u8; 64]> {
+            use ed25519_dalek::Signer as _;
+            Ok(self.0.sign(bytes).to_bytes())
+        }
+    }
+
+    fn assert_restart_dispatch_denied<T>(result: Result<T>, case: &str) -> Result<()> {
+        let error = result.err().ok_or_else(|| anyhow!("{case} reached the Registry handler"))?;
+        anyhow::ensure!(
+            error.to_string().contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
+            "{case} failed outside the uniform dispatch boundary: {error}"
+        );
+        Ok(())
+    }
+
+    /// Run by exact filter in its own test process: request/response verify
+    /// configs are first-write globals, while the dispatch PEP is swappable.
+    #[tokio::test]
+    #[ignore = "requires first-write verify-config globals; run with --exact --test-threads=1"]
+    async fn restart_fixture_authenticated_hybrid_get_by_name_requires_model_holder() -> Result<()> {
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+
+        let repo = tempfile::TempDir::new()?;
+        let model_name = "restart-auth-regression";
+        let auth = RestartAuthServices::new(repo.path(), model_name).await?;
+        let model = auth.model_registry_client()?;
+        let policy_check = hyprstream_rpc_std::policy_client::PolicyCheck {
+            subject: "service:model".to_owned(),
+            domain: "*".to_owned(),
+            resource: "registry:*".to_owned(),
+            operation: "query".to_owned(),
+        };
+        anyhow::ensure!(auth.model_policy_client()?.check(&policy_check).await?,
+            "model holder must reach real Policy dispatch");
+        let found = model.get_by_name(model_name).await?;
+        anyhow::ensure!(found.name == model_name,
+            "the authenticated model lookup returned the wrong repository");
+        anyhow::ensure!(model.list().await?.iter().any(|entry| entry.name == model_name),
+            "Registry-to-Policy mediation lost the authenticated model caller");
+
+        let client = |key: SigningKey, token: Option<String>| {
+            RegistryClient::for_local_endpoint_bootstrap(
+                &auth.registry_endpoint, key, auth.registry_key.verifying_key(), token,
+            )
+        };
+        let missing = client(auth.model_key.clone(), None)?.get_by_name(model_name).await;
+        assert_restart_dispatch_denied(missing, "tokenless model lookup")?;
+        let wrong_holder = client(SigningKey::from_bytes(&[0x94; 32]), Some(auth.model_token.clone()))?
+            .get_by_name(model_name).await;
+        assert_restart_dispatch_denied(wrong_holder, "wrong holder with model token")?;
+
+        let processor = hyprstream_rpc::dial::lookup_inproc(
+            auth.registry_endpoint.strip_prefix("inproc://")
+                .ok_or_else(|| anyhow!("fixture Registry endpoint is not in-process"))?,
+        ).ok_or_else(|| anyhow!("fixture Registry handle was not retained"))?;
+        let classical = RpcClientImpl::new(
+            ClassicalRestartSigner(auth.model_key.clone()),
+            InMemoryTransport::new(processor),
+            Some(auth.registry_key.verifying_key()),
+        ).with_default_jwt(auth.model_token.clone());
+        let classical = RegistryClient::new(Arc::new(classical));
+        let classical_error = classical.get_by_name(model_name).await
+            .err().ok_or_else(|| anyhow!("classical signer reached Registry"))?;
+        anyhow::ensure!(classical_error.to_string().contains("mandatory Hybrid suite requires an ML-DSA-65 signer key"),
+            "classical signer failed for an unrelated reason: {classical_error}");
+
+        // This signer has its own valid model certificate, but no PQ anchor in
+        // the process verifier. Credential authority cannot fill that gap.
+        let unanchored_key = SigningKey::from_bytes(&[0x95; 32]);
+        let ca = hyprstream_rpc::node_identity::derive_purpose_key(&auth.policy_key, "hyprstream-jwt-v1");
+        let unanchored_credentials = tempfile::TempDir::new()?;
+        let unanchored_token = restart_fixture_service_jwt(&unanchored_credentials, "model", &ca, &unanchored_key)?;
+        let unanchored = client(unanchored_key, Some(unanchored_token))?
+            .get_by_name(model_name).await;
+        let unanchored_error = unanchored.err()
+            .ok_or_else(|| anyhow!("unanchored PQ signer reached Registry"))?;
+        anyhow::ensure!(unanchored_error.to_string() == "registry envelope admission failed",
+            "unanchored PQ signer failed outside envelope admission: {unanchored_error:#}");
+        anyhow::ensure!(unanchored_error.chain().any(|cause| matches!(
+            cause.downcast_ref::<hyprstream_rpc::EnvelopeError>(),
+            Some(hyprstream_rpc::EnvelopeError::PqSignatureInvalid(reason))
+                if reason == "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key"
+        )), "unanchored PQ signer failed for an unrelated admission reason: {unanchored_error:#}");
+        Ok(())
+    }
+
+    impl RestartAcceptanceFixture {
+        async fn from_guest_env() -> Result<Self> {
+            let repo = std::path::PathBuf::from(std::env::var(
+                "HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_REPO",
+            ).map_err(|_| anyhow!(
+                "HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_REPO must name the sealed local bare model repository"
+            ))?);
+            anyhow::ensure!(repo.is_dir(), "restart acceptance model repository is not a directory");
+            let model_name = std::env::var("HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_NAME")
+                .unwrap_or_else(|_| "restart-acceptance-fixture".to_owned());
+            let instance_name = std::env::var("HYPRSTREAM_INSTANCE").map_err(|_| anyhow!(
+                "HYPRSTREAM_INSTANCE must be set to an isolated synthetic-guest namespace"
+            ))?;
+            anyhow::ensure!(
+                instance_name.starts_with("restart-acceptance-"),
+                "HYPRSTREAM_INSTANCE must use the restart-acceptance-* isolated namespace"
+            );
+
+            let storage = crate::storage::StoragePaths::new()?;
+            let worktree = storage.worktree_path(&model_name, "main")?;
+            anyhow::ensure!(worktree.is_dir(), "fixture main worktree is absent");
+            anyhow::ensure!(
+                worktree.join("config.json").is_file()
+                    && worktree.join("tokenizer.json").is_file()
+                    && std::fs::read_dir(&worktree)?.flatten().any(|entry| {
+                        entry.file_name().to_string_lossy().ends_with(".safetensors")
+                    }),
+                "fixture must provide config.json, tokenizer.json, and safetensors weights"
+            );
+            validate_restart_fixture_worktree_link(&repo, &worktree)?;
+
+            let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+                hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+            );
+            hyprstream_rpc::registry::init(
+                hyprstream_rpc::registry::EndpointMode::Inproc,
+                None,
+            );
+            anyhow::ensure!(
+                hyprstream_rpc::registry::global().mode()
+                    == hyprstream_rpc::registry::EndpointMode::Inproc,
+                "restart fixture endpoint registry must use Inproc mode"
+            );
+            let auth = RestartAuthServices::new(&repo, &model_name).await?;
+            let mut config = ModelServiceConfig::default();
+            config.inference_deployment.compute = InferenceCompute::Cpu;
+            let model = ModelService::new(
+                config,
+                auth.model_key.clone(),
+                auth.model_policy_client()?,
+                auth.model_registry_client()?,
+                TransportConfig::inproc(format!("restart-acceptance-model-{}", hex::encode(hyprstream_rpc::envelope::generate_nonce()))),
+                auth.policy_transport.clone(),
+            )
+            .await?
+            .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
+            .with_jwt_key_source(auth.jwt_source.clone());
+            let model_ref = format!("{model_name}:main");
+            let instance = InferenceInstanceId::new("restart-acceptance-tenant", &model_ref, 0)?;
+            Ok(Self {
+                model,
+                model_key: auth.model_key.clone(),
+                model_ref,
+                instance,
+                _auth: auth,
+            })
+        }
+    }
+
+    #[test]
+    fn restart_fixture_gitdir_backlink_requires_expected_checkout() -> Result<()> {
+        fn git(args: &[&str]) -> Result<()> {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .status()
+                .map_err(|error| anyhow!("temporary Git fixture command did not start: {error}"))?;
+            anyhow::ensure!(
+                status.success(),
+                "temporary Git fixture command failed: git {args:?}"
+            );
+            Ok(())
+        }
+
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        let repo = temp.path().join("fixture.git");
+        let expected_checkout = temp.path().join("isolated/models/worktrees/main");
+        let other_checkout = temp.path().join("other-worktree");
+        let source_arg = source
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary source path is not UTF-8"))?;
+        let repo_arg = repo
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary bare repository path is not UTF-8"))?;
+        let expected_arg = expected_checkout
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary expected checkout path is not UTF-8"))?;
+        let other_arg = other_checkout
+            .to_str()
+            .ok_or_else(|| anyhow!("temporary mismatched checkout path is not UTF-8"))?;
+
+        git(&["init", "-b", "main", source_arg])?;
+        git(&["-C", source_arg, "config", "user.name", "restart-fixture-test"])?;
+        git(&[
+            "-C",
+            source_arg,
+            "config",
+            "user.email",
+            "restart-fixture-test@example.invalid",
+        ])?;
+        std::fs::write(source.join("fixture.txt"), "fixture\n")?;
+        git(&["-C", source_arg, "add", "fixture.txt"])?;
+        git(&["-C", source_arg, "commit", "-m", "temporary fixture"])?;
+        git(&["clone", "--bare", source_arg, repo_arg])?;
+        std::fs::create_dir_all(
+            expected_checkout
+                .parent()
+                .ok_or_else(|| anyhow!("temporary expected checkout has no parent"))?,
+        )?;
+        git(&["--git-dir", repo_arg, "worktree", "add", expected_arg, "main"])?;
+        git(&[
+            "--git-dir",
+            repo_arg,
+            "worktree",
+            "add",
+            "-b",
+            "other",
+            other_arg,
+            "main",
+        ])?;
+
+        validate_restart_fixture_worktree_link(&repo, &expected_checkout)?;
+        let mismatch = match validate_restart_fixture_worktree_link(&repo, &other_checkout) {
+            Ok(()) => anyhow::bail!("a different linked checkout must be rejected"),
+            Err(error) => error,
+        };
+        anyhow::ensure!(
+            mismatch
+                .to_string()
+                .contains("does not name the isolated StoragePaths worktree"),
+            "mismatched checkout error must identify the administrative backlink"
+        );
+        Ok(())
+    }
+
+    fn assert_restart_order_holder(
+        order: &str,
+        controller: &SigningKey,
+        audience: &str,
+        subject: &str,
+        caller_key: &SigningKey,
+    ) -> Result<()> {
+        let claims = verify_internal_work(
+            order,
+            &controller.verifying_key(),
+            audience,
+            chrono::Utc::now().timestamp(),
+        )?;
+        anyhow::ensure!(claims.sub == subject && claims.caller.sub == subject);
+        anyhow::ensure!(claims.tenant == "restart-acceptance-tenant");
+        anyhow::ensure!(claims.resource == "inference:HasLora" && claims.operation == "query");
+        anyhow::ensure!(
+            claims.owner_did.as_deref()
+                == Some(hyprstream_rpc::identity::Did::from_ed25519(
+                    &caller_key.verifying_key().to_bytes(),
+                ).as_str()),
+            "work order owner DID must remain bound to the verified caller"
+        );
+        Ok(())
+    }
+
+    /// Test-only observer for the one server-side denial class that identifies
+    /// an old worker order at its replacement.  It retains only a boolean: no
+    /// bearer, subject, audience, request ID, or formatted event is kept.
+    #[derive(Clone)]
+    struct RestartAudienceDenialProbe {
+        seen: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RestartAudienceDenialProbe {
+        fn install() -> Result<Arc<std::sync::atomic::AtomicBool>> {
+            use tracing_subscriber::prelude::*;
+
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let subscriber = tracing_subscriber::registry().with(Self {
+                seen: Arc::clone(&seen),
+            });
+            // The prescribed invocation is one ignored test in its own
+            // process (`--exact --test-threads=1`). A global dispatcher is
+            // necessary because the real worker dispatches on its own service
+            // task; a thread-local subscriber would not observe that task.
+            tracing::subscriber::set_global_default(subscriber).map_err(|_| {
+                anyhow!(
+                    "restart acceptance requires an isolated test process without a preinstalled tracing subscriber"
+                )
+            })?;
+            Ok(seen)
+        }
+    }
+
+    struct RestartAudienceDenialVisitor<'a> {
+        seen: &'a std::sync::atomic::AtomicBool,
+    }
+
+    impl RestartAudienceDenialVisitor<'_> {
+        fn record_message(&self, field: &tracing::field::Field, message: &str) {
+            if field.name() == "message"
+                && message.contains("claims verification failed")
+                && message.contains("audience")
+            {
+                self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl tracing::field::Visit for RestartAudienceDenialVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.record_message(field, &format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.record_message(field, value);
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for RestartAudienceDenialProbe
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "hyprstream_rpc::service::dispatch" {
+                event.record(&mut RestartAudienceDenialVisitor { seen: &self.seen });
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the sealed local CPU-model repository and isolated XDG guest fixture"]
+    async fn real_cpu_worker_restart_rejects_old_order_and_preserves_holders() -> Result<()> {
+        crate::services::restart_diag::enable();
+        crate::services::restart_diag::phase("test.enter");
+        let audience_denial = RestartAudienceDenialProbe::install()?;
+        crate::services::restart_diag::phase("fixture.enter");
+        let fixture = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            RestartAcceptanceFixture::from_guest_env(),
+        )
+        .await
+        .map_err(|_| anyhow!("RESTART_DIAG_PHASE_TIMEOUT=fixture"))??;
+        crate::services::restart_diag::phase("fixture.done");
+        let caller_a_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let caller_b_key = SigningKey::from_bytes(&[0xB1; 32]);
+        let caller_a = restart_acceptance_caller_ctx(
+            "restart-caller-a",
+            &caller_a_key,
+            "restart-acceptance-tenant",
+        );
+        let caller_b = restart_acceptance_caller_ctx(
+            "restart-caller-b",
+            &caller_b_key,
+            "restart-acceptance-tenant",
+        );
+        let scope = ModelService::inference_scope("hasLora", "query");
+
+        // A is a real CPU Model load, then the normal Model forwarding path.
+        crate::services::restart_diag::phase("worker_a.load.enter");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            fixture.model.load_model(&fixture.instance, None, None),
+        )
+        .await
+        .map_err(|_| anyhow!("RESTART_DIAG_PHASE_TIMEOUT=worker_a.load"))??;
+        crate::services::restart_diag::phase("worker_a.load.done");
+        let (audience_a, incarnation_a) = {
+            let cache = fixture.model.loaded_models.read().await;
+            let loaded = cache.peek(&fixture.instance)
+                .ok_or_else(|| anyhow!("worker A missing after successful load"))?;
+            (loaded.work_audience.clone(), loaded.incarnation.clone())
+        };
+        let a_client = fixture.model.get_inference_client(&fixture.model_ref, &caller_a, scope.clone()).await?;
+        let mut old_order = fixture.model.take_test_work_order().await
+            .ok_or_else(|| anyhow!("test-only capture missed worker A work order"))?;
+        assert_restart_order_holder(&old_order, &fixture.model_key, &audience_a, "restart-caller-a", &caller_a_key)?;
+        crate::services::restart_diag::phase("worker_a.call.enter");
+        let _ = a_client.has_lora().await?;
+        crate::services::restart_diag::phase("worker_a.call.done");
+
+        // Model's actual unload owns the cached SpawnedService stop/join. A
+        // subsequent load creates B through the same production init closure.
+        crate::services::restart_diag::phase("worker_a.unload.enter");
+        fixture.model.unload_model(&fixture.instance).await?;
+        crate::services::restart_diag::phase("worker_a.unload.done");
+        anyhow::ensure!(
+            !fixture.model.loaded_models.read().await.contains(&fixture.instance),
+            "unload must remove worker A before B is created"
+        );
+        crate::services::restart_diag::phase("worker_b.load.enter");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            fixture.model.load_model(&fixture.instance, None, None),
+        )
+        .await
+        .map_err(|_| anyhow!("RESTART_DIAG_PHASE_TIMEOUT=worker_b.load"))??;
+        crate::services::restart_diag::phase("worker_b.load.done");
+        let (audience_b, incarnation_b, worker_b) = {
+            let cache = fixture.model.loaded_models.read().await;
+            let loaded = cache.peek(&fixture.instance)
+                .ok_or_else(|| anyhow!("worker B missing after successful reload"))?;
+            (loaded.work_audience.clone(), loaded.incarnation.clone(), loaded.client.clone())
+        };
+        anyhow::ensure!(audience_a != audience_b && incarnation_a != incarnation_b,
+            "reload must install a fresh worker-generated incarnation");
+
+        // This is the causal assertion: B receives A's real captured bearer
+        // through generated dispatch. Its client response stays uniformly
+        // opaque, while the in-process test probe records only the server-side
+        // audience-denial class before the `hasLora` handler can succeed.
+        crate::services::restart_diag::phase("old_order.denial.enter");
+        let replay_error = match worker_b
+            .with_bearer(std::mem::take(&mut *old_order))
+            .has_lora()
+            .await
+        {
+            Ok(_) => anyhow::bail!("worker B accepted worker A's order"),
+            Err(error) => error,
+        };
+        anyhow::ensure!(
+            replay_error.to_string() == hyprstream_rpc::service::dispatch::DISPATCH_DENIED,
+            "old order must receive the uniform dispatch denial"
+        );
+        anyhow::ensure!(
+            audience_denial.load(std::sync::atomic::Ordering::SeqCst),
+            "replacement worker must classify the old order as an audience mismatch"
+        );
+        crate::services::restart_diag::phase("old_order.denial.done");
+
+        // Fresh A work succeeds at B and carries the same original holder.
+        let b_client_for_a = fixture.model.get_inference_client(&fixture.model_ref, &caller_a, scope.clone()).await?;
+        let fresh_a_order = fixture.model.take_test_work_order().await
+            .ok_or_else(|| anyhow!("test-only capture missed worker B fresh order"))?;
+        assert_restart_order_holder(&fresh_a_order, &fixture.model_key, &audience_b, "restart-caller-a", &caller_a_key)?;
+        crate::services::restart_diag::phase("fresh_a.call.enter");
+        let _ = b_client_for_a.has_lora().await?;
+        crate::services::restart_diag::phase("fresh_a.call.done");
+
+        // Caller B gets a different holder-bound order; it cannot inherit A's
+        // subject, caller snapshot, or pairwise owner DID.
+        let b_client_for_b = fixture.model.get_inference_client(&fixture.model_ref, &caller_b, scope).await?;
+        let fresh_b_order = fixture.model.take_test_work_order().await
+            .ok_or_else(|| anyhow!("test-only capture missed caller B order"))?;
+        assert_restart_order_holder(&fresh_b_order, &fixture.model_key, &audience_b, "restart-caller-b", &caller_b_key)?;
+        anyhow::ensure!(fresh_a_order != fresh_b_order, "distinct caller requests require distinct work orders");
+        crate::services::restart_diag::phase("fresh_b.call.enter");
+        let _ = b_client_for_b.has_lora().await?;
+        crate::services::restart_diag::phase("fresh_b.call.done");
+        crate::services::restart_diag::phase("holders.done");
+
+        crate::services::restart_diag::phase("worker_b.unload.enter");
+        fixture.model.unload_model(&fixture.instance).await?;
+        crate::services::restart_diag::phase("worker_b.unload.done");
+        Ok(())
     }
 
     #[tokio::test]

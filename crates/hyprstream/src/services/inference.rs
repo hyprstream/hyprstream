@@ -493,8 +493,16 @@ impl InferenceService {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
 
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.create.enter");
         let mut engine = create_engine(&config)?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.create.done");
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.load_model.enter");
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.load_model.done");
 
         // Initialize KV cache registry
         let model_info = RuntimeEngine::model_info(&engine);
@@ -3518,6 +3526,21 @@ impl Drop for QuinnDrainOwner {
     }
 }
 
+async fn observe_inference_shutdown(
+    shutdown: Arc<tokio::sync::Notify>,
+    network_ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    armed: tokio::sync::oneshot::Sender<()>,
+) {
+    let notified = shutdown.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let _ = armed.send(());
+    notified.await;
+    draining.store(true, Ordering::Release);
+    network_ready.store(false, Ordering::Release);
+}
+
 impl hyprstream_service::Spawnable for InferenceServiceConfig {
     fn name(&self) -> &str {
         &self.service_name
@@ -3583,11 +3606,21 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             let lifecycle_ready = Arc::clone(&network_ready);
             let lifecycle_draining = Arc::clone(&draining);
             let lifecycle_shutdown = Arc::clone(&shutdown);
+            let (lifecycle_armed_tx, lifecycle_armed_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                lifecycle_shutdown.notified().await;
-                lifecycle_draining.store(true, Ordering::Release);
-                lifecycle_ready.store(false, Ordering::Release);
+                observe_inference_shutdown(
+                    lifecycle_shutdown,
+                    lifecycle_ready,
+                    lifecycle_draining,
+                    lifecycle_armed_tx,
+                )
+                .await;
             });
+            lifecycle_armed_rx.await.map_err(|_| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(
+                    "inference lifecycle shutdown observer exited before arming".to_owned(),
+                )
+            })?;
 
             // Standalone instances use an isolated origin so two CPU replicas
             // in one deployment cannot expose each other's broadcast namespace.
@@ -3605,6 +3638,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             let bridge_shutdown = Arc::clone(&shutdown);
 
             // Build PolicyClient + GPU service + adapter ON the bridge thread.
+            #[cfg(test)]
+            crate::services::restart_diag::phase("bridge.build.enter");
             let (bridge, ready) = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn_with(
                 "inference",
                 move || async move {
@@ -3683,6 +3718,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         }
                         None => {}
                     }
+                    #[cfg(test)]
+                    crate::services::restart_diag::phase("incarnation.sent");
 
                     Ok(InferenceZmqAdapter {
                         service,
@@ -3700,6 +3737,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
 
             // Surface GPU-init failure before advertising readiness.
+            #[cfg(test)]
+            crate::services::restart_diag::phase("bridge.ready.await.enter");
             ready
                 .await
                 .map_err(|_| {
@@ -3708,6 +3747,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     )
                 })?
                 .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("init: {e}")))?;
+            #[cfg(test)]
+            crate::services::restart_diag::phase("bridge.ready.await.done");
 
             let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
                 Arc::new(bridge);
@@ -3721,6 +3762,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     server_signing_key.clone(),
                     hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
                 );
+            #[cfg(test)]
+            crate::services::restart_diag::phase("iroh.bind.enter");
             let substrate =
                 hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
                     iroh_key.to_bytes(),
@@ -3735,6 +3778,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         "inference iroh bind: {e}"
                     ))
                 })?;
+            #[cfg(test)]
+            crate::services::restart_diag::phase("iroh.bind.done");
             let node_id = *substrate.endpoint_id().as_bytes();
             let direct_addrs = substrate.endpoint().bound_sockets().into_iter().collect();
             *network_reach.write() = Some(hyprstream_rpc::transport::TransportConfig::iroh(
@@ -3742,6 +3787,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 direct_addrs,
                 None,
             ));
+            #[cfg(test)]
+            crate::services::restart_diag::phase("inproc.serve.enter");
             let result = serve_inference_bridged(
                 &service_name,
                 &transport,
@@ -4595,6 +4642,38 @@ mod tests {
             source.contains("serve_bridged_with_shutdown_armed_silent"),
             "nested REP helper must suppress its own readiness"
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_observer_arms_before_owner_readiness() {
+        let source = include_str!("inference.rs");
+        assert!(
+            source.contains("lifecycle_armed_rx.await"),
+            "inference startup must wait for the lifecycle shutdown observer to arm"
+        );
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let network_ready = Arc::new(AtomicBool::new(true));
+        let draining = Arc::new(AtomicBool::new(false));
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let observer = tokio::spawn(observe_inference_shutdown(
+            Arc::clone(&shutdown),
+            Arc::clone(&network_ready),
+            Arc::clone(&draining),
+            armed_tx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), armed_rx)
+            .await
+            .expect("lifecycle observer did not arm")
+            .expect("lifecycle observer dropped before arming");
+        shutdown.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .expect("lifecycle observer did not finish")
+            .expect("lifecycle observer panicked");
+        assert!(draining.load(Ordering::Acquire));
+        assert!(!network_ready.load(Ordering::Acquire));
     }
 
     /// Build a `GenerationStats` with only the fields the spend reads.
