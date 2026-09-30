@@ -28,6 +28,37 @@ use super::state::{TuiState, TuiEvent};
 use super::diff;
 use super::vte_parser;
 
+/// TUI service-to-service calls must carry the credential bound to the TUI
+/// signing key. A missing or blank attestation is a construction error, never
+/// a tokenless fallback that changes downstream admission semantics.
+pub(crate) fn required_service_token(signing_key: &SigningKey) -> Result<String> {
+    nonempty_service_token(crate::services::factories::service_token(signing_key))
+}
+
+fn nonempty_service_token(token: Option<String>) -> Result<String> {
+    token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TUI service credential is unavailable"))
+}
+
+pub(crate) fn production_model_client(
+    signing_key: SigningKey,
+) -> Result<hyprstream_rpc_std::model_client::ModelClient> {
+    let token = required_service_token(&signing_key)?;
+    hyprstream_rpc_std::model_client::ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider, signing_key, Some(token),
+    )
+}
+
+pub(crate) fn production_registry_client(
+    signing_key: SigningKey,
+) -> Result<hyprstream_rpc_std::registry_client::RegistryClient> {
+    let token = required_service_token(&signing_key)?;
+    hyprstream_rpc_std::registry_client::RegistryClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider, signing_key, Some(token),
+    )
+}
+
 // ============================================================================
 // Display Mode
 // ============================================================================
@@ -254,11 +285,12 @@ impl TuiService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {
@@ -844,15 +876,8 @@ impl TuiService {
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
 
         let models = {
-            let registry_client: hyprstream_rpc_std::registry_client::RegistryClient =
-                hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
-                    self.signing_key.clone(),
-                    None,
-                )?;
-            let model_client_for_status = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
-                self.signing_key.clone(),
-                None,
-            )?;
+            let registry_client = production_registry_client(self.signing_key.clone())?;
+            let model_client_for_status = production_model_client(self.signing_key.clone())?;
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = hyprstream_rpc_std::model_client::StatusRequest { model_ref: String::new() };
             let (repos_result, status_result) = tokio::join!(
@@ -900,10 +925,7 @@ impl TuiService {
                 let h   = handle_load.clone();
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
-                        sk.clone(),
-                        None,
-                    ) {
+                    let client = match production_model_client(sk.clone()) {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::warn!("Failed to create ModelClient: {e}");
@@ -924,10 +946,7 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
-                                sk_poll.clone(),
-                                None,
-                            ) {
+                            let client = match production_model_client(sk_poll.clone()) {
                                 Ok(c) => c,
                                 Err(e) => {
                                     tracing::warn!("Failed to create ModelClient: {e}");
@@ -952,10 +971,7 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
-                    sk.clone(),
-                    None,
-                ) {
+                let client = match production_model_client(sk.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("Failed to create ModelClient: {e}");
@@ -980,7 +996,7 @@ impl TuiService {
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
+                        let registry = match production_registry_client(sk) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1079,7 +1095,7 @@ impl TuiService {
                 let h = h_pull.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
+                        let registry = match production_registry_client(sk) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1118,7 +1134,7 @@ impl TuiService {
                 let h = h_push.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
+                        let registry = match production_registry_client(sk) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1163,7 +1179,7 @@ impl TuiService {
                 let h = h_status.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
+                        let registry = match production_registry_client(sk) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("Failed to create RegistryClient: {e}");
@@ -1192,14 +1208,14 @@ impl TuiService {
                 let rmd = rmd_refresh.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry_client = match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk.clone(), None) {
+                        let registry_client = match production_registry_client(sk.clone()) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: RegistryClient: {e}");
                                 return;
                             }
                         };
-                        let model_client = match hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None) {
+                        let model_client = match production_model_client(sk) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: ModelClient: {e}");
@@ -1334,6 +1350,10 @@ impl TuiService {
             (sid, active_pane_id, cols, rows)
         };
 
+        let model_ref = model_ref.to_owned();
+        let (tool_caller, tool_descriptions, openai_tools) =
+            super::rpc_transport::make_tool_caller(&self.signing_key)?;
+
         // Rename the window to "Chat: model_ref" so the titlebar is meaningful.
         {
             let mut state = self.state.write().await;
@@ -1346,11 +1366,6 @@ impl TuiService {
                 }
             }
         }
-
-        let model_ref = model_ref.to_owned();
-
-        let (tool_caller, tool_descriptions, openai_tools) =
-            super::rpc_transport::make_tool_caller(&self.signing_key);
 
         let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
             hyprstream_tui::chat_app::ChatGenConfig::default(),
@@ -2446,6 +2461,13 @@ pub(crate) async fn run_frame_loop(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_clients_fail_closed_without_a_nonempty_service_token() {
+        assert!(nonempty_service_token(None).is_err());
+        assert!(nonempty_service_token(Some(" \t".to_owned())).is_err());
+        assert_eq!(nonempty_service_token(Some("bound.jwt".to_owned())).unwrap(), "bound.jwt");
+    }
 
     #[test]
     fn test_display_mode() {

@@ -102,6 +102,12 @@ pub mod policy_methods {
     pub const REFRESH_SERVICE_TOKEN: u16 = 19;
 }
 
+/// Canonical `DiscoveryRequest` union discriminants used by native startup.
+pub mod discovery_methods {
+    /// `announce @9` is union discriminant 8, not wire field ordinal 9.
+    pub const ANNOUNCE: u16 = 8;
+}
+
 /// Canonical `InferenceRequest` union discriminants.
 ///
 /// The values are the Cap'n Proto union discriminants: 0-based DECLARATION
@@ -151,9 +157,9 @@ pub mod inference_methods {
     pub const GET_LAYER_PROFILE: u16 = 32;
 }
 
-/// The deliberate subject clearance declared for the staging bootstrap
-/// services: an internal system principal presenting a verified classical
-/// key. The assurance axis is a *ceiling*, not a grant — evaluation clamps it
+/// Clearance for the narrow local Policy bootstrap authority and classical
+/// test fixtures. Enrolled native services use the hybrid ceiling below.
+/// The assurance axis is a *ceiling*, not a grant — evaluation clamps it
 /// to the cryptographically verified key material (#548), so a caller whose
 /// envelope proved less derives less.
 pub const BOOTSTRAP_SERVICE_CLEARANCE: SecurityLabel = SecurityLabel {
@@ -489,6 +495,15 @@ impl MacDispatchPep for DeclaredDispatchPep {
 // ── Production declarations (the staging bootstrap set, #1499) ─────────────
 
 static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "discovery",
+            method: discovery_methods::ANNOUNCE,
+        },
+        method_name: "announce",
+        label: HYBRID_SERVICE_CLEARANCE,
+        justification: "native endpoint publication requires the schema-declared internal:pq-hybrid context; Discovery additionally verifies the service credential, signer binding, and accepted current identity state",
+    },
     DispatchMethodPolicy {
         id: DispatchMethodId {
             service: "inference",
@@ -881,16 +896,13 @@ static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
 static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
     ServiceSubjectClearance {
         service: "discovery",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "announce/presence precedes identity standing; \
-             discovery registers its key at boot",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled discovery identity publishes its accepted native endpoint; verified envelope material clamps assurance",
     },
     ServiceSubjectClearance {
         service: "event",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
-        justification: "the event bus is startup wiring, not content; \
-             declared so the bootstrap set holds one uniform deliberate \
-             clearance",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled event service publishes its accepted native endpoint; verified envelope material clamps assurance",
     },
     ServiceSubjectClearance {
         service: "inference",
@@ -921,15 +933,20 @@ static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
     },
     ServiceSubjectClearance {
         service: "policy",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
+        clearance: HYBRID_SERVICE_CLEARANCE,
         justification: "the CA itself; its local control-plane rows are separately \
              restricted to the verified tokenless service:policy authority",
     },
     ServiceSubjectClearance {
         service: "registry",
-        clearance: BOOTSTRAP_SERVICE_CLEARANCE,
+        clearance: HYBRID_SERVICE_CLEARANCE,
         justification: "service/model registration is part of boot; registry \
              registers its key at boot",
+    },
+    ServiceSubjectClearance {
+        service: "streams",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled streams service publishes its accepted native endpoint; stream authorization remains in its handler",
     },
 ];
 
@@ -945,9 +962,13 @@ mod tests {
 
     fn service_subject_ctx(service: &str, key_byte: u8) -> EnvelopeContext {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[key_byte; 32]);
-        EnvelopeContext::for_test_authenticated_subject(
+        let claims = hyprstream_rpc::auth::Claims::new(format!("service:{service}"), 1, i64::MAX)
+            .with_clearance(BOOTSTRAP_SERVICE_CLEARANCE);
+        EnvelopeContext::for_test_authenticated_subject_with_claims(
             hyprstream_rpc::Subject::new(format!("service:{service}")),
+            "test-tenant",
             signer.verifying_key(),
+            claims,
         )
     }
 
@@ -959,7 +980,7 @@ mod tests {
         )
     }
 
-    /// The production PEP exactly as the daemon installs it (floor-only
+    /// The production PEP exactly as the daemon installs it (identity-aware
     /// activation control, production table).
     fn production_pep() -> DeclaredDispatchPep {
         DeclaredDispatchPep::new(DeclaredDispatchTable::production()).with_activation_control()
@@ -1081,17 +1102,18 @@ mod tests {
                 "oai",
                 "oauth",
                 "policy",
-                "registry"
+                "registry",
+                "streams"
             ]
         );
         // Hybrid-enrolled runtime services hold the hybrid clearance; the
         // bootstrap identity-lifecycle services stay at the floor.
-        const HYBRID_SERVICES: &[&str] = &["inference", "model", "oai", "oauth"];
+        const HYBRID_SERVICES: &[&str] = &["discovery", "event", "inference", "model", "oai", "oauth", "policy", "registry", "streams"];
         for row in table.clearances() {
             let is_hybrid = HYBRID_SERVICES.contains(&row.service);
             let expected_clearance = match row.service {
                 "oauth" => OAUTH_ISSUANCE_LABEL,
-                "model" | "oai" | "inference" => HYBRID_SERVICE_CLEARANCE,
+                "discovery" | "event" | "model" | "oai" | "inference" | "policy" | "registry" | "streams" => HYBRID_SERVICE_CLEARANCE,
                 _ => BOOTSTRAP_SERVICE_CLEARANCE,
             };
             assert_eq!(row.clearance, expected_clearance);
@@ -1144,6 +1166,33 @@ mod tests {
             services, sorted_services,
             "clearance rows must be sorted and unique"
         );
+    }
+
+    #[test]
+    fn native_announce_row_matches_schema_and_requires_hybrid_identity() {
+        let mut message = capnp::message::Builder::new_default();
+        message.init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>()
+            .init_announce();
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        let method = hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap();
+        assert_eq!(method, discovery_methods::ANNOUNCE);
+        let table = DeclaredDispatchTable::production();
+        let row = table.resolve_row("discovery", Some(&[method])).unwrap();
+        assert_eq!(row.method_name, "announce");
+        assert_eq!(row.label, HYBRID_SERVICE_CLEARANCE);
+        let pep = DeclaredDispatchPep::new(table);
+        for service in ["policy", "discovery", "registry", "event", "streams", "model", "oai", "oauth"] {
+            let clearance = table.service_clearance(service).unwrap();
+            assert!(SecurityContext::from_clearance(clearance, hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid).can_access(&row.label));
+            assert!(!SecurityContext::from_clearance(clearance, hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical).can_access(&row.label));
+            let ctx = EnvelopeContext::for_test_authenticated_subject(
+                hyprstream_rpc::Subject::new(format!("service:{service}")),
+                ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]).verifying_key(),
+            );
+            assert_eq!(pep.check(&ctx, "discovery", Some(&[method])), MacDecision::Deny(MacDenyReason::NoClearance), "bearerless identity cannot announce");
+        }
+        assert!(table.resolve_row("discovery", Some(&[method, 0])).is_none());
+        assert!(table.resolve_row("discovery", Some(&[u16::MAX])).is_none());
     }
 
     // ── deny-by-default: unknown service / leaf / VFS alias ─────────────

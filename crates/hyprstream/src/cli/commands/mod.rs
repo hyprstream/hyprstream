@@ -300,6 +300,15 @@ pub enum ServiceAction {
         name: String,
     },
 
+    /// Validate retained bootstrap identities and reconcile their enrollment and JWTs
+    ///
+    /// Runs offline before service startup. Never generates or rotates keys,
+    /// changes the bootstrap key set, or replaces a disagreeing manifest.
+    ReconcileEnrollment,
+
+    /// Initialize or validate the node CA without provisioning a service roster
+    EnsureNodeAuthority,
+
     /// Persist built-in policy templates directly into the configured policy store
     ///
     /// This offline provisioning command is intended for boot orchestration before

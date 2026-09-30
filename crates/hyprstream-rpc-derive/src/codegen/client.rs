@@ -1033,6 +1033,21 @@ pub fn generate_client(
                 self
             }
 
+            /// Set this client's DIRECT bearer for every call.
+            ///
+            /// Unlike [`Self::with_delegated_bearer`], the token travels as the
+            /// envelope's own JWT — the caller is asserting the token as ITS
+            /// verified credential, and the receiving service's holder/cnf
+            /// binding applies against this client's signing key. Used for
+            /// caller-authored credentials (e.g. the Model→Inference
+            /// `iw+jwt` internal work order); never for relaying a foreign
+            /// holder's token.
+            #[must_use]
+            pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
+                self.call_options.jwt = Some(token.into());
+                self
+            }
+
             /// Get the next request ID.
             pub fn next_id(&self) -> u64 {
                 self.client.next_id()
@@ -1046,6 +1061,10 @@ pub fn generate_client(
             pub fn request(&self) -> hyprstream_rpc::RequestBuilder<'_> {
                 let builder =
                     hyprstream_rpc::RequestBuilder::for_service(&self.client, Self::SERVICE_NAME);
+                let builder = match &self.call_options.jwt {
+                    Some(token) => builder.jwt(token.clone()),
+                    None => builder,
+                };
                 match &self.call_options.delegated_bearer {
                     Some(token) => builder.delegated_bearer(token.clone()),
                     None => builder,
@@ -1868,6 +1887,30 @@ mod resolved_service_codegen_tests {
         assert!(!generated.contains("pub async fn from_provider"));
         assert!(generated.contains("for_local_bootstrap"));
         assert!(generated.contains("from_local_bootstrap_provider"));
+    }
+
+    #[test]
+    fn generated_request_builder_preserves_both_client_auth_options() {
+        let source = include_str!("client.rs");
+        let request_start = source
+            .find("pub fn request(&self) -> hyprstream_rpc::RequestBuilder")
+            .expect("generated client template must define request()");
+        let request_end = source[request_start..]
+            .find("/// Send a raw request")
+            .expect("request() must end before raw call generation");
+        let generated = &source[request_start..request_start + request_end];
+        assert!(
+            generated.contains("match &self.call_options.jwt"),
+            "a generated client with_bearer token must reach request()"
+        );
+        assert!(
+            generated.contains("builder.jwt(token.clone())"),
+            "request() must carry the direct bearer into its per-call builder"
+        );
+        assert!(
+            generated.contains("match &self.call_options.delegated_bearer"),
+            "request() must retain delegated-bearer propagation"
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+type ServiceTokenProvider = Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>;
+
 /// Build a `StreamSpawner` that drives inference via `ModelClient`.
 ///
 /// Spawns a dedicated OS thread with a single-threaded Tokio runtime per
@@ -26,7 +28,6 @@ pub fn make_chat_spawner(
 
     use hyprstream_rpc_std::inference_client::GenerationRequest;
     use hyprstream_rpc_std::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
-    use hyprstream_rpc_std::model_client::ModelClient;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
     let sk = signing_key.clone();
@@ -59,7 +60,7 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
-                let model_client = match ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_inner.clone(), None) {
+                let model_client = match crate::tui::service::production_model_client(sk_inner.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::StreamError(format!(
@@ -229,26 +230,45 @@ pub fn make_chat_spawner(
 /// Eagerly fetches the tool list so that `tool_descriptions` and `openai_tools`
 /// can be returned alongside the caller.  If the MCP service is unreachable,
 /// returns empty collections and a caller that immediately sends an error result.
+/// A missing or blank TUI service credential is rejected before either operation
+/// is constructed, so neither production MCP path can fall back to tokenless RPC.
 ///
 /// Returns `(caller, descriptions, openai_tools)` where:
 /// - `descriptions` maps UUID → human label (for TUI display)
 /// - `openai_tools` is the full OpenAI-format tool list for `apply_chat_template`
 pub fn make_tool_caller(
     signing_key: &SigningKey,
-) -> (
+) -> anyhow::Result<(
     hyprstream_tui::chat_app::ToolCaller,
     HashMap<String, String>,
     Vec<serde_json::Value>,
-) {
+)> {
+    let sk = signing_key.clone();
+    let token_key = signing_key.clone();
+    let token_provider: ServiceTokenProvider = Arc::new(move || {
+        super::service::required_service_token(&token_key)
+    });
+    make_tool_caller_with_token_provider(sk, token_provider)
+}
+
+fn make_tool_caller_with_token_provider(
+    signing_key: SigningKey,
+    token_provider: ServiceTokenProvider,
+) -> anyhow::Result<(
+    hyprstream_tui::chat_app::ToolCaller,
+    HashMap<String, String>,
+    Vec<serde_json::Value>,
+)> {
     use hyprstream_rpc_std::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
 
-    let sk = signing_key.clone();
+    let sk = signing_key;
 
     // ── Eagerly fetch tool list ───────────────────────────────────────────────
     // Spawned on a dedicated OS thread so `block_on` is safe regardless of
     // whether the caller is inside an existing Tokio runtime.
     let sk_fetch = sk.clone();
+    let token_fetch = current_service_token(&token_provider)?;
     let (descriptions, openai_tools): (HashMap<String, String>, Vec<serde_json::Value>) =
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -256,7 +276,12 @@ pub fn make_tool_caller(
                 .build()
                 .ok()?;
             rt.block_on(async move {
-                let gen: GenMcpClient = GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_fetch, None).ok()?;
+                let gen: GenMcpClient = GenMcpClient::from_provider(
+                    &hyprstream_discovery::ProductionRpcClientProvider,
+                    sk_fetch,
+                    Some(token_fetch),
+                )
+                .ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -289,9 +314,17 @@ pub fn make_tool_caller(
               arguments: String,
               event_tx: std::sync::mpsc::SyncSender<ChatEvent>| {
             let sk_c = sk.clone();
+            let token_provider_c = Arc::clone(&token_provider);
             let uuid_c = uuid.clone();
             std::thread::spawn(move || {
                 let result_str: String = (move || {
+                    // Resolve at invocation time: the service JWT can renew
+                    // while a chat stays open, so a captured eager-list token
+                    // would eventually fail valid tool calls.
+                    let token_c = match current_service_token(&token_provider_c) {
+                        Ok(token) => token,
+                        Err(e) => return format!("error: TUI MCP service credential unavailable: {e}"),
+                    };
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -300,7 +333,11 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        let mcp_client = match GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_c, None) {
+                        let mcp_client = match GenMcpClient::from_provider(
+                            &hyprstream_discovery::ProductionRpcClientProvider,
+                            sk_c,
+                            Some(token_c),
+                        ) {
                             Ok(c) => c,
                             Err(e) => return format!("error: failed to create McpClient: {e}"),
                         };
@@ -332,5 +369,44 @@ pub fn make_tool_caller(
         },
     );
 
-    (caller, descriptions, openai_tools)
+    Ok((caller, descriptions, openai_tools))
+}
+
+fn current_service_token(token_provider: &ServiceTokenProvider) -> anyhow::Result<String> {
+    let token = token_provider()?;
+    anyhow::ensure!(
+        !token.trim().is_empty(),
+        "TUI MCP service credential is unavailable"
+    );
+    Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tool_caller_rejects_missing_or_blank_service_credentials() {
+        for token in [String::new(), " \t".to_owned()] {
+            let provider: ServiceTokenProvider = Arc::new(move || Ok(token.clone()));
+            let error = match current_service_token(&provider) {
+                Ok(_) => panic!("blank credential must not create a TUI MCP caller"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("service credential is unavailable"));
+        }
+    }
+
+    #[test]
+    fn current_service_token_is_refreshed_each_time() -> anyhow::Result<()> {
+        let tokens = Arc::new(parking_lot::Mutex::new(vec!["renewed".to_owned(), "initial".to_owned()]));
+        let tokens_for_provider = Arc::clone(&tokens);
+        let provider: ServiceTokenProvider = Arc::new(move || {
+            tokens_for_provider.lock().pop()
+                .ok_or_else(|| anyhow::anyhow!("credential no longer available"))
+        });
+        assert_eq!(current_service_token(&provider)?, "initial");
+        assert_eq!(current_service_token(&provider)?, "renewed");
+        Ok(())
+    }
 }

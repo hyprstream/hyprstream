@@ -1276,16 +1276,10 @@ fn handle_quick_command(
                             .await
                             .context("construct worker 9P MAC PEP")?;
                         // #1269: install the full ReferenceMonitor at every
-                        // production 9P constructor. Fail-closed until #698
-                        // wires clearance issuance + S6 token path.
-                        // This worker transport still carries no verified
-                        // attach credential. Register the live UDS/vsock seam
-                        // as a structural G2 blocker before constructing its
-                        // deny-only authenticator; a late registration also
-                        // narrows an already-widened process.
-                        hyprstream_rpc::auth::mac::block_identity_widening_for_unverified_attach_transport(
-                            "worker-uds-vsock",
-                        );
+                        // production 9P constructor. Its anonymous attach
+                        // authenticator denies the uncredentialed UDS/vsock
+                        // boundary locally; do not narrow process-global RPC
+                        // activation and deny authenticated Worker methods.
                         let ninep_monitor = Some(
                             hyprstream_core::mac::enrollment_ninep_reference_monitor(Arc::clone(
                                 &ninep_decider,
@@ -1971,7 +1965,72 @@ fn install_envelope_verify_config(
     }
 
     install_session_pq_overlay();
-    install_proof_admission(oauth);
+    install_proof_admission(oauth, config);
+}
+
+/// PostgreSQL-backed replay admission for the configured shared RDS domain.
+///
+/// The database sees only a SHA-256 digest of a domain-separated replay tuple
+/// and its signed expiry. It never receives a bearer, proof bytes, or request
+/// body. `PgKv::replay_admit` executes the check-and-insert in one transaction.
+#[cfg(feature = "pds-postgres")]
+struct PostgresProofReplayStore {
+    kv: hyprstream_pds::pgsql_kv::PgKv,
+}
+
+#[cfg(feature = "pds-postgres")]
+impl PostgresProofReplayStore {
+    fn digest(parts: &[&[u8]]) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"hyprstream/proof-replay-admission/v1\0");
+        for part in parts {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+        digest.finalize().into()
+    }
+
+    fn record(&self, parts: &[&[u8]], expires_at: u64) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        match self.kv.replay_admit(Self::digest(parts), expires_at) {
+            Ok(true) => hyprstream_rpc::proof::admission::ProofAdmissionResult::Admitted,
+            Ok(false) => hyprstream_rpc::proof::admission::ProofAdmissionResult::Replayed,
+            // Do not include a database error: a driver may retain connection
+            // context. Dispatch receives a uniform failure/denial instead.
+            Err(_) => hyprstream_rpc::proof::admission::ProofAdmissionResult::Failed,
+        }
+    }
+}
+
+#[cfg(feature = "pds-postgres")]
+impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayStore {
+    fn domain_guarantee(&self) -> hyprstream_rpc::proof::admission::ReplayDomainGuarantee {
+        hyprstream_rpc::proof::admission::ReplayDomainGuarantee::LinearizableSharedStore
+    }
+
+    fn check_and_insert(
+        &self,
+        partition: hyprstream_rpc::proof::ProofDisposition,
+        key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        let partition = match partition {
+            hyprstream_rpc::proof::ProofDisposition::Authenticated => &b"authenticated"[..],
+            hyprstream_rpc::proof::ProofDisposition::Unattributed => &b"unattributed"[..],
+        };
+        self.record(&[b"request-proof", partition, &key.signer_thumbprint, &key.request_id], expires_at)
+    }
+
+    fn check_and_insert_mediated(
+        &self,
+        key: &hyprstream_rpc::proof::admission::MediatedQueryReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.record(&[
+            b"mediated-query", &key.signer_thumbprint, &key.request_id.to_be_bytes(),
+            &key.request_nonce, key.mediator.as_bytes(), key.resource.as_bytes(), key.operation.as_bytes(),
+        ], expires_at)
+    }
 }
 
 /// Install the v16 proof admission substrate: the rotating server challenge
@@ -1990,7 +2049,7 @@ fn install_envelope_verify_config(
 /// here instead — the same trait, a different substrate. Installing this one
 /// across several instances would silently weaken "admitted once per domain"
 /// to "once per node", so the log line below states the guarantee in force.
-fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
+fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>, config: Option<&HyprConfig>) {
     use hyprstream_rpc::proof::admission::{
         set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
         ProofReplayStore, ReplayDomainGuarantee,
@@ -2019,6 +2078,46 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
         ),
     }
 
+    // A configured records-role RDS binding is the safe production default:
+    // every verifier sharing that binding asks PostgreSQL to perform the one
+    // atomic insert. A configured store that cannot open denies; it never
+    // falls back to a per-node map.
+    #[cfg(feature = "pds-postgres")]
+    let shared_store: Option<Box<dyn ProofReplayStore>> = match config {
+        Some(config) => match config.rds.resolved_from_env() {
+            Ok(rds) if rds.is_configured() => match rds.connect_replay_admission() {
+                Ok(kv) => Some(Box::new(PostgresProofReplayStore { kv })),
+                Err(_) => {
+                    tracing::error!("configured shared Postgres replay store could not open; proof admission denies");
+                    return;
+                }
+            },
+            Ok(_) => None,
+            Err(_) => {
+                tracing::error!("records-role RDS binding could not be resolved; proof admission denies");
+                return;
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(feature = "pds-postgres"))]
+    let shared_store: Option<Box<dyn ProofReplayStore>> = {
+        if let Some(config) = config {
+            match config.rds.resolved_from_env() {
+                Ok(rds) if rds.is_configured() => {
+                    tracing::error!("configured shared Postgres replay store requires the pds-postgres feature; proof admission denies");
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::error!("records-role RDS binding could not be resolved; proof admission denies");
+                    return;
+                }
+            }
+        }
+        None
+    };
+
     // The replay admission domain is an operator statement about deployment
     // topology, not something startup may assume. "Admitted once" means once
     // per service domain, so a node that shares its service domain with other
@@ -2030,7 +2129,9 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
     // the correct posture for an undeclared topology: it is visible and safe,
     // rather than a silent per-node guarantee that reads as domain-wide.
     let declared_domain = std::env::var("HYPRSTREAM_REPLAY_ADMISSION_DOMAIN").ok();
-    let guarantee = match declared_domain.as_deref() {
+    let guarantee = if shared_store.is_some() {
+        Some(ReplayDomainGuarantee::LinearizableSharedStore)
+    } else { match declared_domain.as_deref() {
         Some("single-verifier-instance") => {
             // The single-verifier shape is only sound if this process is
             // genuinely the sole verifier for the domain. A bare env string
@@ -2094,7 +2195,7 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
             );
             None
         }
-    };
+    }};
 
     let Some(guarantee) = guarantee else {
         return;
@@ -2187,13 +2288,12 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
     // Partitioned by disposition, fail-closed on capacity: an unexpired
     // accepted record is never evicted to make room.
     const REPLAY_CAPACITY_PER_PARTITION: usize = 100_000;
-    let store: Box<dyn ProofReplayStore> = match guarantee {
-        ReplayDomainGuarantee::SingleVerifierInstance => Box::new(
+    let store: Box<dyn ProofReplayStore> = match (guarantee, shared_store) {
+        (ReplayDomainGuarantee::LinearizableSharedStore, Some(store)) => store,
+        (ReplayDomainGuarantee::SingleVerifierInstance, None) => Box::new(
             InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
         ),
-        // Unreachable today: the declaration parser above accepts no other
-        // value precisely because this build ships no other substrate.
-        other => {
+        (other, _) => {
             tracing::error!("no replay store implementation for {other:?}; admission denies");
             return;
         }
@@ -2343,6 +2443,16 @@ type NativeAnnouncementFirstResult =
 /// can report the result of the first announcement.
 type NativeAnnouncementFirstTx =
     Option<std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>>>;
+
+/// Use the current authority projection's service JWT for envelope identity.
+fn native_announcement_bearer(
+    announcement: &hyprstream_rpc_std::discovery_client::ServiceAnnouncement,
+) -> anyhow::Result<String> {
+    announcement.service_jwt.as_ref()
+        .filter(|token| !token.trim().is_empty())
+        .cloned()
+        .context("Native announcement requires a service JWT as its RPC bearer")
+}
 
 /// The required first result covers both fresh-authority projection and the
 /// Discovery publication. An authority error must not bypass the handshake.
@@ -3011,7 +3121,17 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── `service ensure-key` early dispatch ─────────────────────────────────
+    // ── Offline service-authority provisioning ─────────────────────────────
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if sub_m.subcommand_name() == Some("reconcile-enrollment") {
+            return hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(&config);
+        }
+        if sub_m.subcommand_name() == Some("ensure-node-authority") {
+            let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
+            return hyprstream_core::auth::service_enrollment::ensure_node_authority(&secrets);
+        }
+    }
+
     // Key materialization for provisioning/keygen units: it must work on a
     // fresh install (before any bootstrap-pubkeys exist) and must not start
     // any services, so dispatch before the registry bootstrap below — same
@@ -3145,9 +3265,9 @@ fn main() -> Result<()> {
                     // 9P translator PEP (see `mac::genesis`).
                     let mac_gate = hyprstream_core::mac::GenesisGate::production();
                     mac_gate.log_report();
-                    // Installation is activation-ready but remains floor-only.
-                    // Only the explicit G1-G7 operator control may widen it.
-                    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+                    // IdentityAware is the default. Refuse startup if the
+                    // generated dispatch inventory is incomplete or invalid.
+                    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
 
                     if foreground || standalone {
                         // --foreground requires a service name or --services list;
@@ -3630,25 +3750,24 @@ fn main() -> Result<()> {
                                                         let socket_kind = request.reach.socket_kind().to_owned();
                                                         let endpoint = request.reach.endpoint();
                                                         let service_name = request.service_name.clone();
-                                                        let client = match if hyprstream_discovery::native_network_required() {
-                                                            hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, request.signing_key.clone(), None)
-                                                        } else {
-                                                            hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
-                                                                &discovery_transport,
-                                                                request.signing_key.clone(),
-                                                                request.discovery_verifying_key,
-                                                                None,
-                                                            )
-                                                        } {
-                                                            Ok(client) => client,
-                                                            Err(error) => {
-                                                                tracing::warn!("Failed to build DiscoveryClient: {error}");
-                                                                if let Some(tx) = announce_tx {
-                                                                    if let Some(tx) = tx.lock().take() {
-                                                                        let _ = tx.send(Err(error.to_string()));
-                                                                    }
-                                                                }
-                                                                return;
+                                                        let signing_key = request.signing_key.clone();
+                                                        let discovery_verifying_key = request.discovery_verifying_key;
+                                                        // Resolve a fresh client for EACH authority projection.
+                                                        // The body JWT alone does not authenticate the envelope,
+                                                        // and retaining a client would retain an expired bearer
+                                                        // across credential renewal.
+                                                        let make_client = |announcement: &hyprstream_rpc_std::discovery_client::ServiceAnnouncement| {
+                                                            let token = native_announcement_bearer(announcement)?;
+                                                            if hyprstream_discovery::native_network_required() {
+                                                                hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(
+                                                                    &hyprstream_discovery::ProductionRpcClientProvider,
+                                                                    signing_key.clone(), Some(token),
+                                                                )
+                                                            } else {
+                                                                hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
+                                                                    &discovery_transport, signing_key.clone(),
+                                                                    discovery_verifying_key, Some(token),
+                                                                )
                                                             }
                                                         };
                                                         if service_name == "policy"
@@ -3663,9 +3782,10 @@ fn main() -> Result<()> {
                                                                     // Re-read signed current state and the exact service
                                                                     // key's credential on every attempt, before any dial.
                                                                     let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
-                                                                    let client = &client;
+                                                                    let client = announcement.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(&make_client);
                                                                     async move {
                                                                         let announcement = announcement?;
+                                                                        let client = client?;
                                                                         let jwt_expiry = announcement.service_jwt.as_deref()
                                                                             .and_then(hyprstream_core::auth::identity_store::decode_jwt_exp_raw)
                                                                             .and_then(|seconds| seconds.checked_mul(1_000))
@@ -3708,9 +3828,9 @@ fn main() -> Result<()> {
                                                             || {
                                                                 let announcement = hyprstream_core::services::factories::current_native_announcement(&mut request);
                                                                 let announce_tx = announce_tx.as_ref().map(std::sync::Arc::clone);
-                                                                let client = &client;
+                                                                let client = announcement.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(&make_client);
                                                                 publish_native_announcement_attempt(announcement, announce_tx, move |announcement| async move {
-                                                                    client.announce(&announcement).await.map(|_| ())
+                                                                    client?.announce(&announcement).await.map(|_| ())
                                                                 })
                                                             },
                                                         )
@@ -4093,6 +4213,13 @@ fn main() -> Result<()> {
                         Some(ctx.config()),
                         &name,
                     )?;
+                }
+                ServiceAction::ReconcileEnrollment => {
+                    hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(ctx.config())?;
+                }
+                ServiceAction::EnsureNodeAuthority => {
+                    let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(ctx.config()))?;
+                    hyprstream_core::auth::service_enrollment::ensure_node_authority(&secrets)?;
                 }
                 ServiceAction::ProvisionPolicyTemplates { template } => {
                     let models_dir = config_for_service.models_dir().clone();
@@ -5271,6 +5398,12 @@ mod native_announcement_wiring {
                         Ok(announcement), announce_tx.as_ref().map(std::sync::Arc::clone),
                         move |announcement| async move {
                             assert_eq!(announcement.service_jwt, Some(format!("jwt-{i}")));
+                            assert_eq!(super::native_announcement_bearer(&announcement).unwrap(), format!("jwt-{i}"));
+                            let mut missing = announcement.clone();
+                            missing.service_jwt = None;
+                            assert!(super::native_announcement_bearer(&missing).is_err());
+                            missing.service_jwt = Some(" ".into());
+                            assert!(super::native_announcement_bearer(&missing).is_err());
                             assert_eq!(announcement.expires_at_unix_ms, 1000 + i as i64);
                             cycle_tx.send(announcement.accepted_state_epoch).expect("test receiver is live");
                             Ok(())

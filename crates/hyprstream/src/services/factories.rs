@@ -1813,16 +1813,11 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     })
     .context("construct worker 9P MAC PEP")?;
 
-    // Fixed-subject worker transports keep the mandatory monitor and floor
-    // context. Identity-aware widening remains blocked until those transports
-    // have a credential-bearing attach carrier (G2 evidence).
     // The worker UDS/vsock carrier still has no verified attach credential.
-    // Make that runtime fact a structural G2 blocker: operator evidence cannot
-    // widen this process until the constructor is replaced with a credentialed
-    // authenticator.
-    hyprstream_rpc::auth::mac::block_identity_widening_for_unverified_attach_transport(
-        "worker-uds-vsock",
-    );
+    // Keep that boundary local: enrollment_ninep_reference_monitor installs an
+    // AnonymousAuthenticator, so every 9P attach denies. It must not narrow
+    // process-global RPC activation, which would turn authenticated Worker
+    // RPCs into anonymous-floor requests before their handler runs.
     let ninep_monitor = Some(crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
         &ninep_decider,
     )));
@@ -2886,6 +2881,9 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "tui", &sk)?;
+    let service_token = service_token(&sk)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TUI service credential absent after registration"))?;
 
     let state = Arc::new(RwLock::new(TuiState::new(
         80,
@@ -2896,8 +2894,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    let policy_client = policy_client_for_deployment(ctx, sk.clone(), policy_vk, Some(service_token.clone()))?;
 
     // Build the direct-VFS PEP before exposing the namespace. Failure to open
     // its signed WAL aborts construction; there is no unarmed fallback.
@@ -3507,6 +3504,24 @@ mod tests {
         assert!(
             !source.contains("Config::load().unwrap_or_default()"),
             "config load must fail closed, never fall back to defaults"
+        );
+    }
+
+    #[test]
+    fn worker_ninep_denial_is_local_not_global_rpc_floor_only() {
+        let source = include_str!("factories.rs");
+        let production = &source[..source.find("\nmod tests").expect("tests module")];
+        let worker = top_level_body(production, "fn create_worker_service(");
+        assert!(worker.contains("enrollment_ninep_reference_monitor"));
+        assert!(
+            !worker.contains("block_identity_widening_for_unverified_attach_transport"),
+            "an unauthenticated 9P attach must not narrow ordinary RPC dispatch"
+        );
+        let standalone_worker = include_str!("../bin/main.rs");
+        assert!(standalone_worker.contains("enrollment_ninep_reference_monitor"));
+        assert!(
+            !standalone_worker.contains("block_identity_widening_for_unverified_attach_transport"),
+            "the standalone Worker constructor must preserve identity-aware RPC activation"
         );
     }
 

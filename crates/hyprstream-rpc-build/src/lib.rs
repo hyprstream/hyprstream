@@ -43,6 +43,12 @@ pub fn compile_schemas(schema_dir: &Path, out_dir: &Path, import_paths: &[&Path]
             .unwrap_or_else(|e| panic!("Failed to compile {name}.capnp: {e}"));
 
         if let Err(e) = parse_schema_and_extract_annotations(&cgr_path, &metadata_path, name) {
+            // A maxLen(0) violation is a schema-contract failure (annotations.capnp:
+            // "the build fails if a schema sets maxLen(0)") — a warning would let the
+            // unbounded reader generate silently. Generic parse errors stay warnings.
+            if e.to_string().contains(crate::schema::MAXLEN_ZERO_CONTRACT_ERROR) {
+                panic!("schema contract violation in {name}.capnp: {e}");
+            }
             println!("cargo:warning=Failed to parse schema for {name}: {e}");
         }
     }

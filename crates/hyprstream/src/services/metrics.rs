@@ -202,11 +202,12 @@ impl MetricsHandler for MetricsService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("Policy check error for {}: {}", subject, e))?;

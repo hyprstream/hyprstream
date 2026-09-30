@@ -161,6 +161,12 @@ annotation optional(field) :Void;
 #   Usage: serviceDid @0 :Text $domainType("hyprstream_rpc::identity::Did");
 annotation domainType(field, struct) :Text;
 
+# Maximum decoded byte length for a Text field. The generated reader rejects
+# longer values at the borrowed reader, before any owned String is allocated
+# (bounded preallocation for adversarial inputs). 0 is invalid; the build
+# fails if a schema sets maxLen(0).
+annotation maxLen(field) :UInt32;
+
 # Serde field rename — generates #[serde(rename = "...")] on the Rust field.
 # Usage: toolType @1 :Text $serdeRename("type");
 annotation serdeRename(field) :Text;

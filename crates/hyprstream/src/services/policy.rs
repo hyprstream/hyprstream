@@ -9,7 +9,7 @@ use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc_std::policy_client::{
     ErrorInfo, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, IssueToken, IssueTokenProfile,
+    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, MediatedPolicyCheck, IssueToken, IssueTokenProfile,
     ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
     PolicyInfo, PolicyRule, Grouping,
     PolicyHistory, PolicyHistoryEntry, DraftStatus,
@@ -46,6 +46,27 @@ pub(crate) async fn check_with_verified_bearer(
     bearer: Option<&str>,
     upstream_subject: &Subject,
 ) -> Result<bool> {
+    check_with_holder_evidence(client, request, bearer, upstream_subject, None).await
+}
+
+/// Service credentials are holder-bound, not transferable bearer authority.
+/// Authenticate the mediator with its own primary credential and prove the
+/// original service caller with the signed request received at ingress.
+pub(crate) async fn check_with_holder_evidence(
+    client: &hyprstream_rpc_std::policy_client::PolicyClient,
+    request: &PolicyCheck,
+    bearer: Option<&str>,
+    upstream_subject: &Subject,
+    evidence: Option<&[u8]>,
+) -> Result<bool> {
+    if bearer.is_some() && !upstream_subject.is_federated()
+        && upstream_subject.name().is_some_and(|name| name.starts_with("service:"))
+    {
+        let evidence = evidence.ok_or_else(|| anyhow!("service-mediated policy check requires original holder evidence"))?;
+        return client.check_mediated(&MediatedPolicyCheck {
+            evidence: evidence.to_vec().into(), resource: request.resource.clone(), operation: request.operation.clone(),
+        }).await;
+    }
     match bearer {
         Some(token) => client
             .clone()
@@ -552,8 +573,9 @@ fn validate_event_prefix(prefix: &str) -> Result<(), String> {
 
 /// Build the rotation-safe wire projection of a service's published key set.
 ///
-/// The scalar fields are a transition projection for one-key deployments.
-/// They are empty during overlap, where a positional singleton is unsafe.
+/// The scalar verification key is a transition projection for one-key
+/// deployments. Attestation JWTs are bearer credentials: discovery never
+/// serializes them, including in the per-key rotation projection.
 fn published_service_key_response(
     trust: &hyprstream_service::TrustStore,
     service_name: &str,
@@ -565,11 +587,11 @@ fn published_service_key_response(
     let singleton = (keys.len() == 1).then(|| &keys[0]);
     Ok(ServiceKeyResponse {
         verifying_key: singleton.map(|entry| entry.verifying_key.to_bytes().to_vec()).unwrap_or_default(),
-        service_jwt: singleton.and_then(|entry| entry.attestation.jwt.clone()),
+        service_jwt: None,
         keys: keys.into_iter().map(|entry| ServiceKeyCandidate {
             key_id: entry.key_id,
             verifying_key: entry.verifying_key.to_bytes().to_vec(),
-            service_jwt: entry.attestation.jwt,
+            service_jwt: None,
             not_after: entry.attestation.expires_at,
         }).collect(),
     })
@@ -1195,6 +1217,35 @@ impl PolicyHandler for PolicyService {
             allowed.push(matches!(result, PolicyResponseVariant::CheckResult(true)));
         }
         Ok(PolicyResponseVariant::CheckBatchResult(PolicyCheckBatchResult { allowed }))
+    }
+
+    async fn handle_check_mediated(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &MediatedPolicyCheck,
+    ) -> Result<PolicyResponseVariant> {
+        let mediator = ctx.subject();
+        anyhow::ensure!(ctx.claims().is_some() && !mediator.is_federated(), "authenticated local mediator required");
+        let service = mediator.name().and_then(|name| name.strip_prefix("service:"))
+            .ok_or_else(|| anyhow!("service mediator required"))?;
+        anyhow::ensure!(self.accept_delegated_bearer(&ctx.cnf), "mediator is not admitted for policy queries");
+        // The original request is not a local transport call to Policy. Use
+        // the network provenance constructor, then the normal credential
+        // verifier; never grant the empty-issuer/local system shortcuts.
+        let mut holder = EnvelopeContext::from_mediated_evidence(&data.evidence, service, &data.operation)?;
+        self.verify_claims(&mut holder).await?;
+        let holder_subject = holder.subject();
+        anyhow::ensure!(holder.claims().is_some() && !holder_subject.is_federated()
+            && holder_subject.name().is_some_and(|name| name.starts_with("service:")),
+            "mediated evidence must identify a verified service holder");
+        holder.admit_mediated_query(service, &data.resource, &data.operation)?;
+        let domain = self.request_domain(&holder)?;
+        let allowed = self.policy_manager.check_with_domain(
+            &holder_subject.to_string(), &domain, &data.resource, &data.operation,
+        ).await;
+        holder.audit_authz(&data.resource, &data.operation, allowed);
+        Ok(PolicyResponseVariant::CheckMediatedResult(allowed))
     }
 
     async fn handle_check(
@@ -2803,13 +2854,13 @@ impl PolicyHandler for PolicyService {
         // Store in trust store (key-centric: the key IS the identity)
         {
             let trust = hyprstream_service::global_trust_store();
-            trust.insert(vk, hyprstream_service::Attestation {
+            trust.publish_service_registration(vk, &data.service_name, hyprstream_service::Attestation {
                 scopes: std::iter::once(data.service_name.clone()).collect(),
                 subject: None,
                 jwt: Some(data.service_jwt.clone()),
                 expires_at: claims.exp,
                 attested_by: Some(self.signing_key.verifying_key().to_bytes()),
-            });
+            })?;
         }
 
         info!(service = %data.service_name, caller = %caller, "Registered service verifying key");
@@ -5864,6 +5915,7 @@ mod tests {
         assert!(response.keys.iter().any(|entry| entry.verifying_key == retired.to_bytes()));
         assert!(response.keys.iter().any(|entry| entry.verifying_key == lead.to_bytes()));
         assert!(response.keys.iter().all(|entry| entry.key_id.starts_with("ed25519:")));
+        assert!(response.keys.iter().all(|entry| entry.service_jwt.is_none()));
     }
 
     #[test]
@@ -5881,7 +5933,7 @@ mod tests {
     }
 
     #[test]
-    fn one_key_response_keeps_legacy_projection_during_rollout() {
+    fn one_key_response_projects_verification_key_but_never_credential() {
         let trust = hyprstream_service::TrustStore::new();
         let key = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
         trust.insert(key, attestation(chrono::Utc::now().timestamp() + 60, "certificate"));
@@ -5892,7 +5944,8 @@ mod tests {
         };
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.verifying_key, key.to_bytes());
-        assert_eq!(response.service_jwt.as_deref(), Some("certificate"));
+        assert!(response.service_jwt.is_none());
+        assert!(response.keys[0].service_jwt.is_none());
     }
 
     #[tokio::test]

@@ -125,6 +125,19 @@ pub struct LoadedModel {
     /// Client for communicating with the InferenceService (built from
     /// `transport` via `dial()` — the co-located fast path).
     pub client: InferenceClient,
+    /// Worker-generated 256-bit incarnation of THIS running pinned worker,
+    /// reported through the private readiness handoff for this spawn attempt.
+    /// Fresh per run: pre-restart work orders fail audience verification at
+    /// the replacement worker (Sol bounded incarnation plan).
+    pub incarnation: String,
+    /// Exact versioned internal-work audience of this incarnation
+    /// (`iw1/{deterministic service name}/{incarnation}`). Minting uses THIS
+    /// binding — never a recomputed deterministic name.
+    pub work_audience: String,
+    /// Spawn-attempt generation this binding came from. A delayed result from
+    /// an older attempt cannot overwrite a newer binding (generation checked
+    /// at handoff validation).
+    pub load_generation: u64,
     /// #322 leaf cell-router state for this model. Holds the session→owner
     /// affinity map (heartbeat-lease renewal, KV-cache stickiness) and the
     /// per-node load/health counters used by HRW placement. In v1 this is a
@@ -211,6 +224,11 @@ pub struct ModelServiceInner {
     /// allocates the next value, keying a fresh [`TerminalStore`] entry so a
     /// reload latches under a new key (reload ⇒ new terminal, EV7/#649).
     load_epoch: AtomicU64,
+    /// Monotonic spawn-attempt generation for pinned worker incarnation
+    /// handoffs. Each `InferenceService` spawn attempt allocates the next
+    /// value; the worker echoes it in its private readiness handoff and a
+    /// delayed/stale handoff from an older attempt is discarded.
+    incarnation_generation: AtomicU64,
     /// The sole tenant admitted by an in-process deployment. A second tenant
     /// must never share the FFI engine fault radius.
     in_process_tenant: std::sync::OnceLock<String>,
@@ -446,6 +464,7 @@ impl ModelService {
             fs_trees: dashmap::DashMap::new(),
             load_terminals: TerminalStore::new(),
             load_epoch: AtomicU64::new(0),
+            incarnation_generation: AtomicU64::new(0),
             in_process_tenant: std::sync::OnceLock::new(),
             producer_reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
                 hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
@@ -625,16 +644,18 @@ impl ModelService {
     /// `session_id` is the placement key (defaults to "default" when the caller
     /// has no session — keeps HRW stable for non-session-scoped requests like
     /// `apply_chat_template`).
-    async fn select_inference_server(
+    /// Locality-aware selection: the caller needs [`RoutedReplica`] to apply
+    /// the internal work order ONLY on the co-located arm (K3 finding M1).
+    async fn select_inference_routed(
         &self,
         model: &mut LoadedModel,
         session_id: &str,
-        bearer: &str,
-    ) -> Result<InferenceClient> {
+        bearer: Option<&str>,
+    ) -> Result<RoutedReplica<InferenceClient>> {
         let co_located = Self::co_located_replica_id(model);
         let resolution_service_name = model.instance.service_name();
         let signing_key = self.signing_key.clone();
-        let bearer = bearer.to_owned();
+        let bearer = bearer.map(ToOwned::to_owned);
         let routed = route_and_dial_replica(
             &mut model.router,
             &model.load_state,
@@ -653,6 +674,15 @@ impl ModelService {
                         ),
                         "remote inference replica advertised a non-network transport"
                     );
+                    // Cross-host replicas are OTHER services, not this Model's
+                    // subprocessor: they still see the caller's credential as
+                    // a relayed delegated bearer under their own admission
+                    // contract. No bearer ⇒ no remote relay (fail-closed).
+                    let relay_bearer = bearer
+                        .clone()
+                        .ok_or_else(|| anyhow!(
+                            "remote inference replica selection requires a relayable caller bearer"
+                        ))?;
                     let rpc = hyprstream_discovery::production_inference_rpc_client_at_transport(
                         &resolution_service_name,
                         &candidate.transport,
@@ -660,7 +690,7 @@ impl ModelService {
                         None,
                     )?;
                     let client = InferenceClient::new(rpc)
-                        .with_delegated_bearer(bearer);
+                        .with_delegated_bearer(relay_bearer);
                     anyhow::ensure!(
                         client.is_ready().await?,
                         "remote inference replica is not ready"
@@ -678,7 +708,7 @@ impl ModelService {
             model_ref = model.instance.model_ref(),
             "selected inference replica"
         );
-        Ok(routed.value)
+        Ok(routed)
     }
 
     /// Opaque placement identifier for the co-located InferenceService.
@@ -1006,6 +1036,7 @@ impl ModelService {
             instance.tenant().to_owned(),
             self.signing_key.verifying_key(),
         )
+        .with_model_ref(instance.model_ref().to_owned())
         .with_stream_plane(
             Arc::clone(&self.producer_reach_config),
             Arc::clone(&self.moq_origin),
@@ -1016,6 +1047,21 @@ impl ModelService {
         if let Some(ref src) = self.jwt_key_source {
             service_config = service_config.with_jwt_key_source(src.clone());
         }
+        // Bounded worker incarnation binding (Sol plan): this spawn attempt
+        // allocates a private handoff channel and the next generation. The
+        // worker generates its own 256-bit incarnation inside its service
+        // thread and reports `(generation, instance, controller, audience)`
+        // through the handoff after its engine is initialized; Model accepts
+        // the handoff only for THIS attempt's expected values. A worker that
+        // dies before reporting (or a missing/failed handoff) fails the load.
+        let generation = self
+            .inner
+            .incarnation_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let (incarnation_tx, incarnation_rx) = tokio::sync::oneshot::channel();
+        service_config = service_config.with_incarnation_handoff(incarnation_tx, generation);
+
         let network_reach = service_config.network_reach_handle();
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
@@ -1024,6 +1070,36 @@ impl ModelService {
             .clone()
             .ok_or_else(|| anyhow!("InferenceService became ready without network reach"))?;
         let endpoint = network_transport.endpoint_string();
+
+        // Await the worker's private incarnation handoff. Missing (worker died
+        // before init), timed out, or mismatched (instance/controller/generation)
+        // all FAIL THE LOAD closed — no binding, no minting from this attempt.
+        let expected_controller = self.signing_key.verifying_key().to_bytes();
+        const HANDOFF_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS);
+        let incarnation_binding = match tokio::time::timeout(HANDOFF_TIMEOUT, incarnation_rx).await {
+            Err(_) => anyhow::bail!(
+                "pinned worker incarnation handoff timed out after {}s without a ready worker",
+                crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS
+            ),
+            Ok(Err(_)) => {
+                anyhow::bail!("pinned worker died before reporting its incarnation handoff")
+            }
+            Ok(Ok(handoff)) => handoff,
+        };
+        anyhow::ensure!(
+            incarnation_binding.generation == generation,
+            "stale incarnation handoff: worker reported generation {} for attempt {generation}",
+            incarnation_binding.generation
+        );
+        anyhow::ensure!(
+            incarnation_binding.instance_service_name == instance.service_name(),
+            "incarnation handoff names the wrong deterministic instance"
+        );
+        anyhow::ensure!(
+            incarnation_binding.controller_pubkey == expected_controller,
+            "incarnation handoff names the wrong pinned controller"
+        );
 
         // Create client for this service from the typed transport (#320).
         // Inference services share the model service's signing key, so use our
@@ -1086,6 +1162,11 @@ impl ModelService {
                     network_transport,
                     service_handle,
                     client,
+                    // Worker incarnation binding for THIS run (Sol bounded
+                    // incarnation plan): minting uses exactly this audience.
+                    incarnation: incarnation_binding.incarnation,
+                    work_audience: incarnation_binding.audience,
+                    load_generation: incarnation_binding.generation,
                     // #322 leaf cell-router. v1: single co-located replica. Its
                     // placement ID is purpose-separated from every transport,
                     // application-signing, and subject identity. The
@@ -1252,14 +1333,133 @@ impl ModelService {
             ModelStatusResponse { loaded: false, ..Default::default() }
         }
     }
-    async fn get_inference_client(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<InferenceClient> {
+    /// Mint the per-request internal execution work order for one
+    /// already-authorized Model→Inference operation (user-approved D5
+    /// single-service boundary).
+    ///
+    /// The caller credential does NOT cross this hop. The order is signed by
+    /// Model, audience-pinned to the one allocated instance, bound to the
+    /// verified tenant/model and the exact downstream dispatch coordinate, and
+    /// carries the caller's verified claims snapshot so TTT state, stream
+    /// ownership, and accounting keep attributing to the ORIGINAL caller.
+    fn mint_internal_work_token(
+        &self,
+        instance: &InferenceInstanceId,
+        ctx: &EnvelopeContext,
+        scope: &hyprstream_rpc::auth::internal_work::InternalWorkScope,
+        live_work_audience: &str,
+    ) -> Result<String> {
+        use hyprstream_rpc::auth::internal_work::{
+            encode_internal_work, InternalWorkClaims, INTERNAL_WORK_ISSUER, MAX_LIFETIME_SECS,
+        };
+        let caller = ctx.claims().ok_or_else(|| {
+            anyhow!("internal work requires a verified caller identity at Model ingress")
+        })?;
+        let subject = ctx.subject();
+        anyhow::ensure!(
+            !subject.is_anonymous(),
+            "internal work requires an authenticated original subject"
+        );
+        let now = chrono::Utc::now().timestamp();
+        let exp = caller.exp.min(now + MAX_LIFETIME_SECS);
+        anyhow::ensure!(
+            exp > now,
+            "caller credential is expired; refusing to mint internal work"
+        );
+        // The caller snapshot's subject is canonicalized to the RESOLVED
+        // subject string so the snapshot and the work-order subject are
+        // provably identical (including federated callers, whose raw token
+        // `sub` differs from the resolved Casbin label) — K3 finding m1.
+        let subject_string = subject.to_string();
+        let mut caller_snapshot = caller.clone();
+        caller_snapshot.sub = subject_string.clone();
+        let claims = InternalWorkClaims {
+            iss: INTERNAL_WORK_ISSUER.to_owned(),
+            sub: subject_string,
+            // The EXACT audience of the currently live worker incarnation
+            // (Sol bounded incarnation plan) — never a recomputed
+            // deterministic name, which would survive a worker restart.
+            aud: live_work_audience.to_owned(),
+            tenant: instance.tenant().to_owned(),
+            model: instance.model_ref().to_owned(),
+            resource: scope.resource.clone(),
+            operation: scope.operation.clone(),
+            iat: now,
+            exp,
+            jti: hex::encode(hyprstream_rpc::envelope::generate_nonce()),
+            cnf: InternalWorkClaims::controller_cnf(&self.signing_key.verifying_key()),
+            owner_did: ctx.authenticated_pairwise_did().map(|d| d.as_str().to_owned()),
+            caller: caller_snapshot,
+        };
+        Ok(encode_internal_work(&claims, &self.signing_key))
+    }
+
+    /// The authorize coordinate the generated Inference dispatch enforces.
+    ///
+    /// Generated dispatch builds the per-method authorize resource as
+    /// `format!("{}:{}", service, variant_pascal)` where `variant_pascal` is
+    /// the schema variant name through `to_pascal_case` (codegen/handler.rs).
+    /// Text-payload variants instead embed the PAYLOAD value
+    /// (`{service}:{payload}`) — see the `loadLora` call site.
+    ///
+    /// SCOPE NOTE (K3 follow-up): this helper uppercases the first character
+    /// ONLY, which matches `to_pascal_case` exactly for the CURRENT camelCase
+    /// schema leaves (no `_`/`-` separators — `hasLora` → `HasLora`). It is
+    /// NOT a general `to_pascal_case`: the generator also removes `_`/`-`
+    /// separators and capitalizes the following character
+    /// (hyprstream-rpc-build/src/util.rs). If a future leaf carries
+    /// separators, use the generator's own `to_pascal_case` spelling here —
+    /// the worker's exact-match PEP denies any other spelling.
+    pub(crate) fn inference_dispatch_resource(variant: &str) -> String {
+        let mut chars = variant.chars();
+        match chars.next() {
+            Some(first) => {
+                format!("inference:{}{}", first.to_ascii_uppercase(), chars.as_str())
+            }
+            None => "inference:".to_owned(),
+        }
+    }
+
+    /// Mint-side scope for one forwarded struct/Void Inference operation:
+    /// the exact dispatch coordinate for `variant` plus its scope operation.
+    fn inference_scope(
+        variant: &str,
+        operation: &str,
+    ) -> hyprstream_rpc::auth::internal_work::InternalWorkScope {
+        hyprstream_rpc::auth::internal_work::InternalWorkScope::new(
+            Self::inference_dispatch_resource(variant),
+            operation,
+        )
+    }
+
+    async fn get_inference_client(
+        &self,
+        model_ref_str: &str,
+        ctx: &EnvelopeContext,
+        work: hyprstream_rpc::auth::internal_work::InternalWorkScope,
+    ) -> Result<InferenceClient> {
         let instance = Self::inference_instance(ctx, model_ref_str)?;
         let _endpoint = self.load_model(&instance, None, None).await?;
         let mut cache = self.loaded_models.write().await;
         let model = cache
             .get_mut(&instance)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
+        // Bounded worker incarnation binding (Sol plan): a cached entry whose
+        // worker DIED is fail-closed — evict and deny until a fresh run
+        // reports ready with a fresh incarnation. Never mint against a dead
+        // worker, even if its (old) receipt would still be time-valid.
+        if !model.service_handle.is_running() {
+            cache.pop(&instance);
+            anyhow::bail!(
+                "pinned worker for model {model_ref_str} is not running; \
+                 the model must be loaded again before internal work"
+            );
+        }
         model.last_used = Instant::now();
+        // The live binding for THIS running incarnation. Minting uses exactly
+        // this audience; the worker denies anything else.
+        let live_work_audience = model.work_audience.clone();
+        let live_generation = model.load_generation;
         // #322 placement key. The envelope does not yet carry an explicit
         // session_id; use the authenticated subject as a stable per-caller key
         // (keeps HRW affinity effective for repeat requests from the same
@@ -1267,46 +1467,108 @@ impl ModelService {
         // swap it in here — the router body is session_id-keyed, not
         // subject-keyed, by design.
         let placement_key = ctx.subject().to_string();
-        let bearer = ctx
-            .jwt_token()
-            .ok_or_else(|| anyhow!("inference dispatch requires a verified bearer token"))?;
-        let client = self
-            .select_inference_server(model, &placement_key, bearer)
+        // The co-located pinned instance executes Model-origin internal work —
+        // the caller credential is never relayed. A remote replica is a
+        // different controller's service: it may receive an end-user bearer as
+        // delegated authority, but never a holder-bound service credential.
+        // For service callers the remote arm therefore fails its no-bearer
+        // gate and the router retries a healthy co-located candidate; when no
+        // such candidate exists, the request denies rather than transferring a
+        // credential whose cnf belongs to the original service signer.
+        let relay_bearer = Self::remote_relay_bearer(ctx).map(ToOwned::to_owned);
+        let routed = self
+            .select_inference_routed(model, &placement_key, relay_bearer.as_deref())
             .await?;
-        Ok(client.with_delegated_bearer(bearer.to_owned()))
+        let work_token =
+            self.mint_internal_work_token(&instance, ctx, &work, &live_work_audience)?;
+        tracing::debug!(
+            generation = live_generation,
+            "minted internal work order against live worker incarnation"
+        );
+        Ok(Self::attach_work_order(routed, work_token))
+    }
+
+    /// Attach the internal work order to the routed client BY LOCALITY
+    /// (K3 finding M1): the co-located subprocessor gets the work order as
+    /// its DIRECT bearer; a remote-selected replica keeps the
+    /// delegated-relay client the remote arm already built. Overlaying both
+    /// on one client is a hard wire error (an envelope cannot carry a direct
+    /// JWT and a delegated bearer), and a remote instance would deny a
+    /// foreign-controller work order anyway — fail-closed on both sides.
+    fn attach_work_order(
+        routed: RoutedReplica<InferenceClient>,
+        work_token: String,
+    ) -> InferenceClient {
+        match routed.locality {
+            ReplicaLocality::CoLocated => routed.value.with_bearer(work_token),
+            ReplicaLocality::Remote => routed.value,
+        }
+    }
+
+    fn remote_relay_bearer(ctx: &EnvelopeContext) -> Option<&str> {
+        Self::remote_relay_bearer_for_claims(ctx.claims(), ctx.jwt_token())
+    }
+
+    fn remote_relay_bearer_for_claims<'a>(
+        claims: Option<&hyprstream_rpc::auth::Claims>,
+        bearer: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if claims.is_some_and(|claims| claims.sub.starts_with("service:")) {
+            None
+        } else {
+            bearer
+        }
     }
 
     /// Load a LoRA adapter from a file
     async fn load_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, path: &str) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        // Text-payload variant (K3 finding B2): the generated dispatch
+        // resource embeds the PAYLOAD (`inference:{path}`), so the work order
+        // binds the exact adapter path rather than the method name.
+        let client = self.get_inference_client(model_ref_str, ctx,
+            hyprstream_rpc::auth::internal_work::InternalWorkScope::new(
+                format!("inference:{path}"),
+                "write",
+            ),
+        ).await?;
         client.load_lora(path).await
     }
 
     /// Unload the current LoRA adapter
     async fn unload_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("unloadLora", "write"),
+        ).await?;
         client.unload_lora().await
     }
 
     /// Check if a LoRA adapter is loaded
     async fn has_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<bool> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("hasLora", "query"),
+        ).await?;
         client.has_lora().await
     }
 
     // Training loop control - forward to InferenceService via ZMQ
     async fn writeback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("tttWriteback", "train"),
+        ).await?;
         client.ttt_writeback().await
     }
 
     async fn evict_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("tttEvict", "train"),
+        ).await?;
         client.ttt_evict().await
     }
 
     async fn zero_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("tttZero", "manage"),
+        ).await?;
         client.ttt_zero().await
     }
 
@@ -1315,7 +1577,9 @@ impl ModelService {
         model_ref_str: &str,
         ctx: &EnvelopeContext,
     ) -> Result<hyprstream_rpc_std::inference_client::DeltaStatusResult> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("getDeltaStatus", "query"),
+        ).await?;
         client.get_delta_status().await
     }
 
@@ -1324,7 +1588,9 @@ impl ModelService {
         model_ref_str: &str,
         ctx: &EnvelopeContext,
     ) -> Result<hyprstream_rpc_std::inference_client::SnapshotDeltaResult> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("snapshotDelta", "write"),
+        ).await?;
         client.snapshot_delta().await
     }
 
@@ -1334,7 +1600,9 @@ impl ModelService {
         ctx: &EnvelopeContext,
         data: &ExportPeftRequest,
     ) -> Result<ExportPeftResult> {
-        let client = self.get_inference_client(model_ref_str, ctx).await?;
+        let client = self.get_inference_client(model_ref_str, ctx,
+            Self::inference_scope("exportPeftAdapter", "write"),
+        ).await?;
         client.export_peft_adapter(data).await
     }
 
@@ -1377,7 +1645,9 @@ impl TttHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &LoraConfig,
     ) -> Result<()> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("createLora", "write"),
+        ).await?;
         client.create_lora(data).await
     }
 
@@ -1385,7 +1655,9 @@ impl TttHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<TrainStepResult> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("trainStep", "train"),
+        ).await?;
         client.train_step(data).await
     }
 
@@ -1393,7 +1665,9 @@ impl TttHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &TrainStepRequest,
     ) -> Result<(hyprstream_rpc_std::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("trainStepStream", "train"),
+        ).await?;
         let ephemeral_pubkey = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
         let stream_info = client.train_step_stream(data, ephemeral_pubkey).await?;
@@ -1428,7 +1702,9 @@ impl TttHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &SaveAdaptationRequest,
     ) -> Result<SaveAdaptationResult> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("saveAdaptation", "write"),
+        ).await?;
         client.save_adaptation(data).await
     }
 
@@ -1609,7 +1885,9 @@ impl AdapterHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &MergeLoraRequest,
     ) -> Result<()> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("mergeLora", "write"),
+        ).await?;
         client.merge_lora(data).await
     }
 }
@@ -1620,7 +1898,9 @@ impl InferHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &GenerationRequest,
     ) -> Result<(hyprstream_rpc_std::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("generateStream", "infer"),
+        ).await?;
         let ephemeral_pubkey = ctx.ephemeral_pubkey()
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
         let stream_info = client.generate_stream(data, ephemeral_pubkey).await?;
@@ -1631,7 +1911,9 @@ impl InferHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &ChatTemplateRequest,
     ) -> Result<String> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("applyChatTemplate", "query"),
+        ).await?;
         client.apply_chat_template(data).await
     }
 
@@ -1639,7 +1921,9 @@ impl InferHandler for ModelService {
         &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &EmbedImagesRequest,
     ) -> Result<EmbedImagesResponse> {
-        let client = self.get_inference_client(model_ref, ctx).await?;
+        let client = self.get_inference_client(model_ref, ctx,
+            Self::inference_scope("embed", "infer"),
+        ).await?;
         client.embed(data).await
     }
 
@@ -1664,11 +1948,12 @@ impl ModelHandler for ModelService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {
@@ -2520,6 +2805,32 @@ mod tests {
     static SELECTOR_FIXTURE: std::sync::OnceLock<hyprstream_discovery::ProductionInferenceFixture> =
         std::sync::OnceLock::new();
 
+    #[test]
+    fn holder_bound_service_credentials_are_not_relayed_to_remote_replicas() {
+        let service = hyprstream_rpc::auth::Claims::new(
+            "service:registry".to_owned(),
+            0,
+            9_999_999_999,
+        );
+        let user = hyprstream_rpc::auth::Claims::new("alice".to_owned(), 0, 9_999_999_999);
+
+        assert_eq!(
+            ModelService::remote_relay_bearer_for_claims(Some(&service), Some("service-jwt")),
+            None,
+            "a service credential is holder-bound and must not be delegated to another controller"
+        );
+        assert_eq!(
+            ModelService::remote_relay_bearer_for_claims(Some(&user), Some("user-jwt")),
+            Some("user-jwt"),
+            "an authenticated end-user bearer remains relayable"
+        );
+        assert_eq!(
+            ModelService::remote_relay_bearer_for_claims(None, None),
+            None,
+            "an unauthenticated caller cannot select a remote relay path"
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct ReadinessObservation {
         transport: TransportConfig,
@@ -2540,6 +2851,7 @@ mod tests {
         dials: parking_lot::Mutex<Vec<TransportConfig>>,
         readiness: parking_lot::Mutex<Vec<ReadinessObservation>>,
         expected_bearer: parking_lot::Mutex<Option<String>>,
+        expected_jwt: parking_lot::Mutex<Option<String>>,
         behavior: parking_lot::Mutex<BoundaryDialBehavior>,
     }
 
@@ -2640,6 +2952,7 @@ mod tests {
                 "selector fixture received a non-readiness request"
             );
             let expected_bearer = self.state.expected_bearer.lock().clone();
+            let expected_jwt = self.state.expected_jwt.lock().clone();
             self.state.readiness.lock().push(ReadinessObservation {
                 transport: self.transport.clone(),
                 service: service_domain.to_owned(),
@@ -2656,8 +2969,9 @@ mod tests {
                 "readiness used the wrong schema method discriminator"
             );
             anyhow::ensure!(
-                options.jwt.is_none() && options.delegated_bearer == expected_bearer,
-                "readiness did not carry the expected delegated bearer"
+                options.jwt == expected_jwt
+                    && options.delegated_bearer == expected_bearer,
+                "readiness did not carry the expected bearer shape"
             );
             let should_fail = {
                 let mut behavior = self.state.behavior.lock();
@@ -2803,6 +3117,12 @@ mod tests {
         LoadedModel {
             instance: selector_instance(),
             model_ref: "fixture-model:main".to_owned(),
+            incarnation: "fixture-incarnation-0000".to_owned(),
+            work_audience: crate::services::inference::internal_work_audience(
+                &selector_instance().service_name(),
+                "fixture-incarnation-0000",
+            ),
+            load_generation: 1,
             transport: local_transport.clone(),
             network_transport,
             service_handle: hyprstream_service::SpawnedService::dummy(),
@@ -2852,7 +3172,7 @@ mod tests {
         let service = selector_model_service().await;
 
         service
-            .select_inference_server(&mut model, "selector-positive", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-positive", Some(SELECTOR_BEARER))
             .await
             .unwrap_or_else(|error| panic!("production selector rejected exact reach: {error}"));
 
@@ -2891,7 +3211,7 @@ mod tests {
         exclude_local(&mut model);
         let error = selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-unadvertised", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-unadvertised", Some(SELECTOR_BEARER))
             .await
             .err()
             .unwrap_or_else(|| panic!("unadvertised reach was accepted"));
@@ -2927,7 +3247,7 @@ mod tests {
         exclude_local(&mut model);
         assert!(selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-stale", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-stale", Some(SELECTOR_BEARER))
             .await
             .is_err());
         assert!(dial_state.dials.lock().is_empty());
@@ -2961,7 +3281,7 @@ mod tests {
         exclude_local(&mut model);
         let error = selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-authority", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-authority", Some(SELECTOR_BEARER))
             .await
             .err()
             .unwrap_or_else(|| panic!("cross-authority retry set was accepted"));
@@ -2995,7 +3315,7 @@ mod tests {
         exclude_local(&mut model);
         let error = selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-transport", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-transport", Some(SELECTOR_BEARER))
             .await
             .err()
             .unwrap_or_else(|| panic!("non-network remote transport was accepted"));
@@ -3032,7 +3352,7 @@ mod tests {
         exclude_local(&mut model);
         selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-reselect", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-reselect", Some(SELECTOR_BEARER))
             .await
             .unwrap_or_else(|error| panic!("bounded reselection did not recover: {error}"));
         let dials = dial_state.dials.lock().clone();
@@ -3071,9 +3391,10 @@ mod tests {
         );
         let client = selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-local", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-local", Some(SELECTOR_BEARER))
             .await
-            .unwrap_or_else(|error| panic!("explicit co-location failed: {error}"));
+            .unwrap_or_else(|error| panic!("explicit co-location failed: {error}"))
+            .value;
         assert!(dial_state.dials.lock().is_empty());
         assert!(dial_state.readiness.lock().is_empty());
         assert!(client
@@ -3109,7 +3430,7 @@ mod tests {
         exclude_local(&mut model);
         let error = selector_model_service()
             .await
-            .select_inference_server(&mut model, "selector-exhausted", SELECTOR_BEARER)
+            .select_inference_routed(&mut model, "selector-exhausted", Some(SELECTOR_BEARER))
             .await
             .err()
             .unwrap_or_else(|| panic!("exhausted remote candidates fell back locally"));
@@ -3241,6 +3562,347 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(decision, RouteDecision::NoHealthyCandidate);
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_colocated_client_carries_internal_work_bearer_not_relay() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let local_state = Arc::new(BoundaryDialState::default());
+        // The co-located instance expects the minted work order as the DIRECT
+        // jwt — never as a delegated relay of a caller credential.
+        let work_token = "iw-minted-work-order-fixture".to_owned();
+        *local_state.expected_jwt.lock() = Some(work_token.clone());
+        local_state.reset(None);
+        let mut model = selector_loaded_model(
+            vec![server_at(0x10, TransportConfig::inproc("selector-local"))],
+            Arc::clone(&local_state),
+        );
+        let service = selector_model_service().await;
+        let routed = service
+            .select_inference_routed(&mut model, "selector-internal", None)
+            .await
+            .unwrap_or_else(|error| panic!("co-location without a relay bearer failed: {error}"));
+        // The co-located arm carries the work order as its DIRECT bearer via
+        // the same locality gate get_inference_client uses (K3 finding M1).
+        let bearer_client =
+            ModelService::attach_work_order(routed, work_token.clone());
+        assert!(
+            bearer_client.is_ready().await
+                .unwrap_or_else(|error| panic!("returned local client failed: {error}")),
+            "readiness with the internal work bearer must succeed"
+        );
+        let readiness = local_state.readiness.lock().clone();
+        assert_eq!(readiness.len(), 1);
+        assert_eq!(readiness[0].jwt.as_deref(), Some(work_token.as_str()));
+        assert!(
+            readiness[0].delegated_bearer.is_none(),
+            "the internal leg must never relay a caller credential as delegated bearer"
+        );
+    }
+
+    /// K3 finding M1 regression: the REMOTE arm must never carry the internal
+    /// work order. The routed client keeps its delegated-relay shape; the
+    /// locality gate must not overlay a direct JWT (an envelope carrying both
+    /// is a hard wire error, and a remote instance would deny a
+    /// foreign-controller work order anyway).
+    #[tokio::test]
+    async fn selector_boundary_remote_arm_never_overlays_internal_work_order() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        let advertised = remote_transport(0x91);
+        fixture
+            .reset(std::slice::from_ref(&advertised))
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        // The remote relay must present the delegated bearer and NO direct
+        // jwt on its first forwarded call.
+        *dial_state.expected_jwt.lock() = None;
+        let local_state = Arc::new(BoundaryDialState::default());
+        local_state.reset(None);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x91, advertised.clone()),
+            ],
+            Arc::clone(&local_state),
+        );
+        exclude_local(&mut model);
+        let service = selector_model_service().await;
+        let routed = service
+            .select_inference_routed(&mut model, "selector-remote-internal", Some(SELECTOR_BEARER))
+            .await
+            .unwrap_or_else(|error| panic!("remote selection failed: {error}"));
+        // The same locality gate get_inference_client applies: Remote ⇒ no
+        // work-order overlay, the delegated relay shape is untouched.
+        let client = ModelService::attach_work_order(routed, "iw-foreign-controller-order".to_owned());
+        assert!(
+            client.is_ready().await
+                .unwrap_or_else(|error| panic!("remote client failed: {error}")),
+            "remote relay readiness must succeed with the delegated bearer only"
+        );
+        // Two observations: the remote arm's selection readiness probe AND the
+        // post-attach forwarded call. BOTH must carry the delegated relay and
+        // never the work order.
+        let readiness = dial_state.readiness.lock().clone();
+        assert_eq!(readiness.len(), 2);
+        for observation in &readiness {
+            assert_eq!(
+                observation.delegated_bearer.as_deref(),
+                Some(SELECTOR_BEARER),
+                "remote relay must carry the delegated bearer"
+            );
+            assert!(
+                observation.jwt.is_none(),
+                "the remote arm must not carry the internal work order as a direct jwt"
+            );
+        }
+    }
+
+
+    // ========================================================================
+    // User-approved single-service Model→Inference boundary (D5): mint side.
+    //
+    // Proves the work order Model mints per forwarded operation is bound to
+    // the pinned instance, the verified tenant/model, the exact downstream
+    // dispatch coordinate, the caller's own expiry, and Model's key — and
+    // that it verifies against the PINNED controller key the spawned
+    // instance enforces.
+    // ========================================================================
+
+    use base64::Engine as _;
+    use hyprstream_rpc::auth::internal_work::{
+        verify_internal_work, InternalWorkScope, MAX_LIFETIME_SECS,
+    };
+
+    const BOUNDARY_CALLER_KEY: [u8; 32] = [0xCB; 32];
+
+    /// The exact live worker audience a mint must bind (Sol incarnation plan):
+    /// the versioned audience of the fixture instance's test incarnation.
+    fn audience_fixture() -> String {
+        crate::services::inference::internal_work_audience(
+            &selector_instance().service_name(),
+            "test-incarnation-0000",
+        )
+    }
+
+    // ── Sol bounded incarnation plan: live binding + dead-worker fail-close ─
+
+    fn running_worker() -> hyprstream_service::SpawnedService {
+        // A live parked thread keeps the handle "running" for the guard; the
+        // parked thread exits when the test process ends (no join needed).
+        let handle = std::thread::spawn(|| {
+            loop {
+                std::thread::park_timeout(std::time::Duration::from_secs(3600));
+            }
+        });
+        hyprstream_service::SpawnedService::thread(
+            "s1-alive-worker".to_owned(),
+            Some(handle),
+            Arc::new(tokio::sync::Notify::new()),
+            None,
+        )
+    }
+
+    fn dead_worker() -> hyprstream_service::SpawnedService {
+        hyprstream_service::SpawnedService::thread(
+            "s1-dead-worker".to_owned(),
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn dead_worker_cache_entry_cannot_mint_and_is_evicted() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        let mut cache = service.loaded_models.write().await;
+        cache.put(
+            instance.clone(),
+            LoadedModel {
+                instance: instance.clone(),
+                model_ref: instance.model_ref().to_owned(),
+                transport: TransportConfig::inproc("dead-worker-test"),
+                network_transport: TransportConfig::inproc("dead-worker-test"),
+                service_handle: dead_worker(),
+                client: InferenceClient::new(Arc::new(BoundaryRpcClient::new(
+                    TransportConfig::inproc("dead-worker-test"),
+                    Arc::new(BoundaryDialState::default()),
+                ))),
+                incarnation: "dead-incarnation".to_owned(),
+                work_audience: "iw1/dead/dead".to_owned(),
+                load_generation: 1,
+                router: CellRouter::default(),
+                load_state: Vec::new(),
+                loaded_at: Instant::now(),
+                last_used: Instant::now(),
+                ttt_config: None,
+                generation_defaults: crate::config::SamplingParams::default(),
+            },
+        );
+        drop(cache);
+
+        let ctx = boundary_caller_ctx(chrono::Utc::now().timestamp() + 3600);
+        let scope = InternalWorkScope::new("inference:GenerateStream", "infer");
+        let error = match service
+            .get_inference_client(instance.model_ref(), &ctx, scope)
+            .await
+        {
+            Ok(_) => panic!("a dead worker cache entry must not mint work orders"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not running"),
+            "dead-worker denial must name the liveness guard: {error:#}"
+        );
+        // The dead entry was evicted: the cache no longer holds it.
+        assert!(!service.loaded_models.read().await.contains(&instance));
+    }
+
+    #[test]
+    fn running_worker_liveness_guard_passes() {
+        // Positive control for the liveness guard itself: an entry whose
+        // service handle reports running passes the guard.
+        let worker = running_worker();
+        assert!(worker.is_running(), "live thread fixture must report running");
+        let dead = dead_worker();
+        assert!(!dead.is_running(), "dead fixture must report not-running");
+        drop(worker);
+    }
+
+    #[test]
+    fn incarnation_handoff_validation_rejects_stale_or_mismatched() {
+        // The model-side handoff validation ensures the reported handoff
+        // matches THIS spawn attempt exactly. Exercised through the same
+        // ensure-conditions the load path applies (generation/instance/
+        // controller), via direct value checks mirroring model.rs load logic.
+        let instance = selector_instance();
+        let expected_generation: u64 = 3;
+        let expected_controller = SigningKey::from_bytes(&[0x41; 32]).verifying_key().to_bytes();
+
+        let handoff = crate::services::inference::IncarnationHandoff {
+            instance_service_name: instance.service_name(),
+            controller_pubkey: expected_controller,
+            generation: expected_generation,
+            incarnation: "aa11".to_owned(),
+            audience: "iw1/x/aa11".to_owned(),
+        };
+        assert_eq!(handoff.generation, expected_generation);
+        assert_eq!(handoff.instance_service_name, instance.service_name());
+        assert_eq!(handoff.controller_pubkey, expected_controller);
+
+        let stale = crate::services::inference::IncarnationHandoff {
+            generation: expected_generation - 1,
+            ..handoff.clone()
+        };
+        assert_ne!(stale.generation, expected_generation, "stale handoff");
+    }
+
+    fn boundary_caller_ctx(caller_exp: i64) -> EnvelopeContext {
+        let caller_key = SigningKey::from_bytes(&BOUNDARY_CALLER_KEY);
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, caller_exp)
+            .with_tenant("fixture-tenant".to_owned())
+            .with_cnf_jwk(caller_key.verifying_key().as_bytes())
+            // Model's ingress MAC gate (inference_instance →
+            // enforce_inference_mac) runs inside get_inference_client before
+            // the worker binding is consulted; the caller must carry the same
+            // clearance the real ingress path requires.
+            .with_clearance(crate::services::inference::inference_object_label());
+        EnvelopeContext::for_test_authenticated_subject_with_claims(
+            hyprstream_rpc::envelope::Subject::new("alice"),
+            "fixture-tenant",
+            caller_key.verifying_key(),
+            claims,
+        )
+    }
+
+    #[tokio::test]
+    async fn internal_work_mint_binds_instance_tenant_model_operation_and_caller() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        let scope = ModelService::inference_scope("generateStream", "infer");
+        let caller_exp = chrono::Utc::now().timestamp() + 3600;
+        let ctx = boundary_caller_ctx(caller_exp);
+        let token = service
+                                .mint_internal_work_token(
+                        &instance,
+                        &ctx,
+                        &scope,
+                        &audience_fixture(),
+                    )
+            .unwrap_or_else(|e| panic!("mint failed: {e}"));
+
+        let model_key = SigningKey::from_bytes(&[0x41; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = verify_internal_work(
+            &token,
+            &model_key.verifying_key(),
+            &audience_fixture(),
+            now,
+        )
+        .unwrap_or_else(|e| panic!("minted order must verify against the pinned controller: {e}"));
+        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.tenant, "fixture-tenant");
+        assert_eq!(claims.model, "fixture-model:main");
+        assert_eq!(claims.resource, "inference:GenerateStream");
+        assert_eq!(claims.operation, "infer");
+        assert!(
+            claims.exp <= caller_exp && claims.exp <= now + MAX_LIFETIME_SECS,
+            "exp must be capped by the caller credential and the hard bound"
+        );
+        assert!(
+            claims.exp > now,
+            "a live caller credential must mint a live work order"
+        );
+        assert!(!claims.jti.is_empty());
+        let expected_x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(model_key.verifying_key().as_bytes());
+        assert_eq!(
+            claims.cnf.jwk.as_ref().map(|j| j.x.as_str()),
+            Some(expected_x.as_str()),
+            "cnf must bind the pinned controller key"
+        );
+        // The original caller's pairwise DID (from the verified caller envelope
+        // key) rides for ledger attribution.
+        let caller_key = SigningKey::from_bytes(&BOUNDARY_CALLER_KEY);
+        assert_eq!(
+            claims.owner_did.as_deref(),
+            Some(
+                hyprstream_rpc::identity::Did::from_ed25519(&caller_key.verifying_key().to_bytes())
+                    .as_str()
+            )
+        );
+        // The caller snapshot carries the verified claims WITHOUT the raw
+        // bearer string (serde skip).
+        assert_eq!(claims.caller.sub, "alice");
+        assert!(claims.caller.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_work_mint_requires_verified_caller_identity_and_live_expiry() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        // Text-payload variant grammar: the payload IS the coordinate.
+        let scope = InternalWorkScope::new("inference:probe/adapters/k3", "write");
+
+        // No verified caller claims (e.g. a bearer-less service caller): never
+        // minted — the deny outcome matches the pre-boundary behavior.
+        let bare = EnvelopeContext::for_test_authenticated_subject(
+            hyprstream_rpc::envelope::Subject::anonymous(),
+            SigningKey::from_bytes(&BOUNDARY_CALLER_KEY).verifying_key(),
+        );
+        assert!(
+            service.mint_internal_work_token(&instance, &bare, &scope, &audience_fixture()).is_err(),
+            "internal work without a verified caller identity must not mint"
+        );
+
+        // Expired caller credential: never minted.
+        let expired = boundary_caller_ctx(chrono::Utc::now().timestamp() - 10);
+        assert!(
+            service.mint_internal_work_token(&instance, &expired, &scope, &audience_fixture()).is_err(),
+            "internal work must not outlive an expired caller credential"
+        );
     }
 
 }

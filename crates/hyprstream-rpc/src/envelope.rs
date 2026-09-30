@@ -598,6 +598,8 @@ pub struct RequestEnvelope {
     /// this in the dispatch pipeline; the legacy nonce-based replay cache is
     /// the fallback during dual-read migration.
     pub proof_cwt: Option<Vec<u8>>,
+    /// Read-only mediated-authorization proof, never a dispatch credential.
+    pub authorization_witness: Option<crate::sensitive::SensitiveBytes>,
 }
 
 impl RequestEnvelope {
@@ -616,6 +618,7 @@ impl RequestEnvelope {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         }
     }
 
@@ -1679,6 +1682,7 @@ impl SignedEnvelope {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         }
     }
 
@@ -2143,6 +2147,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref proof_cwt) = self.proof_cwt {
             builder.set_proof_cwt(proof_cwt);
         }
+        if let Some(ref witness) = self.authorization_witness {
+            builder.set_authorization_witness(witness);
+        }
     }
 }
 
@@ -2270,6 +2277,11 @@ impl FromCapnp for RequestEnvelope {
             client_kem_public,
             response_kem_recipient,
             service_domain,
+            authorization_witness: if reader.has_authorization_witness() {
+                let value = reader.get_authorization_witness()?;
+                anyhow::ensure!(value.len() <= crate::authorization_witness::MAX_WITNESS_BYTES, "authorization witness too large");
+                Some(value.to_vec().into())
+            } else { None },
             proof_cwt: {
                 let has = reader.reborrow().has_proof_cwt();
                 if !has {
@@ -2316,6 +2328,104 @@ impl ToCapnp for SignedEnvelope {
             builder.set_pq_kem_ciphertext(kem_ct);
         }
     }
+}
+
+/// Hard wire-size cap for original-holder authorization-query evidence.
+pub const MAX_MEDIATED_EVIDENCE_BYTES: usize = 64 * 1024;
+
+/// Bound variable request data before copying it into mediation evidence.
+/// The final serialized frame is capped separately, including framing overhead.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn mediated_request_fits(request: &RequestEnvelope) -> bool {
+    // Only the holder's own IdJag binds a mediated query. Relayed
+    // (delegated) service credentials carry no holder consent here and are
+    // denied (3c72353b6 relay-vouching exception removed per scoped repair).
+    let Some(credential) = request.jwt_token() else { return false; };
+    if request.delegation_token.is_some() {
+        return false;
+    }
+    let mut remaining = MAX_MEDIATED_EVIDENCE_BYTES;
+    let lengths = [
+        request.payload.len(),
+        credential.len(),
+        request.service_domain.as_ref().map_or(0, String::len),
+        request.proof_cwt.as_ref().map_or(0, Vec::len),
+        request.authorization_witness.as_ref().map_or(0, |bytes| bytes.len()),
+    ];
+    for length in lengths {
+        let Some(next) = remaining.checked_sub(length) else { return false; };
+        remaining = next;
+    }
+    for recipient in [&request.client_kem_public, &request.response_kem_recipient]
+        .into_iter().flatten()
+    {
+        // Validation bounds the component count and each key length before
+        // encode() allocates its wire representation.
+        if recipient.validate().is_err() {
+            return false;
+        }
+        for key in &recipient.eks {
+            let Some(next) = remaining.checked_sub(key.len()) else { return false; };
+            remaining = next;
+        }
+    }
+    true
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn mediated_capture_bounds_all_variable_fields_before_serializing() {
+    let request = RequestEnvelope::new(vec![1; 32]).with_jwt_token("holder-token".into());
+    assert!(mediated_request_fits(&request));
+    let mut oversized = request.clone();
+    oversized.proof_cwt = Some(vec![0; MAX_MEDIATED_EVIDENCE_BYTES]);
+    assert!(!mediated_request_fits(&oversized));
+    oversized = request.clone();
+    oversized.authorization_witness = Some(vec![0; MAX_MEDIATED_EVIDENCE_BYTES].into());
+    assert!(!mediated_request_fits(&oversized));
+    oversized = request.clone().with_jwt_token("x".repeat(MAX_MEDIATED_EVIDENCE_BYTES));
+    assert!(!mediated_request_fits(&oversized));
+    oversized = request.clone();
+    oversized.service_domain = Some("x".repeat(MAX_MEDIATED_EVIDENCE_BYTES));
+    assert!(!mediated_request_fits(&oversized));
+    oversized = request.clone();
+    oversized.delegation_token = Some("nested-bearer".into());
+    assert!(!mediated_request_fits(&oversized));
+    oversized = request;
+    oversized.authorization = Authorization::None;
+    assert!(!mediated_request_fits(&oversized));
+}
+
+/// Decode and authenticate a bounded original request for a mediated policy
+/// query. This proves the signed transcript only: callers must separately
+/// verify the credential, method/operation binding and query replay admission.
+/// It must never be used to install an identity on the mediator's context.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn verify_mediated_envelope_evidence(
+    evidence: &[u8],
+    mediator_service: &str,
+) -> Result<SignedEnvelope> {
+    anyhow::ensure!(
+        !evidence.is_empty() && evidence.len() <= MAX_MEDIATED_EVIDENCE_BYTES,
+        "invalid mediated evidence size"
+    );
+    validate_service_domain(mediator_service)?;
+    let mut options = capnp::message::ReaderOptions::new();
+    options.traversal_limit_in_words(Some(64 * 1024 / 8));
+    options.nesting_limit(16);
+    let mut remaining = evidence;
+    let message = capnp::serialize::read_message_from_flat_slice(&mut remaining, options)?;
+    anyhow::ensure!(remaining.is_empty(), "trailing mediated evidence bytes");
+    let signed = SignedEnvelope::read_from(message.get_root::<common_capnp::signed_envelope::Reader<'_>>()?)?;
+    anyhow::ensure!(signed.encrypted_envelope.is_none(), "encrypted outer evidence requires the proof path");
+    anyhow::ensure!(signed.envelope.service_domain.as_deref() == Some(mediator_service), "mediated evidence target mismatch");
+    anyhow::ensure!(signed.envelope.delegation_token.is_none(), "nested delegated evidence denied");
+    anyhow::ensure!(signed.envelope.jwt_token().is_some(), "mediated evidence requires a holder credential");
+    signed.validate_timestamp()?;
+    let holder = VerifyingKey::from_bytes(&signed.cnf)?;
+    let trust = global_pq_store();
+    signed.verify_signature_only_with(&holder, trust.as_deref(), mandatory_envelope_policy())?;
+    Ok(signed)
 }
 
 impl FromCapnp for SignedEnvelope {
@@ -3609,6 +3719,7 @@ mod tests {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         };
 
         let mut message = Builder::new_default();
@@ -3654,6 +3765,7 @@ mod tests {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         };
 
         // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
@@ -3718,6 +3830,7 @@ mod tests {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         };
         let signed =
             SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
@@ -3770,6 +3883,7 @@ mod tests {
                 response_kem_recipient: None,
                 service_domain: None,
                 proof_cwt: None,
+                authorization_witness: None,
             },
             &node_sk,
             &pq_sk,
@@ -3970,6 +4084,7 @@ mod tests {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -4018,6 +4133,7 @@ mod tests {
             response_kem_recipient: None,
             service_domain: None,
             proof_cwt: None,
+            authorization_witness: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);

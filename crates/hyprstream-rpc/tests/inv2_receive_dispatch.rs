@@ -345,6 +345,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         response_kem_recipient: None,
         service_domain: Some("inv2-sentinel".to_owned()),
         proof_cwt: None,
+        authorization_witness: None,
     }
 }
 

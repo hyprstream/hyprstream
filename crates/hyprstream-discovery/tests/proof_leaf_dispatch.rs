@@ -209,6 +209,7 @@ fn envelope_for(payload: &[u8]) -> Vec<u8> {
         response_kem_recipient: None,
         service_domain: Some("discovery".to_owned()),
         proof_cwt: None,
+        authorization_witness: None,
     }
     .with_response_kem_recipient(response_recipient.public());
     let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();

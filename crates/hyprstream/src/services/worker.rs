@@ -19,26 +19,26 @@ use hyprstream_rpc_std::policy_client::PolicyClient;
 /// works on single-threaded runtimes used by RequestService.
 pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
     Arc::new(
-        move |subject: String,
-              domain: String,
+        move |ctx: hyprstream_rpc::service::EnvelopeContext,
               resource: String,
-              operation: String,
-              bearer: Option<String>| {
+              operation: String| {
             let client = policy_client.clone();
             Box::pin(async move {
-                let upstream_subject =
-                    hyprstream_rpc::envelope::Subject::new(subject.clone());
+                let upstream_subject = ctx.subject();
                 let request = PolicyCheck {
-                    subject,
-                    domain,
+                    subject: upstream_subject.to_string(),
+                    // Compatibility fields only; Policy derives the domain
+                    // from independently verified caller evidence.
+                    domain: String::new(),
                     resource,
                     operation,
                 };
-                crate::services::policy::check_with_verified_bearer(
+                crate::services::policy::check_with_holder_evidence(
                     &client,
                     &request,
-                    bearer.as_deref(),
+                    ctx.jwt_token(),
                     &upstream_subject,
+                    ctx.original_holder_evidence(),
                 )
                 .await
             })

@@ -10,9 +10,8 @@
 //!    `UnlabeledObject` and without a fabricated anonymous/public clearance
 //!    (the caller presents a verified CA-signed service identity, and the PEP
 //!    requires the declared service clearance).
-//! 2. The causal twin — the identical caller and service with an undeclared
-//!    leaf (`resolveServiceKey`) — denies `UnlabeledObject` before handler
-//!    entry, and the PEP remains installed afterwards.
+//! 2. Other schema-declared leaves resolve through the same full inventory;
+//!    unknown paths still deny before handler entry.
 //! 3. A call to an undeclared service domain from the same declared caller
 //!    denies before handler entry (handler invocation counter stays zero).
 
@@ -50,12 +49,99 @@ const POLICY_ROOT_KEY: [u8; 32] = [0x52; 32];
 const DISCOVERY_KEY: [u8; 32] = [0x42; 32];
 const GHOST_CLIENT_KEY: [u8; 32] = [0x43; 32];
 const OAUTH_KEY: [u8; 32] = [0x44; 32];
+const BROWSER_KEY: [u8; 32] = [0x45; 32];
+const REGISTRY_KEY: [u8; 32] = [0x46; 32];
+const REGISTRATION_KEY: [u8; 32] = [0x47; 32];
+const OAUTH_RELAY_KEY: [u8; 32] = [0x48; 32];
+const REPLAY_POLICY_KEY: [u8; 32] = [0x49; 32];
+const REPLAY_RELAY_KEY: [u8; 32] = [0x4a; 32];
+const MEDIATED_MODEL_KEY: [u8; 32] = [0x4b; 32];
+const MEDIATED_DENIED_KEY: [u8; 32] = [0x4c; 32];
 const ISSUER: &str = "http://127.0.0.1:6791";
+
+/// Exercise the installed production PEP over every actual generated leaf,
+/// including nested Registry paths, with a user rather than service subject.
+/// Signature/JWT verification is exercised separately through real RPC below;
+/// these explicit context fixtures isolate the mandatory label decision.
+#[test]
+fn generated_dispatch_accepts_verified_user_clearance_without_service_prefix() -> Result<()> {
+    use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason};
+    use hyprstream_rpc::proof::policy::{collect_generated_rows, AuthenticationRequirement};
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let pep = global_mac_dispatch_pep().unwrap();
+    let hybrid = SigningKey::from_bytes(&DISCOVERY_KEY).verifying_key();
+    let classical = SigningKey::from_bytes(&[0xA5; 32]).verifying_key();
+    let rows = collect_generated_rows()?;
+    let registry: Vec<_> = rows.iter().filter(|row| row.service == "registry").collect();
+    assert!(registry.iter().any(|row| row.leaf_path.len() == 3));
+    assert!(registry.iter().any(|row| row.symbolic_path == "list"));
+    for row in registry {
+        assert_eq!(row.authentication, AuthenticationRequirement::CredentialRequired);
+        let claims = hyprstream_rpc::auth::Claims::new("browser-user".to_owned(), 1, i64::MAX)
+            .with_clearance(row.target_label);
+        let context = |signer, claims| EnvelopeContext::for_test_authenticated_subject_with_claims(
+            hyprstream_rpc::Subject::new("browser-user"), "staging-test", signer, claims,
+        );
+        assert_eq!(pep.check(&context(hybrid, claims.clone()), row.service, Some(row.leaf_path)), MacDecision::Permit,
+            "verified user must reach declared {}", row.symbolic_path);
+        assert_eq!(pep.check(&context(classical, claims), row.service, Some(row.leaf_path)), MacDecision::Deny(MacDenyReason::FloorDeny),
+            "a JWT cannot upgrade classical envelope assurance");
+        let absent = hyprstream_rpc::auth::Claims::new("browser-user".to_owned(), 1, i64::MAX);
+        let low = absent.clone().with_clearance(hyprstream_rpc::auth::mac::SecurityLabel::bottom());
+        assert_eq!(pep.check(&context(hybrid, low), row.service, Some(row.leaf_path)), MacDecision::Deny(MacDenyReason::FloorDeny));
+        assert_eq!(pep.check(&context(hybrid, absent), row.service, Some(row.leaf_path)), MacDecision::Deny(MacDenyReason::NoClearance));
+        if row.leaf_path.len() > 1 {
+            assert_eq!(pep.check(&bearerless_context(hybrid), row.service, Some(&row.leaf_path[..row.leaf_path.len() - 1])), MacDecision::Deny(MacDenyReason::UnlabeledObject));
+        }
+    }
+    let bearerless = EnvelopeContext::for_test_authenticated_subject(hyprstream_rpc::Subject::new("browser-user"), hybrid);
+    for (service, path) in [("registry", &[u16::MAX][..]), ("registry", &[0, 0][..]), ("/registry", &[0][..]), ("policy", &[u16::MAX][..])] {
+        assert_eq!(pep.check(&bearerless, service, Some(path)), MacDecision::Deny(MacDenyReason::UnlabeledObject));
+    }
+    assert_eq!(pep.check(&bearerless, "registry", None), MacDecision::Deny(MacDenyReason::UnlabeledObject));
+    Ok(())
+}
+
+#[test]
+fn generated_dispatch_restricts_all_credential_authority_leaves() -> Result<()> {
+    use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason};
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let pep = global_mac_dispatch_pep().unwrap();
+    let signer = SigningKey::from_bytes(&DISCOVERY_KEY).verifying_key();
+    let names = ["issueToken", "registerSession", "revokeSession", "revokeCredential", "exchangeDelegated", "exchangeWit"];
+    let rows = hyprstream_rpc::proof::policy::collect_generated_rows()?;
+    for name in names {
+        let row = rows.iter().find(|row| row.service == "policy" && row.symbolic_path == name)
+            .ok_or_else(|| anyhow::anyhow!("missing authority leaf {name}"))?;
+        for (subject, allowed) in [("service:discovery", false), ("service:mcp", false),
+            ("service:registry", false), ("service:unknown", false),
+            ("service:oauth", true), ("service:policy", true)] {
+            let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), 1, i64::MAX)
+                .with_clearance(row.target_label);
+            let context = EnvelopeContext::for_test_authenticated_subject_with_claims(
+                hyprstream_rpc::Subject::new(subject), "staging-test", signer, claims,
+            );
+            assert_eq!(pep.check(&context, "policy", Some(row.leaf_path)),
+                if allowed { MacDecision::Permit } else { MacDecision::Deny(MacDenyReason::NoClearance) },
+                "{subject} on {name}");
+        }
+    }
+    Ok(())
+}
+
+fn bearerless_context(signer: ed25519_dalek::VerifyingKey) -> EnvelopeContext {
+    EnvelopeContext::for_test_authenticated_subject(hyprstream_rpc::Subject::new("browser-user"), signer)
+}
 
 /// Install this binary's process-wide hybrid trust view: envelope signature
 /// verification (Hybrid policy) with the PQ anchors of the fixture keys.
 /// These anchors authenticate keys; they grant no authorization.
 fn install_crypto() {
+    let _ = hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+        hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(10_000),
+    ));
     // Match the Policy-host startup authority: the dispatch plane fails
     // closed on jti-bearing service credentials without the process-global
     // revocation store, even on a fresh deployment. Get-or-init an in-memory
@@ -66,7 +152,7 @@ fn install_crypto() {
         ));
     }
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY] {
+    for bytes in [POLICY_ROOT_KEY, DISCOVERY_KEY, GHOST_CLIENT_KEY, OAUTH_KEY, BROWSER_KEY, REGISTRY_KEY, REGISTRATION_KEY, OAUTH_RELAY_KEY, REPLAY_POLICY_KEY, REPLAY_RELAY_KEY, MEDIATED_MODEL_KEY, MEDIATED_DENIED_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -147,9 +233,74 @@ async fn register_active_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hybrid_user_registry_rpc_passes_and_missing_clearance_or_wrong_signer_deny() -> Result<()> {
+    use hyprstream_core::services::RegistryService;
+    use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
+    use hyprstream_rpc_std::registry_client::RegistryClient;
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+    let ca_pq = derive_mesh_mldsa_key(&ca_jwt_key);
+    let user_key = SigningKey::from_bytes(&BROWSER_KEY);
+    let registry_key = SigningKey::from_bytes(&REGISTRY_KEY);
+    // Relay authorization comes from the enrolled service key, not the
+    // browser's bearer or a caller-supplied subject string.
+    hyprstream_service::global_trust_store().insert(registry_key.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("registry".to_owned()).collect(),
+        subject: Some("service:registry".to_owned()),
+        jwt: None,
+        expires_at: 0,
+        attested_by: None,
+    });
+    let tag = format!("mac-user-registry-{}", uuid::Uuid::new_v4());
+    let policy = spawn_policy_and_client(&format!("{tag}-policy"), &registry_key, None).await?;
+    let data = tempfile::TempDir::new()?;
+    let registry = RegistryService::new(data.path(), policy, TransportConfig::inproc(&tag), registry_key.clone())
+        .await?
+        .with_jwt_key_source(cluster_key_source(&ca_jwt_key));
+    let _handle = InprocManager::new().spawn(Box::new(registry)).await?;
+    let sid = format!("registry-browser-{}", uuid::Uuid::new_v4());
+    register_active_session(ISSUER, &sid, "browser-user", "staging-test").await?;
+    let now = chrono::Utc::now().timestamp();
+    let base = hyprstream_rpc::auth::Claims::new("browser-user".to_owned(), now, now + 300)
+        .with_issuer(ISSUER.to_owned())
+        .with_audience(Some(ISSUER.to_owned()))
+        .with_tenant("staging-test".to_owned())
+        .with_client_id("staging-browser-test")
+        .with_sid(sid)
+        .with_scope(Some("query:registry:*".to_owned()))
+        .with_cnf_jwk(user_key.verifying_key().as_bytes());
+    let cleared = base.clone().with_clearance(SecurityLabel::new(Level::Internal, Assurance::PqHybrid, CompartmentSet::EMPTY));
+    let mint = |claims: &hyprstream_rpc::auth::Claims| {
+        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &ca_pq, &ca_jwt_key)
+    };
+    let token = mint(&cleared);
+    let client = |key, token| RegistryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"), key, registry_key.verifying_key(), token,
+    );
+    let listed = client(user_key.clone(), Some(token.clone()))?.list().await?;
+    let persisted = git2db::Git2DB::open(data.path()).await?;
+    let mut expected: Vec<_> = persisted.list().filter(|repo| repo.name.as_ref().is_some_and(|name| !name.is_empty())).map(|repo| repo.id.to_string()).collect();
+    let mut actual: Vec<_> = listed.iter().map(|repo| repo.id.clone()).collect();
+    expected.sort();
+    actual.sort();
+    assert_eq!(actual, expected, "RPC returns the fixture registry, including its bootstrap repositories");
+    for (key, bearer) in [
+        (user_key.clone(), None),
+        (user_key, Some(mint(&base))),
+        (SigningKey::from_bytes(&OAUTH_KEY), Some(token)),
+    ] {
+        let error = client(key, bearer)?.list().await.expect_err("invalid caller must not list Registry");
+        assert!(format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED), "uniform denial: {error:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<()> {
     install_crypto();
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -180,40 +331,203 @@ async fn authenticated_oauth_policy_check_reaches_the_real_handler() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_boundary() -> Result<()> {
+async fn hybrid_service_registry_policy_mediation_preserves_caller() -> Result<()> {
+    use hyprstream_core::services::RegistryService;
+    use hyprstream_rpc_std::registry_client::RegistryClient;
     install_crypto();
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let caller = SigningKey::from_bytes(&MEDIATED_MODEL_KEY);
+    let registry_key = SigningKey::from_bytes(&REGISTRY_KEY);
+    let credentials = tempfile::TempDir::new()?;
+    let token = mint_service_jwt(&credentials, "model", &ca, &caller);
+    let registry_token = mint_service_jwt(&credentials, "registry", &ca, &registry_key);
+    hyprstream_service::global_trust_store().insert(registry_key.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("registry".to_owned()).collect(),
+        subject: Some("service:registry".to_owned()), jwt: None, expires_at: 0, attested_by: None,
+    });
+    let tag = format!("mac-service-mediation-{}", uuid::Uuid::new_v4());
+    let policy_tag = format!("{tag}-policy");
+    let rules = tempfile::TempDir::new()?;
+    let policies = Arc::new(PolicyManager::new(rules.path().join("policies")).await?);
+    policies.add_policy_with_domain("service:discovery", "*", "registry:List", "query", "deny").await?;
+    let policy = spawn_policy_with_manager(&policy_tag, &registry_key, Some(registry_token.clone()), policies).await?;
+    let direct = PolicyClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{policy_tag}"), caller.clone(), root.verifying_key(), Some(token.clone()),
+    )?;
+    assert!(direct.check(&PolicyCheck {
+        subject: "service:model".to_owned(), domain: "*".to_owned(),
+        resource: "registry:*".to_owned(), operation: "query".to_owned(),
+    }).await?, "the original holder must authenticate and reach Policy");
 
-    // The production PEP is activation-controlled and every process starts
-    // FloorOnly: the anonymous-floor subject context can dominate the floor
-    // `check` row but can never dominate the schema-declared Internal/PqHybrid
-    // `issueToken` row, even with a perfect service clearance. Widen the
-    // operator control identity-aware for this test (the same mechanism the
-    // mac_enforcing_gate T8 contract exercises) and narrow on drop. This
-    // synthetic evidence tests the control mechanism only; production staging
-    // activation stays an operator gate.
-    let coverage = hyprstream_rpc::auth::mac::GenesisReport {
-        labeled: vec!["policy.issueToken".to_owned()],
-        unlabeled: Vec::new(),
-        ill_formed: Vec::new(),
+    // Exercise the real mediated handler, not merely the evidence decoder.
+    // A valid proof can answer a read-only check once; it cannot change the
+    // requested operation, target, bound credential, or its freshness.
+    use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+    use hyprstream_rpc::ToCapnp;
+    use hyprstream_rpc_std::policy_client::MediatedPolicyCheck;
+    let mut body = capnp::message::Builder::new_default();
+    body.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>().set_list(());
+    let original = RequestEnvelope::new(capnp::serialize::write_message_to_words(&body))
+        .with_jwt_token(token.clone()).with_service_domain("registry")?;
+    let query = |request: RequestEnvelope, operation: &str| {
+        let signed = SignedEnvelope::new_signed_hybrid(request, &caller, &derive_mesh_mldsa_key(&caller));
+        let mut message = capnp::message::Builder::new_default();
+        signed.write_to(&mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>());
+        MediatedPolicyCheck { evidence: capnp::serialize::write_message_to_words(&message).into(),
+            resource: "registry:List".into(), operation: operation.into() }
     };
-    let evidence = hyprstream_rpc::auth::mac::MacActivationEvidence {
-        genesis: &coverage,
-        mediation_integrity_g2: true,
-        denial_handling_g4: true,
-        observability_g5: true,
-        runbook_signoff_g6: true,
-        revocation_reload_g7: true,
-    };
-    hyprstream_rpc::auth::mac::global_mac_activation_control()
-        .widen_identity_aware(&evidence)?;
-    struct NarrowOnDrop;
-    impl Drop for NarrowOnDrop {
-        fn drop(&mut self) {
-            hyprstream_rpc::auth::mac::global_mac_activation_control().narrow_to_floor();
+    let changed_operation = policy.check_mediated(&query(original.clone(), "manage")).await
+        .expect_err("a query proof cannot authorize manage");
+    assert!(format!("{changed_operation:?}").contains("mediated operation"));
+    let wrong_target = original.clone().with_service_domain("model")?;
+    let error = policy.check_mediated(&query(wrong_target, "query")).await.expect_err("wrong mediator target");
+    assert!(format!("{error:?}").contains("target mismatch"));
+    let swapped = original.clone().with_jwt_token(registry_token);
+    policy.check_mediated(&query(swapped, "query")).await.expect_err("credential must belong to original signer");
+    let mut stale = original.clone();
+    stale.iat -= hyprstream_rpc::envelope::MAX_TIMESTAMP_AGE_MS + 60_000;
+    let error = policy.check_mediated(&query(stale, "query")).await.expect_err("expired evidence");
+    assert!(format!("{error:?}").contains("timestamp too old"));
+    let valid_query = query(original, "query");
+    assert!(format!("{valid_query:?}").contains("SensitiveBytes([REDACTED])"));
+    assert!(!format!("{valid_query:?}").contains(&format!("{:?}", &*valid_query.evidence)));
+    assert!(policy.check_mediated(&valid_query).await?, "invalid evidence must not consume valid admission");
+    let error = policy.check_mediated(&valid_query).await.expect_err("same derived query cannot be replayed");
+    assert!(format!("{error:?}").contains("replay admission denied"));
+
+    // A valid network-sized write still reaches the real mediated Policy
+    // handler. Its compact witness commits the exact large body hash and the
+    // derived `write` leaf; neither the body nor a substituted bearer crosses
+    // the 64 KiB mediation boundary.
+    let mut large_body = capnp::message::Builder::new_default();
+    {
+        let mut root = large_body
+            .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+        root.set_id(1);
+        let mut put = root.reborrow().init_put_blob();
+        put.set_bytes(&vec![0xA5; hyprstream_rpc::envelope::MAX_MEDIATED_EVIDENCE_BYTES + 1]);
+        put.set_grant_repo("at://did:example:model/repo");
+    }
+    let mut large = RequestEnvelope::new(capnp::serialize::write_message_to_words(&large_body))
+        .with_jwt_token(token.clone()).with_service_domain("registry")?;
+    large.authorization_witness = Some(
+        hyprstream_rpc::authorization_witness::sign(&large, &LocalSigner::new(caller.clone())).await?,
+    );
+    let large_evidence = hyprstream_rpc::authorization_witness::package(
+        &large, &caller.verifying_key().to_bytes(),
+    ).expect("large authenticated scoped request must retain compact holder evidence");
+    assert!(large_evidence.len() <= hyprstream_rpc::envelope::MAX_MEDIATED_EVIDENCE_BYTES);
+    assert!(policy.check_mediated(&MediatedPolicyCheck {
+        evidence: large_evidence.into(), resource: "registry:*".into(), operation: "write".into(),
+    }).await?, "the real mediated handler must admit the compact large-body holder evidence");
+    let data = tempfile::TempDir::new()?;
+    let registry = RegistryService::new(data.path(), policy, TransportConfig::inproc(&tag), registry_key.clone())
+        .await?.with_jwt_key_source(cluster_key_source(&ca));
+    let _handle = InprocManager::new().spawn(Box::new(registry)).await?;
+    let client = RegistryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"), caller.clone(), registry_key.verifying_key(), Some(token.clone()),
+    )?;
+    client.list().await.expect("authenticated service caller must survive Registry-to-Policy mediation");
+    let denied_key = SigningKey::from_bytes(&MEDIATED_DENIED_KEY);
+    let denied_token = mint_service_jwt(&credentials, "discovery", &ca, &denied_key);
+    let denied_client = RegistryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"), denied_key.clone(), registry_key.verifying_key(), Some(denied_token.clone()),
+    )?;
+    let error = denied_client.list().await.expect_err("the mediator's broad grants must not replace caller policy");
+    assert!(format!("{error:?}").contains("Unauthorized: service:discovery cannot query on registry:List"),
+        "expected caller-specific authorization denial, not a transport failure: {error:?}");
+
+    // Same live Registry, policies and caller identities over encrypted Iroh.
+    // Only the carrier changes: native clients must emit AQW rather than
+    // forwarding an unverifiable decrypted ciphertext envelope.
+    use hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler;
+    use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC};
+    use hyprstream_rpc::transport::iroh_transport::IrohTransport;
+    use hyprstream_rpc::rpc_client::RpcClientImpl;
+    hyprstream_rpc::transport::pq_provider::install_pq_crypto_provider()?;
+    let processor = hyprstream_rpc::dial::lookup_inproc(&tag).expect("same live Registry processor");
+    let server = IrohSubstrate::new(
+        derive_purpose_key(&registry_key, "mediation-test-server").to_bytes(),
+        NoopHandler::new("unused events"),
+        IrohRpcProtocolHandler::with_stream_limit(processor, registry_key.clone(), 16),
+    ).await?;
+    let network = IrohSubstrate::new(
+        derive_purpose_key(&caller, "mediation-test-client").to_bytes(),
+        NoopHandler::new("unused events"), NoopHandler::new("unused inbound RPC"),
+    ).await?;
+    let address = iroh::EndpointAddr::from_parts(server.endpoint_id(),
+        server.endpoint().bound_sockets().into_iter().map(iroh::TransportAddr::Ip));
+    let mut kem = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+    kem.bind(registry_key.verifying_key().to_bytes(),
+        hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&registry_key)?.public());
+    let kem = Arc::new(kem);
+    let pq = hyprstream_rpc::envelope::global_pq_store().expect("fixture PQ anchors");
+    for (key, credential, allowed) in [(caller, token, true), (denied_key, denied_token, false)] {
+        let connection = network.connect(address.clone(), ALPN_HYPRSTREAM_RPC).await?;
+        let rpc = RpcClientImpl::new(LocalSigner::new(key), IrohTransport::new(connection), Some(registry_key.verifying_key()))
+            .with_default_jwt(credential).with_request_kem_store(kem.clone()).with_response_pq_store(pq.clone());
+        let client = RegistryClient::new(Arc::new(rpc));
+        let result = client.list().await;
+        if allowed {
+            result.expect("native hybrid holder witness must preserve model's grant");
+        } else {
+            let error = result.expect_err("native mediation must preserve discovery's denial");
+            assert!(format!("{error:?}").contains("Unauthorized: service:discovery cannot query on registry:List"),
+                "native denial must be caller policy, not transport: {error:?}");
         }
     }
-    let _narrow = NarrowOnDrop;
+    network.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn mediated_original_envelope_requires_hybrid_target_and_untampered_evidence() -> Result<()> {
+    use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope, verify_mediated_envelope_evidence, MAX_MEDIATED_EVIDENCE_BYTES};
+    use hyprstream_rpc::ToCapnp;
+    install_crypto();
+    let holder = SigningKey::from_bytes(&REPLAY_POLICY_KEY);
+    // This layer verifies the signed transcript, not the credential. Policy
+    // must separately reject this deliberately non-JWT placeholder.
+    let request = RequestEnvelope::anonymous(vec![1, 2, 3])
+        .with_jwt_token("credential-placeholder".to_owned())
+        .with_service_domain("registry")?;
+    let classical = SignedEnvelope::new_signed(request.clone(), &holder);
+    let signed = SignedEnvelope::new_signed_hybrid(request, &holder, &derive_mesh_mldsa_key(&holder));
+    let encode = |value: &SignedEnvelope| {
+        let mut message = capnp::message::Builder::new_default();
+        value.write_to(&mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder<'_>>());
+        capnp::serialize::write_message_to_words(&message)
+    };
+    let evidence = encode(&signed);
+    assert!(verify_mediated_envelope_evidence(&encode(&classical), "registry").is_err());
+    assert_eq!(verify_mediated_envelope_evidence(&evidence, "registry")?.cnf, holder.verifying_key().to_bytes());
+    assert!(verify_mediated_envelope_evidence(&evidence, "model").is_err());
+    let context = EnvelopeContext::from_verified_as_system(&signed);
+    assert_eq!(context.original_holder_evidence(), Some(evidence.as_slice()));
+    let mut tampered = signed.clone();
+    tampered.envelope.payload.push(4);
+    assert!(verify_mediated_envelope_evidence(&encode(&tampered), "registry").is_err());
+    let nested = SignedEnvelope::new_signed_hybrid(
+        signed.envelope.clone().with_delegation_token("nested".to_owned()), &holder, &derive_mesh_mldsa_key(&holder),
+    );
+    assert!(verify_mediated_envelope_evidence(&encode(&nested), "registry").is_err());
+    let mut trailing = evidence.clone();
+    trailing.extend_from_slice(&[0; 8]);
+    assert!(verify_mediated_envelope_evidence(&trailing, "registry").is_err());
+    assert!(verify_mediated_envelope_evidence(&vec![0; MAX_MEDIATED_EVIDENCE_BYTES + 1], "registry").is_err());
+    assert!(verify_mediated_envelope_evidence(&[], "registry").is_err());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_boundary() -> Result<()> {
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    // Use the production IdentityAware default. Do not mutate process-global
+    // activation under parallel tests or manufacture coverage evidence.
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -256,9 +570,8 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
     assert_eq!(claims.tenant.as_deref(), Some(tenant));
     assert_eq!(claims.client_id.as_deref(), Some("cold-signup-browser"));
 
-    // A signed, hybrid bootstrap service with no scoped token-issuer
-    // clearance cannot borrow OAuth's authority. The uniform dispatch denial
-    // occurs before the handler, so it cannot mint or expose its policy state.
+    // A signed, hybrid service is not an issuance authority, even with the
+    // permissive/legacy policy used here. No fixture-specific deny rule.
     let discovery_key = SigningKey::from_bytes(&DISCOVERY_KEY);
     let discovery_credentials = tempfile::TempDir::new()?;
     let discovery_jwt = mint_service_jwt(
@@ -286,11 +599,378 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
             client_id: Some("cold-signup-browser".to_owned()),
         })
         .await;
-    let error = denied.expect_err("a non-OAuth service must not reach issueToken");
+    let error = denied.expect_err("ordinary service clearance must not grant token issuance");
     assert!(
-        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
-        "non-OAuth issueToken must fail at the uniform dispatch boundary: {error:?}"
+        format!("{error:?}").contains("dispatch denied"),
+        "token issuance must fail at the principal dispatch boundary: {error:?}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolve_service_key_never_discloses_hybrid_policy_credential() -> Result<()> {
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let holder = SigningKey::from_bytes(&REPLAY_POLICY_KEY);
+    let relay = SigningKey::from_bytes(&REPLAY_RELAY_KEY);
+    let credentials = tempfile::TempDir::new()?;
+    let holder_token = mint_service_jwt(&credentials, "policy", &ca, &holder);
+    let relay_credentials = tempfile::TempDir::new()?;
+    let relay_token = mint_service_jwt(&relay_credentials, "registry", &ca, &relay);
+    let tag = format!("hybrid-public-wit-replay-{}", uuid::Uuid::new_v4());
+    let holder_client = spawn_policy_and_client(&tag, &holder, Some(holder_token.clone())).await?;
+    holder_client.register_service_key(&RegisterServiceKey {
+        service_name: "policy".to_owned(),
+        verifying_key: holder.verifying_key().to_bytes().to_vec(),
+        service_jwt: holder_token.clone(),
+    }).await?;
+    let relay_client = PolicyClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"), relay.clone(), root.verifying_key(), Some(relay_token.clone()),
+    )?;
+    relay_client.register_service_key(&RegisterServiceKey {
+        service_name: "registry".to_owned(),
+        verifying_key: relay.verifying_key().to_bytes().to_vec(),
+        service_jwt: relay_token,
+    }).await?;
+    let resolved = relay_client.resolve_service_key(&ResolveServiceKey {
+        service_name: "policy".to_owned(),
+    }).await?;
+    assert!(resolved.service_jwt.is_none(), "legacy singleton must not disclose the holder credential");
+    let published = resolved.keys.into_iter()
+        .find(|entry| entry.verifying_key == holder.verifying_key().as_bytes())
+        .expect("the registered verification key remains discoverable");
+    assert!(published.service_jwt.is_none(), "resolution must not disclose the holder credential");
+    assert_ne!(published.service_jwt.as_deref(), Some(holder_token.as_str()));
+    Ok(())
+}
+
+/// Real OAuth authorization hook + real Policy RPC with production base rules.
+/// A local service cannot borrow the OAuth deputy's account-management grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oauth_management_preserves_caller_authority_over_local_transport() -> Result<()> {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+    use hyprstream_core::services::generated::oauth_client::OauthHandler;
+    use hyprstream_core::services::oauth::{rpc_handler::OAuthRpcHandler, state::OAuthState};
+    use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let relay = SigningKey::from_bytes(&OAUTH_RELAY_KEY);
+    hyprstream_service::global_trust_store().insert(relay.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("oauth".to_owned()).collect(),
+        subject: Some("service:oauth".to_owned()), jwt: None, expires_at: 0, attested_by: None,
+    });
+    let dir = tempfile::TempDir::new()?;
+    let tag = format!("oauth-management-policy-{}", uuid::Uuid::new_v4());
+    let manager = Arc::new(PolicyManager::new(dir.path().join("policies")).await?);
+    let verifier = PolicyService::new(
+        manager, Arc::new(root.clone()), TokenConfig::default(),
+        Arc::new(tokio::sync::RwLock::new(git2db::Git2DB::open(dir.path().join("registry")).await?)),
+        TransportConfig::inproc(&tag),
+    ).with_jwt_key_source(cluster_key_source(&ca));
+    let mut contexts = Vec::new();
+    for (name, bytes, allowed) in [("discovery", DISCOVERY_KEY, false), ("oauth", OAUTH_RELAY_KEY, true)] {
+        let key = SigningKey::from_bytes(&bytes);
+        let credentials = tempfile::TempDir::new()?;
+        let token = mint_service_jwt(&credentials, name, &ca, &key);
+        let envelope = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(Vec::new()).with_jwt_token(token), &key,
+        );
+        // Explicit local provenance fixture; JWT/cnf/issuer/audience/clearance
+        // are checked by the production verifier, not injected as test claims.
+        let mut ctx = EnvelopeContext::from_verified_as_system(&envelope);
+        verifier.verify_claims(&mut ctx).await?;
+        assert_eq!(ctx.claims().map(|claims| claims.sub.as_str()), Some(format!("service:{name}").as_str()));
+        // RPC deliberately redacts verifier errors to the uniform denial.
+        // The verifier unit regression asserts the precise holder mismatch.
+        contexts.push((ctx, allowed, Some("dispatch denied")));
+    }
+    // A user bearer is not a public service attestation: the admitted OAuth
+    // relay must still carry it to a real Policy decision as the user, never
+    // borrowing its own account-management grant.
+    let user_key = SigningKey::from_bytes(&BROWSER_KEY);
+    let sid = format!("oauth-management-user-{}", uuid::Uuid::new_v4());
+    register_active_session(ISSUER, &sid, "unprivileged-user", "staging-test").await?;
+    let now = chrono::Utc::now().timestamp();
+    let claims = hyprstream_rpc::auth::Claims::new("unprivileged-user".to_owned(), now, now + 300)
+        .with_issuer(ISSUER.to_owned())
+        .with_audience(Some(ISSUER.to_owned()))
+        .with_tenant("staging-test".to_owned())
+        .with_client_id("oauth-management-test")
+        .with_sid(sid)
+        .with_cnf_jwk(user_key.verifying_key().as_bytes());
+    let token = hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+        &claims, &derive_mesh_mldsa_key(&ca), &ca,
+    );
+    let envelope = SignedEnvelope::new_signed(
+        RequestEnvelope::anonymous(Vec::new()).with_jwt_token(token), &user_key,
+    );
+    let mut user_ctx = EnvelopeContext::from_verified_as_system(&envelope);
+    verifier.verify_claims(&mut user_ctx).await?;
+    contexts.push((user_ctx, false, Some("Unauthorized OAuth user management operation")));
+    let _handle = InprocManager::new().spawn(Box::new(verifier)).await?;
+    let endpoint = format!("inproc://{tag}");
+    let policy = PolicyClient::for_local_endpoint_bootstrap(&endpoint, relay.clone(), root.verifying_key(), None)?;
+    // Unused in this authorization-only fixture; no Discovery request occurs.
+    let discovery = DiscoveryClient::for_local_endpoint_bootstrap(&endpoint, relay.clone(), root.verifying_key(), None)?;
+    let state = OAuthState::new(&hyprstream_core::config::OAuthConfig::default(), policy, discovery, relay.verifying_key().to_bytes());
+    let handler = OAuthRpcHandler::new(Arc::new(state), TransportConfig::inproc("unused-oauth-handler"), relay);
+    for (ctx, allowed, expected_denial) in contexts {
+        for resource in ["oauth:AddPubkey", "oauth:RemoveUser"] {
+            let result = handler.authorize(&ctx, resource, "manage").await;
+            assert_eq!(result.is_ok(), allowed, "caller {} on {resource}: {result:?}", ctx.subject());
+            if !allowed {
+                let error = format!("{:?}", result.unwrap_err());
+                assert!(error.contains(expected_denial.unwrap()), "wrong denial boundary: {error}");
+            }
+        }
+    }
+    assert!(handler.authorize(&EnvelopeContext::from_callback_service(1, "oauth"), "oauth:AddPubkey", "manage").await.is_err(),
+        "locality without an upstream credential must not borrow deputy authority");
+    Ok(())
+}
+
+/// After JWT admission, a real generated OAuth request must not turn an
+/// enrolled ordinary service into the OAuth account-management deputy.  The
+/// production OAuth bridge currently has no JWT key source (covered by the
+/// production-equivalent negative below), so this fixture supplies the same
+/// cluster verifier explicitly to regress the next authorization boundary.
+/// It deliberately traverses JWT verification -> generated decode -> dispatch
+/// PEP -> handler and proves both targeted mutations stop at OAuth's authenticated
+/// local-control-plane gate before a mutator is selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_service_cannot_mutate_oauth_after_jwt_admission() -> Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use hyprstream_core::services::oauth::{rpc_handler::OAuthRpcHandler, state::OAuthState};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::oauth_client::{AddPubkey, OauthClient};
+
+    // This wrapper is intentionally synthetic: production constructs a bare
+    // OAuthRpcHandler, which currently returns RequestService's default
+    // jwt_key_source (None).  The separate production-equivalent test below
+    // protects that present fail-closed wiring; this one protects the OAuth
+    // authorization boundary if production later wires JWT verification.
+    struct VerifiedOAuthDispatch {
+        inner: OAuthRpcHandler,
+        transport: TransportConfig,
+        signing_key: SigningKey,
+        jwt_key_source: Arc<ClusterKeySource>,
+        handler_entries: Arc<AtomicUsize>,
+    }
+
+    #[async_trait(?Send)]
+    impl RequestService for VerifiedOAuthDispatch {
+        fn decode_request_body(&self, signed_body: &[u8]) -> Result<DecodedRequestBody> {
+            self.inner.decode_request_body(signed_body)
+        }
+
+        async fn handle_request(
+            &self,
+            ctx: &EnvelopeContext,
+            body: &DecodedRequestBody,
+        ) -> Result<(Vec<u8>, Option<Continuation>)> {
+            self.handler_entries.fetch_add(1, Ordering::SeqCst);
+            self.inner.handle_request(ctx, body).await
+        }
+
+        fn name(&self) -> &str {
+            "oauth"
+        }
+
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+
+        fn jwt_key_source(&self) -> Option<Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+            Some(self.jwt_key_source.clone())
+        }
+
+        fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+            self.inner.build_error_payload(request_id, error)
+        }
+    }
+
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let relay = SigningKey::from_bytes(&OAUTH_RELAY_KEY);
+    let caller = SigningKey::from_bytes(&DISCOVERY_KEY);
+    let credentials = tempfile::TempDir::new()?;
+    let caller_jwt = mint_service_jwt(&credentials, "discovery", &ca, &caller);
+    hyprstream_service::global_trust_store().insert(relay.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("oauth".to_owned()).collect(),
+        subject: Some("service:oauth".to_owned()),
+        jwt: None,
+        expires_at: 0,
+        attested_by: None,
+    });
+
+    let tag = format!("oauth-generated-mutation-{}", uuid::Uuid::new_v4());
+    let policy_tag = format!("{tag}-policy");
+    let policy = spawn_policy_and_client(&policy_tag, &relay, None).await?;
+    // No Discovery request occurs in these mutation calls; the real OAuth
+    // state still receives its normal generated client shape.
+    let discovery = DiscoveryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{policy_tag}"),
+        relay.clone(),
+        root.verifying_key(),
+        None,
+    )?;
+
+    let state = OAuthState::new(
+        &hyprstream_core::config::OAuthConfig::default(),
+        policy,
+        discovery,
+        relay.verifying_key().to_bytes(),
+    );
+    let handler_entries = Arc::new(AtomicUsize::new(0));
+    let fixture = VerifiedOAuthDispatch {
+        inner: OAuthRpcHandler::new(
+            Arc::new(state),
+            TransportConfig::inproc(&tag),
+            relay.clone(),
+        ),
+        transport: TransportConfig::inproc(&tag),
+        signing_key: relay.clone(),
+        jwt_key_source: cluster_key_source(&ca),
+        handler_entries: handler_entries.clone(),
+    };
+    let _handle = InprocManager::new().spawn(Box::new(fixture)).await?;
+    let client = OauthClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"),
+        caller,
+        relay.verifying_key(),
+        Some(caller_jwt),
+    )?;
+
+    let attempted_key = SigningKey::from_bytes(&GHOST_CLIENT_KEY);
+    let add_error = client
+        .add_pubkey(&AddPubkey {
+            username: "mutation-victim".to_owned(),
+            pubkey_base64: URL_SAFE_NO_PAD.encode(attempted_key.verifying_key().as_bytes()),
+            label: Some("must-not-write".to_owned()),
+        })
+        .await
+        .expect_err("ordinary enrolled service must not add an OAuth user key");
+    let add_error = format!("{add_error:?}");
+    assert!(add_error.contains("authenticated local service boundary"),
+        "addPubkey must stop at the OAuth locality gate before its mutator: {add_error}");
+    let remove_error = client
+        .remove_user("mutation-victim")
+        .await
+        .expect_err("ordinary enrolled service must not remove an OAuth user");
+    let remove_error = format!("{remove_error:?}");
+    assert!(remove_error.contains("authenticated local service boundary"),
+        "removeUser must stop at the OAuth locality gate before its mutator: {remove_error}");
+
+    assert_eq!(handler_entries.load(Ordering::SeqCst), 2,
+        "both generated mutation requests must reach real dispatch and stop in OAuth authorization");
+    Ok(())
+}
+
+/// The production OAuth bridge constructs a bare OAuthRpcHandler with
+/// LocalServiceBridge::spawn_with.  That handler has no JWT key source, so a
+/// JWT-bearing ordinary-service mutation must fail closed before generated
+/// dispatch or the OAuth handler can select a mutator.  This is deliberately
+/// separate from `ordinary_service_cannot_mutate_oauth_after_jwt_admission`:
+/// the latter covers the authorization boundary after a future production JWT
+/// source is installed, while this test names and locks the current factory
+/// behavior rather than simulating it with a wrapper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_oauth_factory_rejects_service_mutations_before_dispatch() -> Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use hyprstream_core::services::oauth::{rpc_handler::OAuthRpcHandler, state::OAuthState};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::oauth_client::{AddPubkey, OauthClient};
+
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let relay = SigningKey::from_bytes(&OAUTH_RELAY_KEY);
+    let caller = SigningKey::from_bytes(&DISCOVERY_KEY);
+    let credentials = tempfile::TempDir::new()?;
+    let caller_jwt = mint_service_jwt(&credentials, "discovery", &ca, &caller);
+    hyprstream_service::global_trust_store().insert(relay.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("oauth".to_owned()).collect(),
+        subject: Some("service:oauth".to_owned()),
+        jwt: None,
+        expires_at: 0,
+        attested_by: None,
+    });
+
+    let tag = format!("oauth-production-mutation-{}", uuid::Uuid::new_v4());
+    let policy_tag = format!("{tag}-policy");
+    let policy = spawn_policy_and_client(&policy_tag, &relay, None).await?;
+    let discovery = DiscoveryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{policy_tag}"),
+        relay.clone(),
+        root.verifying_key(),
+        None,
+    )?;
+    let state = Arc::new(OAuthState::new(
+        &hyprstream_core::config::OAuthConfig::default(),
+        policy,
+        discovery,
+        relay.verifying_key().to_bytes(),
+    ));
+
+    // Keep the builder shape aligned with oauth/mod.rs's production factory:
+    // a bridge-thread construction of the unwrapped OAuthRpcHandler.
+    let factory_state = Arc::clone(&state);
+    let factory_transport = TransportConfig::inproc(&tag);
+    let factory_signing_key = relay.clone();
+    let (bridge, ready) = LocalServiceBridge::spawn_with(
+        "oauth-user-crud-production-negative",
+        move || async move {
+            Ok(OAuthRpcHandler::new(
+                factory_state,
+                factory_transport,
+                factory_signing_key,
+            ))
+        },
+        Arc::new(InMemoryNonceCache::new()),
+        0,
+    )?;
+    ready.await??;
+    let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
+    register_inproc(&tag, &processor);
+
+    let client = OauthClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"),
+        caller,
+        relay.verifying_key(),
+        Some(caller_jwt),
+    )?;
+    let attempted_key = SigningKey::from_bytes(&GHOST_CLIENT_KEY);
+    let add_error = client
+        .add_pubkey(&AddPubkey {
+            username: "production-mutation-victim".to_owned(),
+            pubkey_base64: URL_SAFE_NO_PAD.encode(attempted_key.verifying_key().as_bytes()),
+            label: Some("must-not-write".to_owned()),
+        })
+        .await
+        .expect_err("production OAuth factory must fail closed before addPubkey dispatch");
+    assert!(format!("{add_error:?}").contains("dispatch denied"),
+        "JWT-source absence must retain the uniform pre-handler denial: {add_error:?}");
+    let remove_error = client
+        .remove_user("production-mutation-victim")
+        .await
+        .expect_err("production OAuth factory must fail closed before removeUser dispatch");
+    assert!(format!("{remove_error:?}").contains("dispatch denied"),
+        "JWT-source absence must retain the uniform pre-handler denial: {remove_error:?}");
     Ok(())
 }
 
@@ -372,6 +1052,15 @@ async fn spawn_policy_and_client(
     caller_key: &SigningKey,
     service_jwt: Option<String>,
 ) -> Result<PolicyClient> {
+    spawn_policy_with_manager(tag, caller_key, service_jwt, Arc::new(PolicyManager::permissive().await?)).await
+}
+
+async fn spawn_policy_with_manager(
+    tag: &str,
+    caller_key: &SigningKey,
+    service_jwt: Option<String>,
+    policy_manager: Arc<PolicyManager>,
+) -> Result<PolicyClient> {
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
 
@@ -380,7 +1069,7 @@ async fn spawn_policy_and_client(
         git2db::Git2DB::open(policy_dir.path()).await?,
     ));
     let policy_service = PolicyService::new(
-        Arc::new(PolicyManager::permissive().await?),
+        policy_manager,
         Arc::new(root_key.clone()),
         TokenConfig::default(),
         git2db,
@@ -403,7 +1092,7 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
     install_crypto();
 
     // The exact production install seam `service start` runs (main.rs).
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
     assert!(
         global_mac_dispatch_pep().is_some(),
         "the production dispatch PEP must be installed"
@@ -411,7 +1100,9 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");
-    let discovery_key = SigningKey::from_bytes(&DISCOVERY_KEY);
+    // Other parallel tests mint different credentials for their discovery
+    // caller. Keep this fresh registration key out of their identity cache.
+    let discovery_key = SigningKey::from_bytes(&REGISTRATION_KEY);
     let creds = tempfile::TempDir::new()?;
     let discovery_jwt = mint_service_jwt(
         &creds,
@@ -447,28 +1138,28 @@ async fn fresh_state_register_service_key_passes_production_dispatch_pep() -> Re
         "the dispatch PEP must remain installed after a permit"
     );
 
-    // Causal twin: identical caller, identical service, undeclared leaf.
-    // `resolveServiceKey` is a real policy method (discriminant 17) that this
-    // slice deliberately does NOT declare — declaration, not schema, is the
-    // authority. It must deny before handler entry. Per the v16 §14.2
-    // uniform-denial rule the wire error is opaque ("dispatch denied") so the
-    // response cannot leak which gate fired; the specific UnlabeledObject
-    // reason is asserted at the PEP unit level (mac::dispatch_labels and
-    // mac::cas_pep tests) and in the audit trail.
-    let undeclared = client
+    // verify_claims cached this same JWT before the handler ran. Registration
+    // must complete that entry's service scope even at identical expiry.
+    let published = client.resolve_service_key(&ResolveServiceKey {
+        service_name: "discovery".to_owned(),
+    }).await?;
+    assert!(published.keys.iter().any(|candidate| candidate.verifying_key == discovery_key.verifying_key().as_bytes()));
+
+    // The schema, not a partial second table, now declares this leaf. The
+    // same authenticated caller reaches the real resolution handler. Asking
+    // for an unregistered name must produce the handler's missing-key result,
+    // not the old incomplete-table dispatch denial.
+    let resolved = client
         .resolve_service_key(&ResolveServiceKey {
-            service_name: "registry".to_owned(),
+            service_name: "not-enrolled-in-fixture".to_owned(),
         })
         .await;
-    let error = undeclared.expect_err("undeclared leaf must deny");
-    assert!(
-        format!("{error:?}").contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
-        "undeclared leaf must deny through the uniform dispatch denial, got: {error:?}"
-    );
+    let error = resolved.expect_err("unregistered name has no resolution");
+    assert!(format!("{error:?}").contains("service key 'not-enrolled-in-fixture' not registered"), "must reach resolution rather than dispatch denial: {error:?}");
 
     assert!(
         global_mac_dispatch_pep().is_some(),
-        "the dispatch PEP must remain installed after a deny"
+        "the dispatch PEP must remain installed after key resolution"
     );
     Ok(())
 }
@@ -525,7 +1216,7 @@ impl RequestService for CountingEchoService {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undeclared_service_domain_denies_before_handler_entry() -> Result<()> {
     install_crypto();
-    hyprstream_core::mac::install_production_rpc_dispatch_pep();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
 
     let root_key = SigningKey::from_bytes(&POLICY_ROOT_KEY);
     let ca_jwt_key = derive_purpose_key(&root_key, "hyprstream-jwt-v1");

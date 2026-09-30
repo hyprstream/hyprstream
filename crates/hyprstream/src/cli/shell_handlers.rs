@@ -962,6 +962,16 @@ async fn handle_rpc(
         }
 
         RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid, gen_defaults } => {
+            let (tool_caller, tool_descriptions, openai_tools) = match crate::tui::rpc_transport::make_tool_caller(signing_key) {
+                Ok(tool_caller) => tool_caller,
+                Err(_) => {
+                    compositor.chrome.push_toast(
+                        "Private chat unavailable: TUI service credential is required".to_owned(),
+                        ToastLevel::Error,
+                    );
+                    return vec![];
+                }
+            };
             // Allocate a local pane ID in the high-bit range to avoid
             // collision with server-allocated IDs (which start at 1).
             let pane_id = *next_local_id;
@@ -971,11 +981,6 @@ async fn handle_rpc(
                 Some(s) => uuid::Uuid::parse_str(s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 None => uuid::Uuid::new_v4(),
             };
-            // Fetch tool list once; used by both the spawner (for chat template)
-            // and the ChatApp (for dispatch + descriptions).
-            let (tool_caller, tool_descriptions, openai_tools) =
-                crate::tui::rpc_transport::make_tool_caller(signing_key);
-
             // Shared gen_config Arc — passed to both the spawner and the ChatApp.
             // Use model-specific defaults from RPC if available, otherwise fall back.
             let chat_gen_cfg = match gen_defaults {

@@ -108,6 +108,32 @@ fn malformed_bodies_do_not_decode() {
     assert!(decode_registry_request_body(&[]).is_err());
 }
 
+#[test]
+fn mediated_operation_is_bound_to_the_generated_signed_leaf() {
+    let mut request = capnp::message::Builder::new_default();
+    request.init_root::<registry_capnp::registry_request::Builder>().set_list(());
+    let body = to_bytes(&request);
+    policy::verify_mediated_operation("registry", &body, "query").unwrap();
+    assert!(policy::verify_mediated_operation("registry", &body, "manage").is_err());
+    assert!(policy::verify_mediated_operation("registry", &body, "").is_err());
+    assert!(policy::verify_mediated_operation("unknown", &body, "query").is_err());
+    assert!(policy::verify_mediated_operation("registry", b"invalid", "query").is_err());
+
+    let mut scoped = capnp::message::Builder::new_default();
+    scoped.init_root::<registry_capnp::registry_request::Builder>()
+        .init_repo().set_list_worktrees(());
+    policy::verify_mediated_operation("registry", &to_bytes(&scoped), "query").unwrap();
+    assert!(policy::verify_mediated_operation("registry", &to_bytes(&scoped), "manage").is_err());
+
+    // Public queries and nested mediation are not scoped caller operations.
+    let mut public = capnp::message::Builder::new_default();
+    public.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>().init_check();
+    assert!(policy::verify_mediated_operation("policy", &to_bytes(&public), "query").is_err());
+    let mut nested = capnp::message::Builder::new_default();
+    nested.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>().init_check_mediated();
+    assert!(policy::verify_mediated_operation("policy", &to_bytes(&nested), "query").is_err());
+}
+
 /// Every derivable leaf resolves a generated inventory row, symbolically
 /// named for review, and the complete linked inventory validates + installs.
 #[test]
@@ -577,4 +603,101 @@ fn scope_exempt_mutator_is_explicitly_classified() {
         assert!(lookup(public).scope_action.is_empty());
         assert_eq!(lookup(public).mutation_semantics, None, "{public}");
     }
+}
+
+
+/// Sol finding 2: the generated required-Data reader must reject evidence
+/// above the mediated-evidence cap at the field boundary — BEFORE any owned
+/// copy — while exactly-at-limit evidence decodes.
+#[test]
+fn mediated_check_evidence_reader_enforces_cap_before_copy() {
+    use hyprstream_rpc::capnp::FromCapnp;
+    use hyprstream_rpc::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+    use hyprstream_rpc_std::policy_capnp::policy_request;
+    use policy_request::Which;
+
+    let build = |evidence_len: usize| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let req = message.init_root::<policy_request::Builder>();
+            let mut mediated = req.init_check_mediated();
+            mediated.set_evidence(&vec![0u8; evidence_len]);
+            mediated.set_resource("registry");
+            mediated.set_operation("query");
+        }
+        to_bytes(&message)
+    };
+
+    // Over the cap: the typed read denies at the field boundary.
+    let oversized = build(MAX_MEDIATED_EVIDENCE_BYTES + 1);
+    let message = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&oversized),
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("capnp frame decodes");
+    let req = message.get_root::<policy_request::Reader>().unwrap();
+    let Which::CheckMediated(v) = req.which().unwrap() else {
+        panic!("expected checkMediated variant");
+    };
+    let v = v.expect("typed variant reader");
+    assert!(
+        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v).is_err(),
+        "oversized evidence must be rejected before the owned copy"
+    );
+
+    // Exactly at the cap: the typed read succeeds.
+    let exact = build(MAX_MEDIATED_EVIDENCE_BYTES);
+    let message = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&exact),
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("capnp frame decodes");
+    let req = message.get_root::<policy_request::Reader>().unwrap();
+    let Which::CheckMediated(v) = req.which().unwrap() else {
+        panic!("expected checkMediated variant");
+    };
+    let v = v.expect("typed variant reader");
+    <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
+        .expect("exactly-at-cap evidence must decode");
+}
+
+/// Sol MED-2 (Text half): `$maxLen` bounds resource/operation at the borrowed
+/// reader — oversized values reject before any owned String is allocated, and
+/// each exact boundary decodes.
+#[test]
+fn mediated_check_text_fields_enforce_maxlen_before_copy() {
+    use hyprstream_rpc::capnp::FromCapnp;
+    use hyprstream_rpc_std::policy_capnp::policy_request;
+    use policy_request::Which;
+
+    let build = |resource_len: usize, operation_len: usize| -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let req = message.init_root::<policy_request::Builder>();
+            let mut mediated = req.init_check_mediated();
+            mediated.set_evidence(&[0u8; 16]);
+            mediated.set_resource("a".repeat(resource_len).as_str());
+            mediated.set_operation("b".repeat(operation_len).as_str());
+        }
+        to_bytes(&message)
+    };
+
+    let read = |bytes: &[u8]| -> anyhow::Result<hyprstream_rpc_std::policy_client::MediatedPolicyCheck> {
+        let message = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(bytes),
+            capnp::message::ReaderOptions::new(),
+        )?;
+        let req = message.get_root::<policy_request::Reader>()?;
+        let Which::CheckMediated(v) = req.which()? else {
+            panic!("expected checkMediated variant");
+        };
+        let v = v?;
+        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
+    };
+
+    // resource over 4096 / operation over 128: rejected at the reader.
+    assert!(read(&build(4097, 1)).is_err(), "oversized resource must reject");
+    assert!(read(&build(1, 129)).is_err(), "oversized operation must reject");
+    // Each exact boundary decodes.
+    assert!(read(&build(4096, 128)).is_ok(), "at-boundary resource+operation must decode");
 }

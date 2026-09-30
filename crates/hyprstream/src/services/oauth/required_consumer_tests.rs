@@ -388,6 +388,16 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
     );
     hyprstream_rpc::transport::pq_provider::install_pq_crypto_provider()?;
     crate::mac::install_explicit_test_dispatch_pep();
+    // This isolated child bypasses main. Match production's sole-verifier
+    // lease before enabling the bounded mediated-query replay backend.
+    let replay_lease = hyprstream_rpc::proof::admission::SingleVerifierLease::acquire(
+        &directory.path().join("policy-replay.lease"),
+    )?;
+    hyprstream_rpc::proof::admission::hold_single_verifier_lease(replay_lease)
+        .map_err(|_| anyhow::anyhow!("test replay lease already installed"))?;
+    hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+        hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(10_000),
+    )).map_err(|_| anyhow::anyhow!("test replay store already installed"))?;
     // Production publishes the authority stores before constructing any
     // service factory. This isolated child bypasses main, so install the same
     // fail-closed revocation seam before presenting the jti-bearing OAI WIT.

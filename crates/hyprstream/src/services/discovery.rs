@@ -28,6 +28,37 @@ impl PolicyAuthProvider {
 
 #[async_trait(?Send)]
 impl AuthorizationProvider for PolicyAuthProvider {
+    async fn check_context(
+        &self, ctx: &hyprstream_rpc::service::EnvelopeContext, resource: &str, operation: &str,
+    ) -> anyhow::Result<bool> {
+        let subject = ctx.subject();
+        let request = PolicyCheck {
+            subject: subject.to_string(), domain: String::new(),
+            resource: resource.to_owned(), operation: operation.to_owned(),
+        };
+        crate::services::policy::check_with_holder_evidence(
+            &self.client, &request, ctx.jwt_token(), &subject, ctx.original_holder_evidence(),
+        ).await
+    }
+
+    async fn check_batch_context(
+        &self, ctx: &hyprstream_rpc::service::EnvelopeContext, resources: &[String], operation: &str,
+    ) -> anyhow::Result<Vec<bool>> {
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let subject = ctx.subject();
+        if ctx.jwt_token().is_some() && !subject.is_federated()
+            && subject.name().is_some_and(|name| name.starts_with("service:"))
+        {
+            let mut decisions = Vec::with_capacity(resources.len());
+            for resource in resources {
+                decisions.push(self.check_context(ctx, resource, operation).await?);
+            }
+            Ok(decisions)
+        } else {
+            self.check_batch(&subject.to_string(), "*", resources, operation, ctx.jwt_token()).await
+        }
+    }
+
     async fn check_batch(
         &self, subject: &str, domain: &str, resources: &[String],
         operation: &str, bearer: Option<&str>,

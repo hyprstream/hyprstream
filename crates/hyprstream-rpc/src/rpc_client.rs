@@ -874,6 +874,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             )?;
             let public = keypair.public();
             envelope = envelope.with_response_kem_recipient(public.clone());
+            // This unverified subject inspection only selects extra proof
+            // emission; it grants no authority. Policy verifies the credential
+            // and holder independently. User delegation remains unchanged.
+            if envelope.delegation_token.is_none() && envelope.jwt_token()
+                .and_then(|token| crate::auth::decode_unverified(token).ok())
+                .is_some_and(|claims| claims.sub.starts_with("service:"))
+            {
+                envelope.authorization_witness = Some(
+                    crate::authorization_witness::sign(&envelope, &self.signer).await?,
+                );
+            }
             let pending = Some(PendingResponse {
                 request_id,
                 request_iat: envelope.iat,

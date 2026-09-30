@@ -546,6 +546,8 @@ mod tests {
     fn widening_requires_complete_coverage_and_narrowing_is_always_available() {
         let _guard = CACHE_TEST_LOCK.lock();
         let control = MacActivationControl::default();
+        assert_eq!(control.mode(), MacActivationMode::IdentityAware);
+        control.narrow_to_floor();
         let incomplete = report(false);
         let mut evidence = MacActivationEvidence {
             genesis: &incomplete,
@@ -569,6 +571,7 @@ mod tests {
     fn unverified_attach_transport_structurally_blocks_g2_widening() {
         let _guard = CACHE_TEST_LOCK.lock();
         let control = MacActivationControl::default();
+        control.narrow_to_floor();
         control.block_unverified_attach_transport("worker-uds-vsock");
 
         let complete = report(true);

@@ -183,7 +183,8 @@ struct EndpointInfo {
   socketKind @0 :Text;
   # Endpoint string (e.g. "inproc://hyprstream/policy")
   endpoint @1 :Text;
-  # Service identity JWT (carries sub, pub, exp — replaces self-proof fields)
+  # Reserved compatibility field. Discovery never serializes service bearer
+  # JWTs; consumers must treat this as empty and use the bound metadata below.
   serviceJwt @2 :Text;
   # TLS endorsement: Sign(tls_key, ed25519_pubkey || domain) — optional
   tlsEndorsement @3 :Data;
@@ -394,4 +395,3 @@ struct NodeLiveness {
   loadFraction @2 :Float32;         # [0,1], live
   ts           @3 :Int64;           # unix millis this snapshot was taken (0 = use receipt time)
 }
-
