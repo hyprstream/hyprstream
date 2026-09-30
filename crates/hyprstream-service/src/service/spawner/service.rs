@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use super::{ProcessConfig, ProcessSpawner, SpawnedProcess};
 use hyprstream_rpc::error::Result;
@@ -809,6 +809,7 @@ impl ServiceSpawner {
             kind: ServiceKind::Thread {
                 handle: Some(thread_handle),
                 shutdown,
+                completion: None,
             },
             _registration: registration,
         })
@@ -874,6 +875,10 @@ pub enum ServiceKind {
     Thread {
         handle: Option<JoinHandle<()>>,
         shutdown: Arc<Notify>,
+        /// Shared completion for a join started by an earlier `stop()` call.
+        /// A cancelled waiter must not make a later stop report success before
+        /// the owner thread has actually reached a terminal result.
+        completion: Option<Arc<ThreadStopCompletion>>,
     },
 
     /// Running as a subprocess with PID file tracking.
@@ -882,6 +887,107 @@ pub enum ServiceKind {
         /// PID file path (XDG-compliant) for lifecycle management.
         pid_file: PathBuf,
     },
+}
+
+#[derive(Clone)]
+enum ThreadStopTerminal {
+    Stopped,
+    Failed(String),
+}
+
+#[doc(hidden)]
+pub struct ThreadStopCompletion {
+    terminal: watch::Sender<Option<ThreadStopTerminal>>,
+    /// The original worker handle stays here until the dedicated join owner
+    /// has taken and joined it. This avoids an ambiguous `spawn_blocking`
+    /// cancellation path that could otherwise detach the worker.
+    join_handle: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    join_started: std::sync::atomic::AtomicBool,
+    /// The joining task owns registration while teardown is in progress, so a
+    /// cancelled stop waiter (or a dropped outer owner) cannot unregister the
+    /// service before its thread and bridge have stopped.
+    registration: parking_lot::Mutex<Option<ServiceRegistration>>,
+}
+
+impl ThreadStopCompletion {
+    fn new(registration: Option<ServiceRegistration>, join_handle: JoinHandle<()>) -> Self {
+        let (terminal, _receiver) = watch::channel(None);
+        Self {
+            terminal,
+            join_handle: parking_lot::Mutex::new(Some(join_handle)),
+            join_started: std::sync::atomic::AtomicBool::new(false),
+            registration: parking_lot::Mutex::new(registration),
+        }
+    }
+
+    fn publish(&self, terminal: ThreadStopTerminal) {
+        // `send` drops the value when a cancelled first stop waiter was the
+        // final receiver. Retain the terminal result for a later stop caller.
+        self.terminal.send_replace(Some(terminal));
+    }
+
+    fn release_registration(&self) {
+        self.registration.lock().take();
+    }
+
+    fn ensure_join_started(self: &Arc<Self>, service_id: &str) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        if self.terminal.borrow().is_some()
+            || self
+                .join_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Ok(());
+        }
+
+        let completion = Arc::clone(self);
+        let joiner_name = format!("{service_id}-join");
+        if let Err(error) = thread::Builder::new().name(joiner_name).spawn(move || {
+            let handle = completion.join_handle.lock().take();
+            let terminal = match handle {
+                Some(handle) => match handle.join() {
+                    Ok(()) => ThreadStopTerminal::Stopped,
+                    Err(_) => ThreadStopTerminal::Failed(
+                        "service thread panicked during shutdown".to_owned(),
+                    ),
+                },
+                None => ThreadStopTerminal::Failed(
+                    "service thread join owner started without a worker handle".to_owned(),
+                ),
+            };
+            // Only this dedicated owner consumes the actual JoinHandle, so
+            // registration cannot be released before a definitive join result.
+            completion.release_registration();
+            completion.publish(terminal);
+        }) {
+            self.join_started.store(false, Ordering::Release);
+            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                "service thread {service_id} join supervisor failed to start: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn wait(&self) -> Result<()> {
+        let mut receiver = self.terminal.subscribe();
+        loop {
+            if let Some(terminal) = receiver.borrow().clone() {
+                return match terminal {
+                    ThreadStopTerminal::Stopped => Ok(()),
+                    ThreadStopTerminal::Failed(error) => Err(
+                        hyprstream_rpc::error::RpcError::SpawnFailed(error),
+                    ),
+                };
+            }
+            receiver.changed().await.map_err(|_| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(
+                    "service thread stop completion owner exited without a terminal result".to_owned(),
+                )
+            })?;
+        }
+    }
 }
 
 /// Handle for a spawned service.
@@ -926,7 +1032,11 @@ impl SpawnedService {
     ) -> Self {
         Self {
             id,
-            kind: ServiceKind::Thread { handle, shutdown },
+            kind: ServiceKind::Thread {
+                handle,
+                shutdown,
+                completion: None,
+            },
             _registration: registration,
         }
     }
@@ -943,8 +1053,13 @@ impl SpawnedService {
                 .as_ref()
                 .map(hyprstream_rpc::service::ServiceHandle::is_running)
                 .unwrap_or(false),
-            ServiceKind::Thread { handle, .. } => {
-                handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+            ServiceKind::Thread {
+                handle, completion, ..
+            } => {
+                completion
+                    .as_ref()
+                    .map(|completion| completion.terminal.borrow().is_none())
+                    .unwrap_or_else(|| handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false))
             }
             ServiceKind::Subprocess { pid_file, .. } => {
                 // Check if PID file exists and process is alive (signal 0)
@@ -962,21 +1077,39 @@ impl SpawnedService {
 
     /// Stop the service.
     ///
-    /// Idempotent: subsequent calls are no-ops if already stopped.
+    /// Idempotent: subsequent calls share the first terminal teardown result.
     pub async fn stop(&mut self) -> Result<()> {
-        match &mut self.kind {
+        let (kind, registration) = (&mut self.kind, &mut self._registration);
+        match kind {
             ServiceKind::TokioTask { handle } => {
                 if let Some(mut h) = handle.take() {
                     h.stop().await;
                 }
             }
-            ServiceKind::Thread { handle, shutdown } => {
-                // Signal shutdown
-                shutdown.notify_one();
+            ServiceKind::Thread {
+                handle,
+                shutdown,
+                completion,
+            } => {
+                // A threaded service may have independent lifecycle and serving
+                // waiters. Both must observe shutdown before the owner joins.
+                shutdown.notify_waiters();
 
-                // Wait for thread to finish
-                if let Some(h) = handle.take() {
-                    let _ = h.join();
+                if let Some(existing) = completion.as_ref() {
+                    // An earlier caller may have been cancelled while the join
+                    // was pending. Its teardown owner remains live, and every
+                    // later caller must observe that same terminal result.
+                    existing.ensure_join_started(&self.id)?;
+                    existing.wait().await?;
+                } else if let Some(h) = handle.take() {
+                    // The cancellable caller does not own the join. A dedicated
+                    // native join owner retains both the actual JoinHandle and
+                    // registry registration until the worker is terminal.
+                    let service_id = self.id.clone();
+                    let owned_completion = Arc::new(ThreadStopCompletion::new(registration.take(), h));
+                    *completion = Some(Arc::clone(&owned_completion));
+                    owned_completion.ensure_join_started(&service_id)?;
+                    owned_completion.wait().await?;
                 }
             }
             ServiceKind::Subprocess { process, pid_file } => {
@@ -1005,6 +1138,28 @@ impl SpawnedService {
 
         tracing::info!("Service {} stopped", self.id);
         Ok(())
+    }
+}
+
+impl Drop for SpawnedService {
+    fn drop(&mut self) {
+        if let ServiceKind::Thread {
+            completion: Some(completion),
+            ..
+        } = &self.kind
+        {
+            if let Err(error) = completion.ensure_join_started(&self.id) {
+                tracing::error!(
+                    service = %self.id,
+                    error = %error,
+                    "retaining thread teardown state after join-supervisor start failure"
+                );
+                // Releasing registration or the JoinHandle would make an
+                // uncertain worker invisible. Leak only this exceptional
+                // completion owner until process-level recovery instead.
+                let _ = Arc::into_raw(Arc::clone(completion));
+            }
+        }
     }
 }
 
@@ -1331,6 +1486,458 @@ mod tests {
         fn name(&self) -> &str { "echo" }
         fn transport(&self) -> &TransportConfig { &self.echo.transport }
         fn signing_key(&self) -> SigningKey { self.echo.signing_key.clone() }
+    }
+
+    /// Test-only threaded owner with two independently armed shutdown waiters:
+    /// a lifecycle observer and the inproc serving loop. Readiness is withheld
+    /// until both waiters are armed so this test exercises broadcast shutdown,
+    /// not Notify registration timing.
+    struct TwoWaiterInprocService {
+        service: GatedService,
+        lifecycle_observed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Spawnable for TwoWaiterInprocService {
+        fn name(&self) -> &str {
+            RequestService::name(&self.service)
+        }
+
+        fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
+            vec![(SocketKind::Rep, self.service.transport().clone())]
+        }
+
+        fn run(
+            self: Box<Self>,
+            shutdown: Arc<Notify>,
+            on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ) -> Result<()> {
+            let TwoWaiterInprocService {
+                service,
+                lifecycle_observed,
+            } = *self;
+            let transport = service.transport().clone();
+            let signing_key = service.signing_key();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "two-waiter test runtime: {error}"
+                    ))
+                })?;
+
+            runtime.block_on(async move {
+                let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
+                let bridge = Arc::new(
+                    hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+                        service,
+                        nonce_cache,
+                        0,
+                    )
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "two-waiter test bridge: {error}"
+                        ))
+                    })?,
+                );
+                let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
+                    bridge.clone();
+
+                let (lifecycle_armed_tx, lifecycle_armed_rx) = tokio::sync::oneshot::channel();
+                let lifecycle_shutdown = Arc::clone(&shutdown);
+                let lifecycle = tokio::spawn(async move {
+                    let notified = lifecycle_shutdown.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let _ = lifecycle_armed_tx.send(());
+                    notified.await;
+                    lifecycle_observed.store(true, std::sync::atomic::Ordering::Release);
+                });
+                lifecycle_armed_rx.await.map_err(|_| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "two-waiter lifecycle exited before arming".to_owned(),
+                    )
+                })?;
+
+                let (serve_armed_tx, serve_armed_rx) = tokio::sync::oneshot::channel();
+                let serve_shutdown = Arc::clone(&shutdown);
+                let serve = tokio::spawn(async move {
+                    hyprstream_rpc::service::serve::serve_bridged_with_shutdown_armed_silent(
+                        &transport,
+                        processor,
+                        signing_key,
+                        serve_shutdown,
+                        None,
+                        Some(serve_armed_tx),
+                    )
+                    .await
+                });
+                serve_armed_rx.await.map_err(|_| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(
+                        "two-waiter inproc server exited before arming".to_owned(),
+                    )
+                })?;
+                if let Some(ready) = on_ready {
+                    let _ = ready.send(());
+                }
+
+                let serve_result = serve
+                    .await
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "two-waiter inproc server task failed: {error}"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "two-waiter inproc server failed: {error}"
+                        ))
+                    });
+                let lifecycle_result = lifecycle.await.map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "two-waiter lifecycle task failed: {error}"
+                    ))
+                });
+                let bridge_result = bridge.shutdown().await.map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "two-waiter bridge shutdown failed: {error}"
+                    ))
+                });
+                serve_result.and(lifecycle_result).and(bridge_result)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn threaded_stop_broadcasts_to_lifecycle_and_inproc_with_retained_client() -> AnyhowResult<()> {
+        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+
+        let (key, _) = generate_signing_keypair();
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(
+            key.verifying_key().to_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
+        let store = Arc::new(store);
+        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store.clone()),
+        })?;
+
+        let endpoint = "threaded-two-waiter-retained-client";
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lifecycle_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service = TwoWaiterInprocService {
+            service: GatedService {
+                echo: EchoService::new(TransportConfig::inproc(endpoint), key.clone()),
+                entered: entered.clone(),
+                release: release.clone(),
+                dropped: dropped.clone(),
+                panic_on_drop: false,
+            },
+            lifecycle_observed: lifecycle_observed.clone(),
+        };
+        let mut spawned = ServiceSpawner::threaded().spawn(service).await?;
+        let processor = hyprstream_rpc::dial::lookup_inproc(endpoint)
+            .ok_or_else(|| anyhow!("two-waiter inproc endpoint was not registered"))?;
+        let client = Arc::new(
+            RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                InMemoryTransport::new(processor),
+                Some(key.verifying_key()),
+            )
+            .with_response_pq_store(store),
+        );
+        let caller = client.clone();
+        let response = tokio::spawn(async move { caller.call(b"accepted".to_vec()).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
+
+        let stop = tokio::spawn(async move { spawned.stop().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while hyprstream_rpc::dial::lookup_inproc(endpoint).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            lifecycle_observed.load(std::sync::atomic::Ordering::Acquire),
+            "broadcast shutdown must wake the lifecycle waiter"
+        );
+        assert!(
+            !stop.is_finished(),
+            "thread owner returned before the accepted request drained"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec()))
+                .await?
+                .is_err(),
+            "retained client must lose admission after endpoint unregister"
+        );
+
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), response).await???,
+            hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), stop).await???;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "thread owner must join the bridge after drain"
+        );
+        assert!(client.call(b"late".to_vec()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_direct_thread_stop_waits_for_the_same_terminal_join() -> AnyhowResult<()> {
+        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+
+        let (key, _) = generate_signing_keypair();
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(
+            key.verifying_key().to_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
+        let store = Arc::new(store);
+        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store.clone()),
+        })?;
+
+        let endpoint = "threaded-stop-cancellation-retained-client";
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lifecycle_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service = TwoWaiterInprocService {
+            service: GatedService {
+                echo: EchoService::new(TransportConfig::inproc(endpoint), key.clone()),
+                entered: entered.clone(),
+                release: release.clone(),
+                dropped: dropped.clone(),
+                panic_on_drop: false,
+            },
+            lifecycle_observed: lifecycle_observed.clone(),
+        };
+        let mut spawned = ServiceSpawner::threaded().spawn(service).await?;
+        let processor = hyprstream_rpc::dial::lookup_inproc(endpoint)
+            .ok_or_else(|| anyhow!("direct-stop endpoint was not registered"))?;
+        let client = Arc::new(
+            RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                InMemoryTransport::new(processor),
+                Some(key.verifying_key()),
+            )
+            .with_response_pq_store(store),
+        );
+        let caller = client.clone();
+        let response = tokio::spawn(async move { caller.call(b"accepted".to_vec()).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
+
+        let mut first_stop = Box::pin(spawned.stop());
+        let endpoint_unregistered = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while hyprstream_rpc::dial::lookup_inproc(endpoint).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow!("first stop did not unregister endpoint before cancellation"))
+        };
+        tokio::select! {
+            result = &mut first_stop => anyhow::bail!(
+                "first stop returned before the accepted request drained: {result:?}"
+            ),
+            result = endpoint_unregistered => result?,
+        }
+        drop(first_stop);
+
+        assert!(
+            lifecycle_observed.load(std::sync::atomic::Ordering::Acquire),
+            "first stop must broadcast to the lifecycle waiter before cancellation"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec()))
+                .await?
+                .is_err(),
+            "endpoint removal must reject retained-client late admission"
+        );
+
+        let mut second_stop = Box::pin(spawned.stop());
+        tokio::select! {
+            result = &mut second_stop => anyhow::bail!(
+                "second stop returned before the original join completed: {result:?}"
+            ),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+        }
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "bridge/service destruction must wait for the accepted request"
+        );
+
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), response).await???,
+            hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut second_stop).await??;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "second stop must await bridge/service destruction from the original join"
+        );
+        assert!(client.call(b"late".to_vec()).await.is_err());
+        Ok(())
+    }
+
+    fn blocking_panicking_thread_for_stop_test(
+        armed: std::sync::mpsc::Sender<()>,
+        shutdown_observed: tokio::sync::oneshot::Sender<()>,
+        release: Arc<Notify>,
+    ) -> SpawnedService {
+        let shutdown = Arc::new(Notify::new());
+        let worker_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("build stop-error test runtime: {error}"));
+            runtime.block_on(async move {
+                let notified = worker_shutdown.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                armed
+                    .send(())
+                    .unwrap_or_else(|error| panic!("signal stop-error worker readiness: {error}"));
+                notified.await;
+                let _ = shutdown_observed.send(());
+                release.notified().await;
+                panic!("deliberate direct-stop terminal error")
+            });
+        });
+        SpawnedService::thread(
+            "direct-stop-terminal-error".to_owned(),
+            Some(handle),
+            shutdown,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancelled_direct_thread_stop_replays_the_same_terminal_error() -> AnyhowResult<()> {
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let mut spawned = blocking_panicking_thread_for_stop_test(
+            armed_tx,
+            shutdown_observed_tx,
+            Arc::clone(&release),
+        );
+        tokio::task::spawn_blocking(move || {
+            armed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| anyhow!("stop-error worker did not arm: {error}"))
+        })
+        .await??;
+
+        let mut first_stop = Box::pin(spawned.stop());
+        tokio::select! {
+            result = &mut first_stop => anyhow::bail!(
+                "first stop returned before the controlled thread terminal: {result:?}"
+            ),
+            result = shutdown_observed_rx => result.map_err(|error| anyhow!(
+                "stop-error worker dropped shutdown observation: {error}"
+            ))?,
+        }
+        drop(first_stop);
+
+        let mut second_stop = Box::pin(spawned.stop());
+        tokio::select! {
+            result = &mut second_stop => anyhow::bail!(
+                "second stop returned before the original terminal error: {result:?}"
+            ),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+        }
+        release.notify_one();
+        let second_error = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            &mut second_stop,
+        )
+        .await?
+        {
+            Err(error) => error.to_string(),
+            Ok(()) => anyhow::bail!("joined panicking worker unexpectedly stopped successfully"),
+        };
+        drop(second_stop);
+        let third_error = match spawned.stop().await {
+            Err(error) => error.to_string(),
+            Ok(()) => anyhow::bail!("later stop unexpectedly hid the terminal join error"),
+        };
+        assert_eq!(
+            second_error, third_error,
+            "every later stop must receive the same terminal error"
+        );
+        assert!(
+            second_error.contains("panicked during shutdown"),
+            "terminal error must remain truthful: {second_error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_direct_thread_stop_retains_terminal_after_all_waiters_drop() -> AnyhowResult<()> {
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let mut spawned = blocking_panicking_thread_for_stop_test(
+            armed_tx,
+            shutdown_observed_tx,
+            Arc::clone(&release),
+        );
+        tokio::task::spawn_blocking(move || {
+            armed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| anyhow!("no-waiter worker did not arm: {error}"))
+        })
+        .await??;
+
+        let mut first_stop = Box::pin(spawned.stop());
+        tokio::select! {
+            result = &mut first_stop => anyhow::bail!(
+                "first stop returned before the controlled thread terminal: {result:?}"
+            ),
+            result = shutdown_observed_rx => result.map_err(|error| anyhow!(
+                "no-waiter worker dropped shutdown observation: {error}"
+            ))?,
+        }
+        drop(first_stop);
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while spawned.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("joined worker never published a terminal result"))?;
+        let second_error = match spawned.stop().await {
+            Err(error) => error.to_string(),
+            Ok(()) => anyhow::bail!("late stop unexpectedly hid the retained terminal error"),
+        };
+        assert!(
+            second_error.contains("panicked during shutdown"),
+            "late terminal error must remain truthful: {second_error}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

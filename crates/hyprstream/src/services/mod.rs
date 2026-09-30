@@ -103,6 +103,34 @@ pub mod rpc_types;
 pub mod typed;
 pub mod worker;
 
+#[cfg(test)]
+pub(crate) mod restart_diag {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+
+    pub(crate) fn enable() {
+        STARTED.get_or_init(Instant::now);
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn phase(label: &'static str) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        let elapsed_ms = STARTED.get().map_or(0, |started| started.elapsed().as_millis());
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::Write::write_fmt(
+            &mut stderr,
+            format_args!("RESTART_DIAG_PHASE={label} elapsed_ms={elapsed_ms}\n"),
+        );
+        let _ = std::io::Write::flush(&mut stderr);
+    }
+}
+
 // Postgres-backed PDS record store (#1257) — gated behind `pds-postgres`.
 // When a `[rds]` config section is present, the factory selects this backend;
 // otherwise the RocksDB local backend is used. D2 invariant: signed bytes are
