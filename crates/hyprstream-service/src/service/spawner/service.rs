@@ -1075,6 +1075,20 @@ impl SpawnedService {
         }
     }
 
+    /// Broadcast threaded shutdown to waiters that are already armed and retain
+    /// one notification for the lifecycle waiter that is created immediately
+    /// after a service reports readiness.
+    ///
+    /// `Notify::notify_waiters()` intentionally has no stored permit. Threaded
+    /// services that create their runtime after their ready handshake therefore
+    /// need the retained `notify_one()` permit to observe a stop requested in
+    /// that narrow interval. Services with multiple independent waiters must
+    /// still arm those waiters before reporting ready.
+    fn request_thread_shutdown(shutdown: &Notify) {
+        shutdown.notify_waiters();
+        shutdown.notify_one();
+    }
+
     /// Stop the service.
     ///
     /// Idempotent: subsequent calls share the first terminal teardown result.
@@ -1092,8 +1106,9 @@ impl SpawnedService {
                 completion,
             } => {
                 // A threaded service may have independent lifecycle and serving
-                // waiters. Both must observe shutdown before the owner joins.
-                shutdown.notify_waiters();
+                // waiters. Wake armed waiters and retain shutdown for the
+                // lifecycle waiter that may be installed just after readiness.
+                Self::request_thread_shutdown(shutdown);
 
                 if let Some(existing) = completion.as_ref() {
                     // An earlier caller may have been cancelled while the join
@@ -1830,6 +1845,85 @@ mod tests {
             shutdown,
             None,
         )
+    }
+
+    fn ready_before_waiter_thread_for_stop_test(
+        ready: std::sync::mpsc::Sender<()>,
+        arm_waiter: std::sync::mpsc::Receiver<()>,
+        shutdown_observed: tokio::sync::oneshot::Sender<()>,
+    ) -> (SpawnedService, Arc<ThreadStopCompletion>) {
+        let shutdown = Arc::new(Notify::new());
+        let worker_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            ready
+                .send(())
+                .unwrap_or_else(|error| panic!("signal ready-before-waiter readiness: {error}"));
+            arm_waiter
+                .recv()
+                .unwrap_or_else(|error| panic!("release ready-before-waiter arm: {error}"));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("build ready-before-waiter runtime: {error}"));
+            runtime.block_on(async move {
+                worker_shutdown.notified().await;
+                let _ = shutdown_observed.send(());
+            });
+        });
+        let completion = Arc::new(ThreadStopCompletion::new(None, handle));
+        (
+            SpawnedService {
+                id: "ready-before-waiter".to_owned(),
+                kind: ServiceKind::Thread {
+                    handle: None,
+                    shutdown,
+                    completion: Some(Arc::clone(&completion)),
+                },
+                _registration: None,
+            },
+            completion,
+        )
+    }
+
+    #[tokio::test]
+    async fn threaded_stop_retains_shutdown_for_waiter_armed_after_readiness() -> AnyhowResult<()> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (arm_waiter_tx, arm_waiter_rx) = std::sync::mpsc::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+        let (mut spawned, completion) =
+            ready_before_waiter_thread_for_stop_test(ready_tx, arm_waiter_rx, shutdown_observed_tx);
+
+        tokio::task::spawn_blocking(move || {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| anyhow!("thread did not report readiness: {error}"))
+        })
+        .await??;
+
+        let mut stop = Box::pin(spawned.stop());
+        tokio::select! {
+            result = &mut stop => anyhow::bail!(
+                "stop returned before the thread installed its post-readiness waiter: {result:?}"
+            ),
+            _ = async {
+                while !completion.join_started.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+        }
+        // `join_started` is set only after stop has requested shutdown. Arm the
+        // service waiter now, reproducing an immediate stop after readiness.
+        arm_waiter_tx
+            .send(())
+            .map_err(|error| anyhow!("release post-readiness waiter: {error}"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_observed_rx)
+            .await
+            .map_err(|_| anyhow!("late shutdown waiter did not observe retained stop"))?
+            .map_err(|error| anyhow!("late shutdown observer dropped: {error}"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut stop)
+            .await
+            .map_err(|_| anyhow!("stop did not join the late waiter thread"))??;
+        Ok(())
     }
 
     #[tokio::test]
