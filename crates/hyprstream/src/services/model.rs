@@ -1382,31 +1382,72 @@ impl ModelService {
         }
     }
 
-    /// Return status entries for all known models (loaded + loading).
+    /// Return status entries for all known models (loaded, loading, and unloading).
     /// Absence from this list means unloaded.
     async fn model_status_all(&self, verified_tenant: &str) -> Vec<GenModelStatusEntry> {
-        let cache = self.loaded_models.read().await;
-        let pending = self.pending_loads.lock().await;
-        let mut entries: Vec<GenModelStatusEntry> = cache
-            .iter()
-            .filter(|(instance, _)| instance.tenant() == verified_tenant)
-            .map(|(_, model)| GenModelStatusEntry {
-                model_ref: model.model_ref.clone(),
-                status: "loaded".to_owned(),
-                reach: Self::model_reach(&model.network_transport),
-                loaded_at: model.loaded_at.elapsed().as_millis() as i64,
-                last_used: model.last_used.elapsed().as_millis() as i64,
-                online_training_config: model.ttt_config.as_ref()
-                    .map(Self::ttt_config_to_wire)
-                    .unwrap_or_default(),
-                generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
-            })
-            .collect();
-        for instance in pending.iter().filter(|instance| instance.tenant() == verified_tenant) {
-            if !cache.contains(instance) {
+        // Do not hold the cache while reading lifecycle reservations: unload
+        // reserves `unloading_models` before popping the cache entry.
+        let (mut entries, loaded): (Vec<_>, HashSet<_>) = {
+            let cache = self.loaded_models.read().await;
+            (
+                cache
+                    .iter()
+                    .filter(|(instance, _)| instance.tenant() == verified_tenant)
+                    .map(|(_, model)| GenModelStatusEntry {
+                        model_ref: model.model_ref.clone(),
+                        status: "loaded".to_owned(),
+                        reach: Self::model_reach(&model.network_transport),
+                        loaded_at: model.loaded_at.elapsed().as_millis() as i64,
+                        last_used: model.last_used.elapsed().as_millis() as i64,
+                        online_training_config: model.ttt_config.as_ref()
+                            .map(Self::ttt_config_to_wire)
+                            .unwrap_or_default(),
+                        generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
+                    })
+                    .collect(),
+                cache
+                    .iter()
+                    .filter(|(instance, _)| instance.tenant() == verified_tenant)
+                    .map(|(instance, _)| instance.clone())
+                    .collect(),
+            )
+        };
+        let pending: HashSet<_> = {
+            self.pending_loads
+                .lock()
+                .await
+                .iter()
+                .filter(|instance| instance.tenant() == verified_tenant)
+                .cloned()
+                .collect()
+        };
+        for instance in &pending {
+            if !loaded.contains(instance) {
                 entries.push(GenModelStatusEntry {
                     model_ref: instance.model_ref().to_owned(),
                     status: "loading".to_owned(),
+                    reach: Vec::new(),
+                    loaded_at: 0,
+                    last_used: 0,
+                    online_training_config: GenOnlineTrainingConfig::default(),
+                    generation_defaults: GenGenerationDefaults::default(),
+                });
+            }
+        }
+        let unloading: Vec<_> = {
+            self.unloading_models
+                .lock()
+                .await
+                .iter()
+                .filter(|instance| instance.tenant() == verified_tenant)
+                .cloned()
+                .collect()
+        };
+        for instance in unloading {
+            if !loaded.contains(&instance) && !pending.contains(&instance) {
+                entries.push(GenModelStatusEntry {
+                    model_ref: instance.model_ref().to_owned(),
+                    status: "unloading".to_owned(),
                     reach: Vec::new(),
                     loaded_at: 0,
                     last_used: 0,
@@ -1420,19 +1461,21 @@ impl ModelService {
 
     /// Return status entry for a specific model ref (0 or 1 element).
     async fn model_status_single(&self, instance: &InferenceInstanceId) -> Vec<GenModelStatusEntry> {
-        let cache = self.loaded_models.read().await;
-        if let Some(model) = cache.peek(instance) {
-            return vec![GenModelStatusEntry {
-                model_ref: instance.model_ref().to_owned(),
-                status: "loaded".to_owned(),
-                reach: Self::model_reach(&model.network_transport),
-                loaded_at: model.loaded_at.elapsed().as_millis() as i64,
-                last_used: model.last_used.elapsed().as_millis() as i64,
-                online_training_config: model.ttt_config.as_ref()
-                    .map(Self::ttt_config_to_wire)
-                    .unwrap_or_default(),
-                generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
-            }];
+        {
+            let cache = self.loaded_models.read().await;
+            if let Some(model) = cache.peek(instance) {
+                return vec![GenModelStatusEntry {
+                    model_ref: instance.model_ref().to_owned(),
+                    status: "loaded".to_owned(),
+                    reach: Self::model_reach(&model.network_transport),
+                    loaded_at: model.loaded_at.elapsed().as_millis() as i64,
+                    last_used: model.last_used.elapsed().as_millis() as i64,
+                    online_training_config: model.ttt_config.as_ref()
+                        .map(Self::ttt_config_to_wire)
+                        .unwrap_or_default(),
+                    generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
+                }];
+            }
         }
         let pending = self.pending_loads.lock().await;
         if pending.contains(instance) {
@@ -1446,7 +1489,20 @@ impl ModelService {
                 generation_defaults: GenGenerationDefaults::default(),
             }]
         } else {
-            vec![]
+            drop(pending);
+            if self.unloading_models.lock().await.contains(instance) {
+                vec![GenModelStatusEntry {
+                    model_ref: instance.model_ref().to_owned(),
+                    status: "unloading".to_owned(),
+                    reach: Vec::new(),
+                    loaded_at: 0,
+                    last_used: 0,
+                    online_training_config: GenOnlineTrainingConfig::default(),
+                    generation_defaults: GenGenerationDefaults::default(),
+                }]
+            } else {
+                vec![]
+            }
         }
     }
 
@@ -3941,6 +3997,27 @@ mod tests {
             !service.loaded_models.read().await.contains(&instance),
             "the cache must not expose a worker after its shutdown begins"
         );
+        let (all_status, single_status) = tokio::join!(
+            service.model_status_all(instance.tenant()),
+            service.model_status_single(&instance),
+        );
+        assert_eq!(
+            all_status
+                .iter()
+                .filter(|entry| entry.model_ref == instance.model_ref())
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unloading"],
+            "all-status must retain an unloading worker after its caller is cancelled"
+        );
+        assert_eq!(
+            single_status
+                .iter()
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unloading"],
+            "single-status must not report the draining worker as absent"
+        );
         let error = match service.load_model(&instance, None, None).await {
             Err(error) => error,
             Ok(_) => panic!("a replacement load must not race the draining worker"),
@@ -3961,6 +4038,14 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("owned teardown did not clear its reservation after join"));
+        let (all_status, single_status) = tokio::join!(
+            service.model_status_all(instance.tenant()),
+            service.model_status_single(&instance),
+        );
+        assert!(
+            all_status.is_empty() && single_status.is_empty(),
+            "status absence is permitted only after teardown releases its reservation"
+        );
     }
 
     #[tokio::test]
