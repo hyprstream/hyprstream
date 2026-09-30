@@ -26,7 +26,6 @@ pub fn make_chat_spawner(
 
     use hyprstream_rpc_std::inference_client::GenerationRequest;
     use hyprstream_rpc_std::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
-    use hyprstream_rpc_std::model_client::ModelClient;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
     let sk = signing_key.clone();
@@ -59,7 +58,7 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
-                let model_client = match ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_inner.clone(), None) {
+                let model_client = match crate::tui::service::production_model_client(sk_inner.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::StreamError(format!(
