@@ -582,7 +582,7 @@ async fn authenticated_hybrid_oauth_issue_token_reaches_the_real_authorization_b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resolved_hybrid_policy_credential_cannot_be_replayed_for_issuance() -> Result<()> {
+async fn resolve_service_key_never_discloses_hybrid_policy_credential() -> Result<()> {
     install_crypto();
     hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
     let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
@@ -611,25 +611,12 @@ async fn resolved_hybrid_policy_credential_cannot_be_replayed_for_issuance() -> 
     let resolved = relay_client.resolve_service_key(&ResolveServiceKey {
         service_name: "policy".to_owned(),
     }).await?;
-    let disclosed = resolved.keys.into_iter()
+    assert!(resolved.service_jwt.is_none(), "legacy singleton must not disclose the holder credential");
+    let published = resolved.keys.into_iter()
         .find(|entry| entry.verifying_key == holder.verifying_key().as_bytes())
-        .and_then(|entry| entry.service_jwt).expect("real resolution returns the published policy WIT");
-    assert_eq!(disclosed, holder_token);
-    let subject = format!("replay-target-{}", uuid::Uuid::new_v4());
-    let sid = format!("replay-session-{}", uuid::Uuid::new_v4());
-    register_active_session(ISSUER, &sid, &subject, "staging-test").await?;
-    let request = IssueToken {
-        requested_scopes: Some(vec!["openid".to_owned()]), ttl: Some(300),
-        audience: Some(ISSUER.to_owned()), subject: Some(subject), user_pub_key: None,
-        dpop_jkt: None, issuer: Some(ISSUER.to_owned()), tenant: Some("staging-test".to_owned()),
-        require_clearance: false, session_id: Some(sid),
-        issuance_profile: IssueTokenProfile::InteractiveSession, client_id: Some("replay-test".to_owned()),
-    };
-    assert!(!holder_client.issue_token(&request).await?.token.is_empty(),
-        "the real holder must be able to issue this exact request");
-    let error = relay_client.with_delegated_bearer(disclosed).issue_token(&request).await
-        .expect_err("an admitted relay must not convert a public policy WIT into issuance authority");
-    assert!(format!("{error:?}").contains("dispatch denied"), "wrong denial boundary: {error:?}");
+        .expect("the registered verification key remains discoverable");
+    assert!(published.service_jwt.is_none(), "resolution must not disclose the holder credential");
+    assert_ne!(published.service_jwt.as_deref(), Some(holder_token.as_str()));
     Ok(())
 }
 

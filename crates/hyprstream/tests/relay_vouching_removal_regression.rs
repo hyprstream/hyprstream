@@ -522,11 +522,9 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
         .await?;
     assert!(!allowed, "A2: a relayed user must not acquire oauth's grant");
 
-    // B. MALICIOUS (inverted): harvest oauth's PUBLIC WIT through the real
-    // resolution RPC and relay it as a delegated service credential. With the
-    // vouching exception removed, the holder binding denies BEFORE foreign
-    // claims are published and nothing is minted.
-    let harvested = model_client
+    // B. The real resolution RPC exposes the verification key only. It must
+    // not turn OAuth's attestation into a harvestable delegated credential.
+    let published = model_client
         .resolve_service_key(&ResolveServiceKey {
             service_name: "oauth".to_owned(),
         })
@@ -534,14 +532,15 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
         .keys
         .into_iter()
         .find(|entry| entry.verifying_key == oauth_key.verifying_key().as_bytes())
-        .and_then(|entry| entry.service_jwt)
-        .expect("real resolution returns the published oauth WIT");
-    assert_eq!(harvested, oauth_wit, "the public attestation IS the live credential");
+        .expect("the registered OAuth verification key remains discoverable");
+    assert!(published.service_jwt.is_none(), "B: resolution must not disclose OAuth's credential");
 
+    // Holder binding remains mandatory even for an OAuth credential obtained
+    // through some independent compromise: the relay cannot replay it.
     let malicious = hop
         .policy_client(&relay_key, policy_vk, Some(model_wit.clone()))
         .await?
-        .with_delegated_bearer(harvested);
+        .with_delegated_bearer(oauth_wit);
     let error = malicious
         .check(&PolicyCheck {
             subject: String::new(),
@@ -550,40 +549,11 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
             operation: "manage".to_owned(),
         })
         .await
-        .expect_err(
-            "B: a harvested public WIT must deny once the vouching exception is removed",
-        );
-    // The denial is the uniform dispatch boundary: the relayed credential
-    // never authenticates, so no oauth claims are ever published and the
-    // caller-specific decision evaluates the relay's own (insufficient)
-    // identity. This is the required fail-closed entry point.
+        .expect_err("B: a foreign holder credential must deny at dispatch");
     assert!(
         error.to_string().contains("dispatch denied")
             || error.to_string().contains("requires its bound holder signer"),
-        "B: expected fail-closed denial before foreign claims entry, got: {error:?}"
-    );
-
-    // No authority conversion: the mint attempt with the same relayed
-    // credential is denied by dispatch (the credential never authenticated).
-    let mint = malicious
-        .issue_token(&IssueToken {
-            requested_scopes: Some(vec!["openid".to_owned()]),
-            ttl: Some(300),
-            audience: Some(ISSUER.to_owned()),
-            subject: Some("harvested-victim".to_owned()),
-            user_pub_key: None,
-            dpop_jkt: None,
-            issuer: Some(ISSUER.to_owned()),
-            tenant: None,
-            require_clearance: false,
-            session_id: None,
-            issuance_profile: IssueTokenProfile::Rfc8693,
-            client_id: Some("relay-removal-attack".to_owned()),
-        })
-        .await;
-    assert!(
-        mint.is_err(),
-        "B: no token may be minted for the relayed harvested credential"
+        "B: expected fail-closed holder denial, got: {error:?}"
     );
 
     hop.shutdown().await?;

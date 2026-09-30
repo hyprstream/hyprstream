@@ -573,8 +573,9 @@ fn validate_event_prefix(prefix: &str) -> Result<(), String> {
 
 /// Build the rotation-safe wire projection of a service's published key set.
 ///
-/// The scalar fields are a transition projection for one-key deployments.
-/// They are empty during overlap, where a positional singleton is unsafe.
+/// The scalar verification key is a transition projection for one-key
+/// deployments. Attestation JWTs are bearer credentials: discovery never
+/// serializes them, including in the per-key rotation projection.
 fn published_service_key_response(
     trust: &hyprstream_service::TrustStore,
     service_name: &str,
@@ -586,11 +587,11 @@ fn published_service_key_response(
     let singleton = (keys.len() == 1).then(|| &keys[0]);
     Ok(ServiceKeyResponse {
         verifying_key: singleton.map(|entry| entry.verifying_key.to_bytes().to_vec()).unwrap_or_default(),
-        service_jwt: singleton.and_then(|entry| entry.attestation.jwt.clone()),
+        service_jwt: None,
         keys: keys.into_iter().map(|entry| ServiceKeyCandidate {
             key_id: entry.key_id,
             verifying_key: entry.verifying_key.to_bytes().to_vec(),
-            service_jwt: entry.attestation.jwt,
+            service_jwt: None,
             not_after: entry.attestation.expires_at,
         }).collect(),
     })
@@ -5914,6 +5915,7 @@ mod tests {
         assert!(response.keys.iter().any(|entry| entry.verifying_key == retired.to_bytes()));
         assert!(response.keys.iter().any(|entry| entry.verifying_key == lead.to_bytes()));
         assert!(response.keys.iter().all(|entry| entry.key_id.starts_with("ed25519:")));
+        assert!(response.keys.iter().all(|entry| entry.service_jwt.is_none()));
     }
 
     #[test]
@@ -5931,7 +5933,7 @@ mod tests {
     }
 
     #[test]
-    fn one_key_response_keeps_legacy_projection_during_rollout() {
+    fn one_key_response_projects_verification_key_but_never_credential() {
         let trust = hyprstream_service::TrustStore::new();
         let key = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
         trust.insert(key, attestation(chrono::Utc::now().timestamp() + 60, "certificate"));
@@ -5942,7 +5944,8 @@ mod tests {
         };
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.verifying_key, key.to_bytes());
-        assert_eq!(response.service_jwt.as_deref(), Some("certificate"));
+        assert!(response.service_jwt.is_none());
+        assert!(response.keys[0].service_jwt.is_none());
     }
 
     #[tokio::test]
