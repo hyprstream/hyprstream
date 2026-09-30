@@ -1350,6 +1350,11 @@ impl TuiService {
             (sid, active_pane_id, cols, rows)
         };
 
+        let model_ref = model_ref.to_owned();
+        let service_token = required_service_token(&self.signing_key)?;
+        let (tool_caller, tool_descriptions, openai_tools) =
+            super::rpc_transport::make_tool_caller(&self.signing_key, service_token)?;
+
         // Rename the window to "Chat: model_ref" so the titlebar is meaningful.
         {
             let mut state = self.state.write().await;
@@ -1362,11 +1367,6 @@ impl TuiService {
                 }
             }
         }
-
-        let model_ref = model_ref.to_owned();
-
-        let (tool_caller, tool_descriptions, openai_tools) =
-            super::rpc_transport::make_tool_caller(&self.signing_key);
 
         let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
             hyprstream_tui::chat_app::ChatGenConfig::default(),

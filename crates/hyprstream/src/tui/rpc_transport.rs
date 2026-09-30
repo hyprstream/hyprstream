@@ -228,26 +228,34 @@ pub fn make_chat_spawner(
 /// Eagerly fetches the tool list so that `tool_descriptions` and `openai_tools`
 /// can be returned alongside the caller.  If the MCP service is unreachable,
 /// returns empty collections and a caller that immediately sends an error result.
+/// A missing or blank TUI service credential is rejected before either operation
+/// is constructed, so neither production MCP path can fall back to tokenless RPC.
 ///
 /// Returns `(caller, descriptions, openai_tools)` where:
 /// - `descriptions` maps UUID → human label (for TUI display)
 /// - `openai_tools` is the full OpenAI-format tool list for `apply_chat_template`
 pub fn make_tool_caller(
     signing_key: &SigningKey,
-) -> (
+    service_token: String,
+) -> anyhow::Result<(
     hyprstream_tui::chat_app::ToolCaller,
     HashMap<String, String>,
     Vec<serde_json::Value>,
-) {
+)> {
     use hyprstream_rpc_std::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
 
+    anyhow::ensure!(
+        !service_token.trim().is_empty(),
+        "TUI MCP service credential is unavailable"
+    );
     let sk = signing_key.clone();
 
     // ── Eagerly fetch tool list ───────────────────────────────────────────────
     // Spawned on a dedicated OS thread so `block_on` is safe regardless of
     // whether the caller is inside an existing Tokio runtime.
     let sk_fetch = sk.clone();
+    let token_fetch = service_token.clone();
     let (descriptions, openai_tools): (HashMap<String, String>, Vec<serde_json::Value>) =
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -255,7 +263,12 @@ pub fn make_tool_caller(
                 .build()
                 .ok()?;
             rt.block_on(async move {
-                let gen: GenMcpClient = GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_fetch, None).ok()?;
+                let gen: GenMcpClient = GenMcpClient::from_provider(
+                    &hyprstream_discovery::ProductionRpcClientProvider,
+                    sk_fetch,
+                    Some(token_fetch),
+                )
+                .ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -288,6 +301,7 @@ pub fn make_tool_caller(
               arguments: String,
               event_tx: std::sync::mpsc::SyncSender<ChatEvent>| {
             let sk_c = sk.clone();
+            let token_c = service_token.clone();
             let uuid_c = uuid.clone();
             std::thread::spawn(move || {
                 let result_str: String = (move || {
@@ -299,7 +313,11 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        let mcp_client = match GenMcpClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk_c, None) {
+                        let mcp_client = match GenMcpClient::from_provider(
+                            &hyprstream_discovery::ProductionRpcClientProvider,
+                            sk_c,
+                            Some(token_c),
+                        ) {
                             Ok(c) => c,
                             Err(e) => return format!("error: failed to create McpClient: {e}"),
                         };
@@ -331,5 +349,22 @@ pub fn make_tool_caller(
         },
     );
 
-    (caller, descriptions, openai_tools)
+    Ok((caller, descriptions, openai_tools))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tool_caller_rejects_missing_or_blank_service_credentials() {
+        let signing_key = SigningKey::from_bytes(&[0x51; 32]);
+        for token in [String::new(), " \t".to_owned()] {
+            let error = match make_tool_caller(&signing_key, token) {
+                Ok(_) => panic!("blank credential must not create a TUI MCP caller"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("service credential is unavailable"));
+        }
+    }
 }
