@@ -918,16 +918,21 @@ async fn cmd_ping(pool: &deadpool_postgres::Pool) -> AnyResult<()> {
 async fn cmd_replay_admit(pool: &deadpool_postgres::Pool, replay_id: &[u8; 32], expires_at: u64) -> AnyResult<bool> {
     let expires_at = i64::try_from(expires_at)
         .map_err(|_| anyhow::anyhow!("replay expiry exceeds PostgreSQL BIGINT range"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| anyhow::anyhow!("system clock predates Unix epoch"))?
-        .as_secs();
-    let now = i64::try_from(now)
-        .map_err(|_| anyhow::anyhow!("current time exceeds PostgreSQL BIGINT range"))?;
     let mut conn = pool.get().await
         .map_err(|e| anyhow::anyhow!("RDS replay admission: connection acquisition failed: {e}"))?;
     let tx = conn.transaction().await
         .map_err(|e| anyhow::anyhow!("RDS replay admission: begin transaction failed: {e}"))?;
+    // Use PostgreSQL's transaction clock, not the verifier host clock. All
+    // competing verifiers therefore agree which durable replay rows remain
+    // live while this atomic cleanup-and-insert transaction is serialized.
+    let now = tx
+        .query_one(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM transaction_timestamp()))::BIGINT",
+            &[],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS replay admission: database clock read failed: {e}"))?
+        .get::<_, i64>(0);
     // Bounded expiry collection keeps the table durable but not permanently
     // append-only. `SKIP LOCKED` lets concurrent verifiers collect disjoint
     // expired rows without waiting behind an admission transaction.

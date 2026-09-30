@@ -1468,10 +1468,14 @@ impl ModelService {
         // subject-keyed, by design.
         let placement_key = ctx.subject().to_string();
         // The co-located pinned instance executes Model-origin internal work —
-        // the caller credential is never relayed. Only the cross-host remote
-        // replica arm (a DIFFERENT node's service, not this Model's
-        // subprocessor) still requires a relayable bearer.
-        let relay_bearer = ctx.jwt_token().map(ToOwned::to_owned);
+        // the caller credential is never relayed. A remote replica is a
+        // different controller's service: it may receive an end-user bearer as
+        // delegated authority, but never a holder-bound service credential.
+        // For service callers the remote arm therefore fails its no-bearer
+        // gate and the router retries a healthy co-located candidate; when no
+        // such candidate exists, the request denies rather than transferring a
+        // credential whose cnf belongs to the original service signer.
+        let relay_bearer = Self::remote_relay_bearer(ctx).map(ToOwned::to_owned);
         let routed = self
             .select_inference_routed(model, &placement_key, relay_bearer.as_deref())
             .await?;
@@ -1498,6 +1502,21 @@ impl ModelService {
         match routed.locality {
             ReplicaLocality::CoLocated => routed.value.with_bearer(work_token),
             ReplicaLocality::Remote => routed.value,
+        }
+    }
+
+    fn remote_relay_bearer(ctx: &EnvelopeContext) -> Option<&str> {
+        Self::remote_relay_bearer_for_claims(ctx.claims(), ctx.jwt_token())
+    }
+
+    fn remote_relay_bearer_for_claims<'a>(
+        claims: Option<&hyprstream_rpc::auth::Claims>,
+        bearer: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if claims.is_some_and(|claims| claims.sub.starts_with("service:")) {
+            None
+        } else {
+            bearer
         }
     }
 
@@ -2785,6 +2804,32 @@ mod tests {
         std::sync::OnceLock::new();
     static SELECTOR_FIXTURE: std::sync::OnceLock<hyprstream_discovery::ProductionInferenceFixture> =
         std::sync::OnceLock::new();
+
+    #[test]
+    fn holder_bound_service_credentials_are_not_relayed_to_remote_replicas() {
+        let service = hyprstream_rpc::auth::Claims::new(
+            "service:registry".to_owned(),
+            0,
+            9_999_999_999,
+        );
+        let user = hyprstream_rpc::auth::Claims::new("alice".to_owned(), 0, 9_999_999_999);
+
+        assert_eq!(
+            ModelService::remote_relay_bearer_for_claims(Some(&service), Some("service-jwt")),
+            None,
+            "a service credential is holder-bound and must not be delegated to another controller"
+        );
+        assert_eq!(
+            ModelService::remote_relay_bearer_for_claims(Some(&user), Some("user-jwt")),
+            Some("user-jwt"),
+            "an authenticated end-user bearer remains relayable"
+        );
+        assert_eq!(
+            ModelService::remote_relay_bearer_for_claims(None, None),
+            None,
+            "an unauthenticated caller cannot select a remote relay path"
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct ReadinessObservation {
