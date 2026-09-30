@@ -962,10 +962,7 @@ async fn handle_rpc(
         }
 
         RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid, gen_defaults } => {
-            let (tool_caller, tool_descriptions, openai_tools) = match crate::tui::service::required_service_token(signing_key)
-                .and_then(|service_token| {
-                    crate::tui::rpc_transport::make_tool_caller(signing_key, service_token)
-                }) {
+            let (tool_caller, tool_descriptions, openai_tools) = match crate::tui::rpc_transport::make_tool_caller(signing_key) {
                 Ok(tool_caller) => tool_caller,
                 Err(_) => {
                     compositor.chrome.push_toast(

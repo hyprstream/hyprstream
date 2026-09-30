@@ -304,6 +304,14 @@ impl RdsConfig {
             .ok_or_else(|| anyhow::anyhow!("RDS root_cert_file not configured"))?;
         crate::pgsql_kv::PgKv::connect_readonly(&url, root_cert)
     }
+
+    /// Open replay admission without creating checkpointed PDS state.
+    pub fn connect_replay_admission(&self) -> anyhow::Result<crate::pgsql_kv::PgKv> {
+        let url = self.read_url()?;
+        let root_cert = self.root_cert_file()
+            .ok_or_else(|| anyhow::anyhow!("RDS root_cert_file not configured"))?;
+        crate::pgsql_kv::PgKv::connect_replay_admission(&url, root_cert)
+    }
 }
 
 #[cfg(test)]

@@ -1351,9 +1351,8 @@ impl TuiService {
         };
 
         let model_ref = model_ref.to_owned();
-        let service_token = required_service_token(&self.signing_key)?;
         let (tool_caller, tool_descriptions, openai_tools) =
-            super::rpc_transport::make_tool_caller(&self.signing_key, service_token)?;
+            super::rpc_transport::make_tool_caller(&self.signing_key)?;
 
         // Rename the window to "Chat: model_ref" so the titlebar is meaningful.
         {

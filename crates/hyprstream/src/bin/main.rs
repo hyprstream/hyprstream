@@ -2085,7 +2085,7 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
     #[cfg(feature = "pds-postgres")]
     let shared_store: Option<Box<dyn ProofReplayStore>> = match config {
         Some(config) => match config.rds.resolved_from_env() {
-            Ok(rds) if rds.is_configured() => match rds.connect_kv() {
+            Ok(rds) if rds.is_configured() => match rds.connect_replay_admission() {
                 Ok(kv) => Some(Box::new(PostgresProofReplayStore { kv })),
                 Err(_) => {
                     tracing::error!("configured shared Postgres replay store could not open; proof admission denies");

@@ -155,6 +155,16 @@ pub struct PgKv {
     _thread: JoinHandle<()>,
 }
 
+/// Startup provisioning is explicit: replay admission may create only its
+/// opaque table and must never recreate checkpointed PDS state before the
+/// resolver can fail closed on lost history.
+#[derive(Clone, Copy, Debug)]
+enum ProvisioningMode {
+    Full,
+    ReadOnly,
+    ReplayAdmissionOnly,
+}
+
 impl PgKv {
     /// Connect to RDS, run the schema migration, and spawn the async bridge.
     ///
@@ -168,7 +178,7 @@ impl PgKv {
     ) -> AnyResult<Self> {
         let pg_config = build_driver_config(url.driver_url(), url.dns_hostname())?;
         let pool = assemble_pool(pg_config, root_cert_pem)?;
-        Self::start(pool, cell_id, false)
+        Self::start(pool, cell_id, ProvisioningMode::Full)
     }
 
     /// Connect READ-ONLY: no schema migration and no writes — the resolver
@@ -182,7 +192,18 @@ impl PgKv {
     ) -> AnyResult<Self> {
         let pg_config = build_driver_config(url.driver_url(), url.dns_hostname())?;
         let pool = assemble_pool(pg_config, root_cert_pem)?;
-        Self::start(pool, "", true)
+        Self::start(pool, "", ProvisioningMode::ReadOnly)
+    }
+
+    /// Connect proof replay admission without creating `pds_kv` or
+    /// `pds_meta`; resolver startup retains the lost-history check.
+    pub(crate) fn connect_replay_admission(
+        url: &crate::rds::ValidatedRdsUrl,
+        root_cert_pem: &std::path::Path,
+    ) -> AnyResult<Self> {
+        let pg_config = build_driver_config(url.driver_url(), url.dns_hostname())?;
+        let pool = assemble_pool(pg_config, root_cert_pem)?;
+        Self::start(pool, "", ProvisioningMode::ReplayAdmissionOnly)
     }
 
     /// TEST-ONLY read-only connect with no TLS and no URL validation (the
@@ -197,7 +218,7 @@ impl PgKv {
         apply_driver_timeouts(&mut pg_config);
         let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
         let pool = build_bounded_pool(manager)?;
-        Self::start(pool, "", true)
+        Self::start(pool, "", ProvisioningMode::ReadOnly)
     }
 
     /// TEST-ONLY: connect with no TLS and no URL validation.
@@ -219,19 +240,23 @@ impl PgKv {
         apply_driver_timeouts(&mut pg_config);
         let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
         let pool = build_bounded_pool(manager)?;
-        Self::start(pool, cell_id, false)
+        Self::start(pool, cell_id, ProvisioningMode::Full)
     }
 
     /// Spawn the bridge over an assembled pool, then verify connectivity +
     /// migration by pinging. The ping is the FATAL-on-unavailable boundary: a
     /// failure propagates as an error, refusing startup rather than degrading
     /// to local.
-    fn start(pool: deadpool_postgres::Pool, cell_id: &str, read_only: bool) -> AnyResult<Self> {
+    fn start(
+        pool: deadpool_postgres::Pool,
+        cell_id: &str,
+        provisioning: ProvisioningMode,
+    ) -> AnyResult<Self> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PgCmd>();
         let cell_id = cell_id.to_owned();
         let thread = std::thread::Builder::new()
             .name("pds-pg-bridge".into())
-            .spawn(move || bridge_main(pool, cell_id, read_only, cmd_rx))
+            .spawn(move || bridge_main(pool, cell_id, provisioning, cmd_rx))
             .context("failed to spawn pds-pg-bridge thread")?;
 
         let kv = Self {
@@ -366,7 +391,7 @@ pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 fn bridge_main(
     pool: deadpool_postgres::Pool,
     cell_id: String,
-    read_only: bool,
+    provisioning: ProvisioningMode,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PgCmd>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -386,12 +411,10 @@ fn bridge_main(
     };
 
     rt.block_on(async move {
-        // Read-only bridges verify provisioning; read-write bridges run the
-        // idempotent schema migration. Either way this is the FATAL boundary.
-        let provision = if read_only {
-            verify_provisioned(&pool).await
-        } else {
-            migrate(&pool, &cell_id).await
+        let provision = match provisioning {
+            ProvisioningMode::ReadOnly => verify_provisioned(&pool).await,
+            ProvisioningMode::Full => migrate(&pool, &cell_id).await,
+            ProvisioningMode::ReplayAdmissionOnly => migrate_replay_admission(&pool).await,
         };
         if let Err(e) = provision {
             tracing::error!("pds-pg-bridge: provisioning check failed: {e}");
@@ -401,7 +424,7 @@ fn bridge_main(
             return;
         }
 
-        tracing::info!(read_only, "pds-pg-bridge: connected to RDS");
+        tracing::info!(?provisioning, "pds-pg-bridge: connected to RDS");
 
         // Serve commands until the sender half is dropped. Each command runs
         // on its own spawned task so one slow statement does not serialize
@@ -648,6 +671,33 @@ async fn migrate(pool: &deadpool_postgres::Pool, cell_id: &str) -> AnyResult<()>
         .await
         .map_err(|e| anyhow::anyhow!("RDS migration: commit failed: {e}"))?;
     Ok(())
+}
+
+/// Provision replay admission alone. It shares the full migration lock, but
+/// deliberately cannot recreate checkpointed PDS history.
+async fn migrate_replay_admission(pool: &deadpool_postgres::Pool) -> AnyResult<()> {
+    const MIGRATION_LOCK_ID: i64 = 0x1257_1257_1257_1257;
+    let mut conn = pool.get().await
+        .map_err(|e| anyhow::anyhow!("RDS connection acquisition failed during replay migration: {e}"))?;
+    let tx = conn.transaction().await
+        .map_err(|e| anyhow::anyhow!("RDS replay migration: begin transaction failed: {e}"))?;
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID]).await
+        .map_err(|e| anyhow::anyhow!("RDS replay migration: advisory lock failed: {e}"))?;
+    tx.batch_execute(replay_admission_ddl()).await
+        .map_err(|e| anyhow::anyhow!("RDS replay schema migration failed: {e}"))?;
+    tx.commit().await
+        .map_err(|e| anyhow::anyhow!("RDS replay migration: commit failed: {e}"))?;
+    Ok(())
+}
+
+fn replay_admission_ddl() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS proof_replay_admission (
+        replay_id BYTEA PRIMARY KEY CHECK (octet_length(replay_id) = 32),
+        expires_at BIGINT NOT NULL CHECK (expires_at > 0)
+    );
+    CREATE INDEX IF NOT EXISTS proof_replay_admission_expiry_idx
+        ON proof_replay_admission (expires_at);
+    REVOKE ALL ON TABLE proof_replay_admission FROM PUBLIC;"
 }
 
 async fn handle_cmd(pool: &deadpool_postgres::Pool, cmd: PgCmd) -> AnyResult<()> {
@@ -1199,6 +1249,14 @@ mod tests {
         assert!(table.contains("expires_at BIGINT NOT NULL CHECK (expires_at > 0)"));
         assert!(!table.contains("credential"));
         assert!(!table.contains("request_body"));
+    }
+
+    #[test]
+    fn replay_only_migration_never_creates_checkpointed_pds_state() {
+        let ddl = replay_admission_ddl();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS proof_replay_admission"));
+        assert!(!ddl.contains("pds_kv"));
+        assert!(!ddl.contains("pds_meta"));
     }
 
     #[test]
