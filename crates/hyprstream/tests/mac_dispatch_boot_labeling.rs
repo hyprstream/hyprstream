@@ -722,24 +722,26 @@ async fn oauth_management_preserves_caller_authority_over_local_transport() -> R
     Ok(())
 }
 
-/// A real generated OAuth request must not turn an enrolled ordinary service
-/// into the OAuth account-management deputy.  The earlier authorization test
-/// above drives the handler with an already-verified context; this regression
-/// deliberately traverses the production decode -> dispatch PEP -> JWT ->
-/// handler sequence used by the in-process carrier, then proves both targeted
-/// mutations stop at OAuth's authenticated-local-control-plane gate before a
-/// mutator is selected.
+/// After JWT admission, a real generated OAuth request must not turn an
+/// enrolled ordinary service into the OAuth account-management deputy.  The
+/// production OAuth bridge currently has no JWT key source (covered by the
+/// production-equivalent negative below), so this fixture supplies the same
+/// cluster verifier explicitly to regress the next authorization boundary.
+/// It deliberately traverses generated decode -> dispatch PEP -> JWT ->
+/// handler and proves both targeted mutations stop at OAuth's authenticated
+/// local-control-plane gate before a mutator is selected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ordinary_service_cannot_mutate_oauth_through_generated_dispatch() -> Result<()> {
+async fn ordinary_service_cannot_mutate_oauth_after_jwt_admission() -> Result<()> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use hyprstream_core::services::oauth::{rpc_handler::OAuthRpcHandler, state::OAuthState};
     use hyprstream_rpc_std::discovery_client::DiscoveryClient;
     use hyprstream_rpc_std::oauth_client::{AddPubkey, OauthClient};
 
-    // OAuthRpcHandler deliberately contains only the generated handler and
-    // authorization logic.  The production factory supplies its cluster JWT
-    // verifier.  Keep that wiring explicit in this integration fixture so the
-    // generated client reaches the real verifier rather than a test context.
+    // This wrapper is intentionally synthetic: production constructs a bare
+    // OAuthRpcHandler, which currently returns RequestService's default
+    // jwt_key_source (None).  The separate production-equivalent test below
+    // protects that present fail-closed wiring; this one protects the OAuth
+    // authorization boundary if production later wires JWT verification.
     struct VerifiedOAuthDispatch {
         inner: OAuthRpcHandler,
         transport: TransportConfig,
@@ -803,14 +805,7 @@ async fn ordinary_service_cannot_mutate_oauth_through_generated_dispatch() -> Re
 
     let tag = format!("oauth-generated-mutation-{}", uuid::Uuid::new_v4());
     let policy_tag = format!("{tag}-policy");
-    let policy_dir = tempfile::TempDir::new()?;
-    let policies = Arc::new(PolicyManager::new(policy_dir.path().join("policies")).await?);
-    for resource in ["oauth:AddPubkey", "oauth:RemoveUser"] {
-        policies
-            .add_policy_with_domain("service:discovery", "*", resource, "manage", "deny")
-            .await?;
-    }
-    let policy = spawn_policy_with_manager(&policy_tag, &relay, None, policies).await?;
+    let policy = spawn_policy_and_client(&policy_tag, &relay, None).await?;
     // No Discovery request occurs in these mutation calls; the real OAuth
     // state still receives its normal generated client shape.
     let discovery = DiscoveryClient::for_local_endpoint_bootstrap(
@@ -868,6 +863,101 @@ async fn ordinary_service_cannot_mutate_oauth_through_generated_dispatch() -> Re
 
     assert_eq!(handler_entries.load(Ordering::SeqCst), 2,
         "both generated mutation requests must reach real dispatch and stop in OAuth authorization");
+    Ok(())
+}
+
+/// The production OAuth bridge constructs a bare OAuthRpcHandler with
+/// LocalServiceBridge::spawn_with.  That handler has no JWT key source, so a
+/// JWT-bearing ordinary-service mutation must fail closed before generated
+/// dispatch or the OAuth handler can select a mutator.  This is deliberately
+/// separate from `ordinary_service_cannot_mutate_oauth_after_jwt_admission`:
+/// the latter covers the authorization boundary after a future production JWT
+/// source is installed, while this test names and locks the current factory
+/// behavior rather than simulating it with a wrapper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_oauth_factory_rejects_service_mutations_before_dispatch() -> Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use hyprstream_core::services::oauth::{rpc_handler::OAuthRpcHandler, state::OAuthState};
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::oauth_client::{AddPubkey, OauthClient};
+
+    install_crypto();
+    hyprstream_core::mac::install_production_rpc_dispatch_pep()?;
+
+    let root = SigningKey::from_bytes(&POLICY_ROOT_KEY);
+    let ca = derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let relay = SigningKey::from_bytes(&OAUTH_RELAY_KEY);
+    let caller = SigningKey::from_bytes(&DISCOVERY_KEY);
+    let credentials = tempfile::TempDir::new()?;
+    let caller_jwt = mint_service_jwt(&credentials, "discovery", &ca, &caller);
+    hyprstream_service::global_trust_store().insert(relay.verifying_key(), hyprstream_service::Attestation {
+        scopes: std::iter::once("oauth".to_owned()).collect(),
+        subject: Some("service:oauth".to_owned()),
+        jwt: None,
+        expires_at: 0,
+        attested_by: None,
+    });
+
+    let tag = format!("oauth-production-mutation-{}", uuid::Uuid::new_v4());
+    let policy_tag = format!("{tag}-policy");
+    let policy = spawn_policy_and_client(&policy_tag, &relay, None).await?;
+    let discovery = DiscoveryClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{policy_tag}"),
+        relay.clone(),
+        root.verifying_key(),
+        None,
+    )?;
+    let state = Arc::new(OAuthState::new(
+        &hyprstream_core::config::OAuthConfig::default(),
+        policy,
+        discovery,
+        relay.verifying_key().to_bytes(),
+    ));
+
+    // Keep the builder shape aligned with oauth/mod.rs's production factory:
+    // a bridge-thread construction of the unwrapped OAuthRpcHandler.
+    let factory_state = Arc::clone(&state);
+    let factory_transport = TransportConfig::inproc(&tag);
+    let factory_signing_key = relay.clone();
+    let (bridge, ready) = LocalServiceBridge::spawn_with(
+        "oauth-user-crud-production-negative",
+        move || async move {
+            Ok(OAuthRpcHandler::new(
+                factory_state,
+                factory_transport,
+                factory_signing_key,
+            ))
+        },
+        Arc::new(InMemoryNonceCache::new()),
+        0,
+    )?;
+    ready.await??;
+    let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
+    register_inproc(&tag, &processor);
+
+    let client = OauthClient::for_local_endpoint_bootstrap(
+        &format!("inproc://{tag}"),
+        caller,
+        relay.verifying_key(),
+        Some(caller_jwt),
+    )?;
+    let attempted_key = SigningKey::from_bytes(&GHOST_CLIENT_KEY);
+    let add_error = client
+        .add_pubkey(&AddPubkey {
+            username: "production-mutation-victim".to_owned(),
+            pubkey_base64: URL_SAFE_NO_PAD.encode(attempted_key.verifying_key().as_bytes()),
+            label: Some("must-not-write".to_owned()),
+        })
+        .await
+        .expect_err("production OAuth factory must fail closed before addPubkey dispatch");
+    assert!(format!("{add_error:?}").contains("dispatch denied"),
+        "JWT-source absence must retain the uniform pre-handler denial: {add_error:?}");
+    let remove_error = client
+        .remove_user("production-mutation-victim")
+        .await
+        .expect_err("production OAuth factory must fail closed before removeUser dispatch");
+    assert!(format!("{remove_error:?}").contains("dispatch denied"),
+        "JWT-source absence must retain the uniform pre-handler denial: {remove_error:?}");
     Ok(())
 }
 
