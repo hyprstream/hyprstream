@@ -1431,6 +1431,29 @@ mod tests {
         }
     }
 
+    /// The envelope verifier is intentionally process-global and first-write
+    /// wins. Every inproc spawner test in this binary therefore uses this same
+    /// deterministic identity and equivalent trust store, whether it performs
+    /// the initial install or observes an already-installed test configuration.
+    fn spawner_test_hybrid_identity(
+    ) -> (SigningKey, Arc<hyprstream_rpc::envelope::KeyedPqTrustStore>) {
+        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
+
+        let key = SigningKey::from_bytes(&[0xD3; 32]);
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(
+            key.verifying_key().to_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
+        let store = Arc::new(store);
+        let _ = hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store.clone()),
+        });
+        (key, store)
+    }
+
     #[async_trait::async_trait(?Send)]
     impl RequestService for EchoService {
         fn decode_request_body(
@@ -1625,23 +1648,11 @@ mod tests {
 
     #[tokio::test]
     async fn threaded_stop_broadcasts_to_lifecycle_and_inproc_with_retained_client() -> AnyhowResult<()> {
-        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::in_memory::InMemoryTransport;
 
-        let (key, _) = generate_signing_keypair();
-        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
-        let mut store = KeyedPqTrustStore::new();
-        store.bind(
-            key.verifying_key().to_bytes(),
-            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq),
-        );
-        let store = Arc::new(store);
-        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
-            pq_store: Some(store.clone()),
-        })?;
+        let (key, store) = spawner_test_hybrid_identity();
 
         let endpoint = "threaded-two-waiter-retained-client";
         let entered = Arc::new(Notify::new());
@@ -1711,23 +1722,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_direct_thread_stop_waits_for_the_same_terminal_join() -> AnyhowResult<()> {
-        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::in_memory::InMemoryTransport;
 
-        let (key, _) = generate_signing_keypair();
-        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
-        let mut store = KeyedPqTrustStore::new();
-        store.bind(
-            key.verifying_key().to_bytes(),
-            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq),
-        );
-        let store = Arc::new(store);
-        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
-            pq_store: Some(store.clone()),
-        })?;
+        let (key, store) = spawner_test_hybrid_identity();
 
         let endpoint = "threaded-stop-cancellation-retained-client";
         let entered = Arc::new(Notify::new());
@@ -2036,19 +2035,10 @@ mod tests {
 
     #[tokio::test]
     async fn both_inproc_owners_drain_entered_request_with_retained_client() -> AnyhowResult<()> {
-        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore};
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::in_memory::InMemoryTransport;
-        let (key, _) = generate_signing_keypair();
-        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
-        let mut store = KeyedPqTrustStore::new();
-        store.bind(key.verifying_key().to_bytes(), &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq));
-        let store = Arc::new(store);
-        hyprstream_rpc::envelope::install_verify_config(EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
-            pq_store: Some(store.clone()),
-        })?;
+        let (key, store) = spawner_test_hybrid_identity();
         for unified in [false, true] {
             let endpoint = format!("bridge-drain-owner-{unified}");
             let transport = TransportConfig::inproc(&endpoint);
