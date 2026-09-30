@@ -24,7 +24,11 @@ set -euo pipefail
 [[ " $* " == *' --show-output '* ]] || exit 65
 case " $* " in
   *' auth::postgres_store::tests:: '*) sentinel='auth::postgres_store::tests::add_list_remove_pubkey' ;;
-  *' services::pds_record_pg::tests::live_ '*) sentinel='services::pds_record_pg::tests::live_put_get_roundtrip_and_absent' ;;
+  *' pgsql_kv::tests::live_ '*)
+    [[ " $* " == *' -p hyprstream-pds '* ]] || exit 66
+    [[ " $* " == *' --features postgres '* ]] || exit 67
+    sentinel='pgsql_kv::tests::live_replay_admission_is_cross_handle_once_and_reclaims_expiry'
+    ;;
   *' services::pds_record_rocksdb::pg_tests::live_ '*) sentinel='services::pds_record_rocksdb::pg_tests::live_two_handle_persistence_and_visibility' ;;
   *) exit 64 ;;
 esac

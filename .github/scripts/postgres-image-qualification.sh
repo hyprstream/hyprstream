@@ -19,8 +19,10 @@ readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-pos
 # instance. Keep the account-store and PDS record-store coverage separate so a
 # module move or an empty filter cannot silently turn this into a green skip.
 run_live_module() {
-  local filter="$1"
-  local sentinel="$2"
+  local package="$1"
+  local features="$2"
+  local filter="$3"
+  local sentinel="$4"
   local log
   local passed
   local cargo_status
@@ -34,8 +36,8 @@ run_live_module() {
   # failure to one, which otherwise hides an OOM/signal or a cache-permission
   # failure on the native ARM builder. Neither status can contain the URL.
   set +e
-  cargo test -p hyprstream --locked --lib --no-default-features \
-      --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- "${filter}" \
+  cargo test -p "${package}" --locked --lib --no-default-features \
+      --features "${features}" -- "${filter}" \
       --test-threads=1 --show-output 2>&1 | tee "${log}"
   pipeline_status=("${PIPESTATUS[@]}")
   cargo_status="${pipeline_status[0]}"
@@ -66,9 +68,9 @@ run_live_module() {
   printf 'postgres-qualification filter=%s passed=%s\n' "${filter}" "${passed}"
 }
 
-run_live_module 'auth::postgres_store::tests::' \
+run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'auth::postgres_store::tests::' \
   'auth::postgres_store::tests::add_list_remove_pubkey'
-run_live_module 'services::pds_record_pg::tests::live_' \
-  'services::pds_record_pg::tests::live_put_get_roundtrip_and_absent'
-run_live_module 'services::pds_record_rocksdb::pg_tests::live_' \
+run_live_module hyprstream-pds postgres 'pgsql_kv::tests::live_' \
+  'pgsql_kv::tests::live_replay_admission_is_cross_handle_once_and_reclaims_expiry'
+run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'services::pds_record_rocksdb::pg_tests::live_' \
   'services::pds_record_rocksdb::pg_tests::live_two_handle_persistence_and_visibility'

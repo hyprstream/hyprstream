@@ -162,11 +162,15 @@ impl DiscoveryState {
 }
 
 /// Endpoint data stored per announced entry.
+///
+/// The announcement's service JWT is verified before this value is created,
+/// but is deliberately not retained: it is a bearer credential, not endpoint
+/// resolution metadata. Older Valkey JSON rows may contain that now-unknown
+/// field; serde ignores it on read and never writes it back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AnnouncedEndpoint {
     pub(crate) socket_kind: String,
     pub(crate) endpoint: String,
-    pub(crate) service_jwt: String,
     pub(crate) service_did: Did,
     pub(crate) capabilities: BTreeSet<String>,
     pub(crate) accepted_state_digest: Vec<u8>,
@@ -1623,7 +1627,6 @@ pub(crate) mod tests {
         AnnouncedEndpoint {
             socket_kind: kind.to_owned(),
             endpoint: format!("iroh://{kind}"),
-            service_jwt: "jwt".to_owned(),
             service_did: Did::new("did:at9p:test".to_owned()),
             capabilities: BTreeSet::from(["discovery".to_owned()]),
             accepted_state_digest: vec![7; 64],
@@ -1635,6 +1638,23 @@ pub(crate) mod tests {
             source_signer: [9; 32],
             live_until_unix_ms: live_until,
         }
+    }
+
+    #[test]
+    fn legacy_announcement_bearer_field_is_dropped_on_read_and_rewrite() {
+        let now = unix_millis_now();
+        let mut legacy = serde_json::to_value(endpoint("iroh", 1, now + 10_000, now + 50))
+            .expect("serialize current endpoint fixture");
+        legacy
+            .as_object_mut()
+            .expect("endpoint fixture is an object")
+            .insert("service_jwt".to_owned(), serde_json::json!("legacy-bearer-jwt"));
+
+        let parsed: AnnouncedEndpoint =
+            serde_json::from_value(legacy).expect("legacy endpoint remains readable");
+        let rewritten = serde_json::to_string(&parsed).expect("rewrite endpoint");
+        assert!(!rewritten.contains("service_jwt"));
+        assert!(!rewritten.contains("legacy-bearer-jwt"));
     }
 
     async fn assert_announcement_backend_contract(store: &dyn DiscoveryStateStore) {
@@ -2208,7 +2228,7 @@ pub(crate) mod tests {
             let name = format!("lease-{skew}");
             let mut value = endpoint("iroh", 1, now + 7_200_000, now + 7_200_000);
             value.capabilities.clear();
-            value.service_jwt = "payload with \"live_until_unix_ms\":123 and λ".to_owned();
+            value.response_key_id = "payload with \"live_until_unix_ms\":123 and λ".to_owned();
             value.source_signer = [255; 32];
             let mut expected = serde_json::to_value(&value).unwrap();
             expected.as_object_mut().unwrap().remove("live_until_unix_ms");

@@ -1040,7 +1040,6 @@ impl DiscoveryService {
         let replacement = AnnouncedEndpoint {
             socket_kind: sock_kind.clone(),
             endpoint: endpoint.clone(),
-            service_jwt: service_jwt.clone(),
             service_did: data.service_did.clone(),
             capabilities: data.capabilities.iter().cloned().collect(),
             accepted_state_digest: data.accepted_state_digest.clone(),
@@ -1504,7 +1503,7 @@ pub(super) fn project_bootstrap_endpoint(
     hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&subject_key.mldsa65_pub)?;
     Ok(AnnouncedEndpoint {
         socket_kind: "iroh".to_owned(), endpoint: entry.endpoint.address.clone(),
-        service_jwt: String::new(), service_did: Did::from(state.did.clone()),
+        service_did: Did::from(state.did.clone()),
         capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
         accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
         response_key_id: format!("{}#response", state.did),
@@ -1545,7 +1544,6 @@ impl DiscoveryServiceResolver {
                     Some(AnnouncedEndpoint {
                         socket_kind: endpoint.socket_kind,
                         endpoint: endpoint.endpoint,
-                        service_jwt: endpoint.service_jwt,
                         service_did: endpoint.service_did,
                         capabilities: endpoint.capabilities.into_iter().collect(),
                         accepted_state_digest: endpoint.accepted_state_digest,
@@ -4365,7 +4363,6 @@ pub mod test_fixtures {
         Ok(AnnouncedEndpoint {
             socket_kind: socket_kind.to_owned(),
             endpoint: transport.endpoint_string(),
-            service_jwt: "fixture-verified".to_owned(),
             service_did: Did::from(authority.state.did.clone()),
             capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
                 .into_iter()
@@ -5483,7 +5480,6 @@ mod resolver_tests {
         AnnouncedEndpoint {
             socket_kind: socket_kind.to_owned(),
             endpoint: endpoint.to_owned(),
-            service_jwt: "jwt".to_owned(),
             service_did: Did::default(),
             capabilities: BTreeSet::new(),
             accepted_state_digest: Vec::new(),
@@ -5635,7 +5631,6 @@ mod resolver_tests {
                 }
                 .to_owned(),
                 endpoint,
-                service_jwt: "verified-by-handler".to_owned(),
                 service_did: Did::from(state.did.clone()),
                 capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
                     .into_iter()
@@ -5921,7 +5916,11 @@ mod resolver_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_iroh_announcement_handler_populates_production_resolver() {
+    async fn ordinary_iroh_announcement_handler_redacts_bearer_before_storage_and_discovery() {
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Inproc,
+            None,
+        );
         let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
         )
@@ -5962,7 +5961,7 @@ mod resolver_tests {
                     service_name: "model".to_owned(),
                     socket_kind: "iroh".to_owned(),
                     endpoint: reach,
-                    service_jwt: Some(jwt),
+                    service_jwt: Some(jwt.clone()),
                     service_did: Did::from(state.did.clone()),
                     capabilities: vec!["hyprstream-rpc/1".to_owned()],
                     accepted_state_digest: state.head_digest.to_vec(),
@@ -5976,6 +5975,31 @@ mod resolver_tests {
             .await
             .expect("ordinary announcement handler");
         assert!(matches!(response, DiscoveryResponseVariant::AnnounceResult));
+        let stored = service
+            .state_store
+            .announcements_for("model", unix_millis_now())
+            .await
+            .expect("read stored announcement");
+        assert_eq!(stored.len(), 1);
+        let stored_json = serde_json::to_string(&stored[0]).expect("serialize stored announcement");
+        assert!(!stored_json.contains(&jwt), "bearer JWT must not persist");
+
+        let endpoints = service
+            .handle_get_endpoints(&ctx, 2, "model")
+            .await
+            .expect("get endpoints after announcement");
+        let DiscoveryResponseVariant::GetEndpointsResult(endpoints) = endpoints else {
+            panic!("announcement must provide a discovery endpoint");
+        };
+        assert!(!endpoints.endpoints.is_empty());
+        assert!(
+            endpoints
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.service_jwt.is_empty()),
+            "discovery must never project a stored bearer JWT"
+        );
+
         let resolver = service.production_resolver().expect("production resolver");
         let resolved = resolver
             .resolve_service(ServiceQuery::network("model").expect("query"))
@@ -6278,7 +6302,8 @@ mod resolver_tests {
                 assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
                 assert_eq!(rows[0].expires_at_unix_ms, request.expires_at_unix_ms);
                 assert_eq!(rows[0].request_kem_recipient, request.request_kem_recipient);
-                assert_eq!(rows[0].service_jwt, request.service_jwt.clone().unwrap());
+                let stored_json = serde_json::to_string(&rows[0]).unwrap();
+                assert!(!stored_json.contains(request.service_jwt.as_deref().unwrap()));
                 // Repeated reads exercise populated L1, not only its first fill.
                 assert!(service.resolve_announced_endpoint("model", SocketKind::Quic).await.unwrap().is_some());
                 assert_eq!(service.state_store.all_announcements(now + skew).await.unwrap().len(), 1);
@@ -7442,7 +7467,10 @@ impl DiscoveryHandler for DiscoveryService {
             None => Vec::new(),
         };
 
-        // Merge announced endpoints from other processes (carry service JWT).
+        // Merge announced endpoints from other processes. Their service JWTs
+        // were verified at announcement time and are never persisted or
+        // projected through discovery: bearer credentials must not become a
+        // discovery-read capability.
         for ep in self
             .state_store
             .announcements_for(service_name, unix_millis_now())
@@ -7452,7 +7480,7 @@ impl DiscoveryHandler for DiscoveryService {
                 endpoints.push(EndpointInfo {
                     socket_kind: ep.socket_kind,
                     endpoint: ep.endpoint,
-                    service_jwt: ep.service_jwt,
+                    service_jwt: String::new(),
                     tls_endorsement: self.tls_endorsement.clone(),
                     tls_domain: self.tls_domain.clone(),
                     service_did: ep.service_did,
