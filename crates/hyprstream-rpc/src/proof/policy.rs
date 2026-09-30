@@ -298,11 +298,11 @@ pub struct GeneratedMethodPolicyProvider {
 #[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(GeneratedMethodPolicyProvider);
 
-/// Bind a mediated query's operation to the original signed request leaf.
-/// This does not authenticate the body or grant authority: callers must first
-/// verify the holder transcript, credential, target, freshness and replay.
+/// Recover the only policy action an authenticated scoped request may mediate.
+/// The returned action is derived from the signed request leaf, not supplied
+/// by the mediator.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn verify_mediated_operation(service: &str, signed_body: &[u8], operation: &str) -> Result<()> {
+pub fn mediated_operation_for_request(service: &str, signed_body: &[u8]) -> Result<String> {
     let mut providers = inventory::iter::<GeneratedMethodPolicyProvider>
         .into_iter()
         .filter(|provider| provider.service == service);
@@ -317,8 +317,19 @@ pub fn verify_mediated_operation(service: &str, signed_body: &[u8], operation: &
         .ok_or_else(|| anyhow::anyhow!("unknown mediated method leaf"))?;
     anyhow::ensure!(
         row.authentication == AuthenticationRequirement::CredentialRequired
-            && !row.scope_exempt && !row.scope_action.is_empty()
-            && row.scope_action == operation,
+            && !row.scope_exempt && !row.scope_action.is_empty(),
+        "mediated request is not an authenticated scoped method"
+    );
+    Ok(row.scope_action.to_owned())
+}
+
+/// Bind a mediated query's operation to the original signed request leaf.
+/// This does not authenticate the body or grant authority: callers must first
+/// verify the holder transcript, credential, target, freshness and replay.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn verify_mediated_operation(service: &str, signed_body: &[u8], operation: &str) -> Result<()> {
+    anyhow::ensure!(
+        mediated_operation_for_request(service, signed_body)? == operation,
         "mediated operation does not match an authenticated scoped method"
     );
     Ok(())

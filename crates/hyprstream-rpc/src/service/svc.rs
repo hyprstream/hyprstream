@@ -227,9 +227,24 @@ impl EnvelopeContext {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_mediated_evidence(evidence: &[u8], mediator_service: &str, operation: &str) -> Result<Self> {
         if crate::authorization_witness::is_witness_evidence(evidence) {
-            let (request, signer) = crate::authorization_witness::verify(evidence, mediator_service)?;
-            crate::proof::policy::verify_mediated_operation(mediator_service, &request.payload, operation)?;
-            return Ok(Self::from_authenticated_request(&request, signer, Some(MediatedEvidence(evidence.to_vec().into()))));
+            let verified = crate::authorization_witness::verify(evidence, mediator_service)?;
+            if let Some(signed_operation) = verified.operation.as_deref() {
+                anyhow::ensure!(
+                    signed_operation == operation,
+                    "mediated operation does not match holder-signed request leaf"
+                );
+            } else {
+                crate::proof::policy::verify_mediated_operation(
+                    mediator_service,
+                    &verified.request.payload,
+                    operation,
+                )?;
+            }
+            return Ok(Self::from_authenticated_request(
+                &verified.request,
+                verified.signer,
+                Some(MediatedEvidence(evidence.to_vec().into())),
+            ));
         }
         let signed = crate::envelope::verify_mediated_envelope_evidence(evidence, mediator_service)?;
         crate::proof::policy::verify_mediated_operation(mediator_service, &signed.envelope.payload, operation)?;

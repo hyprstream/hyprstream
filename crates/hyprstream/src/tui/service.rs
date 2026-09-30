@@ -254,11 +254,12 @@ impl TuiService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {

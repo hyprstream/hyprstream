@@ -396,6 +396,32 @@ async fn hybrid_service_registry_policy_mediation_preserves_caller() -> Result<(
     assert!(policy.check_mediated(&valid_query).await?, "invalid evidence must not consume valid admission");
     let error = policy.check_mediated(&valid_query).await.expect_err("same derived query cannot be replayed");
     assert!(format!("{error:?}").contains("replay admission denied"));
+
+    // A valid network-sized write still reaches the real mediated Policy
+    // handler. Its compact witness commits the exact large body hash and the
+    // derived `write` leaf; neither the body nor a substituted bearer crosses
+    // the 64 KiB mediation boundary.
+    let mut large_body = capnp::message::Builder::new_default();
+    {
+        let mut root = large_body
+            .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+        root.set_id(1);
+        let mut put = root.reborrow().init_put_blob();
+        put.set_bytes(&vec![0xA5; hyprstream_rpc::envelope::MAX_MEDIATED_EVIDENCE_BYTES + 1]);
+        put.set_grant_repo("at://did:example:model/repo");
+    }
+    let mut large = RequestEnvelope::new(capnp::serialize::write_message_to_words(&large_body))
+        .with_jwt_token(token.clone()).with_service_domain("registry")?;
+    large.authorization_witness = Some(
+        hyprstream_rpc::authorization_witness::sign(&large, &LocalSigner::new(caller.clone())).await?,
+    );
+    let large_evidence = hyprstream_rpc::authorization_witness::package(
+        &large, &caller.verifying_key().to_bytes(),
+    ).expect("large authenticated scoped request must retain compact holder evidence");
+    assert!(large_evidence.len() <= hyprstream_rpc::envelope::MAX_MEDIATED_EVIDENCE_BYTES);
+    assert!(policy.check_mediated(&MediatedPolicyCheck {
+        evidence: large_evidence.into(), resource: "registry:*".into(), operation: "write".into(),
+    }).await?, "the real mediated handler must admit the compact large-body holder evidence");
     let data = tempfile::TempDir::new()?;
     let registry = RegistryService::new(data.path(), policy, TransportConfig::inproc(&tag), registry_key.clone())
         .await?.with_jwt_key_source(cluster_key_source(&ca));
