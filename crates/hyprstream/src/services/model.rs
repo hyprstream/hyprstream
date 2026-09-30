@@ -53,7 +53,7 @@ use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
 use lru::LruCache;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -190,7 +190,7 @@ pub struct ModelServiceInner {
     /// LRU cache of loaded models
     loaded_models: RwLock<LruCache<InferenceInstanceId, LoadedModel>>,
     /// Models currently being loaded (accepted but not yet in LRU cache)
-    pending_loads: Mutex<HashSet<InferenceInstanceId>>,
+    pending_loads: parking_lot::Mutex<HashMap<InferenceInstanceId, u64>>,
     /// Models whose cache entry has been removed and whose worker teardown is
     /// still in progress. This survives cancellation of the caller awaiting
     /// `unload_model`, so a replacement load cannot race a draining worker.
@@ -199,6 +199,12 @@ pub struct ModelServiceInner {
     /// existing worker for teardown. The guard covers the unloading check,
     /// cache observation, and pending-load insertion as one decision.
     load_unload_gate: Mutex<()>,
+    /// Serializes lifecycle event delivery. It is deliberately separate from
+    /// lifecycle admission: a successful unload acquires this order before
+    /// releasing its slot, preventing a later loaded event from overtaking the
+    /// listener-visible unloaded completion without holding admission locks
+    /// across network/event delivery.
+    lifecycle_event_publish_gate: Mutex<()>,
     /// Service configuration
     config: ModelServiceConfig,
     /// Ed25519 signing key for creating InferenceClients
@@ -255,6 +261,10 @@ pub struct ModelServiceInner {
     /// environment value merely to support restart acceptance coverage.
     #[cfg(test)]
     test_work_order_capture: Mutex<Option<Zeroizing<String>>>,
+    /// Test-only ordering witness: successful unload clears admission before
+    /// making its `model.unloaded` event visible.
+    #[cfg(test)]
+    before_unloaded_event: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -278,7 +288,40 @@ pub struct ModelService {
 enum InterceptedLoadAdmission {
     Loaded { reach: Vec<WireTransportConfig> },
     Pending,
-    Accepted,
+    Accepted(InterceptedLoadReservation),
+}
+
+/// Owns an intercepted load's pending marker from admission through either
+/// continuation completion or cancellation. The marker uses a tiny synchronous
+/// mutex deliberately: `Drop` must be able to roll it back if serialization or
+/// the continuation handoff is cancelled before the future is ever polled.
+struct InterceptedLoadReservation {
+    inner: Arc<ModelServiceInner>,
+    instance: InferenceInstanceId,
+    attempt: u64,
+    active: bool,
+}
+
+impl InterceptedLoadReservation {
+    fn new(inner: Arc<ModelServiceInner>, instance: InferenceInstanceId, attempt: u64) -> Self {
+        Self { inner, instance, attempt, active: true }
+    }
+
+    fn release(&mut self) {
+        if self.active {
+            let mut pending = self.inner.pending_loads.lock();
+            if pending.get(&self.instance) == Some(&self.attempt) {
+                pending.remove(&self.instance);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for InterceptedLoadReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 fn admit_in_process_tenant(
@@ -477,9 +520,10 @@ impl ModelService {
 
         Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
-            pending_loads: Mutex::new(HashSet::new()),
+            pending_loads: parking_lot::Mutex::new(HashMap::new()),
             unloading_models: Mutex::new(HashSet::new()),
             load_unload_gate: Mutex::new(()),
+            lifecycle_event_publish_gate: Mutex::new(()),
             config,
             signing_key,
             policy_client,
@@ -501,6 +545,8 @@ impl ModelService {
             moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(test)]
             test_work_order_capture: Mutex::new(None),
+            #[cfg(test)]
+            before_unloaded_event: Mutex::new(None),
         })})
     }
 
@@ -629,13 +675,18 @@ impl ModelService {
             }
         }
 
-        let mut pending = self.pending_loads.lock().await;
-        if pending.contains(instance) {
+        let mut pending = self.pending_loads.lock();
+        if pending.contains_key(instance) {
             return Ok(InterceptedLoadAdmission::Pending);
         }
 
-        pending.insert(instance.clone());
-        Ok(InterceptedLoadAdmission::Accepted)
+        let attempt = self.allocate_load_epoch();
+        pending.insert(instance.clone(), attempt);
+        Ok(InterceptedLoadAdmission::Accepted(InterceptedLoadReservation::new(
+            Arc::clone(&self.inner),
+            instance.clone(),
+            attempt,
+        )))
     }
 
     /// Execute one previously admitted intercepted load. Its pending reservation
@@ -646,10 +697,11 @@ impl ModelService {
         instance: &InferenceInstanceId,
         max_context: Option<u32>,
         kv_quant: Option<KVQuantType>,
+        mut reservation: InterceptedLoadReservation,
     ) -> Result<String> {
-        let epoch = self.allocate_load_epoch();
+        let epoch = reservation.attempt;
         let result = self.load_model_inner(instance, max_context, kv_quant).await;
-        self.pending_loads.lock().await.remove(instance);
+        reservation.release();
         self.latch_load_terminal(instance, epoch, &result);
         result
     }
@@ -1021,27 +1073,28 @@ impl ModelService {
 
         // Atomically check-and-insert into pending_loads (prevents duplicate GPU loads
         // when multiple requests arrive during the ~40s load window).
-        // HashSet::insert returns false if the value was already present.
+        // HashMap::insert is guarded by contains_key so a direct attempt owns
+        // the epoch stored beside its pending marker.
+        let epoch;
         {
-            let mut pending = self.pending_loads.lock().await;
-            if !pending.insert(instance.clone()) {
+            let mut pending = self.pending_loads.lock();
+            if pending.contains_key(instance) {
                 anyhow::bail!(
                     "Model {} is already being loaded — please retry shortly",
                     model_ref_str
                 );
             }
+            epoch = self.allocate_load_epoch();
+            pending.insert(instance.clone(), epoch);
         }
         drop(load_unload_gate);
 
-        // EV7/#649: this is a genuine new load attempt (past the already-loaded
-        // and already-pending fast paths) — allocate a fresh epoch so its
-        // terminal latches under a new key (reload ⇒ new terminal).
-        let epoch = self.allocate_load_epoch();
-
+        // EV7/#649: the gated pending insertion allocated this genuine load's
+        // fresh epoch, so its terminal latches under a new key on completion.
         let result = self.load_model_inner(instance, max_context, kv_quant).await;
 
         // Always remove from pending, whether load succeeded or failed
-        self.pending_loads.lock().await.remove(instance);
+        self.pending_loads.lock().remove(instance);
 
         // EV7/#649: latch the retained terminal (Loaded / LoadFailed) for this
         // load attempt — the host-side retain a late `load --wait` reads.
@@ -1374,7 +1427,7 @@ impl ModelService {
                 cache.pop_entry(instance).map(|(_, model)| model)
             };
             let pending_load = if model.is_none() {
-                inner.pending_loads.lock().await.contains(instance)
+                inner.pending_loads.lock().contains_key(instance)
             } else {
                 false
             };
@@ -1408,6 +1461,16 @@ impl ModelService {
                 model_ref_str
             ));
         }
+        // Acquire delivery order before releasing admission. A successful join
+        // proves the worker is gone, so a listener may reload immediately; its
+        // later loaded event must wait behind this unloaded completion, but no
+        // lifecycle admission lock is held across the publish await.
+        let _event_publish_gate = inner.lifecycle_event_publish_gate.lock().await;
+        inner.unloading_models.lock().await.remove(instance);
+        #[cfg(test)]
+        if let Some(before_publish) = inner.before_unloaded_event.lock().await.take() {
+            let _ = before_publish.send(());
+        }
         let model_name = model_ref_str.split(':').next().unwrap_or(&model_ref_str);
         let scope = format!("serve:model:{}", model_name);
         let event = crate::events::EventEnvelope::new(
@@ -1420,7 +1483,6 @@ impl ModelService {
         if let Ok(payload) = serde_json::to_vec(&event) {
             let _ = inner.event_publisher.publish("lifecycle", "unloaded", &payload).await;
         }
-        inner.unloading_models.lock().await.remove(instance);
         Ok(())
     }
 
@@ -1508,8 +1570,7 @@ impl ModelService {
         let pending: HashSet<_> = {
             self.pending_loads
                 .lock()
-                .await
-                .iter()
+                .keys()
                 .filter(|instance| instance.tenant() == verified_tenant)
                 .cloned()
                 .collect()
@@ -1560,8 +1621,8 @@ impl ModelService {
                 }];
             }
         }
-        let pending = self.pending_loads.lock().await;
-        if pending.contains(instance) {
+        let pending = self.pending_loads.lock();
+        if pending.contains_key(instance) {
             vec![GenModelStatusEntry {
                 model_ref: instance.model_ref().to_owned(),
                 status: "loading".to_owned(),
@@ -2343,7 +2404,7 @@ impl ModelService {
         SyntheticTree::new(SyntheticNode::DynamicDir {
             list: Box::new(move || {
                 let cache = inner_list.loaded_models.blocking_read();
-                let pending = inner_list.pending_loads.blocking_lock();
+                let pending = inner_list.pending_loads.lock();
                 let mut entries: Vec<DirEntry> = cache
                     .iter()
                     .filter(|(instance, _)| instance.tenant() == list_tenant)
@@ -2355,7 +2416,7 @@ impl ModelService {
                     })
                     .collect();
                 for instance in pending
-                    .iter()
+                    .keys()
                     .filter(|instance| instance.tenant() == list_tenant)
                 {
                     if !cache.contains(instance) {
@@ -2602,7 +2663,7 @@ impl crate::services::RequestService for ModelService {
             // instance only from the already-verified tenant in the envelope.
             let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
             let model_ref = load_data.model_ref.clone();
-            match self.reserve_intercepted_load(&instance).await? {
+            let reservation = match self.reserve_intercepted_load(&instance).await? {
                 InterceptedLoadAdmission::Loaded { reach } => {
                     let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                         LoadedModelResponse { model_ref, reach },
@@ -2616,23 +2677,28 @@ impl crate::services::RequestService for ModelService {
                     ))?;
                     return Ok((response, None));
                 }
-                InterceptedLoadAdmission::Accepted => {}
-            }
+                InterceptedLoadAdmission::Accepted(reservation) => reservation,
+            };
 
             // The accepted response is sent only after the shared gate has
-            // reserved `pending_loads`. The continuation owns that reservation
-            // and publishes the established lifecycle success/failure edge.
+            // reserved `pending_loads`. Transfer its attempt-scoped RAII guard
+            // into the continuation *before* response signing/serialization:
+            // if that fallible response path returns early, dropping this
+            // continuation synchronously releases only this attempt's marker.
             info!("Load request accepted for {} (async)", model_ref);
-            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                LoadedModelResponse { model_ref: model_ref.clone(), reach: Vec::new() },
-            ))?;
+            let response_model_ref = model_ref.clone();
             let service = self.clone(); // Arc clone — cheap, 'static
             let (load_max_context, load_kv_quant) = load_data.to_load_params();
             let continuation: crate::services::Continuation = Box::pin(async move {
                 let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                 let scope = format!("serve:model:{}", model_name);
                 match service
-                    .run_intercepted_load(&instance, load_max_context, load_kv_quant)
+                    .run_intercepted_load(
+                        &instance,
+                        load_max_context,
+                        load_kv_quant,
+                        reservation,
+                    )
                     .await
                 {
                     Ok(endpoint) => {
@@ -2646,6 +2712,7 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
+                            let _event_publish_gate = service.lifecycle_event_publish_gate.lock().await;
                             let _ = service.event_publisher.publish("lifecycle", "loaded", &payload).await;
                             debug!("Published model.loaded event");
                         }
@@ -2661,11 +2728,16 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
+                            let _event_publish_gate = service.lifecycle_event_publish_gate.lock().await;
                             let _ = service.event_publisher.publish("lifecycle", "failed", &payload).await;
                         }
                     }
                 }
             });
+
+            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
+                LoadedModelResponse { model_ref: response_model_ref, reach: Vec::new() },
+            ))?;
 
             return Ok((response, Some(continuation)));
         }
@@ -4022,7 +4094,7 @@ mod tests {
         // visible in the cache while the load reservation still exists. The
         // unloading worker below blocks its join so both status APIs must
         // prefer the reservation for the whole drain interval.
-        service.pending_loads.lock().await.insert(instance.clone());
+        service.pending_loads.lock().insert(instance.clone(), 1);
 
         tokio::task::spawn_blocking(move || {
             armed_rx
@@ -4090,7 +4162,7 @@ mod tests {
         // In production the outer load completion clears this marker. Keep the
         // worker drain blocked but model that completion before asserting final
         // status absence below.
-        service.pending_loads.lock().await.remove(&instance);
+        service.pending_loads.lock().remove(&instance);
         release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4125,7 +4197,7 @@ mod tests {
             instance.clone(),
             selector_loaded_model(Vec::new(), Arc::new(BoundaryDialState::default())),
         );
-        service.pending_loads.lock().await.insert(instance.clone());
+        service.pending_loads.lock().insert(instance.clone(), 1);
         service.unloading_models.lock().await.insert(instance.clone());
 
         let (all_status, single_status) = tokio::join!(
@@ -4160,10 +4232,11 @@ mod tests {
         // pending load, then unload attempts to win before the continuation is
         // polled. Both transitions use `load_unload_gate`, so the unload must
         // fail closed and leave the accepted continuation as sole owner.
-        assert!(matches!(
-            service.reserve_intercepted_load(&instance).await,
-            Ok(InterceptedLoadAdmission::Accepted)
-        ));
+        let reservation = match service.reserve_intercepted_load(&instance).await {
+            Ok(InterceptedLoadAdmission::Accepted(reservation)) => reservation,
+            Ok(_) => panic!("fixture load must receive a new accepted reservation"),
+            Err(error) => panic!("fixture load admission failed: {error:#}"),
+        };
         let unload_error = match service.unload_model(&instance).await {
             Err(error) => error,
             Ok(()) => panic!("unload must not cancel an accepted pending load"),
@@ -4173,7 +4246,7 @@ mod tests {
             "unload must reject against the accepted pending reservation: {unload_error:#}"
         );
         assert!(
-            service.pending_loads.lock().await.contains(&instance),
+            service.pending_loads.lock().contains_key(&instance),
             "the continuation must retain ownership of the accepted reservation"
         );
         assert!(
@@ -4185,13 +4258,94 @@ mod tests {
         // drives the continuation's ordinary failure completion without
         // starting a worker and proves it releases its own reservation.
         assert!(
-            service.run_intercepted_load(&instance, None, None).await.is_err(),
+            service
+                .run_intercepted_load(&instance, None, None, reservation)
+                .await
+                .is_err(),
             "fixture resolution must reach the continuation failure path"
         );
         assert!(
-            !service.pending_loads.lock().await.contains(&instance),
+            !service.pending_loads.lock().contains_key(&instance),
             "continuation completion must release its accepted reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_intercepted_load_reservation_rolls_back_pending_marker() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+
+        // This is the response-serialization / unpolled-continuation failure
+        // path: admission succeeded, the continuation owns its guard, but the
+        // response path drops that continuation before its first poll. Drop
+        // must synchronously remove the marker so neither status nor a later
+        // admission sees a permanent false load.
+        let reservation = match service.reserve_intercepted_load(&instance).await {
+            Ok(InterceptedLoadAdmission::Accepted(reservation)) => reservation,
+            Ok(_) => panic!("fixture load must receive a new accepted reservation"),
+            Err(error) => panic!("fixture load admission failed: {error:#}"),
+        };
+        assert!(service.pending_loads.lock().contains_key(&instance));
+        let unpolled: crate::services::Continuation = Box::pin(async move {
+            let _reservation = reservation;
+            std::future::pending::<()>().await;
+        });
+        drop(unpolled);
+        assert!(
+            !service.pending_loads.lock().contains_key(&instance),
+            "dropping an unpolled accepted continuation must roll back pending"
+        );
+
+        // A late Drop from an earlier handoff must not erase a newer attempt
+        // for the same instance. This is the attempt identity contract, not a
+        // best-effort instance-wide cleanup.
+        let stale = InterceptedLoadReservation::new(Arc::clone(&service.inner), instance.clone(), 7);
+        service.pending_loads.lock().insert(instance.clone(), 8);
+        drop(stale);
+        assert_eq!(
+            service.pending_loads.lock().get(&instance),
+            Some(&8),
+            "a stale guard must release only its own attempt marker"
+        );
+        service.pending_loads.lock().remove(&instance);
+        let retry = service.reserve_intercepted_load(&instance).await;
+        assert!(
+            matches!(retry, Ok(InterceptedLoadAdmission::Accepted(_))),
+            "a later load must not deduplicate against a dropped reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_unload_releases_admission_before_unloaded_event() {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        service.loaded_models.write().await.put(
+            instance.clone(),
+            selector_loaded_model(Vec::new(), Arc::new(BoundaryDialState::default())),
+        );
+        let (before_publish_tx, before_publish_rx) = tokio::sync::oneshot::channel();
+        *service.before_unloaded_event.lock().await = Some(before_publish_tx);
+
+        let unload_service = service.clone();
+        let unload_instance = instance.clone();
+        let unload = tokio::spawn(async move { unload_service.unload_model(&unload_instance).await });
+        before_publish_rx
+            .await
+            .unwrap_or_else(|error| panic!("unload did not reach event boundary: {error}"));
+
+        assert!(
+            !service.unloading_models.lock().await.contains(&instance),
+            "successful join must release admission before model.unloaded is published"
+        );
+        let reload = service.reserve_intercepted_load(&instance).await;
+        assert!(
+            matches!(reload, Ok(InterceptedLoadAdmission::Accepted(_))),
+            "an event-driven reload must be admitted after a successful join"
+        );
+        unload
+            .await
+            .unwrap_or_else(|error| panic!("unload task panicked: {error}"))
+            .unwrap_or_else(|error| panic!("dummy worker unload failed: {error:#}"));
     }
 
     #[tokio::test]
