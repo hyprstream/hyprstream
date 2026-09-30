@@ -727,8 +727,8 @@ async fn oauth_management_preserves_caller_authority_over_local_transport() -> R
 /// production OAuth bridge currently has no JWT key source (covered by the
 /// production-equivalent negative below), so this fixture supplies the same
 /// cluster verifier explicitly to regress the next authorization boundary.
-/// It deliberately traverses generated decode -> dispatch PEP -> JWT ->
-/// handler and proves both targeted mutations stop at OAuth's authenticated
+/// It deliberately traverses JWT verification -> generated decode -> dispatch
+/// PEP -> handler and proves both targeted mutations stop at OAuth's authenticated
 /// local-control-plane gate before a mutator is selected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_service_cannot_mutate_oauth_after_jwt_admission() -> Result<()> {
