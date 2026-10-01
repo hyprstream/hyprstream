@@ -7140,6 +7140,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-decision-backbone"
+version = "0.1.0"
+dependencies = [
+ "hyprstream-decision",
+ "hyprstream-decision-head",
+ "serde",
+ "tch",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-decision-head"
 version = "0.1.0"
 dependencies = [

@@ -39,6 +39,7 @@ members = [
     "crates/hyprstream-pay",
     "crates/hyprstream-resource",
     "crates/hyprstream-decision",
+    "crates/hyprstream-decision-backbone",
     "crates/hyprstream-calibration",
     "crates/hyprstream-decision-head",
     "crates/hyprstream-decision-stub",
