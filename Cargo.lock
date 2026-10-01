@@ -7650,6 +7650,8 @@ name = "hyprstream-rpc-std"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array 56.2.0",
+ "arrow-schema 56.2.0",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -7659,6 +7661,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.3",
  "hyprstream-9p",
+ "hyprstream-decision",
  "hyprstream-pay",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
@@ -7673,6 +7676,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "subsecond",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "url",
