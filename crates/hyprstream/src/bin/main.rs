@@ -3180,8 +3180,12 @@ fn main() -> Result<()> {
             let service_token = match native_service_name.as_deref() {
                 Some(name) => {
                     let secrets = HyprConfig::resolve_secrets_dir_for(Some(&config))?;
-                    Some(hyprstream_core::auth::identity_store::load_service_jwt(&secrets, name)?
-                        .with_context(|| format!("missing enrolled service credential for {name}"))?)
+                    let profile = hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
+                    let token = hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
+                        &secrets, name, profile,
+                    )?
+                    .with_context(|| format!("missing enrolled service credential for {name}"))?;
+                    Some(token)
                 }
                 None => None,
             };
@@ -4977,7 +4981,7 @@ mod resolver_startup_controls {
             .expect("top-level command dispatch");
         assert!(install < first_generated);
         assert!(first_generated < command_dispatch);
-        assert!(production.contains("load_service_jwt(&secrets, name)?"));
+        assert!(production.contains("load_service_jwt_for_profile(\n                        &secrets, name, profile,"));
         assert!(production.contains("signing_key.clone(),\n                service_token,"));
         assert_eq!(
             production
