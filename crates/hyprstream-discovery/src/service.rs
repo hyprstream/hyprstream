@@ -3616,10 +3616,11 @@ fn resolve_local_discovery_transport(
 fn install_local_discovery_client(
     signing_key: SigningKey,
     discovery_vk: VerifyingKey,
+    token: Option<String>,
 ) -> Result<hyprstream_rpc_std::discovery_client::DiscoveryClient> {
     let transport = resolve_local_discovery_transport()?;
     let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
-    let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+    let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), token)?;
     Ok(hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
 }
 
@@ -3637,12 +3638,17 @@ fn install_local_discovery_client(
 /// - `true` (remote worker): dial the DID-advertised network transport and
 ///   REQUIRE a successful signed liveness ping before installing — a dead or
 ///   wrong-key endpoint refuses the boot.
+///
+/// `service_token` is the caller's own enrolled, signer-bound credential.
+/// Discovery must not borrow another service's credential or infer MAC
+/// clearance from a key.
 #[cfg(not(target_arch = "wasm32"))]
 // Without `rocksdb` the accepted-state authority construction fails closed,
 // leaving the verifier binding unused in that configuration.
 #[cfg_attr(not(any(feature = "rocksdb", feature = "postgres")), allow(unused_variables))]
 pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
+    service_token: Option<String>,
     trust_source: crate::DeploymentTrustSource,
     remote_node: bool,
     network_required: bool,
@@ -3705,10 +3711,10 @@ pub async fn bootstrap_deployment_process(
                     discovery_client: None,
                 });
                 hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
-                    "discovery", "discovery", None, signing_key, None, resolver,
+                    "discovery", "discovery", None, signing_key, service_token, resolver,
                 )?))
             } else {
-                install_local_discovery_client(signing_key, discovery_vk)?
+                install_local_discovery_client(signing_key, discovery_vk, service_token)?
             };
             (authority, discovery_client)
         }
@@ -3748,7 +3754,7 @@ pub async fn bootstrap_deployment_process(
                     &discovery_transport,
                     signer,
                     Some(discovery_vk),
-                    None,
+                    service_token,
                     Some(Arc::new(kem_store)),
                     Some(Arc::new(pq_store)),
                 )?;
@@ -3777,7 +3783,7 @@ pub async fn bootstrap_deployment_process(
                     )
                     })?
                     .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)?;
-                let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+                let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), service_token)?;
                 (authority, hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
             }
         }
@@ -9593,7 +9599,7 @@ mod eager_resolver_regression {
         // The resolver-install path: dial + DiscoveryClient::new.
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let discovery_vk = signing_key.verifying_key();
-        let _client = install_local_discovery_client(signing_key, discovery_vk)
+        let _client = install_local_discovery_client(signing_key, discovery_vk, None)
             .expect(
                 "install_local_discovery_client must succeed at first boot with \
                  no registered discovery endpoint",
@@ -9613,6 +9619,18 @@ mod eager_resolver_regression {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&runtime_dir);
+    }
+
+    #[test]
+    fn production_bootstrap_discovery_dials_with_caller_credential() {
+        let source = include_str!("service.rs");
+        let production = source
+            .split("// ============================================================================\n// Regression: PostgreSQL accepted-state authority selection")
+            .next()
+            .expect("production source");
+        assert!(production.contains("None, signing_key, service_token, resolver,"));
+        assert!(production.contains("install_local_discovery_client(signing_key, discovery_vk, service_token)"));
+        assert!(production.contains("Some(discovery_vk), service_token)?"));
     }
 
     /// Structural guard: the OsOwnedFiles arm of
@@ -9684,7 +9702,7 @@ mod pg_authority_wiring {
         // The public bootstrap entry point takes the resolved records binding.
         assert!(
             production.contains(
-                "pub async fn bootstrap_deployment_process(\n    signing_key: SigningKey,\n    trust_source: crate::DeploymentTrustSource,\n    remote_node: bool,\n    network_required: bool,\n    records: &hyprstream_pds::rds::RdsConfig,\n) -> Result<()>"
+                "pub async fn bootstrap_deployment_process(\n    signing_key: SigningKey,\n    service_token: Option<String>,\n    trust_source: crate::DeploymentTrustSource,\n    remote_node: bool,\n    network_required: bool,\n    records: &hyprstream_pds::rds::RdsConfig,\n) -> Result<()>"
             ),
             "bootstrap_deployment_process must take the resolved records binding"
         );

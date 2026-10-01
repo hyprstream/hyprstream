@@ -518,6 +518,7 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
         );
         hyprstream_discovery::bootstrap_deployment_process(
             oauth.clone(),
+            None,
             hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles,
             false,
             true,
