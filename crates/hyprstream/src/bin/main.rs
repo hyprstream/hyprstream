@@ -1716,6 +1716,7 @@ fn resolve_service_vk(
 async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
+    service_token: Option<String>,
 ) -> Result<bool> {
     let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
         config.cluster_at9p_did.as_deref(),
@@ -1809,6 +1810,7 @@ async fn install_process_production_resolver(
         .context("failed to resolve the records-role binding")?;
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
+        service_token,
         trust_source,
         config.cluster_remote_node,
         config.quic.iroh_required(),
@@ -3171,11 +3173,28 @@ fn main() -> Result<()> {
             let signing_key = load_process_signing_key(&config, native_service_name.as_deref()).await?;
             let verifying_key = signing_key.verifying_key();
 
-            let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
+            // The process-owned Discovery client is the first native RPC
+            // client created. It must present the same enrolled, holder-bound
+            // service JWT as the later factory clients: a signature alone
+            // identifies the service but carries no MAC clearance.
+            let service_token = match native_service_name.as_deref() {
+                Some(name) => {
+                    let secrets = HyprConfig::resolve_secrets_dir_for(Some(&config))?;
+                    let profile = hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
+                    let token = hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
+                        &secrets, name, profile,
+                    )?
+                    .with_context(|| format!("missing enrolled service credential for {name}"))?;
+                    Some(token)
+                }
+                None => None,
+            };
+
+            let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config, service_token.clone()).await
                 .context("Failed to install checkpoint-backed production resolver")?;
             let client = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
                 signing_key.clone(),
-                None,
+                service_token,
             )?;
 
             Ok::<_, anyhow::Error>((client, signing_key, verifying_key, is_os_owned_bootstrap))
@@ -4949,10 +4968,10 @@ mod resolver_startup_controls {
             .next()
             .expect("production binary source");
         let startup = production
-            .find("install_process_production_resolver(&signing_key, &config).await")
+            .find("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
             .expect("trusted startup boundary");
         let install = production[startup..]
-            .find("install_process_production_resolver(&signing_key, &config).await")
+            .find("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
             .find("RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,")
@@ -4962,9 +4981,11 @@ mod resolver_startup_controls {
             .expect("top-level command dispatch");
         assert!(install < first_generated);
         assert!(first_generated < command_dispatch);
+        assert!(production.contains("load_service_jwt_for_profile(\n                        &secrets, name, profile,"));
+        assert!(production.contains("signing_key.clone(),\n                service_token,"));
         assert_eq!(
             production
-                .matches("install_process_production_resolver(&signing_key, &config).await")
+                .matches("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
                 .count(),
             1
         );

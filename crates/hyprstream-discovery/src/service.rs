@@ -3616,11 +3616,35 @@ fn resolve_local_discovery_transport(
 fn install_local_discovery_client(
     signing_key: SigningKey,
     discovery_vk: VerifyingKey,
+    token: Option<String>,
 ) -> Result<hyprstream_rpc_std::discovery_client::DiscoveryClient> {
     let transport = resolve_local_discovery_transport()?;
+    let token_provider = renewing_service_token_provider(&signing_key, token);
     let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
-    let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+    let rpc = hyprstream_rpc::dial::dial_with_token_provider(
+        &transport, signer, Some(discovery_vk), token_provider,
+    )?;
     Ok(hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
+}
+
+/// Only a caller that supplied its own enrolled credential can obtain a
+/// default JWT. Renewal replaces that same signer's attestation in the process
+/// trust store; the initial credential covers the interval before registration.
+fn current_service_token(signing_key: &SigningKey, initial: &Option<String>) -> Option<String> {
+    initial.as_ref()?;
+    hyprstream_service::global_trust_store()
+        .get(&signing_key.verifying_key())
+        .and_then(|att| att.jwt)
+        .or_else(|| initial.clone())
+}
+
+fn renewing_service_token_provider(
+    signing_key: &SigningKey,
+    initial: Option<String>,
+) -> Option<Arc<dyn Fn() -> Option<String> + Send + Sync>> {
+    initial.as_ref()?;
+    let signer = signing_key.clone();
+    Some(Arc::new(move || current_service_token(&signer, &initial)))
 }
 
 /// Atomically consume the explicitly selected deployment witness and install
@@ -3637,12 +3661,17 @@ fn install_local_discovery_client(
 /// - `true` (remote worker): dial the DID-advertised network transport and
 ///   REQUIRE a successful signed liveness ping before installing — a dead or
 ///   wrong-key endpoint refuses the boot.
+///
+/// `service_token` is the caller's own enrolled, signer-bound credential.
+/// Discovery must not borrow another service's credential or infer MAC
+/// clearance from a key.
 #[cfg(not(target_arch = "wasm32"))]
 // Without `rocksdb` the accepted-state authority construction fails closed,
 // leaving the verifier binding unused in that configuration.
 #[cfg_attr(not(any(feature = "rocksdb", feature = "postgres")), allow(unused_variables))]
 pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
+    service_token: Option<String>,
     trust_source: crate::DeploymentTrustSource,
     remote_node: bool,
     network_required: bool,
@@ -3705,10 +3734,10 @@ pub async fn bootstrap_deployment_process(
                     discovery_client: None,
                 });
                 hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
-                    "discovery", "discovery", None, signing_key, None, resolver,
+                    "discovery", "discovery", None, signing_key, service_token, resolver,
                 )?))
             } else {
-                install_local_discovery_client(signing_key, discovery_vk)?
+                install_local_discovery_client(signing_key, discovery_vk, service_token)?
             };
             (authority, discovery_client)
         }
@@ -3716,7 +3745,8 @@ pub async fn bootstrap_deployment_process(
             anyhow::ensure!(!network_required, "required native bootstrap needs provisioned OS-owned accepted service state");
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
                 authenticate_did_anchored_bootstrap(&anchors).await?;
-            let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+                let token_provider = renewing_service_token_provider(&signing_key, service_token);
+                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
             if remote_node {
                 // Remote worker: the DID-advertised transport is the only
                 // reach. QUIC forbids cleartext envelopes, so the document's
@@ -3744,11 +3774,11 @@ pub async fn bootstrap_deployment_process(
                 pq_store.bind(discovery_vk.to_bytes(), &pq_key);
                 // Dial it and require liveness — a reachable-but-wrong
                 // endpoint (no discovery key) or a dead one fails closed here.
-                let rpc = hyprstream_rpc::dial::dial_with_crypto_stores(
+                let rpc = hyprstream_rpc::dial::dial_with_crypto_stores_and_token_provider(
                     &discovery_transport,
                     signer,
                     Some(discovery_vk),
-                    None,
+                    token_provider,
                     Some(Arc::new(kem_store)),
                     Some(Arc::new(pq_store)),
                 )?;
@@ -3777,7 +3807,9 @@ pub async fn bootstrap_deployment_process(
                     )
                     })?
                     .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)?;
-                let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+                let rpc = hyprstream_rpc::dial::dial_with_token_provider(
+                    &transport, signer, Some(discovery_vk), token_provider,
+                )?;
                 (authority, hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
             }
         }
@@ -4080,7 +4112,7 @@ impl ProductionRpcClient {
             snapshot.transport(),
             signer,
             Some(snapshot.response_verifying_key()),
-            self.token.clone(),
+            current_service_token(&self.signing_key, &self.token),
             Some(kem),
             Some(pq),
         )
@@ -9593,7 +9625,7 @@ mod eager_resolver_regression {
         // The resolver-install path: dial + DiscoveryClient::new.
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let discovery_vk = signing_key.verifying_key();
-        let _client = install_local_discovery_client(signing_key, discovery_vk)
+        let _client = install_local_discovery_client(signing_key, discovery_vk, None)
             .expect(
                 "install_local_discovery_client must succeed at first boot with \
                  no registered discovery endpoint",
@@ -9613,6 +9645,45 @@ mod eager_resolver_regression {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&runtime_dir);
+    }
+
+    #[test]
+    fn production_bootstrap_discovery_dials_with_caller_credential() {
+        let source = include_str!("service.rs");
+        let production = source
+            .split("// ============================================================================\n// Regression: PostgreSQL accepted-state authority selection")
+            .next()
+            .expect("production source");
+        assert!(production.contains("None, signing_key, service_token, resolver,"));
+        assert!(production.contains("install_local_discovery_client(signing_key, discovery_vk, service_token)"));
+        assert!(production.contains("Some(discovery_vk), token_provider,"));
+        assert!(production.contains("current_service_token(&self.signing_key, &self.token)"));
+    }
+
+    #[test]
+    fn process_client_observes_same_signer_jwt_renewal() {
+        let signing_key = SigningKey::from_bytes(&[0x6d; 32]);
+        let initial = Some("initial-service-jwt".to_owned());
+        let provider = renewing_service_token_provider(&signing_key, initial.clone())
+            .expect("credentialed client has provider");
+        assert_eq!(provider(), initial);
+
+        hyprstream_service::global_trust_store().insert(
+            signing_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("model".to_owned()).collect(),
+                subject: None,
+                jwt: Some("renewed-service-jwt".to_owned()),
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+        assert_eq!(provider().as_deref(), Some("renewed-service-jwt"));
+        assert_eq!(
+            current_service_token(&signing_key, &initial).as_deref(),
+            Some("renewed-service-jwt")
+        );
+        assert!(renewing_service_token_provider(&signing_key, None).is_none());
     }
 
     /// Structural guard: the OsOwnedFiles arm of
@@ -9684,7 +9755,7 @@ mod pg_authority_wiring {
         // The public bootstrap entry point takes the resolved records binding.
         assert!(
             production.contains(
-                "pub async fn bootstrap_deployment_process(\n    signing_key: SigningKey,\n    trust_source: crate::DeploymentTrustSource,\n    remote_node: bool,\n    network_required: bool,\n    records: &hyprstream_pds::rds::RdsConfig,\n) -> Result<()>"
+                "pub async fn bootstrap_deployment_process(\n    signing_key: SigningKey,\n    service_token: Option<String>,\n    trust_source: crate::DeploymentTrustSource,\n    remote_node: bool,\n    network_required: bool,\n    records: &hyprstream_pds::rds::RdsConfig,\n) -> Result<()>"
             ),
             "bootstrap_deployment_process must take the resolved records binding"
         );

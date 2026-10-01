@@ -858,6 +858,7 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
         .build()?;
     bootstrap_rt.block_on(hyprstream_discovery::bootstrap_deployment_process(
         oauth.clone(),
+        None,
         hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles,
         false,
         true,

@@ -157,13 +157,16 @@ jobs:
             -e POSTGRES_DB=hyprstream_qualification \
             -e POSTGRES_PASSWORD=qualification-only \
             docker.io/library/postgres:16-alpine
+          # The image starts a temporary Unix-socket server for initialization,
+          # then stops it before launching the final TCP server. Probe TCP so
+          # we cannot pass the temporary phase and race its shutdown.
           for _ in $(seq 1 60); do
-            if podman exec "$POSTGRES_QUALIFICATION_CONTAINER" pg_isready -U postgres -d hyprstream_qualification >/dev/null; then
+            if podman exec "$POSTGRES_QUALIFICATION_CONTAINER" pg_isready -h 127.0.0.1 -U postgres -d hyprstream_qualification >/dev/null; then
               break
             fi
             sleep 1
           done
-          podman exec "$POSTGRES_QUALIFICATION_CONTAINER" pg_isready -U postgres -d hyprstream_qualification >/dev/null
+          podman exec "$POSTGRES_QUALIFICATION_CONTAINER" pg_isready -h 127.0.0.1 -U postgres -d hyprstream_qualification >/dev/null
           printf '%s\n' 'postgresql://postgres:qualification-only@postgres:5432/hyprstream_qualification?sslmode=disable' >"$url_file"
           chmod 0600 "$url_file"
           podman build --target builder-cpu-arm64 --build-arg VARIANT=cpu-arm64 \

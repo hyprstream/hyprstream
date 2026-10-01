@@ -162,13 +162,51 @@ pub fn dial_with_crypto_stores<S>(
 where
     S: Signer + 'static,
 {
+    let token_provider = token.map(|token| {
+        Arc::new(move || Some(token.clone())) as Arc<dyn Fn() -> Option<String> + Send + Sync>
+    });
+    dial_with_crypto_stores_and_token_provider(
+        target, signer, server_verifying_key, token_provider,
+        request_kem_store, response_pq_store,
+    )
+}
+
+/// Dial with a JWT provider evaluated for each request, so long-lived clients
+/// observe credential renewal without rebuilding their transport.
+pub fn dial_with_token_provider<S>(
+    target: &TransportConfig,
+    signer: S,
+    server_verifying_key: Option<VerifyingKey>,
+    token_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+) -> Result<Arc<dyn RpcClient>>
+where
+    S: Signer + 'static,
+{
+    dial_with_crypto_stores_and_token_provider(
+        target, signer, server_verifying_key, token_provider, None, None,
+    )
+}
+
+/// The provider form of the crypto-bound dial. A missing JWT remains missing;
+/// this API does not manufacture clearance from the caller's signing key.
+pub fn dial_with_crypto_stores_and_token_provider<S>(
+    target: &TransportConfig,
+    signer: S,
+    server_verifying_key: Option<VerifyingKey>,
+    token_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
+) -> Result<Arc<dyn RpcClient>>
+where
+    S: Signer + 'static,
+{
     /// Wrap a built transport as an `RpcClient`, applying the optional default
     /// JWT (CA-signed trust cert included in request envelopes) if present.
     fn build_client<S2, T2>(
         signer: S2,
         transport: T2,
         vk: Option<VerifyingKey>,
-        token: Option<String>,
+        token_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
         request_kem_store: Option<Arc<dyn KemTrustStore>>,
         response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
     ) -> Arc<dyn RpcClient>
@@ -185,8 +223,8 @@ where
             Some(store) => rpc.with_response_pq_store(store),
             None => rpc,
         };
-        let rpc = match token {
-            Some(t) => rpc.with_default_jwt(t),
+        let rpc = match token_provider {
+            Some(provider) => rpc.with_token_provider(move || provider()),
             None => rpc,
         };
         Arc::new(rpc) as Arc<dyn RpcClient>
@@ -205,7 +243,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -237,7 +275,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -265,7 +303,7 @@ where
                 signer,
                 transport,
                 Some(response_key),
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -283,7 +321,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -294,7 +332,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
