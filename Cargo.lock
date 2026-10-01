@@ -7223,6 +7223,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-eval"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "criterion",
+ "hyprstream-bench",
+ "hyprstream-calibration",
+ "hyprstream-decision",
+ "hyprstream-decision-stub",
+ "hyprstream-metrics-api",
+ "parking_lot 0.12.4",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic 0.13.1",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-flight"
 version = "0.1.0"
 dependencies = [
@@ -19548,6 +19570,8 @@ dependencies = [
  "cc",
  "chrono",
  "cipher",
+ "clap",
+ "clap_builder",
  "compact_str 0.9.0",
  "concurrent-queue",
  "const-oid 0.10.2",

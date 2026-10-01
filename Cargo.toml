@@ -42,6 +42,7 @@ members = [
     "crates/hyprstream-calibration",
     "crates/hyprstream-decision-head",
     "crates/hyprstream-decision-stub",
+    "crates/hyprstream-eval",
     "workspace-hack",
 ]
 default-members = [
