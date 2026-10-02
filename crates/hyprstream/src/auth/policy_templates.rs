@@ -264,6 +264,24 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
             groupings: None,
         },
         PolicyTemplate {
+            name: "cyberdione-staging-ui",
+            description: "Cyberdione staging only: allow OAuth CIMD and peer registration from https://www.staging.lab.hyprstream.com",
+            policies: Some(&[
+                // The current policy model intentionally uses this same exact
+                // origin gate for OAuth client metadata and peer registration.
+                // It does not auto-register a peer or open federation to any
+                // other origin.
+                ServicePolicyRule {
+                    subject: "*",
+                    domain: "*",
+                    resource: "federation:register:https://www.staging.lab.hyprstream.com",
+                    action: "check",
+                    effect: "allow",
+                },
+            ]),
+            groupings: None,
+        },
+        PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",
             policies: Some(&[
