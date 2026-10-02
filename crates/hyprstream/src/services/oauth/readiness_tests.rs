@@ -661,8 +661,8 @@ fn manager_spawn_pre_ready_failure_maps_to_spawn_error() -> anyhow::Result<()> {
         done_tx: Some(done_tx),
     };
     let manager = hyprstream_service::InprocManager::new();
+    // The manager's startup handshake must not need Tokio's time driver.
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
         .build()?;
     let spawned = rt.block_on(hyprstream_service::ServiceManager::spawn(
         &manager,
@@ -675,6 +675,10 @@ fn manager_spawn_pre_ready_failure_maps_to_spawn_error() -> anyhow::Result<()> {
     assert!(
         err.to_string().contains("service thread exited before ready"),
         "failure must traverse the real ready-channel chain: {err}"
+    );
+    assert!(
+        err.to_string().contains("bind failed"),
+        "the foreground startup error must retain the service's bind failure: {err}"
     );
     // Bounded wait for the REAL teardown: the manager rejects the spawn, but
     // its service thread still runs the inner run() to completion; done_rx
