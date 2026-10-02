@@ -1820,6 +1820,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn cyberdione_staging_ui_template_allows_only_its_exact_origin() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        apply_template(&pm, "cyberdione-staging-ui").await;
+
+        let allowed =
+            federation_registration_resource("https://www.staging.lab.hyprstream.com").unwrap();
+        assert!(
+            pm.check_with_domain("service:oauth", "*", &allowed, "check")
+                .await
+        );
+
+        for denied_origin in [
+            "https://staging-amp.hyprstream.com",
+            "https://evil.www.staging.lab.hyprstream.com",
+            "https://www.staging.lab.hyprstream.com.evil.example",
+            "http://www.staging.lab.hyprstream.com",
+        ] {
+            let denied = federation_registration_resource(denied_origin).unwrap();
+            assert!(
+                !pm.check_with_domain("service:oauth", "*", &denied, "check").await,
+                "staging policy must deny {denied_origin}"
+            );
+        }
+
+        let policies = pm.get_policy().await;
+        assert_eq!(
+            policies
+                .iter()
+                .filter(|rule| rule
+                    .get(2)
+                    .is_some_and(|resource| resource.starts_with("federation:register:")))
+                .count(),
+            1
+        );
+        assert!(policies.iter().any(|rule| rule.get(2).is_some_and(|resource| resource == &allowed)));
+    }
+
     /// #319 invariant — the mesh authority actions are NEVER reachable by a
     /// wildcard (`*`) or `anonymous` subject, even when a `federation-open`-style
     /// wildcard rule AND the public-inference template are both loaded. Only a
