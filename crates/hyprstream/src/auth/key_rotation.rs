@@ -332,6 +332,42 @@ fn component_state_digest_from_slots(
     URL_SAFE_NO_PAD.encode(digest.finalize())
 }
 
+/// Cheaply detect a component-key change before deciding that a rejected
+/// proposal is still stale. Slot persistence uses atomic file replacement, so
+/// identity plus modification time detects a new key without repeatedly
+/// deserializing private ML-DSA material on the verifier hot path.
+fn fingerprint_component_slot_files(
+    secrets_dir: &Path,
+    fingerprint: &mut Sha256,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let state_dir = rotation_state_dir(secrets_dir);
+    for dir in [secrets_dir, state_dir.as_path()] {
+        for family in ["jwt-signing-key", "ml-dsa-signing-key"] {
+            for slot in ["drain", "active", "lead"] {
+                for suffix in ["", ".meta"] {
+                    let path = dir.join(format!("{family}.{slot}{suffix}"));
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) => {
+                            fingerprint.update([1]);
+                            fingerprint.update(metadata.dev().to_be_bytes());
+                            fingerprint.update(metadata.ino().to_be_bytes());
+                            fingerprint.update(metadata.len().to_be_bytes());
+                            fingerprint.update(metadata.mtime().to_be_bytes());
+                            fingerprint.update(metadata.mtime_nsec().to_be_bytes());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            fingerprint.update([0]);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn component_state_digest(
     ed_store: &SigningKeyStore,
     pq_store: &MlDsaSigningKeyStore,
@@ -439,6 +475,7 @@ fn start_composite_authority_subscription(
                     let mut fingerprint = Sha256::new();
                     fingerprint.update(&pending_bytes);
                     fingerprint.update(&marker_bytes);
+                    fingerprint_component_slot_files(&secrets_dir, &mut fingerprint)?;
                     let fingerprint: [u8; 32] = fingerprint.finalize().into();
                     if rejected_pending.as_ref().is_some_and(|(previous, at)| {
                         *previous == fingerprint
@@ -2309,6 +2346,32 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[test]
+    fn rejected_composite_proposal_rechecks_replaced_component_slot() {
+        let dir = TempDir::new().unwrap();
+        let fingerprint = || {
+            let mut digest = Sha256::new();
+            fingerprint_component_slot_files(dir.path(), &mut digest).unwrap();
+            digest.finalize().to_vec()
+        };
+        let missing = fingerprint();
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-signing-key.active",
+            b"first-component",
+        )
+        .unwrap();
+        let first = fingerprint();
+        assert_ne!(missing, first);
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-signing-key.active",
+            b"second-component",
+        )
+        .unwrap();
+        assert_ne!(first, fingerprint());
+    }
 
     struct PermitFixtureAccountReads;
 
