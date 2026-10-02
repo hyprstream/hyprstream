@@ -2825,10 +2825,17 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     // MCP HTTP is fire-and-forget (no Arc<Notify> shutdown signal),
                     // so no Handle is wired for graceful shutdown. The process exit
                     // will terminate this task. OAI/OAuth use serve_app() instead.
-                    if let Err(e) = axum_server::bind_rustls(addr, tls)
-                        .serve(router.into_make_service())
-                        .await
-                    {
+                    let serve_result = if let Some(acme_acceptor) = tls.acme_acceptor {
+                        axum_server::bind(addr)
+                            .acceptor(acme_acceptor)
+                            .serve(router.into_make_service())
+                            .await
+                    } else {
+                        axum_server::bind_rustls(addr, tls.rustls)
+                            .serve(router.into_make_service())
+                            .await
+                    };
+                    if let Err(e) = serve_result {
                         tracing::error!("MCP HTTPS server error: {}", e);
                     }
                 }
