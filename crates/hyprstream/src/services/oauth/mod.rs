@@ -1380,7 +1380,7 @@ impl Spawnable for OAuthService {
                     })?;
                 let account_bound = crate::server::tls::bind_listener(
                     account_addr,
-                    Some(account_tls),
+                    Some(crate::server::tls::ResolvedTlsConfig::ordinary(account_tls)),
                     "AccountHttpService",
                 )?;
                 Some((account_bound, account_app, http_config.clone(), zone))
