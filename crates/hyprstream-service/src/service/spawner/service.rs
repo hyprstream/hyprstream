@@ -1259,6 +1259,7 @@ impl ServiceManager for InprocManager {
         // Spawn on dedicated thread
         // The ready signal is sent by the service after the socket binds
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (startup_error_tx, startup_error_rx) = tokio::sync::oneshot::channel::<String>();
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
         let name_clone = name.clone(); // Clone for closure use
@@ -1267,6 +1268,10 @@ impl ServiceManager for InprocManager {
             .name(format!("{}-service", name))
             .spawn(move || {
                 if let Err(e) = service.run(shutdown_clone, Some(ready_tx)) {
+                    // Deliver the concrete startup error before the manager
+                    // reports a closed READY channel. The foreground binary
+                    // can otherwise exit before this thread's log is flushed.
+                    let _ = startup_error_tx.send(e.to_string());
                     tracing::error!("Service {} failed: {}", name_clone, e);
                 }
             })
@@ -1275,7 +1280,25 @@ impl ServiceManager for InprocManager {
         // Wait for service to be ready (socket bound)
         // Note: systemd notification is handled inside run() after socket binds
         if ready_rx.await.is_err() {
-            return Err(anyhow!("service thread exited before ready"));
+            // A service may drop READY before its teardown completes. Bound
+            // the error wait without requiring the caller's Tokio runtime to
+            // have a time driver (ServiceManager::spawn does not require one).
+            let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel::<()>();
+            let _deadline_thread = thread::Builder::new()
+                .name("service-startup-deadline".to_owned())
+                .spawn(move || {
+                    thread::sleep(std::time::Duration::from_secs(10));
+                    let _ = deadline_tx.send(());
+                })
+                .map_err(|e| anyhow!("startup deadline thread spawn: {e}"))?;
+            let cause = tokio::select! {
+                result = startup_error_rx => result.ok(),
+                _ = deadline_rx => None,
+            };
+            return Err(match cause {
+                Some(cause) => anyhow!("service thread exited before ready: {cause}"),
+                None => anyhow!("service thread exited before ready"),
+            });
         }
 
         Ok(SpawnedService::thread(
