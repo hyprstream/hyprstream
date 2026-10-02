@@ -332,6 +332,42 @@ fn component_state_digest_from_slots(
     URL_SAFE_NO_PAD.encode(digest.finalize())
 }
 
+/// Cheaply detect a component-key change before deciding that a rejected
+/// proposal is still stale. Slot persistence uses atomic file replacement, so
+/// identity plus modification time detects a new key without repeatedly
+/// deserializing private ML-DSA material on the verifier hot path.
+fn fingerprint_component_slot_files(
+    secrets_dir: &Path,
+    fingerprint: &mut Sha256,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let state_dir = rotation_state_dir(secrets_dir);
+    for dir in [secrets_dir, state_dir.as_path()] {
+        for family in ["jwt-signing-key", "ml-dsa-signing-key"] {
+            for slot in ["drain", "active", "lead"] {
+                for suffix in ["", ".meta"] {
+                    let path = dir.join(format!("{family}.{slot}{suffix}"));
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) => {
+                            fingerprint.update([1]);
+                            fingerprint.update(metadata.dev().to_be_bytes());
+                            fingerprint.update(metadata.ino().to_be_bytes());
+                            fingerprint.update(metadata.len().to_be_bytes());
+                            fingerprint.update(metadata.mtime().to_be_bytes());
+                            fingerprint.update(metadata.mtime_nsec().to_be_bytes());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            fingerprint.update([0]);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn component_state_digest(
     ed_store: &SigningKeyStore,
     pq_store: &MlDsaSigningKeyStore,
@@ -419,6 +455,8 @@ fn start_composite_authority_subscription(
         .spawn(move || {
             use nix::fcntl::{flock, FlockArg};
             use std::os::fd::AsRawFd;
+            let mut last_error: Option<String> = None;
+            let mut rejected_pending: Option<([u8; 32], std::time::Instant)> = None;
             loop {
                 if COMPOSITE_PUBLISHING.load(Ordering::Acquire) {
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -432,9 +470,23 @@ fn start_composite_authority_subscription(
                         .write(true)
                         .open(composite_ledger_lock_path(&secrets_dir))?;
                     flock(lock.as_raw_fd(), FlockArg::LockShared)?;
-                    let pending: CompositeLedger = serde_json::from_slice(&std::fs::read(
-                        composite_ledger_path(&secrets_dir),
-                    )?)?;
+                    let pending_bytes = std::fs::read(composite_ledger_path(&secrets_dir))?;
+                    let marker_bytes = std::fs::read(composite_committed_path(&secrets_dir))?;
+                    let mut fingerprint = Sha256::new();
+                    fingerprint.update(&pending_bytes);
+                    fingerprint.update(&marker_bytes);
+                    fingerprint_component_slot_files(&secrets_dir, &mut fingerprint)?;
+                    let fingerprint: [u8; 32] = fingerprint.finalize().into();
+                    if rejected_pending.as_ref().is_some_and(|(previous, at)| {
+                        *previous == fingerprint
+                            && at.elapsed() < std::time::Duration::from_secs(60)
+                    }) {
+                        // Neither the proposal nor its commit marker changed.
+                        // Retain the already-published authority without
+                        // repeatedly deserializing private signing keys.
+                        return Ok(());
+                    }
+                    let pending: CompositeLedger = serde_json::from_slice(&pending_bytes)?;
                     let ed = load_or_init_key_store(&secrets_dir, &OAuthConfig::default());
                     let pq = load_or_init_ml_dsa_key_store(&secrets_dir, &OAuthConfig::default());
                     // Acknowledgement means only that the proposed generation is
@@ -445,10 +497,13 @@ fn start_composite_authority_subscription(
                         let pq_slots = pq.0.blocking_read();
                         component_state_digest_from_slots(&ed_slots, &pq_slots, ca_key)
                     };
-                    anyhow::ensure!(
-                        pending.component_digest == local_digest,
-                        "pending composite ledger does not match local component authority"
-                    );
+                    if pending.component_digest != local_digest {
+                        rejected_pending = Some((fingerprint, std::time::Instant::now()));
+                        anyhow::bail!(
+                            "pending composite ledger does not match local component authority"
+                        );
+                    }
+                    rejected_pending = None;
                     let _staged = ledger_pairs_from_local_keys(&pending, &ed, &pq, ca_key, true)?;
                     super::identity_store::write_secret(
                         &subscribers,
@@ -472,10 +527,24 @@ fn start_composite_authority_subscription(
                     }
                     Ok(())
                 })();
-                if let Err(error) = load {
-                    tracing::warn!("composite authority reload failed closed: {error:#}");
+                match load {
+                    Ok(()) => {
+                        last_error = None;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if last_error.as_deref() != Some(&message) {
+                            tracing::warn!("composite authority reload failed closed: {message}");
+                            last_error = Some(message);
+                        }
+                        // A stale or interrupted pending generation cannot become
+                        // live authority. Retrying its expensive key-store load
+                        // every 25 ms can exhaust a small verifier host before a
+                        // publisher has a chance to replace the pending ledger.
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(25));
             }
         })?;
     Ok(())
@@ -2277,6 +2346,32 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[test]
+    fn rejected_composite_proposal_rechecks_replaced_component_slot() {
+        let dir = TempDir::new().unwrap();
+        let fingerprint = || {
+            let mut digest = Sha256::new();
+            fingerprint_component_slot_files(dir.path(), &mut digest).unwrap();
+            digest.finalize().to_vec()
+        };
+        let missing = fingerprint();
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-signing-key.active",
+            b"first-component",
+        )
+        .unwrap();
+        let first = fingerprint();
+        assert_ne!(missing, first);
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-signing-key.active",
+            b"second-component",
+        )
+        .unwrap();
+        assert_ne!(first, fingerprint());
+    }
 
     struct PermitFixtureAccountReads;
 
