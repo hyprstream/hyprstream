@@ -137,6 +137,26 @@ jobs:
           # not a separate command.
           podman run --rm "$SMOKE_IMAGE" --version
 
+      # Staging projects the pinned Rocky host age utility into this same
+      # runtime image to decrypt deployment-trust inputs. Keep that boundary
+      # under the image smoke test too: age is dynamically linked against
+      # libresolv.so.2, which the minimal Hummingbird base intentionally omits.
+      - name: Projected age utility executes (glibc resolver closure)
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/age || {
+            echo "::error::runner image must provide the same /usr/bin/age used by staging"
+            exit 1
+          }
+          age_copy="$(mktemp "${RUNNER_TEMP}/hyprstream-age.XXXXXX")"
+          cp -- /usr/bin/age "$age_copy"
+          chmod 0755 "$age_copy"
+          podman run --rm --pull=never --network=none --read-only \
+            --user=65532:65532 \
+            --volume "$age_copy:/usr/bin/age:ro,Z" \
+            --entrypoint /usr/bin/age \
+            "$SMOKE_IMAGE" --version
+
       # This is deliberately a real PostgreSQL qualification, not a source
       # test that passes after an opt-in skip. It covers the account and PDS
       # stores under the exact OCI feature profile. The disposable local

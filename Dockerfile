@@ -433,11 +433,15 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # base provides, and its ELF interpreter resolves through the base's /lib
 # symlink.
 #
-# Only OpenSSL genuinely has to be carried over — the runtime base supplies
-# libc, libm, libdl, libpthread, librt, libstdc++, libgcc_s, and libz. libgomp
-# and libz are copied anyway so the runtime keeps the exact implementations the
-# LibTorch build was validated against rather than silently adopting the base
-# image's; LD_LIBRARY_PATH puts LibTorch's own bundled copies first in any case.
+# The runtime base supplies libc, libm, libdl, libpthread, librt, libstdc++,
+# libgcc_s, and libz. OpenSSL, libgomp, and libz are carried over so the runtime
+# keeps the implementations the application build was validated against.
+# libresolv is also required: staging projects Rocky's digest-pinned `age`
+# executable into this image for deployment-trust operations, and that host
+# binary dynamically links libresolv.so.2. The Hummingbird core runtime does
+# not include it. The Debian builder's library is ABI-compatible with the
+# newer glibc in the runtime base and is installed in the base's /usr/lib64
+# search path. LD_LIBRARY_PATH puts LibTorch's bundled copies first where used.
 # libzstd is carried because Debian trixie's libcrypto links it transitively
 # and the runtime base does not ship it.
 
@@ -453,6 +457,7 @@ FROM ${RUNTIME_BASE} AS runtime-cuda128
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libresolv.so.2 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -474,6 +479,7 @@ FROM ${RUNTIME_BASE} AS runtime-cuda130
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libresolv.so.2 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -495,6 +501,7 @@ FROM ${RUNTIME_BASE} AS runtime-rocm71
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libresolv.so.2 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -511,6 +518,7 @@ FROM ${RUNTIME_BASE} AS runtime-cpu
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libresolv.so.2 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -536,6 +544,7 @@ FROM ${RUNTIME_BASE} AS runtime-cpu-arm64
 # LD_LIBRARY_PATH searches first). Removing them was deferred until a real
 # build confirmed the image — this is that build.
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libresolv.so.2 /usr/lib64/
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib64/
 
