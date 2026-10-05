@@ -37,6 +37,9 @@ const PROJECTION_TYPE_ID: u64 = 0x6272_6f77_7365_7231;
 pub enum BrowserCarrierProfile {
     /// A Hyprstream-owned endpoint. Transport PQ is required independently of
     /// the mandatory application HyKEM envelope.
+    /// Accept the previously emitted query spelling during the browser WASM
+    /// rollout; serialization and new queries use the canonical Serde form.
+    #[serde(alias = "owned-hybrid-webtransport")]
     OwnedHybridWebTransport,
     /// A stock public relay. Its WebTransport hop is explicitly classical and
     /// untrusted; only opaque encrypted Objects may traverse it.
@@ -46,7 +49,7 @@ pub enum BrowserCarrierProfile {
 impl BrowserCarrierProfile {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::OwnedHybridWebTransport => "owned-hybrid-webtransport",
+            Self::OwnedHybridWebTransport => "owned-hybrid-web-transport",
             Self::StandardPublicRelay => "standard-public-relay",
         }
     }
@@ -1124,6 +1127,25 @@ impl crate::rpc_client::PreSealGuard for BrowserProvisioningGuard {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_carrier_query_spelling_matches_wire_profile() {
+        let profile = BrowserCarrierProfile::OwnedHybridWebTransport;
+        assert_eq!(profile.as_str(), "owned-hybrid-web-transport");
+        assert_eq!(
+            serde_json::to_string(&profile).expect("serialize profile"),
+            format!("\"{}\"", profile.as_str())
+        );
+        for value in ["owned-hybrid-web-transport", "owned-hybrid-webtransport"] {
+            let parsed: BrowserCarrierProfile =
+                serde_json::from_str(&format!("\"{value}\"")).expect("parse profile");
+            assert_eq!(parsed, profile);
+        }
+        assert!(serde_json::from_str::<BrowserCarrierProfile>(
+            "\"owned-hybrid-webtransport-untrusted\""
+        )
+        .is_err());
+    }
 
     fn material(now: i64) -> BrowserProvisioningMaterial {
         let response = crate::crypto::SigningKey::from_bytes(&[0x41; 32]);
