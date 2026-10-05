@@ -146,8 +146,8 @@ pub struct InferenceServiceInner {
     model_path: PathBuf,
     /// Writable adaptation state is never placed in the sealed base tree.
     state_path: PathBuf,
-    /// Retains the sealed descriptors and projection through lazy reads.
-    _pinned_artifact: Option<Arc<git2db::pinned_tree::SealedTreeProjection>>,
+    /// Retains verified read-only descriptors and their paths through lazy reads.
+    _pinned_artifact: Option<Arc<git2db::pinned_disk::DiskPinnedTreeProjection>>,
     /// Current session ID for events
     session_id: parking_lot::RwLock<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
@@ -480,7 +480,7 @@ impl InferenceService {
     async fn initialize(
         model_path: PathBuf,
         state_path: PathBuf,
-        pinned_artifact: Option<Arc<git2db::pinned_tree::SealedTreeProjection>>,
+        pinned_artifact: Option<Arc<git2db::pinned_disk::DiskPinnedTreeProjection>>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
@@ -505,6 +505,9 @@ impl InferenceService {
         crate::services::restart_diag::phase("engine.create.done");
         #[cfg(test)]
         crate::services::restart_diag::phase("engine.load_model.enter");
+        if let Some(ref artifact) = pinned_artifact {
+            artifact.ensure_current_process()?;
+        }
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
         #[cfg(test)]
         crate::services::restart_diag::phase("engine.load_model.done");
@@ -3000,7 +3003,7 @@ pub struct InferenceServiceConfig {
     service_name: String,
     model_path: PathBuf,
     state_path: PathBuf,
-    pinned_artifact: Option<Arc<git2db::pinned_tree::SealedTreeProjection>>,
+    pinned_artifact: Option<Arc<git2db::pinned_disk::DiskPinnedTreeProjection>>,
     config: RuntimeConfig,
     server_pubkey: VerifyingKey,
     signing_key: SigningKey,
@@ -3107,7 +3110,7 @@ impl InferenceServiceConfig {
     #[must_use]
     pub fn with_pinned_artifact(
         mut self,
-        artifact: Arc<git2db::pinned_tree::SealedTreeProjection>,
+        artifact: Arc<git2db::pinned_disk::DiskPinnedTreeProjection>,
     ) -> Self {
         self.model_path = artifact.root().to_path_buf();
         self.pinned_artifact = Some(artifact);
@@ -3934,6 +3937,7 @@ impl StreamChunkMessage {
 #[cfg(test)]
 mod tenant_binding_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use hyprstream_rpc::auth::mac::{
         Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel,
         VerifiedKeyMaterial,
@@ -3957,7 +3961,9 @@ mod tenant_binding_tests {
         let oid = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
         drop(tree);
         drop(repo);
-        let artifact = crate::storage::pinned_model::acquire_pinned_model(dir.path(), oid)
+        let parent = tempfile::tempdir()?;
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))?;
+        let artifact = crate::storage::pinned_model::acquire_pinned_model_in(dir.path(), oid, parent.path())
             .await?;
         let signing_key = key(3);
         let config = InferenceServiceConfig::new(

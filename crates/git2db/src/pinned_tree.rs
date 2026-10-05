@@ -294,7 +294,7 @@ fn verified_git_object_bytes(
     Ok(object.data().to_vec())
 }
 
-fn is_pointer(bytes: &[u8]) -> bool {
+pub(crate) fn is_pointer(bytes: &[u8]) -> bool {
     let trimmed = bytes.trim_ascii_start();
     bytes.starts_with(b"version https://git-lfs")
         || bytes.starts_with(b"version https://hawser")

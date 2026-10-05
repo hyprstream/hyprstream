@@ -472,6 +472,12 @@ impl LfsStorage {
         self.xet.smudge_lfs(pointer).await
     }
 
+    /// Stream a captured LFS pointer's payload into a private file. Callers
+    /// must independently verify SHA-256 and size before publishing it.
+    pub async fn smudge_lfs_pointer_to_file(&self, pointer: &LfsPointer, path: &Path) -> Git2DBResult<()> {
+        self.xet.smudge_lfs_to_file(pointer, path).await
+    }
+
     /// Smudge LFS pointer with validation
     pub async fn smudge_lfs_pointer_validated(&self, pointer: &LfsPointer) -> Git2DBResult<Vec<u8>> {
         self.xet.smudge_lfs_validated(pointer).await

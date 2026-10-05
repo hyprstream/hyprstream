@@ -1535,7 +1535,7 @@ impl ModelService {
 
         if let Some(ref artifact) = pinned_artifact {
             info!(model = %model_ref_str, commit = %artifact.commit(), files = artifact.file_count(),
-                "loaded model from sealed exact-tree artifact");
+                "loaded model from private disk exact-tree artifact");
         }
 
         Ok(endpoint)

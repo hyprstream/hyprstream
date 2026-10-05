@@ -1,0 +1,666 @@
+//! Bounded-memory, exact-commit projection for path-based model loaders.
+//!
+//! The selected Git tree is enumerated without reading blob bodies. A packaged
+//! Git CLI streams packed or loose blobs to private disk files; each body is
+//! hashed against its tree OID. Resolved LFS/XET payloads are verified against
+//! the captured pointer before any loader path is published. Payload names are
+//! then unlinked, leaving only read-only descriptors and private `/proc/self/fd`
+//! aliases for the lifetime of this value. No worktree file is read or aliased.
+
+use crate::{Git2DBError, Git2DBResult, GitManager, Oid};
+use git2::{ObjectType, Repository, Tree};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+// This absolute path is populated by the runtime image's git-core package.
+// The OCI digest, not a mutable host PATH, pins the executable at deployment.
+const GIT_CLI: &str = "/usr/bin/git";
+const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
+const RAMFS_MAGIC: libc::c_long = 0x8584_58f6;
+
+#[derive(Debug)]
+struct BlobEntry {
+    path: PathBuf,
+    oid: Oid,
+}
+
+/// Exact-tree files backed by disk, but not by the selected worktree.
+///
+/// The private parent must be disk-backed and container-private to the loader.
+/// In particular, it must not be mounted into Registry or another writer. The
+/// only write handles close before verification and publication; unlinked
+/// payloads survive solely through these retained read-only descriptors. The
+/// 0400 mode is a guard against mistakes, not the security boundary: arbitrary
+/// code running as the loader UID or host root can tamper with the process and
+/// is outside the Registry-worktree-mutation threat model.
+#[derive(Debug)]
+pub struct DiskPinnedTreeProjection {
+    commit: Oid,
+    owner_pid: u32,
+    _root: tempfile::TempDir,
+    input_root: PathBuf,
+    files: Vec<File>,
+}
+
+impl DiskPinnedTreeProjection {
+    pub fn commit(&self) -> Oid {
+        self.commit
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.input_root
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// A `/proc/self/fd` alias is valid only in the acquiring process. An
+    /// exec'd inference process must not be handed this projection: its CLOEXEC
+    /// descriptors are absent and a reused descriptor number could name other
+    /// bytes. The active Model→Inference route is threaded, not subprocess.
+    pub fn ensure_current_process(&self) -> Git2DBResult<()> {
+        if self.owner_pid != std::process::id() {
+            return Err(internal(
+                "disk-backed pinned projection cannot cross a process boundary",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Capture exactly `commit` into a private disk parent. No partial input
+    /// directory is published on any failure.
+    #[cfg(target_os = "linux")]
+    pub async fn acquire(
+        repo_path: &Path,
+        commit: Oid,
+        private_disk_parent: &Path,
+    ) -> Git2DBResult<Self> {
+        verify_private_disk_parent(private_disk_parent)?;
+        let repo = GitManager::global().get_repository(repo_path)?.open()?;
+        verify_object(&repo, commit, ObjectType::Commit)?;
+        let tree = repo
+            .find_commit(commit)
+            .map_err(|e| internal(format!("pinned commit {commit} unavailable: {e}")))?
+            .tree()
+            .map_err(|e| internal(format!("pinned tree: {e}")))?;
+        let mut entries = Vec::new();
+        collect_entries(&repo, &tree, Path::new(""), &mut entries)?;
+        let git_dir = repo.path().to_path_buf();
+        drop(tree);
+        drop(repo);
+
+        let root = tempfile::Builder::new()
+            .prefix("git2db-pinned-disk-")
+            .tempdir_in(private_disk_parent)
+            .map_err(|e| internal(format!("create private projection: {e}")))?;
+        let payload_dir = root.path().join("payloads");
+        let staged_inputs = root.path().join("staged-inputs");
+        fs::create_dir(&payload_dir)
+            .map_err(|e| internal(format!("create payload directory: {e}")))?;
+        fs::create_dir(&staged_inputs)
+            .map_err(|e| internal(format!("create staged inputs: {e}")))?;
+        let mut files = Vec::with_capacity(entries.len());
+        #[cfg(feature = "xet-storage")]
+        let mut storage = None;
+
+        for (index, entry) in entries.into_iter().enumerate() {
+            let source_path = payload_dir.join(format!("{index}.git"));
+            let source_git_dir = git_dir.clone();
+            let source_oid = entry.oid;
+            let source_copy = source_path.clone();
+            let size = tokio::task::spawn_blocking(move || {
+                stream_verified_blob(&source_git_dir, source_oid, &source_copy)
+            })
+            .await
+            .map_err(|e| internal(format!("Git stream task failed: {e}")))??;
+
+            #[cfg(feature = "xet-storage")]
+            let mut final_path = source_path;
+            #[cfg(not(feature = "xet-storage"))]
+            let final_path = source_path;
+            if size <= 4096 {
+                let bytes = fs::read(&final_path)
+                    .map_err(|e| internal(format!("read pointer candidate: {e}")))?;
+                if crate::pinned_tree::is_pointer(&bytes) {
+                    #[cfg(feature = "xet-storage")]
+                    {
+                        let resolved = payload_dir.join(format!("{index}.resolved"));
+                        resolve_pointer_to_file(&bytes, &resolved, &mut storage).await?;
+                        final_path = resolved;
+                    }
+                    #[cfg(not(feature = "xet-storage"))]
+                    return Err(internal("pinned tree contains unresolved pointer"));
+                }
+            } else {
+                // A malformed oversized pointer must not become a loader input.
+                let mut prefix = [0u8; 128];
+                let count = File::open(&final_path)
+                    .and_then(|mut file| file.read(&mut prefix))
+                    .map_err(|e| internal(format!("read payload prefix: {e}")))?;
+                if prefix[..count].starts_with(b"version https://git-lfs")
+                    || prefix[..count].starts_with(b"version https://hawser")
+                    || prefix[..count].starts_with(b"# xet version")
+                {
+                    return Err(internal("oversized model pointer"));
+                }
+            }
+
+            // Verify after all writers close. Hold only a read-only descriptor;
+            // the payload's disk pathname is then removed before publishing the
+            // reader-facing symlink.
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&final_path, fs::Permissions::from_mode(0o400))
+                .map_err(|e| internal(format!("make private payload read-only: {e}")))?;
+            let reader = File::open(&final_path)
+                .map_err(|e| internal(format!("open verified payload: {e}")))?;
+            fs::remove_file(&final_path)
+                .map_err(|e| internal(format!("unlink private payload: {e}")))?;
+            let projected_path = staged_inputs.join(&entry.path);
+            let parent = projected_path
+                .parent()
+                .ok_or_else(|| internal("invalid projected path"))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| internal(format!("create projected directories: {e}")))?;
+            std::os::unix::fs::symlink(
+                format!("/proc/self/fd/{}", reader.as_raw_fd()),
+                &projected_path,
+            )
+            .map_err(|e| internal(format!("project verified input: {e}")))?;
+            files.push(reader);
+        }
+
+        let input_root = root.path().join("inputs");
+        fs::rename(&staged_inputs, &input_root)
+            .map_err(|e| internal(format!("publish verified inputs: {e}")))?;
+        Ok(Self {
+            commit,
+            owner_pid: std::process::id(),
+            _root: root,
+            input_root,
+            files,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn acquire(
+        _repo_path: &Path,
+        _commit: Oid,
+        _private_disk_parent: &Path,
+    ) -> Git2DBResult<Self> {
+        Err(internal(
+            "disk-backed pinned projection requires Linux /proc/self/fd",
+        ))
+    }
+}
+
+fn internal(message: impl std::fmt::Display) -> Git2DBError {
+    Git2DBError::internal(message.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_private_disk_parent(path: &Path) -> Git2DBResult<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata =
+        fs::symlink_metadata(path).map_err(|e| internal(format!("private parent: {e}")))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(internal("projection parent must be a real directory"));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(internal(
+            "projection parent must be owned by loader and mode 0700",
+        ));
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| internal(format!("private parent path: {e}")))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: c_path is NUL-terminated and stat points to writable storage.
+    if unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(internal(format!(
+            "stat private parent: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: statfs succeeded and initialized the output.
+    let stat = unsafe { stat.assume_init() };
+    if stat.f_type == TMPFS_MAGIC || stat.f_type == RAMFS_MAGIC {
+        return Err(internal("private projection parent is memory-backed"));
+    }
+    if !Path::new(GIT_CLI).is_file() {
+        return Err(internal("packaged /usr/bin/git is unavailable"));
+    }
+    Ok(())
+}
+
+fn verify_object(repo: &Repository, oid: Oid, expected: ObjectType) -> Git2DBResult<()> {
+    let odb = repo
+        .odb()
+        .map_err(|e| internal(format!("open Git ODB: {e}")))?;
+    let object = odb
+        .read(oid)
+        .map_err(|e| internal(format!("read Git object {oid}: {e}")))?;
+    if object.kind() != expected
+        || Oid::hash_object(expected, object.data())
+            .map_err(|e| internal(format!("hash Git object {oid}: {e}")))?
+            != oid
+    {
+        return Err(internal(format!("Git object type/hash mismatch at {oid}")));
+    }
+    Ok(())
+}
+
+fn collect_entries(
+    repo: &Repository,
+    tree: &Tree<'_>,
+    prefix: &Path,
+    entries: &mut Vec<BlobEntry>,
+) -> Git2DBResult<()> {
+    verify_object(repo, tree.id(), ObjectType::Tree)?;
+    for entry in tree {
+        let name = entry
+            .name()
+            .ok_or_else(|| internal("non-UTF-8 tree entry"))?;
+        let component = Path::new(name);
+        if name.contains('/')
+            || name.contains('\\')
+            || component.components().count() != 1
+            || !matches!(component.components().next(), Some(Component::Normal(_)))
+        {
+            return Err(internal(format!("unsafe tree entry: {name:?}")));
+        }
+        let path = prefix.join(component);
+        match (entry.kind(), entry.filemode()) {
+            (Some(ObjectType::Tree), 0o040000) => {
+                let child = repo
+                    .find_tree(entry.id())
+                    .map_err(|e| internal(format!("tree {}: {e}", path.display())))?;
+                collect_entries(repo, &child, &path, entries)?;
+            }
+            (Some(ObjectType::Blob), 0o100644 | 0o100755) => entries.push(BlobEntry {
+                path,
+                oid: entry.id(),
+            }),
+            _ => {
+                return Err(internal(format!(
+                    "unsupported tree entry {}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_verified_blob(git_dir: &Path, oid: Oid, destination: &Path) -> Git2DBResult<u64> {
+    let mut child = Command::new(GIT_CLI)
+        .arg("cat-file")
+        .arg("--batch")
+        .env_clear()
+        .env("GIT_DIR", git_dir)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| internal(format!("spawn packaged Git: {e}")))?;
+    let result = (|| {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| internal("Git stdin unavailable"))?;
+        writeln!(stdin, "{oid}").map_err(|e| internal(format!("request Git blob: {e}")))?;
+        drop(stdin);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| internal("Git stdout unavailable"))?;
+        let mut output = BufReader::new(stdout);
+        let mut header = String::new();
+        output
+            .read_line(&mut header)
+            .map_err(|e| internal(format!("read Git blob header: {e}")))?;
+        let mut fields = header.split_whitespace();
+        let expected_oid = oid.to_string();
+        if fields.next() != Some(expected_oid.as_str()) || fields.next() != Some("blob") {
+            return Err(internal(format!("Git returned wrong object for {oid}")));
+        }
+        let size = fields
+            .next()
+            .ok_or_else(|| internal("Git blob size missing"))?
+            .parse::<u64>()
+            .map_err(|e| internal(format!("Git blob size invalid: {e}")))?;
+        if fields.next().is_some() {
+            return Err(internal("Git blob header has extra fields"));
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|e| internal(format!("create private payload: {e}")))?;
+        let copied = std::io::copy(&mut output.by_ref().take(size), &mut file)
+            .map_err(|e| internal(format!("stream Git blob: {e}")))?;
+        if copied != size {
+            return Err(internal(format!(
+                "short Git blob: expected {size}, got {copied}"
+            )));
+        }
+        file.sync_all()
+            .map_err(|e| internal(format!("sync Git payload: {e}")))?;
+        drop(file);
+        let mut terminator = [0u8; 1];
+        output
+            .read_exact(&mut terminator)
+            .map_err(|e| internal(format!("Git blob terminator: {e}")))?;
+        if terminator != *b"\n" {
+            return Err(internal("Git blob terminator mismatch"));
+        }
+        Ok(size)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|e| internal(format!("wait for Git blob: {e}")))?;
+    let size = result?;
+    if !status.success() {
+        return Err(internal("Git cat-file failed"));
+    }
+    verify_blob_file(oid, destination)?;
+    Ok(size)
+}
+
+fn verify_blob_file(oid: Oid, path: &Path) -> Git2DBResult<()> {
+    let computed = Oid::hash_file(ObjectType::Blob, path)
+        .map_err(|e| internal(format!("hash streamed Git blob: {e}")))?;
+    if computed != oid {
+        return Err(internal(format!(
+            "streamed Git blob hash mismatch: expected {oid}, got {computed}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "xet-storage")]
+async fn resolve_pointer_to_file(
+    bytes: &[u8],
+    path: &Path,
+    storage: &mut Option<crate::LfsStorage>,
+) -> Git2DBResult<()> {
+    let text = std::str::from_utf8(bytes).map_err(|e| internal(format!("pointer UTF-8: {e}")))?;
+    if text.starts_with("# xet version") {
+        return Err(internal("unsupported legacy XET pointer"));
+    }
+    if storage.is_none() {
+        *storage = Some(crate::LfsStorage::new(&crate::XetConfig::default()).await?);
+    }
+    let storage = storage
+        .as_ref()
+        .ok_or_else(|| internal("LFS storage unavailable"))?;
+    if crate::is_lfs_pointer(text) {
+        let pointer = crate::LfsPointer::parse(text)?;
+        storage.smudge_lfs_pointer_to_file(&pointer, path).await?;
+        let expected = pointer.oid().to_owned();
+        let expected_size = pointer.size();
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || verify_lfs_file(&path, &expected, expected_size))
+            .await
+            .map_err(|e| internal(format!("LFS verify task failed: {e}")))??;
+        return Ok(());
+    }
+    let info: data::XetFileInfo =
+        serde_json::from_str(text).map_err(|e| internal(format!("invalid XET pointer: {e}")))?;
+    storage.smudge_file(text, path).await?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || verify_xet_file(&path, &info))
+        .await
+        .map_err(|e| internal(format!("XET verify task failed: {e}")))??;
+    Ok(())
+}
+
+#[cfg(feature = "xet-storage")]
+fn verify_lfs_file(path: &Path, expected_sha: &str, expected_size: u64) -> Git2DBResult<()> {
+    use sha2::{Digest, Sha256};
+    let mut file = File::open(path).map_err(|e| internal(format!("open LFS payload: {e}")))?;
+    let mut hash = Sha256::new();
+    let mut size = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| internal(format!("hash LFS payload: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+        size += n as u64;
+    }
+    let actual = format!("{:x}", hash.finalize());
+    if size != expected_size || actual != expected_sha {
+        return Err(internal("LFS payload SHA-256/size mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "xet-storage")]
+fn verify_xet_file(path: &Path, info: &data::XetFileInfo) -> Git2DBResult<()> {
+    let mut file = File::open(path).map_err(|e| internal(format!("open XET payload: {e}")))?;
+    let mut chunker = deduplication::Chunker::default();
+    let mut chunks = Vec::new();
+    let mut total = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| internal(format!("read XET payload: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        let block = bytes::Bytes::copy_from_slice(&buf[..n]);
+        chunks.extend(
+            chunker
+                .next_block_bytes(&block, false)
+                .into_iter()
+                .map(|chunk| (chunk.hash, chunk.data.len() as u64)),
+        );
+    }
+    chunks.extend(
+        chunker
+            .next_block_bytes(&bytes::Bytes::new(), true)
+            .into_iter()
+            .map(|chunk| (chunk.hash, chunk.data.len() as u64)),
+    );
+    let expected = info
+        .merkle_hash()
+        .map_err(|e| internal(format!("XET hash invalid: {e}")))?;
+    let actual = merklehash::file_hash(&chunks);
+    if total != info.file_size() || actual != expected {
+        return Err(internal("XET payload Merkle/size mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn commit_files(root: &Path, files: &[(&str, &[u8])]) -> Git2DBResult<Oid> {
+        let repo = Repository::init(root).map_err(internal)?;
+        let mut index = repo.index().map_err(internal)?;
+        for &(name, content) in files {
+            fs::write(root.join(name), content).map_err(internal)?;
+            index.add_path(Path::new(name)).map_err(internal)?;
+        }
+        index.write().map_err(internal)?;
+        let tree = repo
+            .find_tree(index.write_tree().map_err(internal)?)
+            .map_err(internal)?;
+        let signature = git2::Signature::now("test", "test@example.invalid").map_err(internal)?;
+        repo.commit(Some("HEAD"), &signature, &signature, "pinned", &tree, &[])
+            .map_err(internal)
+    }
+
+    #[tokio::test]
+    async fn packed_blob_stays_exact_during_checkout_mutation_and_lazy_thread_read(
+    ) -> Git2DBResult<()> {
+        let source = tempfile::tempdir().map_err(internal)?;
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let reviewed = b"reviewed packed model bytes";
+        let commit = commit_files(source.path(), &[("weights.safetensors", reviewed)])?;
+        let repo = Repository::open(source.path()).map_err(internal)?;
+        let blob = repo
+            .find_commit(commit)
+            .map_err(internal)?
+            .tree()
+            .map_err(internal)?
+            .get_name("weights.safetensors")
+            .ok_or_else(|| internal("missing test blob"))?
+            .id();
+        drop(repo);
+        let status = Command::new(GIT_CLI)
+            .arg("-C")
+            .arg(source.path())
+            .args(["gc", "--prune=now"])
+            .status()
+            .map_err(internal)?;
+        assert!(status.success());
+        let loose = source
+            .path()
+            .join(".git/objects")
+            .join(&blob.to_string()[..2])
+            .join(&blob.to_string()[2..]);
+        assert!(!loose.exists(), "test blob must be packed");
+        let linked_parent = tempfile::tempdir().map_err(internal)?;
+        let linked = linked_parent.path().join("linked-model");
+        let status = Command::new(GIT_CLI)
+            .arg("-C")
+            .arg(source.path())
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked)
+            .arg(commit.to_string())
+            .status()
+            .map_err(internal)?;
+        assert!(status.success());
+        let mut projection =
+            DiskPinnedTreeProjection::acquire(&linked, commit, parent.path()).await?;
+        projection.ensure_current_process()?;
+        assert_eq!(projection.file_count(), 1);
+        let input = projection.root().join("weights.safetensors");
+        assert!(
+            input.is_file(),
+            "loader file-type checks must follow the fd alias"
+        );
+        fs::write(linked.join("weights.safetensors"), b"unreviewed mutation").map_err(internal)?;
+        assert_eq!(fs::read(&input).map_err(internal)?, reviewed);
+        assert_eq!(
+            std::thread::spawn({
+                let input = input.clone();
+                move || fs::read(input)
+            })
+            .join()
+            .map_err(|_| internal("reader thread panicked"))?
+            .map_err(internal)?,
+            reviewed
+        );
+        assert!(OpenOptions::new().write(true).open(&input).is_err());
+        let child = Command::new("/usr/bin/cat")
+            .arg(&input)
+            .output()
+            .map_err(internal)?;
+        assert!(
+            !child.status.success(),
+            "subprocess must not inherit projection descriptors"
+        );
+        assert_ne!(child.stdout, reviewed);
+        projection.owner_pid = projection.owner_pid.wrapping_add(1);
+        assert!(projection.ensure_current_process().is_err());
+        projection.owner_pid = std::process::id();
+        assert_eq!(
+            fs::read_dir(projection._root.path().join("payloads"))
+                .map_err(internal)?
+                .count(),
+            0,
+            "no payload pathname may remain"
+        );
+        drop(projection);
+        assert!(
+            !input.exists(),
+            "dropping the projection removes lazy aliases"
+        );
+        assert_eq!(fs::read_dir(parent.path()).map_err(internal)?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_acquire_removes_partially_streamed_private_tree() -> Git2DBResult<()> {
+        let source = tempfile::tempdir().map_err(internal)?;
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let commit = commit_files(
+            source.path(),
+            &[
+                ("a-config.json", b"verified first file"),
+                ("z-pointer", b"# xet version 1\nunsupported\n"),
+            ],
+        )?;
+        assert!(
+            DiskPinnedTreeProjection::acquire(source.path(), commit, parent.path())
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(parent.path()).map_err(internal)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_blob_tamper_and_oid_mismatch_fail_closed() -> Git2DBResult<()> {
+        let dir = tempfile::tempdir().map_err(internal)?;
+        let original = dir.path().join("blob");
+        fs::write(&original, b"reviewed").map_err(internal)?;
+        let oid = Oid::hash_file(ObjectType::Blob, &original).map_err(internal)?;
+        verify_blob_file(oid, &original)?;
+        fs::write(&original, b"replaced").map_err(internal)?;
+        assert!(verify_blob_file(oid, &original).is_err());
+        let repo = Repository::init(dir.path().join("repo")).map_err(internal)?;
+        let other = repo.blob(b"other").map_err(internal)?;
+        let destination = dir.path().join("wrong-oid");
+        assert!(stream_verified_blob(repo.path(), other, &destination).is_ok());
+        assert!(stream_verified_blob(repo.path(), oid, &dir.path().join("missing-oid")).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "xet-storage")]
+    #[test]
+    fn streamed_lfs_and_xet_digest_checks_reject_matching_size_tamper() -> Git2DBResult<()> {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().map_err(internal)?;
+        let path = dir.path().join("resolved");
+        let bytes = vec![b'R'; 256 * 1024 + 17];
+        fs::write(&path, &bytes).map_err(internal)?;
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        verify_lfs_file(&path, &sha, bytes.len() as u64)?;
+        let mut chunker = deduplication::Chunker::default();
+        let chunks = chunker.next_block_bytes(&bytes::Bytes::copy_from_slice(&bytes), true);
+        let expected = merklehash::file_hash(
+            &chunks
+                .iter()
+                .map(|chunk| (chunk.hash, chunk.data.len() as u64))
+                .collect::<Vec<_>>(),
+        );
+        let info = data::XetFileInfo::new(expected.hex(), bytes.len() as u64);
+        verify_xet_file(&path, &info)?;
+        fs::write(&path, vec![b'X'; bytes.len()]).map_err(internal)?;
+        assert!(verify_lfs_file(&path, &sha, bytes.len() as u64).is_err());
+        assert!(verify_xet_file(&path, &info).is_err());
+        Ok(())
+    }
+}

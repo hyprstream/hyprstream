@@ -2,35 +2,40 @@
 
 use anyhow::{ensure, Context, Result};
 use git2::{Oid, StatusOptions};
-use git2db::pinned_tree::{PinnedTree, SealedTreeProjection};
+use git2db::pinned_disk::DiskPinnedTreeProjection;
 use std::path::Path;
 use std::sync::Arc;
 
 /// Admit only the selected, clean checkout of `commit`, then capture the
 /// requested Git tree independently of worktree bytes. The second checkout
 /// observation enforces the dirty policy during acquisition; the Git object
-/// capture and sealed projection, not these observations, prove loader bytes.
+/// capture and private disk projection, not these observations, prove loader bytes.
 pub async fn acquire_pinned_model(
     worktree_path: &Path,
     commit: Oid,
-) -> Result<Arc<SealedTreeProjection>> {
-    acquire_pinned_model_with_observer(worktree_path, commit, || Ok(())).await
+) -> Result<Arc<DiskPinnedTreeProjection>> {
+    acquire_pinned_model_in(worktree_path, commit, Path::new("/var/cache/hyprstream-pinned")).await
+}
+
+pub(crate) async fn acquire_pinned_model_in(
+    worktree_path: &Path,
+    commit: Oid,
+    private_disk_parent: &Path,
+) -> Result<Arc<DiskPinnedTreeProjection>> {
+    acquire_pinned_model_with_observer(worktree_path, commit, private_disk_parent, || Ok(())).await
 }
 
 async fn acquire_pinned_model_with_observer(
     worktree_path: &Path,
     commit: Oid,
+    private_disk_parent: &Path,
     after_capture: impl FnOnce() -> Result<()>,
-) -> Result<Arc<SealedTreeProjection>> {
+) -> Result<Arc<DiskPinnedTreeProjection>> {
     verify_selected_checkout(worktree_path, commit)?;
-    let tree = PinnedTree::acquire(worktree_path, commit)
-        .await
-        .with_context(|| format!("capture model commit {commit}"))?;
+    let projection = DiskPinnedTreeProjection::acquire(worktree_path, commit, private_disk_parent)
+        .await.with_context(|| format!("capture model commit {commit}"))?;
     after_capture()?;
     verify_selected_checkout(worktree_path, commit)?;
-    let projection = tree
-        .into_sealed_projection()
-        .context("seal captured model inputs")?;
     ensure!(
         projection.commit() == commit,
         "pinned projection commit mismatch"
@@ -71,10 +76,13 @@ pub fn verify_selected_checkout(worktree_path: &Path, commit: Oid) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn mismatched_or_dirty_checkout_fails_before_artifact_success() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let parent = tempfile::tempdir()?;
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))?;
         let repo = git2db::Repository::init(dir.path())?;
         std::fs::write(dir.path().join("config.json"), b"reviewed")?;
         let mut index = repo.index()?;
@@ -85,15 +93,17 @@ mod tests {
         let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
         drop(tree);
         drop(repo);
-        assert!(acquire_pinned_model(dir.path(), Oid::zero()).await.is_err());
+        assert!(acquire_pinned_model_in(dir.path(), Oid::zero(), parent.path()).await.is_err());
         std::fs::write(dir.path().join("config.json"), b"changed")?;
-        assert!(acquire_pinned_model(dir.path(), commit).await.is_err());
+        assert!(acquire_pinned_model_in(dir.path(), commit, parent.path()).await.is_err());
         Ok(())
     }
 
     #[tokio::test]
     async fn mutation_during_acquisition_fails_closed() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let parent = tempfile::tempdir()?;
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))?;
         let repo = git2db::Repository::init(dir.path())?;
         std::fs::write(dir.path().join("config.json"), b"reviewed")?;
         let mut index = repo.index()?;
@@ -104,7 +114,7 @@ mod tests {
         let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
         drop(tree);
         drop(repo);
-        assert!(acquire_pinned_model_with_observer(dir.path(), commit, || {
+        assert!(acquire_pinned_model_with_observer(dir.path(), commit, parent.path(), || {
             std::fs::write(dir.path().join("config.json"), b"changed")?;
             Ok(())
         }).await.is_err());
@@ -117,6 +127,8 @@ mod tests {
         use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
 
         let dir = tempfile::tempdir()?;
+        let parent = tempfile::tempdir()?;
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))?;
         let repo = git2db::Repository::init(dir.path())?;
         let config = br#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2}"#;
         std::fs::write(dir.path().join("config.json"), config)?;
@@ -136,7 +148,7 @@ mod tests {
         drop(tree);
         drop(repo);
 
-        let artifact = acquire_pinned_model(dir.path(), commit).await?;
+        let artifact = acquire_pinned_model_in(dir.path(), commit, parent.path()).await?;
         std::fs::write(dir.path().join("config.json"), b"invalid replacement")?;
         std::fs::write(dir.path().join("model.safetensors"), b"replacement weights")?;
         std::fs::write(dir.path().join("tokenizer.json"), b"invalid replacement")?;
