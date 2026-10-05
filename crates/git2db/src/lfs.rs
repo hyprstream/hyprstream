@@ -97,12 +97,16 @@ impl LfsPointer {
     ) -> Git2DBResult<Self> {
         // Validate OID format for SHA256 (should be 64 character hex)
         if hash_method == "sha256"
-            && (oid.len() != 64 || !oid.chars().all(|c| c.is_ascii_hexdigit())) {
-                return Err(Git2DBError::lfs(
-                    LfsErrorKind::InvalidPointer,
-                    format!("Invalid OID format: expected 64 hex characters, got {}", oid.len()),
-                ));
-            }
+            && (oid.len() != 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(Git2DBError::lfs(
+                LfsErrorKind::InvalidPointer,
+                format!(
+                    "Invalid OID format: expected 64 hex characters, got {}",
+                    oid.len()
+                ),
+            ));
+        }
 
         Ok(LfsPointer {
             version,
@@ -158,20 +162,24 @@ impl LfsPointer {
             Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Missing version field")
         })?;
         let hash_method = hash_method.ok_or_else(|| {
-            Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Missing or unsupported oid hash method")
+            Git2DBError::lfs(
+                LfsErrorKind::InvalidPointer,
+                "Missing or unsupported oid hash method",
+            )
         })?;
-        let oid = oid.ok_or_else(|| {
-            Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Missing oid field")
-        })?;
-        let size = size.ok_or_else(|| {
-            Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Missing size field")
-        })?;
+        let oid =
+            oid.ok_or_else(|| Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Missing oid field"))?;
+        let size = size
+            .ok_or_else(|| Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Missing size field"))?;
 
         // Validate OID format (should be 64 character hex for SHA256)
         if oid.len() != 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(Git2DBError::lfs(
                 LfsErrorKind::InvalidPointer,
-                format!("Invalid OID format: expected 64 hex characters, got {}", oid.len()),
+                format!(
+                    "Invalid OID format: expected 64 hex characters, got {}",
+                    oid.len()
+                ),
             ));
         }
 
@@ -353,18 +361,23 @@ impl LfsSmudge for XetStorage {
     async fn smudge_lfs(&self, pointer: &LfsPointer) -> Git2DBResult<Vec<u8>> {
         let hash = pointer.xet_merkle_hash()?;
         self.smudge_from_hash(&hash).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::SmudgeFailed, format!("XET smudge failed: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::SmudgeFailed,
+                format!("XET smudge failed: {e}"),
+            )
         })
     }
 
     async fn smudge_lfs_to_file(&self, pointer: &LfsPointer, path: &Path) -> Git2DBResult<()> {
         let hash = pointer.xet_merkle_hash()?;
-        self.smudge_from_hash_to_file(&hash, path).await.map_err(|e| {
-            Git2DBError::lfs(
-                LfsErrorKind::SmudgeFailed,
-                format!("XET smudge to file failed: {e}"),
-            )
-        })
+        self.smudge_from_hash_to_file(&hash, path)
+            .await
+            .map_err(|e| {
+                Git2DBError::lfs(
+                    LfsErrorKind::SmudgeFailed,
+                    format!("XET smudge to file failed: {e}"),
+                )
+            })
     }
 
     async fn smudge_lfs_validated(&self, pointer: &LfsPointer) -> Git2DBResult<Vec<u8>> {
@@ -438,7 +451,10 @@ impl LfsStorage {
     /// Create new LFS storage with XET backend
     pub async fn new(config: &XetConfig) -> Git2DBResult<Self> {
         let xet = XetStorage::new(config).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to create XET storage: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::IoError,
+                format!("Failed to create XET storage: {e}"),
+            )
         })?;
         Ok(Self { xet: Arc::new(xet) })
     }
@@ -472,14 +488,49 @@ impl LfsStorage {
         self.xet.smudge_lfs(pointer).await
     }
 
+    /// Stream a captured LFS pointer through a writer that rejects any byte
+    /// beyond its declared size before it reaches the projection filesystem.
+    pub async fn smudge_lfs_pointer_to_file_bounded(
+        &self,
+        pointer: &LfsPointer,
+        path: &Path,
+    ) -> Git2DBResult<u64> {
+        let hash = pointer.xet_merkle_hash()?;
+        self.xet
+            .smudge_hash_to_file_bounded(&hash, path, pointer.size())
+            .await
+            .map_err(|e| Git2DBError::lfs(LfsErrorKind::SmudgeFailed, e.to_string()))
+    }
+
+    /// Stream an XET JSON pointer through a writer that rejects bytes beyond
+    /// its authenticated pointer size before they reach the projection disk.
+    pub async fn smudge_xet_pointer_to_file_bounded(
+        &self,
+        pointer: &str,
+        path: &Path,
+        max_output_bytes: u64,
+    ) -> Git2DBResult<u64> {
+        self.xet
+            .smudge_file_bounded(pointer, path, max_output_bytes)
+            .await
+            .map_err(|e| Git2DBError::lfs(LfsErrorKind::SmudgeFailed, e.to_string()))
+    }
+
     /// Stream a captured LFS pointer's payload into a private file. Callers
     /// must independently verify SHA-256 and size before publishing it.
-    pub async fn smudge_lfs_pointer_to_file(&self, pointer: &LfsPointer, path: &Path) -> Git2DBResult<()> {
+    pub async fn smudge_lfs_pointer_to_file(
+        &self,
+        pointer: &LfsPointer,
+        path: &Path,
+    ) -> Git2DBResult<()> {
         self.xet.smudge_lfs_to_file(pointer, path).await
     }
 
     /// Smudge LFS pointer with validation
-    pub async fn smudge_lfs_pointer_validated(&self, pointer: &LfsPointer) -> Git2DBResult<Vec<u8>> {
+    pub async fn smudge_lfs_pointer_validated(
+        &self,
+        pointer: &LfsPointer,
+    ) -> Git2DBResult<Vec<u8>> {
         self.xet.smudge_lfs_validated(pointer).await
     }
 
@@ -493,21 +544,33 @@ impl LfsStorage {
     /// Upload data from memory and return XET pointer
     pub async fn clean_bytes(&self, data: &[u8]) -> Git2DBResult<String> {
         self.xet.clean_bytes(data).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("XET clean_bytes failed: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::IoError,
+                format!("XET clean_bytes failed: {e}"),
+            )
         })
     }
 
     /// Download XET pointer to file
     pub async fn smudge_file(&self, pointer: &str, output_path: &Path) -> Git2DBResult<()> {
-        self.xet.smudge_file(pointer, output_path).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::SmudgeFailed, format!("XET smudge_file failed: {e}"))
-        })
+        self.xet
+            .smudge_file(pointer, output_path)
+            .await
+            .map_err(|e| {
+                Git2DBError::lfs(
+                    LfsErrorKind::SmudgeFailed,
+                    format!("XET smudge_file failed: {e}"),
+                )
+            })
     }
 
     /// Download XET pointer to memory
     pub async fn smudge_bytes(&self, pointer: &str) -> Git2DBResult<Vec<u8>> {
         self.xet.smudge_bytes(pointer).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::SmudgeFailed, format!("XET smudge_bytes failed: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::SmudgeFailed,
+                format!("XET smudge_bytes failed: {e}"),
+            )
         })
     }
 
@@ -528,7 +591,10 @@ impl LfsStorage {
         // 1. Check metadata FIRST (instant, no file content I/O)
         // LFS spec: "Pointer files must be less than 1024 bytes in size"
         let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to get file metadata: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::IoError,
+                format!("Failed to get file metadata: {e}"),
+            )
         })?;
         let file_size = metadata.len();
 
@@ -565,7 +631,10 @@ impl LfsStorage {
 
                 let full_content = [&header[..n], &rest[..]].concat();
                 let full_text = String::from_utf8(full_content).map_err(|_| {
-                    Git2DBError::lfs(LfsErrorKind::InvalidPointer, "Pointer file is not valid UTF-8")
+                    Git2DBError::lfs(
+                        LfsErrorKind::InvalidPointer,
+                        "Pointer file is not valid UTF-8",
+                    )
                 })?;
 
                 // Parse and smudge the appropriate pointer type
@@ -579,9 +648,9 @@ impl LfsStorage {
         }
 
         // 5. Not a pointer - seek back to start and read full file
-        file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to seek: {e}"))
-        })?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to seek: {e}")))?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).await.map_err(|e| {
             Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to read file: {e}"))
@@ -599,7 +668,9 @@ impl LfsStorage {
 
         tokio::task::spawn_blocking(move || this.scan_lfs_files_sync(&directory))
             .await
-            .map_err(|e| Git2DBError::lfs(LfsErrorKind::IoError, format!("Task join failed: {e}")))?
+            .map_err(|e| {
+                Git2DBError::lfs(LfsErrorKind::IoError, format!("Task join failed: {e}"))
+            })?
     }
 
     fn scan_lfs_files_sync(&self, directory: &Path) -> Git2DBResult<Vec<PathBuf>> {
@@ -614,7 +685,10 @@ impl LfsStorage {
         })?;
 
         let repo_workdir = repo.workdir().ok_or_else(|| {
-            Git2DBError::lfs(LfsErrorKind::NotInRepository, "Repository has no working directory")
+            Git2DBError::lfs(
+                LfsErrorKind::NotInRepository,
+                "Repository has no working directory",
+            )
         })?;
 
         // Get the current HEAD commit and its tree
@@ -622,10 +696,16 @@ impl LfsStorage {
             Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to get HEAD: {e}"))
         })?;
         let commit = head.peel_to_commit().map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to get HEAD commit: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::IoError,
+                format!("Failed to get HEAD commit: {e}"),
+            )
         })?;
         let tree = commit.tree().map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("Failed to get commit tree: {e}"))
+            Git2DBError::lfs(
+                LfsErrorKind::IoError,
+                format!("Failed to get commit tree: {e}"),
+            )
         })?;
 
         // Convert directory to relative path if needed
@@ -677,9 +757,7 @@ impl LfsStorage {
 
             TreeWalkResult::Ok
         })
-        .map_err(|e| {
-            Git2DBError::lfs(LfsErrorKind::IoError, format!("Tree walk failed: {e}"))
-        })?;
+        .map_err(|e| Git2DBError::lfs(LfsErrorKind::IoError, format!("Tree walk failed: {e}")))?;
 
         // Filter candidates using git status to respect .gitignore
         let filtered = self.filter_by_git_status(&repo, lfs_candidates)?;
@@ -693,7 +771,10 @@ impl LfsStorage {
         candidates: Vec<PathBuf>,
     ) -> Git2DBResult<Vec<PathBuf>> {
         let repo_workdir = repo.workdir().ok_or_else(|| {
-            Git2DBError::lfs(LfsErrorKind::NotInRepository, "Repository has no working directory")
+            Git2DBError::lfs(
+                LfsErrorKind::NotInRepository,
+                "Repository has no working directory",
+            )
         })?;
 
         let mut filtered = Vec::new();
@@ -718,7 +799,11 @@ impl LfsStorage {
             }
         }
 
-        debug!("Filtered {} LFS candidates to {} files", total, filtered.len());
+        debug!(
+            "Filtered {} LFS candidates to {} files",
+            total,
+            filtered.len()
+        );
         Ok(filtered)
     }
 
@@ -731,7 +816,10 @@ impl LfsStorage {
             ));
         }
 
-        info!("Scanning worktree for LFS files: {}", worktree_path.display());
+        info!(
+            "Scanning worktree for LFS files: {}",
+            worktree_path.display()
+        );
         let lfs_files = self.scan_lfs_files(worktree_path).await?;
 
         if lfs_files.is_empty() {
@@ -779,7 +867,10 @@ impl LfsStorage {
             ));
         }
 
-        info!("Scanning worktree for LFS files: {}", worktree_path.display());
+        info!(
+            "Scanning worktree for LFS files: {}",
+            worktree_path.display()
+        );
         let lfs_files = self.scan_lfs_files(worktree_path).await?;
 
         if lfs_files.is_empty() {
@@ -925,14 +1016,13 @@ impl LfsStorage {
 
         // Write to temporary file first
         let temp_file =
-            tempfile::NamedTempFile::new_in(file_path.parent().unwrap_or_else(|| Path::new("."))).map_err(
-                |e| {
-                    Git2DBError::lfs(
-                        LfsErrorKind::IoError,
-                        format!("Failed to create temp file: {e}"),
-                    )
-                },
-            )?;
+            tempfile::NamedTempFile::new_in(file_path.parent().unwrap_or_else(|| Path::new(".")))
+                .map_err(|e| {
+                Git2DBError::lfs(
+                    LfsErrorKind::IoError,
+                    format!("Failed to create temp file: {e}"),
+                )
+            })?;
 
         tokio::fs::write(temp_file.path(), &actual_content)
             .await
@@ -1036,8 +1126,14 @@ ext-1-another value2
 
         let pointer = LfsPointer::parse(content)?;
 
-        assert_eq!(pointer.extensions().get("ext-0-custom"), Some(&"value1".to_owned()));
-        assert_eq!(pointer.extensions().get("ext-1-another"), Some(&"value2".to_owned()));
+        assert_eq!(
+            pointer.extensions().get("ext-0-custom"),
+            Some(&"value1".to_owned())
+        );
+        assert_eq!(
+            pointer.extensions().get("ext-1-another"),
+            Some(&"value2".to_owned())
+        );
         Ok(())
     }
 
@@ -1064,7 +1160,9 @@ size 1024
         assert!(LfsPointer::parse("oid sha256:abc123\nsize 100\n").is_err());
 
         // Missing oid
-        assert!(LfsPointer::parse("version https://git-lfs.github.com/spec/v1\nsize 100\n").is_err());
+        assert!(
+            LfsPointer::parse("version https://git-lfs.github.com/spec/v1\nsize 100\n").is_err()
+        );
 
         // Missing size
         let valid_oid = "a".repeat(64);
@@ -1188,8 +1286,14 @@ size 1024
             Err(e) => {
                 assert_eq!(e.lfs_kind(), Some(LfsErrorKind::MissingXetMerkle));
                 let msg = e.to_string();
-                assert!(msg.contains("xet-merkle"), "error must name the missing extension: {msg}");
-                assert!(msg.contains("#386"), "error must reference issue #386: {msg}");
+                assert!(
+                    msg.contains("xet-merkle"),
+                    "error must name the missing extension: {msg}"
+                );
+                assert!(
+                    msg.contains("#386"),
+                    "error must reference issue #386: {msg}"
+                );
             }
             Ok(h) => panic!("vanilla pointer unexpectedly resolved a MerkleHash: {h}"),
         }

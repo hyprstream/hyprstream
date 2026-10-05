@@ -19,6 +19,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_FILES: usize = 512;
+const MAX_TREE_ENTRIES: usize = 4096;
+const MAX_TREE_DEPTH: usize = 64;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FREE_SPACE_RESERVE: u64 = 512 * 1024 * 1024;
 static PROJECTION_CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -123,7 +125,14 @@ impl DiskPinnedTreeProjection {
             .tree()
             .map_err(|e| internal(format!("pinned tree: {e}")))?;
         let mut entries = Vec::new();
-        collect_entries(&repo, &tree, Path::new(""), &mut entries)?;
+        let mut visited_entries = 0;
+        collect_entries(
+            &repo,
+            &tree,
+            Path::new(""),
+            &mut entries,
+            &mut visited_entries,
+        )?;
         let projected_bytes = preflight_projection(&repo, &entries, private_disk_parent)?;
         if entries.len() > MAX_FILES {
             return Err(internal(format!(
@@ -416,9 +425,23 @@ fn collect_entries(
     tree: &Tree<'_>,
     prefix: &Path,
     entries: &mut Vec<BlobEntry>,
+    visited_entries: &mut usize,
 ) -> Git2DBResult<()> {
+    if prefix.components().count() > MAX_TREE_DEPTH {
+        return Err(internal(format!(
+            "model tree exceeds {MAX_TREE_DEPTH}-level depth limit"
+        )));
+    }
     verify_object(repo, tree.id(), ObjectType::Tree)?;
     for entry in tree {
+        *visited_entries = visited_entries
+            .checked_add(1)
+            .ok_or_else(|| internal("model tree entry count overflow"))?;
+        if *visited_entries > MAX_TREE_ENTRIES {
+            return Err(internal(format!(
+                "model tree exceeds {MAX_TREE_ENTRIES}-entry traversal limit"
+            )));
+        }
         let name = entry
             .name()
             .ok_or_else(|| internal("non-UTF-8 tree entry"))?;
@@ -436,12 +459,19 @@ fn collect_entries(
                 let child = repo
                     .find_tree(entry.id())
                     .map_err(|e| internal(format!("tree {}: {e}", path.display())))?;
-                collect_entries(repo, &child, &path, entries)?;
+                collect_entries(repo, &child, &path, entries, visited_entries)?;
             }
-            (Some(ObjectType::Blob), 0o100644 | 0o100755) => entries.push(BlobEntry {
-                path,
-                oid: entry.id(),
-            }),
+            (Some(ObjectType::Blob), 0o100644 | 0o100755) => {
+                if entries.len() == MAX_FILES {
+                    return Err(internal(format!(
+                        "model tree exceeds {MAX_FILES} file limit"
+                    )));
+                }
+                entries.push(BlobEntry {
+                    path,
+                    oid: entry.id(),
+                });
+            }
             _ => {
                 return Err(internal(format!(
                     "unsupported tree entry {}",
@@ -563,9 +593,16 @@ async fn resolve_pointer_to_file(
         .ok_or_else(|| internal("LFS storage unavailable"))?;
     if crate::is_lfs_pointer(text) {
         let pointer = crate::LfsPointer::parse(text)?;
-        storage.smudge_lfs_pointer_to_file(&pointer, path).await?;
+        let written = storage
+            .smudge_lfs_pointer_to_file_bounded(&pointer, path)
+            .await?;
         let expected = pointer.oid().to_owned();
         let expected_size = pointer.size();
+        if written != expected_size {
+            return Err(internal(
+                "LFS downloader reported a size different from its pointer",
+            ));
+        }
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || verify_lfs_file(&path, &expected, expected_size))
             .await
@@ -574,7 +611,14 @@ async fn resolve_pointer_to_file(
     }
     let info: data::XetFileInfo =
         serde_json::from_str(text).map_err(|e| internal(format!("invalid XET pointer: {e}")))?;
-    storage.smudge_file(text, path).await?;
+    let written = storage
+        .smudge_xet_pointer_to_file_bounded(text, path, info.file_size().min(MAX_EXPANDED_BYTES))
+        .await?;
+    if written != info.file_size() {
+        return Err(internal(
+            "XET downloader reported a size different from its pointer",
+        ));
+    }
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || verify_xet_file(&path, &info))
         .await
@@ -738,8 +782,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_blob_stays_exact_during_checkout_mutation_and_lazy_thread_read()
-    -> Git2DBResult<()> {
+    async fn packed_blob_stays_exact_during_checkout_mutation_and_lazy_thread_read(
+    ) -> Git2DBResult<()> {
         let source = tempfile::tempdir().map_err(internal)?;
         let parent = tempfile::tempdir().map_err(internal)?;
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
