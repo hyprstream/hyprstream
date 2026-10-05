@@ -1,21 +1,25 @@
 //! Structured scope for fine-grained authorization.
 //!
 //! Format: action:resource:identifier
+//! The identifier may contain one `:<ref>` suffix for model resources; the
+//! parser preserves the full identifier so `model:<name>:<ref>` stays exact.
 //! Examples:
 //!   infer:model:qwen-7b     - Specific model inference
 //!   subscribe:stream:abc    - Specific stream subscription
 //!   read:model:*            - Read any model (explicit wildcard)
 //!   manage:*:*              - Manage all resources
 
+use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
-use crate::capnp::{ToCapnp, FromCapnp};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Structured scope for fine-grained authorization.
 ///
 /// Format: action:resource:identifier
+/// A model identifier may carry one ref suffix (`<name>:<ref>`). The first
+/// two separators are structural; the complete remainder is the identifier.
 /// Examples:
 ///   infer:model:qwen-7b     - Specific model inference
 ///   subscribe:stream:abc    - Specific stream subscription
@@ -66,19 +70,45 @@ impl Scope {
         }
     }
 
-    /// Parse from string format "action:resource:identifier"
+    /// Parse the canonical `action:resource:identifier` form.
+    ///
+    /// The first two separators delimit action and resource type. A model
+    /// identifier may contain exactly one additional separator to encode its
+    /// ref, as in `infer:model:qwen2.5-0.5b-instruct:main`. No components are
+    /// discarded, and other resource identifiers cannot contain separators.
     pub fn parse(s: &str) -> Result<Self> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 3 {
+        let (action, tail) = s
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Invalid scope format: {}", s))?;
+        let (resource, identifier) = tail
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Invalid scope format: {}", s))?;
+        if action.is_empty() || resource.is_empty() || identifier.is_empty() {
             return Err(anyhow!("Invalid scope format: {}", s));
         }
+        if identifier.contains(':') {
+            let (model, reference) = identifier
+                .split_once(':')
+                .ok_or_else(|| anyhow!("Invalid scope format: {}", s))?;
+            if resource != "model"
+                || model.is_empty()
+                || reference.is_empty()
+                || reference.contains(':')
+            {
+                return Err(anyhow!("Invalid scope format: {}", s));
+            }
+        }
         Ok(Self::new(
-            parts[0].to_owned(),
-            parts[1].to_owned(),
-            parts[2].to_owned(),
+            action.to_owned(),
+            resource.to_owned(),
+            identifier.to_owned(),
         ))
     }
 
+    /// Return the exact Policy resource represented by this scope.
+    pub fn policy_resource(&self) -> String {
+        format!("{}:{}", self.resource, self.identifier)
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +122,36 @@ mod tests {
         assert_eq!(scope.resource, "model");
         assert_eq!(scope.identifier, "qwen-7b");
         Ok(())
+    }
+
+    #[test]
+    fn model_ref_scope_preserves_the_entire_dispatch_resource() -> Result<()> {
+        const MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
+        let scope = Scope::parse("infer:model:qwen2.5-0.5b-instruct:main")?;
+        assert_eq!(scope.action, "infer");
+        assert_eq!(scope.resource, "model");
+        assert_eq!(scope.identifier, MODEL_REF);
+        assert_eq!(scope.to_string(), "infer:model:qwen2.5-0.5b-instruct:main");
+        assert_eq!(scope.policy_resource(), format!("model:{MODEL_REF}"));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_scope_separators_are_rejected() {
+        for scope in [
+            "infer:model",
+            "infer::qwen:main",
+            "infer:model:",
+            "infer:model:qwen::main",
+            "infer:model:qwen:main:other",
+            "infer:registry:repo:main",
+            ":model:qwen:main",
+        ] {
+            assert!(
+                Scope::parse(scope).is_err(),
+                "accepted malformed scope {scope}"
+            );
+        }
     }
 
     #[test]

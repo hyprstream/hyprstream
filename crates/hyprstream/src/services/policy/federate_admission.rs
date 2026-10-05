@@ -117,7 +117,7 @@ impl Authorities {
             }
             let scope = Scope::parse(text)?;
             if self.policy.check_with_domain(&username, &tenant,
-                &format!("{}:{}", scope.resource, scope.identifier), &scope.action).await {
+                &scope.policy_resource(), &scope.action).await {
                 scopes.push(text.clone());
             }
         }

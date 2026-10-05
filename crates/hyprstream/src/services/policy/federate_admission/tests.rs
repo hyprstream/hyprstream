@@ -2,10 +2,13 @@
 use super::*;
 use crate::auth::user_store::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use parking_lot::RwLock;
 use hyprstream_pds_service::{AccountRecordReadAuthorizer, AccountRecordStore};
 use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
 use hyprstream_vfs::{SyntheticMount, SyntheticNode};
+use parking_lot::RwLock;
+
+const STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
+const STAGING_SCOPE: &str = "infer:model:qwen2.5-0.5b-instruct:main";
 
 struct Accounts(RwLock<UserProfile>);
 #[async_trait::async_trait]
@@ -69,7 +72,7 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
             clearance: SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY),
             allowed_audiences: None, workload_session: false,
         })]) });
-    let scopes = BTreeSet::from(["infer:model:qwen".into()]);
+    let scopes = BTreeSet::from([STAGING_SCOPE.into()]);
     let a = Authorities { users: ProductionUserStore::for_test(users.clone()),
         accounts: Arc::new(AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), Arc::new(Permit))),
         policy: Arc::new(PolicyManager::permissive().await.unwrap()), enrollment,
@@ -84,10 +87,10 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
 #[tokio::test]
 async fn h2_admission_disabled_caller_and_scope_boundaries() {
     let (service, _, ctx) = fixture().await;
-    let requested = vec!["infer:model:qwen".into(), "read:model:other".into()];
+    let requested = vec![STAGING_SCOPE.into(), "read:model:other".into()];
     assert!(AdmissionService::default().prepare(&ctx, &source(), &requested).await.is_err());
     let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
-    assert_eq!(decision.scopes, ["infer:model:qwen"]);
+    assert_eq!(decision.scopes, [STAGING_SCOPE]);
     for who in [Subject::new("alice"), Subject::new("service:model"), Subject::federated("https://foreign.test", "service:oauth")] {
         let wrong = EnvelopeContext::for_test_authenticated_subject(who, SigningKey::from_bytes(&[24;32]).verifying_key());
         assert!(service.prepare(&wrong, &source(), &requested).await.is_err());
@@ -97,14 +100,52 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
         hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX));
     assert!(service.prepare(&wrong, &source(), &requested).await.is_err());
     assert!(service.prepare(&ctx, &source(), &["read:model:other".into()]).await.is_err());
+    for nonmatching in [
+        "infer:model:qwen2.5-0.5b-instruct:other",
+        "infer:model:other:main",
+        "read:model:qwen2.5-0.5b-instruct:main",
+        "infer:model:qwen2.5-0.5b-instruct",
+    ] {
+        assert!(
+            service
+                .prepare(&ctx, &source(), &[nonmatching.into()])
+                .await
+                .is_err(),
+            "nonmatching scope unexpectedly intersected: {nonmatching}"
+        );
+    }
     assert!(canonical_requested(&["infer:model:*".into()]).is_err());
     assert!(canonical_requested(&["infer:model:qwen".into(), "infer:model:qwen".into()]).is_err());
+    for malformed in [
+        "infer:model:qwen2.5-0.5b-instruct::main",
+        "infer:model:qwen2.5-0.5b-instruct:main:other",
+        "infer:registry:qwen2.5-0.5b-instruct:main",
+    ] {
+        assert!(
+            canonical_requested(&[malformed.into()]).is_err(),
+            "accepted malformed or ambiguous scope: {malformed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
+    let (service, _, ctx) = fixture().await;
+    let requested = vec![STAGING_SCOPE.into()];
+    canonical_requested(&requested).unwrap();
+    let parsed = Scope::parse(STAGING_SCOPE).unwrap();
+    let dispatch_resource = format!("model:{STAGING_MODEL_REF}");
+    assert_eq!(parsed.policy_resource(), dispatch_resource);
+
+    let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    assert_eq!(decision.scopes, [STAGING_SCOPE]);
+    assert_eq!(decision.scopes[0], STAGING_SCOPE);
 }
 
 #[tokio::test]
 async fn h2_admission_fresh_account_tenant_revision_and_capacity() {
     let (service, users, ctx) = fixture().await;
-    let requested = vec!["infer:model:qwen".into()];
+    let requested = vec![STAGING_SCOPE.into()];
     let first = service.prepare(&ctx, &source(), &requested).await.unwrap();
     let again = service.prepare(&ctx, &source(), &requested).await.unwrap();
     assert!(first == again);
@@ -129,7 +170,7 @@ fn evidence(challenge: Decision, id: &str) -> PossessionEvidence {
     let source = source();
     PossessionEvidence { created_at: source.issued_at, expires_at: source.issued_at + 60,
         session_expires_at: source.expires_at, source, ed_public: [1;32], pq_public: vec![2;1952],
-        sid: id.into(), generation: [3;32], requested: vec!["infer:model:qwen".into()], challenge }
+        sid: id.into(), generation: [3;32], requested: vec![STAGING_SCOPE.into()], challenge }
 }
 
 /// Only a disposable local Unix-socket fixture; never an environment DSN.
@@ -147,7 +188,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
     let (service, users, ctx) = fixture().await;
-    let requested = vec!["infer:model:qwen".into()];
+    let requested = vec![STAGING_SCOPE.into()];
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
     let mut stale = challenge.clone();
     stale.tenant = "other".into();
