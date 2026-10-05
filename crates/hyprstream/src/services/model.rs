@@ -1301,7 +1301,7 @@ impl ModelService {
 
         let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
             anyhow::ensure!(model_ref_str == pin.model_ref, "staging modelRef changed after admission");
-            Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, pin.commit).await?)
+            Some(crate::storage::pinned_model::acquire_pinned_model_bounded(&model_path, pin.commit).await?)
         } else if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
             Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, *oid).await?)
         } else {
