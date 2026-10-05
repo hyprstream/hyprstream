@@ -19,6 +19,7 @@ pub mod utils;
 pub mod branch;
 pub mod clone_builder;
 pub mod manager;
+pub mod pinned_tree;
 pub mod merge;
 pub mod references;
 pub mod registration_builder;
