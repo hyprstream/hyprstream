@@ -170,7 +170,7 @@ pub use types::{
 pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
 pub use registry::RegistryService;
 pub use policy::PolicyService;
-pub use model::{ModelService, ModelServiceConfig, MODEL_ENDPOINT};
+pub use model::{ModelService, ModelServiceConfig, StagingModelPin, MODEL_ENDPOINT};
 pub use worker::build_authorize_fn;
 pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
 pub use oauth::OAuthService;

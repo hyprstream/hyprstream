@@ -45,7 +45,7 @@ use hyprstream_rpc_std::registry_client::{StageFilesRequest, CommitWithAuthorReq
 use crate::services::WorktreeClientExt;
 use hyprstream_rpc_std::policy_client::PolicyCheck;
 use crate::storage::ModelRef;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::events::EventPublisher;
@@ -115,6 +115,8 @@ pub struct LoadedModel {
     pub instance: InferenceInstanceId,
     /// Model reference string (e.g., "qwen3-small:main")
     pub model_ref: String,
+    /// Exact Git commit whose owned base inputs were used, if pinned.
+    pub pinned_commit: Option<git2::Oid>,
     /// Local transport for this model's InferenceService (#320). This remains
     /// the `Inproc` arm registered by the spawner and is never advertised as a
     /// remotely dialable reach.
@@ -171,6 +173,78 @@ pub struct ModelServiceConfig {
     pub kv_quant: KVQuantType,
     /// Isolation, tenancy, compute, and resource contract for spawned engines.
     pub inference_deployment: InferenceDeploymentProfile,
+    /// Optional exact-ref admission for the bounded staging deployment.
+    pub staging_model_pin: Option<StagingModelPin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingModelPin {
+    pub model_ref: String,
+    pub commit: git2::Oid,
+}
+
+impl StagingModelPin {
+    pub fn new(model_ref: impl Into<String>, commit: git2::Oid) -> Result<Self> {
+        let model_ref = model_ref.into();
+        let parsed = ModelRef::parse(&model_ref)
+            .with_context(|| format!("invalid bounded staging modelRef {model_ref:?}"))?;
+        anyhow::ensure!(
+            matches!(parsed.git_ref, crate::storage::GitRef::Branch(_))
+                && parsed.to_string() == model_ref,
+            "bounded staging modelRef must be a canonical local branch ref"
+        );
+        Ok(Self { model_ref, commit })
+    }
+
+    /// `staging` selects the code-reviewed A0 identity. Optional explicit values
+    /// must match it; incomplete/invalid profiles fail closed at startup.
+    pub fn from_env() -> Result<Option<Self>> {
+        const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
+        const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
+        const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
+        let profile = match std::env::var(PROFILE) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "default".to_owned(),
+            Err(error) => return Err(error.into()),
+        };
+        let read_optional = |name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(anyhow!("read {name}: {error}")),
+        };
+        let model_ref = read_optional(REF)?;
+        let oid = read_optional(OID)?;
+        Self::from_settings(&profile, model_ref.as_deref(), oid.as_deref())
+    }
+
+    fn from_settings(profile: &str, model_ref: Option<&str>, oid: Option<&str>) -> Result<Option<Self>> {
+        const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
+        const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
+        const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
+        const REVIEWED_REF: &str = "qwen2.5-0.5b-instruct:main";
+        const REVIEWED_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
+        if profile == "staging" {
+            match (model_ref, oid) {
+                (None, None) => return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some),
+                (Some(model_ref), Some(oid)) => anyhow::ensure!(model_ref == REVIEWED_REF && oid == REVIEWED_OID,
+                    "staging override must match the complete reviewed model pin"),
+                _ => anyhow::bail!("{REF} and {OID} must either both be absent or both match the reviewed pin"),
+            }
+            return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some);
+        }
+        anyhow::ensure!(profile == "default", "{PROFILE} must be 'default' or 'staging'");
+        match (model_ref, oid) {
+            (None, None) => Ok(None),
+            (Some(model_ref), Some(oid)) => {
+                anyhow::ensure!(oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "{OID} must be a full 40-character hexadecimal Git OID");
+                Self::new(model_ref, git2::Oid::from_str(oid)?).map(Some)
+            }
+            _ => anyhow::bail!("{REF} and {OID} must be configured together"),
+        }
+    }
+
+    fn admits(&self, model_ref: &str) -> bool { self.model_ref == model_ref }
 }
 
 impl Default for ModelServiceConfig {
@@ -180,6 +254,7 @@ impl Default for ModelServiceConfig {
             max_context: None,
             kv_quant: KVQuantType::None,
             inference_deployment: InferenceDeploymentProfile::default(),
+            staging_model_pin: None,
         }
     }
 }
@@ -278,6 +353,30 @@ pub struct ModelServiceInner {
 /// list, health, info, and other requests during long GPU weight transfers.
 pub struct ModelService {
     inner: Arc<ModelServiceInner>,
+}
+
+struct SpawnPublicationGuard(Option<hyprstream_service::SpawnedService>);
+
+impl SpawnPublicationGuard {
+    fn new(handle: hyprstream_service::SpawnedService) -> Self { Self(Some(handle)) }
+    fn publish(mut self) -> Result<hyprstream_service::SpawnedService> {
+        self.0.take().ok_or_else(|| anyhow!("spawn publication guard was already disarmed"))
+    }
+}
+
+impl Drop for SpawnPublicationGuard {
+    fn drop(&mut self) {
+        if let Some(mut handle) = self.0.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => { runtime.spawn(async move {
+                    if let Err(error) = handle.stop().await {
+                        tracing::error!(%error, "failed to reclaim unpublished inference worker");
+                    }
+                }); }
+                Err(error) => tracing::error!(%error, "cannot reclaim unpublished inference worker outside Tokio runtime"),
+            }
+        }
+    }
 }
 
 /// Result of the gated admission used by the non-blocking load RPC path.
@@ -661,6 +760,7 @@ impl ModelService {
         &self,
         instance: &InferenceInstanceId,
     ) -> Result<InterceptedLoadAdmission> {
+        self.validate_staging_model_checkout(instance).await?;
         self.admit_instance(instance)?;
         let _load_unload_gate = self.load_unload_gate.lock().await;
         self.ensure_not_unloading(instance).await?;
@@ -687,6 +787,32 @@ impl ModelService {
             instance.clone(),
             attempt,
         )))
+    }
+
+    fn validate_model_load_ref(&self, model_ref: &str) -> Result<()> {
+        if let Some(pin) = &self.config.staging_model_pin {
+            anyhow::ensure!(pin.admits(model_ref), "Model.load is restricted to the configured staging modelRef");
+        }
+        Ok(())
+    }
+
+    async fn validate_staging_model_checkout(&self, instance: &InferenceInstanceId) -> Result<()> {
+        let Some(pin) = &self.config.staging_model_pin else { return Ok(()); };
+        self.validate_model_load_ref(instance.model_ref())?;
+        let model_ref = ModelRef::parse(instance.model_ref())?;
+        let tracked = self.registry.get_by_name(model_ref.name()).await
+            .map_err(|e| anyhow!("staging model '{}' not found in registry: {e}", model_ref.name()))?;
+        let repo_client = self.registry.repo(&tracked.id);
+        let worktrees = repo_client.list_worktrees().await?;
+        let branch = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(branch) => branch,
+            _ => anyhow::bail!("staging modelRef must select its configured local branch"),
+        };
+        anyhow::ensure!(worktrees.iter().any(|worktree| worktree.branch_name == branch.as_str()),
+            "staging worktree for {}:{} not found", model_ref.name(), branch);
+        let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), branch)?;
+        crate::storage::pinned_model::verify_selected_checkout(&path, pin.commit)
+            .with_context(|| format!("admit staging worktree for {}", pin.model_ref))
     }
 
     /// Execute one previously admitted intercepted load. Its pending reservation
@@ -1054,6 +1180,7 @@ impl ModelService {
         max_context: Option<u32>,
         kv_quant: Option<KVQuantType>,
     ) -> Result<String> {
+        self.validate_staging_model_checkout(instance).await?;
         self.admit_instance(instance)?;
         let model_ref_str = instance.model_ref();
         // A load's admission decision is atomic with unload's reservation and
@@ -1114,6 +1241,7 @@ impl ModelService {
         kv_quant: Option<KVQuantType>,
     ) -> Result<String> {
         let model_ref_str = instance.model_ref();
+        self.validate_model_load_ref(model_ref_str)?;
         // Parse/resolve model reference
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
@@ -1128,7 +1256,14 @@ impl ModelService {
 
         let branch_name = match &model_ref.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
-            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+            crate::storage::GitRef::Commit(_) => repo_client.get_head().await
+                .context("resolve selected worktree branch for pinned commit")?,
+            crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
+                anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
+            }
+            crate::storage::GitRef::DefaultBranch => {
+                repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
+            }
         };
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.enter");
@@ -1148,6 +1283,17 @@ impl ModelService {
                 model_ref_str
             ));
         }
+
+        let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
+            anyhow::ensure!(model_ref_str == pin.model_ref, "staging modelRef changed after admission");
+            Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, pin.commit).await?)
+        } else if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
+            Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, *oid).await?)
+        } else {
+            None
+        };
+        let model_input_path = pinned_artifact.as_ref()
+            .map_or(model_path.as_path(), |artifact| artifact.root());
 
         let endpoint = Self::inference_endpoint(instance);
 
@@ -1192,8 +1338,11 @@ impl ModelService {
             transport.clone(),
             self.policy_transport.clone(),
             fs,
-        )
-        .with_instance_identity(
+        );
+        if let Some(ref artifact) = pinned_artifact {
+            service_config = service_config.with_pinned_artifact(Arc::clone(artifact));
+        }
+        let mut service_config = service_config.with_instance_identity(
             instance.service_name(),
             instance.tenant().to_owned(),
             self.signing_key.verifying_key(),
@@ -1229,6 +1378,7 @@ impl ModelService {
         crate::services::restart_diag::phase("inference.spawn.enter");
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
+        let spawn_guard = SpawnPublicationGuard::new(service_handle);
         #[cfg(test)]
         crate::services::restart_diag::phase("inference.spawn.done");
         let network_transport = network_reach
@@ -1282,7 +1432,7 @@ impl ModelService {
         )?;
 
         // Load TTT config from model's config.json (if TTT is enabled)
-        let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(&model_path)
+        let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(model_input_path)
             .and_then(|tc| {
                 if tc.is_enabled() && tc.mode == crate::config::TrainingMode::TestTimeTraining {
                     Some(crate::training::ttt::TTTConfig {
@@ -1300,7 +1450,7 @@ impl ModelService {
             });
 
         // Load generation parameter defaults from model's generation_config.json
-        let generation_defaults = crate::config::SamplingParams::from_model_path(&model_path)
+        let generation_defaults = crate::config::SamplingParams::from_model_path(model_input_path)
             .await
             .unwrap_or_default();
 
@@ -1323,11 +1473,13 @@ impl ModelService {
             }
 
             // Add to cache
+            let service_handle = spawn_guard.publish()?;
             cache.put(
                 instance.clone(),
                 LoadedModel {
                     instance: instance.clone(),
                     model_ref: model_ref_str.to_owned(),
+                    pinned_commit: pinned_artifact.as_ref().map(|artifact| artifact.commit()),
                     transport: transport.clone(),
                     network_transport,
                     service_handle,
@@ -1364,6 +1516,11 @@ impl ModelService {
                     generation_defaults,
                 },
             );
+        }
+
+        if let Some(ref artifact) = pinned_artifact {
+            info!(model = %model_ref_str, commit = %artifact.commit(), files = artifact.file_count(),
+                "loaded model from sealed exact-tree artifact");
         }
 
         Ok(endpoint)
@@ -2650,18 +2807,21 @@ impl crate::services::RequestService for ModelService {
         // Instead, return an immediate "accepted" response and do the actual
         // load in a Continuation (spawned via spawn_local after the REP is sent).
         if let Some((request_id, load_data)) = Self::try_parse_load_request(body) {
-            // This fast path bypasses generated dispatch, so reproduce its
-            // mandatory operation-level authorization and audit record exactly
-            // (`load` is `$scope(write)` in model.capnp).
+            // The intercepted fast path bypasses generated dispatch, so it
+            // must perform the same operation authorization and audit before
+            // parsing pin/ref details or consulting Registry/Git state.
             let audit_resource = "model:Load";
             let authorization =
                 <Self as ModelHandler>::authorize(self, ctx, audit_resource, "write").await;
             ctx.audit_authz(audit_resource, "write", authorization.is_ok());
             authorization?;
 
+            self.validate_model_load_ref(&load_data.model_ref)?;
+            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
+            self.validate_staging_model_checkout(&instance).await?;
+
             // This interception runs before generated dispatch, so derive the
             // instance only from the already-verified tenant in the envelope.
-            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
             let model_ref = load_data.model_ref.clone();
             let reservation = match self.reserve_intercepted_load(&instance).await? {
                 InterceptedLoadAdmission::Loaded { reach } => {
@@ -2815,6 +2975,199 @@ mod tests {
             config.inference_deployment.isolation,
             InferenceIsolationProfile::InProcess
         );
+    }
+
+    #[test]
+    fn staging_pin_rejects_wrong_name_and_ref() -> Result<()> {
+        let oid = git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?;
+        let pin = StagingModelPin::new("qwen2.5-0.5b-instruct:main", oid)?;
+        assert!(pin.admits("qwen2.5-0.5b-instruct:main"));
+        for wrong in ["other-model:main", "qwen2.5-0.5b-instruct:other", "qwen2.5-0.5b-instruct"] {
+            assert!(!pin.admits(wrong));
+        }
+        assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn denied_model_load_is_audited_before_pin_or_registry_io() -> Result<()> {
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default, Debug)]
+        struct AuditObservation {
+            target: String,
+            resource: String,
+            action: String,
+            decision: String,
+        }
+
+        #[derive(Default)]
+        struct AuditVisitor(AuditObservation);
+
+        impl Visit for AuditVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, format!("{value:?}").trim_matches('"'));
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "resource" => self.0.resource = value.to_owned(),
+                    "action" => self.0.action = value.to_owned(),
+                    "decision" => self.0.decision = value.to_owned(),
+                    _ => {}
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct AuditLayer(Arc<parking_lot::Mutex<Vec<AuditObservation>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for AuditLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "audit" {
+                    return;
+                }
+                let mut visitor = AuditVisitor::default();
+                event.record(&mut visitor);
+                visitor.0.target = event.metadata().target().to_owned();
+                self.0.lock().push(visitor.0);
+            }
+        }
+
+        let registry_calls = Arc::new(BoundaryDialState::default());
+        let policy_calls = Arc::new(BoundaryDialState::default());
+        let registry_rpc = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc("pin-admission-registry"),
+            Arc::clone(&registry_calls),
+        ));
+        let policy_rpc = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc("pin-admission-policy"),
+            Arc::clone(&policy_calls),
+        ));
+        let mut config = ModelServiceConfig::default();
+        config.staging_model_pin = Some(StagingModelPin::new(
+            "qwen2.5-0.5b-instruct:main",
+            git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?,
+        )?);
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+        let service = ModelService::new(
+            config,
+            SigningKey::from_bytes(&[0x45; 32]),
+            PolicyClient::new(policy_rpc),
+            RegistryClient::new(registry_rpc),
+            TransportConfig::inproc("pin-admission-model"),
+            TransportConfig::inproc("pin-admission-policy-transport"),
+        )
+        .await?;
+
+        let context = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            hyprstream_rpc::envelope::Subject::new("unauthorized-caller"),
+            "pin-admission-tenant",
+            SigningKey::from_bytes(&[0x46; 32]).verifying_key(),
+        );
+        let records = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(AuditLayer(Arc::clone(&records)));
+        tracing::subscriber::with_default(subscriber, || -> Result<()> {
+            for model_ref in ["other-model:main", "qwen2.5-0.5b-instruct:main"] {
+                let bytes = hyprstream_rpc::serialize_message(|message| {
+                    let mut request = message
+                        .init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                    request.set_id(91);
+                    request.init_load().set_model_ref(model_ref);
+                })?;
+                let body =
+                    crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+                let error = match
+                    futures::executor::block_on(service.handle_request(&context, &body))
+                {
+                    Err(error) => error,
+                    Ok(_) => anyhow::bail!(
+                        "missing MAC clearance must deny the load before pin/ref status handling"
+                    ),
+                };
+                anyhow::ensure!(
+                    error
+                        .to_string()
+                        .contains("authorization denied: inference caller has no verified MAC clearance"),
+                    "denial must be authorization-specific, not a pin or registry error: {error}"
+                );
+                anyhow::ensure!(
+                    !error.to_string().contains("configured staging modelRef"),
+                    "unauthorized callers must not receive pin-specific diagnostics"
+                );
+            }
+            Ok(())
+        })?;
+
+        let observations = records.lock().clone();
+        anyhow::ensure!(
+            observations.len() == 2,
+            "each denied load must emit one authz audit event: {observations:?}"
+        );
+        for observation in observations {
+            anyhow::ensure!(
+                observation.target == "audit",
+                "authorization denial must use the audit target"
+            );
+            anyhow::ensure!(
+                observation.resource == "model:Load",
+                "unexpected audited resource: {observation:?}"
+            );
+            anyhow::ensure!(
+                observation.action == "write",
+                "unexpected audited action: {observation:?}"
+            );
+            anyhow::ensure!(
+                observation.decision == "deny",
+                "denied caller must be audited as denied: {observation:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staging_pin_settings_fail_closed_on_missing_or_partial_override() -> Result<()> {
+        let pin = StagingModelPin::from_settings("staging", None, None)?
+            .ok_or_else(|| anyhow!("staging profile must have reviewed pin"))?;
+        assert!(pin.admits("qwen2.5-0.5b-instruct:main"));
+        assert!(StagingModelPin::from_settings("staging", Some("qwen2.5-0.5b-instruct:main"), None).is_err());
+        assert!(StagingModelPin::from_settings("staging", None, Some("18c562db6830c2ef6636b8eaf42fb479272052f7")).is_err());
+        assert!(StagingModelPin::from_settings("staging", Some("other:main"), Some("18c562db6830c2ef6636b8eaf42fb479272052f7")).is_err());
+        assert!(StagingModelPin::from_settings("default", None, None)?.is_none());
+        assert!(StagingModelPin::from_settings("default", Some("x:main"), None).is_err());
+        assert!(StagingModelPin::from_settings("default", Some("x:main"), Some("deadbeef")).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unpublished_spawn_guard_stops_worker_after_forced_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stopped = temp.path().join("worker-stopped");
+        let witness = stopped.clone();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return; };
+            runtime.block_on(worker_shutdown.notified());
+            let _ = std::fs::write(witness, b"stopped");
+        });
+        let handle = hyprstream_service::SpawnedService::thread(
+            "model-pin-guard-test".to_owned(), Some(worker), shutdown, None,
+        );
+        let result: Result<()> = async {
+            let _guard = SpawnPublicationGuard::new(handle);
+            anyhow::bail!("forced post-spawn pre-publication failure")
+        }.await;
+        assert!(result.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !stopped.exists() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await?;
+        assert_eq!(std::fs::read(stopped)?, b"stopped");
+        Ok(())
     }
 
     #[test]
@@ -3436,6 +3789,7 @@ mod tests {
         LoadedModel {
             instance: selector_instance(),
             model_ref: "fixture-model:main".to_owned(),
+            pinned_commit: None,
             incarnation: "fixture-incarnation-0000".to_owned(),
             work_audience: crate::services::inference::internal_work_audience(
                 &selector_instance().service_name(),
@@ -4393,6 +4747,7 @@ mod tests {
             LoadedModel {
                 instance: instance.clone(),
                 model_ref: instance.model_ref().to_owned(),
+                pinned_commit: None,
                 transport: TransportConfig::inproc("dead-worker-test"),
                 network_transport: TransportConfig::inproc("dead-worker-test"),
                 service_handle: dead_worker(),

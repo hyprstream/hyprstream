@@ -3144,6 +3144,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn weight_digest_reads_sealed_tree_after_checkout_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2db::Repository::init(dir.path()).unwrap();
+        repo.config().unwrap().set_str("user.name", "test").unwrap();
+        repo.config().unwrap().set_str("user.email", "test@example.invalid").unwrap();
+        write_shard(dir.path(), "model.safetensors", b"reviewed weights");
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("model.safetensors")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[]).unwrap();
+        drop(tree);
+        drop(repo);
+
+        let artifact = git2db::pinned_tree::PinnedTree::acquire(dir.path(), commit)
+            .await.unwrap().into_sealed_projection().unwrap();
+        let baseline = TorchEngine::weights_content_digest(artifact.root()).await.unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"replacement weights").unwrap();
+        let after = TorchEngine::weights_content_digest(artifact.root()).await.unwrap();
+        assert_eq!(baseline, after);
+        assert_ne!(baseline, TorchEngine::weights_content_digest(dir.path()).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn weights_content_digest_same_basename_different_bytes_diverge() {
         let d1 = tempfile::tempdir().unwrap();
         let d2 = tempfile::tempdir().unwrap();

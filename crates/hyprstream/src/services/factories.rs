@@ -1629,6 +1629,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
             let mut model_config = ModelServiceConfig::default();
             model_config.inference_deployment =
                 crate::runtime::inference_profile::InferenceDeploymentProfile::from_env()?;
+            model_config.staging_model_pin = crate::services::StagingModelPin::from_env()?;
             ModelService::new(
                 model_config,
                 sk.clone(),

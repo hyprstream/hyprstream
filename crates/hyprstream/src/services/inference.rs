@@ -142,9 +142,12 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// Streaming continuations clone the `Arc` to own the state across await points.
 pub struct InferenceServiceInner {
     engine: parking_lot::RwLock<TorchEngine>,
-    /// Model path for checkpoint management
-    #[allow(dead_code)] // Future: checkpoint management
+    /// Immutable base inputs, including reads deferred until after startup.
     model_path: PathBuf,
+    /// Writable adaptation state is never placed in the sealed base tree.
+    state_path: PathBuf,
+    /// Retains the sealed descriptors and projection through lazy reads.
+    _pinned_artifact: Option<Arc<git2db::pinned_tree::SealedTreeProjection>>,
     /// Current session ID for events
     session_id: parking_lot::RwLock<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
@@ -476,6 +479,8 @@ impl InferenceService {
     /// Initialize the service
     async fn initialize(
         model_path: PathBuf,
+        state_path: PathBuf,
+        pinned_artifact: Option<Arc<git2db::pinned_tree::SealedTreeProjection>>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
@@ -597,7 +602,7 @@ impl InferenceService {
             };
 
             let kv_reg = engine.kv_registry();
-            let snapshots_dir = model_path.join("adapters").join(".snapshots");
+            let snapshots_dir = state_path.join("adapters").join(".snapshots");
             let num_layers = engine.get_num_layers().unwrap_or(32);
 
             info!(
@@ -631,6 +636,8 @@ impl InferenceService {
             inner: Arc::new(InferenceServiceInner {
                 engine: parking_lot::RwLock::new(engine),
                 model_path,
+                state_path,
+                _pinned_artifact: pinned_artifact,
                 session_id: parking_lot::RwLock::new(None),
                 runtime_handle,
                 stream_channel: Some(stream_channel),
@@ -1862,7 +1869,7 @@ impl InferenceService {
         let strategy = MergeStrategy::from_name(strategy_name, weight)?;
 
         // Save as adapter file
-        let adapter_mgr = crate::storage::AdapterManager::new(&self.model_path);
+        let adapter_mgr = crate::storage::AdapterManager::new(&self.state_path);
         let adapter_name = if name.is_empty() {
             format!("ttt_{}", subject)
         } else {
@@ -2992,6 +2999,8 @@ pub(crate) fn internal_work_audience(service_name: &str, incarnation: &str) -> S
 pub struct InferenceServiceConfig {
     service_name: String,
     model_path: PathBuf,
+    state_path: PathBuf,
+    pinned_artifact: Option<Arc<git2db::pinned_tree::SealedTreeProjection>>,
     config: RuntimeConfig,
     server_pubkey: VerifyingKey,
     signing_key: SigningKey,
@@ -3061,6 +3070,8 @@ impl InferenceServiceConfig {
         Self {
             service_name: "inference".to_owned(),
             model_path: model_path.as_ref().to_path_buf(),
+            state_path: model_path.as_ref().to_path_buf(),
+            pinned_artifact: None,
             config,
             server_pubkey,
             signing_key,
@@ -3089,6 +3100,18 @@ impl InferenceServiceConfig {
             network_ready: Arc::new(AtomicBool::new(true)),
             draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Bind all base-model path reads to the owned exact-tree projection.
+    /// Adapter and training writes continue to use the original checkout.
+    #[must_use]
+    pub fn with_pinned_artifact(
+        mut self,
+        artifact: Arc<git2db::pinned_tree::SealedTreeProjection>,
+    ) -> Self {
+        self.model_path = artifact.root().to_path_buf();
+        self.pinned_artifact = Some(artifact);
+        self
     }
 
     /// Bind this engine to one verified tenant and one controller identity.
@@ -3576,6 +3599,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             let InferenceServiceConfig {
                 service_name,
                 model_path,
+                state_path,
+                pinned_artifact,
                 config,
                 server_pubkey,
                 signing_key: svc_signing_key,
@@ -3663,6 +3688,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     };
                     let service = InferenceService::initialize(
                         model_path,
+                        state_path,
+                        pinned_artifact,
                         config,
                         server_pubkey,
                         svc_signing_key.clone(),
@@ -3915,6 +3942,34 @@ mod tenant_binding_tests {
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[tokio::test]
+    async fn pinned_config_retains_base_inputs_but_not_writable_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = git2db::Repository::init(dir.path())?;
+        std::fs::write(dir.path().join("config.json"), b"reviewed")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("config.json"))?;
+        index.write()?;
+        let tree = repo.find_tree(index.write_tree()?)?;
+        let sig = git2::Signature::now("test", "test@example.invalid")?;
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
+        drop(tree);
+        drop(repo);
+        let artifact = crate::storage::pinned_model::acquire_pinned_model(dir.path(), oid)
+            .await?;
+        let signing_key = key(3);
+        let config = InferenceServiceConfig::new(
+            dir.path(), RuntimeConfig::default(), signing_key.verifying_key(),
+            signing_key, hyprstream_rpc::transport::TransportConfig::inproc("pinned-test"),
+            hyprstream_rpc::transport::TransportConfig::inproc("policy"), None,
+        ).with_pinned_artifact(artifact);
+        std::fs::write(dir.path().join("config.json"), b"replaced")?;
+        assert_eq!(std::fs::read(config.model_path.join("config.json"))?, b"reviewed");
+        assert_eq!(config.state_path, dir.path());
+        assert_eq!(config.pinned_artifact.as_ref().ok_or_else(|| anyhow!("missing pin"))?.commit(), oid);
+        Ok(())
     }
 
     #[test]
@@ -5114,6 +5169,8 @@ mod single_service_boundary_tests {
                         .expect("engine construction (no weights)"),
                 ),
                 model_path: PathBuf::from("/nonexistent"),
+                state_path: PathBuf::from("/nonexistent"),
+                _pinned_artifact: None,
                 session_id: parking_lot::RwLock::new(None),
                 runtime_handle: Handle::current(),
                 stream_channel: None,
