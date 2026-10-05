@@ -2807,17 +2807,18 @@ impl crate::services::RequestService for ModelService {
         // Instead, return an immediate "accepted" response and do the actual
         // load in a Continuation (spawned via spawn_local after the REP is sent).
         if let Some((request_id, load_data)) = Self::try_parse_load_request(body) {
-            self.validate_model_load_ref(&load_data.model_ref)?;
-            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
-            self.validate_staging_model_checkout(&instance).await?;
-            // This fast path bypasses generated dispatch, so reproduce its
-            // mandatory operation-level authorization and audit record exactly
-            // (`load` is `$scope(write)` in model.capnp).
+            // The intercepted fast path bypasses generated dispatch, so it
+            // must perform the same operation authorization and audit before
+            // parsing pin/ref details or consulting Registry/Git state.
             let audit_resource = "model:Load";
             let authorization =
                 <Self as ModelHandler>::authorize(self, ctx, audit_resource, "write").await;
             ctx.audit_authz(audit_resource, "write", authorization.is_ok());
             authorization?;
+
+            self.validate_model_load_ref(&load_data.model_ref)?;
+            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
+            self.validate_staging_model_checkout(&instance).await?;
 
             // This interception runs before generated dispatch, so derive the
             // instance only from the already-verified tenant in the envelope.
@@ -2985,6 +2986,146 @@ mod tests {
             assert!(!pin.admits(wrong));
         }
         assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn denied_model_load_is_audited_before_pin_or_registry_io() -> Result<()> {
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default, Debug)]
+        struct AuditObservation {
+            target: String,
+            resource: String,
+            action: String,
+            decision: String,
+        }
+
+        #[derive(Default)]
+        struct AuditVisitor(AuditObservation);
+
+        impl Visit for AuditVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, format!("{value:?}").trim_matches('"'));
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "resource" => self.0.resource = value.to_owned(),
+                    "action" => self.0.action = value.to_owned(),
+                    "decision" => self.0.decision = value.to_owned(),
+                    _ => {}
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct AuditLayer(Arc<parking_lot::Mutex<Vec<AuditObservation>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for AuditLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "audit" {
+                    return;
+                }
+                let mut visitor = AuditVisitor::default();
+                event.record(&mut visitor);
+                visitor.0.target = event.metadata().target().to_owned();
+                self.0.lock().push(visitor.0);
+            }
+        }
+
+        let registry_calls = Arc::new(BoundaryDialState::default());
+        let policy_calls = Arc::new(BoundaryDialState::default());
+        let registry_rpc = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc("pin-admission-registry"),
+            Arc::clone(&registry_calls),
+        ));
+        let policy_rpc = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc("pin-admission-policy"),
+            Arc::clone(&policy_calls),
+        ));
+        let mut config = ModelServiceConfig::default();
+        config.staging_model_pin = Some(StagingModelPin::new(
+            "qwen2.5-0.5b-instruct:main",
+            git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?,
+        )?);
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+        let service = ModelService::new(
+            config,
+            SigningKey::from_bytes(&[0x45; 32]),
+            PolicyClient::new(policy_rpc),
+            RegistryClient::new(registry_rpc),
+            TransportConfig::inproc("pin-admission-model"),
+            TransportConfig::inproc("pin-admission-policy-transport"),
+        )
+        .await?;
+
+        let context = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            hyprstream_rpc::envelope::Subject::new("unauthorized-caller"),
+            "pin-admission-tenant",
+            SigningKey::from_bytes(&[0x46; 32]).verifying_key(),
+        );
+        let records = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(AuditLayer(Arc::clone(&records)));
+        tracing::subscriber::with_default(subscriber, || -> Result<()> {
+            for model_ref in ["other-model:main", "qwen2.5-0.5b-instruct:main"] {
+                let bytes = hyprstream_rpc::serialize_message(|message| {
+                    let mut request = message
+                        .init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                    request.set_id(91);
+                    request.init_load().set_model_ref(model_ref);
+                })?;
+                let body =
+                    crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+                let error = match
+                    futures::executor::block_on(service.handle_request(&context, &body))
+                {
+                    Err(error) => error,
+                    Ok(_) => anyhow::bail!(
+                        "missing MAC clearance must deny the load before pin/ref status handling"
+                    ),
+                };
+                anyhow::ensure!(
+                    error
+                        .to_string()
+                        .contains("authorization denied: inference caller has no verified MAC clearance"),
+                    "denial must be authorization-specific, not a pin or registry error: {error}"
+                );
+                anyhow::ensure!(
+                    !error.to_string().contains("configured staging modelRef"),
+                    "unauthorized callers must not receive pin-specific diagnostics"
+                );
+            }
+            Ok(())
+        })?;
+
+        let observations = records.lock().clone();
+        anyhow::ensure!(
+            observations.len() == 2,
+            "each denied load must emit one authz audit event: {observations:?}"
+        );
+        for observation in observations {
+            anyhow::ensure!(
+                observation.target == "audit",
+                "authorization denial must use the audit target"
+            );
+            anyhow::ensure!(
+                observation.resource == "model:Load",
+                "unexpected audited resource: {observation:?}"
+            );
+            anyhow::ensure!(
+                observation.action == "write",
+                "unexpected audited action: {observation:?}"
+            );
+            anyhow::ensure!(
+                observation.decision == "deny",
+                "denied caller must be audited as denied: {observation:?}"
+            );
+        }
         Ok(())
     }
 
