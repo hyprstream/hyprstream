@@ -415,6 +415,8 @@ async fn authority_binding_limits_match_browser_transcript_profile() {
     for scope in [
         "query:registry:*\n",
         "query:registry:*\u{7f}",
+        "query\"scope",
+        "query\\scope",
         "scope  with-gap",
         "z a",
     ] {

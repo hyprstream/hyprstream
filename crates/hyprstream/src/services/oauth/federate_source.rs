@@ -454,7 +454,9 @@ fn scopes(s: &str) -> Result<()> {
     for token in s.split(' ') {
         require(
             !token.is_empty()
-                && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                && token
+                    .bytes()
+                    .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
                 && token > previous,
         )?;
         previous = token;
