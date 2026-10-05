@@ -15,6 +15,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const MAX_FILES: usize = 512;
+const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FREE_SPACE_RESERVE: u64 = 512 * 1024 * 1024;
+static PROJECTION_CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 // This absolute path is populated by the runtime image's git-core package.
 // The OCI digest, not a mutable host PATH, pins the executable at deployment.
@@ -44,6 +51,9 @@ pub struct DiskPinnedTreeProjection {
     _root: tempfile::TempDir,
     input_root: PathBuf,
     files: Vec<File>,
+    // Retained for the full artifact lifetime: total private projected disk
+    // occupancy is causally bounded, not merely the number of concurrent copies.
+    _capacity: Option<OwnedSemaphorePermit>,
 }
 
 impl DiskPinnedTreeProjection {
@@ -80,6 +90,30 @@ impl DiskPinnedTreeProjection {
         commit: Oid,
         private_disk_parent: &Path,
     ) -> Git2DBResult<Self> {
+        Self::acquire_with_capacity(repo_path, commit, private_disk_parent, None).await
+    }
+
+    /// Staging admission with one global lease retained until the artifact is
+    /// dropped. Distinct model refs cannot concurrently consume private disk.
+    #[cfg(target_os = "linux")]
+    pub async fn acquire_bounded(
+        repo_path: &Path,
+        commit: Oid,
+        private_disk_parent: &Path,
+    ) -> Git2DBResult<Self> {
+        let capacity = Arc::clone(PROJECTION_CAPACITY.get_or_init(|| Arc::new(Semaphore::new(1))))
+            .try_acquire_owned()
+            .map_err(|_| internal("bounded model projection capacity is occupied"))?;
+        Self::acquire_with_capacity(repo_path, commit, private_disk_parent, Some(capacity)).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn acquire_with_capacity(
+        repo_path: &Path,
+        commit: Oid,
+        private_disk_parent: &Path,
+        capacity: Option<OwnedSemaphorePermit>,
+    ) -> Git2DBResult<Self> {
         verify_private_disk_parent(private_disk_parent)?;
         let repo = GitManager::global().get_repository(repo_path)?.open()?;
         verify_object(&repo, commit, ObjectType::Commit)?;
@@ -90,6 +124,17 @@ impl DiskPinnedTreeProjection {
             .map_err(|e| internal(format!("pinned tree: {e}")))?;
         let mut entries = Vec::new();
         collect_entries(&repo, &tree, Path::new(""), &mut entries)?;
+        let projected_bytes = preflight_projection(&repo, &entries, private_disk_parent)?;
+        if entries.len() > MAX_FILES {
+            return Err(internal(format!(
+                "model tree exceeds {MAX_FILES} file limit"
+            )));
+        }
+        if projected_bytes > MAX_EXPANDED_BYTES {
+            return Err(internal(format!(
+                "model projection exceeds {MAX_EXPANDED_BYTES}-byte limit"
+            )));
+        }
         let git_dir = repo.path().to_path_buf();
         drop(tree);
         drop(repo);
@@ -183,7 +228,31 @@ impl DiskPinnedTreeProjection {
             _root: root,
             input_root,
             files,
+            _capacity: capacity,
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn acquire_with_capacity(
+        _repo_path: &Path,
+        _commit: Oid,
+        _private_disk_parent: &Path,
+        _capacity: Option<OwnedSemaphorePermit>,
+    ) -> Git2DBResult<Self> {
+        Err(internal(
+            "disk-backed pinned projection requires Linux /proc/self/fd",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn acquire_bounded(
+        _repo_path: &Path,
+        _commit: Oid,
+        _private_disk_parent: &Path,
+    ) -> Git2DBResult<Self> {
+        Err(internal(
+            "bounded pinned projection requires Linux /proc/self/fd",
+        ))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -253,6 +322,95 @@ fn verify_object(repo: &Repository, oid: Oid, expected: ObjectType) -> Git2DBRes
     Ok(())
 }
 
+/// Compute an upper bound from Git object sizes and the resolved LFS/XET
+/// pointer sizes before creating any projection files or streaming large blobs.
+fn preflight_projection(
+    repo: &Repository,
+    entries: &[BlobEntry],
+    parent: &Path,
+) -> Git2DBResult<u64> {
+    let odb = repo
+        .odb()
+        .map_err(|e| internal(format!("open projection ODB: {e}")))?;
+    let mut total = 0u64;
+    for entry in entries {
+        let (blob_size, kind) = odb
+            .read_header(entry.oid)
+            .map_err(|e| internal(format!("read model blob size {}: {e}", entry.oid)))?;
+        if kind != ObjectType::Blob {
+            return Err(internal("model tree object ceased to be a blob"));
+        }
+        let mut size = blob_size as u64;
+        if blob_size <= 4096 {
+            let blob = odb
+                .read(entry.oid)
+                .map_err(|e| internal(format!("read pointer candidate: {e}")))?;
+            let bytes = blob.data();
+            if crate::pinned_tree::is_pointer(bytes) {
+                #[cfg(feature = "xet-storage")]
+                {
+                    let text = std::str::from_utf8(bytes)
+                        .map_err(|e| internal(format!("pointer UTF-8: {e}")))?;
+                    if crate::is_lfs_pointer(text) {
+                        size = crate::LfsPointer::parse(text)?.size();
+                    } else if text.starts_with("# xet version") {
+                        return Err(internal("unsupported legacy XET pointer"));
+                    } else {
+                        let info: data::XetFileInfo = serde_json::from_str(text)
+                            .map_err(|e| internal(format!("invalid XET pointer: {e}")))?;
+                        size = info.file_size();
+                    }
+                }
+            }
+        } else {
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| internal("model size overflow"))?;
+        }
+        total = total
+            .checked_add(if blob_size <= 4096 { size } else { 0 })
+            .ok_or_else(|| internal("model size overflow"))?;
+        if total > MAX_EXPANDED_BYTES {
+            return Err(internal(format!(
+                "model projection exceeds {MAX_EXPANDED_BYTES}-byte limit"
+            )));
+        }
+    }
+    // Pointer blobs and filesystem metadata coexist transiently with resolved
+    // payloads; reserve an additional bounded 4 KiB per tree entry.
+    let allocation_bound = total.saturating_add((entries.len() as u64).saturating_mul(4096));
+    ensure_disk_space(parent, allocation_bound)?;
+    Ok(total)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_disk_space(parent: &Path, required: u64) -> Git2DBResult<()> {
+    let c_path = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes())
+        .map_err(|e| internal(format!("projection parent path: {e}")))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: c_path is NUL-terminated and stats is writable.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(internal(format!(
+            "stat projection free space: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: statvfs succeeded and initialized the structure.
+    let stats = unsafe { stats.assume_init() };
+    let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+    if available < required.saturating_add(FREE_SPACE_RESERVE) {
+        return Err(internal(format!(
+            "insufficient disk space for bounded model projection: need {required} bytes plus reserve"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_disk_space(_parent: &Path, _required: u64) -> Git2DBResult<()> {
+    Ok(())
+}
+
 fn collect_entries(
     repo: &Repository,
     tree: &Tree<'_>,
@@ -288,7 +446,7 @@ fn collect_entries(
                 return Err(internal(format!(
                     "unsupported tree entry {}",
                     path.display()
-                )))
+                )));
             }
         }
     }
@@ -509,8 +667,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_blob_stays_exact_during_checkout_mutation_and_lazy_thread_read(
-    ) -> Git2DBResult<()> {
+    async fn bounded_projection_rejects_distinct_ref_burst_and_reclaims_lease() -> Git2DBResult<()>
+    {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let first_repo = tempfile::tempdir().map_err(internal)?;
+        let first_oid = commit_files(first_repo.path(), &[("weights.bin", b"first")])?;
+        let second_repo = tempfile::tempdir().map_err(internal)?;
+        let second_oid = commit_files(second_repo.path(), &[("weights.bin", b"second")])?;
+
+        let first =
+            DiskPinnedTreeProjection::acquire_bounded(first_repo.path(), first_oid, parent.path())
+                .await?;
+        assert!(
+            DiskPinnedTreeProjection::acquire_bounded(
+                second_repo.path(),
+                second_oid,
+                parent.path()
+            )
+            .await
+            .is_err(),
+            "a different ref must not acquire a second private projection while the lease is held"
+        );
+        assert_eq!(
+            fs::read_dir(parent.path()).map_err(internal)?.count(),
+            1,
+            "rejected burst must not create a partial projection"
+        );
+        drop(first);
+        assert_eq!(
+            fs::read_dir(parent.path()).map_err(internal)?.count(),
+            0,
+            "dropping the artifact must reclaim projection bytes and lease"
+        );
+        let second = DiskPinnedTreeProjection::acquire_bounded(
+            second_repo.path(),
+            second_oid,
+            parent.path(),
+        )
+        .await?;
+        assert_eq!(second.commit(), second_oid);
+        drop(second);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_projection_rejects_file_count_before_temp_copy() -> Git2DBResult<()> {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let source = tempfile::tempdir().map_err(internal)?;
+        let files = (0..=MAX_FILES)
+            .map(|index| (format!("model-{index}.bin"), b"small".as_slice()))
+            .collect::<Vec<_>>();
+        let borrowed = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect::<Vec<_>>();
+        let commit = commit_files(source.path(), &borrowed)?;
+        assert!(
+            DiskPinnedTreeProjection::acquire_bounded(source.path(), commit, parent.path())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(parent.path()).map_err(internal)?.count(),
+            0,
+            "file-cap rejection must precede projection directory creation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn packed_blob_stays_exact_during_checkout_mutation_and_lazy_thread_read()
+    -> Git2DBResult<()> {
         let source = tempfile::tempdir().map_err(internal)?;
         let parent = tempfile::tempdir().map_err(internal)?;
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;

@@ -17,23 +17,41 @@ pub async fn acquire_pinned_model(
     acquire_pinned_model_in(worktree_path, commit, Path::new("/var/cache/hyprstream-pinned")).await
 }
 
+/// Bounded single-slot projection lease for the staging admission profile.
+pub async fn acquire_pinned_model_bounded(
+    worktree_path: &Path,
+    commit: Oid,
+) -> Result<Arc<DiskPinnedTreeProjection>> {
+    acquire_pinned_model_with_observer(
+        worktree_path,
+        commit,
+        Path::new("/var/cache/hyprstream-pinned"),
+        true,
+        || Ok(()),
+    ).await
+}
+
 pub(crate) async fn acquire_pinned_model_in(
     worktree_path: &Path,
     commit: Oid,
     private_disk_parent: &Path,
 ) -> Result<Arc<DiskPinnedTreeProjection>> {
-    acquire_pinned_model_with_observer(worktree_path, commit, private_disk_parent, || Ok(())).await
+    acquire_pinned_model_with_observer(worktree_path, commit, private_disk_parent, false, || Ok(())).await
 }
 
 async fn acquire_pinned_model_with_observer(
     worktree_path: &Path,
     commit: Oid,
     private_disk_parent: &Path,
+    bounded: bool,
     after_capture: impl FnOnce() -> Result<()>,
 ) -> Result<Arc<DiskPinnedTreeProjection>> {
     verify_selected_checkout(worktree_path, commit)?;
-    let projection = DiskPinnedTreeProjection::acquire(worktree_path, commit, private_disk_parent)
-        .await.with_context(|| format!("capture model commit {commit}"))?;
+    let projection = if bounded {
+        DiskPinnedTreeProjection::acquire_bounded(worktree_path, commit, private_disk_parent).await
+    } else {
+        DiskPinnedTreeProjection::acquire(worktree_path, commit, private_disk_parent).await
+    }.with_context(|| format!("capture model commit {commit}"))?;
     after_capture()?;
     verify_selected_checkout(worktree_path, commit)?;
     ensure!(
@@ -114,7 +132,7 @@ mod tests {
         let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
         drop(tree);
         drop(repo);
-        assert!(acquire_pinned_model_with_observer(dir.path(), commit, parent.path(), || {
+        assert!(acquire_pinned_model_with_observer(dir.path(), commit, parent.path(), false, || {
             std::fs::write(dir.path().join("config.json"), b"changed")?;
             Ok(())
         }).await.is_err());
