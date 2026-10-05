@@ -38,7 +38,7 @@ async fn acquire_pinned_model_with_observer(
     Ok(Arc::new(projection))
 }
 
-fn verify_selected_checkout(worktree_path: &Path, commit: Oid) -> Result<()> {
+pub fn verify_selected_checkout(worktree_path: &Path, commit: Oid) -> Result<()> {
     let repo = git2db::GitManager::global()
         .get_repository(worktree_path)
         .context("open selected model worktree")?

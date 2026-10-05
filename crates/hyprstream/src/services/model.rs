@@ -173,6 +173,64 @@ pub struct ModelServiceConfig {
     pub kv_quant: KVQuantType,
     /// Isolation, tenancy, compute, and resource contract for spawned engines.
     pub inference_deployment: InferenceDeploymentProfile,
+    /// Optional exact-ref admission for the bounded staging deployment.
+    pub staging_model_pin: Option<StagingModelPin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingModelPin {
+    pub model_ref: String,
+    pub commit: git2::Oid,
+}
+
+impl StagingModelPin {
+    pub fn new(model_ref: impl Into<String>, commit: git2::Oid) -> Result<Self> {
+        let model_ref = model_ref.into();
+        let parsed = ModelRef::parse(&model_ref)
+            .with_context(|| format!("invalid bounded staging modelRef {model_ref:?}"))?;
+        anyhow::ensure!(
+            matches!(parsed.git_ref, crate::storage::GitRef::Branch(_))
+                && parsed.to_string() == model_ref,
+            "bounded staging modelRef must be a canonical local branch ref"
+        );
+        Ok(Self { model_ref, commit })
+    }
+
+    /// `staging` selects the code-reviewed A0 identity. Optional explicit values
+    /// must match it; incomplete/invalid profiles fail closed at startup.
+    pub fn from_env() -> Result<Option<Self>> {
+        const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
+        const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
+        const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
+        const REVIEWED_REF: &str = "qwen2.5-0.5b-instruct:main";
+        const REVIEWED_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
+        let profile = match std::env::var(PROFILE) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "default".to_owned(),
+            Err(error) => return Err(error.into()),
+        };
+        let model_ref = std::env::var(REF).ok();
+        let oid = std::env::var(OID).ok();
+        if profile == "staging" {
+            anyhow::ensure!(model_ref.as_deref().is_none_or(|value| value == REVIEWED_REF),
+                "{REF} must match the reviewed staging modelRef");
+            anyhow::ensure!(oid.as_deref().is_none_or(|value| value == REVIEWED_OID),
+                "{OID} must match the reviewed staging model OID");
+            return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some);
+        }
+        anyhow::ensure!(profile == "default", "{PROFILE} must be 'default' or 'staging'");
+        match (model_ref, oid) {
+            (None, None) => Ok(None),
+            (Some(model_ref), Some(oid)) => {
+                anyhow::ensure!(oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "{OID} must be a full 40-character hexadecimal Git OID");
+                Self::new(model_ref, git2::Oid::from_str(&oid)?).map(Some)
+            }
+            _ => anyhow::bail!("{REF} and {OID} must be configured together"),
+        }
+    }
+
+    fn admits(&self, model_ref: &str) -> bool { self.model_ref == model_ref }
 }
 
 impl Default for ModelServiceConfig {
@@ -182,6 +240,7 @@ impl Default for ModelServiceConfig {
             max_context: None,
             kv_quant: KVQuantType::None,
             inference_deployment: InferenceDeploymentProfile::default(),
+            staging_model_pin: None,
         }
     }
 }
@@ -280,6 +339,30 @@ pub struct ModelServiceInner {
 /// list, health, info, and other requests during long GPU weight transfers.
 pub struct ModelService {
     inner: Arc<ModelServiceInner>,
+}
+
+struct SpawnPublicationGuard(Option<hyprstream_service::SpawnedService>);
+
+impl SpawnPublicationGuard {
+    fn new(handle: hyprstream_service::SpawnedService) -> Self { Self(Some(handle)) }
+    fn publish(mut self) -> Result<hyprstream_service::SpawnedService> {
+        self.0.take().ok_or_else(|| anyhow!("spawn publication guard was already disarmed"))
+    }
+}
+
+impl Drop for SpawnPublicationGuard {
+    fn drop(&mut self) {
+        if let Some(mut handle) = self.0.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => { runtime.spawn(async move {
+                    if let Err(error) = handle.stop().await {
+                        tracing::error!(%error, "failed to reclaim unpublished inference worker");
+                    }
+                }); }
+                Err(error) => tracing::error!(%error, "cannot reclaim unpublished inference worker outside Tokio runtime"),
+            }
+        }
+    }
 }
 
 /// Result of the gated admission used by the non-blocking load RPC path.
@@ -663,6 +746,7 @@ impl ModelService {
         &self,
         instance: &InferenceInstanceId,
     ) -> Result<InterceptedLoadAdmission> {
+        self.validate_staging_model_checkout(instance).await?;
         self.admit_instance(instance)?;
         let _load_unload_gate = self.load_unload_gate.lock().await;
         self.ensure_not_unloading(instance).await?;
@@ -689,6 +773,32 @@ impl ModelService {
             instance.clone(),
             attempt,
         )))
+    }
+
+    fn validate_model_load_ref(&self, model_ref: &str) -> Result<()> {
+        if let Some(pin) = &self.config.staging_model_pin {
+            anyhow::ensure!(pin.admits(model_ref), "Model.load is restricted to the configured staging modelRef");
+        }
+        Ok(())
+    }
+
+    async fn validate_staging_model_checkout(&self, instance: &InferenceInstanceId) -> Result<()> {
+        let Some(pin) = &self.config.staging_model_pin else { return Ok(()); };
+        self.validate_model_load_ref(instance.model_ref())?;
+        let model_ref = ModelRef::parse(instance.model_ref())?;
+        let tracked = self.registry.get_by_name(model_ref.name()).await
+            .map_err(|e| anyhow!("staging model '{}' not found in registry: {e}", model_ref.name()))?;
+        let repo_client = self.registry.repo(&tracked.id);
+        let worktrees = repo_client.list_worktrees().await?;
+        let branch = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(branch) => branch,
+            _ => anyhow::bail!("staging modelRef must select its configured local branch"),
+        };
+        anyhow::ensure!(worktrees.iter().any(|worktree| worktree.branch_name == branch.as_str()),
+            "staging worktree for {}:{} not found", model_ref.name(), branch);
+        let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), branch)?;
+        crate::storage::pinned_model::verify_selected_checkout(&path, pin.commit)
+            .with_context(|| format!("admit staging worktree for {}", pin.model_ref))
     }
 
     /// Execute one previously admitted intercepted load. Its pending reservation
@@ -1056,6 +1166,7 @@ impl ModelService {
         max_context: Option<u32>,
         kv_quant: Option<KVQuantType>,
     ) -> Result<String> {
+        self.validate_staging_model_checkout(instance).await?;
         self.admit_instance(instance)?;
         let model_ref_str = instance.model_ref();
         // A load's admission decision is atomic with unload's reservation and
@@ -1116,6 +1227,7 @@ impl ModelService {
         kv_quant: Option<KVQuantType>,
     ) -> Result<String> {
         let model_ref_str = instance.model_ref();
+        self.validate_model_load_ref(model_ref_str)?;
         // Parse/resolve model reference
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
@@ -1158,7 +1270,10 @@ impl ModelService {
             ));
         }
 
-        let pinned_artifact = if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
+        let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
+            anyhow::ensure!(model_ref_str == pin.model_ref, "staging modelRef changed after admission");
+            Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, pin.commit).await?)
+        } else if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
             Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, *oid).await?)
         } else {
             None
@@ -1249,6 +1364,7 @@ impl ModelService {
         crate::services::restart_diag::phase("inference.spawn.enter");
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
+        let spawn_guard = SpawnPublicationGuard::new(service_handle);
         #[cfg(test)]
         crate::services::restart_diag::phase("inference.spawn.done");
         let network_transport = network_reach
@@ -1343,6 +1459,7 @@ impl ModelService {
             }
 
             // Add to cache
+            let service_handle = spawn_guard.publish()?;
             cache.put(
                 instance.clone(),
                 LoadedModel {
@@ -2676,6 +2793,9 @@ impl crate::services::RequestService for ModelService {
         // Instead, return an immediate "accepted" response and do the actual
         // load in a Continuation (spawned via spawn_local after the REP is sent).
         if let Some((request_id, load_data)) = Self::try_parse_load_request(body) {
+            self.validate_model_load_ref(&load_data.model_ref)?;
+            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
+            self.validate_staging_model_checkout(&instance).await?;
             // This fast path bypasses generated dispatch, so reproduce its
             // mandatory operation-level authorization and audit record exactly
             // (`load` is `$scope(write)` in model.capnp).
@@ -2687,7 +2807,6 @@ impl crate::services::RequestService for ModelService {
 
             // This interception runs before generated dispatch, so derive the
             // instance only from the already-verified tenant in the envelope.
-            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
             let model_ref = load_data.model_ref.clone();
             let reservation = match self.reserve_intercepted_load(&instance).await? {
                 InterceptedLoadAdmission::Loaded { reach } => {
@@ -2841,6 +2960,45 @@ mod tests {
             config.inference_deployment.isolation,
             InferenceIsolationProfile::InProcess
         );
+    }
+
+    #[test]
+    fn staging_pin_rejects_wrong_name_and_ref() -> Result<()> {
+        let oid = git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?;
+        let pin = StagingModelPin::new("qwen2.5-0.5b-instruct:main", oid)?;
+        assert!(pin.admits("qwen2.5-0.5b-instruct:main"));
+        for wrong in ["other-model:main", "qwen2.5-0.5b-instruct:other", "qwen2.5-0.5b-instruct"] {
+            assert!(!pin.admits(wrong));
+        }
+        assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unpublished_spawn_guard_stops_worker_after_forced_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stopped = temp.path().join("worker-stopped");
+        let witness = stopped.clone();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return; };
+            runtime.block_on(worker_shutdown.notified());
+            let _ = std::fs::write(witness, b"stopped");
+        });
+        let handle = hyprstream_service::SpawnedService::thread(
+            "model-pin-guard-test".to_owned(), Some(worker), shutdown, None,
+        );
+        let result: Result<()> = async {
+            let _guard = SpawnPublicationGuard::new(handle);
+            anyhow::bail!("forced post-spawn pre-publication failure")
+        }.await;
+        assert!(result.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !stopped.exists() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await?;
+        assert_eq!(std::fs::read(stopped)?, b"stopped");
+        Ok(())
     }
 
     #[test]
