@@ -113,6 +113,28 @@ mod tests {
     };
 
     #[test]
+    fn browser_carrier_query_matches_emitted_and_legacy_spelling() {
+        for profile in [
+            BrowserCarrierProfile::OwnedHybridWebTransport.as_str(),
+            "owned-hybrid-webtransport",
+        ] {
+            let uri: axum::http::Uri = format!(
+                "/.well-known/hyprstream/browser-provisioning/model?capability=hyprstream-rpc%2F1&scope=model&carrier_profile={profile}"
+            )
+            .parse()
+            .expect("valid URI");
+            let Query(query) = Query::<BrowserProvisioningQuery>::try_from_uri(&uri)
+                .expect("parse browser provisioning query");
+            assert_eq!(query.capability, "hyprstream-rpc/1");
+            assert_eq!(query.scope, "model");
+            assert_eq!(
+                query.carrier_profile,
+                BrowserCarrierProfile::OwnedHybridWebTransport
+            );
+        }
+    }
+
+    #[test]
     fn invalid_query_context_is_rejected_before_resolver_use() {
         let result = BrowserProvisioningRequest::new(
             "Model",
