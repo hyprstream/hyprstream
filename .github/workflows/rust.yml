@@ -116,6 +116,11 @@ jobs:
             # always compile in CI. Keep this script apostrophe-free: it is
             # single-quoted, and an apostrophe would terminate it early.
             cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings
+            # Disabled Federate session proof core is behind the application
+            # postgres feature, distinct from pds-postgres. Compile and exercise
+            # it plus the shared source-verifier vectors on this exact PR head.
+            cargo clippy -p hyprstream --all-targets --features postgres -- -D warnings
+            cargo test -p hyprstream --features postgres --lib federate_
             sccache --show-stats
           '
 
