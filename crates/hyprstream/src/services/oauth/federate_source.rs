@@ -446,7 +446,7 @@ pub(crate) struct AuthorityBinding {
     pub granted: String,
     pub revision: String,
 }
-fn scopes(s: &str) -> Result<()> {
+pub(crate) fn scopes(s: &str) -> Result<()> {
     // Keep the browser and verifier scope grammar/limit identical. Scope
     // tokens are printable ASCII separated by exactly one ASCII space.
     require(!s.is_empty() && s.len() <= MAX_SCOPE_BYTES)?;

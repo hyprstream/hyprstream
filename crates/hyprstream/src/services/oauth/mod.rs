@@ -44,6 +44,8 @@ pub mod dpop;
 pub mod federation_entity;
 // Source-only verifier: no route or runtime construction until admission review.
 #[allow(dead_code)]
+pub(crate) mod federate_exchange;
+#[allow(dead_code)]
 pub(crate) mod federate_source;
 pub mod identity_registration;
 pub mod introspection;
