@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{auth::Scope, Subject};
-use hyprstream_session_store::{Admission, Session, Source, Store};
+use hyprstream_session_store::{Admission, PendingSession, Session, Source, Store};
 use tokio::sync::Semaphore;
 use super::{EnvelopeContext, PolicyManager};
 use crate::auth::{ProductionUserStore, service_enrollment::ServiceEnrollmentManifest};
@@ -31,6 +31,8 @@ struct Decision {
     tenant: String,
     scopes: Vec<String>,
     revision: String,
+    generation: [u8; 32],
+    collision_inventory_id: [u8; 32],
 }
 
 /// Internal upstream evidence, not a browser DTO or verification boolean.
@@ -41,7 +43,6 @@ struct PossessionEvidence {
     ed_public: [u8; 32],
     pq_public: Vec<u8>,
     sid: String,
-    generation: [u8; 32],
     requested: Vec<String>,
     challenge: Decision,
     created_at: i64,
@@ -55,6 +56,10 @@ struct Authorities {
     policy: Arc<PolicyManager>,
     enrollment: Arc<ServiceEnrollmentManifest>,
     profile: Profile,
+    /// Server-owned serving tuple from a complete trusted inventory/profile
+    /// loader. No production constructor is installed by this source slice.
+    serving_generation: [u8; 32],
+    local_collision_inventory_id: [u8; 32],
 }
 
 /// Default denies before any authority or DB access. Future wiring must admit a
@@ -131,7 +136,9 @@ impl Authorities {
             &did, &tenant, requested, &scopes,
         ))?;
         let revision = blake3::hash(&bytes).to_hex().to_string();
-        Ok(Decision { account_id, subject: username, tenant, scopes, revision })
+        Ok(Decision { account_id, subject: username, tenant, scopes, revision,
+            generation: self.serving_generation,
+            collision_inventory_id: self.local_collision_inventory_id })
     }
 }
 
@@ -161,18 +168,20 @@ impl AdmissionService {
         tokio::time::timeout(Duration::from_secs(2), async {
             let current = a.decision(&evidence.source, &evidence.requested).await?;
             ensure!(current == evidence.challenge, "challenge decision changed");
-            let session = Session {
+            let session = PendingSession {
                 host: a.profile.host.clone(), sid: evidence.sid, account_id: current.account_id,
                 subject: current.subject, tenant: current.tenant, client_id: a.profile.client.clone(),
                 resource: a.profile.resource.clone(), scopes: current.scopes,
                 grant_revision: current.revision, ed_public: evidence.ed_public,
-                pq_public: evidence.pq_public, generation: evidence.generation,
+                pq_public: evidence.pq_public, generation: current.generation,
+                collision_inventory_id: current.collision_inventory_id,
                 expires_at: evidence.session_expires_at,
             };
             // No cross-store lock: a mutation here may leave a stale session.
             // No token signer or protected handler is reachable from this core.
             Ok(Store::admit(client, &Admission {
                 session, grant_expires_at: evidence.source.expires_at, source: evidence.source,
+                local_collision_inventory_id: a.local_collision_inventory_id,
                 challenge_created_at: evidence.created_at, challenge_expires_at: evidence.expires_at,
             }).await?)
         }).await?
@@ -184,7 +193,8 @@ impl AdmissionService {
         let _permit = self.capacity.as_ref().ok_or_else(|| anyhow::anyhow!("disabled"))?
             .try_acquire()?;
         ensure!(!sid.is_empty() && sid.len() <= 128, "invalid sid");
-        Ok(tokio::time::timeout(Duration::from_secs(2), Store::lookup(client, &a.profile.host, sid, generation)).await??)
+        Ok(tokio::time::timeout(Duration::from_secs(2), Store::lookup(client, &a.profile.host, sid,
+            generation, &a.local_collision_inventory_id)).await??)
     }
 
     async fn revoke(&self, ctx: &EnvelopeContext, client: &tokio_postgres::Client,
