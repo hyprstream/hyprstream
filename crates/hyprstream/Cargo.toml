@@ -28,6 +28,7 @@ bytes.workspace = true
 pglite-rs = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }  # Networked Postgres UserStore (#1401)
 tokio-postgres = { workspace = true, optional = true }     # Networked Postgres UserStore (#1401)
+hyprstream-session-store = { path = "../hyprstream-session-store", optional = true }
 tokio-postgres-rustls = { workspace = true, optional = true }  # TLS for RDS (#1401)
 webpki-roots = { workspace = true, optional = true }       # Mozilla CA roots for RDS TLS (#1401)
 aes-gcm-siv.workspace = true             # At-rest UserStore envelope encryption (#1377)
@@ -242,7 +243,7 @@ cuda = []
 valkey = ["dep:fred"]  # Enable legacy Valkey/Redis-backed user and token stores
 discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery state
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:hyprstream-session-store"]  # Networked Postgres UserStore for RDS (#1401)
 encrypted-account-admission = []  # Mandatory source-level policy: no plaintext account UserStore in production
 # Local RocksDB persistence (same shape as the `valkey` precedent): the
 # legacy RocksDbUserStore/DeviceStore, the OAuth refresh-token store, and the

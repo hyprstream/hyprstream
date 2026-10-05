@@ -7,10 +7,13 @@
 //! narrow runtime role. No DSN or token bodies are accepted or logged here.
 
 use tokio_postgres::{error::SqlState, Client, IsolationLevel, Row};
+pub mod primary;
+pub use primary::{ActiveSessionPrimary, CollisionInventory};
 
 pub const PROFILE: &str = "federate-session-v1";
 pub const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
 pub const MIGRATION: &str = include_str!("../sql/001_admission.sql");
+pub const PRIMARY_MIGRATION: &str = include_str!("../sql/002_primary_lookup.sql");
 pub const ROLE_GRANTS: &str = include_str!("../sql/roles.sql");
 
 /// Sanitized failures: PostgreSQL detail strings can include bound values.
@@ -70,6 +73,7 @@ pub struct Session {
 
 pub struct Admission {
     pub session: Session,
+    pub inventory: CollisionInventory,
     pub source: Source,
     /// Expiry of the server-owned pending challenge, not supplied by a browser.
     pub challenge_created_at: i64,
@@ -166,17 +170,21 @@ impl Store {
             .query_one("SELECT version FROM federate_session.schema_version", &[])
             .await?
             .try_get(0)?;
-        if version != 1 {
+        if version != 2 {
             return Err(Error::Unavailable);
         }
         let s = &admission.session;
         let row = tx.query_opt(
-            "SELECT enabled, authority_generation FROM federate_session.profile_state WHERE host=$1 AND profile=$2 FOR UPDATE",
+            "SELECT enabled, authority_generation, collision_inventory_id FROM federate_session.profile_state WHERE host=$1 AND profile=$2 FOR UPDATE",
             &[&s.host, &PROFILE],
         ).await?.ok_or(Error::Inactive)?;
         let enabled: bool = row.try_get(0)?;
         let generation: Vec<u8> = row.try_get(1)?;
-        if !enabled || generation != s.generation {
+        let inventory_id: Option<Vec<u8>> = row.try_get(2)?;
+        if !enabled
+            || generation != s.generation
+            || inventory_id.as_deref() != Some(&admission.inventory.id()[..])
+        {
             return Err(Error::Inactive);
         }
         // PostgreSQL transaction timestamps precede lock waits; use clock_timestamp.
@@ -188,9 +196,12 @@ impl Store {
             .await?
             .try_get(0)?;
         let retain_until = admission.validate(now)?;
+        if !admission.inventory.permits(&s.ed_public, &s.pq_public) {
+            return Err(Error::Conflict);
+        }
         tx.execute(
-            "INSERT INTO federate_session.sessions (host,profile,sid,account_id,subject,tenant,client_id,resource,scopes,grant_revision,suite,ed_public,pq_public,generation,created_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
-            &[&s.host,&PROFILE,&s.sid,&s.account_id,&s.subject,&s.tenant,&s.client_id,&s.resource,&s.scopes,&s.grant_revision,&SUITE,&&s.ed_public[..],&s.pq_public,&&s.generation[..],&now,&s.expires_at],
+            "INSERT INTO federate_session.sessions (host,profile,sid,account_id,subject,tenant,client_id,resource,scopes,grant_revision,suite,ed_public,pq_public,generation,created_at,expires_at,collision_inventory_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+            &[&s.host,&PROFILE,&s.sid,&s.account_id,&s.subject,&s.tenant,&s.client_id,&s.resource,&s.scopes,&s.grant_revision,&SUITE,&&s.ed_public[..],&s.pq_public,&&s.generation[..],&now,&s.expires_at,&&admission.inventory.id()[..]],
         ).await?;
         let src = &admission.source;
         tx.execute(
@@ -208,6 +219,7 @@ impl Store {
             Self::lookup(client, &expected.host, &expected.sid, &expected.generation)
                 .await?
                 .as_ref()
+                .map(|a| &a.session)
                 == Some(expected),
         )
     }
@@ -215,16 +227,32 @@ impl Store {
     /// Authoritative full-record lookup for the future request-local proof resolver.
     /// Caller must still compare all credential fields and verify the RPC proof.
     pub async fn lookup(
-        client: &Client,
+        client: &(impl tokio_postgres::GenericClient + Sync),
         host: &str,
         sid: &str,
         generation: &[u8; 32],
-    ) -> Result<Option<Session>, Error> {
+    ) -> Result<Option<ActiveSessionPrimary>, Error> {
         let row = client.query_opt(
-            "SELECT s.* FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint",
+            "SELECT s.* FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND (SELECT version FROM federate_session.schema_version)=2 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint",
             &[&host,&sid,&PROFILE,&SUITE,&&generation[..]],
         ).await?;
-        row.as_ref().map(read_session).transpose()
+        row.as_ref()
+            .map(|row| {
+                let epoch: i64 = row.try_get("proof_epoch")?;
+                if epoch <= 0 {
+                    return Err(Error::Unavailable);
+                }
+                Ok(ActiveSessionPrimary {
+                    session: read_session(row)?,
+                    created_at: row.try_get("created_at")?,
+                    proof_epoch: epoch as u64,
+                    collision_inventory_id: row
+                        .try_get::<_, Vec<u8>>("collision_inventory_id")?
+                        .try_into()
+                        .map_err(|_| Error::Unavailable)?,
+                })
+            })
+            .transpose()
     }
 
     pub async fn revoke(
@@ -244,7 +272,7 @@ impl Store {
     pub async fn cleanup(client: &mut Client) -> Result<(), Error> {
         let tx = client.transaction().await?;
         tx.execute("DELETE FROM federate_session.replay WHERE retain_until<floor(extract(epoch FROM clock_timestamp()))::bigint", &[]).await?;
-        tx.execute("DELETE FROM federate_session.sessions s WHERE expires_at<floor(extract(epoch FROM clock_timestamp()))::bigint AND NOT EXISTS (SELECT 1 FROM federate_session.replay r WHERE r.host=s.host AND r.sid=s.sid)", &[]).await?;
+        tx.execute("DELETE FROM federate_session.sessions s WHERE expires_at::numeric+30<floor(extract(epoch FROM clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM federate_session.replay r WHERE r.host=s.host AND r.sid=s.sid)", &[]).await?;
         tx.commit().await?;
         Ok(())
     }

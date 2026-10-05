@@ -223,7 +223,7 @@ impl PostgresUserStore {
     pub async fn connect_plaintext(config: PostgresUserStoreConfig) -> Result<Self> {
         let url = Url::parse(&config.database_url).context("parsing test PostgresUserStore URL")?;
         let mut cfg = PoolConfig::new();
-        cfg.host = url.host_str().map(|h| h.to_owned());
+        cfg.host = url.host_str().map(str::to_owned);
         cfg.port = url.port();
         if !url.username().is_empty() {
             cfg.user = Some(url.username().to_owned());
@@ -582,7 +582,7 @@ fn validate_pg_url(raw: &str) -> Result<()> {
 fn build_pool_config(database_url: &str) -> Result<PoolConfig> {
     let url = Url::parse(database_url).context("re-parsing validated credentials URL")?;
     let mut cfg = PoolConfig::new();
-    cfg.host = url.host_str().map(|h| h.to_owned());
+    cfg.host = url.host_str().map(str::to_owned);
     cfg.port = url.port();
     let username = url.username();
     if !username.is_empty() {
@@ -596,12 +596,8 @@ fn build_pool_config(database_url: &str) -> Result<PoolConfig> {
         cfg.dbname = Some(path.to_owned());
     }
     for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "sslmode" | "sslrootcert" => { /* handled by connector */ }
-            "application_name" => {
-                cfg.application_name = Some(value.into_owned());
-            }
-            _ => {}
+        if key.as_ref() == "application_name" {
+            cfg.application_name = Some(value.into_owned());
         }
     }
     cfg.ssl_mode = Some(SslMode::Require);
@@ -2184,7 +2180,6 @@ mod tests {
             .await
             .expect_err("self-signed TLS endpoint must not pass the pinned RDS CA verifier");
         let chain = format!("{error:?}");
-        eprintln!("adversarial TLS rejection: {chain}");
         assert!(
             chain.contains("InvalidCertificate")
                 || chain.contains("UnknownIssuer")

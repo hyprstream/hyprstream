@@ -3,12 +3,29 @@
 //! PostgreSQL cluster. Each run creates/drops its own database and NOLOGIN roles.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use hyprstream_session_store::primary::{
+    ExpectedPrimary, InventorySource, LookupCapability, PrimaryLookup,
+};
 use hyprstream_session_store::Session;
-use hyprstream_session_store::{Admission, Error, Source, Store, MIGRATION, PROFILE, ROLE_GRANTS};
+use hyprstream_session_store::{
+    Admission, CollisionInventory, Error, Source, Store, MIGRATION, PRIMARY_MIGRATION, PROFILE,
+    ROLE_GRANTS,
+};
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 
 const HOST: &str = "https://host.test";
+
+fn inventory() -> CollisionInventory {
+    CollisionInventory::from_sources(
+        &["fixture:static-and-envelope".into()],
+        vec![InventorySource {
+            id: "fixture:static-and-envelope".into(),
+            keys: vec![vec![255; 32], vec![254; 1952]],
+        }],
+    )
+    .unwrap()
+}
 
 async fn connect(socket: &str, database: &str, role: Option<&str>) -> Client {
     let (client, conn) = tokio_postgres::Config::new()
@@ -43,6 +60,7 @@ async fn now(c: &Client) -> i64 {
 
 fn input(now: i64, id: u8) -> Admission {
     Admission {
+        inventory: inventory(),
         session: Session {
             host: HOST.into(),
             sid: format!("session-{id}"),
@@ -54,8 +72,8 @@ fn input(now: i64, id: u8) -> Admission {
             scopes: vec!["model:query".into()],
             grant_revision: "revision-1".into(),
             // Storage fixtures only: not valid cryptographic identities/proofs.
-            ed_public: [1; 32],
-            pq_public: vec![2; 1952],
+            ed_public: [id; 32],
+            pq_public: vec![id; 1952],
             generation: [3; 32],
             expires_at: now + 90,
         },
@@ -118,7 +136,7 @@ async fn scenarios(socket: &str, database: &str) {
         Store::admit(&mut runtime, &input(n, 1)).await,
         Err(Error::Inactive)
     ));
-    admin.execute("INSERT INTO federate_session.profile_state(host,profile,authority_generation) VALUES ($1,$2,$3)", &[&HOST,&PROFILE,&&[3u8;32][..]]).await.unwrap();
+    admin.execute("INSERT INTO federate_session.profile_state(host,profile,authority_generation,collision_inventory_id) VALUES ($1,$2,$3,$4)", &[&HOST,&PROFILE,&&[3u8;32][..],&&inventory().id()[..]]).await.unwrap();
     assert!(matches!(
         Store::admit(&mut runtime, &input(n, 1)).await,
         Err(Error::Inactive)
@@ -171,6 +189,7 @@ async fn scenarios(socket: &str, database: &str) {
     assert_eq!(count(&admin, "sessions").await, 1);
     assert_eq!(count(&admin, "replay").await, 1);
     assert!(Store::active(&runtime, &committed).await.unwrap());
+    primary_scenarios(socket, database, &admin, &mut runtime, &committed).await;
     let mut wrong = committed.clone();
     wrong.tenant = "another-tenant".into();
     assert!(!Store::active(&runtime, &wrong).await.unwrap());
@@ -243,8 +262,8 @@ async fn scenarios(socket: &str, database: &str) {
     for rotate in [false, true] {
         control
             .execute(
-                "UPDATE federate_session.profile_state SET enabled=true,authority_generation=$1",
-                &[&&[3u8; 32][..]],
+                "UPDATE federate_session.profile_state SET enabled=true,authority_generation=$1,collision_inventory_id=$2",
+                &[&&[3u8; 32][..], &&inventory().id()[..]],
             )
             .await
             .unwrap();
@@ -260,7 +279,7 @@ async fn scenarios(socket: &str, database: &str) {
         let ctl = connect(socket, database, Some("hs_profile_control")).await;
         let ctl_pid = pid(&ctl).await;
         let control_task = tokio::spawn(async move {
-            ctl.batch_execute(if rotate {"UPDATE federate_session.profile_state SET authority_generation=decode(repeat('04',32),'hex')"}else{"UPDATE federate_session.profile_state SET enabled=false"}).await.unwrap();
+            ctl.batch_execute(if rotate {"UPDATE federate_session.profile_state SET authority_generation=decode(repeat('04',32),'hex'),collision_inventory_id=decode(repeat('09',32),'hex')"}else{"UPDATE federate_session.profile_state SET enabled=false"}).await.unwrap();
         });
         wait_blocked(&admin, ctl_pid).await;
         admin
@@ -281,15 +300,15 @@ async fn scenarios(socket: &str, database: &str) {
     for (id, rotate, rollback) in [(20, false, false), (21, true, false), (22, false, true)] {
         control
             .execute(
-                "UPDATE federate_session.profile_state SET enabled=true,authority_generation=$1",
-                &[&&[3u8; 32][..]],
+                "UPDATE federate_session.profile_state SET enabled=true,authority_generation=$1,collision_inventory_id=$2",
+                &[&&[3u8; 32][..], &&inventory().id()[..]],
             )
             .await
             .unwrap();
         let before = count(&admin, "sessions").await;
         let before_replay = count(&admin, "replay").await;
         let tx = control.transaction().await.unwrap();
-        tx.batch_execute(if rotate {"UPDATE federate_session.profile_state SET authority_generation=decode(repeat('04',32),'hex')"}else{"UPDATE federate_session.profile_state SET enabled=false"}).await.unwrap();
+        tx.batch_execute(if rotate {"UPDATE federate_session.profile_state SET authority_generation=decode(repeat('04',32),'hex'),collision_inventory_id=decode(repeat('09',32),'hex')"}else{"UPDATE federate_session.profile_state SET enabled=false"}).await.unwrap();
         let mut worker = connect(socket, database, Some("hs_policy_runtime")).await;
         let worker_pid = pid(&worker).await;
         let a = input(now(&admin).await, id);
@@ -333,6 +352,273 @@ async fn scenarios(socket: &str, database: &str) {
     ));
 }
 
+async fn primary_scenarios(
+    socket: &str,
+    database: &str,
+    admin: &Client,
+    runtime: &mut Client,
+    committed: &Session,
+) {
+    use hyprstream_rpc::auth::signer_suite::signer_suite_thumbprint;
+    use hyprstream_session_store::SUITE;
+    let first = Store::lookup(runtime, HOST, &committed.sid, &committed.generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.proof_epoch > 0);
+    let reconnect = connect(socket, database, Some("hs_policy_runtime")).await;
+    let reloaded = Store::lookup(&reconnect, HOST, &committed.sid, &committed.generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.proof_epoch, reloaded.proof_epoch);
+    assert_eq!(first.collision_inventory_id, inventory().id());
+    assert!(runtime
+        .execute(
+            "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1",
+            &[]
+        )
+        .await
+        .is_err());
+    assert!(admin
+        .execute(
+            "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1",
+            &[]
+        )
+        .await
+        .is_err());
+    assert!(admin
+        .execute(
+            "UPDATE federate_session.profile_state SET collision_inventory_id=$1",
+            &[&&[9u8; 32][..]]
+        )
+        .await
+        .is_err());
+
+    let authority = PrimaryLookup::new(
+        HOST.into(),
+        inventory(),
+        vec![LookupCapability {
+            service: "service:model".into(),
+            service_key: [42; 32],
+            tenant: committed.tenant.clone(),
+            resource: HOST.into(),
+        }],
+    )
+    .unwrap();
+    let expected = ExpectedPrimary {
+        issuer: HOST.into(),
+        profile: PROFILE.into(),
+        sid: committed.sid.clone(),
+        subject: committed.subject.clone(),
+        tenant: committed.tenant.clone(),
+        client: committed.client_id.clone(),
+        audience: HOST.into(),
+        scopes: committed.scopes.clone(),
+        ed_public: committed.ed_public,
+        suite_thumbprint: signer_suite_thumbprint(
+            SUITE,
+            &[&committed.ed_public, &committed.pq_public],
+        ),
+        generation: committed.generation,
+        expires_at: committed.expires_at,
+    };
+    assert!(authority
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_ok());
+    for (service, key) in [
+        ("service:other", [42; 32]),
+        ("service:model", [41; 32]),
+        ("user:alice", [42; 32]),
+    ] {
+        assert!(authority
+            .resolve(runtime, service, &key, &expected)
+            .await
+            .is_err());
+    }
+    let none = PrimaryLookup::new(HOST.into(), inventory(), vec![]).unwrap();
+    assert!(none
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_err());
+    // Only local provenance changes: key/credential/generation remain valid.
+    let different_inventory = CollisionInventory::from_sources(
+        &["fixture:different-snapshot".into()],
+        vec![InventorySource {
+            id: "fixture:different-snapshot".into(),
+            keys: vec![],
+        }],
+    )
+    .unwrap();
+    let wrong_inventory = PrimaryLookup::new(
+        HOST.into(),
+        different_inventory.clone(),
+        vec![LookupCapability {
+            service: "service:model".into(),
+            service_key: [42; 32],
+            tenant: committed.tenant.clone(),
+            resource: HOST.into(),
+        }],
+    )
+    .unwrap();
+    assert!(wrong_inventory
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_err());
+    let mut wrong_admission = input(now(admin).await, 80);
+    wrong_admission.inventory = different_inventory;
+    assert!(matches!(
+        Store::admit(runtime, &wrong_admission).await,
+        Err(Error::Inactive)
+    ));
+    for field in 0..11 {
+        let mut wrong = expected.clone();
+        match field {
+            0 => wrong.issuer.push('x'),
+            1 => wrong.sid.push('x'),
+            2 => wrong.subject.push('x'),
+            3 => wrong.tenant.push('x'),
+            4 => wrong.client.push('x'),
+            5 => wrong.audience.push('x'),
+            6 => wrong.scopes = vec!["other:query".into()],
+            7 => wrong.ed_public[0] ^= 1,
+            8 => wrong.suite_thumbprint[0] ^= 1,
+            9 => wrong.generation[0] ^= 1,
+            _ => wrong.expires_at += 1,
+        }
+        assert!(authority
+            .resolve(runtime, "service:model", &[42; 32], &wrong)
+            .await
+            .is_err());
+    }
+    // Stale inventory + generation changes atomically, then fixture restores both.
+    admin.execute("UPDATE federate_session.profile_state SET collision_inventory_id=$1,authority_generation=$2", &[&&[9u8;32][..],&&[4u8;32][..]]).await.unwrap();
+    assert!(authority
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_err());
+    admin.execute("UPDATE federate_session.profile_state SET collision_inventory_id=$1,authority_generation=$2", &[&&inventory().id()[..],&&[3u8;32][..]]).await.unwrap();
+
+    // An independent source race sharing just one component, then the other.
+    for (id, ed) in [(50, true), (52, false)] {
+        let a = input(now(admin).await, id);
+        let mut b = input(now(admin).await, id + 1);
+        if ed {
+            b.session.ed_public = a.session.ed_public;
+        } else {
+            b.session.pq_public = a.session.pq_public.clone();
+        }
+        let mut other = connect(socket, database, Some("hs_policy_runtime")).await;
+        let (r1, r2) = tokio::join!(Store::admit(runtime, &a), Store::admit(&mut other, &b));
+        assert!(matches!(
+            (r1, r2),
+            (Ok(_), Err(Error::Conflict)) | (Err(Error::Conflict), Ok(_))
+        ));
+    }
+    for ed in [true, false] {
+        let mut collision = input(now(admin).await, 60);
+        if ed {
+            collision.session.ed_public = [255; 32];
+        } else {
+            collision.session.pq_public = vec![254; 1952];
+        }
+        assert!(matches!(
+            Store::admit(runtime, &collision).await,
+            Err(Error::Conflict)
+        ));
+    }
+    // Isolate fixture rows; production cleanup cannot remove them prematurely.
+    admin
+        .execute(
+            "DELETE FROM federate_session.replay WHERE sid<>$1",
+            &[&committed.sid],
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "DELETE FROM federate_session.sessions WHERE sid<>$1",
+            &[&committed.sid],
+        )
+        .await
+        .unwrap();
+    let a = input(now(admin).await, 70);
+    Store::admit(runtime, &a).await.unwrap();
+    let later = Store::lookup(runtime, HOST, &a.session.sid, &a.session.generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(later.proof_epoch > first.proof_epoch);
+    Store::revoke(runtime, HOST, &a.session.sid, &a.session.generation)
+        .await
+        .unwrap();
+    // First prove replay references protect even a session past its own horizon.
+    admin
+        .execute(
+            "UPDATE federate_session.sessions SET created_at=$1,expires_at=$2 WHERE sid=$3",
+            &[
+                &(now(admin).await - 200),
+                &(now(admin).await - 60),
+                &a.session.sid,
+            ],
+        )
+        .await
+        .unwrap();
+    let mut cleanup = connect(socket, database, Some("hs_session_cleanup")).await;
+    Store::cleanup(&mut cleanup).await.unwrap();
+    assert_eq!(count(admin, "sessions").await, 2);
+    admin
+        .execute(
+            "DELETE FROM federate_session.replay WHERE sid=$1",
+            &[&a.session.sid],
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "UPDATE federate_session.sessions SET expires_at=$1 WHERE sid=$2",
+            &[&(now(admin).await - 10), &a.session.sid],
+        )
+        .await
+        .unwrap();
+    Store::cleanup(&mut cleanup).await.unwrap();
+    assert_eq!(count(admin, "sessions").await, 2);
+    let mut duplicate = input(now(admin).await, 71);
+    duplicate.session.ed_public = a.session.ed_public;
+    assert!(matches!(
+        Store::admit(runtime, &duplicate).await,
+        Err(Error::Conflict)
+    ));
+    admin
+        .execute(
+            "UPDATE federate_session.sessions SET expires_at=$1 WHERE sid=$2",
+            &[&(now(admin).await - 31), &a.session.sid],
+        )
+        .await
+        .unwrap();
+    Store::cleanup(&mut cleanup).await.unwrap();
+    assert_eq!(count(admin, "sessions").await, 1);
+
+    // Actual blocked SQL lookup, not a mock timeout. The authority returns no row.
+    let mut locker = connect(socket, database, None).await;
+    let tx = locker.transaction().await.unwrap();
+    tx.batch_execute("LOCK TABLE federate_session.sessions IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    assert!(matches!(
+        authority
+            .resolve(runtime, "service:model", &[42; 32], &expected)
+            .await,
+        Err(Error::Unavailable)
+    ));
+    tx.rollback().await.unwrap();
+    assert!(authority
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_ok());
+}
+
 #[tokio::test]
 #[ignore = "requires disposable local PostgreSQL 16 Unix socket; never staging"]
 async fn postgres_admission_causal() {
@@ -356,6 +642,7 @@ async fn postgres_admission_causal() {
         .await
         .unwrap();
     admin.batch_execute(MIGRATION).await.unwrap();
+    admin.batch_execute(PRIMARY_MIGRATION).await.unwrap();
     admin.batch_execute(ROLE_GRANTS).await.unwrap();
     admin.batch_execute("RESET ROLE").await.unwrap();
     let socket_copy = socket.clone();
