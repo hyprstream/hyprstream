@@ -395,6 +395,21 @@ def check_appimage_text(text: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def _move_pds_lint_outside_script(rust_text: str) -> str:
+    """Move the actual lint across the quote, independent of adjacent commands."""
+    block = _job_blocks(rust_text)["clippy"]
+    command = "cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings"
+    _assert(command in _podman_quoted_script(block, "clippy"),
+            "mutation requires the pds-postgres lint inside the container script")
+    lines = block.splitlines(keepends=True)
+    matches = [i for i, line in enumerate(lines) if line.strip() == command]
+    _assert(len(matches) == 1, "mutation requires exactly one pds-postgres lint command")
+    lint_line = lines.pop(matches[0])
+    closing = next(i for i, line in enumerate(lines) if line.strip() == "'")
+    lines.insert(closing + 1, lint_line)
+    return rust_text.replace(block, "".join(lines), 1)
+
+
 def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
     """Return (label, mutated_text) pairs that MUST each be rejected."""
     return [
@@ -523,11 +538,7 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
         ),
         (
             "pds-postgres lint moved outside the quoted script",
-            rust_text.replace(
-                "            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n            sccache --show-stats\n          '",
-                "            sccache --show-stats\n          '\n            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings",
-                1,
-            ),
+            _move_pds_lint_outside_script(rust_text),
         ),
     ]
 

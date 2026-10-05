@@ -39,8 +39,12 @@ is not permission.
    disposable PostgreSQL replay adapter with unique `(namespace, request_id)`,
    duplicate denial after restart, fresh-ID control and missing-history denial.
    This patch does not implement or claim F3, durable replay, or handler isolation.
-5. Add stream expiry and at-most-one-second authority rechecks. H2 grant-at-use
-   architecture remains separate. Neither this primitive nor H3a authorizes enablement.
+5. Apply the operator-selected H2 checks at each API request and before each
+   distinct tool call. A previously authorized stream may finish, including after
+   later revocation or credential/session expiry; no per-token, chunk or timer
+   polling. The next request/tool call must recheck. The amended contract awaits
+   K3 review; no H2 grants or streaming behavior are implemented here. Neither
+   this primitive nor H3a authorizes enablement.
 
 ## Local gates
 
