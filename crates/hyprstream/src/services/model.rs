@@ -202,20 +202,34 @@ impl StagingModelPin {
         const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
         const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
         const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
-        const REVIEWED_REF: &str = "qwen2.5-0.5b-instruct:main";
-        const REVIEWED_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
         let profile = match std::env::var(PROFILE) {
             Ok(value) => value,
             Err(std::env::VarError::NotPresent) => "default".to_owned(),
             Err(error) => return Err(error.into()),
         };
-        let model_ref = std::env::var(REF).ok();
-        let oid = std::env::var(OID).ok();
+        let read_optional = |name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(anyhow!("read {name}: {error}")),
+        };
+        let model_ref = read_optional(REF)?;
+        let oid = read_optional(OID)?;
+        Self::from_settings(&profile, model_ref.as_deref(), oid.as_deref())
+    }
+
+    fn from_settings(profile: &str, model_ref: Option<&str>, oid: Option<&str>) -> Result<Option<Self>> {
+        const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
+        const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
+        const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
+        const REVIEWED_REF: &str = "qwen2.5-0.5b-instruct:main";
+        const REVIEWED_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
         if profile == "staging" {
-            anyhow::ensure!(model_ref.as_deref().is_none_or(|value| value == REVIEWED_REF),
-                "{REF} must match the reviewed staging modelRef");
-            anyhow::ensure!(oid.as_deref().is_none_or(|value| value == REVIEWED_OID),
-                "{OID} must match the reviewed staging model OID");
+            match (model_ref, oid) {
+                (None, None) => return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some),
+                (Some(model_ref), Some(oid)) => anyhow::ensure!(model_ref == REVIEWED_REF && oid == REVIEWED_OID,
+                    "staging override must match the complete reviewed model pin"),
+                _ => anyhow::bail!("{REF} and {OID} must either both be absent or both match the reviewed pin"),
+            }
             return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some);
         }
         anyhow::ensure!(profile == "default", "{PROFILE} must be 'default' or 'staging'");
@@ -224,7 +238,7 @@ impl StagingModelPin {
             (Some(model_ref), Some(oid)) => {
                 anyhow::ensure!(oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
                     "{OID} must be a full 40-character hexadecimal Git OID");
-                Self::new(model_ref, git2::Oid::from_str(&oid)?).map(Some)
+                Self::new(model_ref, git2::Oid::from_str(oid)?).map(Some)
             }
             _ => anyhow::bail!("{REF} and {OID} must be configured together"),
         }
@@ -2971,6 +2985,20 @@ mod tests {
             assert!(!pin.admits(wrong));
         }
         assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_pin_settings_fail_closed_on_missing_or_partial_override() -> Result<()> {
+        let pin = StagingModelPin::from_settings("staging", None, None)?
+            .ok_or_else(|| anyhow!("staging profile must have reviewed pin"))?;
+        assert!(pin.admits("qwen2.5-0.5b-instruct:main"));
+        assert!(StagingModelPin::from_settings("staging", Some("qwen2.5-0.5b-instruct:main"), None).is_err());
+        assert!(StagingModelPin::from_settings("staging", None, Some("18c562db6830c2ef6636b8eaf42fb479272052f7")).is_err());
+        assert!(StagingModelPin::from_settings("staging", Some("other:main"), Some("18c562db6830c2ef6636b8eaf42fb479272052f7")).is_err());
+        assert!(StagingModelPin::from_settings("default", None, None)?.is_none());
+        assert!(StagingModelPin::from_settings("default", Some("x:main"), None).is_err());
+        assert!(StagingModelPin::from_settings("default", Some("x:main"), Some("deadbeef")).is_err());
         Ok(())
     }
 
