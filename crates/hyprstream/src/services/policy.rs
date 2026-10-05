@@ -4,6 +4,8 @@
 //! Handlers are async and use `.await` directly (compatible with single-threaded runtime).
 
 use async_trait::async_trait;
+#[cfg(feature = "postgres")]
+mod federate_admission;
 use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
 use crate::services::{EnvelopeContext, RequestService};
