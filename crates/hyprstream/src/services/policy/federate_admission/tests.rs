@@ -78,7 +78,8 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
         policy: Arc::new(PolicyManager::permissive().await.unwrap()), enrollment,
         profile: Profile { issuer: "https://issuer.test".into(), host: "https://host.test".into(),
             client: "client".into(), resource: "https://host.test".into(),
-            client_scopes: scopes.clone(), resource_scopes: scopes } };
+            client_scopes: scopes.clone(), resource_scopes: scopes },
+        serving_generation: [3;32], local_collision_inventory_id: [7;32] };
     (AdmissionService { authority: Some(a), capacity: Some(Semaphore::new(1)) }, users,
         EnvelopeContext::for_test_authenticated_subject_with_claims(Subject::new("service:oauth"), "*", signer,
             hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX)))
@@ -170,7 +171,7 @@ fn evidence(challenge: Decision, id: &str) -> PossessionEvidence {
     let source = source();
     PossessionEvidence { created_at: source.issued_at, expires_at: source.issued_at + 60,
         session_expires_at: source.expires_at, source, ed_public: [1;32], pq_public: vec![2;1952],
-        sid: id.into(), generation: [3;32], requested: vec![STAGING_SCOPE.into()], challenge }
+        sid: id.into(), requested: vec![STAGING_SCOPE.into()], challenge }
 }
 
 /// Only a disposable local Unix-socket fixture; never an environment DSN.
@@ -184,8 +185,9 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     admin.batch_execute(&format!("CREATE DATABASE {db}")).await.unwrap();
     let mut control = connect(&socket, &db).await;
     control.batch_execute(hyprstream_session_store::MIGRATION).await.unwrap();
-    control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation) VALUES ($1,$2,true,$3)",
-        &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..]]).await.unwrap();
+    control.batch_execute(hyprstream_session_store::MIGRATION_V2).await.unwrap();
+    control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
+        &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
     let (service, users, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into()];
@@ -193,6 +195,12 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     let mut stale = challenge.clone();
     stale.tenant = "other".into();
     assert!(service.redeem(&ctx, &mut client, evidence(stale, "mismatch")).await.is_err());
+    let mut stale = challenge.clone();
+    stale.collision_inventory_id = [8;32];
+    assert!(service.redeem(&ctx, &mut client, evidence(stale, "inventory-mismatch")).await.is_err());
+    let mut stale = challenge.clone();
+    stale.generation = [4;32];
+    assert!(service.redeem(&ctx, &mut client, evidence(stale, "generation-mismatch")).await.is_err());
     users.0.write().sub = Some(uuid::Uuid::new_v4().to_string());
     assert!(service.redeem(&ctx, &mut client, evidence(challenge, "revision")).await.is_err());
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
@@ -225,7 +233,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     assert!(a.is_err() && b.is_err());
     assert!(service.revoke(&ctx, &client, &receipt.sid, &[3;32]).await.unwrap());
     assert!(service.lookup(&ctx, &client, &receipt.sid, &[3;32]).await.unwrap().is_none());
-    assert!(service.lookup(&ctx, &client, &receipt.sid, &[4;32]).await.unwrap().is_none());
+    assert!(service.lookup(&ctx, &client, &receipt.sid, &[4;32]).await.is_err());
     Store::cleanup(&mut client).await.unwrap();
     observer.execute("SELECT pg_terminate_backend($1)", &[&pid]).await.unwrap();
     assert!(service.lookup(&ctx, &client, &receipt.sid, &[3;32]).await.is_err());
