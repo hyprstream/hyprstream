@@ -7729,6 +7729,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-postgres",
+ "workspace-hack",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@ agpl_packages = [
   "hyprstream-pds",
   "hyprstream-pds-service",
   "hyprstream-service",
+  "hyprstream-session-store",
   "hyprstream-vfs-server",
   "hyprstream-workers",
 ]
