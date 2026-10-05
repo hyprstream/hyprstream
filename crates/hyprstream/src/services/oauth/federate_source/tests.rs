@@ -348,6 +348,86 @@ async fn challenge_binding_expiry_and_source_replay_mismatch() {
     assert!(source(&v, &t).await.challenge(b, [9; 32], NOW).is_err());
 }
 
+#[tokio::test]
+async fn authority_binding_limits_match_browser_transcript_profile() {
+    let v = verifier();
+    let t = token(&claims());
+    let mut b = binding();
+    b.account = "a".repeat(MAX_AUTHORITY_TEXT);
+    b.subject = "s".repeat(MAX_AUTHORITY_TEXT);
+    b.tenant = "t".repeat(MAX_AUTHORITY_TEXT);
+    b.revision = "r".repeat(MAX_AUTHORITY_TEXT);
+    b.requested = "q".repeat(MAX_SCOPE_BYTES);
+    b.granted = b.requested.clone();
+    let challenge = source(&v, &t).await.challenge(b, [9; 32], NOW).unwrap();
+    assert!(challenge.transcript().len() <= MAX_TRANSCRIPT);
+
+    // The A2 browser counts the encoded transcript field bytes, not Rust or
+    // JavaScript character count; a two-byte UTF-8 value at exactly 256 bytes
+    // is admitted, while the next character exceeds the shared bound.
+    let mut b = binding();
+    b.account = "é".repeat(MAX_AUTHORITY_TEXT / 2);
+    assert!(source(&v, &t).await.challenge(b, [9; 32], NOW).is_ok());
+    let mut b = binding();
+    b.account = "é".repeat(MAX_AUTHORITY_TEXT / 2 + 1);
+    assert!(source(&v, &t).await.challenge(b, [9; 32], NOW).is_err());
+
+    for field in ["account", "subject", "tenant", "revision"] {
+        let mut b = binding();
+        match field {
+            "account" => b.account = "a".repeat(MAX_AUTHORITY_TEXT + 1),
+            "subject" => b.subject = "s".repeat(MAX_AUTHORITY_TEXT + 1),
+            "tenant" => b.tenant = "t".repeat(MAX_AUTHORITY_TEXT + 1),
+            "revision" => b.revision = "r".repeat(MAX_AUTHORITY_TEXT + 1),
+            _ => unreachable!(),
+        }
+        assert!(
+            source(&v, &t).await.challenge(b, [9; 32], NOW).is_err(),
+            "{field} byte limit"
+        );
+
+        for control in ['\0', '\n', '\u{7f}'] {
+            let mut b = binding();
+            let value = format!("before{control}after");
+            match field {
+                "account" => b.account = value,
+                "subject" => b.subject = value,
+                "tenant" => b.tenant = value,
+                "revision" => b.revision = value,
+                _ => unreachable!(),
+            }
+            assert!(
+                source(&v, &t).await.challenge(b, [9; 32], NOW).is_err(),
+                "{field} control U+{:04X}",
+                control as u32
+            );
+        }
+    }
+
+    let mut b = binding();
+    b.requested = "q".repeat(MAX_SCOPE_BYTES + 1);
+    b.granted = b.requested.clone();
+    assert!(
+        source(&v, &t).await.challenge(b, [9; 32], NOW).is_err(),
+        "scope byte limit"
+    );
+
+    for scope in [
+        "query:registry:*\n",
+        "query:registry:*\u{7f}",
+        "scope  with-gap",
+        "z a",
+    ] {
+        let mut b = binding();
+        b.requested = scope.into();
+        b.granted = scope.into();
+        assert!(
+            source(&v, &t).await.challenge(b, [9; 32], NOW).is_err(),
+            "scope {scope:?}"
+        );
+    }
+}
+
 #[test]
 fn published_cross_language_framing_vectors() {
     let v: Value = serde_json::from_str(include_str!("framing-vectors.json")).unwrap();

@@ -32,6 +32,9 @@ const TOKEN_ENDPOINT: &str = "https://discovery.staging.lab.hyprstream.com/oauth
 const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
 const MAX_JWS: usize = 16 * 1024;
 const MAX_JWKS: usize = 64 * 1024;
+const MAX_TRANSCRIPT: usize = 8 * 1024;
+const MAX_AUTHORITY_TEXT: usize = 256;
+const MAX_SCOPE_BYTES: usize = 1024;
 const KEY_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -444,19 +447,26 @@ pub(crate) struct AuthorityBinding {
     pub revision: String,
 }
 fn scopes(s: &str) -> Result<()> {
-    require(!s.is_empty() && s.len() <= 2048)?;
+    // Keep the browser and verifier scope grammar/limit identical. Scope
+    // tokens are printable ASCII separated by exactly one ASCII space.
+    require(!s.is_empty() && s.len() <= MAX_SCOPE_BYTES)?;
     let mut previous = "";
     for token in s.split(' ') {
         require(
             !token.is_empty()
-                && token
-                    .bytes()
-                    .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+                && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
                 && token > previous,
         )?;
         previous = token;
     }
     Ok(())
+}
+fn authority_text(s: &str) -> Result<()> {
+    require(
+        !s.is_empty()
+            && s.len() <= MAX_AUTHORITY_TEXT
+            && !s.bytes().any(|b| b <= 0x1f || b == 0x7f),
+    )
 }
 pub(crate) struct Challenge {
     source: Source,
@@ -480,7 +490,7 @@ impl Source {
             &binding.tenant,
             &binding.revision,
         ] {
-            require(!s.is_empty() && s.len() <= 1024)?;
+            authority_text(s)?;
         }
         require(binding.tenant != "*")?;
         scopes(&binding.requested)?;
@@ -524,6 +534,10 @@ impl Source {
                 binding.revision.as_bytes(),
             ],
         );
+        // Match the A2 browser verifier's hard bound even if this encoding is
+        // extended later; never hand back a transcript that the browser will
+        // reject or truncate.
+        require(transcript.len() <= MAX_TRANSCRIPT)?;
         Ok(Challenge {
             source: self,
             binding,
