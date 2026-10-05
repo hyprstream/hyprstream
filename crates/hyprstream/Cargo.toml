@@ -57,6 +57,7 @@ git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 cas-serve = { path = "../cas-serve" }  # Content-addressed store reconstruction (getBlob #432)
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-session-store = { path = "../hyprstream-session-store", optional = true }
 hyprstream-util = { path = "../hyprstream-util" }  # Generic shared primitives (TtlCache, etc.)
 moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
 ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
@@ -242,7 +243,7 @@ cuda = []
 valkey = ["dep:fred"]  # Enable legacy Valkey/Redis-backed user and token stores
 discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery state
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:hyprstream-session-store"]  # Networked Postgres UserStore for RDS (#1401)
 encrypted-account-admission = []  # Mandatory source-level policy: no plaintext account UserStore in production
 # Local RocksDB persistence (same shape as the `valkey` precedent): the
 # legacy RocksDbUserStore/DeviceStore, the OAuth refresh-token store, and the
