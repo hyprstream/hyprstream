@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/hyprstream-session-store",
     "crates/hyprstream",
     "crates/hyprstream-inference",
     "crates/git2db",

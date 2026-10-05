@@ -7723,6 +7723,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-session-store"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
