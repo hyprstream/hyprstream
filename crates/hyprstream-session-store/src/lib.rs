@@ -7,6 +7,7 @@
 //! narrow runtime role. No DSN or token bodies are accepted or logged here.
 
 use tokio_postgres::{error::SqlState, Client, IsolationLevel, Row};
+pub mod primary;
 
 pub const PROFILE: &str = "federate-session-v1";
 pub const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
@@ -276,7 +277,7 @@ impl Store {
     /// Authoritative full-record lookup for the future request-local proof resolver.
     /// Caller must still compare all credential fields and verify the RPC proof.
     pub async fn lookup(
-        client: &Client,
+        client: &(impl tokio_postgres::GenericClient + Sync),
         host: &str,
         sid: &str,
         generation: &[u8; 32],

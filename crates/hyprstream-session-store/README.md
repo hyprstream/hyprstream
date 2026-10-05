@@ -1,4 +1,4 @@
-# Policy session store — H1 source foundation
+# Policy session store — H1/H3a disabled source foundation
 
 This crate is deliberately **not connected to any runtime**. It is a small native
 PostgreSQL adapter with a typed internal API, separated from the inference-linked
@@ -24,11 +24,15 @@ commit. Request handlers must compare lookup results to credential claims and
 verify v16 proof; a successful lookup is not an RPC authorization decision.
 
 H1 exposes admit, full active lookup, binding comparison, v16 replay-row
-consumption, revoke and cleanup only. The proof caller must derive the exact
-verified v16 namespace; this store installs no verifier or dispatch hook.
-No downstream dependency/factory installs the crate. H2 Policy/account plumbing,
-H3 async v16 lookup/revocation consumers and H4 OAuth validation/issuance remain
-separate changes; naming follows the original A0 host slices.
+consumption, revoke and cleanup. H3a adds a source-only Policy primary reader:
+it requires verified static service identity plus an explicit exact
+service-key/tenant/resource capability, compares the full credential binding
+and local complete inventory, and has no installed provider by default. Its
+trusted constructor also pins the local serving generation. The proof caller
+must derive the exact verified v16 namespace; this slice installs no verifier,
+dispatch hook, runtime factory or participant loader. H2 Policy/account
+plumbing, H3b proof consumption and H4 OAuth validation/issuance remain
+separate changes.
 
 ## Explicit migration assets (not applied to staging)
 
@@ -78,6 +82,10 @@ rotation require one paired generation/inventory UPDATE (including the unchanged
 inventory ID for generation-only rotation), confirmation of the exact pair on
 every participant, then a separately gated reopen. The trigger cannot verify
 that an unchanged column appeared in the SET list; the control procedure must.
+An enabled profile rejects even a paired rotation. Reopen must be conditional
+on the exact pair reported by every configured admission/lookup participant;
+missing, stale or mismatched reports deny. H3a has no live participant loader or
+control procedure, so this source-only slice does not authorize reopening.
 Commit precedes any returned receipt; errors suppress
 PostgreSQL detail strings to avoid logging parameters. Cancellation/unknown commit
 must not trigger a token retry; caller requires fresh login.

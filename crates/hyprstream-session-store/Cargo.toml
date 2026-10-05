@@ -9,6 +9,9 @@ description = "Internal PostgreSQL foundation for Policy-owned Federate session 
 [dependencies]
 tokio-postgres.workspace = true
 thiserror.workspace = true
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+sha2.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }

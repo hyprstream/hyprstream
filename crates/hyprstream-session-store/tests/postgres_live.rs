@@ -3,6 +3,9 @@
 //! PostgreSQL cluster. Each run creates/drops its own database and NOLOGIN roles.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use hyprstream_session_store::primary::{
+    CollisionInventory, ExpectedPrimary, InventorySource, LookupCapability, PrimaryLookup,
+};
 use hyprstream_session_store::Session;
 use hyprstream_session_store::{Admission, Error, PendingSession, Source, Store,
     MIGRATION, MIGRATION_V2, PROFILE, ROLE_GRANTS, ROLE_GRANTS_V2};
@@ -10,6 +13,17 @@ use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 
 const HOST: &str = "https://host.test";
+
+fn inventory() -> CollisionInventory {
+    CollisionInventory::from_sources(
+        &["fixture:static".into()],
+        vec![InventorySource {
+            id: "fixture:static".into(),
+            keys: vec![vec![0; 32]],
+        }],
+    )
+    .unwrap()
+}
 
 async fn connect(socket: &str, database: &str, role: Option<&str>) -> Client {
     let (client, conn) = tokio_postgres::Config::new()
@@ -58,10 +72,10 @@ fn input(now: i64, id: u8) -> Admission {
             ed_public: [id; 32],
             pq_public: vec![id; 1952],
             generation: [3; 32],
-            collision_inventory_id: [7; 32],
+            collision_inventory_id: inventory().id(),
             expires_at: now + 90,
         },
-        local_collision_inventory_id: [7; 32],
+        local_collision_inventory_id: inventory().id(),
         source: Source {
             issuer: "https://issuer.test".into(),
             subject: "opaque-upstream-fixture".into(),
@@ -120,6 +134,118 @@ async fn pid(c: &Client) -> i32 {
         .get(0)
 }
 
+async fn primary_scenarios(
+    socket: &str,
+    database: &str,
+    admin: &Client,
+    runtime: &mut Client,
+    committed: &Session,
+) {
+    use hyprstream_rpc::auth::signer_suite::signer_suite_thumbprint;
+    use hyprstream_session_store::SUITE;
+
+    let capability = || LookupCapability {
+        service: "service:model".into(),
+        service_key: [42; 32],
+        tenant: committed.tenant.clone(),
+        resource: HOST.into(),
+    };
+    let authority = PrimaryLookup::new(
+        HOST.into(),
+        committed.generation,
+        inventory(),
+        vec![capability()],
+    )
+        .unwrap();
+    let expected = ExpectedPrimary {
+        issuer: HOST.into(),
+        profile: PROFILE.into(),
+        sid: committed.sid.clone(),
+        subject: committed.subject.clone(),
+        tenant: committed.tenant.clone(),
+        client: committed.client_id.clone(),
+        audience: HOST.into(),
+        scopes: committed.scopes.clone(),
+        ed_public: committed.ed_public,
+        suite_thumbprint: signer_suite_thumbprint(
+            SUITE,
+            &[&committed.ed_public, &committed.pq_public],
+        ),
+        generation: committed.generation,
+        expires_at: committed.expires_at,
+    };
+    let active = authority
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .unwrap();
+    assert!(active.session == *committed);
+    assert!(active.created_at <= now(admin).await);
+    assert!(active.created_at < committed.expires_at);
+    let reconnect = connect(socket, database, Some("hs_policy_runtime")).await;
+    let reloaded = Store::lookup(
+        &reconnect,
+        HOST,
+        &committed.sid,
+        &committed.generation,
+        &inventory().id(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reloaded.proof_epoch, active.session.proof_epoch);
+
+    for (service, key) in [
+        ("service:other", [42; 32]),
+        ("service:model", [41; 32]),
+        ("user:alice", [42; 32]),
+    ] {
+        assert!(authority.resolve(runtime, service, &key, &expected).await.is_err());
+    }
+    let no_capability = PrimaryLookup::new(HOST.into(), committed.generation, inventory(), vec![])
+        .unwrap();
+    assert!(no_capability
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_err());
+    let stale_generation = PrimaryLookup::new(HOST.into(), [255; 32], inventory(), vec![capability()])
+        .unwrap();
+    assert!(stale_generation
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_err());
+    let changed_inventory = CollisionInventory::from_sources(
+        &["fixture:changed".into()],
+        vec![InventorySource { id: "fixture:changed".into(), keys: vec![vec![0; 32]] }],
+    )
+    .unwrap();
+    let stale_inventory = PrimaryLookup::new(HOST.into(), committed.generation, changed_inventory, vec![capability()])
+        .unwrap();
+    assert!(stale_inventory
+        .resolve(runtime, "service:model", &[42; 32], &expected)
+        .await
+        .is_err());
+    for field in 0..11 {
+        let mut wrong = expected.clone();
+        match field {
+            0 => wrong.issuer.push('x'),
+            1 => wrong.sid.push('x'),
+            2 => wrong.subject.push('x'),
+            3 => wrong.tenant.push('x'),
+            4 => wrong.client.push('x'),
+            5 => wrong.audience.push('x'),
+            6 => wrong.scopes = vec!["other:query".into()],
+            7 => wrong.ed_public[0] ^= 1,
+            8 => wrong.suite_thumbprint[0] ^= 1,
+            9 => wrong.generation[0] ^= 1,
+            _ => wrong.expires_at += 1,
+        }
+        assert!(authority
+            .resolve(runtime, "service:model", &[42; 32], &wrong)
+            .await
+            .is_err());
+    }
+}
+
 async fn scenarios(socket: &str, database: &str) {
     let admin = connect(socket, database, None).await;
     let mut runtime = connect(socket, database, Some("hs_policy_runtime")).await;
@@ -129,7 +255,7 @@ async fn scenarios(socket: &str, database: &str) {
         Store::admit(&mut runtime, &input(n, 1)).await,
         Err(Error::Inactive)
     ));
-    admin.execute("INSERT INTO federate_session.profile_state(host,profile,authority_generation,collision_inventory_id) VALUES ($1,$2,$3,$4)", &[&HOST,&PROFILE,&&[3u8;32][..],&&[7u8;32][..]]).await.unwrap();
+    admin.execute("INSERT INTO federate_session.profile_state(host,profile,authority_generation,collision_inventory_id) VALUES ($1,$2,$3,$4)", &[&HOST,&PROFILE,&&[3u8;32][..],&&inventory().id()[..]]).await.unwrap();
     assert!(matches!(
         Store::admit(&mut runtime, &input(n, 1)).await,
         Err(Error::Inactive)
@@ -203,8 +329,9 @@ async fn scenarios(socket: &str, database: &str) {
     assert!(matches!(Store::admit(&mut runtime, &colliding_pq).await, Err(Error::Conflict)));
     assert_eq!(count(&admin, "replay").await, 1);
     assert!(committed.proof_epoch > 0);
-    assert_eq!(committed.collision_inventory_id, [7;32]);
+    assert_eq!(committed.collision_inventory_id, inventory().id());
     assert!(Store::active(&runtime, &committed).await.unwrap());
+    primary_scenarios(socket, database, &admin, &mut runtime, &committed).await;
     let mut wrong = committed.clone();
     wrong.tenant = "another-tenant".into();
     assert!(!Store::active(&runtime, &wrong).await.unwrap());
@@ -285,7 +412,7 @@ async fn scenarios(socket: &str, database: &str) {
     // A separate advisory lock is only test instrumentation, never production.
     admin.batch_execute("CREATE FUNCTION federate_session.test_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(741901); RETURN NEW; END $$; CREATE TRIGGER test_barrier BEFORE INSERT ON federate_session.sessions FOR EACH ROW EXECUTE FUNCTION federate_session.test_barrier()").await.unwrap();
     let mut serving_generation = [3u8;32];
-    let mut serving_inventory = [7u8;32];
+    let mut serving_inventory = inventory().id();
     for rotate in [false, true] {
         control
             .execute(
@@ -391,6 +518,17 @@ async fn scenarios(socket: &str, database: &str) {
         Store::active(&reconnect, &stored).await,
         Err(Error::Unavailable)
     ));
+    let before_row = control
+        .query_one("SELECT authority_generation, collision_inventory_id, enabled FROM federate_session.profile_state WHERE host=$1", &[&HOST])
+        .await.unwrap();
+    let before: (Vec<u8>, Vec<u8>, bool) = (before_row.get(0), before_row.get(1), before_row.get(2));
+    assert!(before.2);
+    assert!(control.execute("UPDATE federate_session.profile_state SET authority_generation=decode(repeat('06',32),'hex'), collision_inventory_id=decode(repeat('09',32),'hex') WHERE host=$1", &[&HOST]).await.is_err());
+    let after_row = control
+        .query_one("SELECT authority_generation, collision_inventory_id, enabled FROM federate_session.profile_state WHERE host=$1", &[&HOST])
+        .await.unwrap();
+    let after: (Vec<u8>, Vec<u8>, bool) = (after_row.get(0), after_row.get(1), after_row.get(2));
+    assert_eq!(before, after);
     control.batch_execute("UPDATE federate_session.profile_state SET enabled=false").await.unwrap();
     assert!(control.batch_execute("UPDATE federate_session.profile_state SET collision_inventory_id=decode(repeat('0a',32),'hex')").await.is_err());
     // Paired generation-only and generation+inventory rotations both succeed
@@ -398,6 +536,15 @@ async fn scenarios(socket: &str, database: &str) {
     control.batch_execute("UPDATE federate_session.profile_state SET authority_generation=decode(repeat('06',32),'hex'), collision_inventory_id=decode(repeat('09',32),'hex') WHERE enabled=false").await.unwrap();
     control.batch_execute("UPDATE federate_session.profile_state SET authority_generation=decode(repeat('07',32),'hex'), collision_inventory_id=decode(repeat('0a',32),'hex') WHERE enabled=false").await.unwrap();
     assert!(!Store::active(&runtime, &stored).await.unwrap());
+    // A stale participant inventory cannot reopen the profile. Rotation back
+    // to a complete local inventory remains one paired UPDATE while disabled.
+    let reopened = control.execute("UPDATE federate_session.profile_state SET enabled=true WHERE host=$1 AND enabled=false AND authority_generation=$2 AND collision_inventory_id=$3", &[&HOST, &&[7u8;32][..], &&[9u8;32][..]]).await.unwrap();
+    assert_eq!(reopened, 0);
+    control.execute("UPDATE federate_session.profile_state SET authority_generation=$1, collision_inventory_id=$2 WHERE host=$3 AND enabled=false", &[&&[8u8;32][..], &&inventory().id()[..], &HOST]).await.unwrap();
+    let reopened = control.execute("UPDATE federate_session.profile_state SET enabled=true WHERE host=$1 AND enabled=false AND authority_generation=$2 AND collision_inventory_id=$3", &[&HOST, &&[8u8;32][..], &&inventory().id()[..]]).await.unwrap();
+    assert_eq!(reopened, 1);
+    let rotated = Store::admit(&mut runtime, &input_for(now(&admin).await, 90, [8;32], inventory().id())).await.unwrap();
+    primary_scenarios(socket, database, &admin, &mut runtime, &rotated).await;
 }
 
 #[tokio::test]
