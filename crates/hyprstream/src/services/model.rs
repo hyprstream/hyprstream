@@ -45,7 +45,7 @@ use hyprstream_rpc_std::registry_client::{StageFilesRequest, CommitWithAuthorReq
 use crate::services::WorktreeClientExt;
 use hyprstream_rpc_std::policy_client::PolicyCheck;
 use crate::storage::ModelRef;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::events::EventPublisher;
@@ -115,6 +115,8 @@ pub struct LoadedModel {
     pub instance: InferenceInstanceId,
     /// Model reference string (e.g., "qwen3-small:main")
     pub model_ref: String,
+    /// Exact Git commit whose owned base inputs were used, if pinned.
+    pub pinned_commit: Option<git2::Oid>,
     /// Local transport for this model's InferenceService (#320). This remains
     /// the `Inproc` arm registered by the spawner and is never advertised as a
     /// remotely dialable reach.
@@ -1128,7 +1130,14 @@ impl ModelService {
 
         let branch_name = match &model_ref.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
-            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+            crate::storage::GitRef::Commit(_) => repo_client.get_head().await
+                .context("resolve selected worktree branch for pinned commit")?,
+            crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
+                anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
+            }
+            crate::storage::GitRef::DefaultBranch => {
+                repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
+            }
         };
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.enter");
@@ -1148,6 +1157,14 @@ impl ModelService {
                 model_ref_str
             ));
         }
+
+        let pinned_artifact = if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
+            Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, *oid).await?)
+        } else {
+            None
+        };
+        let model_input_path = pinned_artifact.as_ref()
+            .map_or(model_path.as_path(), |artifact| artifact.root());
 
         let endpoint = Self::inference_endpoint(instance);
 
@@ -1192,8 +1209,11 @@ impl ModelService {
             transport.clone(),
             self.policy_transport.clone(),
             fs,
-        )
-        .with_instance_identity(
+        );
+        if let Some(ref artifact) = pinned_artifact {
+            service_config = service_config.with_pinned_artifact(Arc::clone(artifact));
+        }
+        let mut service_config = service_config.with_instance_identity(
             instance.service_name(),
             instance.tenant().to_owned(),
             self.signing_key.verifying_key(),
@@ -1282,7 +1302,7 @@ impl ModelService {
         )?;
 
         // Load TTT config from model's config.json (if TTT is enabled)
-        let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(&model_path)
+        let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(model_input_path)
             .and_then(|tc| {
                 if tc.is_enabled() && tc.mode == crate::config::TrainingMode::TestTimeTraining {
                     Some(crate::training::ttt::TTTConfig {
@@ -1300,7 +1320,7 @@ impl ModelService {
             });
 
         // Load generation parameter defaults from model's generation_config.json
-        let generation_defaults = crate::config::SamplingParams::from_model_path(&model_path)
+        let generation_defaults = crate::config::SamplingParams::from_model_path(model_input_path)
             .await
             .unwrap_or_default();
 
@@ -1328,6 +1348,7 @@ impl ModelService {
                 LoadedModel {
                     instance: instance.clone(),
                     model_ref: model_ref_str.to_owned(),
+                    pinned_commit: pinned_artifact.as_ref().map(|artifact| artifact.commit()),
                     transport: transport.clone(),
                     network_transport,
                     service_handle,
@@ -1364,6 +1385,11 @@ impl ModelService {
                     generation_defaults,
                 },
             );
+        }
+
+        if let Some(ref artifact) = pinned_artifact {
+            info!(model = %model_ref_str, commit = %artifact.commit(), files = artifact.file_count(),
+                "loaded model from sealed exact-tree artifact");
         }
 
         Ok(endpoint)
@@ -3436,6 +3462,7 @@ mod tests {
         LoadedModel {
             instance: selector_instance(),
             model_ref: "fixture-model:main".to_owned(),
+            pinned_commit: None,
             incarnation: "fixture-incarnation-0000".to_owned(),
             work_audience: crate::services::inference::internal_work_audience(
                 &selector_instance().service_name(),
@@ -4393,6 +4420,7 @@ mod tests {
             LoadedModel {
                 instance: instance.clone(),
                 model_ref: instance.model_ref().to_owned(),
+                pinned_commit: None,
                 transport: TransportConfig::inproc("dead-worker-test"),
                 network_transport: TransportConfig::inproc("dead-worker-test"),
                 service_handle: dead_worker(),

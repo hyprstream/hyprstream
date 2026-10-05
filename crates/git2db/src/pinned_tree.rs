@@ -1,16 +1,23 @@
 //! Owned, exact-commit input capture for consumers that cannot trust a worktree.
 //!
-//! This is an input primitive, not a path projection: callers must consume
-//! [`PinnedTree::file`] bytes directly. In particular, copying these bytes back
-//! into a writable worktree does not preserve the pin.
-//! Acquisition retains the entire resolved tree in memory; large-model
-//! consumers need a sealed, streaming projection before adopting this API.
+//! Callers may consume [`PinnedTree::file`] bytes directly or retain a Linux
+//! [`SealedTreeProjection`] for legacy path readers. Copying these bytes back
+//! into a writable worktree does not preserve the pin. Acquisition currently
+//! buffers the full resolved tree before sealing, so memory use is proportional
+//! to the model size until projection completes.
 
 use crate::{Git2DBError, Git2DBResult, GitManager, Oid};
 use git2::{ObjectType, Repository, Tree};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(target_os = "linux")]
+use std::fs::{self, File};
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 /// A complete commit tree captured independently of a mutable checkout.
 ///
@@ -27,6 +34,32 @@ pub struct PinnedTree {
 pub struct PinnedFile {
     source_blob: Oid,
     bytes: Arc<[u8]>,
+}
+
+/// A private directory whose entries point to sealed, owned Linux memfds.
+///
+/// All file content is kernel-sealed against writes and size changes. The
+/// directory exists only for path-based readers; callers must retain this
+/// value through every read, including lazy reads after model startup.
+#[derive(Debug)]
+pub struct SealedTreeProjection {
+    commit: Oid,
+    root: tempfile::TempDir,
+    files: Vec<std::fs::File>,
+}
+
+impl SealedTreeProjection {
+    pub fn commit(&self) -> Oid {
+        self.commit
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
 }
 
 impl PinnedFile {
@@ -87,6 +120,88 @@ impl PinnedTree {
     pub fn files(&self) -> impl Iterator<Item = (&Path, &PinnedFile)> {
         self.files.iter().map(|(path, file)| (path.as_path(), file))
     }
+
+    /// Move the captured bytes into kernel-sealed files for existing path
+    /// loaders. The temporary directory is private and owns no writable file
+    /// content; its lifetime must cover every later path access.
+    #[cfg(target_os = "linux")]
+    pub fn into_sealed_projection(self) -> Git2DBResult<SealedTreeProjection> {
+        let root = tempfile::Builder::new()
+            .prefix("git2db-pinned-tree-")
+            .tempdir()
+            .map_err(|e| Git2DBError::internal(format!("create pinned tree directory: {e}")))?;
+        let mut files = Vec::with_capacity(self.files.len());
+        for (relative_path, pinned) in self.files {
+            let target = root.path().join(&relative_path);
+            let parent = target.parent().ok_or_else(|| {
+                Git2DBError::internal(format!("pinned file has no parent: {}", target.display()))
+            })?;
+            fs::create_dir_all(parent).map_err(|e| {
+                Git2DBError::internal(format!("create pinned directory {}: {e}", parent.display()))
+            })?;
+            let mut file = create_sealable_file()?;
+            file.write_all(pinned.bytes()).map_err(|e| {
+                Git2DBError::internal(format!(
+                    "write pinned file {}: {e}",
+                    relative_path.display()
+                ))
+            })?;
+            seal_file(&file)?;
+            std::os::unix::fs::symlink(format!("/proc/self/fd/{}", file.as_raw_fd()), &target)
+                .map_err(|e| {
+                    Git2DBError::internal(format!("project pinned file {}: {e}", target.display()))
+                })?;
+            files.push(file);
+        }
+        Ok(SealedTreeProjection {
+            commit: self.commit,
+            root,
+            files,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn into_sealed_projection(self) -> Git2DBResult<SealedTreeProjection> {
+        Err(Git2DBError::internal(
+            "sealed pinned model projection requires Linux memfd seals",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_sealable_file() -> Git2DBResult<File> {
+    const NAME: &[u8] = b"git2db-pinned-input\0";
+    // SAFETY: NAME is a NUL-terminated static byte string. A successful
+    // memfd_create returns a new owned descriptor, transferred into File.
+    let fd = unsafe {
+        libc::memfd_create(
+            NAME.as_ptr().cast(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(Git2DBError::internal(format!(
+            "create sealable pinned file: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fd is newly created and owned exclusively by this function.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn seal_file(file: &File) -> Git2DBResult<()> {
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl operates on a valid owned descriptor; the constant-sized
+    // integer third argument is the documented F_ADD_SEALS ABI.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    if result < 0 {
+        return Err(Git2DBError::internal(format!(
+            "seal pinned file: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn capture_blobs(repo_path: &Path, commit: Oid) -> Git2DBResult<Vec<TreeBlob>> {
@@ -345,6 +460,52 @@ mod tests {
             Some(&b"reviewed"[..])
         );
         assert!(PinnedTree::acquire(dir.path(), Oid::zero()).await.is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sealed_projection_survives_worktree_mutation_and_rejects_writes() -> Git2DBResult<()> {
+        let dir = tempfile::tempdir().map_err(|e| Git2DBError::internal(e.to_string()))?;
+        let repo =
+            Repository::init(dir.path()).map_err(|e| Git2DBError::internal(e.to_string()))?;
+        std::fs::write(dir.path().join("tokenizer.json"), b"reviewed")
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        let mut index = repo
+            .index()
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        index
+            .add_path(Path::new("tokenizer.json"))
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        let sig = git2::Signature::now("test", "test@example.invalid")
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        drop(tree);
+        drop(repo);
+
+        let projected = PinnedTree::acquire(dir.path(), oid)
+            .await?
+            .into_sealed_projection()?;
+        let input = projected.root().join("tokenizer.json");
+        std::fs::write(dir.path().join("tokenizer.json"), b"replaced")
+            .map_err(|e| Git2DBError::internal(e.to_string()))?;
+        assert_eq!(
+            std::fs::read(&input).map_err(|e| Git2DBError::internal(e.to_string()))?,
+            b"reviewed"
+        );
+        assert!(std::fs::write(&input, b"tampered").is_err());
+        assert_eq!(
+            std::fs::read(&input).map_err(|e| Git2DBError::internal(e.to_string()))?,
+            b"reviewed"
+        );
         Ok(())
     }
 
