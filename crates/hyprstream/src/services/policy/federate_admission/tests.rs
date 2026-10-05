@@ -233,7 +233,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     assert!(a.is_err() && b.is_err());
     assert!(service.revoke(&ctx, &client, &receipt.sid, &[3;32]).await.unwrap());
     assert!(service.lookup(&ctx, &client, &receipt.sid, &[3;32]).await.unwrap().is_none());
-    assert!(service.lookup(&ctx, &client, &receipt.sid, &[4;32]).await.unwrap().is_none());
+    assert!(service.lookup(&ctx, &client, &receipt.sid, &[4;32]).await.is_err());
     Store::cleanup(&mut client).await.unwrap();
     observer.execute("SELECT pg_terminate_backend($1)", &[&pid]).await.unwrap();
     assert!(service.lookup(&ctx, &client, &receipt.sid, &[3;32]).await.is_err());

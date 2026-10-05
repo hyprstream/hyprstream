@@ -193,6 +193,7 @@ impl AdmissionService {
         let _permit = self.capacity.as_ref().ok_or_else(|| anyhow::anyhow!("disabled"))?
             .try_acquire()?;
         ensure!(!sid.is_empty() && sid.len() <= 128, "invalid sid");
+        ensure!(generation == &a.serving_generation, "stale serving generation");
         Ok(tokio::time::timeout(Duration::from_secs(2), Store::lookup(client, &a.profile.host, sid,
             generation, &a.local_collision_inventory_id)).await??)
     }

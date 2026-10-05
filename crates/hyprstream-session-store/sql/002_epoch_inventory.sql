@@ -27,6 +27,9 @@ ALTER TABLE federate_session.sessions
   ADD CONSTRAINT sessions_host_ed_unique UNIQUE (host, ed_public),
   ADD CONSTRAINT sessions_host_pq_unique UNIQUE (host, pq_public);
 
+-- Generation-only rotation with the same complete inventory ID is valid while
+-- disabled. The control procedure must still issue one paired UPDATE setting
+-- both columns; a row trigger cannot inspect which unchanged columns were SET.
 CREATE FUNCTION federate_session.guard_profile_rotation() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
