@@ -58,6 +58,8 @@ data = { workspace = true, optional = true }
 cas_client = { workspace = true, optional = true }
 cas_object = { workspace = true, optional = true }
 merklehash = { workspace = true, optional = true }
+deduplication = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0", optional = true }
+bytes = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 # Overlayfs support (Linux-specific)
@@ -89,7 +91,7 @@ tracing-detail = []
 # Enable gittorrent transport support (also enables it in git-xet-filter)
 gittorrent-transport = ["hyprstream-p2p", "git-xet-filter/gittorrent-transport"]
 # Enable XET large file storage support
-xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash", "sha2"]
+xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash", "deduplication", "bytes", "sha2"]
 # Enable overlayfs worktree support (Linux-only, space-efficient CoW)
 overlayfs = ["nix/mount", "nix/sched", "dep:caps"]
 # Enable reflink worktree support (cross-platform CoW)
