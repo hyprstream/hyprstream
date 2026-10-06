@@ -1,8 +1,8 @@
-//! Fixed staging Federate source/possession verification, deliberately unwired.
+//! Fixed staging Federate source/possession verification.
 //!
 //! This verifies cryptographic evidence, NOT account authority, callback execution,
-//! PKCE redemption, key freshness, or global replay consumption. H2 must supply
-//! authority; H1 must consume replay atomically. No evidence is a credential.
+//! PKCE redemption, key freshness, or global replay consumption. Policy must
+//! supply authority and durable replay admission. No evidence is a credential.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -442,7 +442,29 @@ pub(crate) struct Source {
     code_hash: [u8; 32],
     commitment: Commitment,
 }
+impl Source {
+    /// The nonce-committed proof keys must be pinned by Policy at prepare time.
+    /// Only a verified `Source` exposes this pair to the authenticated adapter.
+    #[allow(dead_code)] // Consumed by the B1b Policy adapter, not the disabled issuer.
+    pub(crate) fn proof_public_keys(&self) -> (&[u8; 32], &[u8]) {
+        (&self.commitment.ed, &self.commitment.pq)
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn store_source(&self) -> hyprstream_session_store::Source {
+        hyprstream_session_store::Source {
+            issuer: ISSUER.into(),
+            subject: self.subject.clone(),
+            jti: self.jti.clone(),
+            nonce: self.commitment.nonce(),
+            token_hash: self.token_hash,
+            issued_at: self.issued_at as i64,
+            expires_at: self.expires_at as i64,
+        }
+    }
+}
 /// Supplied only by a future Policy integration; this verifier does NOT authorize it.
+#[derive(Clone)]
 pub(crate) struct AuthorityBinding {
     pub account: String,
     pub subject: String,
@@ -560,11 +582,28 @@ pub(crate) struct VerifiedPossession {
     source: Source,
     binding: AuthorityBinding,
     challenge_id: [u8; 32],
+    created_at: u64,
     expires_at: u64,
 }
 impl Challenge {
     pub(crate) fn transcript(&self) -> &[u8] {
         &self.transcript
+    }
+    pub(crate) fn expires_at(&self) -> u64 {
+        self.expires
+    }
+    pub(crate) fn challenge_id(&self) -> [u8; 32] {
+        self.id
+    }
+    pub(crate) fn granted_scope(&self) -> &str {
+        &self.binding.granted
+    }
+    pub(crate) fn expected_session(&self) -> (AuthorityBinding, [u8; 32], Vec<u8>) {
+        (
+            self.binding.clone(),
+            self.source.commitment.ed,
+            self.source.commitment.pq.clone(),
+        )
     }
     pub(crate) fn verify(
         self,
@@ -604,8 +643,37 @@ impl Challenge {
             source,
             binding: self.binding,
             challenge_id: self.id,
+            created_at: self.created,
             expires_at: self.expires,
         })
+    }
+}
+
+impl VerifiedPossession {
+    /// Consumed only by the authenticated Policy admission adapter. The
+    /// verified keys/source are never reconstructed from the exchange form.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn into_admission_parts(
+        self,
+    ) -> (
+        hyprstream_session_store::Source,
+        [u8; 32],
+        Vec<u8>,
+        AuthorityBinding,
+        [u8; 32],
+        u64,
+        u64,
+    ) {
+        let source = self.source.store_source();
+        (
+            source,
+            self.source.commitment.ed,
+            self.source.commitment.pq,
+            self.binding,
+            self.challenge_id,
+            self.created_at,
+            self.expires_at,
+        )
     }
 }
 

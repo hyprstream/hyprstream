@@ -42,9 +42,10 @@ pub mod device_enrollment;
 pub mod did_document;
 pub mod dpop;
 pub mod federation_entity;
-// Source-only verifier: no route or runtime construction until admission review.
+// Exact Federate routes deny until the authenticated Policy runtime is installed.
 #[allow(dead_code)]
 pub(crate) mod federate_exchange;
+pub(crate) mod federate_host;
 #[allow(dead_code)]
 pub(crate) mod federate_source;
 // H3b.1 proof primitive only: no constructor installs its authority provider.
@@ -145,6 +146,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/oauth/par", post(par::push_authorization_request))
+        .route("/oauth/federate/challenge", post(federate_host::challenge))
         .route("/oauth/token", post(token::exchange_token))
         .route("/oauth/spiffe/wit", post(spiffe::exchange_workload_wit))
         .route("/oauth/jwks", get(jwks::jwks))
