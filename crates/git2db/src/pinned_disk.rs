@@ -59,9 +59,6 @@ pub struct DiskPinnedTreeProjection {
     _root: OwnedProjection,
     input_root: PathBuf,
     files: Vec<File>,
-    // Retained for the full artifact lifetime: total private projected disk
-    // occupancy is causally bounded, not merely the number of concurrent copies.
-    _capacity: Option<OwnedSemaphorePermit>,
 }
 
 /// Keep the owner marker and its lock until every payload child is gone. A
@@ -75,6 +72,9 @@ struct OwnedProjection(Arc<OwnedProjectionInner>);
 struct OwnedProjectionInner {
     path: PathBuf,
     _owner_lock: File,
+    // A cancelled acquire can leave its blocking Git writer running. Keep the
+    // one-slot disk lease until that last owner finishes and cleanup completes.
+    _capacity: Option<OwnedSemaphorePermit>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -83,7 +83,7 @@ struct OwnedProjection;
 
 #[cfg(target_os = "linux")]
 impl OwnedProjection {
-    fn create(parent: &Path) -> Git2DBResult<Self> {
+    fn create(parent: &Path, capacity: Option<OwnedSemaphorePermit>) -> Git2DBResult<Self> {
         let root = tempfile::Builder::new()
             .prefix(PROJECTION_PREFIX)
             .tempdir_in(parent)
@@ -93,6 +93,7 @@ impl OwnedProjection {
         Ok(Self(Arc::new(OwnedProjectionInner {
             path: root.keep(),
             _owner_lock: owner_lock,
+            _capacity: capacity,
         })))
     }
 
@@ -203,7 +204,7 @@ impl DiskPinnedTreeProjection {
         drop(tree);
         drop(repo);
 
-        let root = OwnedProjection::create(private_disk_parent)?;
+        let root = OwnedProjection::create(private_disk_parent, capacity)?;
         let payload_dir = root.path().join("payloads");
         let staged_inputs = root.path().join("staged-inputs");
         fs::create_dir(&payload_dir)
@@ -294,7 +295,6 @@ impl DiskPinnedTreeProjection {
             _root: root,
             input_root,
             files,
-            _capacity: capacity,
         })
     }
 
@@ -942,7 +942,7 @@ mod tests {
     fn failed_acquire_guard_keeps_lock_until_cleanup_completes() -> Git2DBResult<()> {
         let parent = tempfile::tempdir().map_err(internal)?;
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
-        let root = OwnedProjection::create(parent.path())?;
+        let root = OwnedProjection::create(parent.path(), None)?;
         let path = root.path().to_path_buf();
         fs::write(path.join("partial-payload"), b"not published").map_err(internal)?;
         scavenge_abandoned_projections(parent.path())?;
@@ -958,15 +958,22 @@ mod tests {
     {
         let parent = tempfile::tempdir().map_err(internal)?;
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
-        let root = OwnedProjection::create(parent.path())?;
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).try_acquire_owned().map_err(internal)?;
+        let root = OwnedProjection::create(parent.path(), Some(permit))?;
         let path = root.path().to_path_buf();
         let writer_owner = root.clone();
         drop(root); // Simulates cancellation while spawn_blocking still runs.
         fs::write(path.join("late-payload"), b"writer still owns root").map_err(internal)?;
         scavenge_abandoned_projections(parent.path())?;
         assert!(path.join("late-payload").exists());
+        assert!(
+            Arc::clone(&slots).try_acquire_owned().is_err(),
+            "late writer must retain the disk-capacity permit"
+        );
         drop(writer_owner);
         assert!(!path.exists());
+        assert!(Arc::clone(&slots).try_acquire_owned().is_ok());
         Ok(())
     }
 
