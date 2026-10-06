@@ -6,6 +6,9 @@ table, expiry index, and a `NOLOGIN` privilege group. The database operator
 grants that group to the dedicated replay login role. Do not grant the replay
 login access to credential or PDS tables. The runtime needs only `USAGE` on
 `replay_admission` and `SELECT, INSERT, UPDATE, DELETE` on `entries_v1`.
+The migration creates the group as `NOLOGIN` and fails closed if an existing
+role with that name can log in, has elevated role attributes, or inherits any
+other role; it never alters an existing role's attributes or memberships.
 
 Build the runtime with `postgres-replay`, then set
 `HYPRSTREAM_REPLAY_ADMISSION_DOMAIN=shared-postgres`,

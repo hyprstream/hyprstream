@@ -21,7 +21,7 @@ set -euo pipefail
 # the account and PDS store, while RocksDB remains only for device/refresh
 # persistence. The OCI runtime job exercises this same profile against a real
 # disposable PostgreSQL instance.
-readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb'
+readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay'
 
 bash "$(dirname "${BASH_SOURCE[0]}")/verify-libtorch.sh"
 
@@ -120,6 +120,12 @@ image_pg_test_args=(-p hyprstream --locked --lib --no-default-features \
     services::pds_record_rocksdb::pg_tests:: config::tests::rds)
 assert_tests_selected "staging Postgres image-profile contract tests" "${image_pg_test_args[@]}"
 run_phase "staging Postgres image-profile contract tests" cargo test "${image_pg_test_args[@]}"
+
+replay_schema_test_args=(-p hyprstream --locked --lib --no-default-features \
+    --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- \
+    auth::postgres_replay::tests::replay_migration_rejects_privileged_or_login_runtime_role)
+assert_tests_selected "staging replay migration contract test" "${replay_schema_test_args[@]}"
+run_phase "staging replay migration contract test" cargo test "${replay_schema_test_args[@]}"
 
 # The KV shell and RDS contract tests live in hyprstream-pds (pgsql_kv:: and
 # rds::tests::); the resolver-side Postgres accepted-state authority tests

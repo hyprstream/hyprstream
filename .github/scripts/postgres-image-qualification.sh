@@ -12,8 +12,14 @@ url_file="${HYPRSTREAM_POSTGRES_TEST_URL_FILE}"
   echo "PostgreSQL qualification requires a nonempty regular URL file" >&2
   exit 1
 }
+: "${HYPRSTREAM_REPLAY_TEST_URL_FILE:?Replay qualification URL file is required}"
+replay_url_file="${HYPRSTREAM_REPLAY_TEST_URL_FILE}"
+[[ -f "${replay_url_file}" && ! -L "${replay_url_file}" && -s "${replay_url_file}" ]] || {
+  echo "Replay qualification requires a nonempty regular URL file" >&2
+  exit 1
+}
 
-readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb'
+readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay'
 
 # These test modules each call require_db! and touch the supplied PostgreSQL
 # instance. Keep the account-store and PDS record-store coverage separate so a
@@ -23,6 +29,8 @@ run_live_module() {
   local features="$2"
   local filter="$3"
   local sentinel="$4"
+  shift 4
+  local -a extra_test_args=("$@")
   local log
   local passed
   local cargo_status
@@ -36,8 +44,8 @@ run_live_module() {
   # failure to one, which otherwise hides an OOM/signal or a cache-permission
   # failure on the native ARM builder. Neither status can contain the URL.
   set +e
-  cargo test -p "${package}" --locked --lib --no-default-features \
-      --features "${features}" -- "${filter}" \
+  HYPRSTREAM_REPLAY_TEST_URL_FILE="${replay_url_file}" cargo test -p "${package}" --locked --lib --no-default-features \
+      --features "${features}" -- "${filter}" "${extra_test_args[@]}" \
       --test-threads=1 --show-output 2>&1 | tee "${log}"
   pipeline_status=("${PIPESTATUS[@]}")
   cargo_status="${pipeline_status[0]}"
@@ -74,3 +82,5 @@ run_live_module hyprstream-pds postgres 'pgsql_kv::tests::live_' \
   'pgsql_kv::tests::live_replay_admission_is_cross_handle_once_and_reclaims_expiry'
 run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'services::pds_record_rocksdb::pg_tests::live_' \
   'services::pds_record_rocksdb::pg_tests::live_two_handle_persistence_and_visibility'
+run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'auth::postgres_replay::tests::scratch_postgres_replay_contract' \
+  'auth::postgres_replay::tests::scratch_postgres_replay_contract' --ignored

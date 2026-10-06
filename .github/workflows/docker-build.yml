@@ -186,6 +186,7 @@ jobs:
         file: ./Dockerfile
         build-args: |
           VARIANT=${{ matrix.docker_variant }}
+          HYPRSTREAM_FEATURES=${{ matrix.variant == 'cpu' && 'otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay' || 'otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb' }}
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
@@ -342,6 +343,7 @@ jobs:
         podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" build \
           --target runtime \
           --build-arg VARIANT=cpu-arm64 \
+          --build-arg HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay \
           --label "org.opencontainers.image.revision=$revision" \
           "${tag_args[@]}" \
           -f Dockerfile \

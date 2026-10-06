@@ -25,6 +25,18 @@ REVOKE ALL ON replay_admission.entries_v1 FROM PUBLIC;
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hyprstream_replay_runtime') THEN
         CREATE ROLE hyprstream_replay_runtime NOLOGIN;
+    ELSE
+        IF EXISTS (
+            SELECT 1 FROM pg_roles
+            WHERE rolname = 'hyprstream_replay_runtime'
+              AND (rolcanlogin OR rolsuper OR rolcreaterole OR rolcreatedb
+                   OR rolbypassrls OR rolreplication)
+        ) OR EXISTS (
+            SELECT 1 FROM pg_auth_members
+            WHERE member = 'hyprstream_replay_runtime'::regrole
+        ) THEN
+            RAISE EXCEPTION 'existing hyprstream_replay_runtime role is not an unprivileged NOLOGIN group';
+        END IF;
     END IF;
 END $$;
 

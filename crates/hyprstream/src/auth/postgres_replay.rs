@@ -360,6 +360,21 @@ mod tests {
                 .await
                 .unwrap();
             client
+                .batch_execute("ALTER ROLE hyprstream_replay_runtime LOGIN")
+                .await
+                .unwrap();
+            assert!(
+                client
+                    .batch_execute(include_str!("../../sql/replay_admission_v1.sql"))
+                    .await
+                    .is_err(),
+                "migration must reject an existing LOGIN runtime role"
+            );
+            client
+                .batch_execute("ALTER ROLE hyprstream_replay_runtime NOLOGIN")
+                .await
+                .unwrap();
+            client
                 .batch_execute(include_str!("../../sql/replay_admission_v1.sql"))
                 .await
                 .expect("reapplying the migration must preserve grants and schema");
@@ -597,6 +612,18 @@ mod tests {
             future(0),
         )
         .is_none());
+    }
+
+    #[test]
+    fn replay_migration_rejects_privileged_or_login_runtime_role() {
+        let migration = include_str!("../../sql/replay_admission_v1.sql");
+        assert!(migration.contains("rolcanlogin OR rolsuper OR rolcreaterole OR rolcreatedb"));
+        assert!(migration.contains("OR rolbypassrls OR rolreplication"));
+        assert!(migration.contains("member = 'hyprstream_replay_runtime'::regrole"));
+        assert!(migration.contains(
+            "existing hyprstream_replay_runtime role is not an unprivileged NOLOGIN group"
+        ));
+        assert!(!migration.contains("ALTER ROLE hyprstream_replay_runtime"));
     }
 
     #[test]
