@@ -524,8 +524,12 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
         (
             "pds-postgres lint moved outside the quoted script",
             rust_text.replace(
-                "            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n            sccache --show-stats\n          '",
-                "            sccache --show-stats\n          '\n            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings",
+                "            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n",
+                "",
+                1,
+            ).replace(
+                "          '\n",
+                "          '\n            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n",
                 1,
             ),
         ),
