@@ -13,6 +13,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -23,6 +25,9 @@ const MAX_TREE_ENTRIES: usize = 4096;
 const MAX_TREE_DEPTH: usize = 64;
 const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FREE_SPACE_RESERVE: u64 = 512 * 1024 * 1024;
+const PROJECTION_PREFIX: &str = "git2db-pinned-disk-";
+const OWNER_FILE: &str = ".git2db-pinned-disk-owner-v1";
+const OWNER_MARKER: &[u8] = b"git2db-pinned-disk-owner-v1\n";
 static PROJECTION_CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 // This absolute path is populated by the runtime image's git-core package.
@@ -52,6 +57,9 @@ pub struct DiskPinnedTreeProjection {
     commit: Oid,
     owner_pid: u32,
     _root: tempfile::TempDir,
+    // The lock remains held until after TempDir removes the projection. A
+    // later process may reclaim only a marked directory with no live holder.
+    _owner_lock: File,
     input_root: PathBuf,
     files: Vec<File>,
     // Retained for the full artifact lifetime: total private projected disk
@@ -118,6 +126,7 @@ impl DiskPinnedTreeProjection {
         capacity: Option<OwnedSemaphorePermit>,
     ) -> Git2DBResult<Self> {
         verify_private_disk_parent(private_disk_parent)?;
+        scavenge_abandoned_projections(private_disk_parent)?;
         let repo = GitManager::global().get_repository(repo_path)?.open()?;
         verify_object(&repo, commit, ObjectType::Commit)?;
         let tree = repo
@@ -150,9 +159,12 @@ impl DiskPinnedTreeProjection {
         drop(repo);
 
         let root = tempfile::Builder::new()
-            .prefix("git2db-pinned-disk-")
+            .prefix(PROJECTION_PREFIX)
             .tempdir_in(private_disk_parent)
             .map_err(|e| internal(format!("create private projection: {e}")))?;
+        // Create and lock the marker before any payload can occupy disk. A
+        // crash in the tiny preceding interval can leave only an empty dir.
+        let owner_lock = create_projection_owner(root.path())?;
         let payload_dir = root.path().join("payloads");
         let staged_inputs = root.path().join("staged-inputs");
         fs::create_dir(&payload_dir)
@@ -237,6 +249,7 @@ impl DiskPinnedTreeProjection {
             commit,
             owner_pid: std::process::id(),
             _root: root,
+            _owner_lock: owner_lock,
             input_root,
             files,
             _capacity: capacity,
@@ -283,8 +296,98 @@ fn internal(message: impl std::fmt::Display) -> Git2DBError {
 }
 
 #[cfg(target_os = "linux")]
+fn try_lock_projection(file: &File) -> Git2DBResult<bool> {
+    // SAFETY: file remains open for the duration of flock; Linux flock locks
+    // the open file description and releases it after the last holder closes.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(internal(format!("lock private projection: {error}")))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_projection_owner(root: &Path) -> Git2DBResult<File> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root.join(OWNER_FILE))
+        .map_err(|e| internal(format!("create projection owner: {e}")))?;
+    if !try_lock_projection(&file)? {
+        return Err(internal("new projection owner lock is occupied"));
+    }
+    file.write_all(OWNER_MARKER)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| internal(format!("write projection owner: {e}")))?;
+    Ok(file)
+}
+
+/// Reclaim only this version's abandoned private projections. Older unmarked
+/// directories are deliberately left alone: without a lock they cannot be
+/// distinguished safely from a projection still in use by another process.
+#[cfg(target_os = "linux")]
+fn scavenge_abandoned_projections(parent: &Path) -> Git2DBResult<()> {
+    for entry in fs::read_dir(parent).map_err(|e| internal(format!("scan projections: {e}")))? {
+        let entry = entry.map_err(|e| internal(format!("scan projection entry: {e}")))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix(PROJECTION_PREFIX) else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            continue;
+        }
+        let Ok(mut file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path.join(OWNER_FILE))
+        else {
+            continue;
+        };
+        let Ok(owner) = file.metadata() else { continue };
+        if !owner.is_file()
+            || owner.uid() != unsafe { libc::geteuid() }
+            || owner.permissions().mode() & 0o077 != 0
+            || owner.len() != OWNER_MARKER.len() as u64
+        {
+            continue;
+        }
+        let mut marker = vec![0; OWNER_MARKER.len()];
+        if file.read_exact(&mut marker).is_err() || marker != OWNER_MARKER {
+            continue;
+        }
+        if !try_lock_projection(&file)? {
+            continue;
+        }
+        // remove_dir_all does not follow symlinks on Linux. Keep the flock
+        // through removal so another scavenger cannot touch a live owner.
+        fs::remove_dir_all(&path)
+            .map_err(|e| internal(format!("reclaim abandoned projection: {e}")))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn verify_private_disk_parent(path: &Path) -> Git2DBResult<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata =
         fs::symlink_metadata(path).map_err(|e| internal(format!("private parent: {e}")))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -711,6 +814,60 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn scavenger_preserves_live_projection_then_reclaims_abandoned_bytes() -> Git2DBResult<()> {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let owned = parent.path().join("git2db-pinned-disk-owned123");
+        fs::create_dir(&owned).map_err(internal)?;
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let owner_lock = create_projection_owner(&owned)?;
+        fs::write(owned.join("stale-payload"), b"disk bytes").map_err(internal)?;
+        let foreign_target = parent.path().join("foreign-target");
+        fs::create_dir(&foreign_target).map_err(internal)?;
+        fs::write(foreign_target.join("keep"), b"foreign").map_err(internal)?;
+        std::os::unix::fs::symlink(&foreign_target, owned.join("foreign-link"))
+            .map_err(internal)?;
+
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(
+            owned.join("stale-payload").exists(),
+            "live owner must not be scavenged"
+        );
+        drop(owner_lock); // Simulates the lock release after SIGKILL/OOM.
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(!owned.exists(), "abandoned payload must be reclaimed");
+        assert_eq!(
+            fs::read(foreign_target.join("keep")).map_err(internal)?,
+            b"foreign",
+            "scavenging must not follow a symlink inside an owned projection"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scavenger_never_follows_symlinks_or_removes_unmarked_foreign_dirs() -> Git2DBResult<()> {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let foreign = parent.path().join("git2db-pinned-disk-foreign123");
+        fs::create_dir(&foreign).map_err(internal)?;
+        fs::write(foreign.join("keep"), b"foreign").map_err(internal)?;
+        let target = parent.path().join("outside-projection");
+        fs::create_dir(&target).map_err(internal)?;
+        fs::write(target.join("keep"), b"target").map_err(internal)?;
+        let link = parent.path().join("git2db-pinned-disk-symlink123");
+        std::os::unix::fs::symlink(&target, &link).map_err(internal)?;
+
+        scavenge_abandoned_projections(parent.path())?;
+        assert_eq!(
+            fs::read(foreign.join("keep")).map_err(internal)?,
+            b"foreign"
+        );
+        assert_eq!(fs::read(target.join("keep")).map_err(internal)?, b"target");
+        assert!(link.is_symlink(), "lookalike symlink must not be removed");
+        Ok(())
+    }
+
     fn commit_files(root: &Path, files: &[(&str, &[u8])]) -> Git2DBResult<Oid> {
         let repo = Repository::init(root).map_err(internal)?;
         let mut index = repo.index().map_err(internal)?;
@@ -849,6 +1006,8 @@ mod tests {
             input.is_file(),
             "loader file-type checks must follow the fd alias"
         );
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(input.is_file(), "active projection must survive scavenging");
         fs::write(linked.join("weights.safetensors"), b"unreviewed mutation").map_err(internal)?;
         assert_eq!(fs::read(&input).map_err(internal)?, reviewed);
         assert_eq!(
