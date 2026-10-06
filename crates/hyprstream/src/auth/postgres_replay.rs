@@ -299,6 +299,14 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
+    fn is_local_scratch_host(host: Option<&str>) -> bool {
+        // OCI qualification attaches this test container and its disposable
+        // PostgreSQL fixture to the same isolated Podman network. `postgres`
+        // is the exact network alias assigned to that fixture there; do not
+        // accept arbitrary DNS names or private IPs (which could be RDS).
+        matches!(host, Some("localhost" | "127.0.0.1" | "::1" | "postgres"))
+    }
+
     fn proof_key(id: u8) -> ProofReplayKey {
         ProofReplayKey {
             signer_thumbprint: [9; 32],
@@ -325,8 +333,9 @@ mod tests {
             + seconds
     }
 
-    // This is deliberately ignored unless an operator supplies a disposable,
-    // loopback-only scratch database. It must never point at shared RDS.
+    // This is deliberately ignored unless an operator supplies a disposable
+    // loopback database or the isolated OCI test's exact `postgres` network
+    // alias. It must never point at shared RDS.
     #[test]
     #[ignore = "requires isolated local PostgreSQL and HYPRSTREAM_REPLAY_TEST_URL_FILE"]
     fn scratch_postgres_replay_contract() {
@@ -335,10 +344,8 @@ mod tests {
         let url = std::fs::read_to_string(file).expect("read scratch URL file");
         let url = url.trim();
         let parsed = url::Url::parse(url).expect("parse scratch URL");
-        assert!(matches!(
-            parsed.host_str(),
-            Some("localhost" | "127.0.0.1" | "::1")
-        ));
+        assert!(is_local_scratch_host(parsed.host_str()));
+        assert_eq!(parsed.port_or_known_default(), Some(5432));
         assert!(parsed
             .path()
             .trim_start_matches('/')
@@ -368,16 +375,13 @@ mod tests {
                     .batch_execute(include_str!("../../sql/replay_admission_v1.sql"))
                     .await
                     .is_err(),
-                "migration must reject an existing LOGIN runtime role"
+                "migration must reject any preexisting runtime role"
             );
+            client.batch_execute("ROLLBACK").await.unwrap();
             client
                 .batch_execute("ALTER ROLE hyprstream_replay_runtime NOLOGIN")
                 .await
                 .unwrap();
-            client
-                .batch_execute(include_str!("../../sql/replay_admission_v1.sql"))
-                .await
-                .expect("reapplying the migration must preserve grants and schema");
             let role = client
                 .query_one(
                     "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'hyprstream_replay_runtime'",
@@ -584,6 +588,34 @@ mod tests {
     }
 
     #[test]
+    fn scratch_host_allowlist_is_local_or_exact_oci_fixture_alias() {
+        for host in [
+            Some("localhost"),
+            Some("127.0.0.1"),
+            Some("::1"),
+            Some("postgres"),
+        ] {
+            assert!(
+                is_local_scratch_host(host),
+                "expected local fixture host: {host:?}"
+            );
+        }
+        for host in [
+            None,
+            Some("postgres.example.test"),
+            Some("db.example.test"),
+            Some("10.0.0.8"),
+            Some("192.168.1.20"),
+            Some("rds.amazonaws.com"),
+        ] {
+            assert!(
+                !is_local_scratch_host(host),
+                "unexpected remote host allowed: {host:?}"
+            );
+        }
+    }
+
+    #[test]
     fn domains_are_explicit_and_bounded() {
         for valid in ["staging.policy", "staging_registry-1"] {
             PostgresProofReplayStore::validate_domain(valid).unwrap();
@@ -615,15 +647,26 @@ mod tests {
     }
 
     #[test]
-    fn replay_migration_rejects_privileged_or_login_runtime_role() {
+    fn replay_migration_rejects_any_preexisting_runtime_role() {
         let migration = include_str!("../../sql/replay_admission_v1.sql");
-        assert!(migration.contains("rolcanlogin OR rolsuper OR rolcreaterole OR rolcreatedb"));
-        assert!(migration.contains("OR rolbypassrls OR rolreplication"));
-        assert!(migration.contains("member = 'hyprstream_replay_runtime'::regrole"));
+        let role_guard = migration
+            .find("IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hyprstream_replay_runtime')");
+        let create_schema = migration
+            .find("CREATE SCHEMA IF NOT EXISTS replay_admission");
+        assert!(
+            matches!(
+                (role_guard, create_schema),
+                (Some(role_guard), Some(create_schema)) if role_guard < create_schema
+            ),
+            "preexisting role must be rejected before any schema/table DDL"
+        );
         assert!(migration.contains(
-            "existing hyprstream_replay_runtime role is not an unprivileged NOLOGIN group"
+            "hyprstream_replay_runtime already exists; audit and provision a fresh migration target"
         ));
         assert!(!migration.contains("ALTER ROLE hyprstream_replay_runtime"));
+        assert!(migration.starts_with("-- Reviewed migration artifact"));
+        assert!(migration.contains("BEGIN;"));
+        assert!(migration.ends_with("COMMIT;\n"));
     }
 
     #[test]
