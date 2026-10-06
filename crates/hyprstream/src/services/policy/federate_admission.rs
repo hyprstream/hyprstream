@@ -5,10 +5,10 @@
 #![allow(dead_code)] // Source-only slice; no runtime installer is exposed.
 
 use super::{EnvelopeContext, PolicyManager};
-use crate::auth::{service_enrollment::ServiceEnrollmentManifest, ProductionUserStore};
-use anyhow::{ensure, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hyprstream_rpc::{auth::Scope, Subject};
+use crate::auth::{ProductionUserStore, service_enrollment::ServiceEnrollmentManifest};
+use anyhow::{Result, ensure};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hyprstream_rpc::{Subject, auth::Scope};
 use hyprstream_session_store::{Admission, PendingSession, PrimaryRecord, Session, Source, Store};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -421,6 +421,7 @@ impl AdmissionService {
     async fn authorize_use(
         &self,
         ctx: &EnvelopeContext,
+        client: &mut tokio_postgres::Client,
         primary: &PrimaryRecord,
         resource: &str,
         operation: &str,
@@ -431,17 +432,36 @@ impl AdmissionService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("disabled"))?
             .try_acquire()?;
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            authority.authorize_use(
-                primary.session(),
-                primary.source_identity().0,
-                primary.source_identity().1,
-                resource,
-                operation,
-                chrono::Utc::now().timestamp(),
-            ),
-        )
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // A PrimaryRecord is a request-local proof/source binding, not a
+            // reusable authorization snapshot. Refresh current DB state at
+            // every protected request or distinct tool-call boundary so a
+            // revoke/profile disable/generation rotation takes effect there.
+            let current = Store::lookup_primary(
+                client,
+                &authority.profile.host,
+                &primary.session().sid,
+                &authority.serving_generation,
+                &authority.local_collision_inventory_id,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session is no longer active"))?;
+            ensure!(
+                current.session() == primary.session()
+                    && current.source_identity() == primary.source_identity(),
+                "session primary binding changed"
+            );
+            authority
+                .authorize_use(
+                    current.session(),
+                    current.source_identity().0,
+                    current.source_identity().1,
+                    resource,
+                    operation,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+        })
         .await??;
         Ok(())
     }

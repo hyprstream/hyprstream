@@ -89,8 +89,8 @@ fn source() -> Source {
 fn record() -> Vec<u8> {
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
     use hyprstream_pds::did_op::{
-        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
-        RecoveryKeyEnrollment, UserRotationKey,
+        GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+        RecoveryKeyEnrollment, UserRotationKey, sign_genesis,
     };
     use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
     let ed = SigningKey::from_bytes(&[22; 32]);
@@ -205,10 +205,12 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
 async fn h2_admission_disabled_caller_and_scope_boundaries() {
     let (service, _, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into(), "read:model:other".into()];
-    assert!(AdmissionService::default()
-        .prepare(&ctx, &source(), &requested)
-        .await
-        .is_err());
+    assert!(
+        AdmissionService::default()
+            .prepare(&ctx, &source(), &requested)
+            .await
+            .is_err()
+    );
     let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
     assert_eq!(decision.scopes, [STAGING_SCOPE]);
     for who in [
@@ -220,10 +222,12 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
             who,
             SigningKey::from_bytes(&[24; 32]).verifying_key(),
         );
-        assert!(service
-            .prepare(&wrong, &source(), &requested)
-            .await
-            .is_err());
+        assert!(
+            service
+                .prepare(&wrong, &source(), &requested)
+                .await
+                .is_err()
+        );
     }
     let wrong = EnvelopeContext::for_test_authenticated_subject_with_claims(
         Subject::new("service:oauth"),
@@ -231,14 +235,18 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
         SigningKey::from_bytes(&[25; 32]).verifying_key(),
         hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX),
     );
-    assert!(service
-        .prepare(&wrong, &source(), &requested)
-        .await
-        .is_err());
-    assert!(service
-        .prepare(&ctx, &source(), &["read:model:other".into()])
-        .await
-        .is_err());
+    assert!(
+        service
+            .prepare(&wrong, &source(), &requested)
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .prepare(&ctx, &source(), &["read:model:other".into()])
+            .await
+            .is_err()
+    );
     for nonmatching in [
         "infer:model:qwen2.5-0.5b-instruct:other",
         "infer:model:other:main",
@@ -370,80 +378,92 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         )
         .await
         .unwrap();
-    assert!(authority
-        .authorize_use(
-            &session,
-            &source_record.issuer,
-            &source_record.subject,
-            "model:qwen2.5-0.5b-instruct:other",
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
-    assert!(authority
-        .authorize_use(
-            &session,
-            &source_record.issuer,
-            &source_record.subject,
-            &resource,
-            "query",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &session,
+                &source_record.issuer,
+                &source_record.subject,
+                "model:qwen2.5-0.5b-instruct:other",
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        authority
+            .authorize_use(
+                &session,
+                &source_record.issuer,
+                &source_record.subject,
+                &resource,
+                "query",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
     let mut expired = session.clone();
     expired.expires_at = chrono::Utc::now().timestamp();
-    assert!(authority
-        .authorize_use(
-            &expired,
-            &source_record.issuer,
-            &source_record.subject,
-            &resource,
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &expired,
+                &source_record.issuer,
+                &source_record.subject,
+                &resource,
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
     let mut wrong_scope = session.clone();
     wrong_scope.scopes = vec!["infer:model:qwen2.5-0.5b-instruct:other".into()];
-    assert!(authority
-        .authorize_use(
-            &wrong_scope,
-            &source_record.issuer,
-            &source_record.subject,
-            &resource,
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &wrong_scope,
+                &source_record.issuer,
+                &source_record.subject,
+                &resource,
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
     let mut wrong_source = source();
     wrong_source.subject = "different-source-user".into();
-    assert!(authority
-        .authorize_use(
-            &session,
-            &wrong_source.issuer,
-            &wrong_source.subject,
-            &resource,
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &session,
+                &wrong_source.issuer,
+                &wrong_source.subject,
+                &resource,
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
     let mut wrong_session = session.clone();
     wrong_session.account_id = uuid::Uuid::new_v4().to_string();
-    assert!(authority
-        .authorize_use(
-            &wrong_session,
-            &source_record.issuer,
-            &source_record.subject,
-            &resource,
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &wrong_session,
+                &source_record.issuer,
+                &source_record.subject,
+                &resource,
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
 
     // The first decision is the authorization point for a streaming request;
     // revocation does not poll/cancel that request. Its next request/tool
@@ -477,30 +497,34 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .await
         .unwrap();
     users.0.write().active = Some(false);
-    assert!(authority
-        .authorize_use(
-            &session,
-            &source_record.issuer,
-            &source_record.subject,
-            &resource,
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &session,
+                &source_record.issuer,
+                &source_record.subject,
+                &resource,
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
     users.0.write().active = Some(true);
     users.0.write().atproto_did = Some("did:web:missing.example.test".into());
-    assert!(authority
-        .authorize_use(
-            &session,
-            &source_record.issuer,
-            &source_record.subject,
-            &resource,
-            "infer",
-            chrono::Utc::now().timestamp()
-        )
-        .await
-        .is_err());
+    assert!(
+        authority
+            .authorize_use(
+                &session,
+                &source_record.issuer,
+                &source_record.subject,
+                &resource,
+                "infer",
+                chrono::Utc::now().timestamp()
+            )
+            .await
+            .is_err()
+    );
 }
 
 /// Only a disposable local Unix-socket fixture; never an environment DSN.
@@ -524,6 +548,10 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .batch_execute(hyprstream_session_store::MIGRATION_V2)
         .await
         .unwrap();
+    control
+        .batch_execute(hyprstream_session_store::MIGRATION_V3)
+        .await
+        .unwrap();
     control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
         &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
@@ -532,27 +560,35 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
     let mut stale = challenge.clone();
     stale.tenant = "other".into();
-    assert!(service
-        .redeem(&ctx, &mut client, evidence(stale, "mismatch"))
-        .await
-        .is_err());
+    assert!(
+        service
+            .redeem(&ctx, &mut client, evidence(stale, "mismatch"))
+            .await
+            .is_err()
+    );
     let mut stale = challenge.clone();
     stale.collision_inventory_id = [8; 32];
-    assert!(service
-        .redeem(&ctx, &mut client, evidence(stale, "inventory-mismatch"))
-        .await
-        .is_err());
+    assert!(
+        service
+            .redeem(&ctx, &mut client, evidence(stale, "inventory-mismatch"))
+            .await
+            .is_err()
+    );
     let mut stale = challenge.clone();
     stale.generation = [4; 32];
-    assert!(service
-        .redeem(&ctx, &mut client, evidence(stale, "generation-mismatch"))
-        .await
-        .is_err());
+    assert!(
+        service
+            .redeem(&ctx, &mut client, evidence(stale, "generation-mismatch"))
+            .await
+            .is_err()
+    );
     users.0.write().sub = Some(uuid::Uuid::new_v4().to_string());
-    assert!(service
-        .redeem(&ctx, &mut client, evidence(challenge, "revision"))
-        .await
-        .is_err());
+    assert!(
+        service
+            .redeem(&ctx, &mut client, evidence(challenge, "revision"))
+            .await
+            .is_err()
+    );
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
     // Hold the H1 row lock to causally place suspension AFTER the Policy read
     // and BEFORE admission commit. This lock is fixture instrumentation only.
@@ -600,16 +636,18 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         mutate
     );
     let receipt = receipt.expect("accepted read-to-commit race must not be rejected");
-    assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        service
+            .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+            .await
+            .unwrap()
+            .is_some()
+    );
     // The NEXT authority read denies. This is not a Registry/Model dispatch test.
     assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
     users.0.write().active = Some(true);
     let primary = Store::lookup_primary(
-        &client,
+        &mut client,
         "https://host.test",
         &receipt.sid,
         &[3; 32],
@@ -625,6 +663,93 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     service
         .authorize_use(
             &ctx,
+            &mut client,
+            &primary,
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+        )
+        .await
+        .unwrap();
+    control
+        .execute(
+            "UPDATE federate_session.profile_state SET enabled=false WHERE host=$1 AND profile=$2",
+            &[&"https://host.test", &hyprstream_session_store::PROFILE],
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .authorize_use(
+                &ctx,
+                &mut client,
+                &primary,
+                &format!("model:{STAGING_MODEL_REF}"),
+                "infer",
+            )
+            .await
+            .is_err()
+    );
+    control
+        .execute(
+            "UPDATE federate_session.profile_state SET enabled=true WHERE host=$1 AND profile=$2",
+            &[&"https://host.test", &hyprstream_session_store::PROFILE],
+        )
+        .await
+        .unwrap();
+    service
+        .authorize_use(
+            &ctx,
+            &mut client,
+            &primary,
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+        )
+        .await
+        .unwrap();
+    control
+        .execute(
+            "UPDATE federate_session.profile_state SET enabled=false WHERE host=$1 AND profile=$2",
+            &[&"https://host.test", &hyprstream_session_store::PROFILE],
+        )
+        .await
+        .unwrap();
+    control
+        .execute(
+            "UPDATE federate_session.profile_state SET authority_generation=$3 WHERE host=$1 AND profile=$2",
+            &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[4u8; 32][..]],
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .authorize_use(
+                &ctx,
+                &mut client,
+                &primary,
+                &format!("model:{STAGING_MODEL_REF}"),
+                "infer",
+            )
+            .await
+            .is_err()
+    );
+    control
+        .execute(
+            "UPDATE federate_session.profile_state SET authority_generation=$3 WHERE host=$1 AND profile=$2",
+            &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8; 32][..]],
+        )
+        .await
+        .unwrap();
+    control
+        .execute(
+            "UPDATE federate_session.profile_state SET enabled=true WHERE host=$1 AND profile=$2",
+            &[&"https://host.test", &hyprstream_session_store::PROFILE],
+        )
+        .await
+        .unwrap();
+    service
+        .authorize_use(
+            &ctx,
+            &mut client,
             &primary,
             &format!("model:{STAGING_MODEL_REF}"),
             "infer",
@@ -637,38 +762,62 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         service.redeem(&ctx, &mut second, evidence(challenge, "replay-b"))
     );
     assert!(a.is_err() && b.is_err());
-    assert!(service
-        .revoke(&ctx, &client, &receipt.sid, &[3; 32])
-        .await
-        .unwrap());
-    assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+    assert!(
+        service
+            .revoke(&ctx, &client, &receipt.sid, &[3; 32])
+            .await
+            .unwrap()
+    );
+    // Reusing the same request-local primary after revocation must fail at
+    // the next distinct use boundary; there is deliberately no chunk polling.
+    assert!(
+        service
+            .authorize_use(
+                &ctx,
+                &mut client,
+                &primary,
+                &format!("model:{STAGING_MODEL_REF}"),
+                "infer",
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Store::lookup_primary(
+            &mut client,
+            "https://host.test",
+            &receipt.sid,
+            &[3; 32],
+            &[7; 32]
+        )
         .await
         .unwrap()
-        .is_none());
-    assert!(Store::lookup_primary(
-        &client,
-        "https://host.test",
-        &receipt.sid,
-        &[3; 32],
-        &[7; 32]
-    )
-    .await
-    .unwrap()
-    .is_none());
-    assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[4; 32])
-        .await
-        .is_err());
+        .is_none()
+    );
+    assert!(
+        service
+            .lookup(&ctx, &client, &receipt.sid, &[4; 32])
+            .await
+            .is_err()
+    );
     Store::cleanup(&mut client).await.unwrap();
     observer
         .execute("SELECT pg_terminate_backend($1)", &[&pid])
         .await
         .unwrap();
-    assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
-        .await
-        .is_err());
+    assert!(
+        service
+            .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+            .await
+            .is_err()
+    );
     drop(client);
     drop(second);
     drop(observer);

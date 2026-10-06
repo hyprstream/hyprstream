@@ -4,8 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hyprstream_session_store::Session;
-use hyprstream_session_store::{Admission, Error, PendingSession, Source, Store,
-    MIGRATION, MIGRATION_V2, PROFILE, ROLE_GRANTS, ROLE_GRANTS_V2};
+use hyprstream_session_store::{
+    Admission, Error, MIGRATION, MIGRATION_V2, MIGRATION_V3, PROFILE, PendingSession, ROLE_GRANTS,
+    ROLE_GRANTS_V2, Source, Store,
+};
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 
@@ -77,7 +79,7 @@ fn input(now: i64, id: u8) -> Admission {
     }
 }
 
-fn input_for(now: i64, id: u8, generation: [u8;32], inventory: [u8;32]) -> Admission {
+fn input_for(now: i64, id: u8, generation: [u8; 32], inventory: [u8; 32]) -> Admission {
     let mut admission = input(now, id);
     admission.session.generation = generation;
     admission.session.collision_inventory_id = inventory;
@@ -160,23 +162,38 @@ async fn scenarios(socket: &str, database: &str) {
         )
         .await
         .unwrap();
-    for sql in ["UPDATE federate_session.profile_state SET enabled=false", "UPDATE federate_session.profile_state SET authority_generation=decode(repeat('00',32),'hex')", "UPDATE federate_session.profile_state SET collision_inventory_id=decode(repeat('00',32),'hex')", "DELETE FROM federate_session.profile_state", "CREATE TABLE federate_session.forbidden(id int)"] {
-        let err=runtime.batch_execute(sql).await.unwrap_err();
-        assert_eq!(err.code(),Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE));
+    for sql in [
+        "UPDATE federate_session.profile_state SET enabled=false",
+        "UPDATE federate_session.profile_state SET authority_generation=decode(repeat('00',32),'hex')",
+        "UPDATE federate_session.profile_state SET collision_inventory_id=decode(repeat('00',32),'hex')",
+        "DELETE FROM federate_session.profile_state",
+        "CREATE TABLE federate_session.forbidden(id int)",
+    ] {
+        let err = runtime.batch_execute(sql).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        );
     }
     assert!(!admin.query_one(
         "SELECT has_column_privilege('hs_policy_runtime', 'federate_session.sessions', 'proof_epoch', 'UPDATE')",
         &[],
     ).await.unwrap().get::<_, bool>(0));
-    assert!(runtime.batch_execute(
-        "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1"
-    ).await.is_err());
+    assert!(
+        runtime
+            .batch_execute("UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1")
+            .await
+            .is_err()
+    );
     for sql in [
         "SELECT * FROM federate_session.request_replay",
         "DELETE FROM federate_session.request_replay",
     ] {
         let err = runtime.batch_execute(sql).await.unwrap_err();
-        assert_eq!(err.code(), Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE));
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        );
     }
     runtime
         .batch_execute("UPDATE federate_session.profile_state SET lock_version=999")
@@ -197,13 +214,19 @@ async fn scenarios(socket: &str, database: &str) {
     assert_eq!(count(&admin, "replay").await, 1);
     let mut colliding_ed = input(n, 7);
     colliding_ed.session.ed_public = committed.ed_public;
-    assert!(matches!(Store::admit(&mut runtime, &colliding_ed).await, Err(Error::Conflict)));
+    assert!(matches!(
+        Store::admit(&mut runtime, &colliding_ed).await,
+        Err(Error::Conflict)
+    ));
     let mut colliding_pq = input(n, 8);
     colliding_pq.session.pq_public = committed.pq_public.clone();
-    assert!(matches!(Store::admit(&mut runtime, &colliding_pq).await, Err(Error::Conflict)));
+    assert!(matches!(
+        Store::admit(&mut runtime, &colliding_pq).await,
+        Err(Error::Conflict)
+    ));
     assert_eq!(count(&admin, "replay").await, 1);
     assert!(committed.proof_epoch > 0);
-    assert_eq!(committed.collision_inventory_id, [7;32]);
+    assert_eq!(committed.collision_inventory_id, [7; 32]);
     assert!(Store::active(&runtime, &committed).await.unwrap());
     let mut wrong = committed.clone();
     wrong.tenant = "another-tenant".into();
@@ -221,8 +244,11 @@ async fn scenarios(socket: &str, database: &str) {
     wrong.proof_epoch += 1;
     assert!(!Store::active(&runtime, &wrong).await.unwrap());
     let mut stale_inventory = input(n, 9);
-    stale_inventory.local_collision_inventory_id = [8;32];
-    assert!(matches!(Store::admit(&mut runtime, &stale_inventory).await, Err(Error::Inactive)));
+    stale_inventory.local_collision_inventory_id = [8; 32];
+    assert!(matches!(
+        Store::admit(&mut runtime, &stale_inventory).await,
+        Err(Error::Inactive)
+    ));
     assert_eq!(count(&admin, "replay").await, 1);
     // Each replay index independently rejects reuse and rolls back session insert.
     for id in 2..5 {
@@ -284,8 +310,8 @@ async fn scenarios(socket: &str, database: &str) {
     // Admission-first: trigger blocks after production row-lock, before insert.
     // A separate advisory lock is only test instrumentation, never production.
     admin.batch_execute("CREATE FUNCTION federate_session.test_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(741901); RETURN NEW; END $$; CREATE TRIGGER test_barrier BEFORE INSERT ON federate_session.sessions FOR EACH ROW EXECUTE FUNCTION federate_session.test_barrier()").await.unwrap();
-    let mut serving_generation = [3u8;32];
-    let mut serving_inventory = [7u8;32];
+    let mut serving_generation = [3u8; 32];
+    let mut serving_inventory = [7u8; 32];
     for rotate in [false, true] {
         control
             .execute(
@@ -300,7 +326,12 @@ async fn scenarios(socket: &str, database: &str) {
             .unwrap();
         let mut worker = connect(socket, database, Some("hs_policy_runtime")).await;
         let worker_pid = pid(&worker).await;
-        let a = input_for(now(&admin).await, if rotate { 11 } else { 10 }, serving_generation, serving_inventory);
+        let a = input_for(
+            now(&admin).await,
+            if rotate { 11 } else { 10 },
+            serving_generation,
+            serving_inventory,
+        );
         let task = tokio::spawn(async move { Store::admit(&mut worker, &a).await });
         wait_blocked(&admin, worker_pid).await;
         let ctl = connect(socket, database, Some("hs_profile_control")).await;
@@ -315,10 +346,17 @@ async fn scenarios(socket: &str, database: &str) {
             .unwrap();
         let session = task.await.unwrap().unwrap();
         control_task.await.unwrap();
-        if rotate { serving_generation = [4;32]; serving_inventory = [8;32]; }
+        if rotate {
+            serving_generation = [4; 32];
+            serving_inventory = [8; 32];
+        }
         assert!(!Store::active(&runtime, &session).await.unwrap());
         assert!(matches!(
-            Store::admit(&mut runtime, &input_for(now(&admin).await, 12, serving_generation, serving_inventory)).await,
+            Store::admit(
+                &mut runtime,
+                &input_for(now(&admin).await, 12, serving_generation, serving_inventory)
+            )
+            .await,
             Err(Error::Inactive)
         ));
     }
@@ -355,7 +393,10 @@ async fn scenarios(socket: &str, database: &str) {
             assert!(matches!(result, Err(Error::Inactive)));
             assert_eq!(count(&admin, "sessions").await, before);
             assert_eq!(count(&admin, "replay").await, before_replay);
-            if rotate { serving_generation = [5;32]; serving_inventory = [9;32]; }
+            if rotate {
+                serving_generation = [5; 32];
+                serving_inventory = [9; 32];
+            }
         }
     }
     // Reconnect/restart preserves active session, revoke remains durable.
@@ -363,25 +404,41 @@ async fn scenarios(socket: &str, database: &str) {
     let stored = rollback_session.expect("rollback admitted one session");
     assert!(Store::active(&reconnect, &stored).await.unwrap());
     assert!(stored.proof_epoch > committed.proof_epoch);
-    assert!(admin.execute(
-        "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1 WHERE sid=$1",
-        &[&stored.sid],
-    ).await.is_err());
-    let namespace = [42u8;32];
-    let request_id = [43u8;16];
-    Store::consume_request_replay(&mut runtime, &stored, &namespace, &request_id,
-        30).await.unwrap();
+    assert!(
+        admin
+            .execute(
+                "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1 WHERE sid=$1",
+                &[&stored.sid],
+            )
+            .await
+            .is_err()
+    );
+    let namespace = [42u8; 32];
+    let request_id = [43u8; 16];
+    Store::consume_request_replay(&mut runtime, &stored, &namespace, &request_id, 30)
+        .await
+        .unwrap();
     // A second Policy connection sees the same durable uniqueness gate.
-    assert!(matches!(Store::consume_request_replay(&mut other, &stored, &namespace,
-        &request_id, 30).await, Err(Error::Conflict)));
-    Store::consume_request_replay(&mut runtime, &stored, &namespace, &[44;16],
-        30).await.unwrap();
+    assert!(matches!(
+        Store::consume_request_replay(&mut other, &stored, &namespace, &request_id, 30).await,
+        Err(Error::Conflict)
+    ));
+    Store::consume_request_replay(&mut runtime, &stored, &namespace, &[44; 16], 30)
+        .await
+        .unwrap();
     assert_eq!(count(&admin, "request_replay").await, 2);
-    assert!(runtime.batch_execute("DELETE FROM federate_session.request_replay").await.is_err());
+    assert!(
+        runtime
+            .batch_execute("DELETE FROM federate_session.request_replay")
+            .await
+            .is_err()
+    );
     let mut wrong_epoch = stored.clone();
     wrong_epoch.proof_epoch += 1;
-    assert!(matches!(Store::consume_request_replay(&mut runtime, &wrong_epoch, &namespace,
-        &[45;16], 30).await, Err(Error::Inactive)));
+    assert!(matches!(
+        Store::consume_request_replay(&mut runtime, &wrong_epoch, &namespace, &[45; 16], 30).await,
+        Err(Error::Inactive)
+    ));
     assert_eq!(count(&admin, "request_replay").await, 2);
     admin
         .query_one("SELECT pg_terminate_backend($1)", &[&pid(&reconnect).await])
@@ -391,7 +448,10 @@ async fn scenarios(socket: &str, database: &str) {
         Store::active(&reconnect, &stored).await,
         Err(Error::Unavailable)
     ));
-    control.batch_execute("UPDATE federate_session.profile_state SET enabled=false").await.unwrap();
+    control
+        .batch_execute("UPDATE federate_session.profile_state SET enabled=false")
+        .await
+        .unwrap();
     assert!(control.batch_execute("UPDATE federate_session.profile_state SET collision_inventory_id=decode(repeat('0a',32),'hex')").await.is_err());
     // Paired generation-only and generation+inventory rotations both succeed
     // only while disabled. The old session is never reactivated.
@@ -429,11 +489,15 @@ async fn postgres_admission_causal() {
     ).await.unwrap();
     assert!(admin.batch_execute(MIGRATION_V2).await.is_err());
     admin.batch_execute("ROLLBACK").await.unwrap();
-    admin.execute(
-        "DELETE FROM federate_session.profile_state WHERE host=$1 AND profile=$2",
-        &[&"https://migration-refusal.test", &PROFILE],
-    ).await.unwrap();
+    admin
+        .execute(
+            "DELETE FROM federate_session.profile_state WHERE host=$1 AND profile=$2",
+            &[&"https://migration-refusal.test", &PROFILE],
+        )
+        .await
+        .unwrap();
     admin.batch_execute(MIGRATION_V2).await.unwrap();
+    admin.batch_execute(MIGRATION_V3).await.unwrap();
     admin.batch_execute(ROLE_GRANTS).await.unwrap();
     admin.batch_execute(ROLE_GRANTS_V2).await.unwrap();
     admin.batch_execute("RESET ROLE").await.unwrap();
