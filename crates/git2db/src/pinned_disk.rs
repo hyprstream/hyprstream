@@ -178,7 +178,26 @@ impl DiskPinnedTreeProjection {
         let capacity = Arc::clone(PROJECTION_CAPACITY.get_or_init(|| Arc::new(Semaphore::new(1))))
             .try_acquire_owned()
             .map_err(|_| internal("bounded model projection capacity is occupied"))?;
-        Self::acquire_with_capacity(repo_path, commit, private_disk_parent, Some(capacity)).await
+        let repo_path = repo_path.to_path_buf();
+        let private_disk_parent = private_disk_parent.to_path_buf();
+        // The Model service has a current-thread reactor. CAS's bounded writer
+        // intentionally does synchronous, backpressured writes; run the entire
+        // projection on a dedicated runtime so those writes cannot stall RPCs.
+        // The detached worker owns the permit even if this await is cancelled.
+        run_on_projection_worker(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| internal(format!("build projection I/O runtime: {e}")))?;
+            runtime.block_on(Self::acquire_with_capacity(
+                &repo_path,
+                commit,
+                &private_disk_parent,
+                Some(capacity),
+            ))
+        })
+        .await
     }
 
     #[cfg(target_os = "linux")]
@@ -352,6 +371,15 @@ impl DiskPinnedTreeProjection {
 
 fn internal(message: impl std::fmt::Display) -> Git2DBError {
     Git2DBError::internal(message.to_string())
+}
+
+#[cfg(target_os = "linux")]
+async fn run_on_projection_worker<T: Send + 'static>(
+    work: impl FnOnce() -> Git2DBResult<T> + Send + 'static,
+) -> Git2DBResult<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| internal(format!("projection I/O worker failed: {e}")))?
 }
 
 #[cfg(target_os = "linux")]
@@ -1090,6 +1118,73 @@ mod tests {
             .next()
             .is_none());
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_projection_write_keeps_service_reactor_live_and_lease_owned(
+    ) -> Git2DBResult<()> {
+        use std::os::fd::FromRawFd;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).try_acquire_owned().map_err(internal)?;
+        let mut pipe = [-1; 2];
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(internal(std::io::Error::last_os_error()));
+        }
+        // SAFETY: pipe2 returned two distinct, owned descriptors.
+        let mut reader = unsafe { File::from_raw_fd(pipe[0]) };
+        let mut writer = unsafe { File::from_raw_fd(pipe[1]) };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let parent_path = parent.path().to_path_buf();
+        let task = tokio::spawn(run_on_projection_worker(move || {
+            let root = OwnedProjection::create(&parent_path, Some(permit))?;
+            let _ = started_tx.send(root.path().to_path_buf());
+            // A full pipe forces the same blocking File::write backpressure as
+            // the bounded CAS writer, with no reader until the test releases it.
+            writer
+                .write_all(&vec![0u8; 8 * 1024 * 1024])
+                .map_err(internal)?;
+            Ok(())
+        }));
+        let root_path = started_rx
+            .await
+            .map_err(|e| internal(format!("projection worker did not start: {e}")))?;
+        let (release_tx, release_rx) = mpsc::channel();
+        let drainer = std::thread::spawn(move || {
+            // A watchdog makes an accidental inline blocking write fail the
+            // timing assertion instead of hanging the test indefinitely.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            std::io::copy(&mut reader, &mut std::io::sink())
+        });
+        let start = Instant::now();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "blocking disk backpressure stalled the current-thread service reactor"
+        );
+        assert!(!task.is_finished(), "the blocked write lost backpressure");
+        drop(task); // Cancel the caller while the worker still owns the write.
+        assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+        assert!(root_path.exists());
+        release_tx.send(()).map_err(internal)?;
+        tokio::task::spawn_blocking(move || drainer.join())
+            .await
+            .map_err(internal)?
+            .map_err(|_| internal("pipe drainer panicked"))?
+            .map_err(internal)?;
+        for _ in 0..100 {
+            if !root_path.exists() && Arc::clone(&slots).try_acquire_owned().is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(internal(
+            "blocked projection worker did not release its lease",
+        ))
     }
 
     #[test]
