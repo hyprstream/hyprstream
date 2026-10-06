@@ -204,6 +204,17 @@ fn provider(record: SessionPrimary) -> Arc<Provider> {
 }
 
 fn proof(ed_seed: u8, pq_seed: u8, credential: &[u8]) -> Vec<u8> {
+    let no_forwarded_recipients =
+        FederateRecipientBinding::from_recipients(None, None, None).unwrap();
+    proof_with_binding(ed_seed, pq_seed, credential, Some(&no_forwarded_recipients))
+}
+
+fn proof_with_binding(
+    ed_seed: u8,
+    pq_seed: u8,
+    credential: &[u8],
+    binding: Option<&FederateRecipientBinding>,
+) -> Vec<u8> {
     let ed = ed25519_dalek::SigningKey::from_bytes(&[ed_seed; 32]);
     let pq = ml_dsa_sk_from_seed(&[pq_seed; 32]);
     let kids = session_primary_kids(&ed.verifying_key().to_bytes(), &ml_dsa_sk_to_vk_bytes(&pq));
@@ -217,7 +228,7 @@ fn proof(ed_seed: u8, pq_seed: u8, credential: &[u8]) -> Vec<u8> {
             capnp_schema_id: SCHEMA,
             capnp_body: BODY,
             response_binding: None,
-            federate_recipient_binding: None,
+            federate_recipient_binding: binding,
         },
         &signer,
     )
@@ -288,6 +299,15 @@ async fn h3b_consumer_accepts_only_deferred_parser_recipient_extension() {
         .verify(&handle, &request(&bytes), &policy, || NOW)
         .await
         .expect("H3b Consumer uses the narrow deferred-Federate parser");
+    let no_binding = proof_with_binding(41, 42, TOKEN, None);
+    assert_eq!(
+        consumer
+            .verify(&handle, &request(&no_binding), &policy, || NOW)
+            .await
+            .unwrap_err(),
+        Error::Denied,
+        "a deferred Federate proof without -70009 must deny"
+    );
 }
 
 #[tokio::test]
@@ -365,6 +385,13 @@ async fn h3b_each_authority_binding_and_epoch_is_checked() {
         in_flight: &permits,
     };
     let bytes = proof(41, 42, TOKEN);
+    let valid = Consumer {
+        provider: Some(provider(base.clone())),
+    };
+    valid
+        .verify(&handle, &request(&bytes), &policy, || NOW)
+        .await
+        .expect("unmodified primary must admit before testing mutations");
     let mutations: &[fn(&mut SessionPrimary)] = &[
         |r| r.host.push('x'),
         |r| r.profile.push('x'),
@@ -415,6 +442,11 @@ async fn h3b_holder_components_and_exact_credential_body_schema_service() {
     let consumer = Consumer {
         provider: Some(provider(record)),
     };
+    let valid_bytes = proof(41, 42, TOKEN);
+    consumer
+        .verify(&handle, &request(&valid_bytes), &policy, || NOW)
+        .await
+        .expect("unmodified holder proof must admit before testing substitutions");
     for bytes in [
         proof(51, 42, TOKEN),
         proof(41, 52, TOKEN),
@@ -480,6 +512,11 @@ async fn h3b_deadline_and_capacity_deny_without_fallback() {
         in_flight: &permits,
     };
     let bytes = proof(41, 42, TOKEN);
+    assert!(
+        hyprstream_rpc::proof::parser::ParsedProof::parse_deferred_federate_request(&bytes)
+            .is_ok(),
+        "capacity and deadline test requires a valid deferred proof"
+    );
     let provider = Arc::new(Provider {
         record: Mutex::new(record),
         calls: AtomicUsize::new(0),
