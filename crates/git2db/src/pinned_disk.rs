@@ -56,15 +56,60 @@ struct BlobEntry {
 pub struct DiskPinnedTreeProjection {
     commit: Oid,
     owner_pid: u32,
-    _root: tempfile::TempDir,
-    // The lock remains held until after TempDir removes the projection. A
-    // later process may reclaim only a marked directory with no live holder.
-    _owner_lock: File,
+    _root: OwnedProjection,
     input_root: PathBuf,
     files: Vec<File>,
     // Retained for the full artifact lifetime: total private projected disk
     // occupancy is causally bounded, not merely the number of concurrent copies.
     _capacity: Option<OwnedSemaphorePermit>,
+}
+
+/// Keep the owner marker and its lock until every payload child is gone. A
+/// failed or interrupted cleanup leaves the marker for the next scavenger.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct OwnedProjection(Arc<OwnedProjectionInner>);
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct OwnedProjectionInner {
+    path: PathBuf,
+    _owner_lock: File,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+struct OwnedProjection;
+
+#[cfg(target_os = "linux")]
+impl OwnedProjection {
+    fn create(parent: &Path) -> Git2DBResult<Self> {
+        let root = tempfile::Builder::new()
+            .prefix(PROJECTION_PREFIX)
+            .tempdir_in(parent)
+            .map_err(|e| internal(format!("create private projection: {e}")))?;
+        // Before this marker exists the newly created directory is empty.
+        let owner_lock = create_projection_owner(root.path())?;
+        Ok(Self(Arc::new(OwnedProjectionInner {
+            path: root.keep(),
+            _owner_lock: owner_lock,
+        })))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0.path
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedProjectionInner {
+    fn drop(&mut self) {
+        // The lock field is dropped only after this method returns. If removal
+        // fails, the still-marked directory can be retried at next startup.
+        if let Err(error) = remove_owned_projection(&self.path) {
+            tracing::warn!(path = %self.path.display(), %error, "projection cleanup deferred");
+        }
+    }
 }
 
 impl DiskPinnedTreeProjection {
@@ -158,13 +203,7 @@ impl DiskPinnedTreeProjection {
         drop(tree);
         drop(repo);
 
-        let root = tempfile::Builder::new()
-            .prefix(PROJECTION_PREFIX)
-            .tempdir_in(private_disk_parent)
-            .map_err(|e| internal(format!("create private projection: {e}")))?;
-        // Create and lock the marker before any payload can occupy disk. A
-        // crash in the tiny preceding interval can leave only an empty dir.
-        let owner_lock = create_projection_owner(root.path())?;
+        let root = OwnedProjection::create(private_disk_parent)?;
         let payload_dir = root.path().join("payloads");
         let staged_inputs = root.path().join("staged-inputs");
         fs::create_dir(&payload_dir)
@@ -181,7 +220,11 @@ impl DiskPinnedTreeProjection {
             let source_oid = entry.oid;
             let source_size = entry.source_size;
             let source_copy = source_path.clone();
+            // The task can outlive a cancelled acquire future. Retaining the
+            // owner prevents cleanup from racing its late payload write.
+            let task_owner = root.clone();
             let size = tokio::task::spawn_blocking(move || {
+                let _task_owner = task_owner;
                 stream_verified_blob(&source_git_dir, source_oid, source_size, &source_copy)
             })
             .await
@@ -249,7 +292,6 @@ impl DiskPinnedTreeProjection {
             commit,
             owner_pid: std::process::id(),
             _root: root,
-            _owner_lock: owner_lock,
             input_root,
             files,
             _capacity: capacity,
@@ -329,6 +371,35 @@ fn create_projection_owner(root: &Path) -> Git2DBResult<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
+fn remove_owned_projection(path: &Path) -> Git2DBResult<()> {
+    // A recursive removal of the root can unlink OWNER_FILE before reaching
+    // a later payload. Remove each child first, so interruption at any point
+    // with payload bytes remaining always leaves the reclaim marker intact.
+    for entry in fs::read_dir(path).map_err(|e| internal(format!("read projection: {e}")))? {
+        let entry = entry.map_err(|e| internal(format!("read projection child: {e}")))?;
+        if entry.file_name() == OWNER_FILE {
+            continue;
+        }
+        let child = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| internal(format!("inspect projection child: {e}")))?;
+        if kind.is_dir() {
+            fs::remove_dir_all(&child)
+                .map_err(|e| internal(format!("remove projection child: {e}")))?;
+        } else {
+            // remove_file unlinks symlinks instead of following them.
+            fs::remove_file(&child)
+                .map_err(|e| internal(format!("remove projection child: {e}")))?;
+        }
+    }
+    fs::remove_file(path.join(OWNER_FILE))
+        .map_err(|e| internal(format!("remove projection owner: {e}")))?;
+    fs::remove_dir(path).map_err(|e| internal(format!("remove empty projection: {e}")))?;
+    Ok(())
+}
+
 /// Reclaim only this version's abandoned private projections. Older unmarked
 /// directories are deliberately left alone: without a lock they cannot be
 /// distinguished safely from a projection still in use by another process.
@@ -378,10 +449,9 @@ fn scavenge_abandoned_projections(parent: &Path) -> Git2DBResult<()> {
         if !try_lock_projection(&file)? {
             continue;
         }
-        // remove_dir_all does not follow symlinks on Linux. Keep the flock
-        // through removal so another scavenger cannot touch a live owner.
-        fs::remove_dir_all(&path)
-            .map_err(|e| internal(format!("reclaim abandoned projection: {e}")))?;
+        // Keep the flock through marker-last removal. A failed cleanup leaves
+        // the marker for another attempt instead of stranding payload bytes.
+        remove_owned_projection(&path)?;
     }
     Ok(())
 }
@@ -842,6 +912,61 @@ mod tests {
             b"foreign",
             "scavenging must not follow a symlink inside an owned projection"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_cleanup_keeps_marker_until_remaining_payload_is_reclaimed() -> Git2DBResult<()> {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let owned = parent.path().join("git2db-pinned-disk-interrupted123");
+        fs::create_dir(&owned).map_err(internal)?;
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let owner_lock = create_projection_owner(&owned)?;
+        fs::write(owned.join("already-removed"), b"first").map_err(internal)?;
+        fs::write(owned.join("remaining-payload"), b"second").map_err(internal)?;
+
+        // The process dies during child removal, before it can unlink the
+        // owner marker. A later process must still recognize this directory.
+        fs::remove_file(owned.join("already-removed")).map_err(internal)?;
+        assert!(owned.join(OWNER_FILE).exists());
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(owned.join("remaining-payload").exists(), "live lock wins");
+        drop(owner_lock);
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(!owned.exists(), "interrupted cleanup must be resumable");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_acquire_guard_keeps_lock_until_cleanup_completes() -> Git2DBResult<()> {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let root = OwnedProjection::create(parent.path())?;
+        let path = root.path().to_path_buf();
+        fs::write(path.join("partial-payload"), b"not published").map_err(internal)?;
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(path.join("partial-payload").exists());
+        drop(root); // The error path drops this guard before returning Err.
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(parent.path()).map_err(internal)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_acquire_cannot_cleanup_before_blocking_writer_releases_owner() -> Git2DBResult<()>
+    {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let root = OwnedProjection::create(parent.path())?;
+        let path = root.path().to_path_buf();
+        let writer_owner = root.clone();
+        drop(root); // Simulates cancellation while spawn_blocking still runs.
+        fs::write(path.join("late-payload"), b"writer still owns root").map_err(internal)?;
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(path.join("late-payload").exists());
+        drop(writer_owner);
+        assert!(!path.exists());
         Ok(())
     }
 
