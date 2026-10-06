@@ -92,6 +92,24 @@ pub struct Session {
     pub expires_at: i64,
 }
 
+/// A full active session together with the one durable source identity that
+/// admitted it. Fields stay private so consumers obtain this binding only
+/// through [`Store::lookup_primary`], never from a browser DTO.
+pub struct PrimaryRecord {
+    session: Session,
+    source: Source,
+}
+
+impl PrimaryRecord {
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub fn source_identity(&self) -> (&str, &str) {
+        (&self.source.issuer, &self.source.subject)
+    }
+}
+
 impl PendingSession {
     fn admitted(&self, proof_epoch: i64) -> Result<Session, Error> {
         if proof_epoch <= 0 {
@@ -287,6 +305,44 @@ impl Store {
             &[&host,&sid,&PROFILE,&SUITE,&&generation[..],&&local_collision_inventory_id[..]],
         ).await?;
         row.as_ref().map(read_session).transpose()
+    }
+
+    /// Resolve the exact active session and its unique, committed source
+    /// identity in one query. A session without exactly one matching replay
+    /// row fails closed; callers still bind the full record to verified host
+    /// JWT claims and holder proof before dispatch.
+    pub async fn lookup_primary(
+        client: &Client,
+        host: &str,
+        sid: &str,
+        generation: &[u8; 32],
+        local_collision_inventory_id: &[u8; 32],
+    ) -> Result<Option<PrimaryRecord>, Error> {
+        let rows = client.query(
+            "SELECT s.*, r.issuer AS source_issuer, r.source_subject, r.jti AS source_jti, r.nonce AS source_nonce, r.token_hash AS source_token_hash, r.source_iat, r.source_exp FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.replay r ON (r.host=s.host AND r.sid=s.sid AND r.client_id=s.client_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint LIMIT 2",
+            &[&host, &sid, &PROFILE, &SUITE, &&generation[..], &&local_collision_inventory_id[..]],
+        ).await?;
+        match rows.len() {
+            0 => Ok(None),
+            1 => {
+                let row = &rows[0];
+                let session = read_session(row)?;
+                let source = Source {
+                    issuer: row.try_get("source_issuer")?,
+                    subject: row.try_get("source_subject")?,
+                    jti: row.try_get("source_jti")?,
+                    nonce: row.try_get("source_nonce")?,
+                    token_hash: row
+                        .try_get::<_, Vec<u8>>("source_token_hash")?
+                        .try_into()
+                        .map_err(|_| Error::Unavailable)?,
+                    issued_at: row.try_get("source_iat")?,
+                    expires_at: row.try_get("source_exp")?,
+                };
+                Ok(Some(PrimaryRecord { session, source }))
+            }
+            _ => Err(Error::Unavailable),
+        }
     }
 
     /// Atomically consumes an already-verified v16 `(namespace, request_id)`
