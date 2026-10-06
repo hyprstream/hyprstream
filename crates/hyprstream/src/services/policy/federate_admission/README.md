@@ -1,54 +1,58 @@
-# Disabled H2 Policy admission core
+# Disabled Federate authority-at-use core
 
-Compiled under `hyprstream/postgres`, with no route, runtime factory, production
-evidence constructor or enablement switch. Default construction denies. This is
-the internal account/Policy/storage boundary, not end-to-end login or H2 dispatch.
+The earlier disabled H2 admission core remains unchanged: it authenticates an
+enrolled local `service:oauth` caller, resolves the upstream identity through
+the admitted UserStore, requires the same immutable account UUID, an explicitly
+active account, and a signed hosted-DID record, and intersects concrete requested
+scopes with fixed client/resource ceilings and current `PolicyManager` checks.
+It does not auto-provision an account or add an account/grant store. Prepare
+computes an observed-decision digest; redemption recomputes the whole decision
+and compares equality. The digest is not a global mutation epoch, and a later
+cross-store mutation may still leave a stale short-lived session. No atomic
+PostgreSQL/PDS/Casbin snapshot is claimed.
 
-The core requires a verified local `service:oauth` envelope whose holder matches
-the authority-owned enrollment entry. It uses admitted UserStore external binding
-and immutable account UUID, requires explicitly active account and a signed hosted
-DID record, and intersects concrete requested scopes with fixed client/resource
-ceilings and existing PolicyManager decisions. No auto-provisioning or new account
-or grant store. Unsupported wildcard scopes deny rather than broadening authority.
+Admission still commits session and source replay atomically before a receipt;
+there is no token signer. Its OAuth-only lookup/revoke boundary and 2-second
+aggregate deadline remain unchanged. Uncached tenant resolution reads exact
+signed account-record paths across at most 256 tenants and rejects missing,
+ambiguous or corrupt records; it does not replace the existing cached caller.
 
-Prepare returns an opaque observed-decision revision. Redemption repeats the read
-and requires the complete decision to match. This revision hashes the observed
-decision and its inputs; it is NOT a global mutation epoch or proof no mutation
-occurred and reverted. No cross-store atomic snapshot is claimed. A mutation after
-the read but before H1 commit can leave a stale short-lived session. That accepted
-race requires fresh authorization at every protected request and distinct tool
-call; an already-authorized stream may finish, without token/chunk/timer polling.
+This source slice adds a fresh current-account, signed-tenant, scope-ceiling,
+and Policy check for one exact Registry/Model operation, plus a PostgreSQL
+primary-record lookup that binds the active session to its unique durable source
+identity. The per-use decision returns no bearer, delegated service credential,
+or reusable permit. Once dispatch wiring exists, each subsequent request or
+distinct tool call must invoke it again. This helper adds no per-token,
+per-chunk, or timer polling; the request/tool handler wiring and stream behavior
+remain unimplemented in this source slice.
 
-H1 commits session/replay atomically before returning a receipt; no token signing
-occurs here. Lookup/revoke are OAuth-only in this slice, bounded and host-pinned.
-H3's separately reviewed consumer-capability lookup is not replaced or broadened.
-Each operation has a capacity permit without queuing and a single aggregate two
-second deadline. Uncertain DB commit denies; no local replay fallback.
+The code remains private, uninstalled and default-deny: no RPC route, service
+factory, proof/session constructor, client/host configuration, or runtime switch
+is added. An ordinary deserialized `Session`, subject string, or browser field
+cannot construct the store's `PrimaryRecord`; only the exact active lookup does.
+The caller must still bind the full record to the verified host JWT and original
+holder proof, then consume v16 request replay before protected dispatch.
 
-Fresh tenant lookup bypasses the shared index, reads only exact account-record
-paths across at most 256 tenants, and rejects missing/ambiguous/corrupt records.
-Its authority remains the admitted PDS mount; a deployment with an independently
-cached/stale mount is not qualified by this implementation. Timeout/capacity are
-enforced by the Policy caller. There is no change to existing cached callers.
+## Remaining staged integration
 
-## Required integration before enablement
+1. H3a/H3b must add and independently review the verified request-local session
+   context: strict host-token binding, original-holder proof verification,
+   full-record lookup/capability, and durable v16 request replay. Current main has
+   no production constructor for the evidence accepted by this H2 core.
+2. Add the authenticated Policy RPC operation and install its single authoritative
+   decision owner only after writer-endpoint account/session access, exact signed
+   tenant reads and committed-policy reload semantics are qualified.
+3. Wire the returned one-request decision through authenticated RPC Registry and
+   Model dispatch, then require a fresh check immediately before each distinct
+   tool call. Deny this profile on unclassified 9P, in-process, HTTP, CLI and
+   background paths. Model→Inference stays inside the same logical Model request
+   and carries the original caller/session context; it does not become a new
+   authority or reusable delegated credential.
+4. Add dispatch-isolation, tool-pre-effect, stream-continuation, cross-replica,
+   and real post-ack revocation tests before any enablement. A prior authorized
+   stream may finish; a new request/tool call after the mutation acknowledgement
+   must deny. No token/chunk/timer polling is permitted.
 
-- H4 strict source/dual-possession verifier and approved typed evidence constructor,
-  binding exact challenge, keys, source, scopes, client and resource. Offline
-  fixtures are not cryptographic verification evidence.
-- Wire the internal operation into authenticated Policy RPC, preserving its enrolled
-  OAuth restriction, with bounded decode and audited operation permission. No
-  browser registration DTO or verification boolean is introduced here.
-- Admit writer-endpoint UserStore/session connections, authoritative signed-record
-  mount and one serving Policy instance. No deployment or schema apply in this PR.
-- H3 full-record capability adapter, request-local proof integration, cached
-  activation, durable request replay; H2 fresh request/tool authority gate. These
-  remain absent. A receipt is neither a reusable authorization permit nor a token.
-
-All Cargo and hooks use BuildQ. Focused filters: `h2_admission` on the application
-with `postgres`, and `h2_current_tenant` on `hyprstream-pds-service`. The ignored
-application PG fixture requires an explicitly supplied local `H2_TEST_SOCKET` and
-creates/drops its own random database; it never uses a deployment DSN. Its accepted
-race test proves stale admission and denial on the next authority read, NOT live
-Registry/Model handler isolation. H1's separate durability suite covers store
-concurrency/roles/cleanup; do not attribute those fixtures to live H2 RPC.
+The `postgres` feature is only a compile/test boundary here. No route or DB
+connection is installed by this patch. No migration, schema, DB role, AWS/GitLab
+setting, live DB, or runtime state is changed.
