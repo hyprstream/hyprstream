@@ -11,7 +11,9 @@ use hyprstream_rpc::{
             AuthenticatedRequestProofInput,
         },
         enrollment::{authenticated_replay_namespace, InMemoryEnrollmentResolver},
+        recipient_binding::FederateRecipientBinding,
     },
+    crypto::hybrid_kem::{generate_recipient, SuiteId},
 };
 use hyprstream_session_store::primary::InventorySource;
 
@@ -206,6 +208,38 @@ fn proof(ed_seed: u8, pq_seed: u8, credential: &[u8]) -> Vec<u8> {
             capnp_schema_id: SCHEMA,
             capnp_body: BODY,
             response_binding: None,
+            federate_recipient_binding: None,
+        },
+        &signer,
+    )
+    .unwrap()
+}
+
+fn proof_with_deferred_recipient_extension(credential: &[u8]) -> Vec<u8> {
+    let ed = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+    let pq = ml_dsa_sk_from_seed(&[42; 32]);
+    let kids = session_primary_kids(&ed.verifying_key().to_bytes(), &ml_dsa_sk_to_vk_bytes(&pq));
+    let signer = AuthenticatedHybridProofSigner::new(ed, kids[0], pq, kids[1]).unwrap();
+    let response = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+    let stream = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+    let response_public = response.public();
+    let stream_public = stream.public();
+    let binding = FederateRecipientBinding::from_recipients(
+        Some(&response_public),
+        Some(&stream_public),
+        Some([0x5a; 32]),
+    )
+    .unwrap();
+    build_authenticated_hybrid_request_proof(
+        &AuthenticatedRequestProofInput {
+            service_domain: "registry",
+            credential,
+            issued_at: NOW,
+            expires_at: NOW + 20,
+            capnp_schema_id: SCHEMA,
+            capnp_body: BODY,
+            response_binding: None,
+            federate_recipient_binding: Some(&binding),
         },
         &signer,
     )
@@ -220,6 +254,31 @@ fn request(proof: &[u8]) -> Request<'_> {
         schema_id: SCHEMA,
         body: BODY,
     }
+}
+
+#[tokio::test]
+async fn h3b_consumer_accepts_only_deferred_parser_recipient_extension() {
+    let (handle, record, inventory) = fixture();
+    let bytes = proof_with_deferred_recipient_extension(TOKEN);
+    assert!(
+        hyprstream_rpc::proof::parser::ParsedProof::parse(&bytes).is_err(),
+        "generic v16 parser must remain closed to the source extension"
+    );
+    let static_enrollments = InMemoryEnrollmentResolver::new();
+    let permits = Semaphore::new(1);
+    let policy = LocalPolicy {
+        inventory: &inventory,
+        static_enrollments: &static_enrollments,
+        in_flight: &permits,
+    };
+    let consumer = Consumer {
+        provider: Some(provider(record)),
+    };
+
+    consumer
+        .verify(&handle, &request(&bytes), &policy, || NOW)
+        .await
+        .expect("H3b Consumer uses the narrow deferred-Federate parser");
 }
 
 #[tokio::test]

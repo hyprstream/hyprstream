@@ -34,6 +34,7 @@ use hyprstream_rpc::{
             build_authenticated_hybrid_request_proof, AuthenticatedHybridProofSigner,
             AuthenticatedRequestProofInput,
         },
+        recipient_binding::FederateRecipientBinding,
         parser::ParsedProof,
         policy::{set_global_method_policy, CryptoSuite, InMemoryMethodPolicy, SignaturePolicy},
         verify::VerifiedProof,
@@ -50,6 +51,7 @@ use sha2::{Digest, Sha256};
 const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
 const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
 const SCHEMA: u64 = 0xe7339d5d26ab3076;
+const CLIENT_DH: [u8; 32] = [0x61; 32];
 
 struct Fixture {
     ca: SigningKey,
@@ -144,7 +146,39 @@ fn token(subject: &str) -> String {
     format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 
-fn proof(token: &str, body: &[u8]) -> Vec<u8> {
+type Recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientKeypair;
+
+fn recipients() -> (Recipient, Recipient) {
+    let suite = hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
+    (
+        hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite).unwrap(),
+        hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite).unwrap(),
+    )
+}
+
+fn proof(
+    token: &str,
+    body: &[u8],
+    response: &Recipient,
+    stream: &Recipient,
+    client_dh_public: [u8; 32],
+) -> Vec<u8> {
+    proof_with_recipients(
+        token,
+        body,
+        Some(response),
+        Some(stream),
+        client_dh_public,
+    )
+}
+
+fn proof_with_recipients(
+    token: &str,
+    body: &[u8],
+    response: Option<&Recipient>,
+    stream: Option<&Recipient>,
+    client_dh_public: [u8; 32],
+) -> Vec<u8> {
     let f = fixture();
     let now = chrono::Utc::now().timestamp() as u64;
     let signer = AuthenticatedHybridProofSigner::new(
@@ -163,6 +197,40 @@ fn proof(token: &str, body: &[u8]) -> Vec<u8> {
             capnp_schema_id: SCHEMA,
             capnp_body: body,
             response_binding: None,
+            federate_recipient_binding: Some(
+                &FederateRecipientBinding::from_recipients(
+                    response.map(Recipient::public).as_ref(),
+                    stream.map(Recipient::public).as_ref(),
+                    Some(client_dh_public),
+                )
+                .unwrap(),
+            ),
+        },
+        &signer,
+    )
+    .unwrap()
+}
+
+fn proof_without_recipient_binding(token: &str, body: &[u8]) -> Vec<u8> {
+    let f = fixture();
+    let now = chrono::Utc::now().timestamp() as u64;
+    let signer = AuthenticatedHybridProofSigner::new(
+        f.holder.clone(),
+        b"holder-ed".to_vec(),
+        ml_dsa_sk_from_seed(&[56; 32]),
+        b"holder-pq".to_vec(),
+    )
+    .unwrap();
+    build_authenticated_hybrid_request_proof(
+        &AuthenticatedRequestProofInput {
+            service_domain: "model",
+            credential: token.as_bytes(),
+            issued_at: now,
+            expires_at: now + 20,
+            capnp_schema_id: SCHEMA,
+            capnp_body: body,
+            response_binding: None,
+            federate_recipient_binding: None,
         },
         &signer,
     )
@@ -289,19 +357,46 @@ impl RequestService for Service {
     }
 }
 
-fn wire(token: &str, proof: Vec<u8>, body: &[u8]) -> Vec<u8> {
+fn wire(
+    token: &str,
+    proof: Vec<u8>,
+    body: &[u8],
+    response_recipient: &Recipient,
+    stream_recipient: &Recipient,
+    client_dh_public: [u8; 32],
+) -> Vec<u8> {
+    wire_with_recipients(
+        token,
+        proof,
+        body,
+        response_recipient,
+        Some(stream_recipient),
+        client_dh_public,
+    )
+}
+
+fn wire_with_recipients(
+    token: &str,
+    proof: Vec<u8>,
+    body: &[u8],
+    response_recipient: &Recipient,
+    stream_recipient: Option<&Recipient>,
+    client_dh_public: [u8; 32],
+) -> Vec<u8> {
     let f = fixture();
     let server_recipient = derive_mesh_kem_recipient(&f.server).unwrap();
-    let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
-        hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
-    )
-    .unwrap();
-    let request = RequestEnvelope::new(body.to_vec())
+    let mut request = RequestEnvelope::new(body.to_vec())
         .with_jwt_token(token.into())
         .with_proof_cwt(proof)
         .with_service_domain("model")
         .unwrap()
+        .with_client_dh_public(client_dh_public)
         .with_response_kem_recipient(response_recipient.public());
+    if let Some(stream_recipient) = stream_recipient {
+        request = request
+            .with_client_kem_public(stream_recipient.public())
+            .unwrap();
+    }
     let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
         request,
         &f.relay,
@@ -316,6 +411,22 @@ fn wire(token: &str, proof: Vec<u8>, body: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &message).unwrap();
     bytes
+}
+
+fn assert_denial_has_no_success_payload(bytes: &[u8]) {
+    let reader = capnp::serialize::read_message(
+        &mut Cursor::new(bytes),
+        capnp::message::ReaderOptions::new(),
+    )
+    .unwrap();
+    let response = reader
+        .get_root::<hyprstream_rpc::common_capnp::response_envelope::Reader>()
+        .unwrap();
+    assert!(response.get_payload().unwrap().is_empty());
+    assert!(
+        !response.get_encrypted_response().unwrap().is_empty(),
+        "the uniform denial remains encrypted"
+    );
 }
 
 async fn send(service: &Service, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -335,12 +446,16 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
     let f = fixture();
     let service = Service::new();
     let bearer = token("alice");
-    let same_proof = proof(&bearer, &f.body);
-    send(&service, &wire(&bearer, same_proof.clone(), &f.body))
+    let (response, stream) = recipients();
+    let same_proof = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
+    send(
+        &service,
+        &wire(&bearer, same_proof.clone(), &f.body, &response, &stream, CLIENT_DH),
+    )
         .await
         .unwrap();
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    send(&service, &wire(&bearer, same_proof, &f.body))
+    send(&service, &wire(&bearer, same_proof, &f.body, &response, &stream, CLIENT_DH))
         .await
         .unwrap();
     assert_eq!(
@@ -350,7 +465,11 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
     );
 
     service.revoked.store(true, Ordering::SeqCst);
-    send(&service, &wire(&bearer, proof(&bearer, &f.body), &f.body))
+    let (response, stream) = recipients();
+    send(
+        &service,
+        &wire(&bearer, proof(&bearer, &f.body, &response, &stream, CLIENT_DH), &f.body, &response, &stream, CLIENT_DH),
+    )
         .await
         .unwrap();
     assert_eq!(
@@ -361,9 +480,17 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
     service.revoked.store(false, Ordering::SeqCst);
 
     let wrong_subject = token("bob");
+    let (response, stream) = recipients();
     send(
         &service,
-        &wire(&wrong_subject, proof(&wrong_subject, &f.body), &f.body),
+        &wire(
+            &wrong_subject,
+            proof(&wrong_subject, &f.body, &response, &stream, CLIENT_DH),
+            &f.body,
+            &response,
+            &stream,
+            CLIENT_DH,
+        ),
     )
     .await
     .unwrap();
@@ -379,9 +506,17 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
             .set_message("other-model");
     })
     .unwrap();
+    let (response, stream) = recipients();
     send(
         &service,
-        &wire(&bearer, proof(&bearer, &wrong_body), &wrong_body),
+        &wire(
+            &bearer,
+            proof(&bearer, &wrong_body, &response, &stream, CLIENT_DH),
+            &wrong_body,
+            &response,
+            &stream,
+            CLIENT_DH,
+        ),
     )
     .await
     .unwrap();
@@ -390,4 +525,114 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
         1,
         "wrong resource/body denial"
     );
+}
+
+#[tokio::test]
+async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
+    let f = fixture();
+    let service = Service::new();
+    let bearer = token("alice");
+    let (holder_response, holder_stream) = recipients();
+    let holder_proof = proof(&bearer, &f.body, &holder_response, &holder_stream, CLIENT_DH);
+
+    let (relay_response, _) = recipients();
+    let response_substitution = send(
+        &service,
+        &wire(
+            &bearer,
+            holder_proof.clone(),
+            &f.body,
+            &relay_response,
+            &holder_stream,
+            CLIENT_DH,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_denial_has_no_success_payload(&response_substitution);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    let (_, relay_stream) = recipients();
+    let stream_substitution = send(
+        &service,
+        &wire(
+            &bearer,
+            holder_proof.clone(),
+            &f.body,
+            &holder_response,
+            &relay_stream,
+            CLIENT_DH,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_denial_has_no_success_payload(&stream_substitution);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    let relay_dh = [0x62; 32];
+    let dh_substitution = send(
+        &service,
+        &wire(
+            &bearer,
+            holder_proof.clone(),
+            &f.body,
+            &holder_response,
+            &holder_stream,
+            relay_dh,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_denial_has_no_success_payload(&dh_substitution);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    // A signed null is meaningful: if the holder chose the legacy DH-only
+    // stream path, the relay cannot add its own stream KEM recipient.
+    let null_stream_proof = proof_with_recipients(
+        &bearer,
+        &f.body,
+        Some(&holder_response),
+        None,
+        CLIENT_DH,
+    );
+    let (_, relay_added_stream) = recipients();
+    let stream_added_to_signed_null = send(
+        &service,
+        &wire_with_recipients(
+            &bearer,
+            null_stream_proof,
+            &f.body,
+            &holder_response,
+            Some(&relay_added_stream),
+            CLIENT_DH,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_denial_has_no_success_payload(&stream_added_to_signed_null);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    let omitted_claim = send(
+        &service,
+        &wire(
+            &bearer,
+            proof_without_recipient_binding(&bearer, &f.body),
+            &f.body,
+            &holder_response,
+            &holder_stream,
+            CLIENT_DH,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_denial_has_no_success_payload(&omitted_claim);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    send(
+        &service,
+        &wire(&bearer, holder_proof, &f.body, &holder_response, &holder_stream, CLIENT_DH),
+    )
+    .await
+    .unwrap();
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
 }

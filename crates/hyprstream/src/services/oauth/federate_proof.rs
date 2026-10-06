@@ -332,7 +332,8 @@ impl Consumer {
         {
             return Err(Error::Denied);
         }
-        let proof = ParsedProof::parse(request.proof).map_err(|_| Error::Denied)?;
+        let proof = ParsedProof::parse_deferred_federate_request(request.proof)
+            .map_err(|_| Error::Denied)?;
         if proof.kind != ProofKind::Request
             || proof.disposition != ProofDisposition::Authenticated
             || proof.claims.aud != request.service

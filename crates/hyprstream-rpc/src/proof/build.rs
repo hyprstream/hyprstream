@@ -13,9 +13,11 @@ use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 
 use super::{
+    recipient_binding::FederateRecipientBinding,
     response::{KemRecipient, ProtectionMode, ResponseBinding, ResponseKind},
     CredentialHash, RequestId, ALG_ED25519, ALG_ML_DSA_65, CLAIM_CAPNP_BODY_BYTES,
-    CLAIM_CAPNP_SCHEMA_ID, CLAIM_CREDENTIAL_HASH, CLAIM_RESPONSE_BINDING, COSE_HEADER_ALG,
+    CLAIM_CAPNP_SCHEMA_ID, CLAIM_CREDENTIAL_HASH, CLAIM_FEDERATE_RECIPIENT_BINDING,
+    CLAIM_RESPONSE_BINDING, COSE_HEADER_ALG,
     COSE_HEADER_CRIT, COSE_HEADER_KID, COSE_HEADER_TYP, CWT_CLAIM_AUD, CWT_CLAIM_CTI,
     CWT_CLAIM_EXP, CWT_CLAIM_IAT, HEADER_HS_DOMAIN, HEADER_HS_LOGICAL_SIGNER_GROUP,
     HEADER_HS_SIGNATURE_PLAN, MAX_BODY_BYTES, MAX_KID_BYTES, PROOF_TYP, REQUEST_PROOF_DOMAIN,
@@ -76,6 +78,9 @@ pub struct AuthenticatedRequestProofInput<'a> {
     pub capnp_body: &'a [u8],
     /// Commitment to response delivery, or `None` for cleartext unary.
     pub response_binding: Option<&'a ResponseBinding>,
+    /// Optional recipient-pair commitment for deferred Federate requests.
+    /// Generic request proofs omit this source-slice extension.
+    pub federate_recipient_binding: Option<&'a FederateRecipientBinding>,
 }
 
 /// Produces a deterministic authenticated request proof in the sole supported
@@ -213,8 +218,8 @@ fn encode_claims(
     credential_hash: CredentialHash,
     request_id: RequestId,
 ) -> Result<Vec<u8>> {
-    // Key order is 3, 4, 6, 7, -70001, -70002, -70003, -70004.
-    encode(&CborValue::Map(vec![
+    // Key order is 3, 4, 6, 7, -70001, -70002, -70003, -70004, -70009.
+    let mut claims = vec![
         (
             CborValue::Integer(CWT_CLAIM_AUD.into()),
             CborValue::Text(input.service_domain.into()),
@@ -247,7 +252,29 @@ fn encode_claims(
             CborValue::Integer(CLAIM_RESPONSE_BINDING.into()),
             response_binding_value(input.response_binding)?,
         ),
-    ]))
+    ];
+    if let Some(binding) = input.federate_recipient_binding {
+        claims.push((
+            CborValue::Integer(CLAIM_FEDERATE_RECIPIENT_BINDING.into()),
+            federate_recipient_binding_value(binding),
+        ));
+    }
+    encode(&CborValue::Map(claims))
+}
+
+fn federate_recipient_binding_value(binding: &FederateRecipientBinding) -> CborValue {
+    let commitment_value = |value: &Option<[u8; 32]>| match value {
+        Some(value) => CborValue::Bytes(value.to_vec()),
+        None => CborValue::Null,
+    };
+    CborValue::Map(vec![
+        (CborValue::Integer(1.into()), commitment_value(&binding.response)),
+        (CborValue::Integer(2.into()), commitment_value(&binding.stream)),
+        (
+            CborValue::Integer(3.into()),
+            commitment_value(&binding.client_dh_public),
+        ),
+    ])
 }
 
 fn response_binding_value(binding: Option<&ResponseBinding>) -> Result<CborValue> {
@@ -405,6 +432,7 @@ mod tests {
             capnp_schema_id: SCHEMA,
             capnp_body: body,
             response_binding: None,
+            federate_recipient_binding: None,
         }
     }
 
@@ -462,6 +490,34 @@ mod tests {
             .unwrap()
             .with_proof_cwt(bytes.clone());
         assert_eq!(envelope.proof_cwt.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn federate_recipient_extension_is_rejected_by_generic_profile_parser() {
+        let (signer, _, _) = fixture();
+        let suite = crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
+        let response =
+            crate::crypto::hybrid_kem::generate_recipient(suite).unwrap();
+        let stream =
+            crate::crypto::hybrid_kem::generate_recipient(suite).unwrap();
+        let binding = FederateRecipientBinding::from_recipients(
+            Some(&response.public()),
+            Some(&stream.public()),
+            Some([0x33; 32]),
+        )
+        .unwrap();
+        let mut request = input(b"federate-request");
+        request.federate_recipient_binding = Some(&binding);
+        let bytes = build_authenticated_hybrid_request_proof(&request, &signer).unwrap();
+
+        assert!(
+            ParsedProof::parse(&bytes).is_err(),
+            "generic v16 parsing must keep the frozen closed claim set"
+        );
+        assert!(
+            ParsedProof::parse_deferred_federate_request(&bytes).is_ok(),
+            "only the deferred Federate parser accepts -70009"
+        );
     }
 
     #[test]

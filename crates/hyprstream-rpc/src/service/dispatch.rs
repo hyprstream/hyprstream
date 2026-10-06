@@ -295,6 +295,7 @@ where
         );
         return dispatch_denied(&format!("claims verification: {e}"));
     }
+    let deferred_federate = ctx.deferred_federate_credential().is_some();
 
     // Proof-CWT structural parse and profile gates (§5.2: parse canonical COSE
     // and proof payload under bounds, then bind the service coordinate and
@@ -313,8 +314,12 @@ where
         // signatures. Signature verification and replay admission run after
         // policy evaluation, immediately before handler entry.
         let parsed = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
-            let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
-                    .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
+            let proof = if deferred_federate {
+                crate::proof::parser::ParsedProof::parse_deferred_federate_request(proof_cwt)
+            } else {
+                crate::proof::parser::ParsedProof::parse(proof_cwt)
+            }
+            .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
 
             // CRITICAL: only request proofs are valid in request dispatch.
             if proof.kind != crate::proof::ProofKind::Request {
@@ -443,7 +448,6 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let deferred_federate = ctx.deferred_federate_credential().is_some();
     let mut verified_proof = if deferred_federate { None } else { match parsed_proof.as_ref() {
         None => None,
         Some(proof) => {
@@ -547,6 +551,20 @@ where
         let Some(proof) = parsed_proof.as_ref() else {
             return dispatch_denied("Federate holder proof missing");
         };
+        let recipients_match = proof
+            .claims
+            .federate_recipient_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                binding.matches(
+                    ctx.response_kem_recipient(),
+                    ctx.stream_kem_recipient(),
+                    ctx.ephemeral_pubkey(),
+                )
+            });
+        if !recipients_match {
+            return dispatch_denied("Federate recipient binding denied");
+        }
         let (verified, holder_ed, resource, operation) = match service
             .admit_deferred_federate_request(&ctx, &decoded_body, proof)
             .await

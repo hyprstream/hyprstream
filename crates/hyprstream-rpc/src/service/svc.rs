@@ -866,6 +866,13 @@ impl EnvelopeContext {
         self.client_kem_public.as_ref()
     }
 
+    /// The one-shot unary reply recipient authenticated by the envelope.
+    /// Deferred Federate admission additionally requires the original holder
+    /// proof to bind this value before any handler or authority side effect.
+    pub fn response_kem_recipient(&self) -> Option<&crate::crypto::hybrid_kem::RecipientPublic> {
+        self.response_kem_recipient.as_ref()
+    }
+
     /// Whether this request came from a genuine in-process / IPC caller (#328).
     ///
     /// `true` for the `FixedSigner` mutual-auth plane and internal self-calls;
