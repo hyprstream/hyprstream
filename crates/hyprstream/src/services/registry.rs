@@ -327,6 +327,9 @@ pub struct RegistryService {
     base_dir: PathBuf,
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
+    /// No runtime installer in this slice; reserved Federate JWTs still deny.
+    #[cfg(feature = "postgres")]
+    federate_dispatch: Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
     signing_key: SigningKey,
@@ -424,6 +427,8 @@ impl RegistryService {
             registry: worker_registry,
             base_dir,
             policy_client,
+            #[cfg(feature = "postgres")]
+            federate_dispatch: None,
             transport,
             signing_key,
             reach_config: Arc::new(parking_lot::RwLock::new(
@@ -1797,19 +1802,25 @@ impl RegistryHandler for RegistryService {
         // the registry does not provide.
         let request = PolicyCheck {
             subject: subject.to_string(),
-            domain: "*".to_owned(),
+            domain: if ctx.is_federate_admitted() { ctx.domain()? } else { "*".to_owned() },
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
+        if ctx.is_federate_admitted() {
+            anyhow::ensure!(ctx.admitted_federate_operation(resource, operation),
+                "Federate request-local operation mismatch");
+            // H2 already performed a fresh Policy check for the original
+            // holder's exact Registry.list action. Generic Policy.check would
+            // instead check this service's own identity.
+            return Ok(());
+        }
         let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
             ctx.original_holder_evidence(),
-        )
-        .await
-        .unwrap_or_else(|e| {
+        ).await.unwrap_or_else(|e| {
             warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
             false
         });
@@ -1821,6 +1832,14 @@ impl RegistryHandler for RegistryService {
     }
 
     async fn handle_list(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+        if ctx.is_federate_admitted() {
+            // H2 admits the Registry.list RPC, but it does not yet expose a
+            // request-bound original-holder query for each model entry. An
+            // authenticated empty list is safe for B; A's pinned entry waits
+            // for that separate exact grant, never the Registry service's
+            // own broad grant.
+            return Ok(RegistryResponseVariant::ListResult(Vec::new()));
+        }
         let repos = match self.handle_list().await {
             Ok(r) => r,
             Err(e) => return Ok(reg_error(&e.to_string())),
@@ -1859,8 +1878,7 @@ impl RegistryHandler for RegistryService {
                 ctx.jwt_token(),
                 &ctx.subject(),
                 ctx.original_holder_evidence(),
-            )
-            .await
+            ).await
             .unwrap_or_else(|e| {
                 warn!("Policy check RPC error while filtering {}: {} - denying access", resource, e);
                 false
@@ -3311,8 +3329,48 @@ impl WorktreeHandler for RegistryService {
     }
 }
 
+#[cfg(feature = "postgres")]
+fn federate_registry_operation(
+    body: &hyprstream_rpc::service::DecodedRequestBody,
+) -> Result<(String, String)> {
+    use hyprstream_rpc_std::registry_capnp::registry_request;
+    let request = body.root::<registry_request::Reader>()?;
+    match request.which()? {
+        registry_request::Which::List(()) => Ok(("registry:List".to_owned(), "query".to_owned())),
+        _ => anyhow::bail!("unsupported Federate Registry method"),
+    }
+}
+
 #[async_trait(?Send)]
 impl RequestService for RegistryService {
+    fn accept_deferred_federate_credential(&self) -> bool {
+        #[cfg(feature = "postgres")]
+        { self.federate_dispatch.is_some() }
+        #[cfg(not(feature = "postgres"))]
+        { false }
+    }
+
+    async fn admit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+        proof: &hyprstream_rpc::proof::parser::ParsedProof,
+    ) -> anyhow::Result<(hyprstream_rpc::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+        #[cfg(feature = "postgres")]
+        {
+            let adapter = self.federate_dispatch.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Federate dispatch is disabled"))?;
+            let (resource, operation) = federate_registry_operation(body)?;
+            let (verified, holder) = adapter.admit(
+                ctx, proof, "registry", 0xb8f611bc0de9988b, body.bytes(),
+                &resource, &operation,
+            ).await?;
+            Ok((verified, holder, resource, operation))
+        }
+        #[cfg(not(feature = "postgres"))]
+        { let _ = (ctx, body, proof); anyhow::bail!("Federate dispatch is disabled") }
+    }
+
     fn decode_request_body(
         &self,
         signed_body: &[u8],
@@ -3584,6 +3642,28 @@ mod xet_pointer_tests {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_registry_route_admits_only_authenticated_list() -> Result<()> {
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(1);
+            request.set_list(());
+        })?;
+        let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert_eq!(federate_registry_operation(&body)?,
+            ("registry:List".into(), "query".into()));
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(2);
+            request.set_get("repo-id");
+        })?;
+        let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert!(federate_registry_operation(&body).is_err());
+        Ok(())
+    }
     use crate::auth::PolicyManager;
     use crate::services::PolicyService;
         use hyprstream_rpc_std::policy_client::PolicyClient;

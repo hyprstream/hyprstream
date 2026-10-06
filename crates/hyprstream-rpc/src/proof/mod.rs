@@ -33,6 +33,7 @@ pub mod parser;
 pub mod plan;
 pub mod policy;
 pub mod response;
+pub mod recipient_binding;
 pub mod verify;
 mod thumbprint;
 
@@ -113,6 +114,10 @@ pub const CLAIM_CREDENTIAL_HASH: i64 = -70001;
 pub const CLAIM_CAPNP_SCHEMA_ID: i64 = -70002;
 pub const CLAIM_CAPNP_BODY_BYTES: i64 = -70003;
 pub const CLAIM_RESPONSE_BINDING: i64 = -70004;
+/// Deferred-Federate-only source extension binding every forwarded response
+/// recipient. Generic proof parsing rejects it; it is not in the frozen
+/// public v16 registry.
+pub const CLAIM_FEDERATE_RECIPIENT_BINDING: i64 = -70009;
 
 // --- private-use COSE header parameters ---
 

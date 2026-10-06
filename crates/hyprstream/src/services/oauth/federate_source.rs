@@ -23,10 +23,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 pub(crate) const ISSUER: &str = "https://login.federate.to";
-pub(crate) const CLIENT: &str = "cyberdione-www-staging";
+pub(crate) const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
 pub(crate) const WEBSITE: &str = "https://www.staging.lab.hyprstream.com";
 pub(crate) const CALLBACK: &str = "https://www.staging.lab.hyprstream.com/federate/callback";
-pub(crate) const HOST: &str = "https://discovery.staging.lab.hyprstream.com";
+pub(crate) const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
 const JWKS: &str = "https://login.federate.to/keys";
 const TOKEN_ENDPOINT: &str = "https://discovery.staging.lab.hyprstream.com/oauth/token";
 const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
@@ -195,17 +195,22 @@ impl Commitment {
         format!("hsn1.{}", B64.encode(sha(&self.preimage())))
     }
     fn kids(&self) -> [[u8; 32]; 2] {
-        [
-            sha(&frame(
-                "hyprstream.session-primary.kid.v1",
-                &[b"Ed25519", &self.ed],
-            )),
-            sha(&frame(
-                "hyprstream.session-primary.kid.v1",
-                &[b"ML-DSA-65", &self.pq],
-            )),
-        ]
+        session_primary_kids(&self.ed, &self.pq)
     }
+}
+
+// Shared by possession verification and the disabled request-proof consumer.
+pub(super) fn session_primary_kids(ed: &[u8; 32], pq: &[u8]) -> [[u8; 32]; 2] {
+    [
+        sha(&frame(
+            "hyprstream.session-primary.kid.v1",
+            &[b"Ed25519", ed],
+        )),
+        sha(&frame(
+            "hyprstream.session-primary.kid.v1",
+            &[b"ML-DSA-65", pq],
+        )),
+    ]
 }
 
 struct Keys {

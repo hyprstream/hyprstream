@@ -6,7 +6,8 @@
 //! The caller supplies a dedicated, TLS-verified PostgreSQL connection under the
 //! narrow runtime role. No DSN or token bodies are accepted or logged here.
 
-use tokio_postgres::{error::SqlState, Client, IsolationLevel, Row};
+use tokio_postgres::{Client, IsolationLevel, Row, error::SqlState};
+pub mod primary;
 
 pub const PROFILE: &str = "federate-session-v1";
 pub const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
@@ -14,6 +15,7 @@ pub const MIGRATION: &str = include_str!("../sql/001_admission.sql");
 pub const ROLE_GRANTS: &str = include_str!("../sql/roles.sql");
 pub const MIGRATION_V2: &str = include_str!("../sql/002_epoch_inventory.sql");
 pub const ROLE_GRANTS_V2: &str = include_str!("../sql/002_roles.sql");
+pub const MIGRATION_V3: &str = include_str!("../sql/003_primary_lookup_index.sql");
 
 /// Sanitized failures: PostgreSQL detail strings can include bound values.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -90,6 +92,29 @@ pub struct Session {
     pub collision_inventory_id: [u8; 32],
     pub proof_epoch: i64,
     pub expires_at: i64,
+}
+
+/// A full active session together with the one durable source identity that
+/// admitted it. Fields stay private so consumers obtain this binding only
+/// through [`Store::lookup_primary`], never from a browser DTO.
+pub struct PrimaryRecord {
+    session: Session,
+    source: Source,
+    created_at: i64,
+}
+
+impl PrimaryRecord {
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub fn source_identity(&self) -> (&str, &str) {
+        (&self.source.issuer, &self.source.subject)
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
 }
 
 impl PendingSession {
@@ -217,7 +242,7 @@ impl Store {
             .query_one("SELECT version FROM federate_session.schema_version", &[])
             .await?
             .try_get(0)?;
-        if version != 2 {
+        if version != 3 {
             return Err(Error::Unavailable);
         }
         let s = &admission.session;
@@ -276,7 +301,7 @@ impl Store {
     /// Authoritative full-record lookup for the future request-local proof resolver.
     /// Caller must still compare all credential fields and verify the RPC proof.
     pub async fn lookup(
-        client: &Client,
+        client: &(impl tokio_postgres::GenericClient + Sync),
         host: &str,
         sid: &str,
         generation: &[u8; 32],
@@ -287,6 +312,66 @@ impl Store {
             &[&host,&sid,&PROFILE,&SUITE,&&generation[..],&&local_collision_inventory_id[..]],
         ).await?;
         row.as_ref().map(read_session).transpose()
+    }
+
+    /// Resolve the exact active session and its unique, committed source
+    /// identity in one query. A session without exactly one matching replay
+    /// row fails closed; callers still bind the full record to verified host
+    /// JWT claims and holder proof before dispatch.
+    pub async fn lookup_primary(
+        client: &mut Client,
+        host: &str,
+        sid: &str,
+        generation: &[u8; 32],
+        local_collision_inventory_id: &[u8; 32],
+    ) -> Result<Option<PrimaryRecord>, Error> {
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        // Bound backend work even if the caller cancels its future. The index
+        // migration below supports the replay-side equality join.
+        tx.batch_execute("SET LOCAL statement_timeout = '2s'")
+            .await?;
+        let version: i32 = tx
+            .query_one("SELECT version FROM federate_session.schema_version", &[])
+            .await?
+            .try_get(0)?;
+        if version != 3 {
+            return Err(Error::Unavailable);
+        }
+        let rows = tx.query(
+            "SELECT s.*, r.issuer AS source_issuer, r.source_subject, r.jti AS source_jti, r.nonce AS source_nonce, r.token_hash AS source_token_hash, r.source_iat, r.source_exp FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.replay r ON (r.host=s.host AND r.sid=s.sid AND r.client_id=s.client_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint LIMIT 2",
+            &[&host, &sid, &PROFILE, &SUITE, &&generation[..], &&local_collision_inventory_id[..]],
+        ).await?;
+        let result = match rows.len() {
+            0 => Ok(None),
+            1 => {
+                let row = &rows[0];
+                let session = read_session(row)?;
+                let source = Source {
+                    issuer: row.try_get("source_issuer")?,
+                    subject: row.try_get("source_subject")?,
+                    jti: row.try_get("source_jti")?,
+                    nonce: row.try_get("source_nonce")?,
+                    token_hash: row
+                        .try_get::<_, Vec<u8>>("source_token_hash")?
+                        .try_into()
+                        .map_err(|_| Error::Unavailable)?,
+                    issued_at: row.try_get("source_iat")?,
+                    expires_at: row.try_get("source_exp")?,
+                };
+                Ok(Some(PrimaryRecord {
+                    session,
+                    source,
+                    created_at: row.try_get("created_at")?,
+                }))
+            }
+            _ => Err(Error::Unavailable),
+        };
+        tx.commit().await?;
+        result
     }
 
     /// Atomically consumes an already-verified v16 `(namespace, request_id)`
@@ -319,7 +404,7 @@ impl Store {
             .query_one("SELECT version FROM federate_session.schema_version", &[])
             .await?
             .try_get(0)?;
-        if version != 2 {
+        if version != 3 {
             return Err(Error::Unavailable);
         }
         let profile = tx.query_opt(

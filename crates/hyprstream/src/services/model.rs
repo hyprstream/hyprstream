@@ -286,6 +286,9 @@ pub struct ModelServiceInner {
     signing_key: SigningKey,
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyClient,
+    /// No runtime installer in this slice; reserved Federate JWTs still deny.
+    #[cfg(feature = "postgres")]
+    federate_dispatch: Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>,
     /// Event publisher for model lifecycle events (replaces NotificationService, EV5/#605).
     /// Plaintext (Public) path; the encrypted-default flip is deferred to #555.
     event_publisher: EventPublisher,
@@ -626,6 +629,8 @@ impl ModelService {
             config,
             signing_key,
             policy_client,
+            #[cfg(feature = "postgres")]
+            federate_dispatch: None,
             event_publisher,
             registry,
             transport,
@@ -1985,6 +1990,12 @@ impl ModelService {
     }
 
     fn remote_relay_bearer(ctx: &EnvelopeContext) -> Option<&str> {
+        // The reserved Federate credential is holder-bound at this ingress.
+        // Never send it to a remote replica as a transferable bearer; only a
+        // co-located worker receives Model's audience-pinned internal order.
+        if ctx.is_federate_admitted() {
+            return None;
+        }
         Self::remote_relay_bearer_for_claims(ctx.claims(), ctx.jwt_token())
     }
 
@@ -2427,15 +2438,22 @@ impl ModelHandler for ModelService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
+        if ctx.is_federate_admitted() {
+            anyhow::ensure!(ctx.admitted_federate_operation(resource, operation),
+                "Federate request-local operation mismatch");
+            // The H2 request-use RPC has already performed the fresh Policy
+            // check for this exact original holder, resource and operation,
+            // and consumed the shared replay key. Generic Policy.check would
+            // authorize this service's identity, not the original caller.
+            return Ok(());
+        }
         let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
             ctx.original_holder_evidence(),
-        )
-        .await
-        .unwrap_or_else(|e| {
+        ).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });
@@ -2782,8 +2800,55 @@ impl ModelService {
 // RequestService Implementation — delegates to generated dispatch_model
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Only the generated `infer.generateStream` leaf can use this request-local
+/// Federate admission. The resource is the exact generated authorize value.
+#[cfg(feature = "postgres")]
+fn federate_model_operation(
+    body: &hyprstream_rpc::service::DecodedRequestBody,
+) -> Result<(String, String)> {
+    use hyprstream_rpc_std::model_capnp::{infer_request, model_request};
+    let request = body.root::<model_request::Reader>()?;
+    let infer = match request.which()? {
+        model_request::Which::Infer(inner) => inner?,
+        _ => anyhow::bail!("unsupported Federate Model method"),
+    };
+    anyhow::ensure!(matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
+        "unsupported Federate inference method");
+    let model_ref = infer.get_model_ref()?.to_str()?;
+    anyhow::ensure!(!model_ref.is_empty(), "empty Federate model reference");
+    Ok((format!("model:{model_ref}"), "infer".to_owned()))
+}
+
 #[async_trait(?Send)]
 impl crate::services::RequestService for ModelService {
+    fn accept_deferred_federate_credential(&self) -> bool {
+        #[cfg(feature = "postgres")]
+        { self.federate_dispatch.is_some() }
+        #[cfg(not(feature = "postgres"))]
+        { false }
+    }
+
+    async fn admit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+        proof: &hyprstream_rpc::proof::parser::ParsedProof,
+    ) -> anyhow::Result<(hyprstream_rpc::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+        #[cfg(feature = "postgres")]
+        {
+            let adapter = self.federate_dispatch.as_ref()
+                .ok_or_else(|| anyhow!("Federate dispatch is disabled"))?;
+            let (resource, operation) = federate_model_operation(body)?;
+            let (verified, holder) = adapter.admit(
+                ctx, proof, "model", 0xe7339d5d26ab3076, body.bytes(),
+                &resource, &operation,
+            ).await?;
+            Ok((verified, holder, resource, operation))
+        }
+        #[cfg(not(feature = "postgres"))]
+        { let _ = (ctx, body, proof); anyhow::bail!("Federate dispatch is disabled") }
+    }
+
     fn decode_request_body(
         &self,
         signed_body: &[u8],
@@ -2964,6 +3029,40 @@ impl crate::services::RequestService for ModelService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_model_route_is_exact_generate_stream_and_model_ref() -> Result<()> {
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(1);
+            let mut infer = request.init_infer();
+            infer.set_model_ref("qwen2.5-0.5b-instruct:main");
+            infer.init_generate_stream();
+        })?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert_eq!(federate_model_operation(&body)?,
+            ("model:qwen2.5-0.5b-instruct:main".into(), "infer".into()));
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(2);
+            let mut infer = request.init_infer();
+            infer.set_model_ref("qwen2.5-0.5b-instruct:main");
+            infer.set_status(());
+        })?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(federate_model_operation(&body).is_err());
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(3);
+            request.init_load().set_model_ref("qwen2.5-0.5b-instruct:main");
+        })?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(federate_model_operation(&body).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_config_defaults() {

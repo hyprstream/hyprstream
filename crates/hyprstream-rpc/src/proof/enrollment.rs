@@ -149,10 +149,7 @@ impl SignerSuiteRecord {
     /// credential are all `Rejected`, never downgraded.
     pub fn check_usable(&self, now: u64, proof_exp: u64, role: SignerRole) -> Result<()> {
         if self.revoked {
-            bail!(
-                "enrollment for principal '{}' is revoked",
-                self.principal
-            );
+            bail!("enrollment for principal '{}' is revoked", self.principal);
         }
         if self.role != role {
             bail!(
@@ -204,9 +201,25 @@ impl SignerSuiteRecord {
     /// Approver groups are deliberately excluded, so every allowed approver
     /// subset for the same primary-signed request stays in one namespace.
     pub fn replay_thumbprint(&self) -> [u8; 32] {
-        let keys = self.components.iter().map(|c| c.key.encoded()).collect::<Vec<_>>();
-        super::thumbprint::authenticated(&self.suite_id, &keys, self.epoch)
+        let keys = self
+            .components
+            .iter()
+            .map(|c| c.key.encoded())
+            .collect::<Vec<_>>();
+        authenticated_replay_namespace(&self.suite_id, &keys, self.epoch)
     }
+}
+
+/// Compute the same authenticated-proof namespace from an already trusted
+/// active session's ordered raw component keys and positive database epoch.
+/// Policy uses this to compare the verifier's proof-derived namespace before
+/// consuming durable replay; this function is a hash, not proof verification.
+pub fn authenticated_replay_namespace(
+    suite: &str,
+    ordered_public_keys: &[Vec<u8>],
+    epoch: u64,
+) -> [u8; 32] {
+    super::thumbprint::authenticated(suite, ordered_public_keys, epoch)
 }
 
 // ---------------------------------------------------------------------------

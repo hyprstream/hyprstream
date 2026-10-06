@@ -295,6 +295,7 @@ where
         );
         return dispatch_denied(&format!("claims verification: {e}"));
     }
+    let deferred_federate = ctx.deferred_federate_credential().is_some();
 
     // Proof-CWT structural parse and profile gates (§5.2: parse canonical COSE
     // and proof payload under bounds, then bind the service coordinate and
@@ -313,8 +314,12 @@ where
         // signatures. Signature verification and replay admission run after
         // policy evaluation, immediately before handler entry.
         let parsed = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
-            let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
-                    .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
+            let proof = if deferred_federate {
+                crate::proof::parser::ParsedProof::parse_deferred_federate_request(proof_cwt)
+            } else {
+                crate::proof::parser::ParsedProof::parse(proof_cwt)
+            }
+            .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
 
             // CRITICAL: only request proofs are valid in request dispatch.
             if proof.kind != crate::proof::ProofKind::Request {
@@ -443,7 +448,7 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let verified_proof = match parsed_proof.as_ref() {
+    let mut verified_proof = if deferred_federate { None } else { match parsed_proof.as_ref() {
         None => None,
         Some(proof) => {
             let authority = (|| -> Result<crate::proof::verify::VerifiedProof> {
@@ -519,7 +524,7 @@ where
                 }
             }
         }
-    };
+    }};
 
     // 2d. The ONE bounded decode of the request body (§5.2 step 4). The
     // service's generated decoder decodes the signed bytes exactly once and
@@ -527,8 +532,9 @@ where
     // then feeds the generated method policy below, the dispatch MAC PEP, and
     // finally the handler — no dispatch component re-reads discriminants and
     // no second decode with different traversal or resource limits can select
-    // a handler. Deliberately placed after signature verification so
-    // unauthenticated garbage cannot trigger Cap'n Proto decode work.
+    // a handler. Ordinary requests reach this after proof verification.
+    // Deferred Federate requests have a verified host JWT and signed envelope;
+    // the narrow hook below verifies the original holder against this body.
     let decoded_body = match service.decode_request_body(&payload) {
         Ok(body) => body,
         Err(e) => {
@@ -540,6 +546,37 @@ where
             return dispatch_denied("dispatch denied");
         }
     };
+
+    if deferred_federate {
+        let Some(proof) = parsed_proof.as_ref() else {
+            return dispatch_denied("Federate holder proof missing");
+        };
+        let recipients_match = proof
+            .claims
+            .federate_recipient_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                binding.matches(
+                    ctx.response_kem_recipient(),
+                    ctx.stream_kem_recipient(),
+                    ctx.ephemeral_pubkey(),
+                )
+            });
+        if !recipients_match {
+            return dispatch_denied("Federate recipient binding denied");
+        }
+        let (verified, holder_ed, resource, operation) = match service
+            .admit_deferred_federate_request(&ctx, &decoded_body, proof)
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => return dispatch_denied("Federate request admission denied"),
+        };
+        if ctx.commit_deferred_federate(&verified, holder_ed, resource, operation).is_err() {
+            return dispatch_denied("Federate holder/subject mismatch");
+        }
+        verified_proof = Some(verified);
+    }
 
     // 2e. Generated per-method signature policy (§5.2 step 5, §4.4). The
     // decoded leaf — not the caller — decides whether this method may be
@@ -661,6 +698,9 @@ where
     // 2e. Replay admission (§5.2 step 7). Deliberately last: the pipeline
     // admits the replay key only after policy evaluation, so rejected and
     // denied requests never consume store capacity.
+    // Federate's H1 replay key was consumed in the request-local Policy RPC;
+    // its session-bound namespace is not eligible for this generic store.
+    if !deferred_federate {
     if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
       let proof_admission = (|| -> Result<()> {
         // Gate 3: Challenge validation (unattributed proofs only).
@@ -751,6 +791,7 @@ where
         );
         return dispatch_denied("dispatch denied");
       }
+    }
     }
 
     // 3. Handle request — from the same decoded body the policy and MAC
