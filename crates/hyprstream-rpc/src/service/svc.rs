@@ -160,6 +160,13 @@ pub struct EnvelopeContext {
     /// future dynamic proof consumer from constructing an authority handle
     /// from merely parsed, legacy or partially verified claims.
     direct_jwt_verified: bool,
+    /// A signature-verified reserved Federate JWT awaiting its original-holder
+    /// proof and Policy admission. It confers no identity before commit.
+    deferred_federate: Option<(crate::auth::Claims, Subject)>,
+    /// Installed only after the H3b hybrid proof and durable Policy admission.
+    /// The envelope signer may be a relay and is never the caller's assurance.
+    federate_holder_ed: Option<[u8; 32]>,
+    federate_request_use: Option<(String, String)>,
     /// Bearer relayed by an authenticated service; deny-by-default.
     delegation_token: Option<String>,
 
@@ -313,6 +320,9 @@ impl EnvelopeContext {
             verified_tenant: None,
             jwt_token: envelope.jwt_token().map(ToOwned::to_owned),
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: envelope.delegation_token.clone(),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -345,6 +355,9 @@ impl EnvelopeContext {
             verified_tenant: Some("local".to_owned()),
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: envelope.envelope.delegation_token.clone(),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
@@ -381,6 +394,9 @@ impl EnvelopeContext {
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
@@ -431,6 +447,9 @@ impl EnvelopeContext {
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: crate::envelope::Subject::anonymous(),
             jwt_subject: None,
@@ -534,10 +553,11 @@ impl EnvelopeContext {
     /// deliberately refused.
     #[must_use]
     pub fn authenticated_signer_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
-        if !self.is_authenticated() || self.cnf == [0u8; 32] {
+        let ed = self.federate_holder_ed.unwrap_or(self.cnf);
+        if !self.is_authenticated() || ed == [0u8; 32] {
             return None;
         }
-        ed25519_dalek::VerifyingKey::from_bytes(&self.cnf).ok()
+        ed25519_dalek::VerifyingKey::from_bytes(&ed).ok()
     }
 
     /// Return this request's self-certifying pairwise DID.
@@ -587,6 +607,9 @@ impl EnvelopeContext {
             verified_tenant: None,
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: subject,
             jwt_subject: None,
@@ -675,6 +698,12 @@ impl EnvelopeContext {
     /// [`crate::auth::mac::SubjectContextClaims::security_context`].
     #[must_use]
     pub fn verified_key_material(&self) -> crate::auth::mac::VerifiedKeyMaterial {
+        // A completed Federate request proved the original holder's hybrid
+        // suite. The envelope signer may be a relay: its key must not supply
+        // the caller's MAC assurance or subject-keyed identity.
+        if self.federate_holder_ed.is_some() {
+            return crate::auth::mac::VerifiedKeyMaterial::PqHybrid;
+        }
         // The callback-service path mints a context with a zeroed cnf and no
         // real envelope — there is no signature to derive assurance from. Floor
         // to Unverified so the S1 dominance check denies anything above the
@@ -754,6 +783,61 @@ impl EnvelopeContext {
             return None;
         }
         Some((self.claims.as_ref()?, self.jwt_token.as_deref()?))
+    }
+
+    /// Signature-verified reserved credential awaiting dynamic holder proof,
+    /// current session and Policy request-use admission. This is evidence only;
+    /// `subject()`, `domain()` and `claims()` remain unpublished meanwhile.
+    pub fn deferred_federate_credential(&self) -> Option<(&crate::auth::Claims, &str)> {
+        let (claims, _) = self.deferred_federate.as_ref()?;
+        Some((claims, self.jwt_token.as_deref()?))
+    }
+
+    /// Original verified-envelope proof bytes, still untrusted until the
+    /// appropriate signer-suite verifier authenticates them.
+    pub fn request_proof_cwt(&self) -> Option<&[u8]> {
+        self.envelope_proof_cwt.as_deref()
+    }
+
+    pub(crate) fn commit_deferred_federate(
+        &mut self,
+        verified: &crate::proof::verify::VerifiedProof,
+        holder_ed: [u8; 32],
+        resource: String,
+        operation: String,
+    ) -> anyhow::Result<()> {
+        let (claims, subject) = self.deferred_federate.take()
+            .ok_or_else(|| anyhow::anyhow!("no deferred Federate credential"))?;
+        anyhow::ensure!(
+            holder_ed != [0; 32]
+                && claims.cnf_key_bytes() == Some(holder_ed)
+                && verified.primary_principal.as_deref() == Some(claims.sub.as_str())
+                && verified.primary_suite == "hs-cose-sign-ed25519-mldsa65-wns-v1"
+                && subject.name() == Some(claims.sub.as_str())
+                && claims.tenant.as_deref().is_some_and(|tenant| !tenant.is_empty() && tenant != "*")
+                && !resource.is_empty()
+                && !operation.is_empty(),
+            "Federate holder/subject/profile mismatch"
+        );
+        self.verified_tenant = claims.tenant.clone();
+        self.jwt_subject = Some(subject);
+        self.claims = Some(claims);
+        self.federate_holder_ed = Some(holder_ed);
+        self.federate_request_use = Some((resource, operation));
+        // This is not the ordinary cnf-to-envelope direct JWT provenance;
+        // keep `verified_direct_jwt()` unavailable to downstream consumers.
+        Ok(())
+    }
+
+    /// Exact request-local Policy-use coordinate, never a reusable permit.
+    /// A serving handler must compare every generated authorization call with
+    /// this tuple and perform its ordinary fresh Policy check as well.
+    pub fn admitted_federate_operation(&self, resource: &str, operation: &str) -> bool {
+        self.federate_request_use.as_ref().is_some_and(|(r, a)| r == resource && a == operation)
+    }
+
+    pub fn is_federate_admitted(&self) -> bool {
+        self.federate_request_use.is_some()
     }
 
     /// Check if request has user context
@@ -1089,6 +1173,27 @@ pub trait RequestService: 'static {
     /// enabling this must pin an independently configured controller key.
     fn accept_delegated_bearer(&self, _signer_pubkey: &[u8; 32]) -> bool {
         false
+    }
+
+    /// Opt in only when this serving instance has a complete request-local
+    /// holder-proof, current-primary and durable Policy-use adapter. Default
+    /// false preserves the generic verifier's reserved-profile denial.
+    fn accept_deferred_federate_credential(&self) -> bool {
+        false
+    }
+
+    /// Admit one decoded Federate request before identity publication, MAC,
+    /// replay bypass and handler entry. Implementations must bind the original
+    /// holder's hybrid proof to the exact body/leaf/resource/action, resolve
+    /// the current session and consume durable Policy replay. The default
+    /// never confers a caller identity.
+    async fn admit_deferred_federate_request(
+        &self,
+        _ctx: &EnvelopeContext,
+        _body: &crate::service::DecodedRequestBody,
+        _proof: &crate::proof::parser::ParsedProof,
+    ) -> anyhow::Result<(crate::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+        anyhow::bail!("Federate request admission is disabled")
     }
 
     /// Verify an `iw+jwt` internal execution work order presented as the
@@ -1463,8 +1568,48 @@ pub trait RequestService: 'static {
         // after complete request-local proof and authority admission exists.
         if verified.hs_session_authority_generation.is_some()
             || verified.is_reserved_federate_staging_credential() {
-            verified.session_authority_generation()?;
-            anyhow::bail!("Federate session dispatch is disabled");
+            let generation = verified.session_authority_generation()?;
+            anyhow::ensure!(
+                self.accept_deferred_federate_credential()
+                    && matches!(self.name(), "registry" | "model")
+                    && verified.is_reserved_federate_staging_credential()
+                    && generation.is_some_and(|value| value != [0; 32])
+                    && protected.typ == "at+jwt"
+                    && !ctx.is_local_caller
+                    && !delegated
+                    && ctx.delegation_token.is_none()
+                    && ctx.jwt_token.as_deref() == Some(token.as_str())
+                    && verified.jti.as_deref().is_some_and(|id| !id.is_empty()),
+                "Federate session dispatch is disabled or malformed"
+            );
+            let local = key_source.local_issuers();
+            let local_refs: Vec<&str> = local.iter().map(String::as_str).collect();
+            anyhow::ensure!(
+                crate::auth::is_local_iss(&verified.iss, &local_refs),
+                "Federate host issuer is not local"
+            );
+            let jti = verified.jti.as_deref().ok_or_else(|| anyhow::anyhow!("missing Federate jti"))?;
+            let revocations = self.credential_revocation_store()
+                .ok_or_else(|| anyhow::anyhow!("Federate revocation authority unavailable"))?;
+            anyhow::ensure!(
+                !revocations.is_revoked(&crate::auth::CredentialId::jwt(&verified.iss, jti)).await,
+                "Federate credential revoked"
+            );
+            if let Some(expected) = ctx.envelope_wit_hash {
+                use sha2::{Digest, Sha256};
+                use subtle::ConstantTimeEq as _;
+                let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+                anyhow::ensure!(bool::from(expected.ct_eq(&actual)), "Federate wth mismatch");
+            }
+            let subject = verified.subject(&local_refs);
+            anyhow::ensure!(
+                !subject.is_federated() && subject.name() == Some(verified.sub.as_str()),
+                "Federate subject is not local"
+            );
+            // No subject, tenant, claims or key cache is published. The
+            // dispatcher must complete original-holder proof + Policy use.
+            ctx.deferred_federate = Some((verified, subject));
+            return Ok(());
         }
 
         // Credential/session checks. The local-issuer set is resolved first:
@@ -1933,6 +2078,7 @@ mod empty_iss_gate_tests {
         /// Pinned controller key for `iw+jwt` internal work admission
         /// (mirrors the Inference subprocessor adapter shape).
         internal_controller: Option<ed25519_dalek::VerifyingKey>,
+        federate_opt_in: bool,
     }
 
     #[async_trait(?Send)]
@@ -1952,7 +2098,10 @@ mod empty_iss_gate_tests {
             Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
         }
         fn name(&self) -> &str {
-            "mock"
+            if self.federate_opt_in { "model" } else { "mock" }
+        }
+        fn accept_deferred_federate_credential(&self) -> bool {
+            self.federate_opt_in
         }
         fn transport(&self) -> &TransportConfig {
             &self.transport
@@ -2038,6 +2187,9 @@ mod empty_iss_gate_tests {
             verified_tenant: None,
             jwt_token: Some(token),
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -2055,6 +2207,43 @@ mod empty_iss_gate_tests {
             internal_work: None,
             is_local_caller,
         }
+    }
+
+    #[test]
+    fn deferred_federate_identity_stays_unpublished_until_exact_holder_commit() {
+        let holder = SigningKey::from_bytes(&[41; 32]).verifying_key().to_bytes();
+        let relay = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
+        let claims = Claims::new("alice".into(), 1, 100)
+            .with_tenant("tenant-a".into())
+            .with_scope(Some("query:model:qwen2.5-0.5b-instruct query:registry:List".into()))
+            .with_cnf_jwk(&holder);
+        let mut ctx = ctx_with_token("signature-verified-token".into(), false);
+        ctx.cnf = relay;
+        ctx.deferred_federate = Some((claims, Subject::new("alice")));
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(ctx.domain().is_err());
+        assert!(ctx.security_context().is_none());
+        assert!(ctx.verified_direct_jwt().is_none());
+        let proof = crate::proof::verify::VerifiedProof {
+            replay_thumbprint: [1; 32],
+            primary_principal: Some("alice".into()),
+            primary_suite: "hs-cose-sign-ed25519-mldsa65-wns-v1".into(),
+            approvers: vec![],
+        };
+        let mut wrong = ctx.clone();
+        assert!(wrong.commit_deferred_federate(&proof, relay,
+            "registry:List".into(), "query".into()).is_err());
+        assert!(wrong.subject().is_anonymous());
+        assert!(ctx.commit_deferred_federate(&proof, holder,
+            "registry:List".into(), "query".into()).is_ok());
+        assert_eq!(ctx.subject().name(), Some("alice"));
+        assert_eq!(ctx.domain().unwrap(), "tenant-a");
+        assert_eq!(ctx.authenticated_signer_key().unwrap().to_bytes(), holder);
+        assert_eq!(ctx.verified_key_material(), crate::auth::mac::VerifiedKeyMaterial::PqHybrid);
+        assert!(ctx.admitted_federate_operation("registry:List", "query"));
+        assert!(!ctx.admitted_federate_operation("registry:Get", "query"));
+        assert!(ctx.verified_direct_jwt().is_none());
     }
 
     /// `verify_claims` fails closed on jti-bearing, issuer-bearing tokens
@@ -2086,6 +2275,7 @@ mod empty_iss_gate_tests {
             relay: None,
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
+            federate_opt_in: false,
         };
         (svc, ca)
     }
@@ -2201,6 +2391,45 @@ mod empty_iss_gate_tests {
         assert!(svc.verify_claims(&mut ctx).await.is_err());
         assert!(ctx.subject().is_anonymous());
         assert!(ctx.claims().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opted_in_federate_jwt_is_deferred_and_marker_stripping_denies() {
+        let (mut svc, ca) = mock_service();
+        svc.federate_opt_in = true;
+        svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            crate::auth::claims::FEDERATE_STAGING_HOST.into(),
+        ));
+        let holder = SigningKey::from_bytes(&[41; 32]).verifying_key().to_bytes();
+        let relay = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".into(), now, now + 300)
+            .with_issuer(crate::auth::claims::FEDERATE_STAGING_HOST.into())
+            .with_audience(Some(crate::auth::claims::FEDERATE_STAGING_HOST.into()))
+            .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
+            .with_tenant("tenant-a".into())
+            .with_sid("sid-a")
+            .with_scope(Some("query:registry:List".into()))
+            .with_cnf_jwk(&holder)
+            .with_session_authority_generation([7; 32]);
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
+        ctx.cnf = relay;
+        svc.verify_claims(&mut ctx).await.expect("reserved JWT snapshot may defer");
+        assert!(ctx.deferred_federate_credential().is_some());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(ctx.verified_direct_jwt().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
+
+        let mut stripped = claims;
+        stripped.hs_session_authority_generation = None;
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&stripped, &ca), false);
+        ctx.cnf = relay;
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.deferred_federate_credential().is_none());
+        assert!(ctx.subject().is_anonymous());
         assert!(svc.cached_subjects.lock().is_empty());
     }
 
@@ -2421,6 +2650,7 @@ mod empty_iss_gate_tests {
             relay: None,
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
+            federate_opt_in: false,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -2460,6 +2690,7 @@ mod empty_iss_gate_tests {
             relay: None,
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
+            federate_opt_in: false,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -2500,6 +2731,7 @@ mod empty_iss_gate_tests {
             relay: None,
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
+            federate_opt_in: false,
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -2579,6 +2811,7 @@ mod empty_iss_gate_tests {
             relay: None,
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
+            federate_opt_in: false,
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -2695,6 +2928,7 @@ mod empty_iss_gate_tests {
             relay: None,
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
+            federate_opt_in: false,
         };
         let now = chrono::Utc::now().timestamp();
         // Local-issuer credentials must carry a credential ID (jti is a
@@ -2955,6 +3189,9 @@ mod ipc_key_identity_tests {
             verified_tenant: None,
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -3261,6 +3498,9 @@ mod accounting_audit_tests {
             verified_tenant: None,
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::new(name),
             jwt_subject: None,
@@ -3323,6 +3563,9 @@ mod accounting_audit_tests {
             verified_tenant: None,
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -3395,6 +3638,9 @@ mod accounting_audit_tests {
             verified_tenant: None,
             jwt_token: None,
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -3748,6 +3994,9 @@ mod internal_work_routing_tests {
             verified_tenant: None,
             jwt_token: Some(token),
             direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,

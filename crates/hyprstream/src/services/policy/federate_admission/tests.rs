@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 
 const STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
 const STAGING_SCOPE: &str = "infer:model:qwen2.5-0.5b-instruct:main";
+const REGISTRY_LIST_SCOPE: &str = "query:registry:List";
 
 struct Accounts(RwLock<UserProfile>);
 #[async_trait::async_trait]
@@ -322,6 +323,34 @@ async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
     let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
     assert_eq!(decision.scopes, [STAGING_SCOPE]);
     assert_eq!(decision.scopes[0], STAGING_SCOPE);
+}
+
+#[tokio::test]
+async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
+    let (mut service, _, ctx) = fixture().await;
+    let authority = service.authority.as_mut().unwrap();
+    authority.profile.client_scopes.insert(REGISTRY_LIST_SCOPE.into());
+    authority.profile.resource_scopes.insert(REGISTRY_LIST_SCOPE.into());
+    authority.policy.add_policy_with_domain(
+        "alice", "tenant", "registry:List", "query", "allow",
+    ).await.unwrap();
+    let source_record = source();
+    let decision = service.prepare(&ctx, &source_record, &[REGISTRY_LIST_SCOPE.into()]).await.unwrap();
+    assert_eq!(decision.scopes, [REGISTRY_LIST_SCOPE]);
+    let session = session(&decision);
+    let authority = service.authority.as_ref().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    authority.authorize_use(&session, &source_record.issuer, &source_record.subject,
+        "registry:List", "query", now).await.unwrap();
+    for (resource, operation) in [
+        ("registry:Get", "query"),
+        ("registry:List", "write"),
+        ("model:qwen2.5-0.5b-instruct:main", "infer"),
+    ] {
+        assert!(authority.authorize_use(&session, &source_record.issuer,
+            &source_record.subject, resource, operation, now).await.is_err(),
+            "Registry-only session admitted {resource}/{operation}");
+    }
 }
 
 #[tokio::test]
