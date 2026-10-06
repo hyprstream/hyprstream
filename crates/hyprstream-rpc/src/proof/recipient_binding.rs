@@ -130,6 +130,7 @@ fn commitment(recipient: &RecipientPublic) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
 
     #[test]
     fn recipient_binding_rejects_omitted_and_malformed_fields() {
@@ -146,5 +147,68 @@ mod tests {
             (key(3), CborValue::Bytes(vec![0x33; 31])),
         ]);
         assert!(FederateRecipientBinding::decode(&malformed_client_dh).is_err());
+    }
+
+    #[test]
+    fn recipient_binding_matches_only_the_forwarded_recipient_set() -> Result<()> {
+        let response = generate_recipient(SuiteId::HyKemX25519MlKem768)?.public();
+        let stream = generate_recipient(SuiteId::HyKemX25519MlKem768)?.public();
+        let replacement = generate_recipient(SuiteId::HyKemX25519MlKem768)?.public();
+        let client_dh = [0x33; 32];
+        let binding = FederateRecipientBinding::from_recipients(
+            Some(&response),
+            Some(&stream),
+            Some(client_dh),
+        )?;
+
+        assert!(binding.matches(Some(&response), Some(&stream), Some(client_dh)));
+        assert!(!binding.matches(Some(&replacement), Some(&stream), Some(client_dh)));
+        assert!(!binding.matches(Some(&response), Some(&replacement), Some(client_dh)));
+        assert!(!binding.matches(None, Some(&stream), Some(client_dh)));
+        assert!(!binding.matches(Some(&response), None, Some(client_dh)));
+        assert!(!binding.matches(Some(&response), Some(&stream), None));
+        assert!(!binding.matches(Some(&response), Some(&stream), Some([0x44; 32])));
+        Ok(())
+    }
+
+    #[test]
+    fn recipient_binding_decodes_only_a_closed_three_field_map() -> Result<()> {
+        let key = |value: i64| CborValue::Integer(value.into());
+        let valid = CborValue::Map(vec![
+            (key(1), CborValue::Bytes(vec![0x11; 32])),
+            (key(2), CborValue::Null),
+            (key(3), CborValue::Bytes(vec![0x33; 32])),
+        ]);
+        assert_eq!(
+            FederateRecipientBinding::decode(&valid)?,
+            FederateRecipientBinding {
+                response: Some([0x11; 32]),
+                stream: None,
+                client_dh_public: Some([0x33; 32]),
+            }
+        );
+
+        let duplicate = CborValue::Map(vec![
+            (key(1), CborValue::Null),
+            (key(1), CborValue::Null),
+            (key(2), CborValue::Null),
+            (key(3), CborValue::Null),
+        ]);
+        assert!(FederateRecipientBinding::decode(&duplicate).is_err());
+
+        let unknown = CborValue::Map(vec![
+            (key(1), CborValue::Null),
+            (key(2), CborValue::Null),
+            (key(4), CborValue::Null),
+        ]);
+        assert!(FederateRecipientBinding::decode(&unknown).is_err());
+
+        let wrong_type = CborValue::Map(vec![
+            (key(1), CborValue::Text("not bytes".into())),
+            (key(2), CborValue::Null),
+            (key(3), CborValue::Null),
+        ]);
+        assert!(FederateRecipientBinding::decode(&wrong_type).is_err());
+        Ok(())
     }
 }

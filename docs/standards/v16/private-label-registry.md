@@ -76,6 +76,16 @@ These are credential claim keys: a proof CWT that carries any of −70005…−7
 denies (they are not in the proof's closed claim set), and a credential CWT that
 carries a proof claim key (−70001…−70004) is equally malformed.
 
+### Draft Federate-only extension: −70009
+
+The disabled deferred-Federate source path uses proof claim **−70009** for
+`federate_recipient_binding`. It is not allocated in the frozen generic v16
+claim set: that parser MUST reject it. The draft
+[`federate-session-v1.md`](federate-session-v1.md) specifies its closed
+three-key map, explicit null values, envelope-recipient comparison, and
+negative-vector requirements. Do not treat this source-only extension as a
+generic claim or production-closed allocation before its exact-delta review.
+
 ## 3. COSE header parameters (−70100 … −70103)
 
 | Label | Name | Type | Bucket | Presence rule | Semantics |

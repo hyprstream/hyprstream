@@ -23,6 +23,7 @@ artifact. No value here is PROPOSED any longer.
 | [`canonical-vectors.md`](canonical-vectors.md) | Human index of the positive and negative vectors, with the deny rule each negative exercises |
 | [`vectors/`](vectors) | Machine-readable vectors: 11 positive, 66 negative, the seeded test keys, the replay-namespace thumbprint vectors (`proof-v1-thumbprints.json`), and the authenticated credential context (`proof-v1-credentials.json`: the frozen `verifier_now` clock, the issuer-signed at+jwt tokens the authenticated positives hash, the configured trusted issuer, the typed JWT/CWT credential-revocation store with signed CWT controls, and the signed CWT workload-session controls) |
 | [`credential-profile.md`](credential-profile.md) | JWT/CWT credential claims table, credential/session identifier rules, Reusable-only credential use (OneShotTransaction deferred), revocation semantics |
+| [`federate-session-v1.md`](federate-session-v1.md) | Draft, opt-in Federate OAuth `PoP` + hybrid COSE request-proof extension; not part of the frozen generic v16 gate or enabled runtime |
 | [`tools/`](tools) | `validate_profile.py` (the mechanical validation gate), `gen_proof_vectors.py` (reproducible generator), `check_proof_vectors.py` (vector verifier), and `requirements.txt` (pinned deps) |
 
 **Prerequisite:** the generator and checker shell out to **OpenSSL 3.5 or newer**

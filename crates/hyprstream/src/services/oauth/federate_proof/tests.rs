@@ -37,7 +37,7 @@ fn host_claims() -> Claims {
         .with_sid("sid-a")
         .with_scope(Some("query:registry:List".into()))
         .with_cnf_jwk(&ed)
-        .with_cnf_hs_signer_suite(
+        .with_federate_signer_suite(
             URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(SUITE, &[&ed, &pq])),
         )
         .with_session_authority_generation([7; 32]);
@@ -75,6 +75,15 @@ fn h3b_verified_host_snapshot_requires_complete_exact_signed_facts() {
     assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
     let mut bad = valid.clone();
     bad.cnf.as_mut().unwrap().jkt = Some("alternate-holder".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.hs_profile = None;
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.hs_signer_suite_v1 = None;
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.cnf.as_mut().unwrap().hs_signer_suite = bad.hs_signer_suite_v1.take();
     assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
     let mut bad = valid.clone();
     bad.workload_session_id = Some("other-session".into());
