@@ -20,11 +20,14 @@ ambiguous or corrupt records; it does not replace the existing cached caller.
 This source slice adds a fresh current-account, signed-tenant, scope-ceiling,
 and Policy check for one exact Registry/Model operation, plus a PostgreSQL
 primary-record lookup that binds the active session to its unique durable source
-identity. The per-use decision returns no bearer, delegated service credential,
-or reusable permit. Once dispatch wiring exists, each subsequent request or
-distinct tool call must invoke it again. This helper adds no per-token,
-per-chunk, or timer polling; the request/tool handler wiring and stream behavior
-remain unimplemented in this source slice.
+identity. Each call first performs a fresh, server-timed PostgreSQL lookup of
+session/profile/source state, then rechecks current account, signed tenant and
+Policy authority. The lookup fails closed unless schema v3's replay
+`(host,sid,client_id)` index is present. The per-use decision returns no bearer,
+delegated service credential, or reusable permit. Once dispatch wiring exists,
+each subsequent request or distinct tool call must invoke it again. This helper
+adds no per-token, per-chunk, or timer polling; the request/tool handler wiring
+and stream behavior remain unimplemented in this source slice.
 
 The code remains private, uninstalled and default-deny: no RPC route, service
 factory, proof/session constructor, client/host configuration, or runtime switch
@@ -53,6 +56,7 @@ holder proof, then consume v16 request replay before protected dispatch.
    stream may finish; a new request/tool call after the mutation acknowledgement
    must deny. No token/chunk/timer polling is permitted.
 
-The `postgres` feature is only a compile/test boundary here. No route or DB
-connection is installed by this patch. No migration, schema, DB role, AWS/GitLab
-setting, live DB, or runtime state is changed.
+The `postgres` feature is only a compile/test boundary here. This source adds a
+version-3 migration for the bounded replay lookup index; it is not run by the
+crate or applied to any database. No route or DB connection is installed, and
+no DB role, AWS/GitLab setting, live DB, or runtime state is changed.
