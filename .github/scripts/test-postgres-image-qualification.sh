@@ -7,6 +7,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 test_root="$(mktemp -d)"
 cleanup() {
   unlink "${test_root}/postgres-url" 2>/dev/null || true
+  unlink "${test_root}/replay-url" 2>/dev/null || true
   unlink "${test_root}/cargo" 2>/dev/null || true
   unlink "${test_root}/success.log" 2>/dev/null || true
   unlink "${test_root}/failure.log" 2>/dev/null || true
@@ -16,6 +17,8 @@ trap cleanup EXIT
 
 printf '%s\n' 'postgresql://user:private-password@postgres/example' > "${test_root}/postgres-url"
 chmod 0600 "${test_root}/postgres-url"
+printf '%s\n' 'postgresql://user:private-password@postgres/hyprstream_replay_test_1' > "${test_root}/replay-url"
+chmod 0600 "${test_root}/replay-url"
 
 cat > "${test_root}/cargo" <<'EOF'
 #!/usr/bin/env bash
@@ -29,6 +32,11 @@ case " $* " in
     [[ " $* " == *' --features postgres '* ]] || exit 67
     sentinel='pgsql_kv::tests::live_replay_admission_is_cross_handle_once_and_reclaims_expiry'
     ;;
+  *' auth::postgres_replay::tests::scratch_postgres_replay_contract '*)
+    [[ " $* " == *' --ignored '* ]] || exit 68
+    [[ " $* " == *' --features '*postgres-replay* ]] || exit 69
+    sentinel='auth::postgres_replay::tests::scratch_postgres_replay_contract'
+    ;;
   *' services::pds_record_rocksdb::pg_tests::live_ '*) sentinel='services::pds_record_rocksdb::pg_tests::live_two_handle_persistence_and_visibility' ;;
   *) exit 64 ;;
 esac
@@ -39,8 +47,9 @@ chmod 0700 "${test_root}/cargo"
 
 PATH="${test_root}:${PATH}" \
 HYPRSTREAM_POSTGRES_TEST_URL_FILE="${test_root}/postgres-url" \
+HYPRSTREAM_REPLAY_TEST_URL_FILE="${test_root}/replay-url" \
 bash "${repo_root}/.github/scripts/postgres-image-qualification.sh" > "${test_root}/success.log"
-grep -F 'postgres-qualification filter=' "${test_root}/success.log" -c | grep -qx '3'
+grep -F 'postgres-qualification filter=' "${test_root}/success.log" -c | grep -qx '4'
 
 cat > "${test_root}/cargo" <<'EOF'
 #!/usr/bin/env bash
@@ -49,6 +58,7 @@ EOF
 chmod 0700 "${test_root}/cargo"
 if PATH="${test_root}:${PATH}" \
     HYPRSTREAM_POSTGRES_TEST_URL_FILE="${test_root}/postgres-url" \
+    HYPRSTREAM_REPLAY_TEST_URL_FILE="${test_root}/replay-url" \
     bash "${repo_root}/.github/scripts/postgres-image-qualification.sh" \
     > "${test_root}/failure.log" 2>&1; then
   echo 'qualification harness accepted a failed cargo command' >&2
@@ -70,6 +80,7 @@ EOF
 chmod 0700 "${test_root}/cargo"
 if PATH="${test_root}:${PATH}" \
     HYPRSTREAM_POSTGRES_TEST_URL_FILE="${test_root}/postgres-url" \
+    HYPRSTREAM_REPLAY_TEST_URL_FILE="${test_root}/replay-url" \
     bash "${repo_root}/.github/scripts/postgres-image-qualification.sh" \
     > "${test_root}/failure.log" 2>&1; then
   echo 'qualification harness accepted an opt-in skip' >&2

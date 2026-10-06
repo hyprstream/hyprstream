@@ -1975,12 +1975,12 @@ fn install_envelope_verify_config(
 /// The database sees only a SHA-256 digest of a domain-separated replay tuple
 /// and its signed expiry. It never receives a bearer, proof bytes, or request
 /// body. `PgKv::replay_admit` executes the check-and-insert in one transaction.
-#[cfg(feature = "pds-postgres")]
+#[cfg(all(feature = "pds-postgres", not(feature = "postgres-replay")))]
 struct PostgresProofReplayStore {
     kv: hyprstream_pds::pgsql_kv::PgKv,
 }
 
-#[cfg(feature = "pds-postgres")]
+#[cfg(all(feature = "pds-postgres", not(feature = "postgres-replay")))]
 impl PostgresProofReplayStore {
     fn digest(parts: &[&[u8]]) -> [u8; 32] {
         use sha2::{Digest as _, Sha256};
@@ -2004,7 +2004,7 @@ impl PostgresProofReplayStore {
     }
 }
 
-#[cfg(feature = "pds-postgres")]
+#[cfg(all(feature = "pds-postgres", not(feature = "postgres-replay")))]
 impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayStore {
     fn domain_guarantee(&self) -> hyprstream_rpc::proof::admission::ReplayDomainGuarantee {
         hyprstream_rpc::proof::admission::ReplayDomainGuarantee::LinearizableSharedStore
@@ -2051,7 +2051,50 @@ impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayS
 /// here instead — the same trait, a different substrate. Installing this one
 /// across several instances would silently weaken "admitted once per domain"
 /// to "once per node", so the log line below states the guarantee in force.
-fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>, config: Option<&HyprConfig>) {
+/// The optional shared-postgres implementation uses a durable admission table
+/// and role-scoped, CA-pinned PostgreSQL connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofReplayStoreSelection {
+    #[cfg(feature = "postgres-replay")]
+    DedicatedPostgresV1,
+    #[cfg(not(feature = "postgres-replay"))]
+    LegacyPdsPostgres,
+    SingleVerifierMemory,
+    Unavailable,
+}
+
+fn select_proof_replay_store(
+    guarantee: hyprstream_rpc::proof::admission::ReplayDomainGuarantee,
+    legacy_pds_store_available: bool,
+) -> ProofReplayStoreSelection {
+    use hyprstream_rpc::proof::admission::ReplayDomainGuarantee;
+
+    match guarantee {
+        #[cfg(feature = "postgres-replay")]
+        ReplayDomainGuarantee::LinearizableSharedStore => {
+            // The purpose-built v1 store must win even in a binary that also
+            // has the PDS records-role feature compiled in.
+            ProofReplayStoreSelection::DedicatedPostgresV1
+        }
+        #[cfg(not(feature = "postgres-replay"))]
+        ReplayDomainGuarantee::LinearizableSharedStore => {
+            if legacy_pds_store_available {
+                ProofReplayStoreSelection::LegacyPdsPostgres
+            } else {
+                ProofReplayStoreSelection::Unavailable
+            }
+        }
+        ReplayDomainGuarantee::SingleVerifierInstance if !legacy_pds_store_available => {
+            ProofReplayStoreSelection::SingleVerifierMemory
+        }
+        _ => ProofReplayStoreSelection::Unavailable,
+    }
+}
+
+fn install_proof_admission(
+    oauth: Option<&hyprstream_core::config::OAuthConfig>,
+    config: Option<&HyprConfig>,
+) {
     use hyprstream_rpc::proof::admission::{
         set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
         ProofReplayStore, ReplayDomainGuarantee,
@@ -2059,6 +2102,9 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
     use hyprstream_rpc::proof::challenge::{
         ChallengeManager, DEFAULT_CHALLENGE_OVERLAP_SECS, DEFAULT_CHALLENGE_WINDOW_SECS,
     };
+
+    #[cfg(feature = "postgres-replay")]
+    let _ = config;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2080,11 +2126,12 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
         ),
     }
 
-    // A configured records-role RDS binding is the safe production default:
-    // every verifier sharing that binding asks PostgreSQL to perform the one
-    // atomic insert. A configured store that cannot open denies; it never
-    // falls back to a per-node map.
-    #[cfg(feature = "pds-postgres")]
+    // The dedicated v1 replay backend has its own schema and login role. When
+    // it is compiled, do not resolve the records-role RDS binding here: the
+    // later shared-postgres branch must select PostgresProofReplayStore from
+    // its dedicated URL/CA files. Retain the historical PDS-backed adapter
+    // only for pds-postgres builds that do not include postgres-replay.
+    #[cfg(all(feature = "pds-postgres", not(feature = "postgres-replay")))]
     let shared_store: Option<Box<dyn ProofReplayStore>> = match config {
         Some(config) => match config.rds.resolved_from_env() {
             Ok(rds) if rds.is_configured() => match rds.connect_replay_admission() {
@@ -2102,7 +2149,9 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
         },
         None => None,
     };
-    #[cfg(not(feature = "pds-postgres"))]
+    #[cfg(feature = "postgres-replay")]
+    let shared_store: Option<Box<dyn ProofReplayStore>> = None;
+    #[cfg(all(not(feature = "pds-postgres"), not(feature = "postgres-replay")))]
     let shared_store: Option<Box<dyn ProofReplayStore>> = {
         if let Some(config) = config {
             match config.rds.resolved_from_env() {
@@ -2179,6 +2228,7 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
                 }
             }
         }
+        Some("shared-postgres") => Some(ReplayDomainGuarantee::LinearizableSharedStore),
         Some(other) => {
             tracing::error!(
                 "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
@@ -2191,7 +2241,8 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
         None => {
             tracing::warn!(
                 "no HYPRSTREAM_REPLAY_ADMISSION_DOMAIN declared; proof replay admission \
-                 is not installed and proof-bearing requests will deny. Set \
+                 is not installed and proof-bearing requests will deny. Declare \
+                 'shared-postgres' for a configured shared replay database, or \
                  'single-verifier-instance' only when this node is the sole verifier \
                  for its service domain."
             );
@@ -2290,21 +2341,36 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>,
     // Partitioned by disposition, fail-closed on capacity: an unexpired
     // accepted record is never evicted to make room.
     const REPLAY_CAPACITY_PER_PARTITION: usize = 100_000;
-    let store: Box<dyn ProofReplayStore> = match (guarantee, shared_store) {
-        (ReplayDomainGuarantee::LinearizableSharedStore, Some(store)) => store,
-        (ReplayDomainGuarantee::SingleVerifierInstance, None) => Box::new(
+    let selection = select_proof_replay_store(guarantee, shared_store.is_some());
+    let store: Box<dyn ProofReplayStore> = match selection {
+        #[cfg(not(feature = "postgres-replay"))]
+        ProofReplayStoreSelection::LegacyPdsPostgres => match shared_store {
+            Some(store) => store,
+            None => {
+                tracing::error!("configured PDS replay store disappeared; admission denies");
+                return;
+            }
+        },
+        ProofReplayStoreSelection::SingleVerifierMemory => Box::new(
             InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
         ),
-        (other, _) => {
-            tracing::error!("no replay store implementation for {other:?}; admission denies");
+        #[cfg(feature = "postgres-replay")]
+        ProofReplayStoreSelection::DedicatedPostgresV1 => {
+            match hyprstream_core::auth::postgres_replay::PostgresProofReplayStore::from_env() {
+                Ok(store) => Box::new(store),
+                Err(error) => {
+                    tracing::error!("shared Postgres replay admission unavailable; admission denies: {error:#}");
+                    return;
+                }
+            }
+        }
+        ProofReplayStoreSelection::Unavailable => {
+            tracing::error!("no replay store implementation for {guarantee:?}; admission denies");
             return;
         }
     };
     if set_global_proof_replay_store(store).is_ok() {
-        tracing::info!(
-            "proof replay store installed: operator-declared {guarantee:?}, \
-             {REPLAY_CAPACITY_PER_PARTITION} records per partition"
-        );
+        tracing::info!("proof replay store installed: operator-declared {guarantee:?}");
     }
 }
 
@@ -5888,5 +5954,42 @@ mod config_load_failure_tests {
         };
         assert!(error.to_string().contains("Failed to load default-location configuration"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod proof_replay_store_selection_tests {
+    use super::{select_proof_replay_store, ProofReplayStoreSelection};
+    use hyprstream_rpc::proof::admission::ReplayDomainGuarantee;
+
+    #[cfg(feature = "postgres-replay")]
+    #[test]
+    fn dedicated_shared_store_wins_over_a_configured_pds_store() {
+        assert_eq!(
+            select_proof_replay_store(ReplayDomainGuarantee::LinearizableSharedStore, true),
+            ProofReplayStoreSelection::DedicatedPostgresV1,
+        );
+    }
+
+    #[cfg(all(feature = "pds-postgres", not(feature = "postgres-replay")))]
+    #[test]
+    fn pds_only_build_retains_legacy_shared_store() {
+        assert_eq!(
+            select_proof_replay_store(ReplayDomainGuarantee::LinearizableSharedStore, true),
+            ProofReplayStoreSelection::LegacyPdsPostgres,
+        );
+    }
+
+    #[cfg(not(any(feature = "pds-postgres", feature = "postgres-replay")))]
+    #[test]
+    fn shared_domain_without_a_backend_fails_closed() {
+        assert_eq!(
+            select_proof_replay_store(ReplayDomainGuarantee::LinearizableSharedStore, false),
+            ProofReplayStoreSelection::Unavailable,
+        );
+        assert_eq!(
+            select_proof_replay_store(ReplayDomainGuarantee::SingleVerifierInstance, false),
+            ProofReplayStoreSelection::SingleVerifierMemory,
+        );
     }
 }

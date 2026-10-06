@@ -413,11 +413,12 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # defaulting to the in-container /build/target for every other invocation
 # (docker-build.yml, build-image.yml).
 ARG CARGO_TARGET_DIR=/build/target
+ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb \
+    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features "${HYPRSTREAM_FEATURES}" \
     && mkdir -p /out \
     && cp "${CARGO_TARGET_DIR:-/build/target}/release/hyprstream" /out/hyprstream
 

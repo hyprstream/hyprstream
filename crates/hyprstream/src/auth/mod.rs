@@ -25,6 +25,8 @@ mod cipher_glue;
 pub mod pglite_store;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
+#[cfg(feature = "postgres-replay")]
+pub mod postgres_replay;
 mod policy_file_adapter;
 mod policy_manager;
 pub mod policy_migration;
