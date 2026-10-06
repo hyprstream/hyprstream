@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyprstream_rpc::{
+    crypto::hybrid_kem::{generate_recipient, SuiteId},
     crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes},
     proof::{
         build::{
@@ -13,7 +14,6 @@ use hyprstream_rpc::{
         enrollment::{authenticated_replay_namespace, InMemoryEnrollmentResolver},
         recipient_binding::FederateRecipientBinding,
     },
-    crypto::hybrid_kem::{generate_recipient, SuiteId},
 };
 use hyprstream_session_store::primary::InventorySource;
 
@@ -502,6 +502,130 @@ async fn h3b_holder_components_and_exact_credential_body_schema_service() {
 }
 
 #[tokio::test]
+async fn h3b_generated_request_root_type_ids_accept_and_file_ids_deny() {
+    let registry_body = hyprstream_rpc::serialize_message(|message| {
+        let mut request =
+            message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+        request.set_id(11);
+        request.set_list(());
+    })
+    .unwrap();
+    crate::services::generated::registry_client::decode_registry_request_body(&registry_body)
+        .unwrap();
+
+    let model_body = hyprstream_rpc::serialize_message(|message| {
+        let mut request =
+            message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+        request.set_id(12);
+        request
+            .init_status()
+            .set_model_ref("qwen2.5-0.5b-instruct:main");
+    })
+    .unwrap();
+    crate::services::generated::model_client::decode_model_request_body(&model_body).unwrap();
+
+    for (service, body, root_type_id, file_id) in [
+        (
+            "registry",
+            registry_body.as_slice(),
+            crate::services::registry::FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID,
+            0xb8f6_11bc_0de9_988b,
+        ),
+        (
+            "model",
+            model_body.as_slice(),
+            crate::services::model::FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID,
+            0xe733_9d5d_26ab_3076,
+        ),
+    ] {
+        assert_ne!(
+            root_type_id, file_id,
+            "{service} file ID is not its request root ID"
+        );
+        let (handle, record, inventory) = fixture();
+        let static_enrollments = InMemoryEnrollmentResolver::new();
+        let permits = Semaphore::new(1);
+        let policy = LocalPolicy {
+            inventory: &inventory,
+            static_enrollments: &static_enrollments,
+            in_flight: &permits,
+        };
+        let consumer = Consumer {
+            provider: Some(provider(record)),
+        };
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let pq = ml_dsa_sk_from_seed(&[42; 32]);
+        let kids =
+            session_primary_kids(&ed.verifying_key().to_bytes(), &ml_dsa_sk_to_vk_bytes(&pq));
+        let signer = AuthenticatedHybridProofSigner::new(ed, kids[0], pq, kids[1]).unwrap();
+        let binding = FederateRecipientBinding::from_recipients(None, None, None).unwrap();
+        let signed = build_authenticated_hybrid_request_proof(
+            &AuthenticatedRequestProofInput {
+                service_domain: service,
+                credential: TOKEN,
+                issued_at: NOW,
+                expires_at: NOW + 20,
+                capnp_schema_id: root_type_id,
+                capnp_body: body,
+                response_binding: None,
+                federate_recipient_binding: Some(&binding),
+            },
+            &signer,
+        )
+        .unwrap();
+        let accepted = Request {
+            proof: &signed,
+            credential: TOKEN,
+            service,
+            schema_id: root_type_id,
+            body,
+        };
+        consumer
+            .verify(&handle, &accepted, &policy, || NOW)
+            .await
+            .unwrap();
+        let wrong_file_id = Request {
+            schema_id: file_id,
+            ..accepted
+        };
+        assert_eq!(
+            consumer
+                .verify(&handle, &wrong_file_id, &policy, || NOW)
+                .await
+                .unwrap_err(),
+            Error::Denied,
+            "{service} must reject the former file-ID verifier setting"
+        );
+        let signed_file_id = build_authenticated_hybrid_request_proof(
+            &AuthenticatedRequestProofInput {
+                service_domain: service,
+                credential: TOKEN,
+                issued_at: NOW,
+                expires_at: NOW + 20,
+                capnp_schema_id: file_id,
+                capnp_body: body,
+                response_binding: None,
+                federate_recipient_binding: Some(&binding),
+            },
+            &signer,
+        )
+        .unwrap();
+        let wrong_proof = Request {
+            proof: &signed_file_id,
+            ..accepted
+        };
+        assert_eq!(
+            consumer
+                .verify(&handle, &wrong_proof, &policy, || NOW)
+                .await
+                .unwrap_err(),
+            Error::Denied,
+            "{service} must reject a proof signed with the former file ID"
+        );
+    }
+}
+
+#[tokio::test]
 async fn h3b_deadline_and_capacity_deny_without_fallback() {
     let (handle, record, inventory) = fixture();
     let static_enrollments = InMemoryEnrollmentResolver::new();
@@ -513,8 +637,7 @@ async fn h3b_deadline_and_capacity_deny_without_fallback() {
     };
     let bytes = proof(41, 42, TOKEN);
     assert!(
-        hyprstream_rpc::proof::parser::ParsedProof::parse_deferred_federate_request(&bytes)
-            .is_ok(),
+        hyprstream_rpc::proof::parser::ParsedProof::parse_deferred_federate_request(&bytes).is_ok(),
         "capacity and deadline test requires a valid deferred proof"
     );
     let provider = Arc::new(Provider {

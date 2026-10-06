@@ -1833,11 +1833,10 @@ impl RegistryHandler for RegistryService {
 
     async fn handle_list(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
         if ctx.is_federate_admitted() {
-            // H2 admits the Registry.list RPC, but it does not yet expose a
-            // request-bound original-holder query for each model entry. An
-            // authenticated empty list is safe for B; A's pinned entry waits
-            // for that separate exact grant, never the Registry service's
-            // own broad grant.
+            // H2 admits Registry.list but cannot check each entry under the
+            // original holder. Keep catalog browsing empty until Policy has
+            // an authenticated per-entry query. The staging acceptance path
+            // uses exact-pin getByName with its own fresh request admission.
             return Ok(RegistryResponseVariant::ListResult(Vec::new()));
         }
         let repos = match self.handle_list().await {
@@ -3330,13 +3329,26 @@ impl WorktreeHandler for RegistryService {
 }
 
 #[cfg(feature = "postgres")]
+pub(crate) const FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID: u64 =
+    <hyprstream_rpc_std::registry_capnp::registry_request::Reader<'static> as capnp::traits::HasTypeId>::TYPE_ID;
+
+#[cfg(feature = "postgres")]
 fn federate_registry_operation(
     body: &hyprstream_rpc::service::DecodedRequestBody,
+    pin: &crate::services::model::StagingModelPin,
 ) -> Result<(String, String)> {
     use hyprstream_rpc_std::registry_capnp::registry_request;
+    anyhow::ensure!(pin == &crate::services::model::StagingModelPin::reviewed()?,
+        "Federate Registry requires the reviewed staging model pin");
     let request = body.root::<registry_request::Reader>()?;
     match request.which()? {
         registry_request::Which::List(()) => Ok(("registry:List".to_owned(), "query".to_owned())),
+        registry_request::Which::GetByName(name) => {
+            let name = name?.to_str()?;
+            anyhow::ensure!(name == crate::services::model::StagingModelPin::reviewed_repo_name(),
+                "Federate Registry lookup is not the reviewed model repository");
+            Ok((format!("registry:{name}"), "query".to_owned()))
+        }
         _ => anyhow::bail!("unsupported Federate Registry method"),
     }
 }
@@ -3360,9 +3372,11 @@ impl RequestService for RegistryService {
         {
             let adapter = self.federate_dispatch.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Federate dispatch is disabled"))?;
-            let (resource, operation) = federate_registry_operation(body)?;
+            let pin = crate::services::model::StagingModelPin::from_env()?
+                .ok_or_else(|| anyhow::anyhow!("Federate Registry requires a staging model pin"))?;
+            let (resource, operation) = federate_registry_operation(body, &pin)?;
             let (verified, holder) = adapter.admit(
-                ctx, proof, "registry", 0xb8f611bc0de9988b, body.bytes(),
+                ctx, proof, "registry", FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID, body.bytes(),
                 &resource, &operation,
             ).await?;
             Ok((verified, holder, resource, operation))
@@ -3645,23 +3659,55 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn federate_registry_route_admits_only_authenticated_list() -> Result<()> {
+    fn federate_registry_route_admits_only_list_and_exact_pinned_get_by_name() -> Result<()> {
+        let pin = crate::services::model::StagingModelPin::reviewed()?;
         let bytes = hyprstream_rpc::serialize_message(|message| {
             let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
             request.set_id(1);
             request.set_list(());
         })?;
         let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
-        assert_eq!(federate_registry_operation(&body)?,
+        assert_eq!(federate_registry_operation(&body, &pin)?,
             ("registry:List".into(), "query".into()));
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
             let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
             request.set_id(2);
+            request.set_get_by_name(crate::services::model::StagingModelPin::reviewed_repo_name());
+        })?;
+        let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert_eq!(federate_registry_operation(&body, &pin)?,
+            ("registry:qwen2.5-0.5b-instruct".into(), "query".into()));
+
+        for rejected in ["", "attacker", "qwen2.5-0.5b-instruct:main"] {
+            let bytes = hyprstream_rpc::serialize_message(|message| {
+                let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+                request.set_id(3);
+                request.set_get_by_name(rejected);
+            })?;
+            let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+            assert!(federate_registry_operation(&body, &pin).is_err(), "accepted {rejected:?}");
+        }
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(4);
             request.set_get("repo-id");
         })?;
         let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
-        assert!(federate_registry_operation(&body).is_err());
+        assert!(federate_registry_operation(&body, &pin).is_err());
+        let other = crate::services::model::StagingModelPin::new(
+            "other:main", pin.commit)?;
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(5);
+            request.set_list(());
+        })?;
+        let body = crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert!(federate_registry_operation(&body, &other).is_err());
+        let wrong_oid = crate::services::model::StagingModelPin::new(
+            pin.model_ref.clone(), git2::Oid::from_str("0000000000000000000000000000000000000001")?)?;
+        assert!(federate_registry_operation(&body, &wrong_oid).is_err());
         Ok(())
     }
     use crate::auth::PolicyManager;
