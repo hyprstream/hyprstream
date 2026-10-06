@@ -74,7 +74,7 @@ impl CredentialHandle {
         let cnf = claims.cnf.as_ref().ok_or(Error::Denied)?;
         let jwk = cnf.jwk.as_ref().ok_or(Error::Denied)?;
         let ed = claims.cnf_key_bytes().ok_or(Error::Denied)?;
-        let suite = cnf.hs_signer_suite.as_deref().ok_or(Error::Denied)?;
+        let suite = claims.hs_signer_suite_v1.as_deref().ok_or(Error::Denied)?;
         let suite_bytes = URL_SAFE_NO_PAD.decode(suite).map_err(|_| Error::Denied)?;
         let suite_thumbprint: [u8; 32] = suite_bytes.try_into().map_err(|_| Error::Denied)?;
         let generation = claims
@@ -94,6 +94,8 @@ impl CredentialHandle {
             || claims.act.is_some()
             || claims.cap.is_some()
             || cnf.jkt.is_some()
+            || cnf.hs_signer_suite.is_some()
+            || claims.hs_profile.as_deref() != Some(PROFILE)
             || jwk.kty != "OKP"
             || jwk.crv != "Ed25519"
             || URL_SAFE_NO_PAD.encode(ed) != jwk.x

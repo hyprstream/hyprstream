@@ -1573,7 +1573,7 @@ pub trait RequestService: 'static {
         // key→subject cache entry; stripping the marker cannot downgrade to a
         // static credential. A future adapter must replace this denial only
         // after complete request-local proof and authority admission exists.
-        if verified.hs_session_authority_generation.is_some()
+        if verified.has_federate_profile_marker()
             || verified.is_reserved_federate_staging_credential() {
             let generation = verified.session_authority_generation()?;
             anyhow::ensure!(
@@ -2381,6 +2381,32 @@ mod empty_iss_gate_tests {
         assert!(ctx.claims().is_none());
         assert!(ctx.verified_direct_jwt().is_none());
         assert!(svc.cached_subjects.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn isolated_federate_profile_claims_cannot_downgrade_to_generic_jwt() {
+        let (svc, ca) = mock_service();
+        let now = chrono::Utc::now().timestamp();
+        for claims in [
+            Claims::new("alice".into(), now, now + 300)
+                .with_federate_signer_suite("fixture-suite".into()),
+            {
+                let mut claims = Claims::new("alice".into(), now, now + 300);
+                claims.hs_profile = Some("federate-session-v1".into());
+                claims
+            },
+            {
+                let mut claims = Claims::new("alice".into(), now, now + 300);
+                claims.hs_signer_suite_v1 = Some("fixture-suite".into());
+                claims
+            },
+        ] {
+            let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), true);
+            assert!(svc.verify_claims(&mut ctx).await.is_err());
+            assert!(ctx.subject().is_anonymous());
+            assert!(ctx.claims().is_none());
+            assert!(svc.cached_subjects.lock().is_empty());
+        }
     }
 
     #[tokio::test]

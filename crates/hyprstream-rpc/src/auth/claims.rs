@@ -59,15 +59,17 @@ pub struct CnfJwk {
 /// - `jwk`: Full OKP JWK object — legacy single-Ed25519 binding (`cnf.jwk`).
 /// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — DPoP user tokens
 ///   (`cnf.jkt`, per RFC 9449 § 6).
-/// - `hs_signer_suite`: the v16 signer-suite content thumbprint (frozen WS-A
+/// - `hs_signer_suite`: the generic v16 signer-suite content thumbprint (frozen WS-A
 ///   credential-profile §1.1/§5) — base64url(SHA-256(det-CBOR `[suite_id,
-///   [ordered raw component public keys]]`)). This is the ONLY confirmation
-///   method that can bind a **hybrid** (multi-key) primary signer group, and it
-///   also covers a classical (single-key) group; a v16 dispatch credential MUST
+///   [ordered raw component public keys]]`)). In the frozen generic v16 profile,
+///   this is the ONLY confirmation method for a **hybrid** (multi-key) primary
+///   signer group; it also covers a classical (single-key) group. A generic v16
+///   dispatch credential MUST
 ///   carry it. Computed via [`crate::auth::signer_suite_thumbprint`] — the one
 ///   shared helper mint (WS-B) and verify (WS-C) both use. Legacy `jwk`/`jkt`
 ///   are preserved ALONGSIDE it where those protocols still require them; adding
-///   `hs_signer_suite` never overwrites them.
+///   `hs_signer_suite` never overwrites them. The opt-in Federate subprofile
+///   instead has one `cnf.jwk` key and a top-level `hs_signer_suite_v1` digest.
 ///
 /// All fields are optional so the struct serialises correctly for each mode.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -161,6 +163,15 @@ pub struct Claims {
     /// JWT-only: an envelope claims field cannot assert session authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hs_session_authority_generation: Option<String>,
+    /// Exact opt-in Federate PoP/COSE subprofile. This is not authority on its
+    /// own; the reserved host path must verify the signed issuer and holder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_profile: Option<String>,
+    /// Federate-only top-level commitment to the ordered hybrid signer suite.
+    /// Unlike generic v16 `cnf.hs_signer_suite`, this is not a second RFC 7800
+    /// confirmation method: `cnf.jwk` remains the sole confirmation key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_suite_v1: Option<String>,
     /// Workload credential family session ID (`workload_session_id`) — a
     /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
     /// credentials of an enrolled workload family (e.g. a service-JWT
@@ -267,6 +278,8 @@ impl std::fmt::Debug for Claims {
             .field("jti", &self.jti)
             .field("sid", &self.sid)
             .field("hs_session_authority_generation", &self.hs_session_authority_generation)
+            .field("hs_profile", &self.hs_profile)
+            .field("hs_signer_suite_v1", &self.hs_signer_suite_v1)
             .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
             .field("client_id", &self.client_id)
@@ -370,6 +383,8 @@ impl FromCapnp for Claims {
             // the envelope Claims surface does not carry them.
             sid: None,
             hs_session_authority_generation: None,
+            hs_profile: None,
+            hs_signer_suite_v1: None,
             workload_session_id: None,
             aud,
             client_id: None,
@@ -432,6 +447,8 @@ impl Claims {
             jti: None,
             sid: None,
             hs_session_authority_generation: None,
+            hs_profile: None,
+            hs_signer_suite_v1: None,
             workload_session_id: None,
             aud: None,
             client_id: None,
@@ -505,6 +522,22 @@ impl Claims {
     pub fn is_reserved_federate_staging_credential(&self) -> bool {
         self.iss == FEDERATE_STAGING_HOST
             && self.client_id.as_deref() == Some(FEDERATE_STAGING_CLIENT)
+    }
+
+    /// Any signed Federate-only marker takes the deferred, fail-closed path;
+    /// stripping one marker cannot reinterpret the remaining token as generic.
+    pub fn has_federate_profile_marker(&self) -> bool {
+        self.hs_session_authority_generation.is_some()
+            || self.hs_profile.is_some()
+            || self.hs_signer_suite_v1.is_some()
+    }
+
+    /// Stamp the exact Federate profile and its ordered hybrid-suite digest.
+    /// Issuers must still commit session admission before signing the JWT.
+    pub fn with_federate_signer_suite(mut self, thumbprint_b64url: String) -> Self {
+        self.hs_profile = Some("federate-session-v1".to_owned());
+        self.hs_signer_suite_v1 = Some(thumbprint_b64url);
+        self
     }
 
     /// Set the workload credential family session ID
@@ -843,6 +876,30 @@ mod tests {
         assert!(decoded.has_scope("atproto"));
         assert!(decoded.has_scope("transition:generic"));
         Ok(())
+    }
+
+    #[test]
+    fn federate_profile_has_one_cnf_key_and_top_level_hybrid_commitment() {
+        let ed = [0x01; 32];
+        let claims = Claims::new("alice".to_owned(), 1000, 1300)
+            .with_cnf_jwk(&ed)
+            .with_federate_signer_suite(
+                "n47qkIMqPn-EuRo0YmrWkGFyyCY0UmVhKE19Bxbtt0U".to_owned(),
+            );
+        let json = serde_json::to_value(&claims).unwrap();
+        assert_eq!(json["hs_profile"], "federate-session-v1");
+        assert_eq!(
+            json["hs_signer_suite_v1"],
+            "n47qkIMqPn-EuRo0YmrWkGFyyCY0UmVhKE19Bxbtt0U"
+        );
+        assert_eq!(json["cnf"].as_object().unwrap().len(), 1);
+        assert_eq!(json["cnf"]["jwk"]["kty"], "OKP");
+        assert_eq!(json["cnf"]["jwk"]["crv"], "Ed25519");
+        assert_eq!(json["cnf"]["jwk"]["x"], "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE");
+        assert!(json["cnf"].get("hs_signer_suite").is_none());
+        assert!(json["cnf"].get("jkt").is_none());
+        let decoded: Claims = serde_json::from_value(json).unwrap();
+        assert!(decoded.has_federate_profile_marker());
     }
 
     #[test]

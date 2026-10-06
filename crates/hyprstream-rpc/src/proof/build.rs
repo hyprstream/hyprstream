@@ -94,6 +94,19 @@ pub fn build_authenticated_hybrid_request_proof(
     input: &AuthenticatedRequestProofInput<'_>,
     signer: &AuthenticatedHybridProofSigner,
 ) -> Result<Vec<u8>> {
+    // The public producer never accepts caller-selected replay identifiers.
+    let mut request_id: RequestId = [0; super::REQUEST_ID_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    build_authenticated_hybrid_request_proof_with_id(input, signer, request_id)
+}
+
+// Private seam for a reproducible signed test vector. Production always enters
+// through the public builder above and generates its own request ID.
+fn build_authenticated_hybrid_request_proof_with_id(
+    input: &AuthenticatedRequestProofInput<'_>,
+    signer: &AuthenticatedHybridProofSigner,
+    request_id: RequestId,
+) -> Result<Vec<u8>> {
     crate::envelope::validate_service_domain(input.service_domain)?;
     if input.credential.is_empty() {
         bail!("request proof: credential bytes must not be empty");
@@ -106,11 +119,6 @@ pub fn build_authenticated_hybrid_request_proof(
         );
     }
     let credential_hash: CredentialHash = Sha256::digest(input.credential).into();
-    // The replay identifier is producer-generated, never caller selected.
-    // It is the only v16 request ID and is later recovered from the proof for
-    // response correlation.
-    let mut request_id: RequestId = [0; super::REQUEST_ID_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut request_id);
     let payload = encode_claims(input, credential_hash, request_id)?;
     let body_protected = encode_body_protected(&signer.ed25519_kid, &signer.ml_dsa_65_kid)?;
     let ed_protected = encode_signature_protected(ALG_ED25519, &signer.ed25519_kid)?;
@@ -518,6 +526,68 @@ mod tests {
             ParsedProof::parse_deferred_federate_request(&bytes).is_ok(),
             "only the deferred Federate parser accepts -70009"
         );
+    }
+
+    #[test]
+    fn federate_signed_proof_vector_is_stable_and_profile_isolated() {
+        use crate::crypto::hybrid_kem::{SuiteId, recipient_from_seeds};
+
+        let (signer, resolver, cnf) = fixture();
+        let suite = SuiteId::HyKemX25519MlKem768;
+        let response = recipient_from_seeds(suite, &[&[7; 32], &[9; 64]])
+            .unwrap()
+            .public();
+        let stream = recipient_from_seeds(suite, &[&[8; 32], &[10; 64]])
+            .unwrap()
+            .public();
+        let binding = FederateRecipientBinding::from_recipients(
+            Some(&response),
+            Some(&stream),
+            Some([0x5a; 32]),
+        )
+        .unwrap();
+        let mut request = input(b"federate-proof-vector-v1");
+        request.federate_recipient_binding = Some(&binding);
+        let bytes = build_authenticated_hybrid_request_proof_with_id(
+            &request,
+            &signer,
+            [0x3c; super::super::REQUEST_ID_SIZE],
+        )
+        .unwrap();
+        let proof = ParsedProof::parse_deferred_federate_request(&bytes).unwrap();
+        assert_eq!(proof.claims.federate_recipient_binding, Some(binding));
+        assert!(ParsedProof::parse(&bytes).is_err());
+        verify_proof_signatures(&proof, Some(&cnf), Some(&resolver), NOW).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&bytes)),
+            "186b33dad6d4b41ed750b0d05e408dcaa78e708c33abac7bf4c2778bcf6826d6"
+        );
+
+        let omitted = mutate_payload(&bytes, |claims| {
+            claims.retain(|(key, _)| {
+                *key != CborValue::Integer(CLAIM_FEDERATE_RECIPIENT_BINDING.into())
+            });
+        });
+        assert!(ParsedProof::parse_deferred_federate_request(&omitted).is_err());
+
+        let substituted = mutate_payload(&bytes, |claims| {
+            let (_, CborValue::Map(fields)) = claims
+                .iter_mut()
+                .find(|(key, _)| *key == CborValue::Integer(CLAIM_FEDERATE_RECIPIENT_BINDING.into()))
+                .unwrap()
+            else {
+                panic!("Federate recipient map missing")
+            };
+            fields[0].1 = CborValue::Bytes(vec![0xff; 32]);
+        });
+        let changed = ParsedProof::parse_deferred_federate_request(&substituted).unwrap();
+        assert!(!changed
+            .claims
+            .federate_recipient_binding
+            .as_ref()
+            .unwrap()
+            .matches(Some(&response), Some(&stream), Some([0x5a; 32])));
+        assert!(verify_proof_signatures(&changed, Some(&cnf), Some(&resolver), NOW).is_err());
     }
 
     #[test]
