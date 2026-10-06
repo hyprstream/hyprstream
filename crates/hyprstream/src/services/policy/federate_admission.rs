@@ -5,7 +5,7 @@
 #![allow(dead_code)] // Source-only slice; no runtime installer is exposed.
 
 use super::{EnvelopeContext, PolicyManager};
-use crate::auth::{service_enrollment::ServiceEnrollmentManifest, ProductionUserStore};
+use crate::auth::{postgres_store::PolicyAccountReader, service_enrollment::ServiceEnrollmentManifest};
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{
@@ -56,7 +56,7 @@ struct PossessionEvidence {
 }
 
 struct Authorities {
-    users: ProductionUserStore,
+    users: PolicyAccountReader,
     accounts: Arc<hyprstream_pds_service::AccountRecordStore>,
     policy: Arc<PolicyManager>,
     enrollment: Arc<ServiceEnrollmentManifest>,
