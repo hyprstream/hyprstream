@@ -6975,6 +6975,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
  "shellexpand",

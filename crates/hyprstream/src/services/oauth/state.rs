@@ -270,6 +270,32 @@ mod tests {
     use hyprstream_rpc::crypto::CryptoPolicy;
     use rand::rngs::OsRng;
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_issuer_is_disabled_at_construction() {
+        assert!(state_for_replay_barrier_tests().federate_issuer.is_none());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_routes_deny_without_policy_adapter() {
+        let state = Arc::new(state_for_replay_barrier_tests());
+        let challenge = super::super::federate_host::challenge(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(challenge.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let exchange = super::super::federate_host::exchange(
+            &state,
+            &axum::http::HeaderMap::new(),
+            b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+        )
+        .await;
+        assert_eq!(exchange.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     fn state_with_user_store(store: Arc<dyn UserStore>) -> OAuthState {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
@@ -1075,6 +1101,10 @@ impl RefreshTokenEntry {
 
 /// Shared OAuth server state.
 pub struct OAuthState {
+    /// Exact Federate host exchange remains disabled until an authenticated
+    /// Policy admission adapter and composite signer are installed together.
+    #[cfg(feature = "postgres")]
+    pub(crate) federate_issuer: Option<Arc<super::federate_host::FederateIssuer>>,
     /// Dynamically-registered (RFC 7591) clients keyed by issued UUID
     /// client_id. CIMD clients live in `cimd_cache` instead — DCR
     /// entries have no TTL and outlive cache evictions, so storage is
@@ -1332,6 +1362,8 @@ impl OAuthState {
         verifying_key_bytes: [u8; 32],
     ) -> Self {
         Self {
+            #[cfg(feature = "postgres")]
+            federate_issuer: None,
             clients: RwLock::new(HashMap::new()),
             pending_authorize_bindings: RwLock::new(HashMap::new()),
             cimd_cache: Arc::new(super::cimd_cache::CimdCache::new(

@@ -71,3 +71,25 @@ direct enrolled OAuth service caller, while the production provider slot stays
 The handle must not become a reusable delegated credential for Registry or
 Model. Their admission uses separate holder proof and current Policy checks
 at every protected request or distinct tool call.
+
+## OAuth-side adapter and activation boundary
+
+`oauth::federate_policy::PolicyFederateAdmission` converts the issuer's
+verified source and possession types to the two typed Policy RPCs. It uses
+checked time conversions, requires the exact requested-scope echo and a
+canonical granted subset, keeps the 32-byte handle server-side, and rejects
+a committed receipt with different Ed/PQ keys or an invalid proof epoch.
+`OAuthService` does not construct or install it: its Federate issuer slot
+remains absent and the browser routes return 503. The adapter is not an
+alternative signer or a fallback Policy authority.
+
+Before installation, Policy needs a complete collision inventory with an
+authoritative required source-ID list, the exact serving generation and
+fixed scope ceilings, a signed PDS account mount with mandatory MAC audit
+sink, and separately provisioned scoped account-reader and session-writer
+PostgreSQL logins. The current best-effort `foreign_protocol_keys` collector
+cannot prove inventory completeness because it skips unreadable sources;
+feeding its result to `CollisionInventory::from_sources` would be unsafe.
+Staging IaC does not yet project those Policy role URLs or provision the
+session generation/profile. The runtime factory must remain default-off until
+these are made source-controlled and validated together.
