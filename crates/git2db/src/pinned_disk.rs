@@ -35,6 +35,7 @@ const RAMFS_MAGIC: libc::c_long = 0x8584_58f6;
 struct BlobEntry {
     path: PathBuf,
     oid: Oid,
+    source_size: u64,
 }
 
 /// Exact-tree files backed by disk, but not by the selected worktree.
@@ -133,7 +134,7 @@ impl DiskPinnedTreeProjection {
             &mut entries,
             &mut visited_entries,
         )?;
-        let projected_bytes = preflight_projection(&repo, &entries, private_disk_parent)?;
+        let projected_bytes = preflight_projection(&repo, &mut entries, private_disk_parent)?;
         if entries.len() > MAX_FILES {
             return Err(internal(format!(
                 "model tree exceeds {MAX_FILES} file limit"
@@ -166,9 +167,10 @@ impl DiskPinnedTreeProjection {
             let source_path = payload_dir.join(format!("{index}.git"));
             let source_git_dir = git_dir.clone();
             let source_oid = entry.oid;
+            let source_size = entry.source_size;
             let source_copy = source_path.clone();
             let size = tokio::task::spawn_blocking(move || {
-                stream_verified_blob(&source_git_dir, source_oid, &source_copy)
+                stream_verified_blob(&source_git_dir, source_oid, source_size, &source_copy)
             })
             .await
             .map_err(|e| internal(format!("Git stream task failed: {e}")))??;
@@ -335,20 +337,21 @@ fn verify_object(repo: &Repository, oid: Oid, expected: ObjectType) -> Git2DBRes
 /// pointer sizes before creating any projection files or streaming large blobs.
 fn preflight_projection(
     repo: &Repository,
-    entries: &[BlobEntry],
+    entries: &mut [BlobEntry],
     parent: &Path,
 ) -> Git2DBResult<u64> {
     let odb = repo
         .odb()
         .map_err(|e| internal(format!("open projection ODB: {e}")))?;
     let mut total = 0u64;
-    for entry in entries {
+    for entry in entries.iter_mut() {
         let (blob_size, kind) = odb
             .read_header(entry.oid)
             .map_err(|e| internal(format!("read model blob size {}: {e}", entry.oid)))?;
         if kind != ObjectType::Blob {
             return Err(internal("model tree object ceased to be a blob"));
         }
+        entry.source_size = blob_size as u64;
         let mut size = blob_size as u64;
         if blob_size <= 4096 {
             let blob = odb
@@ -470,6 +473,7 @@ fn collect_entries(
                 entries.push(BlobEntry {
                     path,
                     oid: entry.id(),
+                    source_size: 0,
                 });
             }
             _ => {
@@ -483,7 +487,12 @@ fn collect_entries(
     Ok(())
 }
 
-fn stream_verified_blob(git_dir: &Path, oid: Oid, destination: &Path) -> Git2DBResult<u64> {
+fn stream_verified_blob(
+    git_dir: &Path,
+    oid: Oid,
+    preflight_size: u64,
+    destination: &Path,
+) -> Git2DBResult<u64> {
     let mut child = Command::new(GIT_CLI)
         .arg("cat-file")
         .arg("--batch")
@@ -526,12 +535,20 @@ fn stream_verified_blob(git_dir: &Path, oid: Oid, destination: &Path) -> Git2DBR
         if fields.next().is_some() {
             return Err(internal("Git blob header has extra fields"));
         }
+        // The ODB may change between libgit2's preflight and this independent
+        // Git CLI read. Reject before creating a payload, and never write more
+        // than the preflighted size even if the stream changes underneath us.
+        if size != preflight_size {
+            return Err(internal(format!(
+                "Git blob size changed after preflight: expected {preflight_size}, got {size}"
+            )));
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(destination)
             .map_err(|e| internal(format!("create private payload: {e}")))?;
-        let copied = std::io::copy(&mut output.by_ref().take(size), &mut file)
+        let copied = std::io::copy(&mut output.by_ref().take(preflight_size), &mut file)
             .map_err(|e| internal(format!("stream Git blob: {e}")))?;
         if copied != size {
             return Err(internal(format!(
@@ -906,8 +923,26 @@ mod tests {
         let repo = Repository::init(dir.path().join("repo")).map_err(internal)?;
         let other = repo.blob(b"other").map_err(internal)?;
         let destination = dir.path().join("wrong-oid");
-        assert!(stream_verified_blob(repo.path(), other, &destination).is_ok());
-        assert!(stream_verified_blob(repo.path(), oid, &dir.path().join("missing-oid")).is_err());
+        assert!(stream_verified_blob(repo.path(), other, 5, &destination).is_ok());
+        assert!(
+            stream_verified_blob(repo.path(), oid, 8, &dir.path().join("missing-oid")).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_rejects_larger_blob_than_preflight_before_writing() -> Git2DBResult<()> {
+        let dir = tempfile::tempdir().map_err(internal)?;
+        let repo = Repository::init(dir.path().join("repo")).map_err(internal)?;
+        let oid = repo
+            .blob(b"larger-than-the-preflighted-blob")
+            .map_err(internal)?;
+        let destination = dir.path().join("must-not-exist");
+        assert!(stream_verified_blob(repo.path(), oid, 1, &destination).is_err());
+        assert!(
+            !destination.exists(),
+            "oversized Git blob must be rejected before file creation"
+        );
         Ok(())
     }
 

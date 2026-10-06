@@ -3,8 +3,50 @@
 use anyhow::{ensure, Context, Result};
 use git2::{Oid, StatusOptions};
 use git2db::pinned_disk::DiskPinnedTreeProjection;
+use git2db::pinned_tree::{PinnedTree, SealedTreeProjection};
 use std::path::Path;
 use std::sync::Arc;
+
+/// Retain the selected commit's verified inputs through every loader read.
+/// Only the fixed staging profile needs the disk-backed, capacity-limited path.
+#[derive(Debug)]
+pub enum PinnedModelArtifact {
+    StagingDisk(DiskPinnedTreeProjection),
+    Sealed { projection: SealedTreeProjection, owner_pid: u32 },
+}
+
+impl PinnedModelArtifact {
+    pub fn commit(&self) -> Oid {
+        match self {
+            Self::StagingDisk(artifact) => artifact.commit(),
+            Self::Sealed { projection, .. } => projection.commit(),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        match self {
+            Self::StagingDisk(artifact) => artifact.root(),
+            Self::Sealed { projection, .. } => projection.root(),
+        }
+    }
+
+    pub fn file_count(&self) -> usize {
+        match self {
+            Self::StagingDisk(artifact) => artifact.file_count(),
+            Self::Sealed { projection, .. } => projection.file_count(),
+        }
+    }
+
+    pub fn ensure_current_process(&self) -> Result<()> {
+        match self {
+            Self::StagingDisk(artifact) => artifact.ensure_current_process()?,
+            Self::Sealed { owner_pid, .. } => {
+                ensure!(*owner_pid == std::process::id(), "sealed pinned projection cannot cross a process boundary");
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Admit only the selected, clean checkout of `commit`, then capture the
 /// requested Git tree independently of worktree bytes. The second checkout
@@ -13,30 +55,55 @@ use std::sync::Arc;
 pub async fn acquire_pinned_model(
     worktree_path: &Path,
     commit: Oid,
-) -> Result<Arc<DiskPinnedTreeProjection>> {
-    acquire_pinned_model_in(worktree_path, commit, Path::new("/var/cache/hyprstream-pinned")).await
+) -> Result<Arc<PinnedModelArtifact>> {
+    verify_selected_checkout(worktree_path, commit)?;
+    let projection = PinnedTree::acquire(worktree_path, commit)
+        .await
+        .with_context(|| format!("capture model commit {commit}"))?
+        .into_sealed_projection()?;
+    verify_selected_checkout(worktree_path, commit)?;
+    ensure!(
+        projection.commit() == commit,
+        "pinned projection commit mismatch"
+    );
+    Ok(Arc::new(PinnedModelArtifact::Sealed {
+        projection,
+        owner_pid: std::process::id(),
+    }))
 }
 
 /// Bounded single-slot projection lease for the staging admission profile.
 pub async fn acquire_pinned_model_bounded(
     worktree_path: &Path,
     commit: Oid,
-) -> Result<Arc<DiskPinnedTreeProjection>> {
-    acquire_pinned_model_with_observer(
+) -> Result<Arc<PinnedModelArtifact>> {
+    let projection = acquire_pinned_model_with_observer(
         worktree_path,
         commit,
         Path::new("/var/cache/hyprstream-pinned"),
         true,
         || Ok(()),
-    ).await
+    )
+    .await?;
+    Ok(Arc::new(PinnedModelArtifact::StagingDisk(projection)))
 }
 
+#[cfg(test)]
 pub(crate) async fn acquire_pinned_model_in(
     worktree_path: &Path,
     commit: Oid,
     private_disk_parent: &Path,
 ) -> Result<Arc<DiskPinnedTreeProjection>> {
-    acquire_pinned_model_with_observer(worktree_path, commit, private_disk_parent, false, || Ok(())).await
+    Ok(Arc::new(
+        acquire_pinned_model_with_observer(
+            worktree_path,
+            commit,
+            private_disk_parent,
+            false,
+            || Ok(()),
+        )
+        .await?,
+    ))
 }
 
 async fn acquire_pinned_model_with_observer(
@@ -45,20 +112,21 @@ async fn acquire_pinned_model_with_observer(
     private_disk_parent: &Path,
     bounded: bool,
     after_capture: impl FnOnce() -> Result<()>,
-) -> Result<Arc<DiskPinnedTreeProjection>> {
+) -> Result<DiskPinnedTreeProjection> {
     verify_selected_checkout(worktree_path, commit)?;
     let projection = if bounded {
         DiskPinnedTreeProjection::acquire_bounded(worktree_path, commit, private_disk_parent).await
     } else {
         DiskPinnedTreeProjection::acquire(worktree_path, commit, private_disk_parent).await
-    }.with_context(|| format!("capture model commit {commit}"))?;
+    }
+    .with_context(|| format!("capture model commit {commit}"))?;
     after_capture()?;
     verify_selected_checkout(worktree_path, commit)?;
     ensure!(
         projection.commit() == commit,
         "pinned projection commit mismatch"
     );
-    Ok(Arc::new(projection))
+    Ok(projection)
 }
 
 pub fn verify_selected_checkout(worktree_path: &Path, commit: Oid) -> Result<()> {
@@ -95,6 +163,30 @@ pub fn verify_selected_checkout(worktree_path: &Path, commit: Oid) -> Result<()>
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn generic_commit_uses_sealed_projection_without_private_disk_parent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = git2db::Repository::init(dir.path())?;
+        std::fs::write(dir.path().join("config.json"), b"reviewed")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("config.json"))?;
+        index.write()?;
+        let tree = repo.find_tree(index.write_tree()?)?;
+        let sig = git2::Signature::now("test", "test@example.invalid")?;
+        let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
+        drop(tree);
+        drop(repo);
+
+        let artifact = acquire_pinned_model(dir.path(), commit).await?;
+        assert!(matches!(&*artifact, PinnedModelArtifact::Sealed { .. }));
+        std::fs::write(dir.path().join("config.json"), b"changed")?;
+        assert_eq!(
+            std::fs::read(artifact.root().join("config.json"))?,
+            b"reviewed"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn mismatched_or_dirty_checkout_fails_before_artifact_success() -> Result<()> {

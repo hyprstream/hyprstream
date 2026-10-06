@@ -147,7 +147,7 @@ pub struct InferenceServiceInner {
     /// Writable adaptation state is never placed in the sealed base tree.
     state_path: PathBuf,
     /// Retains verified read-only descriptors and their paths through lazy reads.
-    _pinned_artifact: Option<Arc<git2db::pinned_disk::DiskPinnedTreeProjection>>,
+    _pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
     /// Current session ID for events
     session_id: parking_lot::RwLock<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
@@ -480,7 +480,7 @@ impl InferenceService {
     async fn initialize(
         model_path: PathBuf,
         state_path: PathBuf,
-        pinned_artifact: Option<Arc<git2db::pinned_disk::DiskPinnedTreeProjection>>,
+        pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
@@ -3003,7 +3003,7 @@ pub struct InferenceServiceConfig {
     service_name: String,
     model_path: PathBuf,
     state_path: PathBuf,
-    pinned_artifact: Option<Arc<git2db::pinned_disk::DiskPinnedTreeProjection>>,
+    pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
     config: RuntimeConfig,
     server_pubkey: VerifyingKey,
     signing_key: SigningKey,
@@ -3110,7 +3110,7 @@ impl InferenceServiceConfig {
     #[must_use]
     pub fn with_pinned_artifact(
         mut self,
-        artifact: Arc<git2db::pinned_disk::DiskPinnedTreeProjection>,
+        artifact: Arc<crate::storage::pinned_model::PinnedModelArtifact>,
     ) -> Self {
         self.model_path = artifact.root().to_path_buf();
         self.pinned_artifact = Some(artifact);
@@ -3937,7 +3937,6 @@ impl StreamChunkMessage {
 #[cfg(test)]
 mod tenant_binding_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use hyprstream_rpc::auth::mac::{
         Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel,
         VerifiedKeyMaterial,
@@ -3961,9 +3960,7 @@ mod tenant_binding_tests {
         let oid = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
         drop(tree);
         drop(repo);
-        let parent = tempfile::tempdir()?;
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))?;
-        let artifact = crate::storage::pinned_model::acquire_pinned_model_in(dir.path(), oid, parent.path())
+        let artifact = crate::storage::pinned_model::acquire_pinned_model(dir.path(), oid)
             .await?;
         let signing_key = key(3);
         let config = InferenceServiceConfig::new(
