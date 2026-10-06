@@ -123,7 +123,7 @@ run_phase "staging Postgres image-profile contract tests" cargo test "${image_pg
 
 replay_schema_test_args=(-p hyprstream --locked --lib --no-default-features \
     --features "${STAGING_POSTGRES_IMAGE_FEATURES}" -- \
-    auth::postgres_replay::tests::replay_migration_rejects_privileged_or_login_runtime_role)
+    auth::postgres_replay::tests::replay_migration_rejects_any_preexisting_runtime_role)
 assert_tests_selected "staging replay migration contract test" "${replay_schema_test_args[@]}"
 run_phase "staging replay migration contract test" cargo test "${replay_schema_test_args[@]}"
 
