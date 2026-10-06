@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use capnp::traits::HasTypeId;
 use wasm_bindgen::prelude::*;
 
 use hyprstream_rpc::browser_provisioning::{
@@ -23,7 +24,14 @@ use hyprstream_rpc::browser_provisioning::{
 
 use hyprstream_rpc::crypto::VerifyingKey;
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
+use hyprstream_rpc::rpc_client::FederateProofProvider;
+use hyprstream_rpc::proof::{
+    build::{AuthenticatedRequestProofInput, build_authenticated_hybrid_request_proof_with_signer},
+    recipient_binding::FederateRecipientBinding,
+};
+use hyprstream_rpc::envelope::RequestEnvelope;
 use hyprstream_rpc::signer::JsSigner;
+use hyprstream_rpc::transport_traits::Signer;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayload};
 use hyprstream_rpc::web_transport::WtConnection;
 
@@ -93,6 +101,51 @@ impl WasmWtConnection {
 #[wasm_bindgen(js_name = "RpcClient")]
 pub struct WasmRpcClient {
     inner: RpcClientImpl<JsSigner, WtConnection>,
+}
+
+struct BrowserFederateProofProvider {
+    signer: JsSigner,
+    ed_kid: Vec<u8>,
+    pq_kid: Vec<u8>,
+    service_name: String,
+    request_schema_id: u64,
+}
+
+#[async_trait::async_trait(?Send)]
+impl FederateProofProvider for BrowserFederateProofProvider {
+    async fn proof_for(&self, envelope: &RequestEnvelope, capnp_body: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(envelope.delegation_token.is_none(), "Federate proof cannot delegate a bearer");
+        let service = envelope.service_domain.as_deref().ok_or_else(||
+            anyhow::anyhow!("Federate proof requires a canonical service domain"))?;
+        anyhow::ensure!(service == self.service_name, "Federate proof service mismatch");
+        let credential = envelope.jwt_token().ok_or_else(||
+            anyhow::anyhow!("Federate proof requires the host session credential"))?;
+        let issued_at = u64::try_from(envelope.iat).map_err(|_| anyhow::anyhow!(
+            "Federate proof requires a nonnegative request timestamp"))?;
+        let binding = FederateRecipientBinding::from_recipients(
+            envelope.response_kem_recipient.as_ref(),
+            envelope.client_kem_public.as_ref(),
+            envelope.client_dh_public,
+        )?;
+        let input = AuthenticatedRequestProofInput {
+            service_domain: service,
+            credential: credential.as_bytes(),
+            issued_at,
+            expires_at: issued_at.checked_add(30).ok_or_else(|| anyhow::anyhow!(
+                "Federate proof timestamp overflow"))?,
+            capnp_schema_id: self.request_schema_id,
+            capnp_body,
+            // v16 response-proof binding is a separate COSE response model.
+            // Current network responses use the hybrid envelope KEM, which is
+            // committed above by signed -70009; it is not an ML-KEM-only
+            // response-proof recipient.
+            response_binding: None,
+            federate_recipient_binding: Some(&binding),
+        };
+        build_authenticated_hybrid_request_proof_with_signer(
+            &input, &self.signer, &self.ed_kid, &self.pq_kid,
+        ).await
+    }
 }
 
 impl WasmRpcClient {
@@ -277,6 +330,52 @@ impl WasmRpcClient {
         WasmRpcClient {
             inner: self.inner.with_default_jwt(token.to_string()),
         }
+    }
+
+    /// Opt into per-request Federate COSE proofs for a single canonical
+    /// Registry or Model client. These callbacks own the dedicated proof keys;
+    /// envelope-signing callbacks configured at connect time stay separate.
+    #[wasm_bindgen(js_name = "withFederateProofSigner")]
+    pub fn with_federate_proof_signer(
+        self,
+        service_name: &str,
+        ed_pubkey: &[u8],
+        ed_sign_fn: js_sys::Function,
+        pq_pubkey: &[u8],
+        pq_sign_fn: js_sys::Function,
+        ed_kid: &[u8],
+        pq_kid: &[u8],
+    ) -> Result<WasmRpcClient, JsError> {
+        hyprstream_rpc::envelope::validate_service_domain(service_name)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let request_schema_id = match service_name {
+            "registry" => <crate::registry_capnp::registry_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            "model" => <crate::model_capnp::model_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            _ => return Err(JsError::new("Federate proof sender is limited to Registry and Model")),
+        };
+        if ed_pubkey == self.inner.signer.pubkey() {
+            return Err(JsError::new("Federate proof Ed25519 key must differ from the envelope key"));
+        }
+        if self.inner.signer.pq_pubkey().as_deref() == Some(pq_pubkey) {
+            return Err(JsError::new("Federate proof ML-DSA-65 key must differ from the envelope key"));
+        }
+        for (name, kid) in [("Ed25519", ed_kid), ("ML-DSA-65", pq_kid)] {
+            if kid.is_empty() || kid.len() > hyprstream_rpc::proof::MAX_KID_BYTES {
+                return Err(JsError::new(&format!("Federate proof {name} kid must be 1..64 bytes")));
+            }
+        }
+        let signer = JsSigner::new_hybrid(ed_pubkey, ed_sign_fn, pq_pubkey, pq_sign_fn)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let provider = BrowserFederateProofProvider {
+            signer,
+            ed_kid: ed_kid.to_vec(),
+            pq_kid: pq_kid.to_vec(),
+            service_name: service_name.to_owned(),
+            request_schema_id,
+        };
+        Ok(WasmRpcClient {
+            inner: self.inner.with_federate_proof_provider(Arc::new(provider)),
+        })
     }
 
     /// Send a signed request and return the verified response payload (Cap'n Proto bytes).

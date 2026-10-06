@@ -95,7 +95,7 @@ run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 # chromedriver were installed as root by the workflow before this script
 # dropped to the non-root `ci` user (see rust.yml's `build` job), so
 # browser-wasm-test-ci.sh finds them already on PATH and skips straight to
-# resolving + running crates/hyprstream-rpc/tests/wasm_browser_fetch.rs in a
+# resolving + running the browser-fetch and browser-session proof tests in a
 # real headless Chromium — the same required-merge-gate invariant the fast PR
 # `WASM (browser client)` job checks, but the fast job is explicitly skipped
 # on `merge_group` (rust.yml:167), so this is the only required-gate path that

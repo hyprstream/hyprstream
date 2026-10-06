@@ -104,6 +104,19 @@ recipient while forwarding the original browser's request proof. It does not
 prevent a relay from dropping or delaying traffic, nor protect a browser that
 has lost both private keys.
 
+The browser SDK opts in per Registry or Model client with
+`RpcClient.withFederateProofSigner(...)`. It takes callbacks for dedicated
+Ed25519 and ML-DSA-65 proof keys, checks their signatures before sending, and
+derives the request schema ID from the selected service. Proof construction
+occurs after the RPC client creates its response recipient. Claim `-70003`
+contains the application Cap'n Proto bytes that dispatch recovers from the
+browser carrier transcript; claim `-70009` commits the actual finalized
+response, stream, and legacy DH fields. The current network response uses a
+hybrid envelope KEM, so this sender encodes `-70004` as `null` rather than
+inventing a different ML-KEM-only response-proof recipient. Registry and
+Model admission must enforce the same forwarded recipient comparison before
+this sender is enabled in the staging website.
+
 ## Required vectors and activation gate
 
 The source-controlled native signed-proof checksum vector in
