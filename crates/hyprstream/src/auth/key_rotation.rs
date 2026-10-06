@@ -765,18 +765,19 @@ async fn publish_composite_key_set(
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid persisted Ed25519 key length"))?;
         let ed_vk = ed25519_dalek::VerifyingKey::from_bytes(&ed_bytes)?;
-        let ed_signing =
-            if URL_SAFE_NO_PAD.encode(ca_key.verifying_key().to_bytes()) == record.ed25519_public {
-                Some(Arc::clone(&ca_key))
-            } else {
-                ed_slots
-                    .iter()
-                    .find(|slot| {
-                        URL_SAFE_NO_PAD.encode(slot.key.verifying_key().to_bytes())
-                            == record.ed25519_public
-                    })
-                    .map(|slot| Arc::clone(&slot.key))
-            };
+        let policy_ca_ed_matched =
+            URL_SAFE_NO_PAD.encode(ca_key.verifying_key().to_bytes()) == record.ed25519_public;
+        let ed_signing = if policy_ca_ed_matched {
+            Some(Arc::clone(&ca_key))
+        } else {
+            ed_slots
+                .iter()
+                .find(|slot| {
+                    URL_SAFE_NO_PAD.encode(slot.key.verifying_key().to_bytes())
+                        == record.ed25519_public
+                })
+                .map(|slot| Arc::clone(&slot.key))
+        };
         let role = if record.role == "policy" {
             CompositePairRole::Policy
         } else {
@@ -796,7 +797,14 @@ async fn publish_composite_key_set(
         if restoring_committed && state == CompositePairState::Active {
             anyhow::ensure!(
                 pq_signing.is_some() && ed_signing.is_some(),
-                "committed active composite signing pair is unavailable after restart"
+                "committed active composite signing pair is unavailable after restart: \
+                 kid={:?} role={:?} ed_component_available={} pq_component_available={} \
+                 policy_ca_ed_matched={}",
+                record.kid,
+                record.role,
+                ed_signing.is_some(),
+                pq_signing.is_some(),
+                policy_ca_ed_matched,
             );
         }
         pairs.push(match (pq_signing, ed_signing) {
@@ -2346,6 +2354,96 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn committed_active_pair_failure_reports_safe_component_availability() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_DIAGNOSTIC_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::committed_active_pair_failure_reports_safe_component_availability",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let ca = Arc::new(SigningKey::from_bytes(&[0x61; 32]));
+        let ed = SigningKeyStore::new(KeySlots {
+            active: Some(KeySlot::new(
+                SigningKey::from_bytes(&[0x62; 32]),
+                now - 60,
+                now + 3600,
+            )),
+            ..KeySlots::default()
+        });
+        let pq = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            active: Some(ml_dsa_rotation::generate_ml_dsa_slot(now - 60, now + 3600)),
+            ..MlDsaKeySlots::default()
+        });
+        initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+            .await
+            .unwrap();
+        let commit: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
+        let immutable = composite_committed_ledger_path(dir.path(), &commit);
+        let mut ledger: CompositeLedger =
+            serde_json::from_slice(&std::fs::read(&immutable).unwrap()).unwrap();
+        let oauth = ledger
+            .pairs
+            .iter()
+            .find(|pair| pair.role == "oauth" && pair.state == "active")
+            .unwrap();
+
+        let missing_ed = SigningKeyStore::new(KeySlots::default());
+        let error =
+            initialize_composite_key_set(dir.path(), &missing_ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .expect_err("missing committed OAuth Ed component must fail closed");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "committed active composite signing pair is unavailable after restart: \
+                 kid={:?} role={:?} ed_component_available=false pq_component_available=true \
+                 policy_ca_ed_matched=false",
+                oauth.kid, oauth.role,
+            )
+        );
+        assert!(!error.to_string().contains(&oauth.ed25519_public));
+        assert!(!error.to_string().contains(&oauth.ml_dsa_public));
+
+        // Put Policy first in this synthetic committed snapshot so the same
+        // restore check reports its CA match when the PQ component is absent.
+        ledger.pairs.sort_by_key(|pair| pair.role != "policy");
+        std::fs::write(&immutable, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        let policy = ledger
+            .pairs
+            .iter()
+            .find(|pair| pair.role == "policy" && pair.state == "active")
+            .unwrap();
+        let missing_pq = MlDsaSigningKeyStore::new(MlDsaKeySlots::default());
+        let error = initialize_composite_key_set(dir.path(), &ed, &missing_pq, ca, 300)
+            .await
+            .expect_err("missing committed Policy PQ component must fail closed");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "committed active composite signing pair is unavailable after restart: \
+                 kid={:?} role={:?} ed_component_available=true pq_component_available=false \
+                 policy_ca_ed_matched=true",
+                policy.kid, policy.role,
+            )
+        );
+        assert!(!error.to_string().contains(&policy.ed25519_public));
+        assert!(!error.to_string().contains(&policy.ml_dsa_public));
+    }
 
     #[test]
     fn rejected_composite_proposal_rechecks_replaced_component_slot() {
