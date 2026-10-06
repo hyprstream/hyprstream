@@ -24,10 +24,13 @@ const POLICY_SESSION_ROLE_SQL: &str =
      has_table_privilege(current_user, 'federate_session.request_replay', 'INSERT') AND \
      has_column_privilege(current_user, 'federate_session.profile_state', 'lock_version', 'UPDATE') AND \
      has_column_privilege(current_user, 'federate_session.sessions', 'status', 'UPDATE') AND \
-     NOT has_table_privilege(current_user, 'federate_session.profile_state', 'INSERT,DELETE,TRUNCATE') AND \
+     NOT has_any_column_privilege(current_user, 'federate_session.profile_state', 'INSERT') AND \
+     NOT has_table_privilege(current_user, 'federate_session.profile_state', 'DELETE,TRUNCATE') AND \
      NOT has_table_privilege(current_user, 'federate_session.sessions', 'DELETE,TRUNCATE') AND \
-     NOT has_table_privilege(current_user, 'federate_session.replay', 'UPDATE,DELETE,TRUNCATE') AND \
-     NOT has_table_privilege(current_user, 'federate_session.request_replay', 'SELECT,UPDATE,DELETE,TRUNCATE') AND \
+     NOT has_any_column_privilege(current_user, 'federate_session.replay', 'UPDATE') AND \
+     NOT has_table_privilege(current_user, 'federate_session.replay', 'DELETE,TRUNCATE') AND \
+     NOT has_any_column_privilege(current_user, 'federate_session.request_replay', 'SELECT,UPDATE') AND \
+     NOT has_table_privilege(current_user, 'federate_session.request_replay', 'DELETE,TRUNCATE') AND \
      NOT EXISTS (SELECT 1 FROM information_schema.columns c \
        WHERE c.table_schema='federate_session' AND c.table_name='profile_state' \
          AND c.column_name <> 'lock_version' \
@@ -163,7 +166,138 @@ mod tests {
             .batch_execute("CREATE TABLE federate_session.forbidden(id integer)")
             .await
             .is_err());
+        client
+            .batch_execute(
+                "INSERT INTO federate_session.request_replay \
+                 (verified_namespace, request_id, retain_until) \
+                 VALUES (decode(repeat('01',32),'hex'), decode(repeat('02',16),'hex'), 4102444800)",
+            )
+            .await
+            .unwrap();
+        let move_error = client
+            .batch_execute(
+                "UPDATE federate_session.request_replay \
+                 SET request_id = decode(repeat('03',16),'hex')",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            move_error.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        );
+        let duplicate_error = client
+            .batch_execute(
+                "INSERT INTO federate_session.request_replay \
+                 (verified_namespace, request_id, retain_until) \
+                 VALUES (decode(repeat('01',32),'hex'), decode(repeat('02',16),'hex'), 4102444800)",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            duplicate_error.code(),
+            Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        );
         client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(
+                "GRANT UPDATE(request_id) ON federate_session.request_replay TO hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
+        let grants = client
+            .query_one(
+                "SELECT has_table_privilege(current_user, 'federate_session.request_replay', 'UPDATE'), \
+                        has_any_column_privilege(current_user, 'federate_session.request_replay', 'UPDATE')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(!grants.get::<_, bool>(0));
+        assert!(grants.get::<_, bool>(1));
+        let allowed: bool = client
+            .query_one(POLICY_SESSION_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "replay-key column UPDATE must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(
+                "REVOKE UPDATE(request_id) ON federate_session.request_replay FROM hs_policy_runtime; \
+                 GRANT SELECT(request_id) ON federate_session.request_replay TO hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_SESSION_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "request replay column SELECT must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(
+                "REVOKE SELECT(request_id) ON federate_session.request_replay FROM hs_policy_runtime; \
+                 GRANT INSERT(host, profile, enabled, authority_generation, collision_inventory_id) \
+                   ON federate_session.profile_state TO hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_SESSION_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "enabled-profile column INSERT must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(
+                "REVOKE INSERT(host, profile, enabled, authority_generation, collision_inventory_id) \
+                   ON federate_session.profile_state FROM hs_policy_runtime; \
+                 GRANT UPDATE(jti) ON federate_session.replay TO hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_SESSION_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "source replay column UPDATE must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute("REVOKE UPDATE(jti) ON federate_session.replay FROM hs_policy_runtime")
+            .await
+            .unwrap();
+        client
+            .batch_execute(
+                "CREATE ROLE hs_policy_runtime_inherited NOLOGIN; \
+                 GRANT UPDATE(request_id) ON federate_session.request_replay \
+                   TO hs_policy_runtime_inherited; \
+                 GRANT hs_policy_runtime_inherited TO hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_SESSION_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "inherited replay-key UPDATE must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(
+                "REVOKE hs_policy_runtime_inherited FROM hs_policy_runtime; \
+                 REVOKE ALL ON federate_session.request_replay FROM hs_policy_runtime_inherited; \
+                 DROP ROLE hs_policy_runtime_inherited",
+            )
+            .await
+            .unwrap();
         client
             .batch_execute(
                 "GRANT UPDATE(enabled) ON federate_session.profile_state TO hs_policy_runtime; \

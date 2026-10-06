@@ -226,10 +226,14 @@ const POLICY_ACCOUNT_ROLE_SQL: &str =
      has_table_privilege(current_user, 'public.user_encryption_keys', 'SELECT') AND \
      NOT has_schema_privilege(current_user, 'public', 'CREATE') AND \
      NOT has_database_privilege(current_user, current_database(), 'CREATE') AND \
-     NOT has_table_privilege(current_user, 'public.users', 'INSERT,UPDATE,DELETE,TRUNCATE') AND \
-     NOT has_table_privilege(current_user, 'public.oidc_bindings', 'INSERT,UPDATE,DELETE,TRUNCATE') AND \
-     NOT has_table_privilege(current_user, 'public.user_did_bindings', 'INSERT,UPDATE,DELETE,TRUNCATE') AND \
-     NOT has_table_privilege(current_user, 'public.user_encryption_keys', 'INSERT,UPDATE,DELETE,TRUNCATE')";
+     NOT has_any_column_privilege(current_user, 'public.users', 'INSERT,UPDATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.oidc_bindings', 'INSERT,UPDATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.user_did_bindings', 'INSERT,UPDATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.user_encryption_keys', 'INSERT,UPDATE') AND \
+     NOT has_table_privilege(current_user, 'public.users', 'DELETE,TRUNCATE') AND \
+     NOT has_table_privilege(current_user, 'public.oidc_bindings', 'DELETE,TRUNCATE') AND \
+     NOT has_table_privilege(current_user, 'public.user_did_bindings', 'DELETE,TRUNCATE') AND \
+     NOT has_table_privilege(current_user, 'public.user_encryption_keys', 'DELETE,TRUNCATE')";
 
 #[allow(dead_code)]
 impl PolicyAccountReader {
@@ -1829,6 +1833,58 @@ mod tests {
             .await
             .is_err());
         client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!(
+                "GRANT UPDATE(active) ON users TO {role}; SET ROLE {role}"
+            ))
+            .await
+            .unwrap();
+        let grants = client
+            .query_one(
+                "SELECT has_table_privilege(current_user, 'public.users', 'UPDATE'), \
+                        has_any_column_privilege(current_user, 'public.users', 'UPDATE')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(!grants.get::<_, bool>(0));
+        assert!(grants.get::<_, bool>(1));
+        let allowed: bool = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "column-level account UPDATE must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!("REVOKE UPDATE(active) ON users FROM {role}"))
+            .await
+            .unwrap();
+        let inherited = format!("hs_policy_inherited_{}", uuid::Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {inherited} NOLOGIN; \
+                 GRANT INSERT(active) ON users TO {inherited}; \
+                 GRANT {inherited} TO {role}; \
+                 SET ROLE {role}"
+            ))
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "inherited column-level INSERT must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!(
+                "REVOKE {inherited} FROM {role}; \
+                 REVOKE ALL ON users FROM {inherited}; \
+                 DROP ROLE {inherited}"
+            ))
+            .await
+            .unwrap();
         client
             .batch_execute(&format!("GRANT INSERT ON users TO {role}; SET ROLE {role}"))
             .await
