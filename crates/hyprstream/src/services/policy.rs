@@ -146,6 +146,10 @@ pub struct PolicyService {
     /// Source-only: never installed by any runtime factory in H3a.
     #[cfg(feature = "postgres")]
     session_primary: Option<primary::SessionPrimaryReader>,
+    /// Disabled until the authenticated serving adapter and causal RPC tests
+    /// are installed. No constructor currently populates this field.
+    #[cfg(feature = "postgres")]
+    federate_request_use: Option<federate_admission::RequestUseReader>,
     // Business logic
     policy_manager: Arc<PolicyManager>,
     signing_key: Arc<SigningKey>,
@@ -215,6 +219,8 @@ impl PolicyService {
         Self {
             #[cfg(feature = "postgres")]
             session_primary: None,
+            #[cfg(feature = "postgres")]
+            federate_request_use: None,
             policy_manager,
             signing_key,
             jwt_signing_key,
@@ -1201,6 +1207,22 @@ fn validate_credential_hs_suite(
 
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
+    async fn handle_admit_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &hyprstream_rpc_std::policy_client::AdmitFederateRequest,
+    ) -> Result<PolicyResponseVariant> {
+        #[cfg(feature = "postgres")]
+        if let Some(reader) = &self.federate_request_use {
+            if reader.admit(ctx, data).await.is_ok() {
+                return Ok(PolicyResponseVariant::AdmitFederateRequestResult(true));
+            }
+        }
+        let _ = (ctx, data);
+        Ok(PolicyResponseVariant::AdmitFederateRequestResult(false))
+    }
+
     async fn handle_resolve_session_primary(
         &self,
         ctx: &EnvelopeContext,
@@ -4353,6 +4375,39 @@ mod tests {
         };
         assert!(matches!(service.handle_resolve_session_primary(&ctx, 1, &data).await,
             Ok(PolicyResponseVariant::Error(ref error)) if error.code == "SESSION_PRIMARY_DENIED"));
+    }
+
+    #[tokio::test]
+    async fn h2_request_use_rpc_has_no_default_provider_or_replay_write() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:model"),
+            SigningKey::from_bytes(&[77; 32]).verifying_key(),
+        );
+        let data = hyprstream_rpc_std::policy_client::AdmitFederateRequest {
+            issuer: "https://host.test".into(),
+            profile: "federate-session-v1".into(),
+            sid: "sid".into(),
+            subject: "alice".into(),
+            tenant: "tenant".into(),
+            client: "client".into(),
+            audience: "https://host.test".into(),
+            scopes: vec!["query:model:test".into()],
+            ed_public: vec![1; 32],
+            suite_thumbprint: vec![2; 32],
+            generation: vec![3; 32],
+            collision_inventory_id: vec![4; 32],
+            expires_at: 1,
+            proof_epoch: 1,
+            verified_namespace: vec![5; 32],
+            request_id: vec![6; 16],
+            resource: "model:test".into(),
+            operation: "query".into(),
+        };
+        assert!(matches!(
+            service.handle_admit_federate_request(&ctx, 1, &data).await,
+            Ok(PolicyResponseVariant::AdmitFederateRequestResult(false))
+        ));
     }
 
     fn issue(subject: &str) -> IssueToken {

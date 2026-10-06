@@ -5,10 +5,15 @@
 #![allow(dead_code)] // Source-only slice; no runtime installer is exposed.
 
 use super::{EnvelopeContext, PolicyManager};
-use crate::auth::{ProductionUserStore, service_enrollment::ServiceEnrollmentManifest};
-use anyhow::{Result, ensure};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hyprstream_rpc::{Subject, auth::Scope};
+use crate::auth::{service_enrollment::ServiceEnrollmentManifest, ProductionUserStore};
+use anyhow::{ensure, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hyprstream_rpc::{
+    auth::{signer_suite::signer_suite_thumbprint, Scope},
+    proof::enrollment::authenticated_replay_namespace,
+    Subject,
+};
+use hyprstream_rpc_std::policy_client::AdmitFederateRequest;
 use hyprstream_session_store::{Admission, PendingSession, PrimaryRecord, Session, Source, Store};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -68,6 +73,171 @@ struct Authorities {
 struct AdmissionService {
     authority: Option<Authorities>,
     capacity: Option<Semaphore>,
+}
+
+/// Source-only Policy authority for a single protected Registry/Model request.
+/// No runtime factory installs it. The same configured `AdmissionService`
+/// supplies the sole account/tenant/grant owner; serving processes hold only
+/// authenticated Policy clients, never database credentials.
+#[allow(dead_code)]
+pub(super) struct RequestUseReader {
+    admission: Arc<AdmissionService>,
+    pool: deadpool_postgres::Pool,
+    capacity: Semaphore,
+    clock_skew_secs: i64,
+}
+
+impl RequestUseReader {
+    pub(super) async fn admit(
+        &self,
+        ctx: &EnvelopeContext,
+        data: &AdmitFederateRequest,
+    ) -> Result<()> {
+        let authority = self
+            .admission
+            .authority
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Federate authority disabled"))?;
+        let caller = serving_caller(ctx, &authority.enrollment)?;
+        ensure!(
+            (caller == "registry" && data.resource.starts_with("registry:"))
+                || (caller == "model" && data.resource.starts_with("model:")),
+            "serving capability does not cover resource"
+        );
+        ensure!(
+            self.clock_skew_secs >= 0 && self.clock_skew_secs <= 300,
+            "invalid replay retention configuration"
+        );
+        ensure!(
+            !data.sid.is_empty()
+                && data.sid.len() <= 128
+                && !data.subject.is_empty()
+                && data.subject.len() <= 256
+                && !data.tenant.is_empty()
+                && data.tenant.len() <= 256
+                && data.tenant != "*"
+                && data.expires_at > chrono::Utc::now().timestamp(),
+            "invalid or expired verified credential tuple"
+        );
+        canonical_requested(&data.scopes)?;
+        let generation: [u8; 32] = data.generation.as_slice().try_into()?;
+        let inventory: [u8; 32] = data.collision_inventory_id.as_slice().try_into()?;
+        let namespace: [u8; 32] = data.verified_namespace.as_slice().try_into()?;
+        let request_id: [u8; 16] = data.request_id.as_slice().try_into()?;
+        let ed: [u8; 32] = data.ed_public.as_slice().try_into()?;
+        let suite_thumbprint: [u8; 32] = data.suite_thumbprint.as_slice().try_into()?;
+        ensure!(
+            data.issuer == authority.profile.host
+                && data.profile == hyprstream_session_store::PROFILE
+                && data.client == authority.profile.client
+                && data.audience == authority.profile.resource
+                && generation == authority.serving_generation
+                && inventory == authority.local_collision_inventory_id
+                && data.proof_epoch > 0
+                && data.proof_epoch <= i64::MAX as u64,
+            "serving profile mismatch"
+        );
+        let _permit = self.capacity.try_acquire()?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client = self.pool.get().await?;
+            let primary = Store::lookup_primary(
+                &mut client,
+                &authority.profile.host,
+                &data.sid,
+                &generation,
+                &inventory,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session primary inactive"))?;
+            let session = primary.session();
+            ensure!(
+                session.host == data.issuer
+                    && session.sid == data.sid
+                    && session.subject == data.subject
+                    && session.tenant == data.tenant
+                    && session.client_id == data.client
+                    && session.resource == data.audience
+                    && session.scopes == data.scopes
+                    && session.ed_public == ed
+                    && session.generation == generation
+                    && session.collision_inventory_id == inventory
+                    && session.proof_epoch == data.proof_epoch as i64
+                    && session.expires_at >= data.expires_at,
+                "verified credential/session mismatch"
+            );
+            let ordered = [session.ed_public.to_vec(), session.pq_public.clone()];
+            ensure!(
+                signer_suite_thumbprint(
+                    hyprstream_session_store::SUITE,
+                    &[&session.ed_public, &session.pq_public]
+                ) == suite_thumbprint
+                    && authenticated_replay_namespace(
+                        hyprstream_session_store::SUITE,
+                        &ordered,
+                        session.proof_epoch as u64,
+                    ) == namespace,
+                "verified holder namespace mismatch"
+            );
+            let (source_issuer, source_subject) = primary.source_identity();
+            authority
+                .authorize_use(
+                    session,
+                    source_issuer,
+                    source_subject,
+                    &data.resource,
+                    &data.operation,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await?;
+            // One shared writer transaction rechecks active session/profile
+            // under row locks and atomically consumes the proof request ID.
+            Store::consume_request_replay(
+                &mut client,
+                session,
+                &namespace,
+                &request_id,
+                self.clock_skew_secs,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+}
+
+fn serving_caller(
+    ctx: &EnvelopeContext,
+    manifest: &ServiceEnrollmentManifest,
+) -> Result<&'static str> {
+    let subject = ctx.subject();
+    let name = subject
+        .name()
+        .ok_or_else(|| anyhow::anyhow!("serving caller missing"))?;
+    let caller = match name {
+        "service:registry" => "registry",
+        "service:model" => "model",
+        _ => anyhow::bail!("unapproved serving caller"),
+    };
+    let claims = ctx
+        .claims()
+        .ok_or_else(|| anyhow::anyhow!("serving credential missing"))?;
+    ensure!(
+        ctx.is_authenticated()
+            && !subject.is_federated()
+            && claims.sub == name
+            && claims.act.is_none()
+            && claims.sid.is_none()
+            && claims.workload_session_id.is_none(),
+        "direct enrolled serving credential required"
+    );
+    let entry = manifest
+        .services
+        .get(caller)
+        .ok_or_else(|| anyhow::anyhow!("serving enrollment missing"))?;
+    let enrolled = URL_SAFE_NO_PAD.decode(&entry.ed25519_pubkey)?;
+    ensure!(enrolled.as_slice() == ctx.cnf, "serving holder mismatch");
+    Ok(caller)
 }
 
 fn oauth_caller(ctx: &EnvelopeContext, manifest: &ServiceEnrollmentManifest) -> Result<()> {

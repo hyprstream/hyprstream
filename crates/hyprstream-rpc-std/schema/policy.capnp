@@ -162,6 +162,13 @@ struct PolicyRequest {
     # capability required by Policy. No provider installed by default, no grants.
     resolveSessionPrimary @30 :ResolveSessionPrimary
       $scope(query) $dispatchMac("internal:pq-hybrid");
+
+    # One request-local, service-authenticated boundary: fresh account/tenant/
+    # grant/session check followed by durable session-bound proof replay consume.
+    # The caller must have verified the original holder's hybrid proof first.
+    # No token, reusable permit or positive cache is returned.
+    admitFederateRequest @31 :AdmitFederateRequest
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
   }
 }
 
@@ -200,6 +207,27 @@ struct SessionPrimary {
   expiresAt @15 :Int64;
   proofEpoch @16 :UInt64;
   collisionInventoryId @17 :Data;
+}
+
+struct AdmitFederateRequest {
+  issuer @0 :Text $maxLen(2048);
+  profile @1 :Text $maxLen(64);
+  sid @2 :Text $maxLen(128);
+  subject @3 :Text $maxLen(256);
+  tenant @4 :Text $maxLen(256);
+  client @5 :Text $maxLen(256);
+  audience @6 :Text $maxLen(2048);
+  scopes @7 :List(Text) $maxLen(64);
+  edPublic @8 :Data $maxLen(32);
+  suiteThumbprint @9 :Data $maxLen(32);
+  generation @10 :Data $maxLen(32);
+  collisionInventoryId @11 :Data $maxLen(32);
+  expiresAt @12 :Int64;
+  proofEpoch @13 :UInt64;
+  verifiedNamespace @14 :Data $maxLen(32);
+  requestId @15 :Data $maxLen(16);
+  resource @16 :Text $maxLen(256);
+  operation @17 :Text $maxLen(64);
 }
 
 struct MediatedPolicyCheck {
@@ -433,6 +461,7 @@ struct PolicyResponse {
     exchangeDelegatedResult @29 :TokenInfo;
     checkMediatedResult @30 :Bool;
     resolveSessionPrimaryResult @31 :SessionPrimary;
+    admitFederateRequestResult @32 :Bool;
   }
 }
 

@@ -10,7 +10,7 @@ use hyprstream_rpc::{
             build_authenticated_hybrid_request_proof, AuthenticatedHybridProofSigner,
             AuthenticatedRequestProofInput,
         },
-        enrollment::InMemoryEnrollmentResolver,
+        enrollment::{authenticated_replay_namespace, InMemoryEnrollmentResolver},
     },
 };
 use hyprstream_session_store::primary::InventorySource;
@@ -35,10 +35,9 @@ fn host_claims() -> Claims {
         .with_sid("sid-a")
         .with_scope(Some("query:registry:List".into()))
         .with_cnf_jwk(&ed)
-        .with_cnf_hs_signer_suite(URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(
-            SUITE,
-            &[&ed, &pq],
-        )))
+        .with_cnf_hs_signer_suite(
+            URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(SUITE, &[&ed, &pq])),
+        )
         .with_session_authority_generation([7; 32]);
     claims.jti = Some("jti-a".into());
     claims
@@ -241,6 +240,11 @@ async fn h3b_disabled_without_provider_and_fresh_lookup_on_every_reuse() {
             .unwrap_err(),
         Error::Disabled
     );
+    let expected_replay_namespace = authenticated_replay_namespace(
+        SUITE,
+        &[record.ed_public.clone(), record.pq_public.clone()],
+        record.proof_epoch,
+    );
     let provider = provider(record);
     let consumer = Consumer {
         provider: Some(provider.clone()),
@@ -256,6 +260,7 @@ async fn h3b_disabled_without_provider_and_fresh_lookup_on_every_reuse() {
     // Crypto success is deliberately NOT replay admission; duplicate proof still
     // verifies here. F3 must be tested at the later dispatch/replay boundary.
     assert_eq!(first.replay_thumbprint, second.replay_thumbprint);
+    assert_eq!(first.replay_thumbprint, expected_replay_namespace);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     // The authority await must not retain the initial verifier timestamp.
     let clock_reads = AtomicUsize::new(0);
