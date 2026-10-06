@@ -157,6 +157,10 @@ pub struct Claims {
     /// standalone service credentials (no session lifecycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
+    /// Federate's signed, canonical 32-byte authority generation. This is
+    /// JWT-only: an envelope claims field cannot assert session authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_session_authority_generation: Option<String>,
     /// Workload credential family session ID (`workload_session_id`) — a
     /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
     /// credentials of an enrolled workload family (e.g. a service-JWT
@@ -245,6 +249,12 @@ pub struct Claims {
     pub cap: Option<String>,
 }
 
+/// Fixed staging Federate issuer/client reservation. Keep these in the JWT
+/// verifier, not only Registry/Model, so a generation-stripped token cannot
+/// authenticate on another RPC, 9P, or HTTP entry point as a static token.
+pub const FEDERATE_STAGING_HOST: &str = "https://discovery.staging.lab.hyprstream.com";
+pub const FEDERATE_STAGING_CLIENT: &str = "cyberdione-www-staging";
+
 // Custom Debug impl — NEVER log the bearer token
 impl std::fmt::Debug for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,6 +266,7 @@ impl std::fmt::Debug for Claims {
             .field("iat", &self.iat)
             .field("jti", &self.jti)
             .field("sid", &self.sid)
+            .field("hs_session_authority_generation", &self.hs_session_authority_generation)
             .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
             .field("client_id", &self.client_id)
@@ -358,6 +369,7 @@ impl FromCapnp for Claims {
             // `sid` / `workload_session_id` are JWT-carried, like `jti`;
             // the envelope Claims surface does not carry them.
             sid: None,
+            hs_session_authority_generation: None,
             workload_session_id: None,
             aud,
             client_id: None,
@@ -419,6 +431,7 @@ impl Claims {
             iat,
             jti: None,
             sid: None,
+            hs_session_authority_generation: None,
             workload_session_id: None,
             aud: None,
             client_id: None,
@@ -460,6 +473,38 @@ impl Claims {
     pub fn with_sid(mut self, sid: impl Into<String>) -> Self {
         self.sid = Some(sid.into());
         self
+    }
+
+    /// Set the signed Federate generation in its one canonical encoding.
+    /// This does not make a token eligible for dispatch; current profile,
+    /// session, proof, replay and Policy checks remain mandatory.
+    pub fn with_session_authority_generation(mut self, generation: [u8; 32]) -> Self {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        self.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode(generation));
+        self
+    }
+
+    /// Parse the signed generation without accepting padding, alternate
+    /// alphabets, truncation, or a wire-provided database locator.
+    pub fn session_authority_generation(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let Some(encoded) = self.hs_session_authority_generation.as_deref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(encoded.len() == 43, "invalid session generation length");
+        let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+        let generation: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid session generation length"))?;
+        anyhow::ensure!(URL_SAFE_NO_PAD.encode(generation) == encoded, "noncanonical session generation");
+        Ok(Some(generation))
+    }
+
+    /// Recognize the fixed host/client even when the generation claim was
+    /// removed by a faulty issuer or token transformation.
+    pub fn is_reserved_federate_staging_credential(&self) -> bool {
+        self.iss == FEDERATE_STAGING_HOST
+            && self.client_id.as_deref() == Some(FEDERATE_STAGING_CLIENT)
     }
 
     /// Set the workload credential family session ID
@@ -1407,5 +1452,23 @@ mod id_token_tests {
         // No delegation chain resolves to no terminal actor.
         let plain = Claims::new("user:alice".into(), 1000, 1030);
         assert_eq!(plain.terminal_actor(), None);
+    }
+
+    #[test]
+    fn federate_generation_is_signed_jwt_only_and_canonical() {
+        let original = [0x42; 32];
+        let claims = Claims::new("alice".into(), 1, 2)
+            .with_session_authority_generation(original);
+        assert_eq!(claims.session_authority_generation().unwrap(), Some(original));
+        let json = serde_json::to_vec(&claims).unwrap();
+        let decoded: Claims = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.session_authority_generation().unwrap(), Some(original));
+        let mut malformed = decoded.clone();
+        for bad in ["", "A", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"] {
+            malformed.hs_session_authority_generation = Some(bad.into());
+            assert!(malformed.session_authority_generation().is_err(), "accepted {bad:?}");
+        }
+        assert!(Claims::new("alice".into(), 1, 2)
+            .session_authority_generation().unwrap().is_none());
     }
 }

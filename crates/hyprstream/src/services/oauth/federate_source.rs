@@ -23,10 +23,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 pub(crate) const ISSUER: &str = "https://login.federate.to";
-pub(crate) const CLIENT: &str = "cyberdione-www-staging";
+pub(crate) const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
 pub(crate) const WEBSITE: &str = "https://www.staging.lab.hyprstream.com";
 pub(crate) const CALLBACK: &str = "https://www.staging.lab.hyprstream.com/federate/callback";
-pub(crate) const HOST: &str = "https://discovery.staging.lab.hyprstream.com";
+pub(crate) const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
 const JWKS: &str = "https://login.federate.to/keys";
 const TOKEN_ENDPOINT: &str = "https://discovery.staging.lab.hyprstream.com/oauth/token";
 const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";

@@ -8,6 +8,21 @@ use serde_json::json;
 
 const NOW: u64 = 1_800_000_000;
 const CODE: &str = "TEST-CODE-NOT-LIVE";
+
+#[test]
+fn reserved_host_client_cannot_downgrade_by_stripping_generation() {
+    let mut claims = hyprstream_rpc::auth::Claims::new("alice".into(), 1, 2);
+    claims.iss = HOST.into();
+    claims.client_id = Some(CLIENT.into());
+    assert!(claims.is_reserved_federate_staging_credential());
+    claims.client_id = None;
+    assert!(!claims.is_reserved_federate_staging_credential());
+    claims.client_id = Some("other-client".into());
+    assert!(!claims.is_reserved_federate_staging_credential());
+    claims.iss = "https://other.example".into();
+    claims.client_id = Some(CLIENT.into());
+    assert!(!claims.is_reserved_federate_staging_credential());
+}
 const MODULUS: &str = "C97781230C20F14C2EB47FDD3AFBB4821EAC87003FF1A8240D1E840EE743E3EAF7A5F204503E15CFB42751AEDB97D76BE41DF559834957D283E4AC097283D18D19A12DCE56434FCA31BFC9635E721798A3D6AACC55FC8CAD559F74D66549EFC160AAD48DA9A2F860CCEA515DFEEEFA930E10B8BA5414CB26034B7352E53C7AAD5C4CE24528615705C737B7D4B554B1B4CE1A52F2D3439B42F67324B4F007691E46BE826EC6DC7CC65DD58FBF183B86DF537889EDBA5866BFD911A2AA27181C9EBD14C6DBACA28E3A37153BCD0018071101E6EA5A900812D194E6220A672EDB9FCA2C24C5486DCF981C3A2C9DC20B95E3D14875F9AF20993751BB8CBB6020678D";
 fn bytes(hex: &str) -> Vec<u8> {
     hex::decode(hex).unwrap()

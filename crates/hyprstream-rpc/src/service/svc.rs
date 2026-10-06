@@ -1428,6 +1428,20 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
+        // Federate's browser proof key is intentionally distinct from the
+        // envelope/relay key. The ordinary cnf→envelope binding below cannot
+        // authenticate it, and its dynamic proof/session/replay adapter is not
+        // installed in this source slice. Reject the signed marker AND the
+        // reserved issuer/client pair here, before publishing identity or a
+        // key→subject cache entry; stripping the marker cannot downgrade to a
+        // static credential. A future adapter must replace this denial only
+        // after complete request-local proof and authority admission exists.
+        if verified.hs_session_authority_generation.is_some()
+            || verified.is_reserved_federate_staging_credential() {
+            verified.session_authority_generation()?;
+            anyhow::bail!("Federate session dispatch is disabled");
+        }
+
         // Credential/session checks. The local-issuer set is resolved first:
         // the credential profile makes `jti` REQUIRED on locally issued
         // tokens, and the session registry is a local authority — both
@@ -2108,6 +2122,37 @@ mod empty_iss_gate_tests {
         );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn signed_federate_generation_denies_before_identity_or_key_cache() {
+        let (svc, ca) = mock_service();
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".into(), now, now + 300)
+            .with_session_authority_generation([0x42; 32]);
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), true);
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserved_client_without_generation_cannot_fall_back_to_static_jwt() {
+        let (mut svc, ca) = mock_service();
+        svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            crate::auth::claims::FEDERATE_STAGING_HOST.into(),
+        ));
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = Claims::new("alice".into(), now, now + 300);
+        claims.iss = crate::auth::claims::FEDERATE_STAGING_HOST.into();
+        claims.client_id = Some(crate::auth::claims::FEDERATE_STAGING_CLIENT.into());
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
     }
 
     #[tokio::test]
