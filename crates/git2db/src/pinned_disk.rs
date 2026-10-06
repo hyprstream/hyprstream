@@ -56,9 +56,11 @@ struct BlobEntry {
 pub struct DiskPinnedTreeProjection {
     commit: Oid,
     owner_pid: u32,
-    _root: OwnedProjection,
     input_root: PathBuf,
+    // Rust drops fields in declaration order. Close the unlinked payload FDs
+    // before the owner releases the disk-capacity lease.
     files: Vec<File>,
+    _root: OwnedProjection,
 }
 
 /// Keep the owner marker and its lock until every payload child is gone. A
@@ -75,6 +77,8 @@ struct OwnedProjectionInner {
     // A cancelled acquire can leave its blocking Git writer running. Keep the
     // one-slot disk lease until that last owner finishes and cleanup completes.
     _capacity: Option<OwnedSemaphorePermit>,
+    #[cfg(test)]
+    observed_reader_fd: Option<std::os::fd::RawFd>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -94,6 +98,8 @@ impl OwnedProjection {
             path: root.keep(),
             _owner_lock: owner_lock,
             _capacity: capacity,
+            #[cfg(test)]
+            observed_reader_fd: None,
         })))
     }
 
@@ -105,6 +111,17 @@ impl OwnedProjection {
 #[cfg(target_os = "linux")]
 impl Drop for OwnedProjectionInner {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(fd) = self.observed_reader_fd {
+            // Regression witness: the enclosing artifact must close its
+            // unlinked reader before this owner can release the lease.
+            if let Ok(target) = fs::read_link(format!("/proc/self/fd/{fd}")) {
+                assert!(
+                    !target.starts_with(&self.path),
+                    "projection reader is still open when its owner drops"
+                );
+            }
+        }
         // The lock field is dropped only after this method returns. If removal
         // fails, the still-marked directory can be retried at next startup.
         if let Err(error) = remove_owned_projection(&self.path) {
@@ -242,7 +259,7 @@ impl DiskPinnedTreeProjection {
                     #[cfg(feature = "xet-storage")]
                     {
                         let resolved = payload_dir.join(format!("{index}.resolved"));
-                        resolve_pointer_to_file(&bytes, &resolved, &mut storage).await?;
+                        resolve_pointer_to_file(&bytes, &resolved, &mut storage, &root).await?;
                         final_path = resolved;
                     }
                     #[cfg(not(feature = "xet-storage"))]
@@ -292,9 +309,9 @@ impl DiskPinnedTreeProjection {
         Ok(Self {
             commit,
             owner_pid: std::process::id(),
-            _root: root,
             input_root,
             files,
+            _root: root,
         })
     }
 
@@ -765,11 +782,12 @@ fn verify_blob_file(oid: Oid, path: &Path) -> Git2DBResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "xet-storage")]
+#[cfg(all(feature = "xet-storage", target_os = "linux"))]
 async fn resolve_pointer_to_file(
     bytes: &[u8],
     path: &Path,
     storage: &mut Option<crate::LfsStorage>,
+    owner: &OwnedProjection,
 ) -> Git2DBResult<()> {
     let text = std::str::from_utf8(bytes).map_err(|e| internal(format!("pointer UTF-8: {e}")))?;
     if text.starts_with("# xet version") {
@@ -794,9 +812,11 @@ async fn resolve_pointer_to_file(
             ));
         }
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || verify_lfs_file(&path, &expected, expected_size))
-            .await
-            .map_err(|e| internal(format!("LFS verify task failed: {e}")))??;
+        spawn_owned_verifier(owner, move || {
+            verify_lfs_file(&path, &expected, expected_size)
+        })
+        .await
+        .map_err(|e| internal(format!("LFS verify task failed: {e}")))??;
         return Ok(());
     }
     let info: data::XetFileInfo =
@@ -810,10 +830,22 @@ async fn resolve_pointer_to_file(
         ));
     }
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || verify_xet_file(&path, &info))
+    spawn_owned_verifier(owner, move || verify_xet_file(&path, &info))
         .await
         .map_err(|e| internal(format!("XET verify task failed: {e}")))??;
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", any(feature = "xet-storage", test)))]
+fn spawn_owned_verifier(
+    owner: &OwnedProjection,
+    verify: impl FnOnce() -> Git2DBResult<()> + Send + 'static,
+) -> tokio::task::JoinHandle<Git2DBResult<()>> {
+    let task_owner = owner.clone();
+    tokio::task::spawn_blocking(move || {
+        let _task_owner = task_owner;
+        verify()
+    })
 }
 
 #[cfg(feature = "xet-storage")]
@@ -974,6 +1006,89 @@ mod tests {
         drop(writer_owner);
         assert!(!path.exists());
         assert!(Arc::clone(&slots).try_acquire_owned().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_verifier_keeps_unlinked_payload_and_lease_until_reader_finishes(
+    ) -> Git2DBResult<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).try_acquire_owned().map_err(internal)?;
+        let root = OwnedProjection::create(parent.path(), Some(permit))?;
+        let path = root.path().to_path_buf();
+        let payload = path.join("resolved-payload");
+        fs::write(&payload, b"verified bytes").map_err(internal)?;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let task = spawn_owned_verifier(&root, move || {
+            let mut reader = File::open(&payload).map_err(internal)?;
+            let mut prefix = [0u8; 4];
+            reader.read_exact(&mut prefix).map_err(internal)?;
+            started_tx.send(()).map_err(internal)?;
+            finish_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(internal)?;
+            let mut bytes = prefix.to_vec();
+            reader.read_to_end(&mut bytes).map_err(internal)?;
+            if bytes != b"verified bytes" {
+                return Err(internal("detached verifier read changed bytes"));
+            }
+            Ok(())
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(internal)?;
+        drop(task); // The acquire future would drop its JoinHandle on cancellation.
+        drop(root);
+        scavenge_abandoned_projections(parent.path())?;
+        assert!(path.exists(), "detached verifier must retain its root");
+        assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+        finish_tx.send(()).map_err(internal)?;
+        for _ in 0..100 {
+            if !path.exists() && Arc::clone(&slots).try_acquire_owned().is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(internal(
+            "detached verifier did not release the projection lease",
+        ))
+    }
+
+    #[test]
+    fn ordinary_drop_closes_unlinked_reader_before_releasing_capacity() -> Git2DBResult<()> {
+        let parent = tempfile::tempdir().map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&slots).try_acquire_owned().map_err(internal)?;
+        let mut root = OwnedProjection::create(parent.path(), Some(permit))?;
+        let payload = root.path().join("payload");
+        fs::write(&payload, b"owned bytes").map_err(internal)?;
+        let reader = File::open(&payload).map_err(internal)?;
+        fs::remove_file(&payload).map_err(internal)?;
+        let reader_fd = reader.as_raw_fd();
+        let owner = Arc::get_mut(&mut root.0)
+            .ok_or_else(|| internal("unexpected retained projection owner"))?;
+        owner.observed_reader_fd = Some(reader_fd);
+        let projection = DiskPinnedTreeProjection {
+            commit: Oid::zero(),
+            owner_pid: std::process::id(),
+            input_root: root.path().to_path_buf(),
+            files: vec![reader],
+            _root: root,
+        };
+        assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+        drop(projection); // The owner's drop witness asserts reader_fd is closed.
+        assert!(Arc::clone(&slots).try_acquire_owned().is_ok());
+        assert!(fs::read_dir(parent.path())
+            .map_err(internal)?
+            .next()
+            .is_none());
         Ok(())
     }
 
