@@ -5,7 +5,9 @@
 #![allow(dead_code)] // Source-only slice; no runtime installer is exposed.
 
 use super::{EnvelopeContext, PolicyManager};
-use crate::auth::{postgres_store::PolicyAccountReader, service_enrollment::ServiceEnrollmentManifest};
+use crate::auth::{
+    postgres_store::PolicyAccountReader, service_enrollment::ServiceEnrollmentManifest,
+};
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{
@@ -15,8 +17,13 @@ use hyprstream_rpc::{
 };
 use hyprstream_rpc_std::policy_client::AdmitFederateRequest;
 use hyprstream_session_store::{Admission, PendingSession, PrimaryRecord, Session, Source, Store};
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
+use rand::RngCore as _;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{Mutex, Semaphore};
 
 /// Fixed, authority-owned ceilings; not browser input or dynamic client metadata.
 struct Profile {
@@ -38,6 +45,29 @@ struct Decision {
     revision: String,
     generation: [u8; 32],
     collision_inventory_id: [u8; 32],
+}
+
+/// Returned only to the authenticated OAuth service. The handle itself stays
+/// in OAuth's server-side pending challenge, never in its browser response.
+pub(super) struct PreparedDecision {
+    pub(super) account_id: String,
+    pub(super) subject: String,
+    pub(super) tenant: String,
+    pub(super) requested: Vec<String>,
+    pub(super) granted: Vec<String>,
+    pub(super) revision: String,
+    pub(super) handle: [u8; 32],
+}
+
+struct PendingDecision {
+    source: Source,
+    requested: Vec<String>,
+    decision: Decision,
+    ed_public: [u8; 32],
+    pq_public: Vec<u8>,
+    challenge_id: [u8; 32],
+    created_at: i64,
+    expires_at: i64,
 }
 
 /// Internal upstream evidence, not a browser DTO or verification boolean.
@@ -70,9 +100,11 @@ struct Authorities {
 /// Default denies before any authority or DB access. Future wiring must admit a
 /// writer-endpoint UserStore, fresh signed PDS mount and sole serving Policy.
 #[derive(Default)]
-struct AdmissionService {
+pub(super) struct AdmissionService {
     authority: Option<Authorities>,
     capacity: Option<Semaphore>,
+    session_pool: Option<deadpool_postgres::Pool>,
+    pending: Mutex<BTreeMap<[u8; 32], PendingDecision>>,
 }
 
 /// Source-only Policy authority for a single protected Registry/Model request.
@@ -480,6 +512,135 @@ impl Authorities {
 mod tests;
 
 impl AdmissionService {
+    /// Cross-process OAuth prepare. A Policy restart drops all unredeemed
+    /// handles; the OAuth process likewise drops its pending challenges. A
+    /// restart is fail-closed, never a reason to reconstruct browser authority.
+    pub(super) async fn prepare_rpc(
+        &self,
+        ctx: &EnvelopeContext,
+        source: Source,
+        requested: Vec<String>,
+        challenge_id: [u8; 32],
+        created_at: i64,
+        ed_public: [u8; 32],
+        pq_public: Vec<u8>,
+    ) -> Result<PreparedDecision> {
+        self.authority(ctx)?;
+        ensure!(
+            self.session_pool.is_some(),
+            "Federate session writer disabled"
+        );
+        let now = chrono::Utc::now().timestamp();
+        ensure!(challenge_id != [0; 32], "invalid challenge ID");
+        ensure!(pq_public.len() == 1952, "invalid PQ public key");
+        ensure!(
+            created_at >= now - 30 && created_at <= now + 5,
+            "stale challenge"
+        );
+        ensure!(
+            source.issued_at >= 0 && source.issued_at <= now + 30,
+            "invalid source time"
+        );
+        ensure!(
+            source.expires_at > now && source.expires_at <= source.issued_at + 300,
+            "expired source"
+        );
+        let expires_at = created_at
+            .checked_add(60)
+            .ok_or_else(|| anyhow::anyhow!("invalid challenge time"))?
+            .min(source.expires_at)
+            .min(source.issued_at + 120);
+        ensure!(expires_at > now, "challenge already expired");
+        let decision = self.prepare(ctx, &source, &requested).await?;
+        let mut pending = self.pending.lock().await;
+        pending.retain(|_, entry| entry.expires_at > now);
+        ensure!(pending.len() < 128, "Federate challenge capacity exhausted");
+        let mut handle = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut handle);
+        ensure!(
+            handle != [0; 32] && !pending.contains_key(&handle),
+            "handle collision"
+        );
+        let response = PreparedDecision {
+            account_id: decision.account_id.clone(),
+            subject: decision.subject.clone(),
+            tenant: decision.tenant.clone(),
+            requested: requested.clone(),
+            granted: decision.scopes.clone(),
+            revision: decision.revision.clone(),
+            handle,
+        };
+        pending.insert(
+            handle,
+            PendingDecision {
+                source,
+                requested,
+                decision,
+                ed_public,
+                pq_public,
+                challenge_id,
+                created_at,
+                expires_at,
+            },
+        );
+        Ok(response)
+    }
+
+    /// Consume exactly one server-owned challenge before doing any database
+    /// work. Failure (including ambiguous commit) does not make it reusable.
+    pub(super) async fn commit_rpc(
+        &self,
+        ctx: &EnvelopeContext,
+        handle: [u8; 32],
+        source: Source,
+        challenge_id: [u8; 32],
+        created_at: i64,
+        expires_at: i64,
+        ed_public: [u8; 32],
+        pq_public: Vec<u8>,
+    ) -> Result<Session> {
+        self.authority(ctx)?;
+        let pool = self
+            .session_pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Federate session writer disabled"))?;
+        let pending = self
+            .pending
+            .lock()
+            .await
+            .remove(&handle)
+            .ok_or_else(|| anyhow::anyhow!("unknown or consumed challenge"))?;
+        let now = chrono::Utc::now().timestamp();
+        ensure!(
+            now < pending.expires_at
+                && source == pending.source
+                && challenge_id == pending.challenge_id
+                && created_at == pending.created_at
+                && expires_at == pending.expires_at
+                && ed_public == pending.ed_public
+                && pq_public == pending.pq_public,
+            "challenge/source binding changed"
+        );
+        ensure!(pq_public.len() == 1952, "invalid PQ public key");
+        let mut client = tokio::time::timeout(Duration::from_secs(2), pool.get()).await??;
+        self.redeem(
+            ctx,
+            &mut client,
+            PossessionEvidence {
+                source,
+                ed_public,
+                pq_public,
+                sid: uuid::Uuid::new_v4().to_string(),
+                requested: pending.requested,
+                challenge: pending.decision,
+                created_at,
+                expires_at,
+                session_expires_at: pending.source.expires_at.min(now + 300),
+            },
+        )
+        .await
+    }
+
     fn authority(&self, ctx: &EnvelopeContext) -> Result<&Authorities> {
         let authority = self
             .authority
