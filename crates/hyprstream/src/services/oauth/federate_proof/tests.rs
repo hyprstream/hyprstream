@@ -22,6 +22,66 @@ const TOKEN: &[u8] = b"fixture-only.verified-host-jwt.original-holder";
 const BODY: &[u8] = b"fixture canonical request bytes, not a dispatch";
 const SCHEMA: u64 = 0xd4d0_f2a1_b3c5_8e67;
 
+fn host_claims() -> Claims {
+    let ed = ed25519_dalek::SigningKey::from_bytes(&[41; 32])
+        .verifying_key()
+        .to_bytes();
+    let pq = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[42; 32]));
+    let mut claims = Claims::new("local-account".into(), NOW as i64, NOW as i64 + 60)
+        .with_issuer(HOST.into())
+        .with_audience(Some(HOST.into()))
+        .with_client_id(CLIENT)
+        .with_tenant("tenant-a".into())
+        .with_sid("sid-a")
+        .with_scope(Some("query:registry:List".into()))
+        .with_cnf_jwk(&ed)
+        .with_cnf_hs_signer_suite(URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(
+            SUITE,
+            &[&ed, &pq],
+        )))
+        .with_session_authority_generation([7; 32]);
+    claims.jti = Some("jti-a".into());
+    claims
+}
+
+#[test]
+fn h3b_verified_host_snapshot_requires_complete_exact_signed_facts() {
+    let valid = host_claims();
+    let handle = CredentialHandle::from_claims_snapshot(&valid, "fixture-token").unwrap();
+    assert_eq!(handle.expected.sid, "sid-a");
+    assert_eq!(handle.expected.generation, [7; 32]);
+    assert_eq!(handle.expected.scopes, ["query:registry:List"]);
+    let token_hash: [u8; 32] = Sha256::digest(b"fixture-token").into();
+    assert_eq!(handle.credential_hash, token_hash);
+
+    let mut bad = valid.clone();
+    bad.hs_session_authority_generation = None;
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.iss = "https://other.example".into();
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.aud = Some("registry".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.client_id = Some("other".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.scope = Some("query:registry:List query:registry:List".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.scope = Some("infer:model:qwen2.5-0.5b-instruct:main:extra".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.cnf.as_mut().unwrap().jkt = Some("alternate-holder".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.workload_session_id = Some("other-session".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let callback = EnvelopeContext::from_callback_service(1, "oauth");
+    assert!(CredentialHandle::from_verified_context(&callback).is_err());
+}
+
 struct Provider {
     record: Mutex<SessionPrimary>,
     calls: AtomicUsize,

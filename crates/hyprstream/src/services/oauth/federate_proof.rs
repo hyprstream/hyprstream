@@ -15,7 +15,7 @@ use std::{sync::Arc, time::Duration};
 
 use ed25519_dalek::VerifyingKey;
 use hyprstream_rpc::{
-    auth::signer_suite::signer_suite_thumbprint,
+    auth::{Claims, Scope, parse_protected_header, signer_suite::signer_suite_thumbprint},
     crypto::pq::ml_dsa_vk_from_bytes,
     proof::{
         enrollment::{
@@ -25,9 +25,11 @@ use hyprstream_rpc::{
         verify::{verify_proof_signatures, VerifiedProof},
         ProofDisposition, ProofKind,
     },
+    service::EnvelopeContext,
 };
 use hyprstream_rpc_std::policy_client::SessionPrimary;
 use hyprstream_session_store::{primary::{CollisionInventory, ExpectedPrimary}, PROFILE, SUITE};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -50,6 +52,102 @@ struct CredentialHandle {
     expected: ExpectedPrimary,
     credential_id: String,
     credential_hash: [u8; 32],
+}
+
+impl CredentialHandle {
+    /// The only prospective production constructor: the RPC verifier must
+    /// have completed direct network JWT verification. This does not confer
+    /// admission; every use still needs dynamic primary, proof, replay, and
+    /// fresh action authority. Today the fixed profile denies before this
+    /// constructor can be reached by a production request.
+    fn from_verified_context(ctx: &EnvelopeContext) -> Result<Self> {
+        let (claims, token) = ctx.verified_direct_jwt().ok_or(Error::Denied)?;
+        let header = parse_protected_header(token).map_err(|_| Error::Denied)?;
+        if header.typ != "at+jwt" {
+            return Err(Error::Denied);
+        }
+        Self::from_claims_snapshot(claims, token)
+    }
+
+    /// Fixture-accessible parser of already signed facts. Never call on an
+    /// unverified JWT; only `from_verified_context` is a production entry.
+    fn from_claims_snapshot(claims: &Claims, token: &str) -> Result<Self> {
+        let cnf = claims.cnf.as_ref().ok_or(Error::Denied)?;
+        let jwk = cnf.jwk.as_ref().ok_or(Error::Denied)?;
+        let ed = claims.cnf_key_bytes().ok_or(Error::Denied)?;
+        let suite = cnf.hs_signer_suite.as_deref().ok_or(Error::Denied)?;
+        let suite_bytes = URL_SAFE_NO_PAD.decode(suite).map_err(|_| Error::Denied)?;
+        let suite_thumbprint: [u8; 32] = suite_bytes.try_into().map_err(|_| Error::Denied)?;
+        let generation = claims
+            .session_authority_generation()
+            .map_err(|_| Error::Denied)?
+            .ok_or(Error::Denied)?;
+        let sid = claims.sid.as_deref().ok_or(Error::Denied)?;
+        let subject = claims.sub.as_str();
+        let tenant = claims.tenant.as_deref().ok_or(Error::Denied)?;
+        let jti = claims.jti.as_deref().ok_or(Error::Denied)?;
+        let scope = claims.scope.as_deref().ok_or(Error::Denied)?;
+        let scopes: Vec<String> = scope.split(' ').map(str::to_owned).collect();
+        if claims.iss != HOST
+            || claims.aud.as_deref() != Some(HOST)
+            || claims.client_id.as_deref() != Some(CLIENT)
+            || claims.workload_session_id.is_some()
+            || claims.act.is_some()
+            || claims.cap.is_some()
+            || cnf.jkt.is_some()
+            || jwk.kty != "OKP"
+            || jwk.crv != "Ed25519"
+            || URL_SAFE_NO_PAD.encode(ed) != jwk.x
+            || URL_SAFE_NO_PAD.encode(suite_thumbprint) != suite
+            || !bounded(sid, 128)
+            || !bounded(subject, 256)
+            || subject == "anonymous"
+            || subject.starts_with("service:")
+            || !bounded(tenant, 256)
+            || tenant == "*"
+            || !bounded(jti, 256)
+            || generation == [0; 32]
+            || claims.iat < 0
+            || claims.exp <= claims.iat
+            || claims.exp - claims.iat > 300
+            || scopes.is_empty()
+            || scopes.len() > 64
+            || scopes.windows(2).any(|window| window[0] >= window[1])
+            || scopes.iter().any(|text| {
+                !bounded(text, 256)
+                    || !text.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                    || match Scope::parse(text) {
+                        Ok(parsed) => {
+                            parsed.action.contains('*')
+                                || parsed.resource.contains('*')
+                                || parsed.identifier.contains('*')
+                        }
+                        Err(_) => true,
+                    }
+            })
+            || token.len() > 16 * 1024
+        {
+            return Err(Error::Denied);
+        }
+        Ok(Self {
+            expected: ExpectedPrimary {
+                issuer: claims.iss.clone(),
+                profile: PROFILE.into(),
+                sid: sid.into(),
+                subject: subject.into(),
+                tenant: tenant.into(),
+                client: CLIENT.into(),
+                audience: HOST.into(),
+                scopes,
+                ed_public: ed,
+                suite_thumbprint,
+                generation,
+                expires_at: claims.exp,
+            },
+            credential_id: jti.into(),
+            credential_hash: Sha256::digest(token.as_bytes()).into(),
+        })
+    }
 }
 
 /// FUTURE trusted adapter contract, currently implemented by fixtures only.

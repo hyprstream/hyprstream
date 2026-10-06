@@ -155,6 +155,11 @@ pub struct EnvelopeContext {
     /// Raw JWT token from the envelope. Server decodes and verifies this.
     /// Preferred over the legacy `claims` field when present.
     jwt_token: Option<String>,
+    /// Set only after the complete direct JWT verification path succeeds,
+    /// including revocation, session, confirmation and WTH checks. Prevents a
+    /// future dynamic proof consumer from constructing an authority handle
+    /// from merely parsed, legacy or partially verified claims.
+    direct_jwt_verified: bool,
     /// Bearer relayed by an authenticated service; deny-by-default.
     delegation_token: Option<String>,
 
@@ -307,6 +312,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: None,
             jwt_token: envelope.jwt_token().map(ToOwned::to_owned),
+            direct_jwt_verified: false,
             delegation_token: envelope.delegation_token.clone(),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -338,6 +344,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: Some("local".to_owned()),
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
+            direct_jwt_verified: false,
             delegation_token: envelope.envelope.delegation_token.clone(),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
@@ -373,6 +380,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
@@ -422,6 +430,7 @@ impl EnvelopeContext {
             claims,
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: crate::envelope::Subject::anonymous(),
             jwt_subject: None,
@@ -577,6 +586,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: subject,
             jwt_subject: None,
@@ -729,6 +739,21 @@ impl EnvelopeContext {
         self.jwt_token
             .as_deref()
             .or(self.delegation_token.as_deref())
+    }
+
+    /// A direct network credential only after the full verifier returned
+    /// successfully. Never substitutes a relayed bearer, legacy claims,
+    /// local callback identity, or a partially checked JWT. The returned
+    /// claims remain evidence, not a dispatch permit.
+    pub fn verified_direct_jwt(&self) -> Option<(&crate::auth::Claims, &str)> {
+        if !self.direct_jwt_verified
+            || self.is_local_caller
+            || self.delegation_token.is_some()
+            || self.internal_work.is_some()
+        {
+            return None;
+        }
+        Some((self.claims.as_ref()?, self.jwt_token.as_deref()?))
     }
 
     /// Check if request has user context
@@ -1671,6 +1696,7 @@ pub trait RequestService: 'static {
             }
         }
 
+        ctx.direct_jwt_verified = !delegated && ctx.jwt_token.is_some();
         Ok(())
     }
 
@@ -2011,6 +2037,7 @@ mod empty_iss_gate_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: Some(token),
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -2122,6 +2149,27 @@ mod empty_iss_gate_tests {
         );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
+        assert!(ctx.verified_direct_jwt().is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_credential_snapshot_is_exposed_only_after_full_network_verification() {
+        let (mut svc, ca) = mock_service();
+        svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            "https://ordinary.example".into(),
+        ));
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = Claims::new("alice".into(), now, now + 300);
+        claims.iss = "https://ordinary.example".into();
+        claims.client_id = Some("ordinary-client".into());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token.clone(), false);
+        assert!(ctx.verified_direct_jwt().is_none());
+        svc.verify_claims(&mut ctx).await.expect("direct credential");
+        let (verified, exact_token) = ctx.verified_direct_jwt().expect("verified direct token");
+        assert_eq!(verified.sub, "alice");
+        assert_eq!(exact_token, token);
     }
 
     #[tokio::test]
@@ -2134,6 +2182,7 @@ mod empty_iss_gate_tests {
         assert!(svc.verify_claims(&mut ctx).await.is_err());
         assert!(ctx.subject().is_anonymous());
         assert!(ctx.claims().is_none());
+        assert!(ctx.verified_direct_jwt().is_none());
         assert!(svc.cached_subjects.lock().is_empty());
     }
 
@@ -2905,6 +2954,7 @@ mod ipc_key_identity_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -3210,6 +3260,7 @@ mod accounting_audit_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::new(name),
             jwt_subject: None,
@@ -3271,6 +3322,7 @@ mod accounting_audit_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -3342,6 +3394,7 @@ mod accounting_audit_tests {
             claims,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -3694,6 +3747,7 @@ mod internal_work_routing_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: Some(token),
+            direct_jwt_verified: false,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
