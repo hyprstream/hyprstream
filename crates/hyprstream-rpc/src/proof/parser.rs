@@ -93,6 +93,9 @@ impl ParsedProof {
         if proof.kind != ProofKind::Request {
             bail!("deferred Federate proof must be a request proof");
         }
+        if proof.claims.federate_recipient_binding.is_none() {
+            bail!("deferred Federate proof requires recipient binding");
+        }
         Ok(proof)
     }
 

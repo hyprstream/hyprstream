@@ -106,6 +106,21 @@ has lost both private keys.
 
 ## Required vectors and activation gate
 
+The source-controlled native signed-proof checksum vector in
+`proof::build::tests::federate_signed_proof_vector_is_stable_and_profile_isolated`
+uses only fixed, non-secret test inputs: Ed25519 signing seed `09`×32,
+ML-DSA-65 signing seed `0a`×32, kids `proof-fixture-ed` and
+`proof-fixture-pq`, response hybrid-KEM seeds (`07`×32, `09`×64), stream
+hybrid-KEM seeds (`08`×32, `0a`×64), legacy client-DH public `5a`×32,
+request ID `3c`×16, credential bytes `fixture.sender.constrained.jwt`,
+service `registry.svc.hyprstream.test`, schema ID `0xd4d0f2a1b3c58e67`,
+body `federate-proof-vector-v1`, `iat=1799999995`, and `exp=1800000030`.
+The expected SHA-256 of the complete untagged `COSE_Sign` bytes is
+`186b33dad6d4b41ed750b0d05e408dcaa78e708c33abac7bf4c2778bcf6826d6`.
+The test also verifies both signatures and proves the frozen generic parser
+rejects those same bytes. This is a **native checksum vector**, not yet the
+required native/browser byte-identical vector or complete negative suite.
+
 Before enabling this profile, publish byte-identical native/browser positive
 vectors for the JWT claim layout and a signed v16 proof with `-70009` and an
 actual forwarded recipient set. Negative vectors MUST cover: missing or
