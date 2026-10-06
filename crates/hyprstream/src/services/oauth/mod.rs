@@ -47,6 +47,10 @@ pub mod federation_entity;
 pub(crate) mod federate_exchange;
 #[allow(dead_code)]
 pub(crate) mod federate_source;
+// H3b.1 proof primitive only: no constructor installs its authority provider.
+#[cfg(feature = "postgres")]
+#[allow(dead_code)]
+mod federate_proof;
 pub mod identity_registration;
 pub mod introspection;
 pub mod jwks;

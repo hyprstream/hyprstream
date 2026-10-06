@@ -195,17 +195,22 @@ impl Commitment {
         format!("hsn1.{}", B64.encode(sha(&self.preimage())))
     }
     fn kids(&self) -> [[u8; 32]; 2] {
-        [
-            sha(&frame(
-                "hyprstream.session-primary.kid.v1",
-                &[b"Ed25519", &self.ed],
-            )),
-            sha(&frame(
-                "hyprstream.session-primary.kid.v1",
-                &[b"ML-DSA-65", &self.pq],
-            )),
-        ]
+        session_primary_kids(&self.ed, &self.pq)
     }
+}
+
+// Shared by possession verification and the disabled request-proof consumer.
+pub(super) fn session_primary_kids(ed: &[u8; 32], pq: &[u8]) -> [[u8; 32]; 2] {
+    [
+        sha(&frame(
+            "hyprstream.session-primary.kid.v1",
+            &[b"Ed25519", ed],
+        )),
+        sha(&frame(
+            "hyprstream.session-primary.kid.v1",
+            &[b"ML-DSA-65", pq],
+        )),
+    ]
 }
 
 struct Keys {
