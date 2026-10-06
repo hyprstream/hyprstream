@@ -1167,7 +1167,12 @@ mod tests {
             "blocking disk backpressure stalled the current-thread service reactor"
         );
         assert!(!task.is_finished(), "the blocked write lost backpressure");
-        drop(task); // Cancel the caller while the worker still owns the write.
+        task.abort();
+        match task.await {
+            Err(error) if error.is_cancelled() => {}
+            outcome => return Err(internal(format!("caller was not cancelled: {outcome:?}"))),
+        }
+        // The detached blocking worker still owns the write and disk lease.
         assert!(Arc::clone(&slots).try_acquire_owned().is_err());
         assert!(root_path.exists());
         release_tx.send(()).map_err(internal)?;
