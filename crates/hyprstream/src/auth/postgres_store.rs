@@ -155,6 +155,30 @@ impl PostgresUserStoreConfig {
         })
     }
 
+    /// Separate read-only account identity for Policy's current-grant checks.
+    /// A password-bearing URL is accepted only from a projected file.
+    pub(crate) fn from_policy_env() -> Result<Self> {
+        let url_file = std::env::var_os("HYPRSTREAM_POLICY_ACCOUNTS_URL_FILE")
+            .context("HYPRSTREAM_POLICY_ACCOUNTS_URL_FILE is required")?;
+        let database_url = std::fs::read_to_string(&url_file)
+            .context("reading Policy account URL file")?
+            .trim()
+            .to_owned();
+        ensure!(!database_url.is_empty(), "Policy account URL file is empty");
+        validate_pg_url(&database_url)?;
+        let ca_file = std::env::var_os("HYPRSTREAM_POLICY_ACCOUNTS_SSLROOTCERT_FILE")
+            .context("HYPRSTREAM_POLICY_ACCOUNTS_SSLROOTCERT_FILE is required")?;
+        ensure!(
+            std::fs::metadata(&ca_file)?.is_file(),
+            "Policy account CA path is not a file"
+        );
+        Ok(Self {
+            database_url,
+            max_connections: 2,
+            ca_file: Some(PathBuf::from(ca_file)),
+        })
+    }
+
     /// Construct from an explicit connection URL — **TEST/MIGRATION ONLY**.
     ///
     /// Production wiring MUST use [`Self::from_env`] which reads the
@@ -180,10 +204,91 @@ pub struct PostgresUserStore {
     cipher: Option<ColumnCipher>,
 }
 
+/// Policy's read-only account capability. The production constructor proves
+/// that the database login can read current identity state and cannot write
+/// account rows or create schema objects. Only the two reads needed for
+/// Federate admission are exposed to Policy.
+#[allow(dead_code)] // Consumed when the Federate Policy runtime is installed.
+pub(crate) struct PolicyAccountReader {
+    store: Arc<dyn UserStore>,
+}
+
+const POLICY_ACCOUNT_ROLE_SQL: &str =
+    "SELECT \
+     to_regclass('public.users') IS NOT NULL AND \
+     to_regclass('public.oidc_bindings') IS NOT NULL AND \
+     to_regclass('public.user_did_bindings') IS NOT NULL AND \
+     to_regclass('public.user_encryption_keys') IS NOT NULL AND \
+     has_schema_privilege(current_user, 'public', 'USAGE') AND \
+     has_table_privilege(current_user, 'public.users', 'SELECT') AND \
+     has_table_privilege(current_user, 'public.oidc_bindings', 'SELECT') AND \
+     has_table_privilege(current_user, 'public.user_did_bindings', 'SELECT') AND \
+     has_table_privilege(current_user, 'public.user_encryption_keys', 'SELECT') AND \
+     NOT has_schema_privilege(current_user, 'public', 'CREATE') AND \
+     NOT has_database_privilege(current_user, current_database(), 'CREATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.users', 'INSERT,UPDATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.oidc_bindings', 'INSERT,UPDATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.user_did_bindings', 'INSERT,UPDATE') AND \
+     NOT has_any_column_privilege(current_user, 'public.user_encryption_keys', 'INSERT,UPDATE') AND \
+     NOT has_table_privilege(current_user, 'public.users', 'DELETE,TRUNCATE') AND \
+     NOT has_table_privilege(current_user, 'public.oidc_bindings', 'DELETE,TRUNCATE') AND \
+     NOT has_table_privilege(current_user, 'public.user_did_bindings', 'DELETE,TRUNCATE') AND \
+     NOT has_table_privilege(current_user, 'public.user_encryption_keys', 'DELETE,TRUNCATE')";
+
+#[allow(dead_code)]
+impl PolicyAccountReader {
+    pub(crate) async fn open() -> Result<Self> {
+        Ok(Self {
+            store: Arc::new(PostgresUserStore::open_policy_reader().await?),
+        })
+    }
+
+    pub(crate) async fn get_external_identity_user(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        self.store.get_external_identity_user(issuer, subject).await
+    }
+
+    pub(crate) async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
+        self.store.get_profile(username).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Arc<dyn UserStore>) -> Self {
+        Self { store }
+    }
+}
+
 #[cfg(not(test))]
 impl super::user_store::private::Sealed for PostgresUserStore {}
 
 impl PostgresUserStore {
+    /// Open Policy's account reader without running the account-store DDL.
+    /// The dedicated login must have SELECT for current identity reads and no
+    /// account mutation or schema-creation authority. The database enforces
+    /// that restriction even if a future caller obtains the inner store.
+    pub(crate) async fn open_policy_reader() -> Result<Self> {
+        let cipher = ColumnCipher::from_deployment_env()
+            .context("load deployment UserStore encryption configuration")?;
+        let config = PostgresUserStoreConfig::from_policy_env()?;
+        let pool = build_pool(Some(&config))?;
+        let client = pool.get().await.map_err(pool_err)?;
+        let row = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .context("verify Policy account reader privileges")?;
+        ensure!(
+            row.get::<_, bool>(0),
+            "Policy account reader schema or privileges invalid"
+        );
+        drop(client);
+        Ok(Self {
+            pool,
+            cipher: Some(cipher),
+        })
+    }
     /// Open the RDS-backed account store through the production admission
     /// boundary. Both the file-backed verify-full configuration and the
     /// deployment envelope-encryption material are mandatory; failure occurs
@@ -712,10 +817,10 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
     Ok(assemble_pool(cfg, ca_file, max_connections)?.pool)
 }
 
-/// Reuse the production CA-pinned, hostname-verifying pool for the replay role.
+/// Reuse the production CA-pinned, hostname-verifying pool for a role-scoped
+/// replay or Federate Policy connection.
 /// The caller supplies a role-scoped URL read from a credential file.
-#[cfg(feature = "postgres-replay")]
-pub(crate) fn build_replay_pool(
+pub(crate) fn build_verified_postgres_pool(
     database_url: &str,
     ca_file: &std::path::Path,
     max_connections: usize,
@@ -1700,6 +1805,105 @@ mod tests {
         let url = require_db!();
         let store = fresh(&url).await;
         assert!(store.get_profile("nobody").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn policy_account_reader_role_is_read_only() {
+        let url = require_db!();
+        let store = fresh(&url).await;
+        let client = store.pool.get().await.unwrap();
+        let role = format!("hs_policy_probe_{}", uuid::Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {role} NOLOGIN; \
+                 GRANT USAGE ON SCHEMA public TO {role}; \
+                 GRANT SELECT ON users, oidc_bindings, user_did_bindings, user_encryption_keys TO {role}; \
+                 SET ROLE {role}"
+            ))
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(allowed, "a read-only account role must pass");
+        assert!(client
+            .batch_execute("CREATE TABLE public.policy_forbidden(id int)")
+            .await
+            .is_err());
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!(
+                "GRANT UPDATE(active) ON users TO {role}; SET ROLE {role}"
+            ))
+            .await
+            .unwrap();
+        let grants = client
+            .query_one(
+                "SELECT has_table_privilege(current_user, 'public.users', 'UPDATE'), \
+                        has_any_column_privilege(current_user, 'public.users', 'UPDATE')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(!grants.get::<_, bool>(0));
+        assert!(grants.get::<_, bool>(1));
+        let allowed: bool = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "column-level account UPDATE must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!("REVOKE UPDATE(active) ON users FROM {role}"))
+            .await
+            .unwrap();
+        let inherited = format!("hs_policy_inherited_{}", uuid::Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {inherited} NOLOGIN; \
+                 GRANT INSERT(active) ON users TO {inherited}; \
+                 GRANT {inherited} TO {role}; \
+                 SET ROLE {role}"
+            ))
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "inherited column-level INSERT must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!(
+                "REVOKE {inherited} FROM {role}; \
+                 REVOKE ALL ON users FROM {inherited}; \
+                 DROP ROLE {inherited}"
+            ))
+            .await
+            .unwrap();
+        client
+            .batch_execute(&format!("GRANT INSERT ON users TO {role}; SET ROLE {role}"))
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_ACCOUNT_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "one inherited write privilege must deny startup");
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(&format!(
+                "REVOKE ALL ON users, oidc_bindings, user_did_bindings, user_encryption_keys FROM {role}; \
+                 REVOKE USAGE ON SCHEMA public FROM {role}; \
+                 DROP ROLE {role}"
+            ))
+            .await
+            .unwrap();
     }
 
     /// A one-slot pool turns a nested checkout into a deterministic timeout.

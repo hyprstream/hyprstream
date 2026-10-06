@@ -39,6 +39,9 @@ use tracing::{debug, info, trace, warn};
 #[cfg(feature = "postgres")]
 #[path = "policy_primary.rs"]
 mod primary;
+#[cfg(feature = "postgres")]
+#[path = "policy_session_db.rs"]
+mod session_db;
 
 /// Evaluate a policy check on behalf of an already-verified upstream caller.
 ///

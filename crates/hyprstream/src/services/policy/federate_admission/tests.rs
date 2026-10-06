@@ -173,7 +173,7 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
         .await
         .unwrap();
     let a = Authorities {
-        users: ProductionUserStore::for_test(users.clone()),
+        users: PolicyAccountReader::for_test(users.clone()),
         accounts: Arc::new(AccountRecordStore::new(
             Arc::new(SyntheticMount::new(root)),
             Arc::new(Permit),

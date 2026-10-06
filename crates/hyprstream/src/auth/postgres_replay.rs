@@ -21,7 +21,7 @@ use hyprstream_rpc::proof::{
 };
 use sha2::{Digest, Sha256};
 
-use super::postgres_store::build_replay_pool;
+use super::postgres_store::build_verified_postgres_pool;
 
 // A caller may time out before the worker's pool wait plus statement deadline.
 // It denies in that case even if the worker later commits; a retry then sees
@@ -90,9 +90,9 @@ impl PostgresProofReplayStore {
         let url = std::fs::read_to_string(&url_path).context("reading replay Postgres URL file")?;
         let url = url.trim();
         ensure!(!url.is_empty(), "replay Postgres URL file is empty");
-        // build_replay_pool enforces remote DNS, verify-full, CA-pinned TLS.
+        // The shared pool builder enforces remote DNS, verify-full, CA-pinned TLS.
         let pool =
-            build_replay_pool(url, &ca_path, 2).context("building replay Postgres TLS pool")?;
+            build_verified_postgres_pool(url, &ca_path, 2).context("building replay Postgres TLS pool")?;
         Self::start(domain, pool)
     }
 
