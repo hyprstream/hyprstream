@@ -714,6 +714,7 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
 
 /// Reuse the production CA-pinned, hostname-verifying pool for the replay role.
 /// The caller supplies a role-scoped URL read from a credential file.
+#[cfg(feature = "postgres-replay")]
 pub(crate) fn build_replay_pool(
     database_url: &str,
     ca_file: &std::path::Path,
