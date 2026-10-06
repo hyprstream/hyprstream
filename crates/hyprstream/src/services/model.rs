@@ -183,7 +183,19 @@ pub struct StagingModelPin {
     pub commit: git2::Oid,
 }
 
+const REVIEWED_STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
+const REVIEWED_STAGING_MODEL_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
+
 impl StagingModelPin {
+    pub(crate) fn reviewed() -> Result<Self> {
+        Self::new(REVIEWED_STAGING_MODEL_REF, git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?)
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn reviewed_repo_name() -> &'static str {
+        "qwen2.5-0.5b-instruct"
+    }
+
     pub fn new(model_ref: impl Into<String>, commit: git2::Oid) -> Result<Self> {
         let model_ref = model_ref.into();
         let parsed = ModelRef::parse(&model_ref)
@@ -221,16 +233,14 @@ impl StagingModelPin {
         const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
         const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
         const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
-        const REVIEWED_REF: &str = "qwen2.5-0.5b-instruct:main";
-        const REVIEWED_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
         if profile == "staging" {
             match (model_ref, oid) {
-                (None, None) => return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some),
-                (Some(model_ref), Some(oid)) => anyhow::ensure!(model_ref == REVIEWED_REF && oid == REVIEWED_OID,
+                (None, None) => return Self::reviewed().map(Some),
+                (Some(model_ref), Some(oid)) => anyhow::ensure!(model_ref == REVIEWED_STAGING_MODEL_REF && oid == REVIEWED_STAGING_MODEL_OID,
                     "staging override must match the complete reviewed model pin"),
                 _ => anyhow::bail!("{REF} and {OID} must either both be absent or both match the reviewed pin"),
             }
-            return Self::new(REVIEWED_REF, git2::Oid::from_str(REVIEWED_OID)?).map(Some);
+            return Self::reviewed().map(Some);
         }
         anyhow::ensure!(profile == "default", "{PROFILE} must be 'default' or 'staging'");
         match (model_ref, oid) {
@@ -2800,23 +2810,40 @@ impl ModelService {
 // RequestService Implementation — delegates to generated dispatch_model
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Only the generated `infer.generateStream` leaf can use this request-local
-/// Federate admission. The resource is the exact generated authorize value.
+/// Only the three staging acceptance methods can use request-local Federate
+/// admission. Top-level resources and the scoped infer resource must exactly
+/// match the generated handler's authorize coordinates. Every request names
+/// the immutable staging model; an empty Status query cannot list other models.
+#[cfg(feature = "postgres")]
+pub(crate) const FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID: u64 =
+    <hyprstream_rpc_std::model_capnp::model_request::Reader<'static> as capnp::traits::HasTypeId>::TYPE_ID;
+
 #[cfg(feature = "postgres")]
 fn federate_model_operation(
     body: &hyprstream_rpc::service::DecodedRequestBody,
+    pin: &StagingModelPin,
 ) -> Result<(String, String)> {
     use hyprstream_rpc_std::model_capnp::{infer_request, model_request};
     let request = body.root::<model_request::Reader>()?;
-    let infer = match request.which()? {
-        model_request::Which::Infer(inner) => inner?,
+    let (model_ref, resource, operation) = match request.which()? {
+        model_request::Which::Load(inner) => {
+            (inner?.get_model_ref()?.to_str()?.to_owned(), "model:Load".to_owned(), "write")
+        }
+        model_request::Which::Status(inner) => {
+            (inner?.get_model_ref()?.to_str()?.to_owned(), "model:Status".to_owned(), "query")
+        }
+        model_request::Which::Infer(inner) => {
+            let infer = inner?;
+            anyhow::ensure!(matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
+                "unsupported Federate inference method");
+            let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
+            (model_ref.clone(), format!("model:{model_ref}"), "infer")
+        }
         _ => anyhow::bail!("unsupported Federate Model method"),
     };
-    anyhow::ensure!(matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
-        "unsupported Federate inference method");
-    let model_ref = infer.get_model_ref()?.to_str()?;
-    anyhow::ensure!(!model_ref.is_empty(), "empty Federate model reference");
-    Ok((format!("model:{model_ref}"), "infer".to_owned()))
+    anyhow::ensure!(pin == &StagingModelPin::reviewed()? && pin.admits(&model_ref),
+        "Federate Model request is not the reviewed pinned staging model");
+    Ok((resource, operation.to_owned()))
 }
 
 #[async_trait(?Send)]
@@ -2838,9 +2865,11 @@ impl crate::services::RequestService for ModelService {
         {
             let adapter = self.federate_dispatch.as_ref()
                 .ok_or_else(|| anyhow!("Federate dispatch is disabled"))?;
-            let (resource, operation) = federate_model_operation(body)?;
+            let pin = self.config.staging_model_pin.as_ref()
+                .ok_or_else(|| anyhow!("Federate Model requires an immutable staging model pin"))?;
+            let (resource, operation) = federate_model_operation(body, pin)?;
             let (verified, holder) = adapter.admit(
-                ctx, proof, "model", 0xe7339d5d26ab3076, body.bytes(),
+                ctx, proof, "model", FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID, body.bytes(),
                 &resource, &operation,
             ).await?;
             Ok((verified, holder, resource, operation))
@@ -3032,35 +3061,80 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn federate_model_route_is_exact_generate_stream_and_model_ref() -> Result<()> {
+    fn federate_model_route_is_exact_load_status_stream_and_pinned_ref() -> Result<()> {
+        let pin = StagingModelPin::from_settings("staging", None, None)?
+            .ok_or_else(|| anyhow!("staging pin missing"))?;
+        let model_ref = pin.model_ref.as_str();
+        assert_eq!(model_ref.split_once(':').map(|(name, _)| name),
+            Some(StagingModelPin::reviewed_repo_name()));
         let bytes = hyprstream_rpc::serialize_message(|message| {
             let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(1);
             let mut infer = request.init_infer();
-            infer.set_model_ref("qwen2.5-0.5b-instruct:main");
+            infer.set_model_ref(model_ref);
             infer.init_generate_stream();
         })?;
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-        assert_eq!(federate_model_operation(&body)?,
-            ("model:qwen2.5-0.5b-instruct:main".into(), "infer".into()));
+        assert_eq!(federate_model_operation(&body, &pin)?,
+            (format!("model:{model_ref}"), "infer".into()));
+        let wrong_oid = StagingModelPin::new(model_ref,
+            git2::Oid::from_str("0000000000000000000000000000000000000001")?)?;
+        assert!(federate_model_operation(&body, &wrong_oid).is_err());
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
             let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(2);
             let mut infer = request.init_infer();
-            infer.set_model_ref("qwen2.5-0.5b-instruct:main");
+            infer.set_model_ref(model_ref);
             infer.set_status(());
         })?;
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-        assert!(federate_model_operation(&body).is_err());
+        assert!(federate_model_operation(&body, &pin).is_err());
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
             let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(3);
-            request.init_load().set_model_ref("qwen2.5-0.5b-instruct:main");
+            request.init_load().set_model_ref(model_ref);
         })?;
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-        assert!(federate_model_operation(&body).is_err());
+        assert_eq!(federate_model_operation(&body, &pin)?,
+            ("model:Load".into(), "write".into()));
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(4);
+            request.init_status().set_model_ref(model_ref);
+        })?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert_eq!(federate_model_operation(&body, &pin)?,
+            ("model:Status".into(), "query".into()));
+
+        for rejected in ["", "qwen2.5-0.5b-instruct:other", "attacker:main"] {
+            let bytes = hyprstream_rpc::serialize_message(|message| {
+                let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                request.set_id(5);
+                request.init_status().set_model_ref(rejected);
+            })?;
+            let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+            assert!(federate_model_operation(&body, &pin).is_err(), "status accepted {rejected:?}");
+        }
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(6);
+            request.init_load().set_model_ref("attacker:main");
+        })?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(federate_model_operation(&body, &pin).is_err());
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(7);
+            let mut infer = request.init_infer();
+            infer.set_model_ref("attacker:main");
+            infer.init_generate_stream();
+        })?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(federate_model_operation(&body, &pin).is_err());
         Ok(())
     }
 
