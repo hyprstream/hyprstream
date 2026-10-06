@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
+    extract::RawForm,
     extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Form, Json,
+    Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
@@ -91,12 +92,34 @@ pub struct TokenRequest {
     pub resource: Option<String>,
 }
 
+fn reserved_federate_form(raw: &[u8]) -> bool {
+    url::form_urlencoded::parse(raw).any(|(key, value)| {
+        key == "hs_profile" || (key == "client_id" && value == super::federate_source::CLIENT)
+    })
+}
+
 /// POST /oauth/token — token exchange
 pub async fn exchange_token(
     State(state): State<Arc<OAuthState>>,
     req_headers: HeaderMap,
-    Form(params): Form<TokenRequest>,
+    RawForm(raw): RawForm,
 ) -> Response {
+    // Reserve the exact Federate client/profile before the generic RFC 8693
+    // dispatcher. The dedicated parser rejects duplicate and unknown fields;
+    // removing hs_profile cannot fall through to generic ID-token exchange.
+    if reserved_federate_form(&raw) {
+        return super::federate_host::exchange(&state, &req_headers, &raw).await;
+    }
+    let params: TokenRequest = match serde_urlencoded::from_bytes(&raw) {
+        Ok(params) => params,
+        Err(_) => {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("invalid token request form"),
+            )
+        }
+    };
     tracing::info!(
         grant_type = %params.grant_type,
         client_id = %params.client_id,
@@ -1684,6 +1707,22 @@ fn token_error_body(error: &str, description: Option<&str>) -> serde_json::Value
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn federate_form_cannot_downgrade_to_generic_exchange() {
+        assert!(super::reserved_federate_form(
+            b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&hs_profile=federate-session-v1"
+        ));
+        assert!(super::reserved_federate_form(format!(
+            "client_id={}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token",
+            super::super::federate_source::CLIENT
+        ).as_bytes()));
+        assert!(super::reserved_federate_form(format!(
+            "client_id=ordinary&client_id={}",
+            super::super::federate_source::CLIENT
+        ).as_bytes()));
+        assert!(!super::reserved_federate_form(b"client_id=ordinary&grant_type=refresh_token"));
+    }
 
     #[test]
     fn dpop_replay_logging_is_generic_and_never_bypasses_full_rate_limit() {
