@@ -27,7 +27,7 @@ use hyprstream_rpc::{
     },
     service::EnvelopeContext,
 };
-use hyprstream_rpc_std::policy_client::SessionPrimary;
+use hyprstream_rpc_std::policy_client::{PolicyClient, ResolveSessionPrimary, SessionPrimary};
 use hyprstream_session_store::{primary::{CollisionInventory, ExpectedPrimary}, PROFILE, SUITE};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
@@ -157,6 +157,44 @@ impl CredentialHandle {
 #[async_trait::async_trait]
 trait CurrentPrimary: Send + Sync {
     async fn resolve_current(&self, credential: &CredentialHandle) -> Result<SessionPrimary>;
+}
+
+/// An authenticated service client, never the browser bearer. The trusted
+/// service factory must construct `PolicyClient` with its own enrolled signer
+/// and capability; this type has no public/runtime constructor or fallback.
+#[allow(dead_code)] // Provider installation remains disabled until dispatch admission is complete.
+struct PolicyPrimaryProvider {
+    client: PolicyClient,
+}
+
+impl PolicyPrimaryProvider {
+    fn request(credential: &CredentialHandle) -> ResolveSessionPrimary {
+        let e = &credential.expected;
+        ResolveSessionPrimary {
+            issuer: e.issuer.clone(),
+            profile: e.profile.clone(),
+            sid: e.sid.clone(),
+            subject: e.subject.clone(),
+            tenant: e.tenant.clone(),
+            client: e.client.clone(),
+            audience: e.audience.clone(),
+            scopes: e.scopes.clone(),
+            ed_public: e.ed_public.to_vec(),
+            suite_thumbprint: e.suite_thumbprint.to_vec(),
+            generation: e.generation.to_vec(),
+            expires_at: e.expires_at,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CurrentPrimary for PolicyPrimaryProvider {
+    async fn resolve_current(&self, credential: &CredentialHandle) -> Result<SessionPrimary> {
+        self.client
+            .resolve_session_primary(&Self::request(credential))
+            .await
+            .map_err(|_| Error::Unavailable)
+    }
 }
 
 /// Input bytes are the original holder's proof/credential, not the relay's.

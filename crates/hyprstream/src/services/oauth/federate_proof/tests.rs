@@ -165,6 +165,25 @@ fn fixture() -> (CredentialHandle, SessionPrimary, CollisionInventory) {
     )
 }
 
+#[test]
+fn h3b_policy_lookup_request_is_exact_credential_tuple() {
+    let (handle, _, _) = fixture();
+    let request = PolicyPrimaryProvider::request(&handle);
+    let e = &handle.expected;
+    assert_eq!(request.issuer, e.issuer);
+    assert_eq!(request.profile, e.profile);
+    assert_eq!(request.sid, e.sid);
+    assert_eq!(request.subject, e.subject);
+    assert_eq!(request.tenant, e.tenant);
+    assert_eq!(request.client, e.client);
+    assert_eq!(request.audience, e.audience);
+    assert_eq!(request.scopes, e.scopes);
+    assert_eq!(request.ed_public, e.ed_public);
+    assert_eq!(request.suite_thumbprint, e.suite_thumbprint);
+    assert_eq!(request.generation, e.generation);
+    assert_eq!(request.expires_at, e.expires_at);
+}
+
 fn provider(record: SessionPrimary) -> Arc<Provider> {
     Arc::new(Provider {
         record: Mutex::new(record),
