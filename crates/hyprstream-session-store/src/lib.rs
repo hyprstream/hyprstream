@@ -7,6 +7,7 @@
 //! narrow runtime role. No DSN or token bodies are accepted or logged here.
 
 use tokio_postgres::{Client, IsolationLevel, Row, error::SqlState};
+pub mod primary;
 
 pub const PROFILE: &str = "federate-session-v1";
 pub const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
@@ -99,6 +100,7 @@ pub struct Session {
 pub struct PrimaryRecord {
     session: Session,
     source: Source,
+    created_at: i64,
 }
 
 impl PrimaryRecord {
@@ -108,6 +110,10 @@ impl PrimaryRecord {
 
     pub fn source_identity(&self) -> (&str, &str) {
         (&self.source.issuer, &self.source.subject)
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
     }
 }
 
@@ -295,7 +301,7 @@ impl Store {
     /// Authoritative full-record lookup for the future request-local proof resolver.
     /// Caller must still compare all credential fields and verify the RPC proof.
     pub async fn lookup(
-        client: &Client,
+        client: &(impl tokio_postgres::GenericClient + Sync),
         host: &str,
         sid: &str,
         generation: &[u8; 32],
@@ -356,7 +362,11 @@ impl Store {
                     issued_at: row.try_get("source_iat")?,
                     expires_at: row.try_get("source_exp")?,
                 };
-                Ok(Some(PrimaryRecord { session, source }))
+                Ok(Some(PrimaryRecord {
+                    session,
+                    source,
+                    created_at: row.try_get("created_at")?,
+                }))
             }
             _ => Err(Error::Unavailable),
         };

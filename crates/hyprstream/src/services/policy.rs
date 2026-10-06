@@ -36,6 +36,10 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
+#[cfg(feature = "postgres")]
+#[path = "policy_primary.rs"]
+mod primary;
+
 /// Evaluate a policy check on behalf of an already-verified upstream caller.
 ///
 /// The compatibility `PolicyCheck.subject/domain` fields are never identity
@@ -139,6 +143,9 @@ fn validate_event_prefix_registration(
 const DEFAULT_REVOCATION_MAX_TTL_SECS: i64 = 45 * 24 * 3600;
 
 pub struct PolicyService {
+    /// Source-only: never installed by any runtime factory in H3a.
+    #[cfg(feature = "postgres")]
+    session_primary: Option<primary::SessionPrimaryReader>,
     // Business logic
     policy_manager: Arc<PolicyManager>,
     signing_key: Arc<SigningKey>,
@@ -206,6 +213,8 @@ impl PolicyService {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
         let jwt_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(&signing_key, "hyprstream-jwt-v1");
         Self {
+            #[cfg(feature = "postgres")]
+            session_primary: None,
             policy_manager,
             signing_key,
             jwt_signing_key,
@@ -1192,6 +1201,26 @@ fn validate_credential_hs_suite(
 
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
+    async fn handle_resolve_session_primary(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &hyprstream_rpc_std::policy_client::ResolveSessionPrimary,
+    ) -> Result<PolicyResponseVariant> {
+        #[cfg(feature = "postgres")]
+        if let Some(reader) = &self.session_primary {
+            if let Ok(record) = reader.resolve(ctx, data).await {
+                return Ok(PolicyResponseVariant::ResolveSessionPrimaryResult(record));
+            }
+        }
+        let _ = (ctx, data);
+        Ok(PolicyResponseVariant::Error(ErrorInfo {
+            code: "SESSION_PRIMARY_DENIED".into(),
+            message: "session primary unavailable or denied".into(),
+            details: String::new(),
+        }))
+    }
+
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
         let domain = self.request_domain(ctx)?;
@@ -4306,6 +4335,24 @@ mod tests {
     async fn test_service() -> (PolicyService, tempfile::TempDir) {
         let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
         test_service_with_manager(manager).await
+    }
+
+    #[tokio::test]
+    async fn h3a_primary_lookup_has_no_default_provider() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:model"),
+            SigningKey::from_bytes(&[77; 32]).verifying_key(),
+        );
+        let data = hyprstream_rpc_std::policy_client::ResolveSessionPrimary {
+            issuer: "https://host.test".into(), profile: "federate-session-v1".into(),
+            sid: "sid".into(), subject: "alice".into(), tenant: "tenant".into(),
+            client: "client".into(), audience: "https://host.test".into(),
+            scopes: vec!["model:query".into()], ed_public: vec![1; 32],
+            suite_thumbprint: vec![2; 32], generation: vec![3; 32], expires_at: 1,
+        };
+        assert!(matches!(service.handle_resolve_session_primary(&ctx, 1, &data).await,
+            Ok(PolicyResponseVariant::Error(ref error)) if error.code == "SESSION_PRIMARY_DENIED"));
     }
 
     fn issue(subject: &str) -> IssueToken {

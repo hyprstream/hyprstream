@@ -7729,6 +7729,8 @@ dependencies = [
 name = "hyprstream-session-store"
 version = "0.1.0"
 dependencies = [
+ "hyprstream-rpc",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tokio-postgres",

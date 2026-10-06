@@ -157,7 +157,49 @@ struct PolicyRequest {
     checkMediated @29 :MediatedPolicyCheck
       $scopeExempt("authorization query verifies holder evidence and mediator admission internally; requiring the queried authority here would be circular")
       $dispatchMac("internal:pq-hybrid");
+
+    # Internal full-record lookup; explicit configured service/key/tenant/resource
+    # capability required by Policy. No provider installed by default, no grants.
+    resolveSessionPrimary @30 :ResolveSessionPrimary
+      $scope(query) $dispatchMac("internal:pq-hybrid");
   }
+}
+
+struct ResolveSessionPrimary {
+  issuer @0 :Text $maxLen(2048);
+  profile @1 :Text $maxLen(64);
+  sid @2 :Text $maxLen(128);
+  subject @3 :Text $maxLen(256);
+  tenant @4 :Text $maxLen(256);
+  client @5 :Text $maxLen(256);
+  audience @6 :Text $maxLen(2048);
+  scopes @7 :List(Text) $maxLen(64);
+  edPublic @8 :Data $maxLen(32);
+  suiteThumbprint @9 :Data $maxLen(32);
+  generation @10 :Data $maxLen(32);
+  expiresAt @11 :Int64;
+}
+
+# Active only. grantRevision is historical admission provenance, not an allow.
+struct SessionPrimary {
+  host @0 :Text;
+  profile @1 :Text;
+  suite @2 :Text;
+  sid @3 :Text;
+  accountId @4 :Text;
+  subject @5 :Text;
+  tenant @6 :Text;
+  client @7 :Text;
+  resource @8 :Text;
+  scopes @9 :List(Text);
+  grantRevision @10 :Text;
+  edPublic @11 :Data;
+  pqPublic @12 :Data;
+  generation @13 :Data;
+  createdAt @14 :Int64;
+  expiresAt @15 :Int64;
+  proofEpoch @16 :UInt64;
+  collisionInventoryId @17 :Data;
 }
 
 struct MediatedPolicyCheck {
@@ -390,6 +432,7 @@ struct PolicyResponse {
     # Minted delegated at+jwt/wit from exchangeDelegated (fresh jti).
     exchangeDelegatedResult @29 :TokenInfo;
     checkMediatedResult @30 :Bool;
+    resolveSessionPrimaryResult @31 :SessionPrimary;
   }
 }
 
