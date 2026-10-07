@@ -4,8 +4,10 @@ use anyhow::{ensure, Context, Result};
 use git2::{Oid, StatusOptions};
 use git2db::pinned_disk::DiskPinnedTreeProjection;
 use git2db::pinned_tree::{PinnedTree, SealedTreeProjection};
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use tokio::sync::Mutex;
 
 /// Retain the selected commit's verified inputs through every loader read.
 /// Only the fixed staging profile needs the disk-backed, capacity-limited path.
@@ -13,6 +15,62 @@ use std::sync::Arc;
 pub enum PinnedModelArtifact {
     StagingDisk(DiskPinnedTreeProjection),
     Sealed { projection: SealedTreeProjection, owner_pid: u32 },
+}
+
+/// Reuse one immutable staging projection across tenant-specific Inference
+/// instances. The weak cache does not keep disk reservations alive by itself;
+/// the serving instances own strong references for as long as they need the
+/// verified file descriptors.
+#[derive(Default)]
+pub struct StagingPinnedArtifactCache {
+    entries: Mutex<HashMap<(PathBuf, git2::Oid), Weak<PinnedModelArtifact>>>,
+}
+
+impl StagingPinnedArtifactCache {
+    pub async fn acquire(
+        &self,
+        worktree_path: &Path,
+        commit: git2::Oid,
+    ) -> Result<Arc<PinnedModelArtifact>> {
+        self.acquire_in(
+            worktree_path,
+            commit,
+            Path::new("/var/cache/hyprstream-pinned"),
+        )
+        .await
+    }
+
+    async fn acquire_in(
+        &self,
+        worktree_path: &Path,
+        commit: git2::Oid,
+        private_disk_parent: &Path,
+    ) -> Result<Arc<PinnedModelArtifact>> {
+        // A cache hit may share only the exact commit from the exact local
+        // checkout, and the checkout must still satisfy the current load's
+        // clean/HEAD admission rule.
+        verify_selected_checkout(worktree_path, commit)?;
+        let key = (worktree_path.to_path_buf(), commit);
+        let mut entries = self.entries.lock().await;
+        entries.retain(|_, artifact| artifact.strong_count() > 0);
+        if let Some(artifact) = entries.get(&key).and_then(Weak::upgrade) {
+            return Ok(artifact);
+        }
+
+        // Hold the async cache lock while acquiring to make same-commit loads
+        // coalesce. The bounded acquisition itself runs on the projection I/O
+        // runtime, not the Model service reactor.
+        let projection = DiskPinnedTreeProjection::acquire_bounded(
+            worktree_path,
+            commit,
+            private_disk_parent,
+        )
+        .await
+        .with_context(|| format!("capture model commit {commit}"))?;
+        let artifact = Arc::new(PinnedModelArtifact::StagingDisk(projection));
+        entries.insert(key, Arc::downgrade(&artifact));
+        Ok(artifact)
+    }
 }
 
 impl PinnedModelArtifact {
@@ -77,15 +135,21 @@ pub async fn acquire_pinned_model_bounded(
     worktree_path: &Path,
     commit: Oid,
 ) -> Result<Arc<PinnedModelArtifact>> {
-    let projection = acquire_pinned_model_with_observer(
-        worktree_path,
-        commit,
-        Path::new("/var/cache/hyprstream-pinned"),
-        true,
-        || Ok(()),
-    )
-    .await?;
-    Ok(Arc::new(PinnedModelArtifact::StagingDisk(projection)))
+    StagingPinnedArtifactCache::default()
+        .acquire(worktree_path, commit)
+        .await
+}
+
+#[cfg(test)]
+pub(crate) async fn acquire_pinned_model_bounded_in(
+    cache: &StagingPinnedArtifactCache,
+    worktree_path: &Path,
+    commit: Oid,
+    private_disk_parent: &Path,
+) -> Result<Arc<PinnedModelArtifact>> {
+    cache
+        .acquire_in(worktree_path, commit, private_disk_parent)
+        .await
 }
 
 #[cfg(test)]
@@ -106,6 +170,7 @@ pub(crate) async fn acquire_pinned_model_in(
     ))
 }
 
+#[cfg(test)]
 async fn acquire_pinned_model_with_observer(
     worktree_path: &Path,
     commit: Oid,
@@ -274,6 +339,54 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert_eq!(sampling.temperature, Some(0.25));
         assert!(!artifact.root().join("untracked.safetensors").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_staging_loads_share_one_projection_for_the_same_commit() -> Result<()> {
+        let repo_dir = tempfile::tempdir()?;
+        let private_parent = tempfile::tempdir_in(
+            std::env::current_exe()?
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("test binary has no parent directory"))?,
+        )?;
+        std::fs::set_permissions(
+            private_parent.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        let repo = git2db::Repository::init(repo_dir.path())?;
+        std::fs::write(repo_dir.path().join("config.json"), b"reviewed")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("config.json"))?;
+        index.write()?;
+        let tree = repo.find_tree(index.write_tree()?)?;
+        let signature = git2::Signature::now("test", "test@example.invalid")?;
+        let commit = repo.commit(Some("HEAD"), &signature, &signature, "reviewed", &tree, &[])?;
+        drop(tree);
+        drop(repo);
+
+        let cache = StagingPinnedArtifactCache::default();
+        let first = acquire_pinned_model_bounded_in(
+            &cache,
+            repo_dir.path(),
+            commit,
+            private_parent.path(),
+        )
+        .await?;
+        let second = acquire_pinned_model_bounded_in(
+            &cache,
+            repo_dir.path(),
+            commit,
+            private_parent.path(),
+        )
+        .await?;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.commit(), commit);
+        assert_eq!(
+            std::fs::read(first.root().join("config.json"))?,
+            b"reviewed"
+        );
         Ok(())
     }
 }

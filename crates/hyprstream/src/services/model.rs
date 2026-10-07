@@ -276,6 +276,9 @@ pub struct ModelServiceInner {
     loaded_models: RwLock<LruCache<InferenceInstanceId, LoadedModel>>,
     /// Models currently being loaded (accepted but not yet in LRU cache)
     pending_loads: parking_lot::Mutex<HashMap<InferenceInstanceId, u64>>,
+    /// Shared read-only staging projection for tenant-specific workers using
+    /// the same reviewed commit pin.
+    staging_pinned_artifacts: crate::storage::pinned_model::StagingPinnedArtifactCache,
     /// Models whose cache entry has been removed and whose worker teardown is
     /// still in progress. This survives cancellation of the caller awaiting
     /// `unload_model`, so a replacement load cannot race a draining worker.
@@ -633,6 +636,7 @@ impl ModelService {
         Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
             pending_loads: parking_lot::Mutex::new(HashMap::new()),
+            staging_pinned_artifacts: crate::storage::pinned_model::StagingPinnedArtifactCache::default(),
             unloading_models: Mutex::new(HashSet::new()),
             load_unload_gate: Mutex::new(()),
             lifecycle_event_publish_gate: Mutex::new(()),
@@ -1301,7 +1305,12 @@ impl ModelService {
 
         let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
             anyhow::ensure!(model_ref_str == pin.model_ref, "staging modelRef changed after admission");
-            Some(crate::storage::pinned_model::acquire_pinned_model_bounded(&model_path, pin.commit).await?)
+            Some(
+                self.inner
+                    .staging_pinned_artifacts
+                    .acquire(&model_path, pin.commit)
+                    .await?,
+            )
         } else if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
             Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, *oid).await?)
         } else {
