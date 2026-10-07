@@ -48,7 +48,8 @@ cargo clippy -p hyprstream --lib --tests -- -D warnings
 `framing-vectors.json` copies the published encoding-only A0 vector. Its patterned
 PQ bytes and fake source token are not a signing identity. `signature-vector.json`
 contains actual RS256, Ed25519 and pure ML-DSA-65 signatures over the same framing
-with real test keys. Native verification consumes the JavaScript-generated vector.
+with real test keys. Its signed source token includes the required Federate
+`atproto` connector DID claim. Native verification consumes the generated vector.
 `test-rsa.pem` and deterministic seeds 7/8 are public disposable test material.
 
 To regenerate the signature vector, install tooling-only dependencies with
