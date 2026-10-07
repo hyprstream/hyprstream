@@ -1330,7 +1330,9 @@ fn generate_slot(nbf: i64, exp: i64) -> KeySlot {
 
 /// Load all three JWT key slots from `secrets_dir`.
 ///
-/// If no active slot exists, generate one immediately (first boot).
+/// If no active slot exists, generate one immediately (first boot) — but only
+/// activate it when it persists; a persistence failure leaves the store
+/// without an active key rather than returning a process-only signer.
 /// Slot files: `jwt-signing-key.{active,drain,lead}` + `.meta` JSON.
 pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
@@ -1354,16 +1356,22 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
         } else {
             info!("No active JWT signing key found — generating on first boot");
             let slot = generate_slot(now, now + active_secs);
-            if let Err(e) = persist_slot(&state_dir, "active", &slot) {
-                error!(
-                    "Could not persist active JWT key to '{}': {e}. The key is \
-                     process-ephemeral — every restart invalidates all issued tokens.",
+            // Disk-before-memory: the generated key becomes active only after
+            // its slot persisted. An unpersisted key is process-only — it can
+            // never be recovered after restart — so on failure the store stays
+            // without an active key instead of serving one.
+            match persist_slot(&state_dir, "active", &slot) {
+                Ok(()) => {
+                    info!("Active JWT key generated (kid={})", slot.kid());
+                    active = Some(slot);
+                }
+                Err(e) => error!(
+                    "Could not persist active JWT key to '{}': {e}. Refusing to \
+                     activate the unpersisted key; no active signer is available \
+                     until persistence succeeds on a restart.",
                     state_dir.display()
-                );
-            } else {
-                info!("Active JWT key generated (kid={})", slot.kid());
+                ),
             }
-            active = Some(slot);
         }
     }
 
@@ -1419,6 +1427,11 @@ pub fn load_or_init_root_identity_key_store(
     let mut active = load_slot(secrets_dir, "active");
     let lead = load_slot(secrets_dir, "lead");
 
+    // Documented follow-up (outside this repair): activation below is not
+    // gated on persistence success, unlike `load_or_init_key_store`. Recovery
+    // differs — the seed is the provisioned node identity key, reloadable
+    // from its own store — but the rotation slot can stay absent on disk
+    // until the next successful persist.
     if active.is_none() {
         let slot = KeySlot::new(initial_key, now, now + active_secs);
         if let Err(error) = persist_slot(secrets_dir, "active", &slot) {
@@ -1461,44 +1474,99 @@ pub async fn rotate_jwt_keys(
     store: &SigningKeyStore,
     now: i64,
 ) {
+    let state_dir = rotation_state_dir(secrets_dir);
+    rotate_jwt_keys_in_state_dir(config, &state_dir, store, now).await;
+}
+
+/// Rotation against an explicit state directory. Private test seam: passing a
+/// state dir that cannot hold files injects deterministic persistence
+/// failures without relying on permission bits.
+async fn rotate_jwt_keys_in_state_dir(
+    config: &OAuthConfig,
+    state_dir: &Path,
+    store: &SigningKeyStore,
+    now: i64,
+) {
     let mut slots = store.0.write().await;
 
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
     let drain_secs = config.drain_secs();
-    let state_dir = rotation_state_dir(secrets_dir);
 
     // 1. Promote lead → active if lead.nbf has passed.
-    if let Some(new_lead) = slots.lead.take().filter(|l| l.nbf <= now) {
-        let old_active = slots.active.take();
+    //
+    // Disk-before-memory: every persistence operation required to retain the
+    // old active signer (the durable drain write) and to durably install the
+    // new active signer must succeed before any in-memory slot changes. On a
+    // failure the previous active stays active in memory, the lead stays
+    // queued for the next tick, and no promotion is reported. The gate is
+    // successful completion of `persist_slot` (temp-file + rename); that is
+    // not proven power-loss durability, and key bytes and metadata remain two
+    // separate files (documented residuals of this repair).
+    if let Some(new_lead) = slots.lead.as_ref().filter(|l| l.nbf <= now).cloned() {
+        let old_active = slots.active.clone();
+        let old_drain = slots.drain.clone();
 
         info!("Promoting lead JWT key (kid={}) to active", new_lead.kid());
 
-        // Old active → drain (evict old drain first)
-        if let Some(prev_drain) = slots.drain.take() {
-            info!("Evicting drain JWT key (kid={})", prev_drain.kid());
-            delete_slot(&state_dir, "drain");
-        }
-        if let Some(old_active_slot) = old_active {
-            if let Err(e) = persist_slot(&state_dir, "drain", &old_active_slot) {
+        // Old active → drain, persisted first so a process that reloads
+        // between the writes can still verify the previous generation. The
+        // previous drain is not evicted up front: the atomic write replaces
+        // it, and it is restored if that write fails.
+        if let Some(ref old) = old_active {
+            if let Err(e) = persist_slot(state_dir, "drain", old) {
+                if let Some(ref prev) = old_drain {
+                    let _ = persist_slot(state_dir, "drain", prev);
+                } else {
+                    delete_slot(state_dir, "drain");
+                }
                 error!(
-                    "Could not persist drain JWT key to '{}': {e}. Rotation state \
-                     will not survive restart.",
+                    "Could not persist drain JWT key to '{}': {e}. Retaining the \
+                     old active in memory; promotion will be retried next tick.",
                     state_dir.display()
                 );
+                return;
             }
-            slots.drain = Some(old_active_slot);
         }
 
-        if let Err(e) = persist_slot(&state_dir, "active", &new_lead) {
+        if let Err(e) = persist_slot(state_dir, "active", &new_lead) {
+            // Restore the pre-promotion durable state best-effort: the old
+            // active (or nothing) back at `active`, and the previous drain —
+            // which the drain write above may have replaced — back at `drain`.
+            if let Some(ref old) = old_active {
+                let _ = persist_slot(state_dir, "active", old);
+            } else {
+                delete_slot(state_dir, "active");
+            }
+            if old_active.is_some() {
+                if let Some(ref prev) = old_drain {
+                    let _ = persist_slot(state_dir, "drain", prev);
+                } else {
+                    delete_slot(state_dir, "drain");
+                }
+            }
             error!(
-                "Could not persist active JWT key to '{}': {e}. The key is \
-                 process-ephemeral — every restart invalidates all issued tokens.",
+                "Could not persist active JWT key to '{}': {e}. Retaining the old \
+                 active in memory; promotion will be retried next tick.",
                 state_dir.display()
             );
+            return;
         }
-        delete_slot(&state_dir, "lead");
+
+        // All persistence succeeded — swap the in-memory slots and clear the
+        // persisted lead slot.
+        if let Some(ref prev) = old_drain {
+            info!(
+                "Evicting previous drain JWT key (kid={}) during promotion",
+                prev.kid()
+            );
+        }
+        delete_slot(state_dir, "lead");
+        if let Some(old) = old_active {
+            slots.drain = Some(old);
+        }
         slots.active = Some(new_lead);
+        slots.lead = None;
     }
 
     // 2. Remove drain if drain window has closed.
@@ -1509,7 +1577,7 @@ pub async fn rotate_jwt_keys(
     {
         let kid = slots.drain.as_ref().map(KeySlot::kid).unwrap_or_default();
         info!("Removing expired drain JWT key (kid={kid})");
-        delete_slot(&state_dir, "drain");
+        delete_slot(state_dir, "drain");
         slots.drain = None;
     }
 
@@ -1525,7 +1593,7 @@ pub async fn rotate_jwt_keys(
                     new_lead.kid(),
                     new_lead.nbf
                 );
-                if let Err(e) = persist_slot(&state_dir, "lead", &new_lead) {
+                if let Err(e) = persist_slot(state_dir, "lead", &new_lead) {
                     error!(
                         "Could not persist lead JWT key to '{}': {e}. Rotation state \
                          will not survive restart.",
@@ -1619,9 +1687,7 @@ pub fn spawn_rotation_task(
                 // `#atproto` generation. Dedicated head-signing key + shared
                 // state dir; async because the ES256 store is a tokio RwLock
                 // (F1). C2 (#1168) seam — see `auth::op_log`.
-                if let Err(error) =
-                    super::op_log::advance_sealed_head(&secrets_dir, es256).await
-                {
+                if let Err(error) = super::op_log::advance_sealed_head(&secrets_dir, es256).await {
                     error!(
                         "failed to re-seal op-log head after ES256 rotation; \
                          cross-process readers will retain the prior generation: {error}"
@@ -1898,6 +1964,11 @@ pub fn load_or_init_es256_key_store(
         lead = None;
     }
 
+    // Documented follow-up (outside this repair): the generated key is
+    // activated even when persistence fails below — the disk-before-memory
+    // gate applied in `load_or_init_key_store` and
+    // `load_or_init_ml_dsa_key_store` does not cover this store yet, so a
+    // process-only ES256 signer remains possible after a failed first boot.
     if active.is_none() {
         info!("No active ES256 signing key found — generating on first boot");
         let slot = generate_es256_slot(now, now + active_secs);
@@ -2030,9 +2101,7 @@ async fn rotate_es256_keys_in_state_dir(
                         "ES256: failed to restore PDS head after promotion failure: {rollback_error}"
                     );
                 }
-                if let Err(rollback_error) =
-                    persist_es256_slot(state_dir, "active", old_active)
-                {
+                if let Err(rollback_error) = persist_es256_slot(state_dir, "active", old_active) {
                     warn!(
                         "ES256: failed to restore persisted active after promotion failure: {rollback_error}"
                     );
@@ -2041,9 +2110,7 @@ async fn rotate_es256_keys_in_state_dir(
                 delete_es256_slot(state_dir, "active");
             }
             if let Some(ref old_drain) = old_drain {
-                if let Err(rollback_error) =
-                    persist_es256_slot(state_dir, "drain", old_drain)
-                {
+                if let Err(rollback_error) = persist_es256_slot(state_dir, "drain", old_drain) {
                     warn!(
                         "ES256: failed to restore persisted drain after promotion failure: {rollback_error}"
                     );
@@ -2260,16 +2327,20 @@ mod ml_dsa_rotation {
             } else {
                 info!("No active ML-DSA-65 signing key found — generating on first boot");
                 let slot = generate_ml_dsa_slot(now, now + active_secs);
-                if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &slot) {
-                    error!(
-                        "Could not persist active ML-DSA key to '{}': {e}. The key is \
-                         process-ephemeral — every restart invalidates all issued tokens.",
+                // Disk-before-memory, matching `load_or_init_key_store`: the
+                // generated key activates only after its slot persisted.
+                match persist_ml_dsa_slot(&state_dir, "active", &slot) {
+                    Ok(()) => {
+                        info!("Active ML-DSA-65 key generated");
+                        active = Some(slot);
+                    }
+                    Err(e) => error!(
+                        "Could not persist active ML-DSA key to '{}': {e}. Refusing \
+                         to activate the unpersisted key; no active signer is \
+                         available until persistence succeeds on a restart.",
                         state_dir.display()
-                    );
-                } else {
-                    info!("Active ML-DSA-65 key generated");
+                    ),
                 }
-                active = Some(slot);
             }
         }
 
@@ -2307,45 +2378,90 @@ mod ml_dsa_rotation {
         store: &MlDsaSigningKeyStore,
         now: i64,
     ) {
+        let state_dir = rotation_state_dir(secrets_dir);
+        rotate_ml_dsa_keys_in_state_dir(config, &state_dir, store, now).await;
+    }
+
+    /// Rotation against an explicit state directory. Private test seam: a
+    /// state dir that cannot hold files injects deterministic persistence
+    /// failures without relying on permission bits.
+    pub(super) async fn rotate_ml_dsa_keys_in_state_dir(
+        config: &OAuthConfig,
+        state_dir: &Path,
+        store: &MlDsaSigningKeyStore,
+        now: i64,
+    ) {
         let mut slots = store.0.write().await;
         let active_secs = config.active_secs();
         let lead_secs = config.lead_secs();
         let drain_secs = config.drain_secs();
-        let state_dir = rotation_state_dir(secrets_dir);
 
-        // Phase 1: promote lead → active
-        let lead_ready = slots.lead.as_ref().is_some_and(|lead| lead.nbf <= now);
-        if lead_ready {
-            if let Some(new_active) = slots.lead.take() {
-                if let Some(old_active) = slots.active.take() {
-                    delete_ml_dsa_slot(&state_dir, "drain");
-                    if let Err(e) = persist_ml_dsa_slot(&state_dir, "drain", &old_active) {
-                        error!(
-                            "ML-DSA: failed to persist drain slot to '{}': {e}. Rotation \
-                             state will not survive restart.",
-                            state_dir.display()
-                        );
+        // Phase 1: promote lead → active. Same disk-before-memory contract as
+        // the Ed25519 rotation: the durable drain write (retaining the old
+        // active) and the durable active write (installing the new signer)
+        // must both succeed before any in-memory slot changes. On a failure
+        // the old active stays active in memory, the lead stays queued, the
+        // pre-promotion durable state is restored best-effort, and no
+        // promotion is reported. The gate is successful completion of
+        // `persist_ml_dsa_slot`; not proven power-loss durability (residual).
+        if let Some(new_active) = slots.lead.as_ref().filter(|lead| lead.nbf <= now).cloned() {
+            let old_active = slots.active.clone();
+            let old_drain = slots.drain.clone();
+
+            info!("ML-DSA: promoting lead to active");
+
+            if let Some(ref old) = old_active {
+                if let Err(e) = persist_ml_dsa_slot(state_dir, "drain", old) {
+                    if let Some(ref prev) = old_drain {
+                        let _ = persist_ml_dsa_slot(state_dir, "drain", prev);
+                    } else {
+                        delete_ml_dsa_slot(state_dir, "drain");
                     }
-                    slots.drain = Some(old_active);
-                }
-                if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &new_active) {
                     error!(
-                        "ML-DSA: failed to persist promoted active to '{}': {e}. The key \
-                         is process-ephemeral — every restart invalidates all issued \
-                         tokens.",
+                        "ML-DSA: failed to persist drain slot to '{}': {e}. Retaining \
+                         the old active in memory; promotion will be retried next \
+                         tick.",
                         state_dir.display()
                     );
+                    return;
                 }
-                delete_ml_dsa_slot(&state_dir, "lead");
-                slots.active = Some(new_active);
-                info!("ML-DSA: promoted lead → active");
             }
+
+            if let Err(e) = persist_ml_dsa_slot(state_dir, "active", &new_active) {
+                // Best-effort restore of the pre-promotion durable state.
+                if let Some(ref old) = old_active {
+                    let _ = persist_ml_dsa_slot(state_dir, "active", old);
+                } else {
+                    delete_ml_dsa_slot(state_dir, "active");
+                }
+                if old_active.is_some() {
+                    if let Some(ref prev) = old_drain {
+                        let _ = persist_ml_dsa_slot(state_dir, "drain", prev);
+                    } else {
+                        delete_ml_dsa_slot(state_dir, "drain");
+                    }
+                }
+                error!(
+                    "ML-DSA: failed to persist promoted active to '{}': {e}. Retaining \
+                     the old active in memory; promotion will be retried next tick.",
+                    state_dir.display()
+                );
+                return;
+            }
+
+            delete_ml_dsa_slot(state_dir, "lead");
+            if let Some(old) = old_active {
+                slots.drain = Some(old);
+            }
+            slots.active = Some(new_active);
+            slots.lead = None;
+            info!("ML-DSA: promoted lead → active");
         }
 
         // Phase 2: remove expired drain
         if let Some(ref drain) = slots.drain {
             if now >= drain.exp + drain_secs {
-                delete_ml_dsa_slot(&state_dir, "drain");
+                delete_ml_dsa_slot(state_dir, "drain");
                 slots.drain = None;
                 info!("ML-DSA: removed expired drain slot");
             }
@@ -2357,7 +2473,7 @@ mod ml_dsa_rotation {
                 let lead_nbf = active.exp - lead_secs;
                 let lead_exp = lead_nbf + active_secs;
                 let new_lead = generate_ml_dsa_slot(lead_nbf, lead_exp);
-                if let Err(e) = persist_ml_dsa_slot(&state_dir, "lead", &new_lead) {
+                if let Err(e) = persist_ml_dsa_slot(state_dir, "lead", &new_lead) {
                     error!(
                         "ML-DSA: failed to persist new lead to '{}': {e}. Rotation state \
                          will not survive restart.",
@@ -2531,18 +2647,13 @@ mod tests {
             hyprstream_pds::did_op::RecoveryKeyEnrollment::Declined,
             hyprstream_pds::did_op::HostKeyEnrollment::Absent,
         )?;
-        let name = hyprstream_pds::AllocatedAccountName::new(
-            label,
-            format!("did:web:{label}.{zone}"),
-        )?;
+        let name =
+            hyprstream_pds::AllocatedAccountName::new(label, format!("did:web:{label}.{zone}"))?;
         let mint = hyprstream_pds::HostedAccountMint::begin(name, rotations)?;
         let document = mint.seal_did_document(&format!("https://{zone}"))?;
-        let pending = mint.prepare_genesis(
-            document,
-            hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
-        )?;
-        let signature =
-            hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &ed, &pq)?;
+        let pending =
+            mint.prepare_genesis(document, hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo)?;
+        let signature = hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &ed, &pq)?;
         let record = pending.seal(signature)?.record_bytes().to_vec();
         let root = hyprstream_vfs::SyntheticNode::dir().with_child(
             zone,
@@ -2557,12 +2668,10 @@ mod tests {
                 ),
             ),
         );
-        Ok(Arc::new(
-            hyprstream_pds_service::AccountRecordStore::new(
-                Arc::new(hyprstream_vfs::SyntheticMount::new(root)),
-                Arc::new(PermitFixtureAccountReads),
-            ),
-        ))
+        Ok(Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+            Arc::new(hyprstream_vfs::SyntheticMount::new(root)),
+            Arc::new(PermitFixtureAccountReads),
+        )))
     }
 
     fn test_config() -> OAuthConfig {
@@ -2584,12 +2693,14 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl crate::services::RequestService for ProductionAuthorityVerifier {
-    fn decode_request_body(
-        &self,
-        signed_body: &[u8],
-    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
-        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(signed_body.to_vec()))
-    }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
 
         async fn handle_request(
             &self,
@@ -2668,7 +2779,9 @@ mod tests {
             Some(SigningKey::from_bytes(&[0x73; 32]).verifying_key()),
         )
         .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
-        Ok(hyprstream_rpc_std::policy_client::PolicyClient::new(Arc::new(rpc)))
+        Ok(hyprstream_rpc_std::policy_client::PolicyClient::new(
+            Arc::new(rpc),
+        ))
     }
 
     fn authority_process_dir() -> Option<PathBuf> {
@@ -3075,7 +3188,8 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
@@ -3211,7 +3325,8 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await;
@@ -3380,7 +3495,8 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
@@ -3506,7 +3622,8 @@ mod tests {
         // Capture a pre-rotation token through the booted OAuth HTTP endpoint;
         // it is used later to prove the committed drain remains usable.
         let oauth_url = std::fs::read_to_string(dir.path().join("oauth-http-url")).unwrap();
-        let old_token = runtime.block_on(async {
+        let old_token = runtime
+            .block_on(async {
                 policy_client_for_socket(dir.path())?
                     .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
@@ -3519,7 +3636,8 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?;
@@ -3546,7 +3664,9 @@ mod tests {
                     .get("access_token")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("pre-rotation OAuth response omitted access_token"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("pre-rotation OAuth response omitted access_token")
+                    })?;
                 let replay = client
                     .post(format!("{oauth_url}/oauth/token"))
                     .form(&authorization_code_form)
@@ -3564,7 +3684,8 @@ mod tests {
                     "authorization-code replay was not rejected as invalid_grant: {replay_body}"
                 );
                 anyhow::Ok(token)
-        }).unwrap();
+            })
+            .unwrap();
         std::fs::write(dir.path().join("old-oauth-token"), old_token).unwrap();
 
         persist_slot(dir.path(), "drain", &old_ed).unwrap();
@@ -3695,9 +3816,9 @@ mod tests {
             .collect();
         for kid in active_kids {
             assert!(jwks["keys"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
+                .as_array()
+                .unwrap()
+                .iter()
                 .any(|key| { key.get("kid").and_then(serde_json::Value::as_str) == Some(kid) }));
         }
 
@@ -3749,7 +3870,8 @@ mod tests {
                         tenant: None,
                         require_clearance: false,
                         session_id: None,
-                        issuance_profile: hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
                         client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
@@ -3852,9 +3974,9 @@ mod tests {
                 .any(|committed_pair| committed_pair.kid == candidate.kid)
         }) {
             assert!(!post_crash_jwks["keys"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
+                .as_array()
+                .unwrap()
+                .iter()
                 .any(|key| key["kid"].as_str() == Some(pending_only.kid.as_str())));
         }
         let _ = (timeout_oauth_token, timeout_policy_token, post_crash_token);
@@ -3980,11 +4102,7 @@ mod tests {
         persist_slot(
             dir.path(),
             "active",
-            &KeySlot::new(
-                SigningKey::from_bytes(&[0x71; 32]),
-                now - 60,
-                now + 1,
-            ),
+            &KeySlot::new(SigningKey::from_bytes(&[0x71; 32]), now - 60, now + 1),
         )
         .unwrap();
         ml_dsa_rotation::persist_ml_dsa_slot(
@@ -4133,6 +4251,188 @@ mod tests {
             slots.lead.is_some(),
             "lead must be generated when active is within lead window"
         );
+    }
+
+    // ── Disk-before-memory promotion ───────────────────────────────────────
+    //
+    // Operator invariant under repair: a generated or promoted signing key
+    // becomes active in memory only after its slot persistence reports
+    // success. Failure injection is a filesystem fixture — a directory
+    // planted at the slot path, or a state dir that is a regular file — which
+    // stays deterministic under root, unlike permission-bit tricks.
+
+    #[test]
+    fn first_boot_persistence_failure_leaves_no_active_ed25519_key() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        // write_secret persists via rename onto this path; renaming a file
+        // onto a directory fails for every user, including root.
+        std::fs::create_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+
+        let store = load_or_init_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            rt.block_on(store.active_verifying_key_bytes()).is_none(),
+            "an unpersisted generated key must not be exposed as active"
+        );
+        assert!(
+            !dir.path().join("jwt-signing-key.active.meta").exists(),
+            "no slot metadata may exist when the key bytes failed to persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn ed25519_rotation_keeps_active_when_drain_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 1,
+        );
+        let lead_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1, // nbf already passed
+            now + 14 * 86400,
+        );
+        let drain_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 45 * 86400,
+            now + 5 * 86400,
+        );
+        let active_vk = active_slot.verifying_key_bytes();
+        let lead_vk = lead_slot.verifying_key_bytes();
+        let drain_vk = drain_slot.verifying_key_bytes();
+
+        let store = SigningKeyStore::new(KeySlots {
+            drain: Some(drain_slot),
+            active: Some(active_slot),
+            lead: Some(lead_slot),
+        });
+
+        // Deterministic seam: this state dir is a regular file, so the first
+        // promotion write (old active → drain) fails.
+        let broken_state = dir.path().join("not-a-directory");
+        std::fs::write(&broken_state, b"file").unwrap();
+        rotate_jwt_keys_in_state_dir(&config, &broken_state, &store, now).await;
+
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.active.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(active_vk),
+            "the old active must remain the in-memory active signer"
+        );
+        assert_eq!(
+            slots.lead.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(lead_vk),
+            "the queued lead must stay in memory for the next tick"
+        );
+        assert_eq!(
+            slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(drain_vk),
+            "a failed promotion must not evict the in-memory drain"
+        );
+        drop(slots);
+
+        // Persistence recovers: the queued lead promotes and the promoted
+        // active is on disk before it is served from memory.
+        rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert_eq!(
+            store.active_verifying_key_bytes().await,
+            Some(lead_vk),
+            "the queued lead must promote once persistence succeeds"
+        );
+        let persisted = load_slot(dir.path(), "active").expect("promoted active must be persisted");
+        assert_eq!(
+            persisted.verifying_key_bytes(),
+            lead_vk,
+            "memory promotion must follow the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(active_vk),
+            "the old active becomes drain only after its persist succeeded"
+        );
+        assert!(slots.lead.is_none());
+        assert!(!dir.path().join("jwt-signing-key.lead").exists());
+    }
+
+    #[tokio::test]
+    async fn ed25519_rotation_keeps_active_when_active_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 1,
+        );
+        let lead_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let active_vk = active_slot.verifying_key_bytes();
+        let lead_vk = lead_slot.verifying_key_bytes();
+        persist_slot(dir.path(), "lead", &lead_slot).unwrap();
+
+        let store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(active_slot),
+            lead: Some(lead_slot),
+        });
+
+        // The drain write succeeds (old active → drain) but the promoted
+        // active write fails: its slot path is a directory. The old active
+        // lives only in memory here, which is exactly what the rollback and
+        // the retry rely on.
+        std::fs::create_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+        rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+
+        assert_eq!(
+            store.active_verifying_key_bytes().await,
+            Some(active_vk),
+            "the failed new key must not be exposed as active in memory"
+        );
+        {
+            let slots = store.0.read().await;
+            assert!(slots.lead.is_some(), "the lead stays queued for retry");
+            assert!(
+                slots.drain.is_none(),
+                "in-memory drain must not change before every write succeeded"
+            );
+        }
+        assert!(
+            load_slot(dir.path(), "drain").is_none(),
+            "the half-applied promotion must be rolled back on disk"
+        );
+        assert!(
+            dir.path().join("jwt-signing-key.active").is_dir()
+                && load_slot(dir.path(), "active").is_none(),
+            "the active slot must not be durably replaced by the failed key;              until the retry lands, the old active survives only in memory"
+        );
+
+        // Remove the obstruction; the queued lead promotes on the next tick.
+        std::fs::remove_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+        rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert_eq!(store.active_verifying_key_bytes().await, Some(lead_vk));
+        assert_eq!(
+            load_slot(dir.path(), "active")
+                .expect("promoted active must be persisted")
+                .verifying_key_bytes(),
+            lead_vk,
+            "memory promotion must be preceded by the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(active_vk)
+        );
+        assert!(slots.lead.is_none());
     }
 
     // ── ES256 store tests ──────────────────────────────────────────────────
@@ -4413,6 +4713,175 @@ mod tests {
         assert!(slots.lead.is_none());
     }
 
+    fn ml_dsa_slot_vk_bytes(slot: &ml_dsa_rotation::MlDsaKeySlot) -> Vec<u8> {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&slot.verifying_key())
+    }
+
+    fn ml_dsa_key_vk_bytes(key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey) -> Vec<u8> {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(key).clone())
+    }
+
+    #[test]
+    fn ml_dsa_first_boot_persistence_failure_leaves_no_active_key() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        // write_secret persists via rename onto this path; renaming a file
+        // onto a directory fails for every user, including root.
+        std::fs::create_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+
+        let store = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            rt.block_on(store.active_key()).is_none(),
+            "an unpersisted generated ML-DSA key must not be exposed as active"
+        );
+        assert!(
+            !dir.path().join("ml-dsa-signing-key.active.meta").exists(),
+            "no slot metadata may exist when the key bytes failed to persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_rotation_keeps_active_when_drain_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 1);
+        let lead = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let drain = ml_dsa_rotation::generate_ml_dsa_slot(now - 45 * 86400, now + 5 * 86400);
+        let active_vk = ml_dsa_slot_vk_bytes(&active);
+        let lead_vk = ml_dsa_slot_vk_bytes(&lead);
+        let drain_vk = ml_dsa_slot_vk_bytes(&drain);
+
+        let store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: Some(drain),
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        // Deterministic seam: this state dir is a regular file, so the first
+        // promotion write (old active → drain) fails.
+        let broken_state = dir.path().join("not-a-directory");
+        std::fs::write(&broken_state, b"file").unwrap();
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, &broken_state, &store, now).await;
+
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.active.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(active_vk.clone()),
+            "the old active must remain the in-memory active signer"
+        );
+        assert_eq!(
+            slots.lead.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(lead_vk.clone()),
+            "the queued lead must stay in memory for the next tick"
+        );
+        assert_eq!(
+            slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(drain_vk.clone()),
+            "a failed promotion must not evict the in-memory drain"
+        );
+        drop(slots);
+
+        // Persistence recovers: the queued lead promotes and the promoted
+        // active is on disk before it is served from memory.
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        let persisted = ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active")
+            .expect("promoted active must be persisted");
+        assert_eq!(
+            ml_dsa_slot_vk_bytes(&persisted),
+            lead_vk,
+            "memory promotion must follow the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.active.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(lead_vk),
+            "the queued lead must promote once persistence succeeds"
+        );
+        assert_eq!(
+            slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(active_vk),
+            "the old active becomes drain only after its persist succeeded"
+        );
+        assert!(slots.lead.is_none());
+        assert!(!dir.path().join("ml-dsa-signing-key.lead").exists());
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_rotation_keeps_active_when_active_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 1);
+        let lead = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let active_vk = ml_dsa_slot_vk_bytes(&active);
+        let lead_vk = ml_dsa_slot_vk_bytes(&lead);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &lead).unwrap();
+
+        let store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        // The drain write succeeds (old active → drain) but the promoted
+        // active write fails: its slot path is a directory. The old active
+        // lives only in memory here, which is exactly what the rollback and
+        // the retry rely on.
+        std::fs::create_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now).await;
+
+        assert_eq!(
+            store.active_key().await.as_deref().map(ml_dsa_key_vk_bytes),
+            Some(active_vk.clone()),
+            "the failed new key must not be exposed as active in memory"
+        );
+        {
+            let slots = store.0.read().await;
+            assert!(slots.lead.is_some(), "the lead stays queued for retry");
+            assert!(
+                slots.drain.is_none(),
+                "in-memory drain must not change before every write succeeded"
+            );
+        }
+        assert!(
+            ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "drain").is_none(),
+            "the half-applied promotion must be rolled back on disk"
+        );
+        assert!(
+            dir.path().join("ml-dsa-signing-key.active").is_dir()
+                && ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active").is_none(),
+            "the active slot must not be durably replaced by the failed key; \
+             until the retry lands, the old active survives only in memory"
+        );
+
+        // Remove the obstruction; the queued lead promotes on the next tick.
+        std::fs::remove_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert_eq!(
+            store.active_key().await.as_deref().map(ml_dsa_key_vk_bytes),
+            Some(lead_vk.clone()),
+            "the queued lead must promote once persistence succeeds"
+        );
+        let persisted = ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active")
+            .expect("promoted active must be persisted");
+        assert_eq!(
+            ml_dsa_key_vk_bytes(persisted.key.as_ref()),
+            lead_vk,
+            "memory promotion must be preceded by the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(active_vk),
+            "the old active becomes drain only after its persist succeeded"
+        );
+        assert!(slots.lead.is_none());
+    }
+
     #[tokio::test]
     async fn committed_marker_failures_never_reinitialize_from_mutable_authority() {
         const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_FAIL_CLOSED_TEST";
@@ -4690,8 +5159,8 @@ mod tests {
         .await
         .unwrap();
         assert!(hyprstream_rpc::auth::global_composite_key_set()
-                .snapshot()
-                .pair(&old_kid)
+            .snapshot()
+            .pair(&old_kid)
             .is_none());
     }
 }
