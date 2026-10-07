@@ -206,6 +206,8 @@ async fn federated_identity_claim_requires_exact_atproto_connector_and_did() {
     }
     let mut c = claims();
     c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:web:users.example:alice"});
+    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_err());
+    c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:web:users.example"});
     assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_ok());
     c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx","future_claim":"ignored"});
     assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_ok());

@@ -10,6 +10,69 @@ const STAGING_SCOPE: &str = "infer:model:qwen2.5-0.5b-instruct:main";
 const REGISTRY_LIST_SCOPE: &str = "query:registry:List";
 const ATPROTO_DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
 
+#[test]
+fn candidate_tenants_are_scoped_to_verified_did_memberships() {
+    let policies = vec![
+        vec![
+            ATPROTO_DID.into(),
+            "tenant-a".into(),
+            "registry:*".into(),
+            "query".into(),
+            "allow".into(),
+        ],
+        vec![
+            "other-user".into(),
+            "unrelated-tenant".into(),
+            "model:*".into(),
+            "infer".into(),
+            "allow".into(),
+        ],
+        vec![
+            ATPROTO_DID.into(),
+            "*".into(),
+            "registry:*".into(),
+            "query".into(),
+            "allow".into(),
+        ],
+    ];
+    let groups = vec![
+        vec![
+            ATPROTO_DID.into(),
+            "registry-reader".into(),
+            "tenant-b".into(),
+        ],
+        vec![
+            "another-user".into(),
+            "model-user".into(),
+            "unrelated-group-tenant".into(),
+        ],
+        vec![ATPROTO_DID.into(), "global-role".into(), "*".into()],
+    ];
+
+    let tenants = candidate_tenants(ATPROTO_DID, &policies, &groups).unwrap();
+    assert_eq!(
+        tenants,
+        BTreeSet::from(["tenant-a".into(), "tenant-b".into()])
+    );
+}
+
+#[test]
+fn candidate_tenant_memberships_have_a_hard_ceiling() {
+    let policies = (0..=MAX_FEDERATE_TENANT_MEMBERSHIPS)
+        .map(|index| {
+            vec![
+                ATPROTO_DID.into(),
+                format!("tenant-{index:03}"),
+                "registry:*".into(),
+                "query".into(),
+                "allow".into(),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert!(candidate_tenants(ATPROTO_DID, &policies, &[]).is_err());
+}
+
 struct Accounts(RwLock<UserProfile>);
 #[async_trait::async_trait]
 impl UserStore for Accounts {

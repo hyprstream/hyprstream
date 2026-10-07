@@ -24,6 +24,11 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
+/// A Federate DID must have a small, explicit set of concrete tenant
+/// memberships. This bounds the number of per-scope Policy checks and keeps
+/// unrelated tenant rules out of login admission work.
+const MAX_FEDERATE_TENANT_MEMBERSHIPS: usize = 128;
+
 /// Fixed, authority-owned ceilings; not browser input or dynamic client metadata.
 struct Profile {
     issuer: String,
@@ -324,6 +329,36 @@ fn canonical_requested(requested: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn candidate_tenants(
+    did: &str,
+    policies: &[Vec<String>],
+    domain_groups: &[Vec<String>],
+) -> Result<BTreeSet<String>> {
+    let mut tenants = BTreeSet::new();
+    // Only concrete grants or memberships attached directly to this verified
+    // DID seed candidates. Role-based policies remain supported: the DID's
+    // g2 membership supplies the domain, and Casbin resolves its role chain
+    // during the final check. Unrelated users' tenant rules are never scanned
+    // with check_with_domain.
+    for (rules, subject_index, tenant_index) in [(policies, 0, 1), (domain_groups, 0, 2)] {
+        for rule in rules {
+            if rule.get(subject_index).is_some_and(|subject| subject == did) {
+                if let Some(tenant) = rule
+                    .get(tenant_index)
+                    .filter(|tenant| !tenant.is_empty() && *tenant != "*")
+                {
+                    tenants.insert(tenant.clone());
+                    ensure!(
+                        tenants.len() <= MAX_FEDERATE_TENANT_MEMBERSHIPS,
+                        "Federate DID exceeds the concrete tenant-membership limit"
+                    );
+                }
+            }
+        }
+    }
+    Ok(tenants)
+}
+
 impl Authorities {
     async fn decision(&self, source: &Source, requested: &[String]) -> Result<Decision> {
         ensure!(source.issuer == self.profile.issuer, "issuer mismatch");
@@ -348,17 +383,9 @@ impl Authorities {
             .ok_or_else(|| anyhow::anyhow!("account UUID missing"))?;
         uuid::Uuid::parse_str(&account_id)?;
         let did = &source.atproto_did;
-        let mut tenants = BTreeSet::new();
-        for rule in self.policy.get_policy().await {
-            if let Some(tenant) = rule.get(1).filter(|tenant| !tenant.is_empty() && *tenant != "*") {
-                tenants.insert(tenant.clone());
-            }
-        }
-        for group in self.policy.get_domain_grouping_policy().await {
-            if let Some(tenant) = group.get(2).filter(|tenant| !tenant.is_empty() && *tenant != "*") {
-                tenants.insert(tenant.clone());
-            }
-        }
+        let policies = self.policy.get_policy().await;
+        let domain_groups = self.policy.get_domain_grouping_policy().await;
+        let tenants = candidate_tenants(did, &policies, &domain_groups)?;
         let mut matching = Vec::new();
         for tenant in tenants {
             let mut scopes = Vec::new();

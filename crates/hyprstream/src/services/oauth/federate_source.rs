@@ -421,6 +421,13 @@ fn atproto_account_did(v: &Value) -> Result<String> {
                     .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)))?;
         }
         "web" => {
+            // ATProto repo/account identifiers use host-form did:web only;
+            // a literal colon introduces a path-form DID that the ATProto
+            // identity profile does not accept. Keep this aligned with the
+            // repo-authority validator while allowing encoded host ports.
+            require(!hyprstream_pds::repo_authority::is_path_form_did_web(
+                did,
+            ))?;
             require(!specific.is_empty()
                 && specific.split(':').all(|part| !part.is_empty())
                 && specific.bytes().all(|b| {
