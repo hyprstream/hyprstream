@@ -13,7 +13,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{
     auth::{signer_suite::signer_suite_thumbprint, Scope},
     proof::enrollment::authenticated_replay_namespace,
-    Subject,
 };
 use hyprstream_rpc_std::policy_client::AdmitFederateRequest;
 use hyprstream_session_store::{Admission, PendingSession, PrimaryRecord, Session, Source, Store};
@@ -24,6 +23,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, Semaphore};
+
+/// A Federate DID must have a small, explicit set of concrete tenant
+/// memberships. This bounds the number of per-scope Policy checks and keeps
+/// unrelated tenant rules out of login admission work.
+const MAX_FEDERATE_TENANT_MEMBERSHIPS: usize = 128;
 
 /// Fixed, authority-owned ceilings; not browser input or dynamic client metadata.
 struct Profile {
@@ -87,7 +91,6 @@ struct PossessionEvidence {
 
 struct Authorities {
     users: PolicyAccountReader,
-    accounts: Arc<hyprstream_pds_service::AccountRecordStore>,
     policy: Arc<PolicyManager>,
     enrollment: Arc<ServiceEnrollmentManifest>,
     profile: Profile,
@@ -211,6 +214,10 @@ impl RequestUseReader {
                 "verified holder namespace mismatch"
             );
             let (source_issuer, source_subject) = primary.source_identity();
+            ensure!(
+                primary.source_atproto_did() == session.subject,
+                "session subject does not match verified ATProto DID"
+            );
             authority
                 .authorize_use(
                     session,
@@ -322,6 +329,36 @@ fn canonical_requested(requested: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn candidate_tenants(
+    did: &str,
+    policies: &[Vec<String>],
+    domain_groups: &[Vec<String>],
+) -> Result<BTreeSet<String>> {
+    let mut tenants = BTreeSet::new();
+    // Only concrete grants or memberships attached directly to this verified
+    // DID seed candidates. Role-based policies remain supported: the DID's
+    // g2 membership supplies the domain, and Casbin resolves its role chain
+    // during the final check. Unrelated users' tenant rules are never scanned
+    // with check_with_domain.
+    for (rules, subject_index, tenant_index) in [(policies, 0, 1), (domain_groups, 0, 2)] {
+        for rule in rules {
+            if rule.get(subject_index).is_some_and(|subject| subject == did) {
+                if let Some(tenant) = rule
+                    .get(tenant_index)
+                    .filter(|tenant| !tenant.is_empty() && *tenant != "*")
+                {
+                    tenants.insert(tenant.clone());
+                    ensure!(
+                        tenants.len() <= MAX_FEDERATE_TENANT_MEMBERSHIPS,
+                        "Federate DID exceeds the concrete tenant-membership limit"
+                    );
+                }
+            }
+        }
+    }
+    Ok(tenants)
+}
+
 impl Authorities {
     async fn decision(&self, source: &Source, requested: &[String]) -> Result<Decision> {
         ensure!(source.issuer == self.profile.issuer, "issuer mismatch");
@@ -345,35 +382,39 @@ impl Authorities {
             .sub
             .ok_or_else(|| anyhow::anyhow!("account UUID missing"))?;
         uuid::Uuid::parse_str(&account_id)?;
-        let did = profile
-            .atproto_did
-            .ok_or_else(|| anyhow::anyhow!("hosted DID missing"))?;
-        let tenant = self
-            .accounts
-            .resolve_current_tenant_for_hosted_did(
-                &Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
-                &did,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("signed tenant missing"))?;
-        ensure!(!tenant.is_empty() && tenant != "*", "invalid tenant");
-        let mut scopes = Vec::new();
-        for text in requested {
-            if !self.profile.client_scopes.contains(text)
-                || !self.profile.resource_scopes.contains(text)
-            {
-                continue;
+        let did = &source.atproto_did;
+        let policies = self.policy.get_policy().await;
+        let domain_groups = self.policy.get_domain_grouping_policy().await;
+        let tenants = candidate_tenants(did, &policies, &domain_groups)?;
+        let mut matching = Vec::new();
+        for tenant in tenants {
+            let mut scopes = Vec::new();
+            for text in requested {
+                if !self.profile.client_scopes.contains(text)
+                    || !self.profile.resource_scopes.contains(text)
+                {
+                    continue;
+                }
+                let scope = Scope::parse(text)?;
+                if self
+                    .policy
+                    .check_with_domain(did, &tenant, &scope.policy_resource(), &scope.action)
+                    .await
+                {
+                    scopes.push(text.clone());
+                }
             }
-            let scope = Scope::parse(text)?;
-            if self
-                .policy
-                .check_with_domain(&username, &tenant, &scope.policy_resource(), &scope.action)
-                .await
-            {
-                scopes.push(text.clone());
+            if !scopes.is_empty() {
+                matching.push((tenant, scopes));
             }
         }
-        ensure!(!scopes.is_empty(), "no grants");
+        ensure!(
+            matching.len() == 1,
+            "ATProto DID has no unique tenant grant for requested scopes"
+        );
+        let (tenant, scopes) = matching
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("unique DID tenant grant disappeared"))?;
         // Revision of this observed decision, not a global mutation epoch. A
         // change after these reads is accepted; use-time authorization is vital.
         let bytes = serde_json::to_vec(&(
@@ -386,8 +427,7 @@ impl Authorities {
             &self.profile.resource_scopes,
             &source.subject,
             &account_id,
-            &username,
-            &did,
+            did,
             &tenant,
             requested,
             &scopes,
@@ -395,7 +435,7 @@ impl Authorities {
         let revision = blake3::hash(&bytes).to_hex().to_string();
         Ok(Decision {
             account_id,
-            subject: username,
+            subject: did.clone(),
             tenant,
             scopes,
             revision,
@@ -469,10 +509,6 @@ impl Authorities {
             .get_external_identity_user(source_issuer, source_subject)
             .await?
             .ok_or_else(|| anyhow::anyhow!("source identity is no longer admitted"))?;
-        ensure!(
-            username == session.subject,
-            "source identity binding changed"
-        );
         let profile = self
             .users
             .get_profile(&username)
@@ -483,26 +519,16 @@ impl Authorities {
             .sub
             .ok_or_else(|| anyhow::anyhow!("account UUID missing"))?;
         ensure!(account_id == session.account_id, "account binding changed");
-        let did = profile
-            .atproto_did
-            .ok_or_else(|| anyhow::anyhow!("hosted DID missing"))?;
-        let tenant = self
-            .accounts
-            .resolve_current_tenant_for_hosted_did(
-                &Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
-                &did,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("signed tenant missing"))?;
+        let did = &session.subject;
         ensure!(
-            tenant == session.tenant && tenant != "*",
-            "tenant binding changed"
+            (did.starts_with("did:plc:") || did.starts_with("did:web:")) && did.len() <= 255,
+            "session subject is not an ATProto DID"
         );
         ensure!(
             self.policy
-                .check_with_domain(&username, &tenant, resource, operation)
+                .check_with_domain(did, &session.tenant, resource, operation)
                 .await,
-            "current Policy grant denied"
+            "current DID tenant grant denied"
         );
         Ok(())
     }
@@ -779,8 +805,13 @@ impl AdmissionService {
             .ok_or_else(|| anyhow::anyhow!("session is no longer active"))?;
             ensure!(
                 current.session() == primary.session()
-                    && current.source_identity() == primary.source_identity(),
+                    && current.source_identity() == primary.source_identity()
+                    && current.source_atproto_did() == primary.source_atproto_did(),
                 "session primary binding changed"
+            );
+            ensure!(
+                current.source_atproto_did() == current.session().subject,
+                "session subject does not match verified ATProto DID"
             );
             authority
                 .authorize_use(

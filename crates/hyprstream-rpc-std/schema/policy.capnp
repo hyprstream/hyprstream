@@ -193,6 +193,8 @@ struct FederateVerifiedSource {
   tokenHash @4 :Data $maxLen(32);
   issuedAt @5 :Int64;
   expiresAt @6 :Int64;
+  # Server-verified Dex federated_claims.user_id from the pinned ATProto connector.
+  atprotoDid @7 :Text $maxLen(255);
 }
 
 struct PrepareFederateSession {

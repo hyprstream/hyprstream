@@ -21,7 +21,7 @@ const state=b64(Buffer.alloc(32,2)), verifier=b64(Buffer.alloc(32,3)), pkce=b64(
 const N=frame('hyprstream.federate.session-primary.nonce.v1',[s(F),s(C),s(W),s(W+'/federate/callback'),s(H),s(H),Buffer.alloc(32,1),ed,pq.publicKey,sha(s(state)),s(pkce)]);
 const nonce='hsn1.'+b64(sha(N)), code='TEST-CODE-NOT-LIVE';
 const header={alg:'RS256',typ:'JWT',kid:'fixture'};
-const claims={iss:F,aud:C,sub:'opaque-sub',jti:'source-id',iat:1800000000,exp:1800000300,nonce,c_hash:b64(sha(s(code)).subarray(0,16))};
+const claims={iss:F,aud:C,sub:'opaque-sub',jti:'source-id',iat:1800000000,exp:1800000300,nonce,c_hash:b64(sha(s(code)).subarray(0,16)),federated_claims:{connector_id:'atproto',user_id:'did:plc:abcdefghijklmnopqrstuvwx'}};
 const signed=b64(s(JSON.stringify(header)))+'.'+b64(s(JSON.stringify(claims)));
 const token=signed+'.'+b64(sign('RSA-SHA256',s(signed),readFileSync(new URL('test-rsa.pem',import.meta.url))));
 const kid=(a,k)=>sha(frame('hyprstream.session-primary.kid.v1',[s(a),k]));

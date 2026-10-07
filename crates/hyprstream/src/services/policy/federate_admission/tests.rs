@@ -2,14 +2,76 @@
 use super::*;
 use crate::auth::user_store::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use hyprstream_pds_service::{AccountRecordReadAuthorizer, AccountRecordStore};
-use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
-use hyprstream_vfs::{SyntheticMount, SyntheticNode};
+use hyprstream_rpc::Subject;
 use parking_lot::RwLock;
 
 const STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
 const STAGING_SCOPE: &str = "infer:model:qwen2.5-0.5b-instruct:main";
 const REGISTRY_LIST_SCOPE: &str = "query:registry:List";
+const ATPROTO_DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
+
+#[test]
+fn candidate_tenants_are_scoped_to_verified_did_memberships() {
+    let policies = vec![
+        vec![
+            ATPROTO_DID.into(),
+            "tenant-a".into(),
+            "registry:*".into(),
+            "query".into(),
+            "allow".into(),
+        ],
+        vec![
+            "other-user".into(),
+            "unrelated-tenant".into(),
+            "model:*".into(),
+            "infer".into(),
+            "allow".into(),
+        ],
+        vec![
+            ATPROTO_DID.into(),
+            "*".into(),
+            "registry:*".into(),
+            "query".into(),
+            "allow".into(),
+        ],
+    ];
+    let groups = vec![
+        vec![
+            ATPROTO_DID.into(),
+            "registry-reader".into(),
+            "tenant-b".into(),
+        ],
+        vec![
+            "another-user".into(),
+            "model-user".into(),
+            "unrelated-group-tenant".into(),
+        ],
+        vec![ATPROTO_DID.into(), "global-role".into(), "*".into()],
+    ];
+
+    let tenants = candidate_tenants(ATPROTO_DID, &policies, &groups).unwrap();
+    assert_eq!(
+        tenants,
+        BTreeSet::from(["tenant-a".into(), "tenant-b".into()])
+    );
+}
+
+#[test]
+fn candidate_tenant_memberships_have_a_hard_ceiling() {
+    let policies = (0..=MAX_FEDERATE_TENANT_MEMBERSHIPS)
+        .map(|index| {
+            vec![
+                ATPROTO_DID.into(),
+                format!("tenant-{index:03}"),
+                "registry:*".into(),
+                "query".into(),
+                "allow".into(),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert!(candidate_tenants(ATPROTO_DID, &policies, &[]).is_err());
+}
 
 struct Accounts(RwLock<UserProfile>);
 #[async_trait::async_trait]
@@ -63,23 +125,12 @@ impl UserStore for Accounts {
         anyhow::bail!("forbidden")
     }
 }
-struct Permit;
-impl AccountRecordReadAuthorizer for Permit {
-    fn check_read(
-        &self,
-        _: &Subject,
-        _: Option<&str>,
-        _: Option<&SecurityContext>,
-        _: &str,
-    ) -> MacDecision {
-        MacDecision::Permit
-    }
-}
 fn source() -> Source {
     let now = chrono::Utc::now().timestamp();
     Source {
         issuer: "https://issuer.test".into(),
         subject: "source-user".into(),
+        atproto_did: ATPROTO_DID.into(),
         jti: "jti".into(),
         nonce: "nonce".into(),
         token_hash: [1; 32],
@@ -87,55 +138,15 @@ fn source() -> Source {
         expires_at: now + 120,
     }
 }
-fn record() -> Vec<u8> {
-    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
-    use hyprstream_pds::did_op::{
-        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
-        RecoveryKeyEnrollment, UserRotationKey,
-    };
-    use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
-    let ed = SigningKey::from_bytes(&[22; 32]);
-    let (pq, vk) = ml_dsa_generate_keypair();
-    let rotations = GenesisRotationKeys::new(
-        UserRotationKey::new(
-            HybridRotationKey::new(ed.verifying_key().to_bytes(), ml_dsa_vk_bytes(&vk)).unwrap(),
-        ),
-        RecoveryKeyEnrollment::Declined,
-        HostKeyEnrollment::Absent,
-    )
-    .unwrap();
-    let mint = HostedAccountMint::begin(
-        AllocatedAccountName::new("alice", "did:web:alice.example.test").unwrap(),
-        rotations,
-    )
-    .unwrap();
-    let doc = mint.seal_did_document("https://pds.test").unwrap();
-    let pending = mint
-        .prepare_genesis(doc, GenesisRepoHead::EmptyRepo)
-        .unwrap();
-    let signature = sign_genesis(pending.unsigned_genesis(), &ed, &pq).unwrap();
-    pending.seal(signature).unwrap().record_bytes().to_vec()
-}
 async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
     let users = Arc::new(Accounts(RwLock::new(UserProfile {
         sub: Some(uuid::Uuid::new_v4().to_string()),
         active: Some(true),
-        atproto_did: Some("did:web:alice.example.test".into()),
+        // Federate identity comes from Dex's signed ATProto claim, not the
+        // distinct hosted-account did:web profile field.
+        atproto_did: None,
         ..Default::default()
     })));
-    let root = SyntheticNode::dir().with_child(
-        "tenant",
-        SyntheticNode::dir().with_child(
-            "accounts",
-            SyntheticNode::dir().with_child(
-                "alice",
-                SyntheticNode::dir().with_child(
-                    hyprstream_pds_service::PDS_ACCOUNT_RECORD_FILE,
-                    SyntheticNode::file(record()),
-                ),
-            ),
-        ),
-    );
     let signer = SigningKey::from_bytes(&[24; 32]).verifying_key();
     use crate::auth::service_enrollment::ServiceEnrollment;
     use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
@@ -164,7 +175,7 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
     let policy = Arc::new(PolicyManager::new_in_memory().await.unwrap());
     policy
         .add_policy_with_domain(
-            "alice",
+            ATPROTO_DID,
             "tenant",
             &format!("model:{STAGING_MODEL_REF}"),
             "infer",
@@ -174,10 +185,6 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
         .unwrap();
     let a = Authorities {
         users: PolicyAccountReader::for_test(users.clone()),
-        accounts: Arc::new(AccountRecordStore::new(
-            Arc::new(SyntheticMount::new(root)),
-            Arc::new(Permit),
-        )),
         policy,
         enrollment,
         profile: Profile {
@@ -454,6 +461,7 @@ async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
     assert_eq!(parsed.policy_resource(), dispatch_resource);
 
     let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    assert_eq!(decision.subject, ATPROTO_DID);
     assert_eq!(decision.scopes, [STAGING_SCOPE]);
     assert_eq!(decision.scopes[0], STAGING_SCOPE);
 }
@@ -465,7 +473,7 @@ async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
     authority.profile.client_scopes.insert(REGISTRY_LIST_SCOPE.into());
     authority.profile.resource_scopes.insert(REGISTRY_LIST_SCOPE.into());
     authority.policy.add_policy_with_domain(
-        "alice", "tenant", "registry:List", "query", "allow",
+        ATPROTO_DID, "tenant", "registry:List", "query", "allow",
     ).await.unwrap();
     let source_record = source();
     let decision = service.prepare(&ctx, &source_record, &[REGISTRY_LIST_SCOPE.into()]).await.unwrap();
@@ -498,10 +506,30 @@ async fn h2_admission_fresh_account_tenant_revision_and_capacity() {
     users.0.write().active = Some(true);
     users.0.write().sub = Some(uuid::Uuid::new_v4().to_string());
     assert!(first != service.prepare(&ctx, &source(), &requested).await.unwrap());
-    users.0.write().atproto_did = Some("did:web:missing.example.test".into());
-    assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
+    users.0.write().atproto_did = Some("did:web:unrelated-hosted-account.example".into());
+    let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    assert_eq!(decision.subject, ATPROTO_DID);
     let _permit = service.capacity.as_ref().unwrap().try_acquire().unwrap();
     assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
+}
+
+#[tokio::test]
+async fn h2_ambiguous_did_tenant_grants_fail_closed() {
+    let (service, _, ctx) = fixture().await;
+    service.authority.as_ref().unwrap().policy
+        .add_policy_with_domain(
+            ATPROTO_DID,
+            "another-tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap();
+    assert!(service
+        .prepare(&ctx, &source(), &[STAGING_SCOPE.into()])
+        .await
+        .is_err());
 }
 
 async fn connect(socket: &str, database: &str) -> tokio_postgres::Client {
@@ -655,7 +683,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
     // boundary does a fresh read and denies before starting the operation.
     let removed = authority
         .policy
-        .remove_policy_with_domain("alice", "tenant", &resource, "infer", "allow")
+        .remove_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "allow")
         .await
         .unwrap();
     assert!(removed);
@@ -674,11 +702,11 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         "next distinct boundary must observe revoke"
     );
 
-    // Account suspension and tenant remapping also take effect on the next
-    // fresh check, without depending on session/token refresh.
+    // Account suspension and grant changes take effect on the next fresh
+    // check, without depending on session/token refresh.
     authority
         .policy
-        .add_policy_with_domain("alice", "tenant", &resource, "infer", "allow")
+        .add_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "allow")
         .await
         .unwrap();
     users.0.write().active = Some(false);
@@ -694,7 +722,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .await
         .is_err());
     users.0.write().active = Some(true);
-    users.0.write().atproto_did = Some("did:web:missing.example.test".into());
+    users.0.write().atproto_did = Some("did:web:unrelated-hosted-account.example".into());
     assert!(authority
         .authorize_use(
             &session,
@@ -705,7 +733,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
             chrono::Utc::now().timestamp()
         )
         .await
-        .is_err());
+        .is_ok());
 }
 
 /// Only a disposable local Unix-socket fixture; never an environment DSN.
@@ -733,10 +761,19 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .batch_execute(hyprstream_session_store::MIGRATION_V3)
         .await
         .unwrap();
+    control
+        .batch_execute(hyprstream_session_store::MIGRATION_V4)
+        .await
+        .unwrap();
+    control
+        .batch_execute(hyprstream_session_store::MIGRATION_V5)
+        .await
+        .unwrap();
     control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
         &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
     let (mut service, users, ctx) = fixture().await;
+    let original_account_id = users.0.read().sub.clone();
     let mut session_config = tokio_postgres::Config::new();
     session_config.host_path(&socket).user("postgres").dbname(&db);
     service.session_pool = Some(deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
@@ -779,6 +816,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .redeem(&ctx, &mut client, evidence(challenge, "revision"))
         .await
         .is_err());
+    users.0.write().sub = original_account_id;
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
     // Hold the H1 row lock to causally place suspension AFTER the Policy read
     // and BEFORE admission commit. This lock is fixture instrumentation only.

@@ -40,9 +40,12 @@ Existing repository convention: SQL assets plus opt-in disposable PostgreSQL tes
 (see `hyprstream-ledger/sql` and `tests/postgres_live.rs`). `001_admission.sql` is a
 one-time, transactional version-1 migration. `002_epoch_inventory.sql` is a
 separate version-2 migration and refuses any existing profile, session or replay
-rows: no legacy row receives a fabricated epoch or inventory. Apply
-`001_admission.sql`, `002_epoch_inventory.sql`, `roles.sql`, then `002_roles.sql`
-explicitly under the migration owner. No runtime boot migration, silent repeat,
+rows: no legacy row receives a fabricated epoch or inventory. Then apply
+`roles.sql`, `002_roles.sql`, `003_primary_lookup_index.sql`,
+`004_atproto_source_did.sql`, `005_identity_binding.sql`, and `005_roles.sql`
+explicitly under the migration owner. Version 5 backfills only retained,
+consistent verified-DID/session rows; conflicting source↔DID↔account histories
+abort the transaction, and unverified legacy rows are not guessed. No runtime boot migration, silent repeat,
 downgrade or staging database change occurs in this source slice. Provisioning
 creates these dedicated NOLOGIN roles:
 
@@ -56,8 +59,9 @@ CREATE ROLE hs_session_migration NOLOGIN;
 The migration identity owns the schema/tables and needs CREATE on the selected
 existing database to apply version 1. Runtime/control/cleanup identities must not
 inherit migration ownership, superuser, PUBLIC rights or any broader role. Runtime
-has SELECT+INSERT on sessions/replay, UPDATE(status) only on sessions, and
-SELECT+UPDATE(lock_version) only on profile state. Control has SELECT and
+has SELECT+INSERT on sessions, replay, and the immutable `identity_bindings`
+table, UPDATE(status) only on sessions, and SELECT+UPDATE(lock_version) only on
+profile state. Control has SELECT and
 UPDATE(enabled,authority_generation,collision_inventory_id). Cleanup alone has
 scoped DELETE rights, including the v16 request-replay table. The operator must
 verify effective privileges and role membership before enabling; narrow grants
