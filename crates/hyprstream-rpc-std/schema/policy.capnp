@@ -169,7 +169,80 @@ struct PolicyRequest {
     # No token, reusable permit or positive cache is returned.
     admitFederateRequest @31 :AdmitFederateRequest
       $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
+
+    # OAuth-only source-to-authority prepare. The result is a server-only
+    # one-use handle plus the binding that OAuth puts in the signed challenge.
+    # The handler verifies the direct enrolled OAuth caller, not a browser.
+    prepareFederateSession @32 :PrepareFederateSession
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
+
+    # OAuth-only redeem after both holder signatures have been verified. Policy
+    # rechecks authority and commits the session before returning it for signing.
+    commitFederateSession @33 :CommitFederateSession
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
   }
+}
+
+# Metadata from an OAuth-verified Federate ID token; never the raw token.
+# This is accepted only from the enrolled OAuth service over signed RPC.
+struct FederateVerifiedSource {
+  issuer @0 :Text $maxLen(2048);
+  subject @1 :Text $maxLen(256);
+  jti @2 :Text $maxLen(256);
+  nonce @3 :Text $maxLen(256);
+  tokenHash @4 :Data $maxLen(32);
+  issuedAt @5 :Int64;
+  expiresAt @6 :Int64;
+}
+
+struct PrepareFederateSession {
+  source @0 :FederateVerifiedSource;
+  requested @1 :List(Text) $maxLen(64);
+  challengeId @2 :Data $maxLen(32);
+  challengeCreatedAt @3 :Int64;
+  # Keys committed by the verified source nonce before the challenge exists.
+  edPublic @4 :Data $maxLen(32);
+  pqPublic @5 :Data $maxLen(1952);
+}
+
+struct PreparedFederateSession {
+  accountId @0 :Text;
+  subject @1 :Text;
+  tenant @2 :Text;
+  requested @3 :List(Text);
+  granted @4 :List(Text);
+  revision @5 :Text;
+  # Random opaque handle. It is never sent to the browser.
+  policyHandle @6 :Data;
+}
+
+struct CommitFederateSession {
+  source @0 :FederateVerifiedSource;
+  policyHandle @1 :Data $maxLen(32);
+  challengeId @2 :Data $maxLen(32);
+  challengeCreatedAt @3 :Int64;
+  challengeExpiresAt @4 :Int64;
+  edPublic @5 :Data $maxLen(32);
+  pqPublic @6 :Data $maxLen(1952);
+}
+
+# Exact durable session receipt returned by Policy after PostgreSQL commit.
+struct FederateCommittedSession {
+  host @0 :Text;
+  sid @1 :Text;
+  accountId @2 :Text;
+  subject @3 :Text;
+  tenant @4 :Text;
+  client @5 :Text;
+  resource @6 :Text;
+  scopes @7 :List(Text);
+  grantRevision @8 :Text;
+  edPublic @9 :Data;
+  pqPublic @10 :Data;
+  generation @11 :Data;
+  collisionInventoryId @12 :Data;
+  proofEpoch @13 :Int64;
+  expiresAt @14 :Int64;
 }
 
 struct ResolveSessionPrimary {
@@ -462,6 +535,8 @@ struct PolicyResponse {
     checkMediatedResult @30 :Bool;
     resolveSessionPrimaryResult @31 :SessionPrimary;
     admitFederateRequestResult @32 :Bool;
+    prepareFederateSessionResult @33 :PreparedFederateSession;
+    commitFederateSessionResult @34 :FederateCommittedSession;
   }
 }
 

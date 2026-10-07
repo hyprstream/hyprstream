@@ -146,6 +146,9 @@ fn validate_event_prefix_registration(
 const DEFAULT_REVOCATION_MAX_TTL_SECS: i64 = 45 * 24 * 3600;
 
 pub struct PolicyService {
+    /// Source-only OAuth→Policy challenge RPC. No production installer yet.
+    #[cfg(feature = "postgres")]
+    federate_admission: Option<Arc<federate_admission::AdmissionService>>,
     /// Source-only: never installed by any runtime factory in H3a.
     #[cfg(feature = "postgres")]
     session_primary: Option<primary::SessionPrimaryReader>,
@@ -220,6 +223,8 @@ impl PolicyService {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
         let jwt_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(&signing_key, "hyprstream-jwt-v1");
         Self {
+            #[cfg(feature = "postgres")]
+            federate_admission: None,
             #[cfg(feature = "postgres")]
             session_primary: None,
             #[cfg(feature = "postgres")]
@@ -1208,8 +1213,126 @@ fn validate_credential_hs_suite(
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
+fn federate_verified_source(
+    data: &hyprstream_rpc_std::policy_client::FederateVerifiedSource,
+) -> Result<hyprstream_session_store::Source> {
+    anyhow::ensure!(
+        !data.issuer.is_empty()
+            && data.issuer.len() <= 2048
+            && !data.subject.is_empty()
+            && data.subject.len() <= 256
+            && !data.jti.is_empty()
+            && data.jti.len() <= 256
+            && !data.nonce.is_empty()
+            && data.nonce.len() <= 256,
+        "invalid Federate source metadata"
+    );
+    Ok(hyprstream_session_store::Source {
+        issuer: data.issuer.clone(),
+        subject: data.subject.clone(),
+        jti: data.jti.clone(),
+        nonce: data.nonce.clone(),
+        token_hash: data.token_hash.as_slice().try_into()?,
+        issued_at: data.issued_at,
+        expires_at: data.expires_at,
+    })
+}
+
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
+    async fn handle_prepare_federate_session(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &hyprstream_rpc_std::policy_client::PrepareFederateSession,
+    ) -> Result<PolicyResponseVariant> {
+        #[cfg(feature = "postgres")]
+        if let Some(reader) = &self.federate_admission {
+            let result = async {
+                let prepared = reader.prepare_rpc(
+                    ctx,
+                    federate_verified_source(&data.source)?,
+                    data.requested.clone(),
+                    data.challenge_id.as_slice().try_into()?,
+                    data.challenge_created_at,
+                    data.ed_public.as_slice().try_into()?,
+                    data.pq_public.clone(),
+                ).await?;
+                Ok::<_, anyhow::Error>(prepared)
+            }.await;
+            if let Ok(prepared) = result {
+                return Ok(PolicyResponseVariant::PrepareFederateSessionResult(
+                    hyprstream_rpc_std::policy_client::PreparedFederateSession {
+                        account_id: prepared.account_id,
+                        subject: prepared.subject,
+                        tenant: prepared.tenant,
+                        requested: prepared.requested,
+                        granted: prepared.granted,
+                        revision: prepared.revision,
+                        policy_handle: prepared.handle.to_vec(),
+                    },
+                ));
+            }
+        }
+        let _ = (ctx, data);
+        Ok(PolicyResponseVariant::Error(ErrorInfo {
+            code: "FEDERATE_PREPARE_DENIED".into(),
+            message: "Federate prepare unavailable or denied".into(),
+            details: String::new(),
+        }))
+    }
+
+    async fn handle_commit_federate_session(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &hyprstream_rpc_std::policy_client::CommitFederateSession,
+    ) -> Result<PolicyResponseVariant> {
+        #[cfg(feature = "postgres")]
+        if let Some(reader) = &self.federate_admission {
+            let result = async {
+                reader.commit_rpc(
+                    ctx,
+                    data.policy_handle.as_slice().try_into()?,
+                    federate_verified_source(&data.source)?,
+                    data.challenge_id.as_slice().try_into()?,
+                    data.challenge_created_at,
+                    data.challenge_expires_at,
+                    data.ed_public.as_slice().try_into()?,
+                    data.pq_public.clone(),
+                ).await
+            }.await;
+            if let Ok(session) = result {
+                return Ok(PolicyResponseVariant::CommitFederateSessionResult(
+                    hyprstream_rpc_std::policy_client::FederateCommittedSession {
+                        host: session.host,
+                        sid: session.sid,
+                        account_id: session.account_id,
+                        subject: session.subject,
+                        tenant: session.tenant,
+                        client: session.client_id,
+                        resource: session.resource,
+                        scopes: session.scopes,
+                        grant_revision: session.grant_revision,
+                        ed_public: session.ed_public.to_vec(),
+                        pq_public: session.pq_public,
+                        generation: session.generation.to_vec(),
+                        collision_inventory_id: session.collision_inventory_id.to_vec(),
+                        proof_epoch: session.proof_epoch,
+                        expires_at: session.expires_at,
+                    },
+                ));
+            }
+        }
+        let _ = (ctx, data);
+        Ok(PolicyResponseVariant::Error(ErrorInfo {
+            code: "FEDERATE_COMMIT_DENIED".into(),
+            message: "Federate commit unavailable or denied".into(),
+            details: String::new(),
+        }))
+    }
+
     async fn handle_admit_federate_request(
         &self,
         ctx: &EnvelopeContext,
@@ -4410,6 +4533,49 @@ mod tests {
         assert!(matches!(
             service.handle_admit_federate_request(&ctx, 1, &data).await,
             Ok(PolicyResponseVariant::AdmitFederateRequestResult(false))
+        ));
+    }
+
+    #[tokio::test]
+    async fn federate_prepare_and_commit_rpc_have_no_default_provider() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:oauth"),
+            SigningKey::from_bytes(&[77; 32]).verifying_key(),
+        );
+        let source = hyprstream_rpc_std::policy_client::FederateVerifiedSource {
+            issuer: "https://issuer.test".into(),
+            subject: "source-user".into(),
+            jti: "jti".into(),
+            nonce: "nonce".into(),
+            token_hash: vec![1; 32],
+            issued_at: 1,
+            expires_at: 2,
+        };
+        let prepare = hyprstream_rpc_std::policy_client::PrepareFederateSession {
+            source: source.clone(),
+            requested: vec!["infer:model:test".into()],
+            challenge_id: vec![9; 32],
+            challenge_created_at: 1,
+            ed_public: vec![1; 32],
+            pq_public: vec![2; 1952],
+        };
+        assert!(matches!(
+            service.handle_prepare_federate_session(&ctx, 1, &prepare).await,
+            Ok(PolicyResponseVariant::Error(ref error)) if error.code == "FEDERATE_PREPARE_DENIED"
+        ));
+        let commit = hyprstream_rpc_std::policy_client::CommitFederateSession {
+            source,
+            policy_handle: vec![3; 32],
+            challenge_id: vec![9; 32],
+            challenge_created_at: 1,
+            challenge_expires_at: 2,
+            ed_public: vec![1; 32],
+            pq_public: vec![2; 1952],
+        };
+        assert!(matches!(
+            service.handle_commit_federate_session(&ctx, 1, &commit).await,
+            Ok(PolicyResponseVariant::Error(ref error)) if error.code == "FEDERATE_COMMIT_DENIED"
         ));
     }
 

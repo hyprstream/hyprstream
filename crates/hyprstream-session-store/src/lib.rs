@@ -43,6 +43,7 @@ impl From<tokio_postgres::Error> for Error {
 }
 
 /// Upstream-verified source metadata; never the raw ID token.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Source {
     pub issuer: String,
     pub subject: String,

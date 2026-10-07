@@ -195,6 +195,7 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
         AdmissionService {
             authority: Some(a),
             capacity: Some(Semaphore::new(1)),
+            ..Default::default()
         },
         users,
         EnvelopeContext::for_test_authenticated_subject_with_claims(
@@ -204,6 +205,138 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
             hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX),
         ),
     )
+}
+
+#[tokio::test]
+async fn rpc_prepare_requires_writer_and_consumes_mismatched_handle_once() {
+    let (mut service, _, ctx) = fixture().await;
+    let now = chrono::Utc::now().timestamp();
+    let verified_source = source();
+    let requested = vec![STAGING_SCOPE.to_owned()];
+    assert!(service
+        .prepare_rpc(
+            &ctx,
+            verified_source.clone(),
+            requested.clone(),
+            [9; 32],
+            now,
+            [1; 32],
+            vec![2; 1952]
+        )
+        .await
+        .is_err());
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host_path("/var/tmp/hyprstream-b1b-no-postgres")
+        .user("nobody")
+        .dbname("unused");
+    service.session_pool = Some(
+        deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            config,
+            tokio_postgres::NoTls,
+        ))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .max_size(1)
+        .build()
+        .unwrap(),
+    );
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            verified_source.clone(),
+            requested,
+            [9; 32],
+            now,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.pending.lock().await.len(), 1);
+    // A wrong key consumes the one-use handle before any database contact.
+    assert!(service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            verified_source.clone(),
+            [9; 32],
+            now,
+            now + 60,
+            [3; 32],
+            vec![2; 1952]
+        )
+        .await
+        .is_err());
+    assert!(service.pending.lock().await.is_empty());
+    assert!(service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            verified_source,
+            [9; 32],
+            now,
+            now + 60,
+            [1; 32],
+            vec![2; 1952]
+        )
+        .await
+        .is_err());
+
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            source(),
+            vec![STAGING_SCOPE.into()],
+            [10; 32],
+            now,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    let mut substituted_source = source();
+    substituted_source.token_hash = [7; 32];
+    assert!(service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            substituted_source,
+            [10; 32],
+            now,
+            now + 60,
+            [1; 32],
+            vec![2; 1952]
+        )
+        .await
+        .is_err());
+    assert!(service.pending.lock().await.is_empty());
+
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            source(),
+            vec![STAGING_SCOPE.into()],
+            [11; 32],
+            now,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    assert!(service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            source(),
+            [12; 32],
+            now,
+            now + 60,
+            [1; 32],
+            vec![2; 1952]
+        )
+        .await
+        .is_err());
+    assert!(service.pending.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -603,9 +736,25 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
         &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
-    let (service, users, ctx) = fixture().await;
+    let (mut service, users, ctx) = fixture().await;
+    let mut session_config = tokio_postgres::Config::new();
+    session_config.host_path(&socket).user("postgres").dbname(&db);
+    service.session_pool = Some(deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+        session_config, tokio_postgres::NoTls,
+    )).runtime(deadpool_postgres::Runtime::Tokio1).max_size(2).build().unwrap());
     let service = Arc::new(service);
     let requested = vec![STAGING_SCOPE.into()];
+    let mut rpc_source = source();
+    rpc_source.jti = "rpc-jti".into();
+    rpc_source.nonce = "rpc-nonce".into();
+    rpc_source.token_hash = [8; 32];
+    let created_at = chrono::Utc::now().timestamp();
+    let prepared = service.prepare_rpc(&ctx, rpc_source.clone(), requested.clone(), [10; 32], created_at, [44; 32], vec![55; 1952]).await.unwrap();
+    let parallel = service.prepare_rpc(&ctx, rpc_source.clone(), requested.clone(), [11; 32], created_at, [44; 32], vec![55; 1952]).await.unwrap();
+    let committed = service.commit_rpc(&ctx, prepared.handle, rpc_source.clone(), [10; 32], created_at, created_at + 60, [44; 32], vec![55; 1952]).await.unwrap();
+    assert!(Store::lookup_primary(&mut client, "https://host.test", &committed.sid, &[3; 32], &[7; 32]).await.unwrap().is_some());
+    assert!(service.commit_rpc(&ctx, prepared.handle, rpc_source.clone(), [10; 32], created_at, created_at + 60, [44; 32], vec![55; 1952]).await.is_err(), "one-use handle must not commit twice");
+    assert!(service.commit_rpc(&ctx, parallel.handle, rpc_source, [11; 32], created_at, created_at + 60, [44; 32], vec![55; 1952]).await.is_err(), "PostgreSQL must reject the same source through a second handle");
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
     let mut stale = challenge.clone();
     stale.tenant = "other".into();
