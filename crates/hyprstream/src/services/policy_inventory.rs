@@ -10,9 +10,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{ensure, Context, Result};
-use ed25519_dalek::SigningKey;
-use hyprstream_rpc::crypto::pq::{ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes};
+use anyhow::{anyhow, ensure, Context, Result};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use hyprstream_rpc::crypto::pq::{ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes, ml_dsa_vk_from_bytes};
 use hyprstream_rpc::did_key::{decode_multikey, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB};
 use hyprstream_session_store::primary::{CollisionInventory, InventorySource};
 use zeroize::Zeroize as _;
@@ -99,6 +99,13 @@ pub(super) fn complete_collision_inventory(
         !bootstrap.is_empty(),
         "Federate bootstrap public-key source is empty"
     );
+    // The low-level loader deliberately still accepts legacy classical-only
+    // records, but every configured record enters this inventory, so one stale
+    // Ed25519-only entry would omit a service's PQ half and let a fresh proof
+    // key paired with the PQ key that service derives from its seed pass
+    // `permits`. Reject the whole file instead.
+    identity_store::ensure_bootstrap_pubkeys_hybrid(&bootstrap)
+        .context("Federate collision inventory bootstrap source is not fully hybrid")?;
     for service in required_services {
         ensure!(
             bootstrap.contains_key(*service),
@@ -113,14 +120,28 @@ pub(super) fn complete_collision_inventory(
         add(format!("bootstrap:{name}"), keys);
     }
 
-    // Every configured mesh peer contributes both halves. A malformed peer
-    // is an unavailable required source, not an empty source.
+    // Every configured mesh peer contributes both halves. A codec prefix
+    // alone accepts cross-algorithm payloads, so each multikey payload is
+    // also validated against its declared algorithm. A malformed peer is an
+    // unavailable required source, not an empty source.
     for (name, peer) in &oauth.mesh_peers {
         ensure!(!name.is_empty(), "mesh peer has an empty inventory ID");
         let ed = decode_multikey(&peer.ed25519_multibase, &MULTICODEC_ED25519_PUB)
             .with_context(|| format!("mesh peer {name} Ed key is invalid"))?;
+        let ed_bytes: [u8; 32] = ed.as_slice().try_into().map_err(|_| {
+            anyhow!(
+                "mesh peer {name} Ed key payload is {} bytes (expected 32)",
+                ed.len()
+            )
+        })?;
+        VerifyingKey::from_bytes(&ed_bytes).with_context(|| {
+            format!("mesh peer {name} Ed key is not a valid Ed25519 verifying key")
+        })?;
         let pq = decode_multikey(&peer.mldsa65_multibase, &MULTICODEC_ML_DSA_65_PUB)
             .with_context(|| format!("mesh peer {name} PQ key is invalid"))?;
+        ml_dsa_vk_from_bytes(&pq).with_context(|| {
+            format!("mesh peer {name} PQ key is not a valid ML-DSA-65 verifying key")
+        })?;
         add(format!("mesh:{name}"), vec![ed, pq]);
     }
 
@@ -234,5 +255,149 @@ mod tests {
 
         identity_store::write_secret(dir.path(), "signing-key", &[0x02; 32]).unwrap();
         assert!(complete_collision_inventory(&oauth, dir.path(), &node, &["policy"]).is_err());
+    }
+
+    #[test]
+    fn classical_bootstrap_entry_is_rejected_whether_required_or_extra() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = fixture(dir.path());
+        let oauth = OAuthConfig::default();
+        assert!(complete_collision_inventory(&oauth, dir.path(), &node, &["policy"]).is_ok());
+
+        // The required service provisioned by a pre-hybrid run: Ed25519-only.
+        let stale = SigningKey::from_bytes(&[0x11; 32]);
+        identity_store::write_bootstrap_pubkeys_hybrid(
+            dir.path(),
+            &HashMap::from([(
+                "policy".into(),
+                BootstrapPubkey::classical(stale.verifying_key()),
+            )]),
+        )
+        .unwrap();
+        let error = complete_collision_inventory(&oauth, dir.path(), &node, &["policy"])
+            .err()
+            .expect("classical-only required bootstrap service must be rejected");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("Ed25519-only") && rendered.contains("policy"),
+            "error must name the stale entry, got: {rendered}"
+        );
+
+        // The loader promises to inventory every configured record, so an
+        // extra non-required classical entry denies too, with everything else
+        // (CA, node, required hybrid entry) still valid.
+        let service = SigningKey::from_bytes(&[0x53; 32]);
+        identity_store::write_bootstrap_pubkeys_hybrid(
+            dir.path(),
+            &HashMap::from([
+                (
+                    "policy".into(),
+                    BootstrapPubkey::for_service_key(&service).unwrap(),
+                ),
+                (
+                    "legacy".into(),
+                    BootstrapPubkey::classical(stale.verifying_key()),
+                ),
+            ]),
+        )
+        .unwrap();
+        let error = complete_collision_inventory(&oauth, dir.path(), &node, &["policy"])
+            .err()
+            .expect("extra classical-only bootstrap entry must be rejected");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("Ed25519-only") && rendered.contains("legacy"),
+            "error must name the stale entry, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mesh_peer_multikeys_are_validated_by_declared_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = fixture(dir.path());
+        let mut oauth = OAuthConfig::default();
+        let peer = SigningKey::from_bytes(&[0x65; 32]);
+        let peer_ed = peer.verifying_key().as_bytes().to_vec();
+        let peer_pq =
+            ml_dsa_sk_to_vk_bytes(&hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&peer));
+        let ed_multikey =
+            crate::auth::mesh_trust::encode_multikey(&peer_ed, &MULTICODEC_ED25519_PUB);
+        let pq_multikey =
+            crate::auth::mesh_trust::encode_multikey(&peer_pq, &MULTICODEC_ML_DSA_65_PUB);
+
+        // Ed codec prefix carrying an ML-DSA-65-length payload; PQ half valid.
+        oauth.mesh_peers.insert(
+            "ed-wrong-length".into(),
+            crate::config::MeshPeerConfig {
+                ed25519_multibase: crate::auth::mesh_trust::encode_multikey(
+                    &peer_pq,
+                    &MULTICODEC_ED25519_PUB,
+                ),
+                mldsa65_multibase: pq_multikey.clone(),
+            },
+        );
+        let error = complete_collision_inventory(&oauth, dir.path(), &node, &["policy"])
+            .err()
+            .expect("Ed multikey with a 1952-byte payload must be rejected");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("ed-wrong-length") && rendered.contains("expected 32"),
+            "error must name the peer and the length mismatch, got: {rendered}"
+        );
+        oauth.mesh_peers.clear();
+
+        // ML-DSA codec prefix carrying a 32-byte payload; Ed half valid.
+        oauth.mesh_peers.insert(
+            "pq-wrong-length".into(),
+            crate::config::MeshPeerConfig {
+                ed25519_multibase: ed_multikey.clone(),
+                mldsa65_multibase: crate::auth::mesh_trust::encode_multikey(
+                    &peer_ed,
+                    &MULTICODEC_ML_DSA_65_PUB,
+                ),
+            },
+        );
+        let error = complete_collision_inventory(&oauth, dir.path(), &node, &["policy"])
+            .err()
+            .expect("ML-DSA multikey with a 32-byte payload must be rejected");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("pq-wrong-length") && rendered.contains("ML-DSA-65"),
+            "error must name the peer and the algorithm, got: {rendered}"
+        );
+        oauth.mesh_peers.clear();
+
+        // Exactly 32 bytes but not a valid Ed25519 point encoding; PQ half
+        // still valid, isolating the encoding check as the cause.
+        oauth.mesh_peers.insert(
+            "ed-not-a-point".into(),
+            crate::config::MeshPeerConfig {
+                ed25519_multibase: crate::auth::mesh_trust::encode_multikey(
+                    &[0x02; 32],
+                    &MULTICODEC_ED25519_PUB,
+                ),
+                mldsa65_multibase: pq_multikey.clone(),
+            },
+        );
+        let error = complete_collision_inventory(&oauth, dir.path(), &node, &["policy"])
+            .err()
+            .expect("32-byte non-point Ed encoding must be rejected");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("ed-not-a-point") && rendered.contains("valid Ed25519 verifying key"),
+            "error must name the peer and the encoding failure, got: {rendered}"
+        );
+        oauth.mesh_peers.clear();
+
+        // The same keys under correct encodings load, so the denials above are
+        // caused by the malformed payload, not by the peer itself.
+        oauth.mesh_peers.insert(
+            "valid".into(),
+            crate::config::MeshPeerConfig {
+                ed25519_multibase: ed_multikey,
+                mldsa65_multibase: pq_multikey,
+            },
+        );
+        assert!(complete_collision_inventory(&oauth, dir.path(), &node, &["policy"]).is_ok());
     }
 }
