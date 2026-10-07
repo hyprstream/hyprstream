@@ -20,6 +20,22 @@ CREATE TABLE federate_session.identity_bindings (
   FOREIGN KEY (host, profile)
     REFERENCES federate_session.profile_state(host, profile)
 );
+-- A non-null DID was already verified and persisted in v4. If it disagrees
+-- with the session subject, do not silently omit the row and backfill from a
+-- consistent subset: later admissions could make the omitted session appear
+-- to match a binding. Preserve only genuinely unverified NULL-DID history.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM federate_session.sessions s
+    JOIN federate_session.replay r ON (r.host=s.host AND r.sid=s.sid)
+    WHERE r.source_atproto_did IS NOT NULL
+      AND s.subject IS DISTINCT FROM r.source_atproto_did
+  ) THEN
+    RAISE EXCEPTION 'v5 refuses inconsistent verified-DID session history';
+  END IF;
+END $$;
 -- Preserve consistent v4 bindings, but reject any history that would require
 -- choosing which account or DID was canonical. Legacy rows without a verified
 -- DID remain unusable as primary records and are intentionally not guessed.

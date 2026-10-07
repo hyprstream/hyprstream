@@ -197,6 +197,47 @@ async fn primary_scenarios(
     .unwrap();
     assert_eq!(reloaded.proof_epoch, active.session.proof_epoch);
 
+    // Even if privileged historical repair/import creates a session whose
+    // subject disagrees with its committed replay DID, the primary lookup
+    // itself must refuse it rather than relying on a later consumer check.
+    let tampered_sid = format!("mismatched-primary-subject-{}", committed.sid);
+    let mut tampered_ed_public = committed.ed_public;
+    tampered_ed_public[0] ^= 0x80;
+    let mut tampered_pq_public = committed.pq_public.clone();
+    tampered_pq_public[0] ^= 0x80;
+    admin.execute(
+        "INSERT INTO federate_session.sessions(host,profile,sid,account_id,subject,tenant,client_id,resource,scopes,grant_revision,suite,ed_public,pq_public,generation,collision_inventory_id,created_at,expires_at,status) SELECT host,profile,$1,account_id,'legacy-user',tenant,client_id,resource,scopes,grant_revision,suite,$4,$5,generation,collision_inventory_id,created_at,expires_at,'active' FROM federate_session.sessions WHERE host=$2 AND sid=$3",
+        &[&tampered_sid, &HOST, &committed.sid, &&tampered_ed_public[..], &tampered_pq_public],
+    ).await.unwrap();
+    admin.execute(
+        "INSERT INTO federate_session.replay(issuer,client_id,source_subject,jti,nonce,token_hash,source_iat,source_exp,retain_until,host,sid,source_atproto_did) SELECT issuer,client_id,source_subject,'tampered-primary-jti','tampered-primary-nonce',decode(repeat('0d',32),'hex'),source_iat,source_exp,retain_until,host,$1,source_atproto_did FROM federate_session.replay WHERE host=$2 AND sid=$3",
+        &[&tampered_sid, &HOST, &committed.sid],
+    ).await.unwrap();
+    assert!(Store::lookup_primary(
+        runtime,
+        HOST,
+        &tampered_sid,
+        &committed.generation,
+        &inventory().id(),
+    )
+    .await
+    .unwrap()
+    .is_none());
+    admin
+        .execute(
+            "DELETE FROM federate_session.replay WHERE host=$1 AND sid=$2",
+            &[&HOST, &tampered_sid],
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "DELETE FROM federate_session.sessions WHERE host=$1 AND sid=$2",
+            &[&HOST, &tampered_sid],
+        )
+        .await
+        .unwrap();
+
     for (service, key) in [
         ("service:other", [42; 32]),
         ("service:model", [41; 32]),
@@ -660,7 +701,51 @@ async fn postgres_admission_causal() {
     admin.batch_execute(MIGRATION_V2).await.unwrap();
     admin.batch_execute(MIGRATION_V3).await.unwrap();
     admin.batch_execute(MIGRATION_V4).await.unwrap();
+    // A verified-DID/session-subject mismatch must abort v5 atomically, while
+    // consistent verified history is backfilled and genuinely unverified
+    // NULL-DID history remains excluded rather than guessed.
+    admin.batch_execute(r#"
+        INSERT INTO federate_session.profile_state(host,profile,authority_generation,collision_inventory_id)
+        VALUES ('https://migration-binding.test','federate-session-v1',decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'));
+        INSERT INTO federate_session.sessions(host,profile,sid,account_id,subject,tenant,client_id,resource,scopes,grant_revision,suite,ed_public,pq_public,generation,collision_inventory_id,created_at,expires_at)
+        VALUES
+          ('https://migration-binding.test','federate-session-v1','verified-ok','account-1','did:plc:abcdefghijklmnopqrstuvwx','tenant-1','client-1','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('01',32),'hex'),decode(repeat('02',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),100,200),
+          ('https://migration-binding.test','federate-session-v1','verified-bad','account-1','legacy-user','tenant-1','client-1','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('04',32),'hex'),decode(repeat('05',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),100,200),
+          ('https://migration-binding.test','federate-session-v1','legacy-null','account-2','legacy-user','tenant-2','client-2','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('06',32),'hex'),decode(repeat('07',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),100,200);
+        INSERT INTO federate_session.replay(issuer,client_id,source_subject,jti,nonce,token_hash,source_iat,source_exp,retain_until,host,sid,source_atproto_did)
+        VALUES
+          ('https://issuer.test','client-1','opaque-sub','jti-ok','nonce-ok',decode(repeat('08',32),'hex'),100,200,530,'https://migration-binding.test','verified-ok','did:plc:abcdefghijklmnopqrstuvwx'),
+          ('https://issuer.test','client-1','opaque-sub','jti-bad','nonce-bad',decode(repeat('09',32),'hex'),100,200,530,'https://migration-binding.test','verified-bad','did:plc:abcdefghijklmnopqrstuvwx'),
+          ('https://issuer.test','client-2','opaque-sub-2','jti-null','nonce-null',decode(repeat('0a',32),'hex'),100,200,530,'https://migration-binding.test','legacy-null',NULL);
+    "#).await.unwrap();
+    assert!(admin.batch_execute(MIGRATION_V5).await.is_err());
+    admin.batch_execute("ROLLBACK").await.unwrap();
+    let version: i32 = admin
+        .query_one("SELECT version FROM federate_session.schema_version", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let bindings_table_exists: bool = admin
+        .query_one(
+            "SELECT to_regclass('federate_session.identity_bindings') IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        version, 4,
+        "failed v5 migration must roll back its version change"
+    );
+    assert!(
+        !bindings_table_exists,
+        "failed v5 migration must roll back its new table"
+    );
+    admin.batch_execute("DELETE FROM federate_session.replay WHERE host='https://migration-binding.test' AND sid='verified-bad'; DELETE FROM federate_session.sessions WHERE host='https://migration-binding.test' AND sid='verified-bad'").await.unwrap();
     admin.batch_execute(MIGRATION_V5).await.unwrap();
+    let backfilled: i64 = admin.query_one("SELECT count(*) FROM federate_session.identity_bindings WHERE host='https://migration-binding.test'", &[]).await.unwrap().get(0);
+    assert_eq!(backfilled, 1, "only consistent non-null verified history is backfilled");
+    admin.batch_execute("DELETE FROM federate_session.replay WHERE host='https://migration-binding.test'; DELETE FROM federate_session.sessions WHERE host='https://migration-binding.test'; DELETE FROM federate_session.identity_bindings WHERE host='https://migration-binding.test'; DELETE FROM federate_session.profile_state WHERE host='https://migration-binding.test'").await.unwrap();
     admin.batch_execute(ROLE_GRANTS).await.unwrap();
     admin.batch_execute(ROLE_GRANTS_V2).await.unwrap();
     admin.batch_execute(ROLE_GRANTS_V5).await.unwrap();
