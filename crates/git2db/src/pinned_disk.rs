@@ -43,6 +43,15 @@ struct BlobEntry {
     source_size: u64,
 }
 
+/// Test seam for acquire-level regressions: observe the live projection after
+/// exactly `fail_after_streams` payloads have streamed, then fail the
+/// acquisition at that point. Production callers always pass `None`.
+#[cfg_attr(not(test), allow(dead_code))]
+struct StreamHooks {
+    fail_after_streams: usize,
+    observe: Box<dyn FnOnce(&Path, usize) + Send>,
+}
+
 /// Exact-tree files backed by disk, but not by the selected worktree.
 ///
 /// The private parent must be disk-backed and container-private to the loader.
@@ -164,7 +173,7 @@ impl DiskPinnedTreeProjection {
         commit: Oid,
         private_disk_parent: &Path,
     ) -> Git2DBResult<Self> {
-        Self::acquire_with_capacity(repo_path, commit, private_disk_parent, None).await
+        Self::acquire_with_capacity(repo_path, commit, private_disk_parent, None, None).await
     }
 
     /// Staging admission with one global lease retained until the artifact is
@@ -174,6 +183,18 @@ impl DiskPinnedTreeProjection {
         repo_path: &Path,
         commit: Oid,
         private_disk_parent: &Path,
+    ) -> Git2DBResult<Self> {
+        Self::acquire_bounded_hooked(repo_path, commit, private_disk_parent, None).await
+    }
+
+    /// Test seam over `acquire_bounded`: `hooks` may deterministically fail
+    /// the acquisition after a chosen number of streamed payloads.
+    #[cfg(target_os = "linux")]
+    async fn acquire_bounded_hooked(
+        repo_path: &Path,
+        commit: Oid,
+        private_disk_parent: &Path,
+        hooks: Option<StreamHooks>,
     ) -> Git2DBResult<Self> {
         let capacity = Arc::clone(PROJECTION_CAPACITY.get_or_init(|| Arc::new(Semaphore::new(1))))
             .try_acquire_owned()
@@ -195,6 +216,7 @@ impl DiskPinnedTreeProjection {
                 commit,
                 &private_disk_parent,
                 Some(capacity),
+                hooks,
             ))
         })
         .await
@@ -206,6 +228,7 @@ impl DiskPinnedTreeProjection {
         commit: Oid,
         private_disk_parent: &Path,
         capacity: Option<OwnedSemaphorePermit>,
+        mut hooks: Option<StreamHooks>,
     ) -> Git2DBResult<Self> {
         verify_private_disk_parent(private_disk_parent)?;
         scavenge_abandoned_projections(private_disk_parent)?;
@@ -320,6 +343,13 @@ impl DiskPinnedTreeProjection {
             )
             .map_err(|e| internal(format!("project verified input: {e}")))?;
             files.push(reader);
+            if let Some(hook) = hooks.take_if(|hook| hook.fail_after_streams == index + 1) {
+                (hook.observe)(root.path(), index + 1);
+                return Err(internal(format!(
+                    "injected stream failure after {} streamed model payloads",
+                    index + 1
+                )));
+            }
         }
 
         let input_root = root.path().join("inputs");
@@ -340,6 +370,7 @@ impl DiskPinnedTreeProjection {
         _commit: Oid,
         _private_disk_parent: &Path,
         _capacity: Option<OwnedSemaphorePermit>,
+        _hooks: Option<StreamHooks>,
     ) -> Git2DBResult<Self> {
         Err(internal(
             "disk-backed pinned projection requires Linux /proc/self/fd",
@@ -944,6 +975,23 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // The bounded projection capacity is one process-global slot. Serialize
+    // tests that acquire it so parallel libtest scheduling cannot make lease
+    // assertions fail for unrelated test timing.
+    static BOUNDED_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn disk_backed_private_parent() -> Git2DBResult<tempfile::TempDir> {
+        let parent = tempfile::tempdir_in(
+            std::env::current_exe()
+                .map_err(internal)?
+                .parent()
+                .ok_or_else(|| internal("test binary has no parent directory"))?,
+        )
+        .map_err(internal)?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        Ok(parent)
+    }
+
     #[test]
     fn scavenger_preserves_live_projection_then_reclaims_abandoned_bytes() -> Git2DBResult<()> {
         let parent = tempfile::tempdir().map_err(internal)?;
@@ -1234,6 +1282,7 @@ mod tests {
     #[tokio::test]
     async fn bounded_projection_rejects_distinct_ref_burst_and_reclaims_lease() -> Git2DBResult<()>
     {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
         let parent = tempfile::tempdir().map_err(internal)?;
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
         let first_repo = tempfile::tempdir().map_err(internal)?;
@@ -1398,22 +1447,75 @@ mod tests {
 
     #[tokio::test]
     async fn failed_acquire_removes_partially_streamed_private_tree() -> Git2DBResult<()> {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
         let source = tempfile::tempdir().map_err(internal)?;
-        let parent = tempfile::tempdir().map_err(internal)?;
-        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
         let commit = commit_files(
             source.path(),
             &[
-                ("a-config.json", b"verified first file"),
-                ("z-pointer", b"# xet version 1\nunsupported\n"),
+                ("a-config.json", b"verified first file" as &[u8]),
+                ("z-weights.bin", b"never published"),
             ],
         )?;
+        let parent = disk_backed_private_parent()?;
+        // Both files are ordinary blobs, so the full-tree preflight passes and
+        // the acquisition reaches projection creation and streaming before the
+        // hook fails it after the first payload.
+        let error = match DiskPinnedTreeProjection::acquire_bounded_hooked(
+            source.path(),
+            commit,
+            parent.path(),
+            Some(StreamHooks {
+                fail_after_streams: 1,
+                observe: Box::new(|root: &Path, streamed: usize| {
+                    assert!(streamed >= 1, "failure must follow a streamed file");
+                    assert!(
+                        root.join(OWNER_FILE).exists(),
+                        "projection owner must already exist"
+                    );
+                    let projected = root.join("staged-inputs").join("a-config.json");
+                    let bytes = fs::read(&projected).unwrap_or_else(|error| {
+                        panic!("projected input must read through its live descriptor: {error}")
+                    });
+                    assert_eq!(bytes, b"verified first file");
+                    let capacity_occupied = PROJECTION_CAPACITY
+                        .get()
+                        .map(|capacity| Arc::clone(capacity).try_acquire_owned().is_err());
+                    assert_eq!(
+                        capacity_occupied,
+                        Some(true),
+                        "capacity must remain leased while owner and reader live"
+                    );
+                }),
+            }),
+        )
+        .await
+        {
+            Ok(projection) => {
+                return Err(internal(format!(
+                    "injected post-stream failure must fail the acquisition: {projection:?}"
+                )))
+            }
+            Err(error) => error,
+        };
         assert!(
-            DiskPinnedTreeProjection::acquire(source.path(), commit, parent.path())
-                .await
-                .is_err()
+            error
+                .to_string()
+                .contains("injected stream failure after 1 streamed model payloads"),
+            "unexpected acquire failure: {error}"
         );
-        assert_eq!(fs::read_dir(parent.path()).map_err(internal)?.count(), 0);
+        assert_eq!(
+            fs::read_dir(parent.path()).map_err(internal)?.count(),
+            0,
+            "partially streamed projection root must be removed"
+        );
+        // The failed acquisition dropped its last owner and reader before
+        // returning, so the process-global lease is available again.
+        let follow = tempfile::tempdir().map_err(internal)?;
+        let follow_commit = commit_files(follow.path(), &[("weights.bin", b"fresh")])?;
+        let reclaimed =
+            DiskPinnedTreeProjection::acquire_bounded(follow.path(), follow_commit, parent.path())
+                .await?;
+        drop(reclaimed);
         Ok(())
     }
 
