@@ -370,6 +370,7 @@ impl Verifier {
         validate_claims(&claims, code, &commitment, now, access_token)?;
         Ok(Source {
             subject: text(&claims, "sub")?.into(),
+            atproto_did: atproto_account_did(&claims)?,
             jti: text(&claims, "jti")?.into(),
             issued_at: number(&claims, "iat")?,
             expires_at: number(&claims, "exp")?,
@@ -396,6 +397,49 @@ fn hash_claim(claim: &str, input: &str) -> Result<()> {
     require(!input.is_empty() && input.len() <= MAX_JWS && input.is_ascii())?;
     require(equal(&fixed::<16>(claim)?, &sha(input.as_bytes())[..16]))
 }
+
+fn atproto_account_did(v: &Value) -> Result<String> {
+    let claims = v
+        .get("federated_claims")
+        .and_then(Value::as_object)
+        .ok_or(Error::Invalid)?;
+    require(claims.get("connector_id").and_then(Value::as_str) == Some("atproto"))?;
+    let did = claims
+        .get("user_id")
+        .and_then(Value::as_str)
+        .ok_or(Error::Invalid)?;
+    require(did.len() <= 255 && did.is_ascii())?;
+    // The configured Dex connector supports ATProto's did:plc and did:web
+    // identifiers. The pinned connector resolves the account during login.
+    let method_specific = did.strip_prefix("did:").ok_or(Error::Invalid)?;
+    let (method, specific) = method_specific.split_once(':').ok_or(Error::Invalid)?;
+    match method {
+        "plc" => {
+            require(specific.len() == 24
+                && specific
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)))?;
+        }
+        "web" => {
+            require(!specific.is_empty()
+                && specific.split(':').all(|part| !part.is_empty())
+                && specific.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'%' || b == b':'
+                }))?;
+            let bytes = specific.as_bytes();
+            for (i, byte) in bytes.iter().enumerate() {
+                if *byte == b'%' {
+                    require(i + 2 < bytes.len()
+                        && bytes[i + 1].is_ascii_hexdigit()
+                        && bytes[i + 2].is_ascii_hexdigit())?;
+                }
+            }
+        }
+        _ => return Err(Error::Invalid),
+    }
+    Ok(did.to_owned())
+}
+
 fn validate_claims(
     v: &Value,
     code: &str,
@@ -412,6 +456,7 @@ fn validate_claims(
         require(azp.as_str() == Some(CLIENT))?;
     }
     text(v, "sub")?;
+    atproto_account_did(v)?;
     text(v, "jti")?;
     let iat = number(v, "iat")?;
     let exp = number(v, "exp")?;
@@ -435,6 +480,7 @@ fn validate_claims(
 /// Private fields, no Deserialize/Clone/Debug: not forgeable from a browser flag.
 pub(crate) struct Source {
     subject: String,
+    atproto_did: String,
     jti: String,
     issued_at: u64,
     expires_at: u64,
@@ -455,6 +501,7 @@ impl Source {
         hyprstream_session_store::Source {
             issuer: ISSUER.into(),
             subject: self.subject.clone(),
+            atproto_did: self.atproto_did.clone(),
             jti: self.jti.clone(),
             nonce: self.commitment.nonce(),
             token_hash: self.token_hash,

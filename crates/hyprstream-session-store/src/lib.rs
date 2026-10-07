@@ -16,6 +16,9 @@ pub const ROLE_GRANTS: &str = include_str!("../sql/roles.sql");
 pub const MIGRATION_V2: &str = include_str!("../sql/002_epoch_inventory.sql");
 pub const ROLE_GRANTS_V2: &str = include_str!("../sql/002_roles.sql");
 pub const MIGRATION_V3: &str = include_str!("../sql/003_primary_lookup_index.sql");
+pub const MIGRATION_V4: &str = include_str!("../sql/004_atproto_source_did.sql");
+pub const MIGRATION_V5: &str = include_str!("../sql/005_identity_binding.sql");
+pub const ROLE_GRANTS_V5: &str = include_str!("../sql/005_roles.sql");
 
 /// Sanitized failures: PostgreSQL detail strings can include bound values.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -47,6 +50,7 @@ impl From<tokio_postgres::Error> for Error {
 pub struct Source {
     pub issuer: String,
     pub subject: String,
+    pub atproto_did: String,
     pub jti: String,
     pub nonce: String,
     pub token_hash: [u8; 32],
@@ -113,6 +117,10 @@ impl PrimaryRecord {
         (&self.source.issuer, &self.source.subject)
     }
 
+    pub fn source_atproto_did(&self) -> &str {
+        &self.source.atproto_did
+    }
+
     pub fn created_at(&self) -> i64 {
         self.created_at
     }
@@ -173,6 +181,7 @@ impl Admission {
                 &s.client_id,
                 &s.grant_revision,
                 &src.subject,
+                &src.atproto_did,
                 &src.jti,
                 &src.nonce,
             ]
@@ -187,6 +196,7 @@ impl Admission {
             || s.scopes.windows(2).any(|w| w[0] >= w[1])
             || src.issued_at < 0
             || src.expires_at <= src.issued_at
+            || s.subject != src.atproto_did
             || src
                 .expires_at
                 .checked_sub(src.issued_at)
@@ -243,7 +253,7 @@ impl Store {
             .query_one("SELECT version FROM federate_session.schema_version", &[])
             .await?
             .try_get(0)?;
-        if version != 3 {
+        if version != 5 {
             return Err(Error::Unavailable);
         }
         let s = &admission.session;
@@ -270,15 +280,26 @@ impl Store {
             .await?
             .try_get(0)?;
         let retain_until = admission.validate(now)?;
+        let src = &admission.source;
+        tx.execute(
+            "INSERT INTO federate_session.identity_bindings (host,profile,issuer,source_subject,atproto_did,account_id,first_seen_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+            &[&s.host,&PROFILE,&src.issuer,&src.subject,&src.atproto_did,&s.account_id,&now],
+        ).await?;
+        let binding_matches = tx.query_opt(
+            "SELECT 1 FROM federate_session.identity_bindings WHERE host=$1 AND profile=$2 AND issuer=$3 AND source_subject=$4 AND atproto_did=$5 AND account_id=$6",
+            &[&s.host,&PROFILE,&src.issuer,&src.subject,&src.atproto_did,&s.account_id],
+        ).await?.is_some();
+        if !binding_matches {
+            return Err(Error::Conflict);
+        }
         let proof_epoch: i64 = tx.query_one(
             "INSERT INTO federate_session.sessions (host,profile,sid,account_id,subject,tenant,client_id,resource,scopes,grant_revision,suite,ed_public,pq_public,generation,collision_inventory_id,created_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING proof_epoch",
             &[&s.host,&PROFILE,&s.sid,&s.account_id,&s.subject,&s.tenant,&s.client_id,&s.resource,&s.scopes,&s.grant_revision,&SUITE,&&s.ed_public[..],&s.pq_public,&generation,&inventory,&now,&s.expires_at],
         ).await?.try_get(0)?;
         let admitted = s.admitted(proof_epoch)?;
-        let src = &admission.source;
         tx.execute(
-            "INSERT INTO federate_session.replay (issuer,client_id,jti,nonce,token_hash,source_iat,source_exp,retain_until,host,sid,source_subject) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-            &[&src.issuer,&s.client_id,&src.jti,&src.nonce,&&src.token_hash[..],&src.issued_at,&src.expires_at,&retain_until,&s.host,&s.sid,&src.subject],
+            "INSERT INTO federate_session.replay (issuer,client_id,jti,nonce,token_hash,source_iat,source_exp,retain_until,host,sid,source_subject,source_atproto_did) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            &[&src.issuer,&s.client_id,&src.jti,&src.nonce,&&src.token_hash[..],&src.issued_at,&src.expires_at,&retain_until,&s.host,&s.sid,&src.subject,&src.atproto_did],
         ).await?;
         tx.commit().await?;
         Ok(admitted)
@@ -309,7 +330,7 @@ impl Store {
         local_collision_inventory_id: &[u8; 32],
     ) -> Result<Option<Session>, Error> {
         let row = client.query_opt(
-            "SELECT s.* FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint",
+            "SELECT s.* FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.identity_bindings b ON (b.host=s.host AND b.profile=s.profile AND b.atproto_did=s.subject AND b.account_id=s.account_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint",
             &[&host,&sid,&PROFILE,&SUITE,&&generation[..],&&local_collision_inventory_id[..]],
         ).await?;
         row.as_ref().map(read_session).transpose()
@@ -339,11 +360,11 @@ impl Store {
             .query_one("SELECT version FROM federate_session.schema_version", &[])
             .await?
             .try_get(0)?;
-        if version != 3 {
+        if version != 5 {
             return Err(Error::Unavailable);
         }
         let rows = tx.query(
-            "SELECT s.*, r.issuer AS source_issuer, r.source_subject, r.jti AS source_jti, r.nonce AS source_nonce, r.token_hash AS source_token_hash, r.source_iat, r.source_exp FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.replay r ON (r.host=s.host AND r.sid=s.sid AND r.client_id=s.client_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint LIMIT 2",
+            "SELECT s.*, r.issuer AS source_issuer, r.source_subject, r.source_atproto_did, r.jti AS source_jti, r.nonce AS source_nonce, r.token_hash AS source_token_hash, r.source_iat, r.source_exp FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.replay r ON (r.host=s.host AND r.sid=s.sid AND r.client_id=s.client_id) JOIN federate_session.identity_bindings b ON (b.host=s.host AND b.profile=s.profile AND b.issuer=r.issuer AND b.source_subject=r.source_subject AND b.atproto_did=r.source_atproto_did AND b.account_id=s.account_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint AND r.source_atproto_did IS NOT NULL LIMIT 2",
             &[&host, &sid, &PROFILE, &SUITE, &&generation[..], &&local_collision_inventory_id[..]],
         ).await?;
         let result = match rows.len() {
@@ -354,6 +375,7 @@ impl Store {
                 let source = Source {
                     issuer: row.try_get("source_issuer")?,
                     subject: row.try_get("source_subject")?,
+                    atproto_did: row.try_get("source_atproto_did")?,
                     jti: row.try_get("source_jti")?,
                     nonce: row.try_get("source_nonce")?,
                     token_hash: row
@@ -405,7 +427,7 @@ impl Store {
             .query_one("SELECT version FROM federate_session.schema_version", &[])
             .await?
             .try_get(0)?;
-        if version != 3 {
+        if version != 5 {
             return Err(Error::Unavailable);
         }
         let profile = tx.query_opt(

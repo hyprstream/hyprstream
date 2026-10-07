@@ -8,8 +8,8 @@ use hyprstream_session_store::primary::{
 };
 use hyprstream_session_store::Session;
 use hyprstream_session_store::{
-    Admission, Error, MIGRATION, MIGRATION_V2, MIGRATION_V3, PROFILE, PendingSession, ROLE_GRANTS,
-    ROLE_GRANTS_V2, Source, Store,
+    Admission, Error, MIGRATION, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4, MIGRATION_V5, PROFILE,
+    PendingSession, ROLE_GRANTS, ROLE_GRANTS_V2, ROLE_GRANTS_V5, Source, Store,
 };
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -64,7 +64,7 @@ fn input(now: i64, id: u8) -> Admission {
             host: HOST.into(),
             sid: format!("session-{id}"),
             account_id: "fixture-account".into(),
-            subject: "fixture-subject".into(),
+            subject: "did:plc:abcdefghijklmnopqrstuvwx".into(),
             tenant: "fixture-tenant".into(),
             client_id: "fixture-client".into(),
             resource: HOST.into(),
@@ -81,6 +81,7 @@ fn input(now: i64, id: u8) -> Admission {
         source: Source {
             issuer: "https://issuer.test".into(),
             subject: "opaque-upstream-fixture".into(),
+            atproto_did: "did:plc:abcdefghijklmnopqrstuvwx".into(),
             jti: format!("jti-{id}"),
             nonce: format!("nonce-{id}"),
             token_hash: [id; 32],
@@ -390,7 +391,22 @@ async fn scenarios(socket: &str, database: &str) {
             Err(Error::Conflict)
         ));
     }
+    let mut reassigned_source = input(n, 5);
+    reassigned_source.source.atproto_did = "did:plc:bcdefghijklmnopqrstuvwxy2".into();
+    reassigned_source.session.subject = reassigned_source.source.atproto_did.clone();
+    assert!(matches!(
+        Store::admit(&mut runtime, &reassigned_source).await,
+        Err(Error::Conflict)
+    ), "an issuer/subject binding cannot be reassigned to another DID");
+    let mut reassigned_account = input(n, 6);
+    reassigned_account.source.subject = "another-upstream-subject".into();
+    reassigned_account.session.account_id = "another-account".into();
+    assert!(matches!(
+        Store::admit(&mut runtime, &reassigned_account).await,
+        Err(Error::Conflict)
+    ), "one DID cannot be admitted to a second local account UUID");
     assert_eq!(count(&admin, "sessions").await, 1);
+    assert_eq!(count(&admin, "identity_bindings").await, 1);
     Store::revoke(&runtime, HOST, &committed.sid, &committed.generation)
         .await
         .unwrap();
@@ -417,6 +433,7 @@ async fn scenarios(socket: &str, database: &str) {
     Store::cleanup(&mut cleanup).await.unwrap();
     assert_eq!(count(&admin, "replay").await, 0);
     assert_eq!(count(&admin, "sessions").await, 0);
+    assert_eq!(count(&admin, "identity_bindings").await, 1);
 
     // Invalid/expired inputs cannot consume replay state.
     let mut bad = input(n, 6);
@@ -642,8 +659,11 @@ async fn postgres_admission_causal() {
         .unwrap();
     admin.batch_execute(MIGRATION_V2).await.unwrap();
     admin.batch_execute(MIGRATION_V3).await.unwrap();
+    admin.batch_execute(MIGRATION_V4).await.unwrap();
+    admin.batch_execute(MIGRATION_V5).await.unwrap();
     admin.batch_execute(ROLE_GRANTS).await.unwrap();
     admin.batch_execute(ROLE_GRANTS_V2).await.unwrap();
+    admin.batch_execute(ROLE_GRANTS_V5).await.unwrap();
     admin.batch_execute("RESET ROLE").await.unwrap();
     let socket_copy = socket.clone();
     let db_copy = db.clone();

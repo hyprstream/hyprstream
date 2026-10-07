@@ -1225,6 +1225,8 @@ fn federate_verified_source(
             && data.issuer.len() <= 2048
             && !data.subject.is_empty()
             && data.subject.len() <= 256
+            && !data.atproto_did.is_empty()
+            && data.atproto_did.len() <= 255
             && !data.jti.is_empty()
             && data.jti.len() <= 256
             && !data.nonce.is_empty()
@@ -1234,6 +1236,7 @@ fn federate_verified_source(
     Ok(hyprstream_session_store::Source {
         issuer: data.issuer.clone(),
         subject: data.subject.clone(),
+        atproto_did: data.atproto_did.clone(),
         jti: data.jti.clone(),
         nonce: data.nonce.clone(),
         token_hash: data.token_hash.as_slice().try_into()?,
@@ -4549,6 +4552,7 @@ mod tests {
         let source = hyprstream_rpc_std::policy_client::FederateVerifiedSource {
             issuer: "https://issuer.test".into(),
             subject: "source-user".into(),
+            atproto_did: "did:plc:abcdefghijklmnopqrstuvwx".into(),
             jti: "jti".into(),
             nonce: "nonce".into(),
             token_hash: vec![1; 32],
