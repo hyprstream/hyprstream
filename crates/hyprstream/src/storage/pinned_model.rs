@@ -46,6 +46,17 @@ impl StagingPinnedArtifactCache {
         commit: git2::Oid,
         private_disk_parent: &Path,
     ) -> Result<Arc<PinnedModelArtifact>> {
+        self.acquire_in_with_observer(worktree_path, commit, private_disk_parent, || Ok(()))
+            .await
+    }
+
+    async fn acquire_in_with_observer(
+        &self,
+        worktree_path: &Path,
+        commit: git2::Oid,
+        private_disk_parent: &Path,
+        after_capture: impl FnOnce() -> Result<()>,
+    ) -> Result<Arc<PinnedModelArtifact>> {
         // A cache hit may share only the exact commit from the exact local
         // checkout, and the checkout must still satisfy the current load's
         // clean/HEAD admission rule.
@@ -67,6 +78,11 @@ impl StagingPinnedArtifactCache {
         )
         .await
         .with_context(|| format!("capture model commit {commit}"))?;
+        after_capture()?;
+        // Capturing a large model can take long enough for a checkout update
+        // to race the admission. Do not publish an artifact unless the exact
+        // selected checkout is still clean and at the requested commit.
+        verify_selected_checkout(worktree_path, commit)?;
         let artifact = Arc::new(PinnedModelArtifact::StagingDisk(projection));
         entries.insert(key, Arc::downgrade(&artifact));
         Ok(artifact)
@@ -229,6 +245,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // The bounded projection capacity is intentionally one process-global
+    // slot. Serialize tests that acquire it so parallel libtest scheduling
+    // cannot make the sharing assertion fail for unrelated test timing.
+    static BOUNDED_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn generic_commit_uses_sealed_projection_without_private_disk_parent() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -297,6 +319,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_cache_rejects_checkout_mutation_during_capture() -> Result<()> {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir()?;
+        let parent = tempfile::tempdir()?;
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))?;
+        let repo = git2db::Repository::init(dir.path())?;
+        std::fs::write(dir.path().join("config.json"), b"reviewed")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("config.json"))?;
+        index.write()?;
+        let tree = repo.find_tree(index.write_tree()?)?;
+        let sig = git2::Signature::now("test", "test@example.invalid")?;
+        let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
+        drop(tree);
+        drop(repo);
+
+        let cache = StagingPinnedArtifactCache::default();
+        assert!(cache
+            .acquire_in_with_observer(dir.path(), commit, parent.path(), || {
+                std::fs::write(dir.path().join("config.json"), b"changed")?;
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(cache.entries.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn loader_inputs_remain_exact_after_checkout_replacement() -> Result<()> {
         use crate::runtime::model_config::ModelConfig;
         use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
@@ -344,6 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_staging_loads_share_one_projection_for_the_same_commit() -> Result<()> {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
         let repo_dir = tempfile::tempdir()?;
         let private_parent = tempfile::tempdir_in(
             std::env::current_exe()?
