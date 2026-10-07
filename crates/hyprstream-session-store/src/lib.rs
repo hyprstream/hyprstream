@@ -321,7 +321,9 @@ impl Store {
     }
 
     /// Authoritative full-record lookup for the future request-local proof resolver.
-    /// Caller must still compare all credential fields and verify the RPC proof.
+    /// The session must have its own matching, verified source-DID replay record
+    /// and immutable identity binding. Caller must still compare all credential
+    /// fields and verify the RPC proof.
     pub async fn lookup(
         client: &(impl tokio_postgres::GenericClient + Sync),
         host: &str,
@@ -330,7 +332,7 @@ impl Store {
         local_collision_inventory_id: &[u8; 32],
     ) -> Result<Option<Session>, Error> {
         let row = client.query_opt(
-            "SELECT s.* FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.identity_bindings b ON (b.host=s.host AND b.profile=s.profile AND b.atproto_did=s.subject AND b.account_id=s.account_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint",
+            "SELECT s.* FROM federate_session.sessions s JOIN federate_session.profile_state p ON (s.host=p.host AND s.profile=p.profile) JOIN federate_session.replay r ON (r.host=s.host AND r.sid=s.sid AND r.client_id=s.client_id) JOIN federate_session.identity_bindings b ON (b.host=s.host AND b.profile=s.profile AND b.issuer=r.issuer AND b.source_subject=r.source_subject AND b.atproto_did=r.source_atproto_did AND b.account_id=s.account_id) WHERE s.host=$1 AND s.sid=$2 AND s.profile=$3 AND s.suite=$4 AND s.status='active' AND p.enabled AND s.generation=p.authority_generation AND s.generation=$5 AND s.collision_inventory_id=p.collision_inventory_id AND s.collision_inventory_id=$6 AND s.proof_epoch>0 AND s.expires_at>floor(extract(epoch FROM clock_timestamp()))::bigint AND r.source_atproto_did IS NOT NULL AND s.subject=r.source_atproto_did",
             &[&host,&sid,&PROFILE,&SUITE,&&generation[..],&&local_collision_inventory_id[..]],
         ).await?;
         row.as_ref().map(read_session).transpose()

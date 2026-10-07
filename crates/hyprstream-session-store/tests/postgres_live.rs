@@ -711,7 +711,7 @@ async fn postgres_admission_causal() {
         VALUES
           ('https://migration-binding.test','federate-session-v1','verified-ok','account-1','did:plc:abcdefghijklmnopqrstuvwx','tenant-1','client-1','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('01',32),'hex'),decode(repeat('02',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),100,200),
           ('https://migration-binding.test','federate-session-v1','verified-bad','account-1','legacy-user','tenant-1','client-1','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('04',32),'hex'),decode(repeat('05',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),100,200),
-          ('https://migration-binding.test','federate-session-v1','legacy-null','account-2','legacy-user','tenant-2','client-2','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('06',32),'hex'),decode(repeat('07',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),100,200);
+          ('https://migration-binding.test','federate-session-v1','legacy-null','account-1','did:plc:abcdefghijklmnopqrstuvwx','tenant-2','client-2','https://host.test',ARRAY['model:query'],'revision-1','hs-cose-sign-ed25519-mldsa65-wns-v1',decode(repeat('06',32),'hex'),decode(repeat('07',1952),'hex'),decode(repeat('03',32),'hex'),decode(repeat('11',32),'hex'),floor(extract(epoch FROM clock_timestamp()))::bigint,floor(extract(epoch FROM clock_timestamp()))::bigint+300);
         INSERT INTO federate_session.replay(issuer,client_id,source_subject,jti,nonce,token_hash,source_iat,source_exp,retain_until,host,sid,source_atproto_did)
         VALUES
           ('https://issuer.test','client-1','opaque-sub','jti-ok','nonce-ok',decode(repeat('08',32),'hex'),100,200,530,'https://migration-binding.test','verified-ok','did:plc:abcdefghijklmnopqrstuvwx'),
@@ -745,6 +745,20 @@ async fn postgres_admission_causal() {
     admin.batch_execute(MIGRATION_V5).await.unwrap();
     let backfilled: i64 = admin.query_one("SELECT count(*) FROM federate_session.identity_bindings WHERE host='https://migration-binding.test'", &[]).await.unwrap().get(0);
     assert_eq!(backfilled, 1, "only consistent non-null verified history is backfilled");
+    admin.batch_execute("UPDATE federate_session.profile_state SET enabled=true WHERE host='https://migration-binding.test'").await.unwrap();
+    assert!(
+        Store::lookup(
+            &admin,
+            "https://migration-binding.test",
+            "legacy-null",
+            &[3; 32],
+            &[0x11; 32]
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a legacy session whose subject resembles a bound DID remains unreadable when its own replay DID is NULL"
+    );
     admin.batch_execute("DELETE FROM federate_session.replay WHERE host='https://migration-binding.test'; DELETE FROM federate_session.sessions WHERE host='https://migration-binding.test'; DELETE FROM federate_session.identity_bindings WHERE host='https://migration-binding.test'; DELETE FROM federate_session.profile_state WHERE host='https://migration-binding.test'").await.unwrap();
     admin.batch_execute(ROLE_GRANTS).await.unwrap();
     admin.batch_execute(ROLE_GRANTS_V2).await.unwrap();
