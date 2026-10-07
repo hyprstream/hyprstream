@@ -1327,8 +1327,11 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_projection_rejects_file_count_before_temp_copy() -> Git2DBResult<()> {
-        let parent = tempfile::tempdir().map_err(internal)?;
-        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
+        // Even a tree the file limit rejects briefly owns the process-global
+        // bounded lease, so this test must join the same serialization as
+        // every other bounded acquisition.
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
+        let parent = disk_backed_private_parent()?;
         let source = tempfile::tempdir().map_err(internal)?;
         let files = (0..=MAX_FILES)
             .map(|index| (format!("model-{index}.bin"), b"small".as_slice()))
@@ -1338,10 +1341,22 @@ mod tests {
             .map(|(name, bytes)| (name.as_str(), *bytes))
             .collect::<Vec<_>>();
         let commit = commit_files(source.path(), &borrowed)?;
-        assert!(
-            DiskPinnedTreeProjection::acquire_bounded(source.path(), commit, parent.path())
+        let error =
+            match DiskPinnedTreeProjection::acquire_bounded(source.path(), commit, parent.path())
                 .await
-                .is_err()
+            {
+                Ok(projection) => {
+                    return Err(internal(format!(
+                        "oversized model tree must fail bounded admission: {projection:?}"
+                    )))
+                }
+                Err(error) => error,
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("model tree exceeds 512 file limit"),
+            "unexpected bounded admission failure: {error}"
         );
         assert_eq!(
             fs::read_dir(parent.path()).map_err(internal)?.count(),
