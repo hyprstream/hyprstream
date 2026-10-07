@@ -42,6 +42,9 @@ mod primary;
 #[cfg(feature = "postgres")]
 #[path = "policy_session_db.rs"]
 mod session_db;
+#[cfg(feature = "postgres")]
+#[path = "policy_inventory.rs"]
+mod inventory;
 
 /// Evaluate a policy check on behalf of an already-verified upstream caller.
 ///
