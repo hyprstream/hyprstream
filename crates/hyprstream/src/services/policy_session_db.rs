@@ -21,6 +21,8 @@ const POLICY_SESSION_ROLE_SQL: &str =
      has_table_privilege(current_user, 'federate_session.sessions', 'INSERT') AND \
      has_table_privilege(current_user, 'federate_session.replay', 'SELECT') AND \
      has_table_privilege(current_user, 'federate_session.replay', 'INSERT') AND \
+     has_table_privilege(current_user, 'federate_session.identity_bindings', 'SELECT') AND \
+     has_table_privilege(current_user, 'federate_session.identity_bindings', 'INSERT') AND \
      has_table_privilege(current_user, 'federate_session.request_replay', 'INSERT') AND \
      has_column_privilege(current_user, 'federate_session.profile_state', 'lock_version', 'UPDATE') AND \
      has_column_privilege(current_user, 'federate_session.sessions', 'status', 'UPDATE') AND \
@@ -29,6 +31,8 @@ const POLICY_SESSION_ROLE_SQL: &str =
      NOT has_table_privilege(current_user, 'federate_session.sessions', 'DELETE,TRUNCATE') AND \
      NOT has_any_column_privilege(current_user, 'federate_session.replay', 'UPDATE') AND \
      NOT has_table_privilege(current_user, 'federate_session.replay', 'DELETE,TRUNCATE') AND \
+     NOT has_any_column_privilege(current_user, 'federate_session.identity_bindings', 'UPDATE') AND \
+     NOT has_table_privilege(current_user, 'federate_session.identity_bindings', 'DELETE,TRUNCATE') AND \
      NOT has_any_column_privilege(current_user, 'federate_session.request_replay', 'SELECT,UPDATE') AND \
      NOT has_table_privilege(current_user, 'federate_session.request_replay', 'DELETE,TRUNCATE') AND \
      NOT EXISTS (SELECT 1 FROM information_schema.columns c \
@@ -70,7 +74,7 @@ impl PolicySessionPool {
             .await
             .context("read Federate session schema version")?
             .get(0);
-        ensure!(version == 3, "Federate session schema version mismatch");
+        ensure!(version == 5, "Federate session schema version mismatch");
         let role: bool = client
             .query_one(POLICY_SESSION_ROLE_SQL, &[])
             .await
@@ -153,6 +157,18 @@ mod tests {
             .await
             .unwrap();
         client
+            .batch_execute(hyprstream_session_store::MIGRATION_V4)
+            .await
+            .unwrap();
+        client
+            .batch_execute(hyprstream_session_store::MIGRATION_V5)
+            .await
+            .unwrap();
+        client
+            .batch_execute(hyprstream_session_store::ROLE_GRANTS_V5)
+            .await
+            .unwrap();
+        client
             .batch_execute("SET ROLE hs_policy_runtime")
             .await
             .unwrap();
@@ -166,6 +182,28 @@ mod tests {
             .batch_execute("CREATE TABLE federate_session.forbidden(id integer)")
             .await
             .is_err());
+        client.batch_execute("RESET ROLE").await.unwrap();
+        client
+            .batch_execute(
+                "GRANT UPDATE(atproto_did) ON federate_session.identity_bindings TO hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
+        let allowed: bool = client
+            .query_one(POLICY_SESSION_ROLE_SQL, &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!allowed, "identity bindings must be immutable to runtime");
+        client
+            .batch_execute(
+                "RESET ROLE; \
+                 REVOKE UPDATE(atproto_did) ON federate_session.identity_bindings FROM hs_policy_runtime; \
+                 SET ROLE hs_policy_runtime",
+            )
+            .await
+            .unwrap();
         client
             .batch_execute(
                 "INSERT INTO federate_session.request_replay \

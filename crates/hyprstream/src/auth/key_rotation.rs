@@ -142,6 +142,19 @@ fn composite_ledger_path(secrets_dir: &Path) -> PathBuf {
 fn composite_committed_path(dir: &Path) -> PathBuf {
     dir.join("jwt-composite-pairs.committed")
 }
+
+/// An existing composite commit marker means this store already has signing
+/// authority. Missing/unreadable rotation slots must not be mistaken for a
+/// first boot: generating replacement Ed/PQ keys would mutate the component
+/// state while the committed ledger still names the previous pair. Treat any
+/// marker entry (including a malformed or unreadable one) as committed so the
+/// normal restore path fails closed without creating keys.
+fn has_committed_composite_marker(dir: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(composite_committed_path(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
 fn composite_committed_ledger_path(dir: &Path, commit: &CompositeCommit) -> PathBuf {
     dir.join(format!(
         "jwt-composite-pairs.committed-{}-{}.json",
@@ -1327,28 +1340,37 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     // Slots are state: read/write them via the writable state dir (#803),
     // falling back to the (possibly read-only, provisioned) secrets dir.
     let state_dir = rotation_state_dir(secrets_dir);
+    let has_committed_authority = has_committed_composite_marker(secrets_dir);
     let drain = load_slot(&state_dir, "drain").or_else(|| load_slot(secrets_dir, "drain"));
     let mut active = load_slot(&state_dir, "active").or_else(|| load_slot(secrets_dir, "active"));
     let lead = load_slot(&state_dir, "lead").or_else(|| load_slot(secrets_dir, "lead"));
 
     if active.is_none() {
-        info!("No active JWT signing key found — generating on first boot");
-        let slot = generate_slot(now, now + active_secs);
-        if let Err(e) = persist_slot(&state_dir, "active", &slot) {
+        if has_committed_authority {
             error!(
-                "Could not persist active JWT key to '{}': {e}. The key is \
-                 process-ephemeral — every restart invalidates all issued tokens.",
-                state_dir.display()
+                "Committed composite authority exists but no active JWT signing slot is \
+                 available; refusing implicit key generation"
             );
         } else {
-            info!("Active JWT key generated (kid={})", slot.kid());
+            info!("No active JWT signing key found — generating on first boot");
+            let slot = generate_slot(now, now + active_secs);
+            if let Err(e) = persist_slot(&state_dir, "active", &slot) {
+                error!(
+                    "Could not persist active JWT key to '{}': {e}. The key is \
+                     process-ephemeral — every restart invalidates all issued tokens.",
+                    state_dir.display()
+                );
+            } else {
+                info!("Active JWT key generated (kid={})", slot.kid());
+            }
+            active = Some(slot);
         }
-        active = Some(slot);
     }
 
     // If we have active but no lead and active is close to expiry, generate lead now.
-    let should_gen_lead =
-        lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
+    let should_gen_lead = !has_committed_authority
+        && lead.is_none()
+        && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
     if should_gen_lead {
         let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
         let lead_exp = lead_nbf + active_secs;
@@ -2221,6 +2243,7 @@ mod ml_dsa_rotation {
         let lead_secs = config.lead_secs();
 
         let state_dir = rotation_state_dir(secrets_dir);
+        let has_committed_authority = has_committed_composite_marker(secrets_dir);
         let drain = load_ml_dsa_slot(&state_dir, "drain")
             .or_else(|| load_ml_dsa_slot(secrets_dir, "drain"));
         let mut active = load_ml_dsa_slot(&state_dir, "active")
@@ -2229,22 +2252,30 @@ mod ml_dsa_rotation {
             load_ml_dsa_slot(&state_dir, "lead").or_else(|| load_ml_dsa_slot(secrets_dir, "lead"));
 
         if active.is_none() {
-            info!("No active ML-DSA-65 signing key found — generating on first boot");
-            let slot = generate_ml_dsa_slot(now, now + active_secs);
-            if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &slot) {
+            if has_committed_authority {
                 error!(
-                    "Could not persist active ML-DSA key to '{}': {e}. The key is \
-                     process-ephemeral — every restart invalidates all issued tokens.",
-                    state_dir.display()
+                    "Committed composite authority exists but no active ML-DSA signing slot is \
+                     available; refusing implicit key generation"
                 );
             } else {
-                info!("Active ML-DSA-65 key generated");
+                info!("No active ML-DSA-65 signing key found — generating on first boot");
+                let slot = generate_ml_dsa_slot(now, now + active_secs);
+                if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &slot) {
+                    error!(
+                        "Could not persist active ML-DSA key to '{}': {e}. The key is \
+                         process-ephemeral — every restart invalidates all issued tokens.",
+                        state_dir.display()
+                    );
+                } else {
+                    info!("Active ML-DSA-65 key generated");
+                }
+                active = Some(slot);
             }
-            active = Some(slot);
         }
 
-        let should_gen_lead =
-            lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
+        let should_gen_lead = !has_committed_authority
+            && lead.is_none()
+            && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
         if should_gen_lead {
             let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
             let lead_exp = lead_nbf + active_secs;
@@ -3904,6 +3935,82 @@ mod tests {
             vk.is_some(),
             "active key should be present after first boot"
         );
+    }
+
+    #[test]
+    fn committed_marker_with_missing_slots_does_not_bootstrap_replacement_keys() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let marker = composite_committed_path(dir.path());
+        // The guard is intentionally based on marker presence, not successful
+        // parsing: malformed committed metadata is not permission to mint a
+        // different authority.
+        std::fs::write(&marker, b"committed but unreadable").unwrap();
+
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(ed.active_verifying_key_bytes()).is_none());
+        assert!(rt.block_on(pq.active_key()).is_none());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"committed but unreadable");
+        for name in [
+            "jwt-signing-key.active",
+            "jwt-signing-key.active.meta",
+            "jwt-signing-key.lead",
+            "jwt-signing-key.lead.meta",
+            "ml-dsa-signing-key.active",
+            "ml-dsa-signing-key.active.meta",
+            "ml-dsa-signing-key.lead",
+            "ml-dsa-signing-key.lead.meta",
+        ] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "committed store unexpectedly created {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_marker_does_not_generate_missing_lead_slots() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+        let marker = composite_committed_path(dir.path());
+        std::fs::write(&marker, b"committed").unwrap();
+        persist_slot(
+            dir.path(),
+            "active",
+            &KeySlot::new(
+                SigningKey::from_bytes(&[0x71; 32]),
+                now - 60,
+                now + 1,
+            ),
+        )
+        .unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(
+            dir.path(),
+            "active",
+            &ml_dsa_rotation::generate_ml_dsa_slot(now - 60, now + 1),
+        )
+        .unwrap();
+
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        assert!(ed.0.read().await.active.is_some());
+        assert!(ed.0.read().await.lead.is_none());
+        assert!(pq.0.read().await.active.is_some());
+        assert!(pq.0.read().await.lead.is_none());
+        for name in [
+            "jwt-signing-key.lead",
+            "jwt-signing-key.lead.meta",
+            "ml-dsa-signing-key.lead",
+            "ml-dsa-signing-key.lead.meta",
+        ] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "committed store unexpectedly created {name}"
+            );
+        }
     }
 
     #[test]

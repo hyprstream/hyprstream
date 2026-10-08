@@ -250,19 +250,19 @@ jobs:
             sccache --show-stats
           '
 
-    # #1425 r3: actually EXECUTES crates/hyprstream-rpc/tests/wasm_browser_fetch.rs
-    # in a real headless browser, as an isolated named wasm test artifact — not
+    # Actually EXECUTES browser-fetch and browser-session proof tests in a
+    # real headless browser, as isolated named wasm test artifacts — not
     # just a compile check. Deliberately does not use `wasm-pack test`: it
     # unconditionally passes `--tests` to cargo, which additionally compiles
     # every other (native-only) test target in the crate and fails before a
-    # browser is ever launched. browser-wasm-test.sh builds only the named
+    # browser is ever launched. browser-wasm-test.sh builds each named
     # integration test via `cargo test --test <name>` (never `--tests`) and
     # runs it through a wasm-bindgen version-matched wasm-bindgen-test-runner.
     # browser-wasm-test-ci.sh installs a headless-capable Chromium + matching
     # chromedriver from the container's own package repo (arch-correct for
     # this arm64/Graviton runner, unlike Google's x64-only Chrome-for-Testing
     # distribution) before delegating to it.
-    - name: Run browser-fetch conformance test (headless Chromium, rust-builder container)
+    - name: Run browser fetch/session proof tests (headless Chromium, rust-builder container)
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \

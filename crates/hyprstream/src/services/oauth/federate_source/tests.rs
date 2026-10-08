@@ -51,7 +51,7 @@ fn commitment() -> Commitment {
     .unwrap()
 }
 fn claims() -> Value {
-    json!({"iss":ISSUER,"aud":CLIENT,"sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":commitment().nonce(),"c_hash":B64.encode(&sha(CODE.as_bytes())[..16])})
+    json!({"iss":ISSUER,"aud":CLIENT,"sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":commitment().nonce(),"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"}})
 }
 fn token(v: &Value) -> String {
     let mut h = Header::new(Algorithm::RS256);
@@ -105,6 +105,7 @@ async fn valid_source_and_both_signatures_only() {
         .verify(source(&v, &t).await, &[9; 32], &ed, &pq, NOW + 1)
         .unwrap();
     assert_eq!(evidence.source.subject, "opaque-sub");
+    assert_eq!(evidence.source.atproto_did, "did:plc:abcdefghijklmnopqrstuvwx");
     assert_eq!(evidence.source.jti, "source-id");
     assert_eq!(evidence.binding.tenant, "test-tenant");
     for bad in 0..6 {
@@ -145,6 +146,7 @@ async fn claims_fail_closed() {
         ("aud", json!([CLIENT, CLIENT])),
         ("azp", json!("other")),
         ("sub", json!("")),
+        ("federated_claims", Value::Null),
         ("jti", Value::Null),
         ("iat", json!(NOW + 31)),
         ("iat", json!(NOW - 121)),
@@ -188,6 +190,27 @@ async fn claims_fail_closed() {
     let mut c = commitment();
     c.pq = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[5; 32]));
     assert!(v.source(&t, CODE, c, NOW, None).await.is_err());
+}
+
+#[tokio::test]
+async fn federated_identity_claim_requires_exact_atproto_connector_and_did() {
+    let v = verifier();
+    for claim in [
+        json!({"connector_id":"github","user_id":"did:plc:abcdefghijklmnopqrstuvwx"}),
+        json!({"connector_id":"atproto","user_id":"alice.example"}),
+        json!({"connector_id":"atproto","user_id":"did:plc:short"}),
+    ] {
+        let mut c = claims();
+        c["federated_claims"] = claim;
+        assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_err());
+    }
+    let mut c = claims();
+    c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:web:users.example:alice"});
+    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_err());
+    c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:web:users.example"});
+    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_ok());
+    c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx","future_claim":"ignored"});
+    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_ok());
 }
 
 #[tokio::test]
@@ -476,6 +499,7 @@ fn published_cross_language_framing_vectors() {
     }
     let s = Source {
         subject: "unused".into(),
+        atproto_did: "did:plc:abcdefghijklmnopqrstuvwx".into(),
         jti: "unused".into(),
         issued_at: NOW,
         expires_at: NOW + 300,

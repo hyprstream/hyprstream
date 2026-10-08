@@ -41,24 +41,27 @@ fn source_wire(source: StoreSource) -> FederateVerifiedSource {
         token_hash: source.token_hash.to_vec(),
         issued_at: source.issued_at,
         expires_at: source.expires_at,
+        atproto_did: source.atproto_did,
     }
 }
 
 fn prepared_binding(
     response: PreparedFederateSession,
     requested: &str,
+    verified_did: &str,
 ) -> Result<PreparedDecision> {
     federate_source::scopes(requested)?;
     let requested_vec: Vec<String> = requested.split(' ').map(str::to_owned).collect();
     ensure!(
         response.policy_handle.len() == 32
+            && response.subject == verified_did
             && response.requested == requested_vec
             && !response.granted.is_empty()
             && response
                 .granted
                 .iter()
                 .all(|grant| requested_vec.contains(grant)),
-        "Policy prepared binding mismatch"
+        "Policy prepared binding or DID principal mismatch"
     );
     let granted = response.granted.join(" ");
     federate_source::scopes(&granted)?;
@@ -77,9 +80,14 @@ fn prepared_binding(
 
 fn committed_session(
     receipt: FederateCommittedSession,
+    expected_subject: &str,
     ed: [u8; 32],
     pq: &[u8],
 ) -> Result<Session> {
+    ensure!(
+        receipt.subject == expected_subject,
+        "Policy committed principal does not match verified ATProto DID"
+    );
     ensure!(
         receipt.ed_public.as_slice() == ed && receipt.pq_public == pq && receipt.proof_epoch > 0,
         "Policy committed signer mismatch"
@@ -115,8 +123,10 @@ impl FederateAdmission for PolicyFederateAdmission {
         federate_source::scopes(requested)?;
         let (ed, pq) = source.proof_public_keys();
         ensure!(pq.len() == 1952, "invalid committed signer suite");
+        let store_source = source.store_source();
+        let verified_did = store_source.atproto_did.clone();
         let data = PrepareFederateSession {
-            source: source_wire(source.store_source()),
+            source: source_wire(store_source),
             requested: requested.split(' ').map(str::to_owned).collect(),
             challenge_id: challenge_id.to_vec(),
             challenge_created_at: i64::try_from(created_at)?,
@@ -126,6 +136,7 @@ impl FederateAdmission for PolicyFederateAdmission {
         prepared_binding(
             self.client.prepare_federate_session(&data).await?,
             requested,
+            &verified_did,
         )
     }
 
@@ -135,8 +146,12 @@ impl FederateAdmission for PolicyFederateAdmission {
         policy_handle: Vec<u8>,
     ) -> Result<Session> {
         ensure!(policy_handle.len() == 32, "invalid Policy handle");
-        let (source, ed, pq, _binding, challenge_id, created_at, expires_at) =
+        let (source, ed, pq, binding, challenge_id, created_at, expires_at) =
             evidence.into_admission_parts();
+        ensure!(
+            binding.subject == source.atproto_did,
+            "Policy challenge subject does not match verified ATProto DID"
+        );
         let data = CommitFederateSession {
             source: source_wire(source),
             policy_handle,
@@ -146,7 +161,8 @@ impl FederateAdmission for PolicyFederateAdmission {
             ed_public: ed.to_vec(),
             pq_public: pq.clone(),
         };
-        committed_session(self.client.commit_federate_session(&data).await?, ed, &pq)
+        let receipt = self.client.commit_federate_session(&data).await?;
+        committed_session(receipt, &binding.subject, ed, &pq)
     }
 }
 
@@ -158,7 +174,7 @@ mod tests {
     fn prepared() -> PreparedFederateSession {
         PreparedFederateSession {
             account_id: "a".into(),
-            subject: "alice".into(),
+            subject: "did:plc:abcdefghijklmnopqrstuvwx".into(),
             tenant: "tenant".into(),
             requested: vec!["query:registry:test".into()],
             granted: vec!["query:registry:test".into()],
@@ -171,21 +187,24 @@ mod tests {
     fn prepared_binding_rejects_changed_scope_and_handle() {
         let requested = "query:registry:test";
         assert_eq!(
-            prepared_binding(prepared(), requested)
+            prepared_binding(prepared(), requested, "did:plc:abcdefghijklmnopqrstuvwx",)
                 .unwrap()
                 .binding
                 .granted,
             requested
         );
         let mut changed = prepared();
+        changed.subject = "alice".into();
+        assert!(prepared_binding(changed, requested, "did:plc:abcdefghijklmnopqrstuvwx",).is_err());
+        let mut changed = prepared();
         changed.granted = vec!["infer:model:other".into()];
-        assert!(prepared_binding(changed, requested).is_err());
+        assert!(prepared_binding(changed, requested, "did:plc:abcdefghijklmnopqrstuvwx",).is_err());
         let mut changed = prepared();
         changed.requested = vec!["query:registry:other".into()];
-        assert!(prepared_binding(changed, requested).is_err());
+        assert!(prepared_binding(changed, requested, "did:plc:abcdefghijklmnopqrstuvwx",).is_err());
         let mut changed = prepared();
         changed.policy_handle.clear();
-        assert!(prepared_binding(changed, requested).is_err());
+        assert!(prepared_binding(changed, requested, "did:plc:abcdefghijklmnopqrstuvwx",).is_err());
     }
 
     #[test]
@@ -194,7 +213,7 @@ mod tests {
             host: federate_source::HOST.into(),
             sid: "sid".into(),
             account_id: "a".into(),
-            subject: "alice".into(),
+            subject: "did:plc:abcdefghijklmnopqrstuvwx".into(),
             tenant: "tenant".into(),
             client: federate_source::CLIENT.into(),
             resource: federate_source::HOST.into(),
@@ -207,8 +226,16 @@ mod tests {
             proof_epoch: 1,
             expires_at: chrono::Utc::now().timestamp() + 60,
         };
-        assert!(committed_session(receipt.clone(), [1; 32], &[2; 1952]).is_ok());
-        assert!(committed_session(receipt.clone(), [5; 32], &[2; 1952]).is_err());
-        assert!(committed_session(receipt, [1; 32], &[6; 1952]).is_err());
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
+        assert!(committed_session(receipt.clone(), did, [1; 32], &[2; 1952]).is_ok());
+        assert!(committed_session(receipt.clone(), did, [5; 32], &[2; 1952]).is_err());
+        assert!(committed_session(receipt.clone(), did, [1; 32], &[6; 1952]).is_err());
+        assert!(committed_session(
+            receipt,
+            "did:plc:bcdefghijklmnopqrstuvwxy2",
+            [1; 32],
+            &[2; 1952]
+        )
+        .is_err());
     }
 }

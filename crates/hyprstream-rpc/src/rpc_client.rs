@@ -33,6 +33,15 @@ pub trait PreSealGuard: Send + Sync {
     async fn ensure_current(&self) -> Result<()>;
 }
 
+/// Builds a holder proof after all forwarded recipients exist. `capnp_body`
+/// is the application body before browser carrier framing, matching what
+/// dispatch recovers and verifies. This is opt-in per client.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait FederateProofProvider: Send + Sync {
+    async fn proof_for(&self, envelope: &RequestEnvelope, capnp_body: &[u8]) -> Result<Vec<u8>>;
+}
+
 /// Non-cloneable, non-serializable one-call response decapsulation material.
 /// The component secret bytes are `Zeroizing` inside `RecipientKeypair` and
 /// are dropped immediately after the sole response-open attempt.
@@ -248,6 +257,7 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     request_kem_store: Option<Arc<dyn KemTrustStore>>,
     pre_seal_guard: Option<Arc<dyn PreSealGuard>>,
     browser_provisioning_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
+    federate_proof_provider: Option<Arc<dyn FederateProofProvider>>,
     #[cfg(test)]
     response_secret_drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -269,6 +279,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             request_kem_store: None,
             pre_seal_guard: None,
             browser_provisioning_binding: None,
+            federate_proof_provider: None,
             #[cfg(test)]
             response_secret_drop_probe: None,
         }
@@ -307,6 +318,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         binding.validate_shape()?;
         self.browser_provisioning_binding = Some(binding);
         Ok(self)
+    }
+
+    /// Enable the dedicated Federate proof sender on this client. The provider
+    /// is called separately for each request, after payload binding and
+    /// recipient generation, immediately before the envelope is sealed.
+    pub fn with_federate_proof_provider(
+        mut self,
+        provider: Arc<dyn FederateProofProvider>,
+    ) -> Self {
+        self.federate_proof_provider = Some(provider);
+        self
     }
 
     #[cfg(test)]
@@ -827,6 +849,10 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         if let Some(service_domain) = service_domain {
             envelope = envelope.with_service_domain(service_domain)?;
         }
+        // The browser carrier adds an authenticated provisioning transcript
+        // around the application body. Dispatch removes that wrapper before
+        // comparing proof claim -70003 to the decoded Cap'n Proto request.
+        let proof_body = self.federate_proof_provider.as_ref().map(|_| envelope.payload.clone());
         if let Some(binding) = &self.browser_provisioning_binding {
             let service_domain = service_domain.ok_or_else(|| {
                 anyhow::anyhow!("browser request extension requires a canonical service domain")
@@ -874,6 +900,12 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             )?;
             let public = keypair.public();
             envelope = envelope.with_response_kem_recipient(public.clone());
+            if let Some(provider) = &self.federate_proof_provider {
+                let body = proof_body.as_deref().ok_or_else(|| anyhow::anyhow!(
+                    "Federate proof lost the original Cap'n Proto body"))?;
+                let proof = provider.proof_for(&envelope, body).await?;
+                envelope = envelope.with_proof_cwt(proof);
+            }
             // This unverified subject inspection only selects extra proof
             // emission; it grants no authority. Policy verifies the credential
             // and holder independently. User delegation remains unchanged.
@@ -903,6 +935,12 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             )?);
             (pending, sealed)
         } else {
+            if let Some(provider) = &self.federate_proof_provider {
+                let body = proof_body.as_deref().ok_or_else(|| anyhow::anyhow!(
+                    "Federate proof lost the original Cap'n Proto body"))?;
+                let proof = provider.proof_for(&envelope, body).await?;
+                envelope = envelope.with_proof_cwt(proof);
+            }
             (None, None)
         };
 
@@ -1416,6 +1454,40 @@ mod request_kem_tests {
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use tokio::sync::{oneshot, Mutex, Notify};
 
+    struct TestFederateProofProvider {
+        seen: Arc<parking_lot::Mutex<Option<(Vec<u8>, crate::proof::recipient_binding::FederateRecipientBinding)>>>,
+    }
+
+    #[async_trait]
+    impl FederateProofProvider for TestFederateProofProvider {
+        async fn proof_for(&self, envelope: &RequestEnvelope, capnp_body: &[u8]) -> Result<Vec<u8>> {
+            use crate::proof::{build::{AuthenticatedHybridProofSigner, AuthenticatedRequestProofInput, build_authenticated_hybrid_request_proof}, recipient_binding::FederateRecipientBinding};
+            let binding = FederateRecipientBinding::from_recipients(
+                envelope.response_kem_recipient.as_ref(),
+                envelope.client_kem_public.as_ref(),
+                envelope.client_dh_public,
+            )?;
+            *self.seen.lock() = Some((capnp_body.to_vec(), binding.clone()));
+            let signer = AuthenticatedHybridProofSigner::new(
+                ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+                b"proof-fixture-ed".to_vec(),
+                crate::crypto::pq::ml_dsa_sk_from_seed(&[10; 32]),
+                b"proof-fixture-pq".to_vec(),
+            )?;
+            let issued_at = u64::try_from(envelope.iat)?;
+            build_authenticated_hybrid_request_proof(&AuthenticatedRequestProofInput {
+                service_domain: envelope.service_domain.as_deref().unwrap(),
+                credential: envelope.jwt_token().unwrap().as_bytes(),
+                issued_at,
+                expires_at: issued_at + 30,
+                capnp_schema_id: 0xd4d0_f2a1_b3c5_8e67,
+                capnp_body,
+                response_binding: None,
+                federate_recipient_binding: Some(&binding),
+            }, &signer)
+        }
+    }
+
     /// A carrier that forbids cleartext envelopes; `send` must never be reached
     /// in these tests (they stop at `sign_envelope`).
     struct ForbidsCleartextMock;
@@ -1839,6 +1911,53 @@ mod request_kem_tests {
             !bytes.windows(b"payload".len()).any(|w| w == b"payload"),
             "cleartext payload must not appear on the wire"
         );
+    }
+
+    #[tokio::test]
+    async fn federate_proof_commits_final_browser_body_and_actual_response_recipient() {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _) = generate_signing_keypair();
+        let server_recipient = derive_mesh_kem_recipient(&server_sk).unwrap();
+        let mut kem_store = KeyedKemTrustStore::new();
+        kem_store.bind(server_vk.to_bytes(), server_recipient.public());
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let client = RpcClientImpl::new(LocalSigner::new(client_sk), ForbidsCleartextMock, Some(server_vk))
+            .with_request_kem_store(Arc::new(kem_store))
+            .with_browser_provisioning_binding(browser_test_binding()).unwrap()
+            .with_federate_proof_provider(Arc::new(TestFederateProofProvider { seen: seen.clone() }))
+            .with_default_jwt("fixture.sender.constrained.jwt".into());
+        let original = browser_capnp_request(7);
+        let (wire, _) = client.sign_envelope(
+            17, original.clone(), None, None,
+            Some("fixture.sender.constrained.jwt".into()), None,
+            Some("model"), Some(7),
+        ).await.unwrap();
+        let mut signed = signed_envelope_from_bytes(&wire);
+        signed.decrypt_in_place_mesh_kem(&server_recipient).unwrap();
+        let forwarded = signed.envelope;
+        let proof = crate::proof::parser::ParsedProof::parse_deferred_federate_request(
+            forwarded.proof_cwt.as_deref().unwrap(),
+        ).unwrap();
+        let (signed_body, binding) = seen.lock().clone().unwrap();
+        assert_eq!(signed_body, original, "proof must sign the application Cap'n Proto body");
+        let (_, recovered) = crate::browser_provisioning::recover_request_payload(
+            &forwarded.payload,
+            crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+                request_id: 17,
+                service_name: "model",
+                carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+            },
+        ).unwrap();
+        assert_eq!(proof.claims.capnp_body_bytes, recovered);
+        assert_ne!(proof.claims.capnp_body_bytes, forwarded.payload,
+            "signing the transport framing would fail dispatch's body comparison");
+        assert_eq!(proof.claims.federate_recipient_binding.as_ref(), Some(&binding));
+        assert!(binding.matches(forwarded.response_kem_recipient.as_ref(), None, None));
+        let replacement = crate::crypto::hybrid_kem::generate_recipient(
+            crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        ).unwrap().public();
+        assert!(!binding.matches(Some(&replacement), None, None),
+            "substituting the forwarded recipient must invalidate the signed binding");
     }
 
     fn browser_test_binding() -> crate::browser_provisioning::BrowserRequestBinding {
