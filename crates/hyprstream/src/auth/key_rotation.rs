@@ -2368,6 +2368,58 @@ pub fn load_or_init_es256_key_store(
     secrets_dir: &Path,
     config: &OAuthConfig,
 ) -> Es256SigningKeyStore {
+    match super::op_log::resolve_oplog_state_dir(secrets_dir) {
+        Ok(state_dir) => {
+            load_or_init_es256_key_store_with_oplog_state_dir(secrets_dir, config, &state_dir)
+        }
+        Err(error) => {
+            error!(
+                "Could not resolve durable ES256 operation-log authority: {error}; refusing implicit key generation"
+            );
+            load_or_init_es256_key_store_with_authority(secrets_dir, config, true)
+        }
+    }
+}
+
+fn load_or_init_es256_key_store_with_oplog_state_dir(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+    oplog_state_dir: &Path,
+) -> Es256SigningKeyStore {
+    let has_durable_authority = match has_es256_oplog_authority(oplog_state_dir) {
+        Ok(present) => present,
+        Err(error) => {
+            error!(
+                "Could not inspect durable ES256 operation-log authority: {error}; refusing implicit key generation"
+            );
+            true
+        }
+    };
+    load_or_init_es256_key_store_with_authority(secrets_dir, config, has_durable_authority)
+}
+
+fn has_es256_oplog_authority(state_dir: &Path) -> std::io::Result<bool> {
+    use std::io::ErrorKind;
+
+    for name in [
+        super::op_log::SEALED_HEAD_FILENAME,
+        super::op_log::SEALED_HEAD_MAX_SEQ_FILENAME,
+        super::op_log::HEAD_VERIFYING_KEY_FILENAME,
+    ] {
+        match std::fs::symlink_metadata(state_dir.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn load_or_init_es256_key_store_with_authority(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+    has_durable_authority: bool,
+) -> Es256SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
@@ -2391,24 +2443,28 @@ pub fn load_or_init_es256_key_store(
         lead = None;
     }
 
-    // Documented follow-up (outside this repair): the generated key is
-    // activated even when persistence fails below — the disk-before-memory
-    // gate applied in `load_or_init_key_store` and
-    // `load_or_init_ml_dsa_key_store` does not cover this store yet, so a
-    // process-only ES256 signer remains possible after a failed first boot.
     if active.is_none() {
-        info!("No active ES256 signing key found — generating on first boot");
-        let slot = generate_es256_slot(now, now + active_secs);
-        if let Err(e) = persist_es256_slot(&state_dir, "active", &slot) {
+        if has_durable_authority {
             error!(
-                "Could not persist active ES256 key to '{}': {e}. The key is \
-                 process-ephemeral — every restart invalidates all issued tokens.",
-                state_dir.display()
+                "Durable ES256 operation-log authority exists but no active signing slot is \
+                 available; refusing implicit key generation"
             );
         } else {
-            info!("Active ES256 key generated (kid={})", slot.kid());
+            info!("No active ES256 signing key found — generating on first boot");
+            let slot = generate_es256_slot(now, now + active_secs);
+            match persist_es256_slot(&state_dir, "active", &slot) {
+                Ok(()) => {
+                    info!("Active ES256 key generated (kid={})", slot.kid());
+                    active = Some(slot);
+                }
+                Err(error) => error!(
+                    "Could not persist active ES256 key to '{}': {error}. Refusing \
+                     to activate the unpersisted key; no active signer is available \
+                     until persistence succeeds on a restart.",
+                    state_dir.display()
+                ),
+            }
         }
-        active = Some(slot);
     }
 
     let should_gen_lead =
@@ -5238,6 +5294,41 @@ mod tests {
         let store = load_or_init_es256_key_store(dir.path(), &config);
         let key = store.active_key();
         assert!(key.is_some());
+    }
+
+    #[test]
+    fn es256_missing_active_with_durable_oplog_authority_does_not_regenerate() {
+        for marker in [
+            super::super::op_log::SEALED_HEAD_FILENAME,
+            super::super::op_log::SEALED_HEAD_MAX_SEQ_FILENAME,
+            super::super::op_log::HEAD_VERIFYING_KEY_FILENAME,
+        ] {
+            let root = TempDir::new().unwrap();
+            let secrets_dir = root.path().join("credentials");
+            let oplog_dir = root.path().join("oplog-state");
+            std::fs::create_dir(&secrets_dir).unwrap();
+            std::fs::create_dir(&oplog_dir).unwrap();
+            std::fs::write(oplog_dir.join(marker), b"existing authority marker").unwrap();
+
+            let store = load_or_init_es256_key_store_with_oplog_state_dir(
+                &secrets_dir,
+                &test_config(),
+                &oplog_dir,
+            );
+            assert!(store.active_key().is_none(), "marker={marker}");
+            assert!(
+                load_es256_slot(&secrets_dir, "active").is_none(),
+                "marker={marker}"
+            );
+            assert!(
+                load_es256_slot(&secrets_dir, "drain").is_none(),
+                "marker={marker}"
+            );
+            assert!(
+                load_es256_slot(&secrets_dir, "lead").is_none(),
+                "marker={marker}"
+            );
+        }
     }
 
     #[test]
