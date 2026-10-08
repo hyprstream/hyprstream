@@ -5331,6 +5331,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn es256_failed_first_boot_persistence_can_recover_without_published_marker() {
+        let root = TempDir::new().unwrap();
+        let secrets_dir = root.path().join("credentials");
+        let oplog_dir = root.path().join("oplog-state");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::create_dir(&oplog_dir).unwrap();
+
+        // The seed write succeeds, but making the metadata destination a
+        // directory forces the second half of the active-slot write to fail.
+        let blocked_metadata = secrets_dir.join("es256-signing-key.active.meta");
+        std::fs::create_dir(&blocked_metadata).unwrap();
+        let failed_boot = load_or_init_es256_key_store_with_oplog_state_dir(
+            &secrets_dir,
+            &test_config(),
+            &oplog_dir,
+        );
+        assert!(failed_boot.active_key().is_none());
+
+        assert!(super::super::op_log::advance_sealed_head_with_state_dir(
+            &secrets_dir,
+            &oplog_dir,
+            &failed_boot,
+        )
+        .await
+        .is_err());
+        assert!(!oplog_dir
+            .join(super::super::op_log::HEAD_VERIFYING_KEY_FILENAME)
+            .exists());
+        assert!(!oplog_dir
+            .join(super::super::op_log::SEALED_HEAD_FILENAME)
+            .exists());
+
+        // After the transient obstruction is repaired, first boot can
+        // complete normally without deleting any operation-log marker.
+        std::fs::remove_dir(&blocked_metadata).unwrap();
+        let recovered = load_or_init_es256_key_store_with_oplog_state_dir(
+            &secrets_dir,
+            &test_config(),
+            &oplog_dir,
+        );
+        assert!(recovered.active_key().is_some());
+        super::super::op_log::advance_sealed_head_with_state_dir(
+            &secrets_dir,
+            &oplog_dir,
+            &recovered,
+        )
+        .await
+        .unwrap();
+        assert!(oplog_dir
+            .join(super::super::op_log::HEAD_VERIFYING_KEY_FILENAME)
+            .exists());
+        assert!(oplog_dir
+            .join(super::super::op_log::SEALED_HEAD_FILENAME)
+            .exists());
+    }
+
     #[test]
     fn es256_persist_and_reload() {
         let dir = TempDir::new().unwrap();

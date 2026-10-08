@@ -377,9 +377,24 @@ pub async fn advance_sealed_head(
     es256_store: &Es256SigningKeyStore,
 ) -> Result<()> {
     let state_dir = resolve_oplog_state_dir(secrets_dir)?;
+    advance_sealed_head_with_state_dir(secrets_dir, &state_dir, es256_store).await
+}
+
+pub(crate) async fn advance_sealed_head_with_state_dir(
+    secrets_dir: &Path,
+    state_dir: &Path,
+    es256_store: &Es256SigningKeyStore,
+) -> Result<()> {
+    // Publishing the head verification key is an authority marker. Do not
+    // leave it behind when first-boot ES256 persistence failed and there is
+    // no usable active signer to seal. Otherwise a repaired storage fault
+    // would be mistaken for previously published authority on the next boot.
+    if es256_store.active_key().is_none() {
+        anyhow::bail!("cannot advance sealed op-log head: ES256 store has no active slot");
+    }
     let head_sk = load_or_init_head_signing_key(secrets_dir)?;
-    publish_head_verifying_key(&state_dir, &head_sk)?;
-    seal_op_log_head(&state_dir, &head_sk, es256_store).await
+    publish_head_verifying_key(state_dir, &head_sk)?;
+    seal_op_log_head(state_dir, &head_sk, es256_store).await
 }
 
 /// Write the sealed op-log head after a promotion (or at boot). The public
