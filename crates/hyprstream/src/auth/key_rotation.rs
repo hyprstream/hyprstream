@@ -1827,9 +1827,14 @@ fn clear_deferred_predecessor(secrets_dir: &Path) {
 /// The record is durable (survives restart), cleared on successful
 /// publication, retained on validation I/O errors, and discarded only after
 /// a verified supersession, followed by one retry anchored on current
-/// memory. Returns `true` when every rotation finished fully restored; a
-/// lock-contended tick skips without rotating and also returns `true` (the
-/// competing cycle owns the transition; this tick changes nothing).
+/// memory. Recovery therefore survives chained deferrals and failed
+/// recovery publications (each certified cycle re-certifies its own
+/// outcome); a restart recovers while the on-disk state still digests to a
+/// certified state and fail-closes (retaining prior authority) after a
+/// foreign writer mutates the shared slot files. Returns `true` when every
+/// rotation finished fully restored; a lock-contended tick skips without
+/// rotating and also returns `true` (the competing cycle owns the
+/// transition; this tick changes nothing).
 async fn run_rotation_cycle(
     config: &OAuthConfig,
     secrets_dir: &Path,
@@ -2036,35 +2041,34 @@ async fn run_rotation_cycle(
                 }
             }
         } else {
-            // Record the committed predecessor together with the certified
-            // deferred states, so the recovery tick can prove continuity
-            // between its stores and the deferred transition. Seeding
-            // requires the pre-rotation digest to still match the committed
-            // ledger (an already-drifted store keeps the pre-existing
-            // stale-authority rejection) and never overwrites an existing
-            // record. A failed record write retains the record in memory,
-            // and the durable copy is retried on later ticks. An
-            // already-certified deferred cycle advances the certified states
-            // to this tick's outcome.
+            // Seeding (no record yet) requires the pre-rotation digest to
+            // still match the committed ledger (an already-drifted store
+            // keeps the pre-existing stale-authority rejection). The seed
+            // records the committed predecessor plus both certified states of
+            // the deferred transition: the deferring cycle's own post-rotation
+            // memory outcome and its durable slot output — both written under
+            // the cycle lock, so both are the transition's own output, and
+            // the durable entry is exactly what a restarted process reloads.
             //
-            // At seed time the certified states are the deferring cycle's own
-            // post-rotation memory outcome plus the durable slot state it
-            // just wrote — both captured under the cycle lock, so both are
-            // the transition's own output and the durable entry is exactly
-            // what a restarted process reloads. Later advances certify only
-            // the consuming tick's memory outcome: durable slot files a tick
-            // did not rewrite cannot be proven to continue the transition
-            // (another writer may have replaced them), so their digest is
-            // never certified by an advance.
+            // A chained certified deferral (record present, memory still
+            // certified) advances the certified states to this tick's own
+            // memory outcome only when a family durably advanced; when the
+            // failure left the transition unchanged, the record is kept
+            // as-is. Durable slot files a tick did not rewrite cannot be
+            // proven to continue the transition (another writer may have
+            // replaced them between cycles), so their digest is never
+            // certified by an advance — restart recovery after such an
+            // advance fail-closes instead of authorizing a foreign state.
+            // A failed record write retains the record in memory, and the
+            // durable copy is retried on later ticks.
             let post_reload = deferred_reload_digest(secrets_dir, config, extra).await;
-            let post_states = vec![post_memory.clone(), post_reload];
             match retained.as_ref() {
                 None => {
                     if let Ok((_, ledger)) = read_committed_composite_ledger(secrets_dir) {
                         if ledger.component_digest == pre_rotation {
                             let record = DeferredPredecessorRecord {
                                 committed_digest: pre_rotation.to_owned(),
-                                states: post_states,
+                                states: vec![post_memory.clone(), post_reload],
                             };
                             if write_deferred_predecessor(secrets_dir, &record) {
                                 info!(
@@ -2082,9 +2086,18 @@ async fn run_rotation_cycle(
                     }
                 }
                 Some(record) if certified => {
+                    let states = if post_memory == *pre_rotation {
+                        // Transition unchanged (the same failure repeated):
+                        // the recorded states already describe it.
+                        record.states.clone()
+                    } else {
+                        // A family durably advanced in this cycle: certify
+                        // only the memory outcome.
+                        vec![post_memory.clone()]
+                    };
                     let advanced = DeferredPredecessorRecord {
                         committed_digest: record.committed_digest.clone(),
-                        states: post_states,
+                        states,
                     };
                     if write_deferred_predecessor(secrets_dir, &advanced) {
                         *DEFERRED_PREDECESSOR_FALLBACK.write() = None;
@@ -2093,10 +2106,12 @@ async fn run_rotation_cycle(
                     }
                 }
                 Some(_) => {
+                    // Uncertified record: it is not this tick's transition, so
+                    // it is left untouched. The durable copy of the in-process
+                    // register is refreshed (the register holds solely
+                    // certified-at-write-time records); a durable file copy is
+                    // left as-is.
                     if !deferred_predecessor_path(secrets_dir).exists() {
-                        // Retry the durable copy of an in-memory record only
-                        // when it is certified; an uncertified record is not
-                        // this transition's.
                         if let Some(record) = DEFERRED_PREDECESSOR_FALLBACK.read().clone() {
                             write_deferred_predecessor(secrets_dir, &record);
                         }
@@ -7238,6 +7253,158 @@ mod tests {
             "the published generation must carry the promoted ML-DSA signer"
         );
         assert!(read_deferred_predecessor(dir.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn ed25519_chained_deferral_never_certifies_reload() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_CHAINED_DEFER_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_chained_deferral_never_certifies_reload",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Bootstrap the ML-DSA active slot on disk (the store handle itself
+        // is rebuilt below with its ready lead).
+        load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let old_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 6 * 3600,
+        );
+        let new_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let old_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 3600, now + 14 * 86400);
+        let new_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        persist_slot(dir.path(), "active", &old_ed).unwrap();
+        persist_slot(dir.path(), "lead", &new_ed).unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &old_pq).unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &new_pq).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(old_ed),
+            lead: Some(new_ed),
+        });
+        let pq_store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(old_pq),
+            lead: Some(new_pq),
+        });
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+
+        let meta_path = dir.path().join("jwt-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let pq_store = Arc::new(pq_store);
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+
+        // Cycle 1: mixed cycle (Ed25519 rollback fails, ML-DSA promotes)
+        // defers and seeds {committed, [memory, durable]}.
+        let deferred1 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!deferred1, "cycle 1 must defer");
+        let seeded =
+            read_deferred_predecessor(dir.path()).expect("cycle 1 must retain a recovery record");
+        assert_eq!(
+            seeded.states.len(),
+            2,
+            "seed records memory and durable states"
+        );
+        let seeded_mem = seeded.states[0].clone();
+        let seeded_reload = seeded.states[1].clone();
+        assert_eq!(
+            seeded.states,
+            vec![seeded_mem.clone(), seeded_reload.clone()],
+            "seed sanity"
+        );
+        let seeded_mem_digest =
+            component_state_digest(&ed_store, &pq_store, ca.verifying_key()).await;
+        assert_eq!(
+            seeded.states,
+            vec![seeded_mem_digest.clone(), seeded_reload.clone()],
+            "the seed's memory entry must match the certified memory"
+        );
+
+        // Cycle 2: consecutive not-fully-restored certified cycle. The
+        // transition is unchanged, so the record must be kept as-is: the
+        // durable entry (its own serialized output) is never re-certified by
+        // an advance, and nothing new enters the certified states.
+        let deferred2 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!deferred2, "cycle 2 must defer again (same obstruction)");
+        let advanced = read_deferred_predecessor(dir.path())
+            .expect("the record must survive the chained deferral");
+        assert_eq!(
+            advanced.committed_digest, commit_before.component_digest,
+            "the chained deferral must keep the committed predecessor"
+        );
+        assert_eq!(
+            advanced.states, seeded.states,
+            "an unchanged chained deferral must keep the record as-is"
+        );
+
+        // Writer B's contamination analogue: a foreign ML-DSA active slot
+        // written to the shared state dir between certified cycles (the
+        // Ed25519 side stays torn under its own obstruction, as in the
+        // captured-transition state the record describes).
+        let foreign_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &foreign_pq).unwrap();
+        let foreign_reload = {
+            let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+            let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await
+        };
+        assert_ne!(
+            foreign_reload, seeded_mem_digest,
+            "fixture: the foreign disk state must differ from the certified \
+             memory outcome"
+        );
+
+        // Cycle 3: the failure persists (the meta obstruction is still in
+        // place). The tick is certified (memory unchanged), its rotations
+        // durably advance a family only if due work exists - here none - and
+        // the chained advance must never certify the foreign durable state.
+        let deferred3 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!deferred3, "cycle 3 must defer again (same obstruction)");
+        let after_foreign = read_deferred_predecessor(dir.path())
+            .expect("the record must survive the third deferral");
+        assert_eq!(
+            after_foreign.committed_digest, commit_before.component_digest,
+            "the committed predecessor must be preserved"
+        );
+        assert!(
+            !after_foreign.states.contains(&foreign_reload),
+            "the foreign durable state left by another writer must never be \
+             certified into the record"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "deferred cycles must not touch the pending ledger"
+        );
     }
 
     #[tokio::test]
