@@ -1,0 +1,39 @@
+[package]
+name = "hyprstream-decision-backbone"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "System One P1.2: LLM2Vec-style backbone conversion (Qwen3.5-0.8B hybrid, bidirectional softmax layers, causal torch-native GDN, LM head amputated) + ModernBERT-large baseline arm, integrated with the shared scorer"
+
+# Model-side contract library (Apache-2.0 per the v1.7.1 licensing policy). This
+# crate is consumed by P1.4 (distillation training) and later serving nodes; it
+# must stay a permissive-only leaf (license-boundary.toml). The Qwen3.5 hybrid
+# encoder here is an independent encoder-side implementation of the public
+# architecture (chunked gated delta rule per the published algorithm) — it does
+# NOT reuse the AGPL hyprstream-inference runtime, and never will: the license
+# boundary gate rejects an AGPL dependency.
+[dependencies]
+hyprstream-decision = { path = "../hyprstream-decision" }
+hyprstream-decision-head = { path = "../hyprstream-decision-head" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+# Torch backend: the workspace's tch-rs fork, same as hyprstream-decision-head —
+# one fork across head + backbone so weights move inside a single VarStore
+# without a format boundary. CUDA (RTX 5090 dev) and ROCm (MI210 volume) builds
+# of libtorch both surface through tch's Device::Cuda API; the LIBTORCH env var
+# selects the build at compile/link time (dual-backend pin, see crate docs).
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libtorch-211" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokenizers = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
