@@ -389,7 +389,11 @@ pub(crate) async fn advance_sealed_head_with_state_dir(
     // leave it behind when first-boot ES256 persistence failed and there is
     // no usable active signer to seal. Otherwise a repaired storage fault
     // would be mistaken for previously published authority on the next boot.
-    if es256_store.active_key().is_none() {
+    // Inspect the already-authorized in-memory slot without refreshing it
+    // from disk. During a rejected/partially rolled-back promotion, disk may
+    // contain the candidate while memory deliberately retains the old active
+    // key; this function must not turn that candidate into published authority.
+    if es256_store.active_slot().is_none() {
         anyhow::bail!("cannot advance sealed op-log head: ES256 store has no active slot");
     }
     let head_sk = load_or_init_head_signing_key(secrets_dir)?;

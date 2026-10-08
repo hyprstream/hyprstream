@@ -5388,6 +5388,47 @@ mod tests {
             .exists());
     }
 
+    #[tokio::test]
+    async fn advance_oplog_does_not_reload_unpromoted_es256_disk_candidate() {
+        let root = TempDir::new().unwrap();
+        let secrets_dir = root.path().join("credentials");
+        let oplog_dir = root.path().join("oplog-state");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::create_dir(&oplog_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let retained = generate_es256_slot(now - 120, now + 86_400);
+        let rejected_candidate = generate_es256_slot(now, now + 172_800);
+        let retained_kid = retained.kid();
+        persist_es256_slot(&secrets_dir, "active", &rejected_candidate).unwrap();
+        persist_es256_slot(&secrets_dir, "drain", &retained).unwrap();
+
+        // Simulate a failed rotation rollback: the candidate remains in the
+        // durable active path, but the store correctly retains the old key.
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(retained),
+            lead: Some(rejected_candidate),
+        });
+        store.bind_secrets_dir(secrets_dir.clone());
+        assert_eq!(store.active_slot().unwrap().kid(), retained_kid);
+
+        super::super::op_log::advance_sealed_head_with_state_dir(&secrets_dir, &oplog_dir, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.active_slot().unwrap().kid(),
+            retained_kid,
+            "op-log advancement must not reload an unpromoted disk candidate"
+        );
+        let head: super::super::op_log::SealedOpLogHead = serde_json::from_slice(
+            &std::fs::read(oplog_dir.join(super::super::op_log::SEALED_HEAD_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.active_kid, retained_kid);
+    }
+
     #[test]
     fn es256_persist_and_reload() {
         let dir = TempDir::new().unwrap();
