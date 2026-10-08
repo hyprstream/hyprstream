@@ -1730,21 +1730,14 @@ pub struct RotationStores {
 
 /// The recovery transaction recorded when a rotation cycle defers composite
 /// publication: `committed_digest` names the marker-selected committed
-/// generation the cycle deferred against, and `states` lists the component
-/// digests certified as that authorized-but-unpublished transition's own
-/// outcome — the cycle's post-rotation in-memory state and the durable slot
-/// state re-read from disk (exactly what a restarted process reloads). A
-/// later tick may anchor publication on this record only when its own
-/// tick-start memory digest is in `states` — continuity between the retained
-/// recovery transaction and the stores actually consuming it — and the
-/// `committed_digest` half is still validated by the unchanged digest gate
-/// against the marker-selected ledger on every use. Every anchored cycle
-/// (deferred or published-with-failure) advances `states` to its own
-/// post-rotation outcome, so recovery survives chained cycles, failed
-/// recovery publications, and restarts. The record is a claim, never an
-/// accepted marker: it can only ever authorize publishing from stores that
-/// demonstrably continue the recorded transition, and cycle capture is
-/// serialized against competing writers by the per-tick cycle lock.
+/// generation the cycle deferred against, and `states` contains only
+/// component digests computed from this process's in-memory stores. A fresh
+/// reload from mutable slot files is never certified as part of the failed
+/// cycle. A later tick may anchor publication only when its tick-start memory
+/// digest is in `states`, and the committed digest is still checked against
+/// the ledger. After restart, a matching reload may continue; a different
+/// reload remains untrusted and cannot advance the ledger. This prefers
+/// explicit repair over guessing which writer produced divergent disk state.
 #[derive(Clone, Serialize, Deserialize)]
 struct DeferredPredecessorRecord {
     committed_digest: String,
@@ -2041,14 +2034,13 @@ async fn run_rotation_cycle(
                 }
             }
         } else {
-            // Seeding (no record yet) requires the pre-rotation digest to
-            // still match the committed ledger (an already-drifted store
-            // keeps the pre-existing stale-authority rejection). The seed
-            // records the committed predecessor plus both certified states of
-            // the deferred transition: the deferring cycle's own post-rotation
-            // memory outcome and its durable slot output — both written under
-            // the cycle lock, so both are the transition's own output, and
-            // the durable entry is exactly what a restarted process reloads.
+            // Seed only from the state computed in this process. The
+            // pre-rotation digest must still match the committed ledger; an
+            // already-drifted store keeps the stale-authority rejection. Do
+            // not reload and certify mutable slot files: another writer may
+            // have changed them before this record was created. After a
+            // restart, a disk digest not in this record cannot authorize a
+            // retry; explicit repair is safer than guessing.
             //
             // A chained certified deferral (record present, memory still
             // certified) advances the certified states to this tick's own
@@ -2061,14 +2053,13 @@ async fn run_rotation_cycle(
             // advance fail-closes instead of authorizing a foreign state.
             // A failed record write retains the record in memory, and the
             // durable copy is retried on later ticks.
-            let post_reload = deferred_reload_digest(secrets_dir, config, extra).await;
             match retained.as_ref() {
                 None => {
                     if let Ok((_, ledger)) = read_committed_composite_ledger(secrets_dir) {
                         if ledger.component_digest == pre_rotation {
                             let record = DeferredPredecessorRecord {
                                 committed_digest: pre_rotation.to_owned(),
-                                states: vec![post_memory.clone(), post_reload],
+                                states: vec![post_memory.clone()],
                             };
                             if write_deferred_predecessor(secrets_dir, &record) {
                                 info!(
@@ -2126,23 +2117,6 @@ async fn run_rotation_cycle(
         }
     }
     all_restored
-}
-
-/// Digest of the durable slot state as a restarted process would reload it
-/// (production load paths, committed marker suppressing any generation).
-async fn deferred_reload_digest(
-    secrets_dir: &Path,
-    config: &OAuthConfig,
-    extra: &RotationStores,
-) -> String {
-    let reloaded_ed = load_or_init_key_store(secrets_dir, config);
-    let reloaded_pq = load_or_init_ml_dsa_key_store(secrets_dir, config);
-    component_state_digest(
-        &reloaded_ed,
-        &reloaded_pq,
-        extra.composite_ca_key.verifying_key(),
-    )
-    .await
 }
 
 pub fn spawn_rotation_task(
@@ -6087,13 +6061,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ed25519_deferred_cycle_republishes_after_recovery() {
-        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_DEFERRED_RECOVERY_TEST";
+    async fn ed25519_restart_mismatch_fails_closed() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_RESTART_MISMATCH_TEST";
         if std::env::var_os(ISOLATED).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "auth::key_rotation::tests::ed25519_deferred_cycle_republishes_after_recovery",
+                    "auth::key_rotation::tests::ed25519_restart_mismatch_fails_closed",
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1")
@@ -6190,11 +6164,11 @@ mod tests {
              deferred cycle"
         );
 
-        // Clear the failure and recover with fresh stores — but first corrupt
-        // the committed marker so the recovery publication fails AFTER the
-        // rotation has advanced the slots: the record must be retained with
-        // its certified states advanced to the recovery tick's own outcome,
-        // and the next tick must publish that outcome.
+        // Clear the write obstruction and reload. The slot state may not
+        // match what this process certified in memory, so restart must not
+        // infer authority from the files. Even after the marker becomes
+        // readable again, the ledger digest gate must keep this state from
+        // being published.
         std::fs::remove_dir(&meta_path).unwrap();
         let fresh_ed = Arc::new(load_or_init_key_store(dir.path(), &config));
         let fresh_pq = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
@@ -6203,6 +6177,13 @@ mod tests {
             ml_dsa: Some(Arc::clone(&fresh_pq)),
             composite_ca_key: Arc::clone(&ca),
         };
+        let initial_record = read_deferred_predecessor(dir.path()).unwrap();
+        let reloaded_digest =
+            component_state_digest(&fresh_ed, &fresh_pq, ca.verifying_key()).await;
+        assert!(
+            !initial_record.states.contains(&reloaded_digest),
+            "a restart reload not certified by this process must remain untrusted"
+        );
         let marker_path = dir.path().join("jwt-composite-pairs.committed");
         let marker_bytes = std::fs::read(&marker_path).unwrap();
         std::fs::write(&marker_path, b"corrupt").unwrap();
@@ -6226,12 +6207,9 @@ mod tests {
             record_after_failure.committed_digest, commit_before.component_digest,
             "the retained record must keep the committed predecessor"
         );
-        let advanced_digest =
-            component_state_digest(&fresh_ed, &fresh_pq, ca.verifying_key()).await;
-        assert!(
-            record_after_failure.states.contains(&advanced_digest),
-            "the certified states must advance to the recovery tick's own \
-             post-rotation outcome"
+        assert_eq!(
+            record_after_failure.states, initial_record.states,
+            "an untrusted restart state must not be added to the recovery record"
         );
         assert_eq!(
             std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
@@ -6239,52 +6217,39 @@ mod tests {
             "the failed recovery publication must not restate the pending ledger"
         );
 
-        // Ledger access restored: the next tick anchors on the advanced
-        // certified states and publishes the resulting generation.
+        // A readable marker does not make the mismatching restart state
+        // trustworthy. The attempt remains fail-closed and preserves the
+        // last committed authority for operator recovery.
         std::fs::write(&marker_path, &marker_bytes).unwrap();
         let recovered = run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
         assert!(
             recovered,
             "the tick after a failed recovery publication must publish"
         );
-        let (commit_after, ledger_after) = read_committed_composite_ledger(dir.path()).unwrap();
-        assert!(
-            commit_after.version > commit_before.version,
-            "the recovery must publish a new committed generation"
-        );
-        let oauth_active = ledger_after
-            .pairs
-            .iter()
-            .find(|record| record.role == "oauth" && record.state == "active")
-            .expect("the published generation must carry an active OAuth pair");
+        let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_after.version, commit_before.version);
+        assert_eq!(commit_after.component_digest, commit_before.component_digest);
         assert_eq!(
-            oauth_active.ed25519_public,
-            URL_SAFE_NO_PAD.encode(new_ed.verifying_key_bytes()),
-            "the published generation must carry the recovered Ed25519 signer"
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before
         );
+        assert!(read_deferred_predecessor(dir.path()).is_some());
         assert_eq!(
-            oauth_active.ml_dsa_public,
-            URL_SAFE_NO_PAD.encode(ml_dsa_slot_vk_bytes(&new_pq)),
-            "the published generation must carry the promoted ML-DSA signer"
-        );
-        assert!(read_deferred_predecessor(dir.path()).is_none());
-        assert!(
             hyprstream_rpc::auth::global_composite_key_set()
                 .snapshot()
-                .version()
-                > snapshot_version_before,
-            "the recovery cycle must publish to the live key set"
+                .version(),
+            snapshot_version_before
         );
     }
 
     #[tokio::test]
-    async fn ml_dsa_deferred_cycle_republishes_after_recovery() {
-        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ML_DSA_DEFERRED_RECOVERY_TEST";
+    async fn ml_dsa_restart_mismatch_fails_closed() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ML_DSA_RESTART_MISMATCH_TEST";
         if std::env::var_os(ISOLATED).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "auth::key_rotation::tests::ml_dsa_deferred_cycle_republishes_after_recovery",
+                    "auth::key_rotation::tests::ml_dsa_restart_mismatch_fails_closed",
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1")
@@ -6377,11 +6342,10 @@ mod tests {
              deferred cycle"
         );
 
-        // Clear the failure and recover with fresh stores — but first corrupt
-        // the committed marker so the recovery publication fails AFTER the
-        // rotation has advanced the slots: the record must be retained with
-        // its certified states advanced to the recovery tick's own outcome,
-        // and the next tick must publish that outcome.
+        // Clear the write obstruction and reload. If the loaded state does
+        // not match what this process certified, restart must not infer
+        // authority from the slot files. A readable marker later does not
+        // make that mismatching state trusted.
         std::fs::remove_dir(&meta_path).unwrap();
         let fresh_ed = Arc::new(load_or_init_key_store(dir.path(), &config));
         let fresh_pq = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
@@ -6390,6 +6354,13 @@ mod tests {
             ml_dsa: Some(Arc::clone(&fresh_pq)),
             composite_ca_key: Arc::clone(&ca),
         };
+        let initial_record = read_deferred_predecessor(dir.path()).unwrap();
+        let reloaded_digest =
+            component_state_digest(&fresh_ed, &fresh_pq, ca.verifying_key()).await;
+        assert!(
+            !initial_record.states.contains(&reloaded_digest),
+            "a restart reload not certified by this process must remain untrusted"
+        );
         let marker_path = dir.path().join("jwt-composite-pairs.committed");
         let marker_bytes = std::fs::read(&marker_path).unwrap();
         std::fs::write(&marker_path, b"corrupt").unwrap();
@@ -6413,12 +6384,9 @@ mod tests {
             record_after_failure.committed_digest, commit_before.component_digest,
             "the retained record must keep the committed predecessor"
         );
-        let advanced_digest =
-            component_state_digest(&fresh_ed, &fresh_pq, ca.verifying_key()).await;
-        assert!(
-            record_after_failure.states.contains(&advanced_digest),
-            "the certified states must advance to the recovery tick's own \
-             post-rotation outcome"
+        assert_eq!(
+            record_after_failure.states, initial_record.states,
+            "an untrusted restart state must not be added to the recovery record"
         );
         assert_eq!(
             std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
@@ -6426,41 +6394,26 @@ mod tests {
             "the failed recovery publication must not restate the pending ledger"
         );
 
-        // Ledger access restored: the next tick anchors on the advanced
-        // certified states and publishes the resulting generation.
+        // A readable marker does not make the mismatching restart state
+        // trustworthy. The retry preserves the committed authority and waits
+        // for explicit repair.
         std::fs::write(&marker_path, &marker_bytes).unwrap();
         let recovered = run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
-        assert!(
-            recovered,
-            "the tick after a failed recovery publication must publish"
-        );
-        let (commit_after, ledger_after) = read_committed_composite_ledger(dir.path()).unwrap();
-        assert!(
-            commit_after.version > commit_before.version,
-            "the recovery must publish a new committed generation"
-        );
-        let oauth_active = ledger_after
-            .pairs
-            .iter()
-            .find(|record| record.role == "oauth" && record.state == "active")
-            .expect("the published generation must carry an active OAuth pair");
+        assert!(recovered, "the rotation operation itself should remain usable");
+        let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_after.version, commit_before.version);
+        assert_eq!(commit_after.component_digest, commit_before.component_digest);
         assert_eq!(
-            oauth_active.ed25519_public,
-            URL_SAFE_NO_PAD.encode(new_ed.verifying_key_bytes()),
-            "the published generation must carry the promoted Ed25519 signer"
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before
         );
+        assert!(read_deferred_predecessor(dir.path()).is_some());
         assert_eq!(
-            oauth_active.ml_dsa_public,
-            URL_SAFE_NO_PAD.encode(ml_dsa_slot_vk_bytes(&new_pq)),
-            "the published generation must carry the recovered ML-DSA signer"
-        );
-        assert!(read_deferred_predecessor(dir.path()).is_none());
-        assert!(
             hyprstream_rpc::auth::global_composite_key_set()
                 .snapshot()
-                .version()
-                > snapshot_version_before,
-            "the recovery cycle must publish to the live key set"
+                .version(),
+            snapshot_version_before,
+            "the restart mismatch must not publish new signer authority"
         );
     }
 
@@ -6891,6 +6844,13 @@ mod tests {
             .snapshot()
             .version();
 
+        // Simulate a stale writer having changed the shared ML-DSA slot
+        // files before this process records its first deferred cycle. The
+        // current process's in-memory store still has the committed key; the
+        // reload digest below must not be certified from disk.
+        let foreign_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 30 * 86400, now + 8 * 86400);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &foreign_pq).unwrap();
+
         let meta_path = dir.path().join("jwt-signing-key.active.meta");
         std::fs::remove_file(&meta_path).unwrap();
         std::fs::create_dir(&meta_path).unwrap();
@@ -6910,7 +6870,24 @@ mod tests {
             seeded.committed_digest, commit_before.component_digest,
             "the record must anchor on the current committed generation"
         );
-        assert_eq!(seeded.states.len(), 2, "memory and durable states recorded");
+        assert_eq!(
+            seeded.states.len(),
+            1,
+            "only this process's memory state is recorded"
+        );
+        let foreign_reload = {
+            let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+            let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await
+        };
+        assert_ne!(
+            foreign_reload, seeded.states[0],
+            "the mutable slot state predated this record and is not trusted"
+        );
+        assert!(
+            !seeded.states.contains(&foreign_reload),
+            "a foreign reload must never be certified into the first record"
+        );
         let certified_states = seeded.states.clone();
 
         // Stale writer B: stores from a different (non-member) component
@@ -7093,7 +7070,11 @@ mod tests {
             seeded.committed_digest, commit_before.component_digest,
             "the record must anchor on the current committed generation"
         );
-        assert_eq!(seeded.states.len(), 2, "memory and durable states recorded");
+        assert_eq!(
+            seeded.states.len(),
+            1,
+            "only process-computed state recorded"
+        );
 
         // The transient Ed25519 obstruction clears before writer B runs.
         std::fs::remove_dir(&meta_path).unwrap();
@@ -7324,35 +7305,23 @@ mod tests {
         };
 
         // Cycle 1: mixed cycle (Ed25519 rollback fails, ML-DSA promotes)
-        // defers and seeds {committed, [memory, durable]}.
+        // defers and seeds {committed, [memory]}.
         let deferred1 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
         assert!(!deferred1, "cycle 1 must defer");
         let seeded =
             read_deferred_predecessor(dir.path()).expect("cycle 1 must retain a recovery record");
-        assert_eq!(
-            seeded.states.len(),
-            2,
-            "seed records memory and durable states"
-        );
-        let seeded_mem = seeded.states[0].clone();
-        let seeded_reload = seeded.states[1].clone();
-        assert_eq!(
-            seeded.states,
-            vec![seeded_mem.clone(), seeded_reload.clone()],
-            "seed sanity"
-        );
+        assert_eq!(seeded.states.len(), 1, "seed records process memory only");
         let seeded_mem_digest =
             component_state_digest(&ed_store, &pq_store, ca.verifying_key()).await;
         assert_eq!(
             seeded.states,
-            vec![seeded_mem_digest.clone(), seeded_reload.clone()],
-            "the seed's memory entry must match the certified memory"
+            vec![seeded_mem_digest.clone()],
+            "the seed must match only this process's computed memory"
         );
 
         // Cycle 2: consecutive not-fully-restored certified cycle. The
-        // transition is unchanged, so the record must be kept as-is: the
-        // durable entry (its own serialized output) is never re-certified by
-        // an advance, and nothing new enters the certified states.
+        // transition is unchanged, so the record must be kept as-is; nothing
+        // new enters the certified states.
         let deferred2 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
         assert!(!deferred2, "cycle 2 must defer again (same obstruction)");
         let advanced = read_deferred_predecessor(dir.path())
