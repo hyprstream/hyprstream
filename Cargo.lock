@@ -7654,6 +7654,8 @@ name = "hyprstream-rpc-std"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array 56.2.0",
+ "arrow-schema 56.2.0",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -7664,6 +7666,7 @@ dependencies = [
  "getrandom 0.3.3",
  "hex",
  "hyprstream-9p",
+ "hyprstream-decision",
  "hyprstream-pay",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
@@ -7679,6 +7682,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subsecond",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "url",
