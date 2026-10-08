@@ -1550,8 +1550,17 @@ async fn rotate_jwt_keys_in_state_dir(
                     persist_slot(state_dir, "drain", prev)
                 } else {
                     delete_slot(state_dir, "drain");
+                    // Error-preserving removal proof: only a definite
+                    // NotFound for both files counts as removed; any other
+                    // metadata error leaves restoration unconfirmed.
                     let (drain_key, drain_meta) = slot_paths(state_dir, "drain");
-                    if drain_key.exists() || drain_meta.exists() {
+                    let removed = [&drain_key, &drain_meta].iter().all(|path| {
+                        matches!(
+                            std::fs::symlink_metadata(path),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        )
+                    });
+                    if !removed {
                         Err(anyhow::anyhow!(
                             "partial replacement drain slot still present after removal"
                         ))
@@ -1719,40 +1728,61 @@ pub struct RotationStores {
     pub composite_ca_key: Arc<SigningKey>,
 }
 
-/// Durable record of the committed component digest that a not-fully-restored
-/// rotation cycle deferred publication against. Without it, one algorithm's
-/// durable advance during a deferred cycle changes tick-start memory, so the
-/// recomputed expected digest can never again match the retained committed
-/// ledger and publication stalls even after full recovery. The value is a
-/// claim, not trust: every use still validates it against the marker-selected
-/// committed ledger through the normal digest gate, so stale-writer rejection
-/// is preserved. It is durable so recovery also works after a restart.
+/// The recovery transaction recorded when a rotation cycle defers composite
+/// publication: `committed_digest` names the marker-selected committed
+/// generation the cycle deferred against, and `deferred_state` is the
+/// component digest of the durable slot set that cycle left behind (re-read
+/// from disk, so it is exactly what a restarted process reloads). A later
+/// tick may anchor publication on this record only when its own tick-start
+/// memory digest equals `deferred_state` — continuity between the retained
+/// recovery transaction and the stores actually consuming it — and the
+/// `committed_digest` half is still validated by the unchanged digest gate
+/// against the marker-selected ledger on every use. The record is therefore
+/// a claim, never an accepted marker: it can only ever authorize publishing
+/// from stores that demonstrably resume the recorded deferred transition.
+#[derive(Clone, Serialize, Deserialize)]
+struct DeferredPredecessorRecord {
+    committed_digest: String,
+    deferred_state: String,
+}
+
+static DEFERRED_PREDECESSOR_FALLBACK: parking_lot::RwLock<Option<DeferredPredecessorRecord>> =
+    parking_lot::RwLock::new(None);
+
 fn deferred_predecessor_path(secrets_dir: &Path) -> PathBuf {
     rotation_state_dir(secrets_dir).join("jwt-composite-deferred-predecessor")
 }
 
-fn read_deferred_predecessor(secrets_dir: &Path) -> Option<String> {
-    let value = std::fs::read_to_string(deferred_predecessor_path(secrets_dir)).ok()?;
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_owned())
+/// Read the recovery record. The in-process register is authoritative when
+/// present (it is set whenever the durable write could not be persisted);
+/// otherwise the durable file copy is parsed. A missing, unreadable, or
+/// malformed record reads as `None` — never as supersession.
+fn read_deferred_predecessor(secrets_dir: &Path) -> Option<DeferredPredecessorRecord> {
+    if let Some(record) = DEFERRED_PREDECESSOR_FALLBACK.read().clone() {
+        return Some(record);
     }
+    let value = std::fs::read_to_string(deferred_predecessor_path(secrets_dir)).ok()?;
+    serde_json::from_str::<DeferredPredecessorRecord>(value.trim()).ok()
 }
 
-fn write_deferred_predecessor(secrets_dir: &Path, component_digest: &str) {
+fn write_deferred_predecessor(secrets_dir: &Path, record: &DeferredPredecessorRecord) -> bool {
     let state_dir = rotation_state_dir(secrets_dir);
-    if let Err(error) = super::identity_store::write_secret(
-        &state_dir,
-        "jwt-composite-deferred-predecessor",
-        component_digest.as_bytes(),
-    ) {
-        warn!("could not record the deferred composite predecessor digest: {error}");
+    match serde_json::to_vec(record) {
+        Ok(bytes) => super::identity_store::write_secret(
+            &state_dir,
+            "jwt-composite-deferred-predecessor",
+            &bytes,
+        )
+        .is_ok(),
+        Err(error) => {
+            warn!("could not serialize the deferred predecessor record: {error}");
+            false
+        }
     }
 }
 
 fn clear_deferred_predecessor(secrets_dir: &Path) {
+    *DEFERRED_PREDECESSOR_FALLBACK.write() = None;
     let _ = std::fs::remove_file(deferred_predecessor_path(secrets_dir));
 }
 
@@ -1764,15 +1794,18 @@ fn clear_deferred_predecessor(secrets_dir: &Path) {
 /// ledger could never be acknowledged and would only strand a divergent
 /// proposal next to the retained prior authority.
 ///
-/// When a cycle defers, the pre-rotation component digest is serialized as
-/// the committed predecessor (validated to match the committed ledger) and
-/// reused as the publication anchor on later ticks until a publication
-/// succeeds — including ticks after a restart, where tick-start memory may
-/// already contain a durably advanced family. The anchor is cleared on
-/// success, and a retained anchor that no longer matches the committed
-/// ledger (its publication raced a competing one) is discarded with one
-/// retry anchored on current memory. Returns `true` when every rotation
-/// finished fully restored.
+/// When a cycle defers, the cycle records a recovery transaction: the
+/// committed component digest it deferred against (validated to match the
+/// marker-selected committed ledger) plus the durable deferred component
+/// state re-read from disk. A later all-restored tick anchors publication on
+/// the recorded committed digest only when its own tick-start memory digest
+/// equals the recorded deferred state — proving its stores resume exactly
+/// that deferred transition; any other record is ignored, and stores that
+/// match nothing keep the pre-existing stale-authority rejection. The record
+/// is durable (survives restart), cleared on successful publication,
+/// retained on validation I/O errors, and discarded only after a verified
+/// supersession, followed by one retry anchored on current memory. Returns
+/// `true` when every rotation finished fully restored.
 async fn run_rotation_cycle(
     config: &OAuthConfig,
     secrets_dir: &Path,
@@ -1789,8 +1822,9 @@ async fn run_rotation_cycle(
     if !all_restored {
         warn!(
             "Ed25519 rotation ended not fully restored: a failed promotion \
-             rollback left the old active signer recoverable only in its drain \
-             slot; publication is deferred until a retry fully restores it"
+             rollback left the signer slots only partially restored; the old \
+             active signer remains active in memory and publication is \
+             deferred until a retry fully restores it"
         );
     }
     // Keep the shared HTTP validator's published Ed25519 key set current after
@@ -1820,25 +1854,36 @@ async fn run_rotation_cycle(
         if !pq_restored {
             warn!(
                 "ML-DSA rotation ended not fully restored: a failed promotion \
-                 rollback left the old active signer recoverable only in its \
-                 drain slot; publication is deferred until a retry fully \
-                 restores it"
+                 rollback left the signer slots only partially restored; the old \
+                 active signer remains active in memory and publication is \
+                 deferred until a retry fully restores it"
             );
         }
         refresh_ml_dsa_verifying_keys(ml_dsa).await;
+        // The recovery record applies only when this tick's component memory
+        // is exactly the durable state the deferred cycle left behind; a
+        // record describing some other transition is ignored (never used,
+        // never treated as supersession).
+        let retained = read_deferred_predecessor(secrets_dir);
+        let anchor = match retained.as_ref() {
+            Some(record) if record.deferred_state == pre_rotation => {
+                info!(
+                    "anchoring deferred composite publication on the retained \
+                     committed predecessor"
+                );
+                Some(record.committed_digest.clone())
+            }
+            _ => None,
+        };
         if all_restored {
-            // A retained predecessor anchors publication across deferred
-            // cycles and restarts; without one the pre-rotation memory digest
-            // is the anchor, exactly as before this mechanism existed.
-            let retained = read_deferred_predecessor(secrets_dir);
-            let anchor = retained.as_deref().unwrap_or(pre_rotation);
+            let expected = anchor.as_deref().unwrap_or(pre_rotation);
             match refresh_composite_key_set(
                 secrets_dir,
                 store,
                 ml_dsa,
                 Arc::clone(&extra.composite_ca_key),
                 config.drain_secs(),
-                anchor,
+                expected,
             )
             .await
             {
@@ -1848,61 +1893,94 @@ async fn run_rotation_cycle(
                     }
                 }
                 Err(error) => {
-                    // An anchor that no longer matches the committed ledger is
-                    // obsolete (its publication raced a competing one); drop it
-                    // and retry once anchored on current memory. Any other
-                    // failure retains the anchor and the prior authority.
-                    let committed_matches_anchor = retained
-                        .as_ref()
-                        .map(|anchor| {
-                            read_committed_composite_ledger(secrets_dir)
-                                .map(|(_, ledger)| ledger.component_digest == *anchor)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if retained.is_some() && !committed_matches_anchor {
-                        clear_deferred_predecessor(secrets_dir);
-                        warn!(
-                            "deferred composite predecessor no longer matches the \
-                             committed ledger; retrying publication anchored on \
-                             current component memory"
-                        );
-                        if let Err(retry_error) = refresh_composite_key_set(
-                            secrets_dir,
-                            store,
-                            ml_dsa,
-                            Arc::clone(&extra.composite_ca_key),
-                            config.drain_secs(),
-                            pre_rotation,
-                        )
-                        .await
-                        {
+                    // Distinguish verified supersession from unavailable
+                    // authority: only a successfully read ledger whose digest
+                    // differs proves the recorded recovery transaction was
+                    // superseded by a competing publication. A read failure
+                    // retains the record and the prior authority.
+                    let superseded = retained.as_ref().map(|record| {
+                        read_committed_composite_ledger(secrets_dir)
+                            .map(|(_, ledger)| ledger.component_digest != record.committed_digest)
+                            .unwrap_or(false)
+                    });
+                    match superseded {
+                        Some(true) => {
+                            clear_deferred_predecessor(secrets_dir);
                             warn!(
-                                "composite key-set publication failed; retaining \
-                                 prior authority: {retry_error}"
+                                "deferred composite predecessor superseded by a \
+                                 competing publication; retrying once anchored on \
+                                 current component memory"
+                            );
+                            if let Err(retry_error) = refresh_composite_key_set(
+                                secrets_dir,
+                                store,
+                                ml_dsa,
+                                Arc::clone(&extra.composite_ca_key),
+                                config.drain_secs(),
+                                pre_rotation,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "composite key-set publication failed; retaining \
+                                     prior authority: {retry_error}"
+                                );
+                            }
+                        }
+                        _ => {
+                            warn!(
+                                "composite key-set publication failed; retaining prior \
+                                 authority: {error}"
                             );
                         }
-                    } else {
-                        warn!(
-                            "composite key-set publication failed; retaining prior \
-                             authority: {error}"
-                        );
                     }
                 }
             }
         } else {
-            // Serialize the committed predecessor so the recovery tick can
-            // anchor publication on it. Only seed it when the pre-rotation
-            // digest still matches the committed ledger — an already-drifted
-            // store keeps the pre-existing stale-authority rejection.
-            if read_deferred_predecessor(secrets_dir).is_none() {
-                if let Ok((_, ledger)) = read_committed_composite_ledger(secrets_dir) {
-                    if ledger.component_digest == pre_rotation {
-                        write_deferred_predecessor(secrets_dir, pre_rotation);
-                        info!(
-                            "composite publication deferred; committed predecessor \
-                             digest recorded for recovery"
-                        );
+            // Record the committed predecessor together with the durable
+            // deferred state (re-read from disk — exactly what a restarted
+            // process reloads), so the recovery tick can prove continuity
+            // between its stores and the deferred transition. Seeding requires
+            // the pre-rotation digest to still match the committed ledger (an
+            // already-drifted store keeps the pre-existing stale-authority
+            // rejection) and never overwrites an existing record. A failed
+            // record write retains the record in memory, and the durable copy
+            // is retried on later ticks.
+            match retained.as_ref() {
+                None => {
+                    if let Ok((_, ledger)) = read_committed_composite_ledger(secrets_dir) {
+                        if ledger.component_digest == pre_rotation {
+                            let reloaded_ed = load_or_init_key_store(secrets_dir, config);
+                            let reloaded_pq = load_or_init_ml_dsa_key_store(secrets_dir, config);
+                            let deferred_state = component_state_digest(
+                                &reloaded_ed,
+                                &reloaded_pq,
+                                extra.composite_ca_key.verifying_key(),
+                            )
+                            .await;
+                            let record = DeferredPredecessorRecord {
+                                committed_digest: pre_rotation.to_owned(),
+                                deferred_state,
+                            };
+                            if write_deferred_predecessor(secrets_dir, &record) {
+                                info!(
+                                    "composite publication deferred; committed predecessor \
+                                     and durable deferred state recorded for recovery"
+                                );
+                            } else {
+                                *DEFERRED_PREDECESSOR_FALLBACK.write() = Some(record);
+                                warn!(
+                                    "could not persist the deferred predecessor record; \
+                                     retaining it in memory for this process"
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(record) => {
+                    if !deferred_predecessor_path(secrets_dir).exists() {
+                        // Retry the durable copy of an in-memory record.
+                        write_deferred_predecessor(secrets_dir, record);
                     }
                 }
             }
@@ -2648,8 +2726,15 @@ mod ml_dsa_rotation {
                         persist_ml_dsa_slot(state_dir, "drain", prev)
                     } else {
                         delete_ml_dsa_slot(state_dir, "drain");
+                        // Error-preserving removal proof, mirroring Ed25519.
                         let (drain_key, drain_meta) = ml_dsa_slot_paths(state_dir, "drain");
-                        if drain_key.exists() || drain_meta.exists() {
+                        let removed = [&drain_key, &drain_meta].iter().all(|path| {
+                            matches!(
+                                std::fs::symlink_metadata(path),
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                            )
+                        });
+                        if !removed {
                             Err(anyhow::anyhow!(
                                 "partial replacement drain slot still present after removal"
                             ))
@@ -5844,8 +5929,8 @@ mod tests {
         );
         // The committed predecessor is durably recorded for the recovery tick.
         assert_eq!(
-            read_deferred_predecessor(dir.path()).as_deref(),
-            Some(commit_before.component_digest.as_str()),
+            read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+            Some(commit_before.component_digest.clone()),
             "a deferring cycle must retain the committed predecessor digest"
         );
     }
@@ -5948,8 +6033,8 @@ mod tests {
             "a deferred cycle must not publish to the live key set"
         );
         assert_eq!(
-            read_deferred_predecessor(dir.path()).as_deref(),
-            Some(commit_before.component_digest.as_str()),
+            read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+            Some(commit_before.component_digest.clone()),
             "the committed predecessor digest must be retained across the \
              deferred cycle"
         );
@@ -6094,8 +6179,8 @@ mod tests {
             "a deferred cycle must not publish to the live key set"
         );
         assert_eq!(
-            read_deferred_predecessor(dir.path()).as_deref(),
-            Some(commit_before.component_digest.as_str()),
+            read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+            Some(commit_before.component_digest.clone()),
             "the committed predecessor digest must be retained across the \
              deferred cycle"
         );
@@ -6282,8 +6367,8 @@ mod tests {
                 "a not-fully-restored cycle must not publish to the live key set"
             );
             assert_eq!(
-                read_deferred_predecessor(dir.path()).as_deref(),
-                Some(commit_before.component_digest.as_str()),
+                read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+                Some(commit_before.component_digest.clone()),
                 "a deferring cycle must retain the committed predecessor digest"
             );
         }
@@ -6407,8 +6492,8 @@ mod tests {
                 "a not-fully-restored cycle must not publish to the live key set"
             );
             assert_eq!(
-                read_deferred_predecessor(dir.path()).as_deref(),
-                Some(commit_before.component_digest.as_str()),
+                read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+                Some(commit_before.component_digest.clone()),
                 "a deferring cycle must retain the committed predecessor digest"
             );
         }
