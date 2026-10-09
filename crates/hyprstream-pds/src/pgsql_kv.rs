@@ -135,6 +135,13 @@ enum PgCmd {
     },
     /// Ping (connection liveness check).
     Ping { reply: mpsc::Sender<AnyResult<()>> },
+    /// Reset only the records KV to a first-boot state, in one transaction.
+    /// Used exclusively by the explicitly authorized staging fresh-genesis
+    /// bootstrap path; retry is idempotent while the marker remains present.
+    ResetToFirstBoot {
+        marker_key: Vec<u8>,
+        reply: mpsc::Sender<AnyResult<()>>,
+    },
     /// Atomically admit an opaque replay identifier. The RPC layer computes
     /// the digest; this bridge receives no credential or request body.
     ReplayAdmit { replay_id: [u8; 32], expires_at: u64, reply: mpsc::Sender<AnyResult<bool>> },
@@ -338,6 +345,20 @@ impl PgKv {
 
     pub fn ping(&self) -> AnyResult<()> {
         self.round_trip(|reply| PgCmd::Ping { reply })
+    }
+
+    /// Atomically clear `pds_kv` and insert the caller's first-boot marker.
+    /// If the marker is already present, the earlier reset committed and this
+    /// retry is a no-op. `pds_meta` and every other table are untouched.
+    pub fn reset_to_first_boot(&self, marker_key: &[u8]) -> AnyResult<()> {
+        anyhow::ensure!(
+            !marker_key.is_empty(),
+            "first-boot marker key must not be empty"
+        );
+        self.round_trip(|reply| PgCmd::ResetToFirstBoot {
+            marker_key: marker_key.to_owned(),
+            reply,
+        })
     }
 
     /// Atomically retain one opaque replay identifier until its signed expiry.
@@ -741,6 +762,10 @@ async fn handle_cmd(pool: &deadpool_postgres::Pool, cmd: PgCmd) -> AnyResult<()>
             let r = cmd_ping(pool).await;
             let _ = reply.send(r);
         }
+        PgCmd::ResetToFirstBoot { marker_key, reply } => {
+            let r = cmd_reset_to_first_boot(pool, &marker_key).await;
+            let _ = reply.send(r);
+        }
         PgCmd::ReplayAdmit { replay_id, expires_at, reply } => {
             let r = cmd_replay_admit(pool, &replay_id, expires_at).await;
             let _ = reply.send(r);
@@ -961,6 +986,43 @@ async fn cmd_ping(pool: &deadpool_postgres::Pool) -> AnyResult<()> {
     Ok(())
 }
 
+async fn cmd_reset_to_first_boot(
+    pool: &deadpool_postgres::Pool,
+    marker_key: &[u8],
+) -> AnyResult<()> {
+    let mut conn = pool.get().await.map_err(|e| {
+        anyhow::anyhow!("RDS fresh-genesis reset: connection acquisition failed: {e}")
+    })?;
+    let tx = conn
+        .transaction()
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS fresh-genesis reset: begin failed: {e}"))?;
+    tx.batch_execute("LOCK TABLE pds_kv IN ACCESS EXCLUSIVE MODE")
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS fresh-genesis reset: table lock failed: {e}"))?;
+    let marker_present = tx
+        .query_opt("SELECT value FROM pds_kv WHERE key = $1", &[&marker_key])
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS fresh-genesis reset: marker check failed: {e}"))?
+        .is_some();
+    if !marker_present {
+        let empty: &[u8] = &[];
+        tx.execute("TRUNCATE TABLE pds_kv", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("RDS fresh-genesis reset: records clear failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO pds_kv (key, value) VALUES ($1, $2)",
+            &[&marker_key, &empty],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS fresh-genesis reset: marker write failed: {e}"))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("RDS fresh-genesis reset: commit failed: {e}"))?;
+    Ok(())
+}
+
 /// The primary-key insert is the cross-verifier serialization point. In one
 /// transaction, drop only this identifier if it expired and insert the new
 /// admission. A concurrent contender either sees the live row or loses
@@ -1027,6 +1089,9 @@ fn send_err(cmd: PgCmd, err: anyhow::Error) -> AnyResult<()> {
             let _ = reply.send(Err(err));
         }
         PgCmd::Ping { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        PgCmd::ResetToFirstBoot { reply, .. } => {
             let _ = reply.send(Err(err));
         }
         PgCmd::ReplayAdmit { reply, .. } => {
@@ -1311,6 +1376,41 @@ mod tests {
             kv.get(&key).unwrap_or_else(|e| panic!("re-get: {e}")),
             Some(b"value-2".to_vec())
         );
+    }
+
+    #[test]
+    fn live_fresh_genesis_reset_clears_records_once_and_preserves_retry_writes() {
+        let url = require_db!();
+        let kv = PgKv::connect_test(&url, "test-cell")
+            .unwrap_or_else(|e| panic!("connect: {e}"));
+        let old_key = run_unique_key("fresh-genesis-old");
+        let marker = run_unique_key("fresh-genesis-marker");
+        kv.put(&old_key, b"old-state")
+            .unwrap_or_else(|e| panic!("seed old state: {e}"));
+
+        kv.reset_to_first_boot(&marker)
+            .unwrap_or_else(|e| panic!("reset: {e}"));
+        assert_eq!(
+            kv.get(&old_key).unwrap_or_else(|e| panic!("old get: {e}")),
+            None
+        );
+        assert_eq!(
+            kv.get(&marker).unwrap_or_else(|e| panic!("marker get: {e}")),
+            Some(Vec::new())
+        );
+
+        let retry_key = run_unique_key("fresh-genesis-retry");
+        kv.put(&retry_key, b"post-reset-state")
+            .unwrap_or_else(|e| panic!("seed retry state: {e}"));
+        kv.reset_to_first_boot(&marker)
+            .unwrap_or_else(|e| panic!("idempotent retry: {e}"));
+        assert_eq!(
+            kv.get(&retry_key)
+                .unwrap_or_else(|e| panic!("retry get: {e}")),
+            Some(b"post-reset-state".to_vec()),
+            "retry after the marker exists must not clear newly written state"
+        );
+        assert!(kv.reset_to_first_boot(b"").is_err());
     }
 
     #[test]
