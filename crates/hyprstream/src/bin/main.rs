@@ -175,7 +175,15 @@ fn build_cli() -> ClapCommand {
             .about("Attach this host to its home personal data server")
             .subcommand(
                 ClapCommand::new("init-deployment-store")
-                    .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
+                    .about("Initialize an explicitly provisioned checkpoint store")
+                    .arg(
+                        Arg::new("fresh-genesis")
+                            .long("fresh-genesis")
+                            .action(clap::ArgAction::SetTrue)
+                            .help(
+                                "Clear only the configured RDS records KV before first-boot initialization; staging deployment bootstrap only",
+                            ),
+                    ),
             )
             .subcommand(
                 ClapCommand::new("inspect-services")
@@ -3103,9 +3111,16 @@ fn main() -> Result<()> {
     if let Some(("pds", sub_m)) = matches.subcommand() {
         match sub_m.subcommand() {
             #[cfg(feature = "rocksdb")]
-            Some(("init-deployment-store", _)) => {
-                hyprstream_core::cli::deployment_bootstrap::init_checkpoint_store(&config)?;
-                println!("initialized empty deployment checkpoint store");
+            Some(("init-deployment-store", init_m)) => {
+                if init_m.get_flag("fresh-genesis") {
+                    hyprstream_core::cli::deployment_bootstrap::init_checkpoint_store_for_fresh_genesis(
+                        &config,
+                    )?;
+                    println!("fresh-genesis deployment checkpoint store initialized");
+                } else {
+                    hyprstream_core::cli::deployment_bootstrap::init_checkpoint_store(&config)?;
+                    println!("initialized empty deployment checkpoint store");
+                }
                 return Ok(());
             }
             #[cfg(feature = "rocksdb")]

@@ -568,6 +568,24 @@ impl PdsRecordStore {
         Ok(())
     }
 
+    /// Explicitly reset the configured RDS records KV to a fresh-genesis
+    /// state. This clears only `pds_kv` and writes the first-boot marker in
+    /// the same Postgres transaction; local RocksDB and read-only stores are
+    /// never reset through this API.
+    #[cfg(feature = "pds-postgres")]
+    pub(crate) fn reset_for_fresh_genesis(&self) -> AnyResult<()> {
+        if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+            anyhow::ensure!(
+                !readonly,
+                "fresh-genesis reset attempted on a read-only PDS store"
+            );
+            return kv.reset_to_first_boot(hyprstream_discovery::FIRST_BOOT_KEY);
+        }
+        bail!(
+            "fresh-genesis reset is supported only for the writable RDS records store"
+        )
+    }
+
     fn conditional_advance_at9p_state(
         &self,
         expected: Option<Watermark>,

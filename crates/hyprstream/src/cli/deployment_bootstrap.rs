@@ -66,13 +66,28 @@ fn open_checkpoint_store(
 /// the RocksDB store and writes the first-boot marker; refuses an existing
 /// store).
 ///
-/// RDS backend: proves the shared store holds no accepted states — refusing
-/// to "initialize" over live security history, mirroring the local guard —
-/// then writes the first-boot provisioning marker into Postgres. The registry
-/// deletes the marker in the same transaction as its first accepted-state
-/// commit, and the QUIC startup gate reads it from the same shared store.
+/// RDS backend, normal mode: proves the shared store holds no accepted states,
+/// refusing to initialize over history, then writes the first-boot marker.
+/// Fresh-genesis mode is separate and explicit: it clears only the configured
+/// records KV and writes that marker atomically. The registry deletes the
+/// marker in the same transaction as its first accepted-state commit.
 pub fn init_checkpoint_store(config: &HyprConfig) -> Result<()> {
+    init_checkpoint_store_mode(config, false)
+}
+
+/// Fresh-genesis variant used only by the protected staging bootstrap when its
+/// saved-plan manifest is bound to the approved pre-genesis RDS snapshot.
+/// Unlike normal initialization, this deliberately clears the records KV.
+pub fn init_checkpoint_store_for_fresh_genesis(config: &HyprConfig) -> Result<()> {
+    init_checkpoint_store_mode(config, true)
+}
+
+fn init_checkpoint_store_mode(config: &HyprConfig, fresh_genesis: bool) -> Result<()> {
     let rds = config.rds.resolved_from_env()?;
+    ensure!(
+        !fresh_genesis || rds.is_configured(),
+        "fresh-genesis reset requires the configured RDS records backend"
+    );
     if rds.is_configured() {
         #[cfg(feature = "pds-postgres")]
         {
@@ -80,6 +95,10 @@ pub fn init_checkpoint_store(config: &HyprConfig) -> Result<()> {
             let directory = hyprstream_service::deployment_data_dir()?.join("pds-store");
             let store = open_checkpoint_store(config, &directory, false)?
                 .with_at9p_deployment_verifier(verifier);
+            if fresh_genesis {
+                store.reset_for_fresh_genesis()?;
+                return Ok(());
+            }
             ensure!(
                 store.accepted_at9p_states()?.is_empty(),
                 "refusing to initialize: the RDS-backed checkpoint store already \
@@ -771,10 +790,23 @@ mod tests {
                 "{marker} must not open the local store directly"
             );
         }
-        let init = top_level_body(source, "pub fn init_checkpoint_store(");
+        let init = top_level_body(source, "fn init_checkpoint_store_mode(");
         assert!(init.contains("resolved_from_env()?"));
         assert!(init.contains("open_checkpoint_store("));
         assert!(init.contains("mark_first_boot"));
+        assert!(init.contains("reset_for_fresh_genesis"));
+        assert!(init.contains("!fresh_genesis || rds.is_configured()"));
+    }
+
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn fresh_genesis_reset_refuses_local_store() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_dir = dir.path().join("pds-store");
+        let store = PdsRecordStore::open(&store_dir)?;
+        assert!(store.reset_for_fresh_genesis().is_err());
+        assert!(!store.first_boot_pending()?);
+        Ok(())
     }
 
     /// RDS-configured bootstrap paths must fail closed and never silently
