@@ -1,12 +1,12 @@
 //! Request-local Federate proof verification and Policy admission.
 //!
 //! The serving factory installs this adapter only when session-store TLS config,
-//! a complete local collision inventory, authenticated Policy transport, and
-//! static proof enrollment are available. It accepts only a host JWT already
-//! signature-verified by the RPC layer; each request resolves current session
-//! primary and fresh Policy authority, then consumes shared replay state before
-//! dispatch. No subject-keyed positive cache or browser-selected DB locator is
-//! used.
+//! authenticated Policy transport, and static proof enrollment are available.
+//! Policy remains the authority for the complete signing-key inventory. The
+//! adapter accepts only a host JWT already signature-verified by the RPC layer;
+//! each request resolves current session primary and fresh Policy authority,
+//! then consumes shared replay state before dispatch. No subject-keyed positive
+//! cache or browser-selected DB locator is used.
 
 use std::{sync::Arc, time::Duration};
 
@@ -25,7 +25,7 @@ use hyprstream_rpc::{
     service::EnvelopeContext,
 };
 use hyprstream_rpc_std::policy_client::{AdmitFederateRequest, PolicyClient, ResolveSessionPrimary, SessionPrimary};
-use hyprstream_session_store::{primary::{CollisionInventory, ExpectedPrimary}, PROFILE, SUITE};
+use hyprstream_session_store::{primary::ExpectedPrimary, PROFILE, SUITE};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -206,16 +206,15 @@ struct Consumer {
 }
 
 struct LocalPolicy<'a> {
-    inventory: &'a CollisionInventory,
     static_enrollments: &'a dyn EnrollmentResolver,
     in_flight: &'a Semaphore,
 }
 
-/// Serving adapter installed only when the authenticated Policy client,
-/// complete local key inventory and static proof enrollment are available.
+/// Serving adapter installed only when the authenticated Policy client and
+/// static proof enrollment are available. The Policy service owns and checks
+/// the complete key inventory; serving services do not need the node root key.
 pub(crate) struct DispatchAdapter {
     client: PolicyClient,
-    inventory: CollisionInventory,
     static_enrollments: Arc<dyn EnrollmentResolver>,
     in_flight: Semaphore,
 }
@@ -237,15 +236,11 @@ impl EnrollmentResolver for GlobalEnrollmentResolver {
 }
 
 impl DispatchAdapter {
-    pub(crate) fn from_global_enrollment(
-        client: PolicyClient,
-        inventory: CollisionInventory,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn from_global_enrollment(client: PolicyClient) -> anyhow::Result<Self> {
         let resolver = hyprstream_rpc::proof::enrollment::global_enrollment_resolver()
             .ok_or_else(|| anyhow::anyhow!("Federate proof enrollment is unavailable"))?;
         Ok(Self {
             client,
-            inventory,
             static_enrollments: Arc::new(GlobalEnrollmentResolver(resolver)),
             in_flight: Semaphore::new(32),
         })
@@ -267,7 +262,6 @@ impl DispatchAdapter {
             provider: Some(Arc::new(PolicyPrimaryProvider { client: self.client.clone() })),
         };
         let local = LocalPolicy {
-            inventory: &self.inventory,
             static_enrollments: self.static_enrollments.as_ref(),
             in_flight: &self.in_flight,
         };
@@ -434,8 +428,10 @@ fn local_resolver<'a>(
         || a.proof_epoch > i64::MAX as u64
         || !bounded(&a.account_id, 256)
         || !bounded(&a.grant_revision, 256)
-        || a.collision_inventory_id != policy.inventory.id()
-        || !policy.inventory.permits(&e.ed_public, &a.pq_public)
+        // This value comes from authenticated Policy after it verified the
+        // active key against its complete local inventory. Serving services
+        // must not reconstruct that inventory from their own (service) key.
+        || a.collision_inventory_id.len() != 32
         || signer_suite_thumbprint(SUITE, &[&a.ed_public, &a.pq_public]) != e.suite_thumbprint
     {
         return Err(Error::Denied);

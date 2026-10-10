@@ -76,8 +76,6 @@ fn policy_client_for_transport(
 
 #[cfg(feature = "postgres")]
 fn federate_dispatch_for_service(
-    ctx: &ServiceContext,
-    config: &HyprConfig,
     policy_client: PolicyClient,
 ) -> anyhow::Result<Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>> {
     if std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_URL_FILE").is_none() {
@@ -87,19 +85,8 @@ fn federate_dispatch_for_service(
         std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_SSLROOTCERT_FILE").is_some(),
         "Federate session DB CA file must be configured with its URL file"
     );
-    let secrets_dir = HyprConfig::resolve_secrets_dir()?;
-    let required_services = hyprstream_service::list_factories()
-        .map(|factory| factory.name)
-        .collect::<Vec<_>>();
-    let collision_inventory = crate::services::policy::inventory::complete_collision_inventory(
-        &config.oauth,
-        &secrets_dir,
-        ctx.signing_key(),
-        &required_services,
-    )?;
     let adapter = crate::services::oauth::federate_proof::DispatchAdapter::from_global_enrollment(
         policy_client,
-        collision_inventory,
     )?;
     Ok(Some(Arc::new(adapter)))
 }
@@ -1378,8 +1365,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_client =
         policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     #[cfg(feature = "postgres")]
-    let federate_dispatch =
-        federate_dispatch_for_service(ctx, &config, policy_client.clone())?;
+    let federate_dispatch = federate_dispatch_for_service(policy_client.clone())?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1741,8 +1727,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client =
         policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     #[cfg(feature = "postgres")]
-    let federate_dispatch =
-        federate_dispatch_for_service(ctx, &config, policy_client.clone())?;
+    let federate_dispatch = federate_dispatch_for_service(policy_client.clone())?;
 
     // Create registry client
     let registry_client: RegistryClient =
