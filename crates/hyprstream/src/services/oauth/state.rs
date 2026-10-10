@@ -286,14 +286,20 @@ mod tests {
             axum::body::Bytes::from_static(b"{}"),
         )
         .await;
-        assert_eq!(challenge.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            challenge.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
         let exchange = super::super::federate_host::exchange(
             &state,
             &axum::http::HeaderMap::new(),
             b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
         )
         .await;
-        assert_eq!(exchange.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            exchange.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     fn state_with_user_store(store: Arc<dyn UserStore>) -> OAuthState {
@@ -396,11 +402,7 @@ mod tests {
         let state = state_for_replay_barrier_tests();
         let now = chrono::Utc::now().timestamp();
         assert!(state.check_and_record_dpop_jti("dpop-future-skew", now + 60));
-        assert!(state.check_and_record_assertion_jti(
-            "client",
-            "assertion-future-skew",
-            now + 360
-        ));
+        assert!(state.check_and_record_assertion_jti("client", "assertion-future-skew", now + 360));
     }
 
     #[test]
@@ -1339,7 +1341,45 @@ fn mesh_kem_public_for_policy(
     }
 }
 
+/// RSA-based FederateSigner using the OAuth service's RSA encoding key.
+#[cfg(feature = "postgres")]
+struct RsaFederateSigner {
+    encoding_key: jsonwebtoken::EncodingKey,
+}
+
+#[async_trait::async_trait]
+#[cfg(feature = "postgres")]
+impl super::federate_host::FederateSigner for RsaFederateSigner {
+    async fn sign(&self, claims: &hyprstream_rpc::auth::claims::Claims) -> anyhow::Result<String> {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        Ok(jsonwebtoken::encode(&header, claims, &self.encoding_key)?)
+    }
+}
+
 impl OAuthState {
+    /// Install the FederateIssuer for the Federate login path.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn install_federate_issuer(
+        &mut self,
+        admission: std::sync::Arc<dyn super::federate_host::FederateAdmission>,
+        signer: std::sync::Arc<dyn super::federate_host::FederateSigner>,
+    ) -> anyhow::Result<()> {
+        let issuer = super::federate_host::FederateIssuer::new(admission, signer)?;
+        self.federate_issuer = Some(std::sync::Arc::new(issuer));
+        Ok(())
+    }
+
+    /// Sign a committed Federate session JWT using the RSA encoding key.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn federate_signer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn super::federate_host::FederateSigner>> {
+        self.rsa_encoding_key.as_ref().map(|key| {
+            std::sync::Arc::new(RsaFederateSigner {
+                encoding_key: key.clone(),
+            }) as std::sync::Arc<dyn super::federate_host::FederateSigner>
+        })
+    }
     const MAX_CLIENT_ASSERTION_REPLAY_SECS: i64 = 360;
     const MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS: i64 = 3_600;
     /// DPoP admits iat up to 60 seconds in the future and retains through
