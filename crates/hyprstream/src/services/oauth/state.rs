@@ -277,81 +277,168 @@ mod tests {
     }
 
     #[cfg(feature = "postgres")]
+    fn composite_signer_fixture(
+        version: u64,
+        pairs: Vec<hyprstream_rpc::auth::CompositeKeyPair>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<hyprstream_rpc::auth::CompositeKeySet>,
+    ) {
+        use hyprstream_rpc::auth::CompositeKeySet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let digest = format!("federate-test-generation-{version}");
+        let ledger = dir.path().join("ledger.json");
+        let committed = dir.path().join("committed.json");
+        let prefix = dir.path().join("committed-ledger");
+        let key_set = std::sync::Arc::new(CompositeKeySet::default());
+        key_set.configure_authority(
+            ledger.clone(),
+            committed.clone(),
+            prefix.clone(),
+            dir.path().join("ledger.lock"),
+        );
+        key_set.publish(version, digest.clone(), pairs).unwrap();
+        let generation = prefix.with_file_name(format!(
+            "{}-{version}-{digest}.json",
+            prefix.file_name().unwrap().to_str().unwrap()
+        ));
+        let contents = serde_json::json!({"version": version, "component_digest": digest});
+        std::fs::write(&ledger, serde_json::to_vec(&contents).unwrap()).unwrap();
+        std::fs::write(&generation, serde_json::to_vec(&contents).unwrap()).unwrap();
+        std::fs::write(&committed, serde_json::to_vec(&contents).unwrap()).unwrap();
+        (dir, key_set)
+    }
+
+    #[cfg(feature = "postgres")]
+    fn oauth_signing_pair(seed: u8) -> hyprstream_rpc::auth::CompositeKeyPair {
+        use std::sync::Arc;
+        let ed = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]));
+        let (pq, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let pq = Arc::new(pq);
+        let kid = hyprstream_rpc::auth::composite_kid(
+            &ml_dsa::Keypair::verifying_key(&*pq),
+            &ed.verifying_key(),
+        );
+        hyprstream_rpc::auth::CompositeKeyPair::signing(
+            kid,
+            pq,
+            ed,
+            hyprstream_rpc::auth::CompositePairRole::OAuth,
+            hyprstream_rpc::auth::CompositePairState::Active,
+            0,
+            i64::MAX,
+        )
+    }
+
+    #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn federate_signer_uses_standard_oauth_access_token_key() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
-        let signer = super::EdDsaFederateSigner {
-            signing_key_store: None,
-            fallback_key: Some(std::sync::Arc::new(key.clone())),
-        };
+    async fn federate_signer_uses_authorized_hybrid_oauth_pair() {
+        let pair = oauth_signing_pair(0x43);
+        let (dir, key_set) = composite_signer_fixture(1, vec![pair.clone()]);
+        let signer = super::HybridFederateSigner::new(key_set).unwrap();
         let now = chrono::Utc::now().timestamp();
         let claims = hyprstream_rpc::auth::claims::Claims::new(
             "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
             now,
             now + 60,
-        );
+        )
+        .with_issuer("https://local".to_owned())
+        .with_jti();
 
         let token = super::super::federate_host::FederateSigner::sign(&signer, &claims)
             .await
             .unwrap();
-        let header = hyprstream_rpc::auth::jwt::parse_protected_header(&token).unwrap();
-        assert_eq!(header.alg, "EdDSA");
-        assert_eq!(header.typ, "at+jwt");
-        let verified =
-            hyprstream_rpc::auth::jwt::decode(&token, &key.verifying_key(), None).unwrap();
+        let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
+        assert_eq!(dispatch.kid(), pair.kid());
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &token,
+            pair.ml_dsa(),
+            pair.ed25519(),
+            None,
+            &dispatch,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, claims.sub);
+        drop(dir);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_signer_uses_new_committed_pair_after_rotation() {
+        use hyprstream_rpc::auth::{CompositePairRole, CompositePairState};
+        let first = oauth_signing_pair(0x44);
+        let second = oauth_signing_pair(0x45);
+        let old_kid = first.kid().to_owned();
+        let (dir, key_set) = composite_signer_fixture(1, vec![first.clone()]);
+        let signer = super::HybridFederateSigner::new(std::sync::Arc::clone(&key_set)).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::claims::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
+            now,
+            now + 60,
+        )
+        .with_issuer("https://local".to_owned())
+        .with_jti();
+        let before = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        let before_dispatch =
+            hyprstream_rpc::auth::parse_composite_dispatch(&before, &["at+jwt"]).unwrap();
+        assert_eq!(before_dispatch.kid(), old_kid);
+
+        let (first_pq, first_ed) = first.signing_keys().unwrap();
+        let draining = hyprstream_rpc::auth::CompositeKeyPair::signing(
+            first.kid().to_owned(),
+            first_pq,
+            first_ed,
+            CompositePairRole::OAuth,
+            CompositePairState::Drain,
+            0,
+            i64::MAX,
+        );
+        let (version, digest) = (2, "federate-test-generation-2");
+        key_set
+            .publish(version, digest.to_owned(), vec![draining, second.clone()])
+            .unwrap();
+        let prefix = dir.path().join("committed-ledger");
+        let generation = prefix.with_file_name(format!("committed-ledger-{version}-{digest}.json"));
+        let contents = serde_json::json!({"version": version, "component_digest": digest});
+        std::fs::write(
+            dir.path().join("ledger.json"),
+            serde_json::to_vec(&contents).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(generation, serde_json::to_vec(&contents).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("committed.json"),
+            serde_json::to_vec(&contents).unwrap(),
+        )
+        .unwrap();
+
+        let after = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        let after_dispatch =
+            hyprstream_rpc::auth::parse_composite_dispatch(&after, &["at+jwt"]).unwrap();
+        assert_eq!(after_dispatch.kid(), second.kid());
+        assert_ne!(after_dispatch.kid(), old_kid);
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &after,
+            second.ml_dsa(),
+            second.ed25519(),
+            None,
+            &after_dispatch,
+        )
+        .unwrap();
         assert_eq!(verified.sub, claims.sub);
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn federate_signer_tracks_active_jwt_key_rotation() {
-        let first = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
-        let second = ed25519_dalek::SigningKey::from_bytes(&[0x45; 32]);
-        let now = chrono::Utc::now().timestamp();
-        let store = std::sync::Arc::new(crate::auth::SigningKeyStore::new(
-            crate::auth::key_rotation::KeySlots {
-                active: Some(crate::auth::key_rotation::KeySlot::new(
-                    first.clone(),
-                    now - 60,
-                    now + 3600,
-                )),
-                ..Default::default()
-            },
-        ));
-        let signer = super::EdDsaFederateSigner {
-            signing_key_store: Some(std::sync::Arc::clone(&store)),
-            fallback_key: Some(std::sync::Arc::new(first.clone())),
-        };
-        let claims = hyprstream_rpc::auth::claims::Claims::new(
-            "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
-            now,
-            now + 60,
-        );
-
-        let before = super::super::federate_host::FederateSigner::sign(&signer, &claims)
-            .await
-            .unwrap();
-        assert!(hyprstream_rpc::auth::jwt::decode(&before, &first.verifying_key(), None).is_ok());
-
-        store.0.write().await.active = Some(crate::auth::key_rotation::KeySlot::new(
-            second.clone(),
-            now,
-            now + 3600,
-        ));
-        let after = super::super::federate_host::FederateSigner::sign(&signer, &claims)
-            .await
-            .unwrap();
-        assert!(hyprstream_rpc::auth::jwt::decode(&after, &second.verifying_key(), None).is_ok());
-        assert!(hyprstream_rpc::auth::jwt::decode(&after, &first.verifying_key(), None).is_err());
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
     async fn federate_signer_fails_closed_without_oauth_signing_key() {
-        assert!(state_for_replay_barrier_tests()
-            .federate_signer()
-            .await
-            .is_err());
+        let empty = std::sync::Arc::new(hyprstream_rpc::auth::CompositeKeySet::default());
+        assert!(super::HybridFederateSigner::new(empty).is_err());
     }
 
     #[cfg(feature = "postgres")]
@@ -1419,24 +1506,43 @@ fn mesh_kem_public_for_policy(
     }
 }
 
-/// Federate session signer using the same Ed25519 key as other OAuth access tokens.
+/// Federate session signer using the currently committed hybrid OAuth key pair.
 #[cfg(feature = "postgres")]
-struct EdDsaFederateSigner {
-    signing_key_store: Option<std::sync::Arc<crate::auth::SigningKeyStore>>,
-    fallback_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+struct HybridFederateSigner {
+    key_set: std::sync::Arc<hyprstream_rpc::auth::CompositeKeySet>,
+}
+
+#[cfg(feature = "postgres")]
+impl HybridFederateSigner {
+    fn new(key_set: std::sync::Arc<hyprstream_rpc::auth::CompositeKeySet>) -> anyhow::Result<Self> {
+        let snapshot = key_set
+            .mint_snapshot()
+            .context("committed OAuth composite signing authority is unavailable")?;
+        anyhow::ensure!(
+            snapshot
+                .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+                .is_some(),
+            "no authorized active OAuth composite signing pair"
+        );
+        Ok(Self { key_set })
+    }
 }
 
 #[async_trait::async_trait]
 #[cfg(feature = "postgres")]
-impl super::federate_host::FederateSigner for EdDsaFederateSigner {
+impl super::federate_host::FederateSigner for HybridFederateSigner {
     async fn sign(&self, claims: &hyprstream_rpc::auth::claims::Claims) -> anyhow::Result<String> {
-        let active_key = match &self.signing_key_store {
-            Some(store) => store.active_key().await,
-            None => None,
-        }
-        .or_else(|| self.fallback_key.clone())
-        .ok_or_else(|| anyhow::anyhow!("OAuth access-token signing key is unavailable"))?;
-        Ok(hyprstream_rpc::auth::jwt::encode(claims, &active_key))
+        let snapshot = self
+            .key_set
+            .mint_snapshot()
+            .context("committed OAuth composite signing authority is unavailable")?;
+        let (pq, ed) = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys)
+            .ok_or_else(|| anyhow::anyhow!("no authorized active OAuth composite signing pair"))?;
+        Ok(crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            claims, &pq, &ed,
+        ))
     }
 }
 
@@ -1453,18 +1559,14 @@ impl OAuthState {
         Ok(())
     }
 
-    /// Use the OAuth service's standard EdDSA access-token signing key.
+    /// Use the currently committed OAuth composite pair for access tokens.
     #[cfg(feature = "postgres")]
     pub(crate) async fn federate_signer(
         &self,
     ) -> anyhow::Result<std::sync::Arc<dyn super::federate_host::FederateSigner>> {
-        if self.active_jwt_signing_key().await.is_none() {
-            anyhow::bail!("OAuth access-token signing key is unavailable");
-        }
-        Ok(std::sync::Arc::new(EdDsaFederateSigner {
-            signing_key_store: self.signing_key_store.clone(),
-            fallback_key: self.ca_jwt_key.clone(),
-        }))
+        Ok(std::sync::Arc::new(HybridFederateSigner::new(
+            hyprstream_rpc::auth::global_composite_key_set(),
+        )?))
     }
     const MAX_CLIENT_ASSERTION_REPLAY_SECS: i64 = 360;
     const MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS: i64 = 3_600;
