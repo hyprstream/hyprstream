@@ -1,15 +1,12 @@
-//! H3b.1: disabled request-local proof verification, NOT dispatch admission.
+//! Request-local Federate proof verification and Policy admission.
 //!
-//! No production constructor for CredentialHandle or installed provider exists.
-//! A future bridge must verify the original host JWT (including signed generation,
-//! direct holder provenance and jti), bind the handle to its connection, and
-//! authenticate the bounded Policy RPC. Neither a subject nor a relay credential
-//! can construct a handle here. Fixtures deliberately bypass that unfinished bridge.
-//!
-//! Success establishes signatures and byte commitments only. Generated method
-//! policy, MAC, durable replay, account/grant authority and streaming currentness
-//! still precede any handler effect. This module is not called by dispatch or
-//! cached activation and cannot mint an admission permit.
+//! The serving factory installs this adapter only when session-store TLS config,
+//! a complete local collision inventory, authenticated Policy transport, and
+//! static proof enrollment are available. It accepts only a host JWT already
+//! signature-verified by the RPC layer; each request resolves current session
+//! primary and fresh Policy authority, then consumes shared replay state before
+//! dispatch. No subject-keyed positive cache or browser-selected DB locator is
+//! used.
 
 use std::{sync::Arc, time::Duration};
 
@@ -151,19 +148,15 @@ impl CredentialHandle {
     }
 }
 
-/// FUTURE trusted adapter contract, currently implemented by fixtures only.
-/// Authenticate Policy with static service keys and an explicit capability;
-/// recheck this exact credential's revocation on EVERY call. Never cache success.
-/// Return only the complete active H3a response; no browser-selected DB locator.
+/// Resolve current Policy-owned session state for every request. Never cache
+/// successful authority; no browser-selected DB locator is accepted.
 #[async_trait::async_trait]
 trait CurrentPrimary: Send + Sync {
     async fn resolve_current(&self, credential: &CredentialHandle) -> Result<SessionPrimary>;
 }
 
-/// An authenticated service client, never the browser bearer. The trusted
-/// service factory must construct `PolicyClient` with its own enrolled signer
-/// and capability; this type has no public/runtime constructor or fallback.
-#[allow(dead_code)] // Provider installation remains disabled until dispatch admission is complete.
+/// An authenticated service client, never the browser bearer. The serving
+/// factory supplies its own enrolled signer and capability; no fallback exists.
 struct PolicyPrimaryProvider {
     client: PolicyClient,
 }
@@ -218,10 +211,8 @@ struct LocalPolicy<'a> {
     in_flight: &'a Semaphore,
 }
 
-/// Disabled serving adapter. A future factory must provide an authenticated
-/// service Policy client, complete local inventory and static approver roster;
-/// no Model/Registry constructor installs one in this source slice.
-#[allow(dead_code)]
+/// Serving adapter installed only when the authenticated Policy client,
+/// complete local key inventory and static proof enrollment are available.
 pub(crate) struct DispatchAdapter {
     client: PolicyClient,
     inventory: CollisionInventory,
@@ -229,7 +220,37 @@ pub(crate) struct DispatchAdapter {
     in_flight: Semaphore,
 }
 
+struct GlobalEnrollmentResolver(&'static dyn EnrollmentResolver);
+
+impl EnrollmentResolver for GlobalEnrollmentResolver {
+    fn resolve_primary(&self, key: &VerifyingKey) -> Option<SignerSuiteRecord> {
+        self.0.resolve_primary(key)
+    }
+
+    fn resolve_approver(&self, kid: &[u8]) -> Option<SignerSuiteRecord> {
+        self.0.resolve_approver(kid)
+    }
+
+    fn resolve_service(&self, service: &str) -> Option<SignerSuiteRecord> {
+        self.0.resolve_service(service)
+    }
+}
+
 impl DispatchAdapter {
+    pub(crate) fn from_global_enrollment(
+        client: PolicyClient,
+        inventory: CollisionInventory,
+    ) -> anyhow::Result<Self> {
+        let resolver = hyprstream_rpc::proof::enrollment::global_enrollment_resolver()
+            .ok_or_else(|| anyhow::anyhow!("Federate proof enrollment is unavailable"))?;
+        Ok(Self {
+            client,
+            inventory,
+            static_enrollments: Arc::new(GlobalEnrollmentResolver(resolver)),
+            in_flight: Semaphore::new(32),
+        })
+    }
+
     pub(crate) async fn admit(
         &self,
         ctx: &EnvelopeContext,

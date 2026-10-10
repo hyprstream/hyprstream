@@ -1,8 +1,10 @@
-//! Disabled Policy-owned admission core. No RPC route, factory or token signer.
-//! OAuth's future H4 adapter must supply typed verified possession evidence.
-//! All serving requests/tool calls still require the separate H2 authority-at-use
-//! gate: admission deliberately does not lock account/PDS/Casbin through commit.
-#![allow(dead_code)] // Source-only slice; no runtime installer is exposed.
+//! Policy-owned admission core for the Federate session flow.
+//! The production factory installs it only with explicit TLS PostgreSQL config,
+//! the enrolled service manifest, complete local key inventory, and one enabled
+//! matching profile. OAuth verifies source-token possession; Policy rechecks
+//! current grants at admission and every protected request/tool-call boundary.
+//! Admission deliberately does not lock account/PDS/Casbin through commit.
+#![allow(dead_code)] // The staging profile is intentionally not a general-purpose API.
 
 use super::{EnvelopeContext, PolicyManager};
 use crate::auth::service_enrollment::ServiceEnrollmentManifest;
@@ -73,8 +75,8 @@ struct PendingDecision {
 }
 
 /// Internal upstream evidence, not a browser DTO or verification boolean.
-/// There is intentionally no production constructor until H4 implements BOTH
-/// signatures over the exact challenge and strict source-token validation.
+/// OAuth's FederateIssuer constructs it only after strict source-token
+/// validation and both signatures over the exact challenge have verified.
 struct PossessionEvidence {
     source: Source,
     ed_public: [u8; 32],
@@ -92,7 +94,7 @@ struct Authorities {
     enrollment: Arc<ServiceEnrollmentManifest>,
     profile: Profile,
     /// Server-owned serving tuple from a complete trusted inventory/profile
-    /// loader. No production constructor is installed by this source slice.
+    /// loader.
     serving_generation: [u8; 32],
     local_collision_inventory_id: [u8; 32],
 }
@@ -107,8 +109,8 @@ pub(super) struct AdmissionService {
     pending: Mutex<BTreeMap<[u8; 32], PendingDecision>>,
 }
 
-/// Source-only Policy authority for a single protected Registry/Model request.
-/// No runtime factory installs it. The same configured `AdmissionService`
+/// Policy authority for a single protected Registry/Model request.
+/// The production factory installs it with the same configured `AdmissionService`
 /// supplies the sole account/tenant/grant owner; serving processes hold only
 /// authenticated Policy clients, never database credentials.
 #[allow(dead_code)]
@@ -120,6 +122,18 @@ pub(super) struct RequestUseReader {
 }
 
 impl RequestUseReader {
+    pub(super) fn new(
+        admission: Arc<AdmissionService>,
+        pool: deadpool_postgres::Pool,
+    ) -> Self {
+        Self {
+            admission,
+            pool,
+            capacity: Semaphore::new(32),
+            clock_skew_secs: 30,
+        }
+    }
+
     pub(super) async fn admit(
         &self,
         ctx: &EnvelopeContext,
@@ -239,6 +253,45 @@ impl RequestUseReader {
         })
         .await??;
         Ok(())
+    }
+}
+
+impl AdmissionService {
+    /// Construct the fixed staging profile from host-owned protocol constants.
+    /// The policy factory must separately qualify the TLS pool and active
+    /// profile generation before installing this authority.
+    pub(super) fn configured(
+        policy: Arc<PolicyManager>,
+        enrollment: Arc<ServiceEnrollmentManifest>,
+        serving_generation: [u8; 32],
+        local_collision_inventory_id: [u8; 32],
+        session_pool: deadpool_postgres::Pool,
+    ) -> Self {
+        let scopes = BTreeSet::from([
+            "infer:model:qwen2.5-0.5b-instruct:main".to_owned(),
+            "query:model:Status".to_owned(),
+            "query:registry:qwen2.5-0.5b-instruct".to_owned(),
+            "write:model:Load".to_owned(),
+        ]);
+        Self {
+            authority: Some(Authorities {
+                policy,
+                enrollment,
+                profile: Profile {
+                    issuer: crate::services::oauth::federate_source::ISSUER.into(),
+                    host: crate::services::oauth::federate_source::HOST.into(),
+                    client: crate::services::oauth::federate_source::CLIENT.into(),
+                    resource: crate::services::oauth::federate_source::HOST.into(),
+                    client_scopes: scopes.clone(),
+                    resource_scopes: scopes,
+                },
+                serving_generation,
+                local_collision_inventory_id,
+            }),
+            capacity: Some(Semaphore::new(32)),
+            session_pool: Some(session_pool),
+            pending: Mutex::default(),
+        }
     }
 }
 

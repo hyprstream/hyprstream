@@ -2,8 +2,8 @@
 //!
 //! This module never migrates or enables a profile. A migration owner applies
 //! the reviewed SQL before deployment; a separate profile-control identity
-//! enables the exact generation. Policy's runtime login is checked here before
-//! any session or request-replay reader can be installed.
+//! enables the exact generation. Policy's runtime login and enabled profile
+//! are checked here before any Federate reader can be installed.
 
 use anyhow::{ensure, Context, Result};
 use deadpool_postgres::Pool;
@@ -44,12 +44,10 @@ const POLICY_SESSION_ROLE_SQL: &str =
          AND c.column_name <> 'status' \
          AND has_column_privilege(current_user, 'federate_session.sessions', c.column_name, 'UPDATE'))";
 
-#[allow(dead_code)] // The Policy factory installs this with the trusted profile loader.
-pub(super) struct PolicySessionPool(Pool);
+pub(in crate::services) struct PolicySessionPool(Pool);
 
-#[allow(dead_code)]
 impl PolicySessionPool {
-    pub(super) async fn from_env() -> Result<Self> {
+    pub(in crate::services) async fn from_env() -> Result<Self> {
         let url_file = std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_URL_FILE")
             .context("HYPRSTREAM_FEDERATE_SESSION_URL_FILE is required")?;
         let ca_file = std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_SSLROOTCERT_FILE")
@@ -85,8 +83,52 @@ impl PolicySessionPool {
         Ok(Self(pool))
     }
 
-    pub(super) fn into_pool(self) -> Pool {
+    pub(in crate::services) fn into_pool(self) -> Pool {
         self.0
+    }
+
+    /// Load the one enabled staging profile and prove it matches the complete
+    /// public-key inventory assembled from this process's trusted sources.
+    /// Profile-control owns enable/rotation; this role can only read it.
+    pub(in crate::services) async fn active_profile(
+        &self,
+        host: &str,
+        inventory_id: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        let client = self
+            .0
+            .get()
+            .await
+            .context("acquire Federate profile connection")?;
+        let rows = client
+            .query(
+                "SELECT enabled, authority_generation, collision_inventory_id \
+                 FROM federate_session.profile_state \
+                 WHERE host=$1 AND profile=$2",
+                &[&host, &hyprstream_session_store::PROFILE],
+            )
+            .await
+            .context("read Federate profile state")?;
+        ensure!(
+            rows.len() == 1,
+            "Federate profile state is missing or ambiguous"
+        );
+        let row = &rows[0];
+        let enabled: bool = row.get(0);
+        ensure!(enabled, "Federate profile is disabled");
+        let generation: Vec<u8> = row.get(1);
+        let current_inventory: Vec<u8> = row.get(2);
+        let generation: [u8; 32] = generation
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Federate authority generation has invalid length"))?;
+        let current_inventory: [u8; 32] = current_inventory
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Federate collision inventory has invalid length"))?;
+        ensure!(
+            current_inventory == inventory_id,
+            "Federate profile collision inventory does not match local trusted inventory"
+        );
+        Ok(generation)
     }
 }
 
