@@ -5,9 +5,7 @@
 #![allow(dead_code)] // Source-only slice; no runtime installer is exposed.
 
 use super::{EnvelopeContext, PolicyManager};
-use crate::auth::{
-    postgres_store::PolicyAccountReader, service_enrollment::ServiceEnrollmentManifest,
-};
+use crate::auth::service_enrollment::ServiceEnrollmentManifest;
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{
@@ -90,7 +88,6 @@ struct PossessionEvidence {
 }
 
 struct Authorities {
-    users: PolicyAccountReader,
     policy: Arc<PolicyManager>,
     enrollment: Arc<ServiceEnrollmentManifest>,
     profile: Profile,
@@ -100,8 +97,8 @@ struct Authorities {
     local_collision_inventory_id: [u8; 32],
 }
 
-/// Default denies before any authority or DB access. Future wiring must admit a
-/// writer-endpoint UserStore, fresh signed PDS mount and sole serving Policy.
+/// Default denies before any authority or DB access. The verified ATProto DID
+/// is the human principal; admission does not require a local UserStore row.
 #[derive(Default)]
 pub(super) struct AdmissionService {
     authority: Option<Authorities>,
@@ -213,7 +210,7 @@ impl RequestUseReader {
                     ) == namespace,
                 "verified holder namespace mismatch"
             );
-            let (source_issuer, source_subject) = primary.source_identity();
+            let source_issuer = primary.source_identity().0;
             ensure!(
                 primary.source_atproto_did() == session.subject,
                 "session subject does not match verified ATProto DID"
@@ -222,7 +219,7 @@ impl RequestUseReader {
                 .authorize_use(
                     session,
                     source_issuer,
-                    source_subject,
+                    primary.source_atproto_did(),
                     &data.resource,
                     &data.operation,
                     chrono::Utc::now().timestamp(),
@@ -363,26 +360,14 @@ impl Authorities {
     async fn decision(&self, source: &Source, requested: &[String]) -> Result<Decision> {
         ensure!(source.issuer == self.profile.issuer, "issuer mismatch");
         canonical_requested(requested)?;
-        let username = self
-            .users
-            .get_external_identity_user(&source.issuer, &source.subject)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("account not admitted"))?;
-        ensure!(
-            !username.is_empty() && !username.starts_with("service:") && username != "anonymous",
-            "local account subject required"
-        );
-        let profile = self
-            .users
-            .get_profile(&username)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("account not admitted"))?;
-        ensure!(profile.active == Some(true), "inactive account");
-        let account_id = profile
-            .sub
-            .ok_or_else(|| anyhow::anyhow!("account UUID missing"))?;
-        uuid::Uuid::parse_str(&account_id)?;
         let did = &source.atproto_did;
+        ensure!(
+            (did.starts_with("did:plc:") || did.starts_with("did:web:")) && did.len() <= 255,
+            "invalid verified ATProto DID"
+        );
+        // Internal join identifier only; the verified DID remains the
+        // authorization principal and no local account is created or read.
+        let account_id = federate_account_id(&self.profile.host, did);
         let policies = self.policy.get_policy().await;
         let domain_groups = self.policy.get_domain_grouping_policy().await;
         let tenants = candidate_tenants(did, &policies, &domain_groups)?;
@@ -445,7 +430,7 @@ impl Authorities {
     }
 
     /// Re-evaluate one protected operation from an exact, active session record
-    /// and its durable source binding. `session` and `source` must come from the
+    /// and its verified source provenance. `session` and `source` must come from the
     /// authenticated full-record lookup after the request's host JWT, holder
     /// proof, and v16 replay admission have been verified. This source slice has
     /// no constructor/route that can create that evidence; callers must not
@@ -454,7 +439,7 @@ impl Authorities {
         &self,
         session: &Session,
         source_issuer: &str,
-        source_subject: &str,
+        source_atproto_did: &str,
         resource: &str,
         operation: &str,
         now: i64,
@@ -504,26 +489,18 @@ impl Authorities {
 
         // These reads are intentionally fresh at every call boundary. Never
         // replace them with a request/session authorization cache.
-        let username = self
-            .users
-            .get_external_identity_user(source_issuer, source_subject)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("source identity is no longer admitted"))?;
-        let profile = self
-            .users
-            .get_profile(&username)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("account is no longer admitted"))?;
-        ensure!(profile.active == Some(true), "account is inactive");
-        let account_id = profile
-            .sub
-            .ok_or_else(|| anyhow::anyhow!("account UUID missing"))?;
-        ensure!(account_id == session.account_id, "account binding changed");
         let did = &session.subject;
         ensure!(
             (did.starts_with("did:plc:") || did.starts_with("did:web:")) && did.len() <= 255,
             "session subject is not an ATProto DID"
         );
+        ensure!(source_atproto_did == did, "source DID does not match session principal");
+        ensure!(
+            session.account_id == federate_account_id(&self.profile.host, did),
+            "session account binding changed"
+        );
+        // Current Policy grants are authoritative for both membership and
+        // suspension. These reads are fresh at each protected operation.
         ensure!(
             self.policy
                 .check_with_domain(did, &session.tenant, resource, operation)
@@ -532,6 +509,11 @@ impl Authorities {
         );
         Ok(())
     }
+}
+
+fn federate_account_id(host: &str, did: &str) -> String {
+    let name = format!("hyprstream-federate-account-v1\0{host}\0{did}");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
 #[cfg(test)]
@@ -817,7 +799,7 @@ impl AdmissionService {
                 .authorize_use(
                     current.session(),
                     current.source_identity().0,
-                    current.source_identity().1,
+                    current.source_atproto_did(),
                     resource,
                     operation,
                     chrono::Utc::now().timestamp(),
