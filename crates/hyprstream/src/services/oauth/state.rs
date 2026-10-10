@@ -278,6 +278,84 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    async fn federate_signer_uses_standard_oauth_access_token_key() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
+        let signer = super::EdDsaFederateSigner {
+            signing_key_store: None,
+            fallback_key: Some(std::sync::Arc::new(key.clone())),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::claims::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
+            now,
+            now + 60,
+        );
+
+        let token = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        let header = hyprstream_rpc::auth::jwt::parse_protected_header(&token).unwrap();
+        assert_eq!(header.alg, "EdDSA");
+        assert_eq!(header.typ, "at+jwt");
+        let verified =
+            hyprstream_rpc::auth::jwt::decode(&token, &key.verifying_key(), None).unwrap();
+        assert_eq!(verified.sub, claims.sub);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_signer_tracks_active_jwt_key_rotation() {
+        let first = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let second = ed25519_dalek::SigningKey::from_bytes(&[0x45; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let store = std::sync::Arc::new(crate::auth::SigningKeyStore::new(
+            crate::auth::key_rotation::KeySlots {
+                active: Some(crate::auth::key_rotation::KeySlot::new(
+                    first.clone(),
+                    now - 60,
+                    now + 3600,
+                )),
+                ..Default::default()
+            },
+        ));
+        let signer = super::EdDsaFederateSigner {
+            signing_key_store: Some(std::sync::Arc::clone(&store)),
+            fallback_key: Some(std::sync::Arc::new(first.clone())),
+        };
+        let claims = hyprstream_rpc::auth::claims::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
+            now,
+            now + 60,
+        );
+
+        let before = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        assert!(hyprstream_rpc::auth::jwt::decode(&before, &first.verifying_key(), None).is_ok());
+
+        store.0.write().await.active = Some(crate::auth::key_rotation::KeySlot::new(
+            second.clone(),
+            now,
+            now + 3600,
+        ));
+        let after = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        assert!(hyprstream_rpc::auth::jwt::decode(&after, &second.verifying_key(), None).is_ok());
+        assert!(hyprstream_rpc::auth::jwt::decode(&after, &first.verifying_key(), None).is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_signer_fails_closed_without_oauth_signing_key() {
+        assert!(state_for_replay_barrier_tests()
+            .federate_signer()
+            .await
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
     async fn federate_routes_deny_without_policy_adapter() {
         let state = Arc::new(state_for_replay_barrier_tests());
         let challenge = super::super::federate_host::challenge(
@@ -1341,18 +1419,24 @@ fn mesh_kem_public_for_policy(
     }
 }
 
-/// RSA-based FederateSigner using the OAuth service's RSA encoding key.
+/// Federate session signer using the same Ed25519 key as other OAuth access tokens.
 #[cfg(feature = "postgres")]
-struct RsaFederateSigner {
-    encoding_key: jsonwebtoken::EncodingKey,
+struct EdDsaFederateSigner {
+    signing_key_store: Option<std::sync::Arc<crate::auth::SigningKeyStore>>,
+    fallback_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
 }
 
 #[async_trait::async_trait]
 #[cfg(feature = "postgres")]
-impl super::federate_host::FederateSigner for RsaFederateSigner {
+impl super::federate_host::FederateSigner for EdDsaFederateSigner {
     async fn sign(&self, claims: &hyprstream_rpc::auth::claims::Claims) -> anyhow::Result<String> {
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        Ok(jsonwebtoken::encode(&header, claims, &self.encoding_key)?)
+        let active_key = match &self.signing_key_store {
+            Some(store) => store.active_key().await,
+            None => None,
+        }
+        .or_else(|| self.fallback_key.clone())
+        .ok_or_else(|| anyhow::anyhow!("OAuth access-token signing key is unavailable"))?;
+        Ok(hyprstream_rpc::auth::jwt::encode(claims, &active_key))
     }
 }
 
@@ -1369,16 +1453,18 @@ impl OAuthState {
         Ok(())
     }
 
-    /// Sign a committed Federate session JWT using the RSA encoding key.
+    /// Use the OAuth service's standard EdDSA access-token signing key.
     #[cfg(feature = "postgres")]
-    pub(crate) fn federate_signer(
+    pub(crate) async fn federate_signer(
         &self,
-    ) -> Option<std::sync::Arc<dyn super::federate_host::FederateSigner>> {
-        self.rsa_encoding_key.as_ref().map(|key| {
-            std::sync::Arc::new(RsaFederateSigner {
-                encoding_key: key.clone(),
-            }) as std::sync::Arc<dyn super::federate_host::FederateSigner>
-        })
+    ) -> anyhow::Result<std::sync::Arc<dyn super::federate_host::FederateSigner>> {
+        if self.active_jwt_signing_key().await.is_none() {
+            anyhow::bail!("OAuth access-token signing key is unavailable");
+        }
+        Ok(std::sync::Arc::new(EdDsaFederateSigner {
+            signing_key_store: self.signing_key_store.clone(),
+            fallback_key: self.ca_jwt_key.clone(),
+        }))
     }
     const MAX_CLIENT_ASSERTION_REPLAY_SECS: i64 = 360;
     const MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS: i64 = 3_600;
