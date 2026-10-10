@@ -2467,6 +2467,68 @@ mod empty_iss_gate_tests {
     }
 
     #[tokio::test]
+    async fn hybrid_federate_access_token_passes_production_verification_gate() {
+        use crate::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+
+        let (mut svc, ca) = mock_service();
+        svc.federate_opt_in = true;
+        svc.policy = crate::crypto::CryptoPolicy::Hybrid;
+
+        let ed = SigningKey::from_bytes(&[61; 32]);
+        let (pq, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let kid = crate::auth::composite_kid(&pq_vk, &ed.verifying_key());
+        let key_set = std::sync::Arc::new(CompositeKeySet::default());
+        key_set
+            .publish(
+                1,
+                "hybrid-federate-verifier-test".to_owned(),
+                vec![CompositeKeyPair::verifying(
+                    kid.clone(),
+                    pq_vk,
+                    ed.verifying_key(),
+                    CompositePairRole::OAuth,
+                    CompositePairState::Active,
+                    0,
+                    i64::MAX,
+                )],
+            )
+            .unwrap();
+        svc.key_source = std::sync::Arc::new(
+            ClusterKeySource::new(
+                ca.verifying_key(),
+                crate::auth::claims::FEDERATE_STAGING_HOST.into(),
+            )
+            .with_composite_key_set(key_set),
+        );
+
+        let holder = SigningKey::from_bytes(&[62; 32]).verifying_key().to_bytes();
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".into(), now, now + 300)
+            .with_issuer(crate::auth::claims::FEDERATE_STAGING_HOST.into())
+            .with_audience(Some(crate::auth::claims::FEDERATE_STAGING_HOST.into()))
+            .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
+            .with_tenant("tenant-a".into())
+            .with_sid("sid-hybrid")
+            .with_scope(Some("query:registry:List".into()))
+            .with_cnf_jwk(&holder)
+            .with_session_authority_generation([7; 32])
+            .with_jti();
+        let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid}"}}"#);
+        let token = composite_token(&header, &claims, &pq, &ed, false);
+        let mut ctx = ctx_with_token(token, false);
+        ctx.cnf = SigningKey::from_bytes(&[63; 32]).verifying_key().to_bytes();
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("hybrid Federate access token should pass Hybrid verification");
+        assert!(ctx.deferred_federate_credential().is_some());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+    }
+
+    #[tokio::test]
     async fn verified_local_did_unknown_jwt_cannot_authenticate() {
         let (svc, ca) = mock_service();
         let now = chrono::Utc::now().timestamp();

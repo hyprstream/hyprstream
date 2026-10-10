@@ -65,7 +65,7 @@ pub(crate) struct PreparedDecision {
     pub policy_handle: Vec<u8>,
 }
 
-/// The signer is the existing composite host authority, not a browser key.
+/// The signer uses the current OAuth access-token key, not a browser key.
 /// It is called only after Policy returns the committed session record.
 #[cfg(feature = "postgres")]
 #[async_trait::async_trait]
@@ -80,8 +80,9 @@ struct Pending {
     policy_handle: Vec<u8>,
 }
 
-/// No production factory constructs this yet. The OAuthState slot defaults to
-/// None and both routes fail before source, challenge or token state changes.
+/// The OAuthState slot defaults to None until the production OAuth factory
+/// installs this with its Policy adapter and access-token signer. When absent,
+/// both routes fail before source, challenge or token state changes.
 #[cfg(feature = "postgres")]
 pub(crate) struct FederateIssuer {
     verifier: Verifier,

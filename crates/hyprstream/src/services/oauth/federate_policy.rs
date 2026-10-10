@@ -1,4 +1,4 @@
-//! Disabled OAuth-side adapter for the enrolled Policy prepare/commit RPC.
+//! OAuth-side adapter for the Policy prepare/commit RPC.
 //!
 //! `FederateIssuer` owns the browser challenge and verifies both signatures;
 //! this adapter relays only its typed verified source/possession evidence to
@@ -19,9 +19,8 @@ use super::{
     federate_source::{self, AuthorityBinding, Source, VerifiedPossession},
 };
 
-/// Only an authenticated client constructed from OAuth's enrolled service
-/// credential may be passed here. This constructor is deliberately not called
-/// by `OAuthService::run` in the source-only packet.
+/// Only the authenticated Policy client constructed for this OAuth service is
+/// passed here by `OAuthService::run`.
 pub(crate) struct PolicyFederateAdmission {
     client: PolicyClient,
 }

@@ -1161,8 +1161,30 @@ impl Spawnable for OAuthService {
             if let Some(key) = ca_jwt_key {
                 oauth_state = oauth_state.with_ca_jwt_key(key);
             }
+            // Install the FederateIssuer for the Federate login path (#1718).
+            // Uses the PolicyClient for prepare/commit and the active OAuth
+            // access-token key (including key-store rotation) for the session JWT.
             if let Some(store) = signing_key_store {
                 oauth_state = oauth_state.with_signing_key_store(store);
+            }
+            #[cfg(feature = "postgres")]
+            {
+                let admission = std::sync::Arc::new(
+                    crate::services::oauth::federate_policy::PolicyFederateAdmission::new(
+                        oauth_state.policy_client.clone(),
+                    ),
+                );
+                let signer = oauth_state
+                    .federate_signer()
+                    .await
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                        format!("FederateSigner construction failed: {e:#}"),
+                    ))?;
+                oauth_state
+                    .install_federate_issuer(admission, signer)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                        format!("FederateIssuer installation failed: {e:#}"),
+                    ))?;
             }
             oauth_state = oauth_state.with_root_identity_key_store(root_identity_store);
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
