@@ -507,6 +507,15 @@ impl RegistryService {
         self
     }
 
+    #[cfg(feature = "postgres")]
+    pub(crate) fn with_federate_dispatch(
+        mut self,
+        adapter: Arc<crate::services::oauth::federate_proof::DispatchAdapter>,
+    ) -> Self {
+        self.federate_dispatch = Some(adapter);
+        self
+    }
+
     /// Install the production CAS PEP used by streaming continuations.
     pub fn with_cas_pep(mut self, pep: Arc<crate::mac::CasPep>) -> Self {
         self.cas_pep = pep;

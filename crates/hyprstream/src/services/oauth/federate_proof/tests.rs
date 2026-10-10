@@ -15,7 +15,7 @@ use hyprstream_rpc::{
         recipient_binding::FederateRecipientBinding,
     },
 };
-use hyprstream_session_store::primary::InventorySource;
+use hyprstream_session_store::primary::{CollisionInventory, InventorySource};
 
 use super::*;
 
@@ -278,7 +278,7 @@ fn request(proof: &[u8]) -> Request<'_> {
 
 #[tokio::test]
 async fn h3b_consumer_accepts_only_deferred_parser_recipient_extension() {
-    let (handle, record, inventory) = fixture();
+    let (handle, record, _) = fixture();
     let bytes = proof_with_deferred_recipient_extension(TOKEN);
     assert!(
         hyprstream_rpc::proof::parser::ParsedProof::parse(&bytes).is_err(),
@@ -287,7 +287,6 @@ async fn h3b_consumer_accepts_only_deferred_parser_recipient_extension() {
     let static_enrollments = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(1);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &static_enrollments,
         in_flight: &permits,
     };
@@ -312,11 +311,10 @@ async fn h3b_consumer_accepts_only_deferred_parser_recipient_extension() {
 
 #[tokio::test]
 async fn h3b_disabled_without_provider_and_fresh_lookup_on_every_reuse() {
-    let (handle, record, inventory) = fixture();
+    let (handle, record, _) = fixture();
     let static_enrollments = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(16);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &static_enrollments,
         in_flight: &permits,
     };
@@ -376,11 +374,10 @@ async fn h3b_disabled_without_provider_and_fresh_lookup_on_every_reuse() {
 
 #[tokio::test]
 async fn h3b_each_authority_binding_and_epoch_is_checked() {
-    let (handle, base, inventory) = fixture();
+    let (handle, base, _) = fixture();
     let static_enrollments = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(16);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &static_enrollments,
         in_flight: &permits,
     };
@@ -409,7 +406,7 @@ async fn h3b_each_authority_binding_and_epoch_is_checked() {
         |r| r.created_at = NOW as i64 + 1,
         |r| r.proof_epoch = 0,
         |r| r.proof_epoch = u64::MAX,
-        |r| r.collision_inventory_id[0] ^= 1,
+        |r| { r.collision_inventory_id.pop(); },
         |r| r.account_id.clear(),
         |r| r.grant_revision.clear(),
     ];
@@ -431,11 +428,10 @@ async fn h3b_each_authority_binding_and_epoch_is_checked() {
 
 #[tokio::test]
 async fn h3b_holder_components_and_exact_credential_body_schema_service() {
-    let (handle, record, inventory) = fixture();
+    let (handle, record, _) = fixture();
     let static_enrollments = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(16);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &static_enrollments,
         in_flight: &permits,
     };
@@ -542,11 +538,10 @@ async fn h3b_generated_request_root_type_ids_accept_and_file_ids_deny() {
             root_type_id, file_id,
             "{service} file ID is not its request root ID"
         );
-        let (handle, record, inventory) = fixture();
+        let (handle, record, _) = fixture();
         let static_enrollments = InMemoryEnrollmentResolver::new();
         let permits = Semaphore::new(1);
         let policy = LocalPolicy {
-            inventory: &inventory,
             static_enrollments: &static_enrollments,
             in_flight: &permits,
         };
@@ -627,11 +622,10 @@ async fn h3b_generated_request_root_type_ids_accept_and_file_ids_deny() {
 
 #[tokio::test]
 async fn h3b_deadline_and_capacity_deny_without_fallback() {
-    let (handle, record, inventory) = fixture();
+    let (handle, record, _) = fixture();
     let static_enrollments = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(1);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &static_enrollments,
         in_flight: &permits,
     };
@@ -672,12 +666,11 @@ async fn h3b_deadline_and_capacity_deny_without_fallback() {
 
 #[test]
 fn h3b_request_local_resolver_never_falls_back_to_static_primary() {
-    let (handle, record, inventory) = fixture();
+    let (handle, record, _) = fixture();
     let static_key = ed25519_dalek::SigningKey::from_bytes(&[71; 32]).verifying_key();
     let mut statics = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(16);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &statics,
         in_flight: &permits,
     };
@@ -694,7 +687,6 @@ fn h3b_request_local_resolver_never_falls_back_to_static_primary() {
     static_record.role = SignerRole::Service;
     statics.enrol_service("registry", static_record).unwrap();
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &statics,
         in_flight: &permits,
     };
@@ -710,25 +702,20 @@ fn h3b_request_local_resolver_never_falls_back_to_static_primary() {
         resolver.primary.replay_thumbprint(),
         next.primary.replay_thumbprint()
     );
-    // Inventory equality alone cannot permit a component collision.
-    let collision = inventory_with_key(&handle.expected.ed_public);
+    // Policy's authenticated response owns inventory verification; the serving
+    // boundary still rejects malformed inventory identifiers.
     let mut record = record;
-    record.collision_inventory_id = collision.id().to_vec();
+    record.collision_inventory_id.pop();
     let policy = LocalPolicy {
-        inventory: &collision,
         static_enrollments: &statics,
         in_flight: &permits,
     };
     assert!(local_resolver(&handle.expected, &record, &policy).is_err());
 }
 
-fn inventory_with_key(key: &[u8; 32]) -> CollisionInventory {
-    inventory(vec![key.to_vec()])
-}
-
 #[tokio::test]
 async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
-    let (a, record_a, inventory) = fixture();
+    let (a, record_a, _) = fixture();
     let (mut b, mut record_b, _) = fixture();
     b.expected.sid = "sid-b".into();
     b.credential_id = "jti-b".into();
@@ -748,7 +735,6 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
     let static_enrollments = InMemoryEnrollmentResolver::new();
     let permits = Semaphore::new(16);
     let policy = LocalPolicy {
-        inventory: &inventory,
         static_enrollments: &static_enrollments,
         in_flight: &permits,
     };

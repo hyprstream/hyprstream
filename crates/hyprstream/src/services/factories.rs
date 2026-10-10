@@ -74,6 +74,23 @@ fn policy_client_for_transport(
     PolicyClient::for_local_transport_bootstrap(transport, signing_key, policy_vk, token)
 }
 
+#[cfg(feature = "postgres")]
+fn federate_dispatch_for_service(
+    policy_client: PolicyClient,
+) -> anyhow::Result<Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>> {
+    if std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_URL_FILE").is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_SSLROOTCERT_FILE").is_some(),
+        "Federate session DB CA file must be configured with its URL file"
+    );
+    let adapter = crate::services::oauth::federate_proof::DispatchAdapter::from_global_enrollment(
+        policy_client,
+    )?;
+    Ok(Some(Arc::new(adapter)))
+}
+
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
@@ -1193,10 +1210,100 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_service = policy_service.with_default_audience(issuer.to_owned());
     }
     policy_service = policy_service.with_jwt_key_source(ctx.cluster_key_source());
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+
+    // The Federate runtime is enabled only by an explicit, file-backed TLS
+    // session-store configuration. Never infer a live database locator from
+    // OIDC input; partial configuration is a startup error and absent local
+    // configuration keeps the feature fail-closed for development.
+    #[cfg(feature = "postgres")]
+    {
+        let session_url_configured =
+            std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_URL_FILE").is_some();
+        let session_ca_configured =
+            std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_SSLROOTCERT_FILE").is_some();
+        anyhow::ensure!(
+            session_url_configured == session_ca_configured,
+            "Federate session DB URL and CA file must be configured together"
+        );
+        if session_url_configured {
+            let (enrollment, session_pool, serving_generation, collision_inventory, primary) =
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let enrollment = crate::auth::service_enrollment::global_service_enrollment()
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "Federate Policy runtime requires service-enrollment.json"
+                            ))?;
+                        let bootstrap = crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(
+                            &secrets_dir,
+                        )?;
+                        let required_services = hyprstream_service::list_factories()
+                            .map(|factory| factory.name)
+                            .collect::<Vec<_>>();
+                        let collision_inventory = crate::services::policy::inventory::
+                            complete_collision_inventory(
+                                &config.oauth,
+                                &secrets_dir,
+                                ctx.signing_key(),
+                                &required_services,
+                            )?;
+                        let session_db = crate::services::policy::session_db::PolicySessionPool::
+                            from_env()
+                            .await?;
+                        let serving_generation = session_db
+                            .active_profile(
+                                crate::services::oauth::federate_source::HOST,
+                                collision_inventory.id(),
+                            )
+                            .await?;
+                        let session_pool = session_db.into_pool();
+                        let mut capabilities = Vec::new();
+                        for service in ["oauth", "registry", "model"] {
+                            let key = bootstrap.get(service).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Federate primary lookup lacks enrolled service {service}"
+                                )
+                            })?;
+                            capabilities.push(
+                                hyprstream_session_store::primary::LookupCapability {
+                                    service: format!("service:{service}"),
+                                    service_key: key.ed25519.to_bytes(),
+                                    tenant: "*".into(),
+                                    resource: crate::services::oauth::federate_source::HOST.into(),
+                                },
+                            );
+                        }
+                        let primary = hyprstream_session_store::primary::PrimaryLookup::new(
+                            crate::services::oauth::federate_source::HOST.into(),
+                            serving_generation,
+                            collision_inventory.clone(),
+                            capabilities,
+                        )?;
+                        Ok::<_, anyhow::Error>((
+                            enrollment,
+                            session_pool,
+                            serving_generation,
+                            collision_inventory,
+                            primary,
+                        ))
+                    })
+                })?;
+            policy_service = policy_service.with_federate_runtime(
+                enrollment,
+                session_pool,
+                serving_generation,
+                collision_inventory.id(),
+                primary,
+            );
+            info!("Federate Policy session and request-use authorities installed");
+        } else {
+            tracing::warn!("Federate Policy runtime disabled: session DB URL/CA files are not configured");
+        }
+    }
 
     // Wire ES256 + ML-DSA rotation stores into PolicyService for composite token issuance.
     // Uses global singletons so PolicyService shares the same store the rotation task updates.
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let es256_store =
         crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
     policy_service = policy_service.with_es256_key_store(es256_store);
@@ -1257,6 +1364,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
         policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    #[cfg(feature = "postgres")]
+    let federate_dispatch = federate_dispatch_for_service(policy_client.clone())?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1371,6 +1480,10 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         registry_service = registry_service.with_expected_audience(issuer.to_owned());
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
+    #[cfg(feature = "postgres")]
+    if let Some(adapter) = federate_dispatch {
+        registry_service = registry_service.with_federate_dispatch(adapter);
+    }
     #[cfg(feature = "rocksdb")]
     if let Some(publisher) = pds_publisher {
         // A promotion publishes the former active key as a bounded drain slot;
@@ -1613,6 +1726,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client =
         policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
+    #[cfg(feature = "postgres")]
+    let federate_dispatch = federate_dispatch_for_service(policy_client.clone())?;
 
     // Create registry client
     let registry_client: RegistryClient =
@@ -1644,6 +1759,10 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         model_service = model_service.with_expected_audience(issuer.to_owned());
     }
     model_service = model_service.with_jwt_key_source(ctx.cluster_key_source());
+    #[cfg(feature = "postgres")]
+    if let Some(adapter) = federate_dispatch {
+        model_service = model_service.with_federate_dispatch(adapter);
+    }
 
     // #431 — DiscoveryClient for federated at:// record resolution. The discovery
     // key is in the trust store (depends_on includes "discovery"). Best-effort:

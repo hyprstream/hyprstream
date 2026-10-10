@@ -12,6 +12,17 @@ pub(super) struct SessionPrimaryReader {
 }
 
 impl SessionPrimaryReader {
+    pub(super) fn new(
+        pool: deadpool_postgres::Pool,
+        authority: PrimaryLookup,
+    ) -> Self {
+        Self {
+            pool,
+            authority,
+            in_flight: tokio::sync::Semaphore::new(16),
+        }
+    }
+
     pub(super) async fn resolve(
         &self,
         ctx: &EnvelopeContext,

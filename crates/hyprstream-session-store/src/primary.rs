@@ -97,7 +97,8 @@ pub struct ExpectedPrimary {
     pub expires_at: i64,
 }
 
-/// Trusted configuration only. No implicit wildcard/service-wide permission.
+/// Trusted configuration only. The tenant may be `*` only when the service
+/// and resource remain exact; Policy still checks every requested operation.
 pub struct LookupCapability {
     pub service: String,
     pub service_key: [u8; 32],
@@ -142,6 +143,15 @@ impl PrimaryLookup {
         })
     }
 
+    fn permits(&self, service: &str, service_key: &[u8; 32], tenant: &str, resource: &str) -> bool {
+        self.capabilities.iter().any(|capability| {
+            capability.service == service
+                && &capability.service_key == service_key
+                && (capability.tenant == tenant || capability.tenant == "*")
+                && capability.resource == resource
+        })
+    }
+
     /// Policy must authenticate the static service/key before calling. This
     /// additional explicit capability gate is not a substitute for signatures.
     pub async fn resolve(
@@ -166,12 +176,7 @@ impl PrimaryLookup {
                 .iter()
                 .any(|s| !bounded(s, 256) || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)))
             || expected.scopes.windows(2).any(|s| s[0] >= s[1])
-            || !self.capabilities.iter().any(|c| {
-                c.service == service
-                    && &c.service_key == service_key
-                    && c.tenant == expected.tenant
-                    && c.resource == expected.audience
-            })
+            || !self.permits(service, service_key, &expected.tenant, &expected.audience)
         {
             return Err(Error::Inactive);
         }
@@ -261,6 +266,53 @@ mod tests {
             vec![source("static:all", 3), source("envelope:local", 2)],
         )?;
         assert_ne!(a.id(), c.id());
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_tenant_capability_stays_bound_to_service_key_and_resource() -> Result<(), Error> {
+        let inventory = CollisionInventory::from_sources(
+            &["fixture:static".into()],
+            vec![InventorySource {
+                id: "fixture:static".into(),
+                keys: vec![],
+            }],
+        )?;
+        let lookup = PrimaryLookup::new(
+            "https://host.test".into(),
+            [3; 32],
+            inventory,
+            vec![LookupCapability {
+                service: "service:registry".into(),
+                service_key: [4; 32],
+                tenant: "*".into(),
+                resource: "https://host.test".into(),
+            }],
+        )?;
+        assert!(lookup.permits(
+            "service:registry",
+            &[4; 32],
+            "tenant-a",
+            "https://host.test"
+        ));
+        assert!(!lookup.permits(
+            "service:model",
+            &[4; 32],
+            "tenant-a",
+            "https://host.test"
+        ));
+        assert!(!lookup.permits(
+            "service:registry",
+            &[5; 32],
+            "tenant-a",
+            "https://host.test"
+        ));
+        assert!(!lookup.permits(
+            "service:registry",
+            &[4; 32],
+            "tenant-a",
+            "https://other.test"
+        ));
         Ok(())
     }
 }

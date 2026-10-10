@@ -38,13 +38,13 @@ use tracing::{debug, info, trace, warn};
 
 #[cfg(feature = "postgres")]
 #[path = "policy_primary.rs"]
-mod primary;
+pub(in crate::services) mod primary;
 #[cfg(feature = "postgres")]
 #[path = "policy_session_db.rs"]
-mod session_db;
+pub(in crate::services) mod session_db;
 #[cfg(feature = "postgres")]
 #[path = "policy_inventory.rs"]
-mod inventory;
+pub(in crate::services) mod inventory;
 
 /// Evaluate a policy check on behalf of an already-verified upstream caller.
 ///
@@ -255,6 +255,37 @@ impl PolicyService {
             enrollment_manifest: None,
             primary_enrollment_resolver: None,
         }
+    }
+
+    /// Install the complete, fail-closed Federate runtime after the factory
+    /// has verified the TLS database role, active profile and collision
+    /// inventory. No reader is installed from a partial or inferred config.
+    #[cfg(feature = "postgres")]
+    pub(super) fn with_federate_runtime(
+        mut self,
+        enrollment: Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>,
+        pool: deadpool_postgres::Pool,
+        serving_generation: [u8; 32],
+        collision_inventory_id: [u8; 32],
+        primary_authority: hyprstream_session_store::primary::PrimaryLookup,
+    ) -> Self {
+        let admission = Arc::new(federate_admission::AdmissionService::configured(
+            Arc::clone(&self.policy_manager),
+            enrollment,
+            serving_generation,
+            collision_inventory_id,
+            pool.clone(),
+        ));
+        self.session_primary = Some(primary::SessionPrimaryReader::new(
+            pool.clone(),
+            primary_authority,
+        ));
+        self.federate_request_use = Some(federate_admission::RequestUseReader::new(
+            Arc::clone(&admission),
+            pool,
+        ));
+        self.federate_admission = Some(admission);
+        self
     }
 
     /// Install the fail-closed authoritative primary-enrollment resolver (WS-C's

@@ -1,9 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::auth::user_store::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyprstream_rpc::Subject;
-use parking_lot::RwLock;
 
 const STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
 const STAGING_SCOPE: &str = "infer:model:qwen2.5-0.5b-instruct:main";
@@ -73,58 +71,6 @@ fn candidate_tenant_memberships_have_a_hard_ceiling() {
     assert!(candidate_tenants(ATPROTO_DID, &policies, &[]).is_err());
 }
 
-struct Accounts(RwLock<UserProfile>);
-#[async_trait::async_trait]
-impl UserStore for Accounts {
-    async fn get_profile(&self, _: &str) -> Result<Option<UserProfile>> {
-        Ok(Some(self.0.read().clone()))
-    }
-    async fn get_external_identity_user(&self, issuer: &str, sub: &str) -> Result<Option<String>> {
-        Ok((issuer == "https://issuer.test" && sub == "source-user").then(|| "alice".into()))
-    }
-    async fn register(&self, _: &str) -> Result<String> {
-        anyhow::bail!("forbidden")
-    }
-    async fn set_profile(&self, _: &str, _: UserProfilePatch) -> Result<()> {
-        anyhow::bail!("forbidden")
-    }
-    async fn remove(&self, _: &str) -> Result<bool> {
-        anyhow::bail!("forbidden")
-    }
-    async fn list_users(&self) -> Result<Vec<String>> {
-        anyhow::bail!("forbidden")
-    }
-    async fn search(&self, _: &UserFilter) -> Result<Vec<(String, UserProfile)>> {
-        anyhow::bail!("forbidden")
-    }
-    async fn set_active(&self, _: &str, _: bool) -> Result<()> {
-        anyhow::bail!("forbidden")
-    }
-    async fn list_pubkeys(&self, _: &str) -> Result<Vec<PubkeyEntry>> {
-        anyhow::bail!("forbidden")
-    }
-    async fn add_pubkey(&self, _: &str, _: VerifyingKey, _: Option<String>) -> Result<String> {
-        anyhow::bail!("forbidden")
-    }
-    async fn add_pubkey_hybrid(
-        &self,
-        _: &str,
-        _: VerifyingKey,
-        _: Vec<u8>,
-        _: Option<String>,
-    ) -> Result<String> {
-        anyhow::bail!("forbidden")
-    }
-    async fn remove_pubkey(&self, _: &str, _: &str) -> Result<bool> {
-        anyhow::bail!("forbidden")
-    }
-    async fn get_pubkey_user(&self, _: &str) -> Result<Option<String>> {
-        anyhow::bail!("forbidden")
-    }
-    async fn touch_pubkey(&self, _: &str, _: &str) -> Result<()> {
-        anyhow::bail!("forbidden")
-    }
-}
 fn source() -> Source {
     let now = chrono::Utc::now().timestamp();
     Source {
@@ -138,15 +84,7 @@ fn source() -> Source {
         expires_at: now + 120,
     }
 }
-async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
-    let users = Arc::new(Accounts(RwLock::new(UserProfile {
-        sub: Some(uuid::Uuid::new_v4().to_string()),
-        active: Some(true),
-        // Federate identity comes from Dex's signed ATProto claim, not the
-        // distinct hosted-account did:web profile field.
-        atproto_did: None,
-        ..Default::default()
-    })));
+async fn fixture() -> (AdmissionService, EnvelopeContext) {
     let signer = SigningKey::from_bytes(&[24; 32]).verifying_key();
     use crate::auth::service_enrollment::ServiceEnrollment;
     use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
@@ -184,7 +122,6 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
         .await
         .unwrap();
     let a = Authorities {
-        users: PolicyAccountReader::for_test(users.clone()),
         policy,
         enrollment,
         profile: Profile {
@@ -204,7 +141,6 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
             capacity: Some(Semaphore::new(1)),
             ..Default::default()
         },
-        users,
         EnvelopeContext::for_test_authenticated_subject_with_claims(
             Subject::new("service:oauth"),
             "*",
@@ -216,7 +152,7 @@ async fn fixture() -> (AdmissionService, Arc<Accounts>, EnvelopeContext) {
 
 #[tokio::test]
 async fn rpc_prepare_requires_writer_and_consumes_mismatched_handle_once() {
-    let (mut service, _, ctx) = fixture().await;
+    let (mut service, ctx) = fixture().await;
     let now = chrono::Utc::now().timestamp();
     let verified_source = source();
     let requested = vec![STAGING_SCOPE.to_owned()];
@@ -348,7 +284,7 @@ async fn rpc_prepare_requires_writer_and_consumes_mismatched_handle_once() {
 
 #[tokio::test]
 async fn h2_request_use_requires_exact_enrolled_serving_holder() {
-    let (service, _, _) = fixture().await;
+    let (service, _) = fixture().await;
     let manifest = &service.authority.as_ref().unwrap().enrollment;
     for (name, seed, expected) in [
         ("service:model", 25, "model"),
@@ -387,7 +323,7 @@ async fn h2_request_use_requires_exact_enrolled_serving_holder() {
 
 #[tokio::test]
 async fn h2_admission_disabled_caller_and_scope_boundaries() {
-    let (service, _, ctx) = fixture().await;
+    let (service, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into(), "read:model:other".into()];
     assert!(AdmissionService::default()
         .prepare(&ctx, &source(), &requested)
@@ -453,7 +389,7 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
 
 #[tokio::test]
 async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
-    let (service, _, ctx) = fixture().await;
+    let (service, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into()];
     canonical_requested(&requested).unwrap();
     let parsed = Scope::parse(STAGING_SCOPE).unwrap();
@@ -468,7 +404,7 @@ async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
 
 #[tokio::test]
 async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
-    let (mut service, _, ctx) = fixture().await;
+    let (mut service, ctx) = fixture().await;
     let authority = service.authority.as_mut().unwrap();
     authority.profile.client_scopes.insert(REGISTRY_LIST_SCOPE.into());
     authority.profile.resource_scopes.insert(REGISTRY_LIST_SCOPE.into());
@@ -481,7 +417,7 @@ async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
     let session = session(&decision);
     let authority = service.authority.as_ref().unwrap();
     let now = chrono::Utc::now().timestamp();
-    authority.authorize_use(&session, &source_record.issuer, &source_record.subject,
+    authority.authorize_use(&session, &source_record.issuer, &source_record.atproto_did,
         "registry:List", "query", now).await.unwrap();
     for (resource, operation) in [
         ("registry:Get", "query"),
@@ -489,33 +425,55 @@ async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
         ("model:qwen2.5-0.5b-instruct:main", "infer"),
     ] {
         assert!(authority.authorize_use(&session, &source_record.issuer,
-            &source_record.subject, resource, operation, now).await.is_err(),
+            &source_record.atproto_did, resource, operation, now).await.is_err(),
             "Registry-only session admitted {resource}/{operation}");
     }
 }
 
 #[tokio::test]
-async fn h2_admission_fresh_account_tenant_revision_and_capacity() {
-    let (service, users, ctx) = fixture().await;
+async fn h2_admission_uses_verified_did_without_a_local_account() {
+    let (service, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into()];
     let first = service.prepare(&ctx, &source(), &requested).await.unwrap();
     let again = service.prepare(&ctx, &source(), &requested).await.unwrap();
     assert!(first == again);
-    users.0.write().active = Some(false);
+    assert_eq!(first.subject, ATPROTO_DID);
+    assert_eq!(
+        first.account_id,
+        federate_account_id("https://host.test", ATPROTO_DID)
+    );
+    let policy = &service.authority.as_ref().unwrap().policy;
+    assert!(policy
+        .remove_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap());
     assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
-    users.0.write().active = Some(true);
-    users.0.write().sub = Some(uuid::Uuid::new_v4().to_string());
-    assert!(first != service.prepare(&ctx, &source(), &requested).await.unwrap());
-    users.0.write().atproto_did = Some("did:web:unrelated-hosted-account.example".into());
+    policy
+        .add_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap();
     let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
     assert_eq!(decision.subject, ATPROTO_DID);
+    assert_eq!(decision.account_id, first.account_id);
     let _permit = service.capacity.as_ref().unwrap().try_acquire().unwrap();
     assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
 }
 
 #[tokio::test]
 async fn h2_ambiguous_did_tenant_grants_fail_closed() {
-    let (service, _, ctx) = fixture().await;
+    let (service, ctx) = fixture().await;
     service.authority.as_ref().unwrap().policy
         .add_policy_with_domain(
             ATPROTO_DID,
@@ -582,7 +540,7 @@ fn session(challenge: &Decision) -> Session {
 
 #[tokio::test]
 async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
-    let (service, users, ctx) = fixture().await;
+    let (service, ctx) = fixture().await;
     let source_record = source();
     let decision = service
         .prepare(&ctx, &source_record, &[STAGING_SCOPE.into()])
@@ -596,7 +554,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .authorize_use(
             &session,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp(),
@@ -607,7 +565,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .authorize_use(
             &session,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             "model:qwen2.5-0.5b-instruct:other",
             "infer",
             chrono::Utc::now().timestamp()
@@ -618,7 +576,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .authorize_use(
             &session,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "query",
             chrono::Utc::now().timestamp()
@@ -631,7 +589,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .authorize_use(
             &expired,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp()
@@ -644,7 +602,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .authorize_use(
             &wrong_scope,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp()
@@ -652,12 +610,12 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .await
         .is_err());
     let mut wrong_source = source();
-    wrong_source.subject = "different-source-user".into();
+    wrong_source.atproto_did = "did:plc:differentprincipal".into();
     assert!(authority
         .authorize_use(
             &session,
             &wrong_source.issuer,
-            &wrong_source.subject,
+            &wrong_source.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp()
@@ -670,7 +628,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         .authorize_use(
             &wrong_session,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp()
@@ -692,7 +650,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
             .authorize_use(
                 &session,
                 &source_record.issuer,
-                &source_record.subject,
+                &source_record.atproto_did,
                 &resource,
                 "infer",
                 chrono::Utc::now().timestamp()
@@ -702,32 +660,39 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
         "next distinct boundary must observe revoke"
     );
 
-    // Account suspension and grant changes take effect on the next fresh
-    // check, without depending on session/token refresh.
+    // A Policy deny is the suspension mechanism and overrides an existing
+    // allow on the next fresh check, without depending on token refresh.
     authority
         .policy
         .add_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "allow")
         .await
         .unwrap();
-    users.0.write().active = Some(false);
+    authority
+        .policy
+        .add_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "deny")
+        .await
+        .unwrap();
     assert!(authority
         .authorize_use(
             &session,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp()
         )
         .await
         .is_err());
-    users.0.write().active = Some(true);
-    users.0.write().atproto_did = Some("did:web:unrelated-hosted-account.example".into());
+    assert!(authority
+        .policy
+        .remove_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "deny")
+        .await
+        .unwrap());
     assert!(authority
         .authorize_use(
             &session,
             &source_record.issuer,
-            &source_record.subject,
+            &source_record.atproto_did,
             &resource,
             "infer",
             chrono::Utc::now().timestamp()
@@ -772,8 +737,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
         &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
-    let (mut service, users, ctx) = fixture().await;
-    let original_account_id = users.0.read().sub.clone();
+    let (mut service, ctx) = fixture().await;
     let mut session_config = tokio_postgres::Config::new();
     session_config.host_path(&socket).user("postgres").dbname(&db);
     service.session_pool = Some(deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
@@ -811,15 +775,34 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .redeem(&ctx, &mut client, evidence(stale, "generation-mismatch"))
         .await
         .is_err());
-    users.0.write().sub = Some(uuid::Uuid::new_v4().to_string());
+    let challenge_policy = Arc::clone(&service.authority.as_ref().unwrap().policy);
+    assert!(challenge_policy
+        .remove_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap());
     assert!(service
         .redeem(&ctx, &mut client, evidence(challenge, "revision"))
         .await
         .is_err());
-    users.0.write().sub = original_account_id;
+    challenge_policy
+        .add_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap();
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
-    // Hold the H1 row lock to causally place suspension AFTER the Policy read
-    // and BEFORE admission commit. This lock is fixture instrumentation only.
+    // Hold the H1 row lock to causally place a grant revocation AFTER the
+    // Policy read and BEFORE admission commit. This lock is fixture-only.
     let tx = control.transaction().await.unwrap();
     tx.query_one(
         "SELECT host FROM federate_session.profile_state FOR UPDATE",
@@ -833,6 +816,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .unwrap()
         .get(0);
     let observer = connect(&socket, &db).await;
+    let race_policy = Arc::clone(&service.authority.as_ref().unwrap().policy);
     let mutate = async {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -852,7 +836,16 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         })
         .await
         .expect("admission reached PG after authority read");
-        users.0.write().active = Some(false);
+        race_policy
+            .remove_policy_with_domain(
+                ATPROTO_DID,
+                "tenant",
+                &format!("model:{STAGING_MODEL_REF}"),
+                "infer",
+                "allow",
+            )
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     };
     let (receipt, ()) = tokio::join!(
@@ -871,7 +864,16 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .is_some());
     // The NEXT authority read denies. This is not a Registry/Model dispatch test.
     assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
-    users.0.write().active = Some(true);
+    race_policy
+        .add_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap();
     let primary = Store::lookup_primary(
         &mut client,
         "https://host.test",
@@ -951,9 +953,35 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     request_use.resource = "model:other:main".into();
     assert!(reader.admit(&model_ctx, &request_use).await.is_err());
     request_use.resource = format!("model:{STAGING_MODEL_REF}");
-    users.0.write().active = Some(false);
+    service
+        .authority
+        .as_ref()
+        .unwrap()
+        .policy
+        .add_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "deny",
+        )
+        .await
+        .unwrap();
     assert!(reader.admit(&model_ctx, &request_use).await.is_err());
-    users.0.write().active = Some(true);
+    assert!(service
+        .authority
+        .as_ref()
+        .unwrap()
+        .policy
+        .remove_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "deny",
+        )
+        .await
+        .unwrap());
     reader.admit(&model_ctx, &request_use).await.unwrap();
     service
         .authorize_use(

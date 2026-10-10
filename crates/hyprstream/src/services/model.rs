@@ -713,6 +713,18 @@ impl ModelService {
         self
     }
 
+    #[cfg(feature = "postgres")]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn with_federate_dispatch(
+        mut self,
+        adapter: Arc<crate::services::oauth::federate_proof::DispatchAdapter>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_federate_dispatch must be called before service is shared")
+            .federate_dispatch = Some(adapter);
+        self
+    }
+
     /// Set the DiscoveryClient for federated `at://` record resolution (#431).
     ///
     /// # Panics

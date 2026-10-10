@@ -24,7 +24,7 @@ use crate::config::OAuthConfig;
 /// service names come from the trusted service-factory inventory, not from a
 /// browser or from whichever records happened to parse successfully.
 #[allow(dead_code)] // Used when the Federate Policy runtime factory is installed.
-pub(super) fn complete_collision_inventory(
+pub(in crate::services) fn complete_collision_inventory(
     oauth: &OAuthConfig,
     credentials_dir: &Path,
     node_key: &SigningKey,

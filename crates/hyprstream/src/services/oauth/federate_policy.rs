@@ -2,8 +2,8 @@
 //!
 //! `FederateIssuer` owns the browser challenge and verifies both signatures;
 //! this adapter relays only its typed verified source/possession evidence to
-//! Policy. No runtime factory installs it until Policy's complete authority
-//! inventory, scoped PostgreSQL roles and composite signer are available.
+//! Policy. The OAuth runner installs it in PostgreSQL builds; Policy remains
+//! fail-closed unless its complete authority and session-store runtime is ready.
 #![allow(dead_code)]
 
 use anyhow::{ensure, Result};

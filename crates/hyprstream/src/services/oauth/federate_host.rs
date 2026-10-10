@@ -1,5 +1,7 @@
-//! Fixed Federate browser exchange. The production runtime slot is absent
-//! until Policy installs an authenticated prepare/commit adapter and signer.
+//! Fixed Federate browser exchange. The OAuth runner installs the issuer only
+//! in PostgreSQL builds after constructing its authenticated Policy adapter and
+//! the currently committed composite signer; downstream Policy handlers still
+//! deny until their own session-store runtime is fully configured.
 #![allow(dead_code)] // The production adapter is a separate B1 activation packet.
 
 #[cfg(feature = "postgres")]
