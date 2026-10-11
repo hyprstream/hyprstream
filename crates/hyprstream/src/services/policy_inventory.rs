@@ -1,11 +1,11 @@
 //! Complete, read-only public-key inventory for Federate Policy admission.
 //!
 //! The older request-proof manifest helper intentionally skips unavailable
-//! sources. That is suitable for its legacy overlap check, but not for a
-//! durable Federate session: an omitted foreign key would make a new proof
-//! signer appear distinct when it is not. This loader must fail instead.
-//! No production factory installs it until the scoped DB/profile and signed
-//! account authority are supplied together.
+//! sources. That is suitable for its legacy overlap check, but not for
+//! Federate proof-key admission: an omitted foreign key would make a new proof
+//! signer appear distinct when it is not. This loader must fail instead. The
+//! Policy factory installs it with stateless admission when the validated
+//! service-enrollment manifest is available.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -21,8 +21,10 @@ use crate::auth::identity_store;
 use crate::config::OAuthConfig;
 
 /// Build one fingerprint of *all* configured foreign protocol keys. The
-/// service names come from the trusted service-factory inventory, not from a
-/// browser or from whichever records happened to parse successfully.
+/// required service names come from the manifest-validated deployed roster,
+/// not every compiled factory, a browser, or whichever records happened to
+/// parse successfully. Additional configured bootstrap keys still enter the
+/// collision set below.
 #[allow(dead_code)] // Used when the Federate Policy runtime factory is installed.
 pub(in crate::services) fn complete_collision_inventory(
     oauth: &OAuthConfig,

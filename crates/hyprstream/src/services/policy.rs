@@ -254,14 +254,12 @@ impl PolicyService {
     pub(super) fn with_federate_runtime(
         mut self,
         enrollment: Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>,
-        serving_generation: [u8; 32],
-        collision_inventory_id: [u8; 32],
+        collision_inventory: hyprstream_session_store::primary::CollisionInventory,
     ) -> Self {
         let admission = Arc::new(federate_admission::AdmissionService::configured(
             Arc::clone(&self.policy_manager),
             enrollment,
-            serving_generation,
-            collision_inventory_id,
+            collision_inventory,
             None,
         ));
         self.federate_request_use = Some(federate_admission::RequestUseReader::new(

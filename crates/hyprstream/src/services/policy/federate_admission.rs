@@ -15,7 +15,9 @@ use hyprstream_rpc::{
     proof::enrollment::authenticated_replay_namespace,
 };
 use hyprstream_rpc_std::policy_client::AdmitFederateRequest;
-use hyprstream_session_store::{Admission, PendingSession, PrimaryRecord, Session, Source, Store};
+use hyprstream_session_store::{
+    primary::CollisionInventory, Admission, PendingSession, PrimaryRecord, Session, Source, Store,
+};
 use rand::RngCore as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -97,6 +99,9 @@ struct Authorities {
     /// loader.
     serving_generation: [u8; 32],
     local_collision_inventory_id: [u8; 32],
+    /// Public keys remain in Policy so issuance can reject cross-protocol
+    /// proof-key reuse without persisting session rows or sharing root keys.
+    collision_inventory: CollisionInventory,
 }
 
 /// Default denies before any authority or DB access. The verified ATProto DID
@@ -304,10 +309,10 @@ impl AdmissionService {
     pub(super) fn configured(
         policy: Arc<PolicyManager>,
         enrollment: Arc<ServiceEnrollmentManifest>,
-        serving_generation: [u8; 32],
-        local_collision_inventory_id: [u8; 32],
+        collision_inventory: CollisionInventory,
         session_pool: Option<deadpool_postgres::Pool>,
     ) -> Self {
+        let inventory_id = collision_inventory.id();
         let scopes = BTreeSet::from([
             "infer:model:qwen2.5-0.5b-instruct:main".to_owned(),
             "query:model:Status".to_owned(),
@@ -326,8 +331,9 @@ impl AdmissionService {
                     client_scopes: scopes.clone(),
                     resource_scopes: scopes,
                 },
-                serving_generation,
-                local_collision_inventory_id,
+                serving_generation: inventory_id,
+                local_collision_inventory_id: inventory_id,
+                collision_inventory,
             }),
             capacity: Some(Semaphore::new(32)),
             session_pool,
@@ -630,10 +636,13 @@ impl AdmissionService {
         ed_public: [u8; 32],
         pq_public: Vec<u8>,
     ) -> Result<PreparedDecision> {
-        self.authority(ctx)?;
+        let authority = self.authority(ctx)?;
         let now = chrono::Utc::now().timestamp();
         ensure!(challenge_id != [0; 32], "invalid challenge ID");
-        ensure!(pq_public.len() == 1952, "invalid PQ public key");
+        ensure!(
+            authority.collision_inventory.permits(&ed_public, &pq_public),
+            "Federate proof key collides with a trusted protocol key or has an invalid PQ length"
+        );
         ensure!(
             created_at >= now - 30 && created_at <= now + 5,
             "stale challenge"
@@ -719,6 +728,10 @@ impl AdmissionService {
             "challenge/source binding changed"
         );
         ensure!(pq_public.len() == 1952, "invalid PQ public key");
+        ensure!(
+            authority.collision_inventory.permits(&ed_public, &pq_public),
+            "Federate proof key collides with a trusted protocol key"
+        );
         if let Some(pool) = &self.session_pool {
             let mut client = tokio::time::timeout(Duration::from_secs(2), pool.get()).await??;
             return self

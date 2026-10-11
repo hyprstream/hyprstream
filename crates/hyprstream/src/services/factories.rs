@@ -1217,8 +1217,13 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         if let Some(enrollment) = crate::auth::service_enrollment::global_service_enrollment()
             .cloned()
         {
-            let required_services = hyprstream_service::list_factories()
-                .map(|factory| factory.name)
+            // The complete manifest-validated bootstrap roster is the
+            // deployed service authority. Compiled but unprovisioned factories
+            // must not block otherwise-valid Policy startup.
+            let required_services = enrollment
+                .services
+                .keys()
+                .map(String::as_str)
                 .collect::<Vec<_>>();
             let collision_inventory = crate::services::policy::inventory::
                 complete_collision_inventory(
@@ -1227,11 +1232,9 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     ctx.signing_key(),
                     &required_services,
                 )?;
-            let inventory_id = collision_inventory.id();
             policy_service = policy_service.with_federate_runtime(
                 enrollment,
-                inventory_id,
-                inventory_id,
+                collision_inventory,
             );
             info!("Federate stateless Policy and request-use authorities installed");
         } else {

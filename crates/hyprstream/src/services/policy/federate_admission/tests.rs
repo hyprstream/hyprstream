@@ -109,6 +109,34 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
             ),
         ]),
     });
+    let collision_inventory = CollisionInventory::from_sources(
+        &["model".into(), "oauth".into(), "registry".into()],
+        vec![
+            hyprstream_session_store::primary::InventorySource {
+                id: "model".into(),
+                keys: vec![
+                    SigningKey::from_bytes(&[25; 32])
+                        .verifying_key()
+                        .to_bytes()
+                        .to_vec(),
+                    vec![27; 1952],
+                ],
+            },
+            hyprstream_session_store::primary::InventorySource {
+                id: "oauth".into(),
+                keys: vec![signer.to_bytes().to_vec()],
+            },
+            hyprstream_session_store::primary::InventorySource {
+                id: "registry".into(),
+                keys: vec![SigningKey::from_bytes(&[26; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec()],
+            },
+        ],
+    )
+    .unwrap();
+    let inventory_id = collision_inventory.id();
     let scopes = BTreeSet::from([STAGING_SCOPE.into()]);
     let policy = Arc::new(PolicyManager::new_in_memory().await.unwrap());
     policy
@@ -132,8 +160,9 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
             client_scopes: scopes.clone(),
             resource_scopes: scopes,
         },
-        serving_generation: [3; 32],
-        local_collision_inventory_id: [7; 32],
+        serving_generation: inventory_id,
+        local_collision_inventory_id: inventory_id,
+        collision_inventory,
     };
     (
         AdmissionService {
@@ -148,6 +177,90 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
             hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX),
         ),
     )
+}
+
+#[tokio::test]
+async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_inventory() {
+    let (service, ctx) = fixture().await;
+    let source = source();
+    let requested = vec![STAGING_SCOPE.to_owned()];
+    let now = chrono::Utc::now().timestamp();
+    let model_ed = SigningKey::from_bytes(&[25; 32]).verifying_key().to_bytes();
+
+    assert!(
+        service
+            .prepare_rpc(
+                &ctx,
+                source.clone(),
+                requested.clone(),
+                [11; 32],
+                now,
+                model_ed,
+                vec![31; 1952],
+            )
+            .await
+            .is_err(),
+        "foreign Ed25519 key was admitted as a Federate proof key"
+    );
+    assert!(
+        service
+            .prepare_rpc(
+                &ctx,
+                source.clone(),
+                requested.clone(),
+                [12; 32],
+                now,
+                [31; 32],
+                vec![27; 1952],
+            )
+            .await
+            .is_err(),
+        "foreign ML-DSA key was admitted as a Federate proof key"
+    );
+
+    let challenge_id = [13; 32];
+    let ed_public = [31; 32];
+    let pq_public = vec![32; 1952];
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            source.clone(),
+            requested,
+            challenge_id,
+            now,
+            ed_public,
+            pq_public.clone(),
+        )
+        .await
+        .expect("fresh proof-key pair should prepare");
+    let expires_at = (now + 60)
+        .min(source.expires_at)
+        .min(source.issued_at + 120);
+    // Simulate a corrupted/legacy pending handle so commit independently
+    // rechecks the current trusted inventory instead of trusting prepare.
+    service
+        .pending
+        .lock()
+        .await
+        .get_mut(&prepared.handle)
+        .unwrap()
+        .ed_public = model_ed;
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                prepared.handle,
+                source,
+                challenge_id,
+                now,
+                expires_at,
+                model_ed,
+                pq_public,
+            )
+            .await
+            .is_err(),
+        "commit failed to recheck the key collision policy"
+    );
 }
 
 #[tokio::test]
@@ -326,6 +439,9 @@ async fn h2_request_use_requires_exact_enrolled_serving_holder() {
 #[tokio::test]
 async fn stateless_request_use_rechecks_the_live_did_grant_each_call() {
     let (service, _) = fixture().await;
+    let authority = service.authority.as_ref().unwrap();
+    let generation = authority.serving_generation.to_vec();
+    let collision_inventory_id = authority.local_collision_inventory_id.to_vec();
     let reader = RequestUseReader::new(Arc::new(service), None);
     let model_ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
         Subject::new("service:model"),
@@ -344,8 +460,8 @@ async fn stateless_request_use_rechecks_the_live_did_grant_each_call() {
         scopes: vec![STAGING_SCOPE.into()],
         ed_public: vec![1; 32],
         suite_thumbprint: vec![2; 32],
-        generation: vec![3; 32],
-        collision_inventory_id: vec![7; 32],
+        generation,
+        collision_inventory_id,
         expires_at: chrono::Utc::now().timestamp() + 60,
         proof_epoch: 1,
         verified_namespace: vec![4; 32],
