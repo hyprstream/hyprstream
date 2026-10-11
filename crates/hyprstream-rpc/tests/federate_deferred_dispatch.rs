@@ -50,6 +50,8 @@ use sha2::{Digest, Sha256};
 
 const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
 const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
+const TEST_DID: &str = "did:plc:3f7ldey5bivhfjapwqi2sljy";
+const SOURCE_ISSUER: &str = "https://login.federate.to";
 const SCHEMA: u64 = 0xe7339d5d26ab3076;
 const CLIENT_DH: [u8; 32] = [0x61; 32];
 
@@ -122,7 +124,7 @@ fn token(subject: &str) -> String {
         "hs-cose-sign-ed25519-mldsa65-wns-v1",
         &[&holder_ed, &holder_pq],
     );
-    let claims = Claims::new(subject.into(), now, now + 120)
+    let mut claims = Claims::new(subject.into(), now, now + 120)
         .with_issuer(HOST.into())
         .with_audience(Some(HOST.into()))
         .with_client_id(CLIENT)
@@ -130,9 +132,12 @@ fn token(subject: &str) -> String {
         .with_sid("sid-a")
         .with_scope(Some("infer:model:qwen2.5-0.5b-instruct:main".into()))
         .with_cnf_jwk(&holder_ed)
-        .with_cnf_hs_signer_suite(URL_SAFE_NO_PAD.encode(suite))
-        .with_session_authority_generation([7; 32])
+        .with_federate_signer_suite(URL_SAFE_NO_PAD.encode(suite))
+        .with_federate_signer_inventory([7; 32])
         .with_jti();
+    claims.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode(holder_pq));
+    claims.hs_source_issuer_v1 = Some(SOURCE_ISSUER.into());
+    claims.hs_source_subject_v1 = Some("opaque-atproto-connector-subject".into());
     let vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&f.ca_pq)).unwrap();
     let kid = hyprstream_rpc::auth::jwt::composite_kid(&vk, &f.ca.verifying_key());
     let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid}"}}"#);
@@ -308,7 +313,7 @@ impl RequestService for Service {
             .deferred_federate_credential()
             .ok_or_else(|| anyhow::anyhow!("not deferred"))?;
         ensure!(
-            claims.sub == "alice" && ctx.subject().is_anonymous(),
+            claims.sub == TEST_DID && ctx.subject().is_anonymous(),
             "wrong subject or early identity"
         );
         ensure!(
@@ -330,7 +335,7 @@ impl RequestService for Service {
         Ok((
             VerifiedProof {
                 replay_thumbprint: [9; 32],
-                primary_principal: Some("alice".into()),
+                primary_principal: Some(TEST_DID.into()),
                 primary_suite: "hs-cose-sign-ed25519-mldsa65-wns-v1".into(),
                 approvers: vec![],
             },
@@ -345,7 +350,7 @@ impl RequestService for Service {
         _: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         ensure!(
-            ctx.subject().name() == Some("alice")
+            ctx.subject().name() == Some(TEST_DID)
                 && ctx.domain()? == "tenant-a"
                 && ctx.authenticated_signer_key().unwrap().to_bytes()
                     == fixture().holder.verifying_key().to_bytes()
@@ -445,7 +450,7 @@ async fn send(service: &Service, bytes: &[u8]) -> Result<Vec<u8>> {
 async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
     let f = fixture();
     let service = Service::new();
-    let bearer = token("alice");
+    let bearer = token(TEST_DID);
     let (response, stream) = recipients();
     let same_proof = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
     send(
@@ -531,7 +536,7 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
 async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
     let f = fixture();
     let service = Service::new();
-    let bearer = token("alice");
+    let bearer = token(TEST_DID);
     let (holder_response, holder_stream) = recipients();
     let holder_proof = proof(&bearer, &f.body, &holder_response, &holder_stream, CLIENT_DH);
 
