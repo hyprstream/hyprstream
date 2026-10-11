@@ -55,6 +55,7 @@ use hyprstream_rpc::{
     transport::{carrier::CarrierContext, TransportConfig},
     ToCapnp,
 };
+use parking_lot::Mutex;
 use std::{
     io::Cursor,
     sync::{
@@ -75,6 +76,7 @@ struct ModelBoundary {
     revocations: InMemoryCredentialRevocationStore,
     attempts: AtomicUsize,
     calls: AtomicUsize,
+    authorization_errors: Mutex<Vec<String>>,
 }
 
 #[async_trait(?Send)]
@@ -164,8 +166,13 @@ impl RequestService for ModelBoundary {
         ctx: &EnvelopeContext,
         _: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        // Confirm the proof-verified context, then enter the actual production
-        // Model authorization path. The outer dispatch PEP is a fixture double.
+        // Enter the production Model authorization path for both allowed and
+        // denied credentials. The outer dispatch PEP remains a fixture double.
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        if let Err(error) = ModelHandler::authorize(&self.model, ctx, RESOURCE, "infer").await {
+            self.authorization_errors.lock().push(error.to_string());
+            return Err(error);
+        }
         let context = ctx
             .security_context()
             .ok_or_else(|| anyhow::anyhow!("verified Model security context missing"))?;
@@ -175,8 +182,6 @@ impl RequestService for ModelBoundary {
             context.can_access(&required),
             "hybrid Federate request proof did not meet the Model method floor"
         );
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        ModelHandler::authorize(&self.model, ctx, RESOURCE, "infer").await?;
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok((b"authorized".to_vec(), None))
     }
@@ -209,6 +214,68 @@ fn enrollment_policy(level: Level, assurance: Assurance) -> CompiledPolicy {
     })
     .load(&signed)
     .unwrap()
+}
+
+async fn signed_model_request_bytes(
+    token: &[u8],
+    body: &[u8],
+    now: i64,
+    holder: &SigningKey,
+    holder_pq: &MlDsaSigningKey,
+    relay: &SigningKey,
+    relay_pq: &MlDsaSigningKey,
+    server: &SigningKey,
+) -> Result<Vec<u8>> {
+    let suite = hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
+    let response = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
+    let stream = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
+    let binding = FederateRecipientBinding::from_recipients(
+        Some(&response.public()),
+        Some(&stream.public()),
+        Some([61; 32]),
+    )?;
+    let holder_ed = holder.verifying_key().to_bytes();
+    let holder_pq_bytes = ml_dsa_sk_to_vk_bytes(holder_pq);
+    let kids = super::super::federate_source::session_primary_kids(&holder_ed, &holder_pq_bytes);
+    let proof_signer = AuthenticatedHybridProofSigner::new(
+        holder.clone(),
+        kids[0].to_vec(),
+        holder_pq.clone(),
+        kids[1].to_vec(),
+    )?;
+    let proof = build_authenticated_hybrid_request_proof(
+        &AuthenticatedRequestProofInput {
+            service_domain: "model",
+            credential: token,
+            issued_at: now as u64,
+            expires_at: now as u64 + 20,
+            capnp_schema_id: SCHEMA,
+            capnp_body: body,
+            response_binding: None,
+            federate_recipient_binding: Some(&binding),
+        },
+        &proof_signer,
+    )?;
+    let request = RequestEnvelope::new(body.to_vec())
+        .with_jwt_token(std::str::from_utf8(token)?.to_owned())
+        .with_proof_cwt(proof)
+        .with_service_domain("model")?
+        .with_client_dh_public([61; 32])
+        .with_response_kem_recipient(response.public())
+        .with_client_kem_public(stream.public())?;
+    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+        request,
+        relay,
+        relay_pq,
+        &derive_mesh_kem_recipient(server)?.public(),
+    )?;
+    let mut message = capnp::message::Builder::new_default();
+    signed.write_to(
+        &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+    );
+    let mut bytes = vec![];
+    capnp::serialize::write_message(&mut bytes, &message)?;
+    Ok(bytes)
 }
 
 #[tokio::test]
@@ -302,6 +369,7 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         revocations: InMemoryCredentialRevocationStore::new(),
         attempts: AtomicUsize::new(0),
         calls: AtomicUsize::new(0),
+        authorization_errors: Mutex::new(Vec::new()),
     };
     let now = chrono::Utc::now().timestamp();
     let session = hyprstream_session_store::Session {
@@ -372,6 +440,16 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         .can_access(&required));
     let missing = federate_exchange::committed_claims(&session, now, ISSUER, "opaque-sub")?;
     assert!(missing.clearance.is_none());
+    let public = federate_exchange::authorized_committed_claims(
+        &session,
+        now,
+        ISSUER,
+        "opaque-sub",
+        &EnrollmentSubjectContextResolver::new(Arc::new(enrollment_policy(
+            Level::Public,
+            Assurance::PqHybrid,
+        ))),
+    )?;
     let mut unknown = session.clone();
     unknown.subject = "did:plc:abcdefghijklmnopqrstuvwx".into();
     assert!(federate_exchange::authorized_committed_claims(
@@ -390,55 +468,61 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             .init_root::<hyprstream_rpc::common_capnp::error_info::Builder>()
             .set_message("model-fixture");
     })?;
+    for (index, (claims, expected_error)) in [
+        (
+            &missing,
+            "authorization denied: inference caller has no verified MAC clearance",
+        ),
+        (
+            &public,
+            "authorization denied: inference caller clearance does not dominate engine label",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let token = signer.sign(claims).await?;
+        let bytes = signed_model_request_bytes(
+            token.as_bytes(),
+            &body,
+            now,
+            &holder,
+            &holder_pq,
+            &relay,
+            &relay_pq,
+            &service.server,
+        )
+        .await?;
+        process_request(
+            &bytes,
+            &service,
+            EnvelopeVerification::AnySigner,
+            &service.server,
+            &envelope::InMemoryNonceCache::new(),
+            CarrierContext::iroh(),
+        )
+        .await?;
+        let errors = service.authorization_errors.lock();
+        assert_eq!(
+            errors.len(),
+            index + 1,
+            "authorization attempts={}",
+            service.attempts.load(Ordering::SeqCst)
+        );
+        assert!(errors.last().unwrap().contains(expected_error));
+    }
     let token = signer.sign(&allowed).await?;
-    let suite = hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
-    let response = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
-    let stream = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
-    let binding = FederateRecipientBinding::from_recipients(
-        Some(&response.public()),
-        Some(&stream.public()),
-        Some([61; 32]),
-    )?;
-    let kids =
-        super::super::federate_source::session_primary_kids(&session.ed_public, &session.pq_public);
-    let proof_signer = AuthenticatedHybridProofSigner::new(
-        holder.clone(),
-        kids[0].to_vec(),
-        holder_pq.clone(),
-        kids[1].to_vec(),
-    )?;
-    let proof = build_authenticated_hybrid_request_proof(
-        &AuthenticatedRequestProofInput {
-            service_domain: "model",
-            credential: token.as_bytes(),
-            issued_at: now as u64,
-            expires_at: now as u64 + 20,
-            capnp_schema_id: SCHEMA,
-            capnp_body: &body,
-            response_binding: None,
-            federate_recipient_binding: Some(&binding),
-        },
-        &proof_signer,
-    )?;
-    let request = RequestEnvelope::new(body.clone())
-        .with_jwt_token(token)
-        .with_proof_cwt(proof)
-        .with_service_domain("model")?
-        .with_client_dh_public([61; 32])
-        .with_response_kem_recipient(response.public())
-        .with_client_kem_public(stream.public())?;
-    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
-        request,
+    let bytes = signed_model_request_bytes(
+        token.as_bytes(),
+        &body,
+        now,
+        &holder,
+        &holder_pq,
         &relay,
         &relay_pq,
-        &derive_mesh_kem_recipient(&service.server)?.public(),
-    )?;
-    let mut message = capnp::message::Builder::new_default();
-    signed.write_to(
-        &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
-    );
-    let mut bytes = vec![];
-    capnp::serialize::write_message(&mut bytes, &message)?;
+        &service.server,
+    )
+    .await?;
     let _ = process_request(
         &bytes,
         &service,
@@ -451,8 +535,10 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         service.attempts.load(Ordering::SeqCst),
-        1,
-        "fixture must reach the real Model authorization handler"
+        3,
+        "all signed credentials must reach the real Model authorization handler"
     );
+    let errors = service.authorization_errors.lock();
+    assert_eq!(errors.len(), 2, "the two weaker clearances must be denied");
     Ok(())
 }
