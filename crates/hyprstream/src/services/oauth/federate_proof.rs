@@ -42,6 +42,41 @@ pub(crate) enum Error {
 }
 type Result<T> = std::result::Result<T, Error>;
 
+/// Exercise the real signed-credential/holder verifier at the dispatch boundary.
+/// The caller's fixture supplies action admission/replay separately; this does
+/// not stand in for the production Policy decision.
+#[cfg(test)]
+pub(crate) async fn verify_dispatch_fixture(
+    ctx: &EnvelopeContext,
+    service: &str,
+    schema_id: u64,
+    body: &[u8],
+) -> Result<(VerifiedProof, [u8; 32])> {
+    let handle = CredentialHandle::from_verified_context(ctx)?;
+    let enrollments = hyprstream_rpc::proof::enrollment::InMemoryEnrollmentResolver::new();
+    let semaphore = Semaphore::new(1);
+    let local = LocalPolicy {
+        static_enrollments: &enrollments,
+        in_flight: &semaphore,
+    };
+    let consumer = Consumer {
+        provider: Some(Arc::new(SignedCredentialPrimaryProvider)),
+    };
+    let request = Request {
+        proof: ctx.request_proof_cwt().ok_or(Error::Denied)?,
+        credential: ctx.deferred_federate_credential().ok_or(Error::Denied)?.1.as_bytes(),
+        service,
+        schema_id,
+        body,
+    };
+    let (verified, _) = consumer
+        .verify_with_primary(&handle, &request, &local, || {
+            chrono::Utc::now().timestamp().max(0) as u64
+        })
+        .await?;
+    Ok((verified, handle.expected.ed_public))
+}
+
 /// Immutable verified credential facts, never a positive authority snapshot.
 /// No Deserialize, subject-keyed registry, Clone or production constructor.
 struct CredentialHandle {

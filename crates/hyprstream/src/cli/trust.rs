@@ -254,6 +254,7 @@ impl LoadedAuthority {
 /// Dispatch one early-startup trust command.
 pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
     match command {
+        TrustCommand::SignMacBootPolicy(args) => crate::mac::bootload::sign_reviewed_boot_policy(&args),
         TrustCommand::MintDeploymentCa(args) => mint_deployment_ca(&args),
         TrustCommand::DelegateRegistrySigner(args) => delegate_registry_signer(&args),
         TrustCommand::MintRegistryJwt(args) => mint_registry_jwt(&args),

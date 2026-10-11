@@ -282,6 +282,21 @@ pub(crate) fn committed_claims(
     Ok(claims)
 }
 
+/// Attach only the exact subject's authority-enrolled MAC clearance. Policy's
+/// action grants do not imply a clearance, and browser inputs cannot select it.
+#[cfg(feature = "postgres")]
+pub(crate) fn authorized_committed_claims(
+    session: &Session,
+    now: i64,
+    source_issuer: &str,
+    source_subject: &str,
+    resolver: &dyn super::token_exchange::SubjectContextResolver,
+) -> Result<Claims, federate_source::Error> {
+    let claims = committed_claims(session, now, source_issuer, source_subject)?;
+    let context = resolver.resolve(&claims.sub).ok_or(federate_source::Error::Unavailable)?;
+    Ok(claims.with_clearance(*context.clearance()))
+}
+
 #[cfg(feature = "postgres")]
 #[derive(Serialize)]
 pub(crate) struct ExchangeResponse {

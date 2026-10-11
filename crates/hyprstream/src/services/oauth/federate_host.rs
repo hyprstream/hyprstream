@@ -199,11 +199,12 @@ impl FederateIssuer {
             return Err(federate_source::Error::Unavailable);
         }
         let now = i64::try_from(now).map_err(|_| federate_source::Error::Invalid)?;
-        let claims = super::federate_exchange::committed_claims(
+        let claims = super::federate_exchange::authorized_committed_claims(
             &committed,
             now,
             &source_issuer,
             &source_subject,
+            crate::mac::exchange_enrollment_resolver().as_ref(),
         )?;
         let token = tokio::time::timeout(Duration::from_secs(2), self.signer.sign(&claims))
             .await

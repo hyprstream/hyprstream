@@ -2175,6 +2175,19 @@ pub struct PolicyServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Optional signed MAC boot artifacts. Supported for OS-owned deployments
+    /// with a chain-enrolled Policy authority; invalid artifacts abort startup.
+    #[serde(default)]
+    pub boot_policy: Option<MacBootPolicyConfig>,
+}
+
+/// Both independently provisioned artifacts are mandatory when configured.
+/// Trust keys are never supplied by these files or this configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacBootPolicyConfig {
+    pub policy_path: PathBuf,
+    pub approval_path: PathBuf,
 }
 
 /// Discovery service configuration.

@@ -179,6 +179,127 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
     )
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<()> {
+    // Crypto configuration and the trust store are process-lifetime globals.
+    // Keep this full wire fixture independent of parallel unit tests.
+    const CHILD: &str = "HYPRSTREAM_OAUTH_POLICY_CLIENT_FIXTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "services::policy::federate_admission::tests::oauth_runtime_client_authenticates_real_prepare_and_commit", "--nocapture"])
+            .env(CHILD, "1").status()?;
+        anyhow::ensure!(status.success(), "isolated OAuth Policy client regression failed");
+        return Ok(());
+    }
+    use hyprstream_rpc::auth::{jwt, Claims, ClusterKeySource};
+    use hyprstream_rpc::transport::TransportConfig;
+    use hyprstream_rpc_std::policy_client::{
+        CommitFederateSession, FederateVerifiedSource, PolicyClient, PrepareFederateSession,
+    };
+    use hyprstream_service::{InprocManager, ServiceManager};
+
+    // Exercise the real client, signed envelope verification and Policy
+    // handlers. The dispatch PEP is an explicit test fixture; this test's
+    // boundary is the OAuth service credential and holder binding.
+    crate::mac::install_explicit_test_dispatch_pep();
+    let _ = hyprstream_rpc::envelope::install_verify_config(
+        hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+            pq_store: None,
+        },
+    );
+    let _ = hyprstream_rpc::envelope::install_response_verify_config(
+        hyprstream_rpc::envelope::ResponseVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+            pq_store: None,
+        },
+    );
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
+    let (admission, _) = fixture().await;
+    let policy = admission.authority.as_ref().unwrap().policy.clone();
+    for rule in crate::auth::policy_templates::SERVICE_BASE_POLICIES {
+        policy.add_policy_with_domain(rule.subject, rule.domain, rule.resource, rule.action, rule.effect).await?;
+    }
+    let authority_key = SigningKey::from_bytes(&[94; 32]);
+    let oauth_key = SigningKey::from_bytes(&[24; 32]);
+    let issuer = "https://federate-policy-client.test";
+    let transport = TransportConfig::inproc(format!("oauth-policy-{}", uuid::Uuid::new_v4()));
+    let root = tempfile::tempdir()?;
+    let git = Arc::new(tokio::sync::RwLock::new(git2db::Git2DB::open(root.path()).await?));
+    let mut service = super::super::PolicyService::new(
+        policy, Arc::new(authority_key.clone()), crate::config::TokenConfig::default(),
+        git, transport.clone(),
+    ).with_jwt_key_source(Arc::new(ClusterKeySource::new(
+        authority_key.verifying_key(), issuer.to_owned(),
+    )));
+    service.federate_admission = Some(Arc::new(admission));
+    let manager = InprocManager::new();
+    manager.spawn(Box::new(service)).await?;
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims::new("service:oauth".into(), now, now + 120)
+        .with_issuer(issuer.to_owned())
+        .with_cnf_jwk(oauth_key.verifying_key().as_bytes());
+    let token = jwt::encode_service_jwt(&claims, &authority_key);
+    hyprstream_service::global_trust_store().insert(
+        oauth_key.verifying_key(), hyprstream_service::Attestation {
+            scopes: ["oauth".to_owned()].into_iter().collect(), subject: None,
+            jwt: Some(token), expires_at: now + 120,
+            attested_by: Some(authority_key.verifying_key().to_bytes()),
+        },
+    );
+    let client = crate::services::oauth::runtime_policy_client(
+        &transport, oauth_key.clone(), authority_key.verifying_key(),
+    )?;
+    let source = source();
+    let verified = FederateVerifiedSource {
+        issuer: source.issuer, subject: source.subject, atproto_did: source.atproto_did,
+        jti: source.jti, nonce: source.nonce, token_hash: source.token_hash.to_vec(),
+        issued_at: source.issued_at, expires_at: source.expires_at,
+    };
+    let request = PrepareFederateSession {
+        source: verified.clone(), requested: vec![STAGING_SCOPE.into()],
+        challenge_id: vec![11; 32], challenge_created_at: now,
+        ed_public: SigningKey::from_bytes(&[31; 32]).verifying_key().to_bytes().to_vec(),
+        pq_public: vec![31; 1952],
+    };
+    let prepared = client.prepare_federate_session(&request).await?;
+    assert_eq!(prepared.subject, ATPROTO_DID);
+    let commit = CommitFederateSession {
+        source: verified, policy_handle: prepared.policy_handle,
+        challenge_id: request.challenge_id.clone(), challenge_created_at: now,
+        challenge_expires_at: now + 60, ed_public: request.ed_public.clone(),
+        pq_public: request.pq_public.clone(),
+    };
+    let committed = client.commit_federate_session(&commit).await?;
+    assert_eq!(committed.subject, ATPROTO_DID);
+    assert!(client.commit_federate_session(&commit).await.is_err());
+
+    let missing = PolicyClient::for_local_transport_bootstrap(
+        &transport, oauth_key.clone(), authority_key.verifying_key(), None,
+    )?;
+    assert!(missing.prepare_federate_session(&request).await.is_err());
+    for bad_claims in [
+        Claims { sub: "service:model".into(), ..claims.clone() },
+        claims.clone().with_cnf_jwk(SigningKey::from_bytes(&[32; 32]).verifying_key().as_bytes()),
+    ] {
+        let bad = PolicyClient::for_local_transport_bootstrap(
+            &transport, oauth_key.clone(), authority_key.verifying_key(),
+            Some(jwt::encode_service_jwt(&bad_claims, &authority_key)),
+        )?;
+        assert!(bad.prepare_federate_session(&request).await.is_err());
+    }
+    assert!(crate::services::oauth::runtime_policy_client(
+        &transport, SigningKey::from_bytes(&[93; 32]), authority_key.verifying_key(),
+    ).is_err(), "a different key cannot borrow OAuth's credential");
+    manager.stop("policy").await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_inventory() {
     let (service, ctx) = fixture().await;

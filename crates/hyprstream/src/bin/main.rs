@@ -3356,6 +3356,20 @@ fn main() -> Result<()> {
                     print_cert_hash,
                     standalone,
                 } => {
+                    // Validate configured artifacts on EVERY startup path, before
+                    // any service spawn or baseline; no JWT key-store condition
+                    // may silently skip the configured policy.
+                    if let Some(artifacts) = &config_for_service.policy.boot_policy {
+                        let secrets_dir =
+                            HyprConfig::resolve_secrets_dir_for(Some(&config_for_service))?;
+                        let policy = hyprstream_core::mac::bootload::install_configured_boot_policy(
+                            artifacts,
+                            &secrets_dir,
+                            is_os_owned_bootstrap,
+                        )
+                        .context("configured MAC boot policy rejected")?;
+                        tracing::info!(generation = policy.generation, "Verified configured MAC boot policy installed");
+                    }
                     // MAC genesis coverage gate (S1 activation, #567): log the
                     // boot-time coverage report on EVERY `service start` path —
                     // foreground (the mode that actually hosts services, incl.
@@ -3987,6 +4001,9 @@ fn main() -> Result<()> {
                                     }
                                     tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
 
+                                    // Configured artifacts were already installed
+                                    // at the startup gate; baseline is absent-config only.
+                                    if config.policy.boot_policy.is_none() {
                                     // MAC S4 policy bootload (#570): compile → sign
                                     // → verify-once-at-load → install the node's
                                     // baseline CompiledPolicy so the MAC PDP inputs
@@ -4036,6 +4053,7 @@ fn main() -> Result<()> {
                                             "MAC S4: no active ML-DSA signing key; baseline policy \
                                              NOT installed (fail-closed — grant-path resolver denies)"
                                         ),
+                                    }
                                     }
                                 }
 
@@ -5092,6 +5110,22 @@ mod resolver_startup_controls {
         ] {
             assert!(production.contains(entry), "missing {entry}");
         }
+    }
+
+    #[test]
+    fn configured_mac_boot_precedes_all_start_paths_and_never_falls_back() {
+        let source = include_str!("main.rs");
+        let production = source.split("mod resolver_startup_controls {").next().expect("production source");
+        let configured = production.find("if let Some(artifacts) = &config_for_service.policy.boot_policy").expect("configured boot branch");
+        let start = &production[configured..];
+        let install = start.find("install_configured_boot_policy(").expect("configured install");
+        let fatal = start.find(".context(\"configured MAC boot policy rejected\")?").expect("fatal configured failure");
+        let branch = start.find("if foreground || standalone {").expect("startup branch");
+        assert!(install < fatal && fatal < branch);
+        let fallback = start.find("if config.policy.boot_policy.is_none() {").expect("absent-only fallback");
+        let baseline = start.find("install_baseline_boot_policy(").expect("baseline install");
+        assert!(branch < fallback && fallback < baseline);
+        assert_eq!(production.matches("install_configured_boot_policy(").count(), 1);
     }
 
     /// Lifecycle classification is consumed only for the authenticated
