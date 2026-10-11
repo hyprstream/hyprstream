@@ -133,5 +133,6 @@ jobs:
               runuser -u ci -- cargo clippy --all-targets -- -D warnings
               runuser -u ci -- cargo clippy -p hyprstream --all-targets --features postgres -- -D warnings
               runuser -u ci -- cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings
+              runuser -u ci -- cargo clippy -p hyprstream --all-targets --no-default-features --features otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay -- -D warnings
             fi
           '
