@@ -1855,14 +1855,20 @@ mod tests {
         // checkpoint-backed discovery resolver; compat dials the
         // factory-resolved IPC transports (20-space continuation inside the
         // profile branch).
-        assert!(run.contains(
-            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
-        ));
+        assert!(run.contains("runtime_policy_client(\n                &self.policy_transport,"));
+        let policy_constructor = production
+            .split("pub(crate) fn runtime_policy_client(")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Create the OAuth Axum router.").next())
+            .expect("production Policy constructor must exist");
+        assert!(policy_constructor.contains("factories::service_token(&signing_key)"));
+        assert!(policy_constructor.contains("PolicyClient::for_local_transport_bootstrap("));
+        assert!(policy_constructor.contains("Some(token)"));
         assert!(run.contains(
             "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
+            policy_constructor.contains("if hyprstream_discovery::native_network_required() {\n        PolicyClient::from_provider("),
             "Required profile must resolve Policy through the checkpoint resolver"
         );
         assert!(
