@@ -63,12 +63,20 @@ impl MacDispatchPep for GeneratedDispatchPep {
         // boundary explicit even if a retained policy has the old service:*
         // IssueToken grant. Human callers still require downstream policy.
         if service_domain == "policy"
-            && matches!(row.symbolic_path,
-                "issueToken" | "registerSession" | "revokeSession"
-                    | "revokeCredential" | "exchangeDelegated" | "exchangeWit")
+            && matches!(
+                row.symbolic_path,
+                "issueToken"
+                    | "registerSession"
+                    | "revokeSession"
+                    | "revokeCredential"
+                    | "exchangeDelegated"
+                    | "exchangeWit"
+            )
         {
             let subject = ctx.subject();
-            if subject.name().is_some_and(|name| name.starts_with("service:"))
+            if subject
+                .name()
+                .is_some_and(|name| name.starts_with("service:"))
                 && (subject.is_federated()
                     || !matches!(subject.name(), Some("service:oauth" | "service:policy")))
             {

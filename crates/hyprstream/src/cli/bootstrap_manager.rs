@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use anyhow::Context;
-use tracing;
 use ed25519_dalek::SigningKey;
+use tracing;
 
 use hyprstream_tui::wizard::backend::*;
 
@@ -19,11 +19,7 @@ use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
 use crate::auth::{PolicyManager, ProductionUserStore};
 use crate::cli::gpu_detect;
-use crate::cli::policy_handlers::{
-    load_or_generate_signing_key, mint_local_token, parse_duration,
-};
-
-
+use crate::cli::policy_handlers::{load_or_generate_signing_key, mint_local_token, parse_duration};
 
 /// Pre-service bootstrap manager for the wizard TUI.
 ///
@@ -105,9 +101,9 @@ type StartDispatchFn = Arc<
             Option<PathBuf>,
             bool,
             bool,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
-        > + Send
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -150,7 +146,11 @@ pub fn is_first_run(_models_dir: &std::path::Path) -> bool {
 
 impl BootstrapManager {
     /// Create a new bootstrap manager.
-    pub fn new(rt: tokio::runtime::Handle, models_dir: PathBuf, config_services: Vec<String>) -> Self {
+    pub fn new(
+        rt: tokio::runtime::Handle,
+        models_dir: PathBuf,
+        config_services: Vec<String>,
+    ) -> Self {
         Self {
             rt,
             models_dir,
@@ -243,9 +243,13 @@ impl BootstrapManager {
         // Root-of-trust enrollment uses the same mandatory hybrid suite as
         // envelope traffic.
         let policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
-        match self.rt.block_on(
-            enroll_user(&*store, &secrets_dir, username, EnrollKeySource::Generate, policy),
-        ) {
+        match self.rt.block_on(enroll_user(
+            &*store,
+            &secrets_dir,
+            username,
+            EnrollKeySource::Generate,
+            policy,
+        )) {
             Ok(outcome) => {
                 // Surface enrollment notices (e.g. the classical-downgrade
                 // warning) — `enroll_user` is fail-loud, not fail-silent.
@@ -264,10 +268,7 @@ impl BootstrapManager {
     fn ensure_signing_key(&mut self) {
         if self.signing_key.is_none() {
             let keys_dir = self.keys_dir();
-            if let Ok(key) = self
-                .rt
-                .block_on(load_or_generate_signing_key(&keys_dir))
-            {
+            if let Ok(key) = self.rt.block_on(load_or_generate_signing_key(&keys_dir)) {
                 self.signing_key = Some(key);
             }
         }
@@ -380,8 +381,7 @@ impl WizardBackend for BootstrapManager {
         };
         let mut latest = None;
         while let Ok(msg) = rx.try_recv() {
-            let is_terminal =
-                matches!(msg, BootstrapPoll::Done(_) | BootstrapPoll::Failed(_));
+            let is_terminal = matches!(msg, BootstrapPoll::Done(_) | BootstrapPoll::Failed(_));
             latest = Some(msg);
             if is_terminal {
                 break;
@@ -391,8 +391,7 @@ impl WizardBackend for BootstrapManager {
         if let Some(BootstrapPoll::Done(_)) = &latest {
             self.ensure_signing_key();
         }
-        let result =
-            latest.unwrap_or_else(|| BootstrapPoll::InProgress("Starting...".to_owned()));
+        let result = latest.unwrap_or_else(|| BootstrapPoll::InProgress("Starting...".to_owned()));
         if matches!(result, BootstrapPoll::Done(_) | BootstrapPoll::Failed(_)) {
             self.bootstrap_rx = None;
         }
@@ -414,9 +413,9 @@ impl WizardBackend for BootstrapManager {
         if let Some(template) = get_template(name) {
             self.ensure_policy_manager();
             if let Some(ref pm) = self.policy_manager {
-                let _ = self.rt.block_on(async {
-                    pm.apply_template(template).await
-                });
+                let _ = self
+                    .rt
+                    .block_on(async { pm.apply_template(template).await });
             }
         }
     }
@@ -561,13 +560,9 @@ impl WizardBackend for BootstrapManager {
                 }
             };
             #[cfg(not(test))]
-            let outcome = dispatch_real_start(
-                &services,
-                explicit_config.as_deref(),
-                daemon,
-                iroh_required,
-            )
-            .await;
+            let outcome =
+                dispatch_real_start(&services, explicit_config.as_deref(), daemon, iroh_required)
+                    .await;
             match outcome {
                 Ok(()) => {
                     let _ = tx.send(OpStatus::Done);
@@ -741,7 +736,9 @@ async fn do_bootstrap(
     let mut steps = Vec::new();
 
     // ── 1. Directories ──────────────────────────────────────────────────────
-    let _ = tx.send(BootstrapPoll::InProgress("Checking directories...".to_owned()));
+    let _ = tx.send(BootstrapPoll::InProgress(
+        "Checking directories...".to_owned(),
+    ));
     let registry_path = models_dir.join(".registry");
     for dir in &[
         models_dir,
@@ -758,7 +755,9 @@ async fn do_bootstrap(
     steps.push("Directories OK".to_owned());
 
     // ── 2. Registry git repo ────────────────────────────────────────────────
-    let _ = tx.send(BootstrapPoll::InProgress("Verifying registry...".to_owned()));
+    let _ = tx.send(BootstrapPoll::InProgress(
+        "Verifying registry...".to_owned(),
+    ));
     let git_dir = registry_path.join(".git");
     if !git_dir.exists() && git2db::Git2DB::open(models_dir).await.is_err() {
         git2::Repository::init(&registry_path)
@@ -775,11 +774,15 @@ async fn do_bootstrap(
     }
 
     // ── 4. Signing key (becomes the CA key for PolicyService) ────────────
-    let _ = tx.send(BootstrapPoll::InProgress("Loading signing key...".to_owned()));
+    let _ = tx.send(BootstrapPoll::InProgress(
+        "Loading signing key...".to_owned(),
+    ));
     let root_key = load_or_generate_signing_key(keys_dir).await?;
 
     // ── 4b. Per-service independent keys + CA credentials ────────────────
-    let _ = tx.send(BootstrapPoll::InProgress("Generating service keys...".to_owned()));
+    let _ = tx.send(BootstrapPoll::InProgress(
+        "Generating service keys...".to_owned(),
+    ));
     {
         let credentials_dir = identity_store::credentials_dir()?;
 
@@ -794,9 +797,8 @@ async fn do_bootstrap(
         // CA JWT signing key (purpose-derived for JWT signature separation).
         // Derived BEFORE writing ca-pubkey so we can store the JWT key's verifying key,
         // not the root key's verifying key. Services verify JWTs with the derived key.
-        let ca_jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(
-            &root_key, "hyprstream-jwt-v1",
-        );
+        let ca_jwt_key =
+            hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
 
         // Write CA signing key only if not already present (idempotent)
         match identity_store::load_ca_signing_key(&credentials_dir) {
@@ -807,7 +809,10 @@ async fn do_bootstrap(
                 identity_store::write_ca_signing_key(&credentials_dir, &root_key)?;
                 // Write the JWT-derived verifying key as ca-pubkey (not the root key).
                 // PolicyService signs JWTs with ca_jwt_key; services must verify with its pubkey.
-                identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
+                identity_store::write_ca_verifying_key(
+                    &credentials_dir,
+                    &ca_jwt_key.verifying_key(),
+                )?;
             }
         }
         // Always sync signing-key and verifying keys (derived from root_key, harmless to overwrite).
@@ -844,7 +849,9 @@ async fn do_bootstrap(
     steps.push("Service keys OK".to_owned());
 
     // ── 5. Done ─────────────────────────────────────────────────────────────
-    let _ = tx.send(BootstrapPoll::InProgress("Validating environment...".to_owned()));
+    let _ = tx.send(BootstrapPoll::InProgress(
+        "Validating environment...".to_owned(),
+    ));
     steps.push("Environment OK".to_owned());
 
     let _ = tx.send(BootstrapPoll::Done(steps));
@@ -1024,7 +1031,10 @@ mod tests {
             vec!["policy".to_owned()],
         );
         manager.set_start_dispatch(Arc::new(
-            move |services: Vec<String>, explicit: Option<PathBuf>, daemon: bool, required: bool| {
+            move |services: Vec<String>,
+                  explicit: Option<PathBuf>,
+                  daemon: bool,
+                  required: bool| {
                 sink.lock().push(RecordedStart {
                     services,
                     explicit,
@@ -1032,7 +1042,9 @@ mod tests {
                     required,
                 });
                 Box::pin(async { Ok::<(), anyhow::Error>(()) })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+                    >
             },
         ));
 
@@ -1045,8 +1057,14 @@ mod tests {
                 assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
                 let call = &calls[0];
                 assert_eq!(call.services, vec!["policy".to_owned()]);
-                assert_eq!(call.explicit, None, "default profile has no explicit provenance");
-                assert!(!call.daemon, "default profile must keep the installed systemd unit route");
+                assert_eq!(
+                    call.explicit, None,
+                    "default profile has no explicit provenance"
+                );
+                assert!(
+                    !call.daemon,
+                    "default profile must keep the installed systemd unit route"
+                );
                 assert!(!call.required, "default profile is not required-native");
             }
             "explicit" => {
@@ -1063,7 +1081,10 @@ mod tests {
                 assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
                 let call = &calls[0];
                 assert_eq!(call.explicit, Some(marker), "provenance must be forwarded");
-                assert!(call.daemon, "explicit --config provenance must take the direct launch route");
+                assert!(
+                    call.daemon,
+                    "explicit --config provenance must take the direct launch route"
+                );
                 assert!(!call.required);
             }
             "required" => {
@@ -1079,8 +1100,14 @@ mod tests {
                 let calls = recorded.lock();
                 assert_eq!(calls.len(), 1, "the dispatch must run exactly once");
                 let call = &calls[0];
-                assert!(call.required, "the required-native profile must be observed");
-                assert!(call.daemon, "required-native must take the direct launch route");
+                assert!(
+                    call.required,
+                    "the required-native profile must be observed"
+                );
+                assert!(
+                    call.daemon,
+                    "required-native must take the direct launch route"
+                );
                 assert_eq!(call.explicit, None);
             }
             "invalid" => {
@@ -1159,7 +1186,10 @@ mod tests {
             let entry = provisioned
                 .get(name)
                 .unwrap_or_else(|| panic!("no bootstrap entry provisioned for '{name}'"));
-            assert!(entry.is_hybrid(), "service '{name}' was provisioned classical");
+            assert!(
+                entry.is_hybrid(),
+                "service '{name}' was provisioned classical"
+            );
         }
 
         // What landed on disk is hybrid too, and passes the strict check.
@@ -1204,8 +1234,7 @@ mod tests {
         let username = "alice";
 
         // CLI's signing key lives in the secrets dir.
-        let (_sk, vk) =
-            identity_store::load_or_generate_user_signing_key(secrets.path())?;
+        let (_sk, vk) = identity_store::load_or_generate_user_signing_key(secrets.path())?;
 
         let store = RocksDbUserStore::open(creds.path())?;
         // Register (user did not exist yet) + bind, exactly like the wizard path.
@@ -1235,8 +1264,7 @@ mod tests {
     async fn bind_is_idempotent_and_repoints_from_anonymous() -> anyhow::Result<()> {
         let creds = TempDir::new()?;
         let secrets = TempDir::new()?;
-        let (_sk, vk) =
-            identity_store::load_or_generate_user_signing_key(secrets.path())?;
+        let (_sk, vk) = identity_store::load_or_generate_user_signing_key(secrets.path())?;
         let fingerprint = crate::auth::user_store::pubkey_fingerprint(&vk);
 
         let store = RocksDbUserStore::open(creds.path())?;

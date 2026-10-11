@@ -10,7 +10,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
-
 use super::state::OAuthState;
 
 #[derive(Deserialize)]
@@ -119,9 +118,7 @@ mod tests {
     use hyprstream_rpc_std::policy_client::PolicyClient;
 
     /// Build a minimal OAuthState with a known Ed25519 signing key.
-    fn make_test_state(
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> (Arc<OAuthState>, String) {
+    fn make_test_state(signing_key: &ed25519_dalek::SigningKey) -> (Arc<OAuthState>, String) {
         use hyprstream_rpc::crypto::CryptoPolicy;
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
@@ -154,9 +151,7 @@ mod tests {
     /// already set (from another test), use the existing one.
     fn ensure_global_store() {
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
-            let store = Arc::new(
-                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
-            );
+            let store = Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new());
             let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(store);
         }
     }
@@ -227,7 +222,10 @@ mod tests {
 
         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&issuer, actual_jti);
         let store = hyprstream_rpc::auth::global_credential_revocation_store().unwrap();
-        assert!(!store.is_revoked(&cred_id).await, "precondition: not revoked");
+        assert!(
+            !store.is_revoked(&cred_id).await,
+            "precondition: not revoked"
+        );
 
         let response = revoke_token(
             State(state),

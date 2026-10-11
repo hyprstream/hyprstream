@@ -3,7 +3,7 @@
 //! Manages driver registration and selection, similar to Docker's
 //! daemon/graphdriver/driver_linux.go
 
-use super::driver::{Driver, DriverError, StorageDriver, DriverFactory};
+use super::driver::{Driver, DriverError, DriverFactory, StorageDriver};
 use inventory;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,10 +24,7 @@ impl DriverRegistry {
         // Load drivers from inventory registry
         for factory in inventory::iter::<DriverFactory> {
             info!("Registering storage driver: {}", factory.name());
-            drivers.insert(
-                factory.name().to_owned(),
-                factory.get_driver()
-            );
+            drivers.insert(factory.name().to_owned(), factory.get_driver());
         }
 
         Self { drivers }

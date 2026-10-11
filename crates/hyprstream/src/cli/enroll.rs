@@ -12,7 +12,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyprstream_rpc::crypto::CryptoPolicy;
 
 use crate::auth::identity_store::{self, UserIdentityKeys};
-use crate::auth::{KeyAlgorithm, UserStore, pubkey_fingerprint};
+use crate::auth::{pubkey_fingerprint, KeyAlgorithm, UserStore};
 
 /// Where the client signing key comes from during enrollment.
 #[derive(Debug, Clone)]
@@ -155,11 +155,19 @@ fn resolve_and_store_identity(
             if keys.mldsa.is_none() {
                 notices.push(classical_notice());
             }
-            Ok(ResolvedIdentity { keys, ed_backup: None, pq_backup: None, notices })
+            Ok(ResolvedIdentity {
+                keys,
+                ed_backup: None,
+                pq_backup: None,
+                notices,
+            })
         }
-        EnrollKeySource::RawSeed(seed) => {
-            adopt_identity(secrets_dir, SigningKey::from_bytes(&seed), policy, &pq_generate)
-        }
+        EnrollKeySource::RawSeed(seed) => adopt_identity(
+            secrets_dir,
+            SigningKey::from_bytes(&seed),
+            policy,
+            &pq_generate,
+        ),
         EnrollKeySource::SigningKey(sk) => adopt_identity(secrets_dir, sk, policy, &pq_generate),
     }
 }
@@ -377,10 +385,11 @@ mod tests {
         let store = open(&creds);
 
         // Generate the on-disk key and bind it to a stale "anonymous" first.
-        let (_sk, vk) =
-            identity_store::load_or_generate_user_signing_key(secrets.path()).unwrap();
+        let (_sk, vk) = identity_store::load_or_generate_user_signing_key(secrets.path()).unwrap();
         store.register("anonymous").await.unwrap();
-        bind_user_signing_key(&store, "anonymous", vk).await.unwrap();
+        bind_user_signing_key(&store, "anonymous", vk)
+            .await
+            .unwrap();
         let fp = crate::auth::pubkey_fingerprint(&vk);
         assert_eq!(
             store.get_pubkey_user(&fp).await.unwrap(),
@@ -449,7 +458,10 @@ mod tests {
 
         // The enrolled algorithm reflects reality: hybrid, not a hardcoded tag.
         assert_eq!(outcome.algorithm, KeyAlgorithm::HybridEd25519MlDsa65);
-        assert!(outcome.notices.is_empty(), "hybrid generate has no downgrade notice");
+        assert!(
+            outcome.notices.is_empty(),
+            "hybrid generate has no downgrade notice"
+        );
 
         // Both on-disk key files exist, each mode 0600.
         let ed = secrets.path().join("user-signing-key");
@@ -468,13 +480,14 @@ mod tests {
         let keys = store.list_pubkeys("alice").await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].algorithm, KeyAlgorithm::HybridEd25519MlDsa65);
-        let pq_bytes = keys[0].pq_pubkey.as_ref().expect("hybrid record has pq_pubkey");
+        let pq_bytes = keys[0]
+            .pq_pubkey
+            .as_ref()
+            .expect("hybrid record has pq_pubkey");
         // Matches the ML-DSA vk derived from the on-disk PQ seed.
-        let loaded = identity_store::load_or_generate_user_identity(
-            secrets.path(),
-            CryptoPolicy::Hybrid,
-        )
-        .unwrap();
+        let loaded =
+            identity_store::load_or_generate_user_identity(secrets.path(), CryptoPolicy::Hybrid)
+                .unwrap();
         assert_eq!(&loaded.pq_verifying_key_bytes().unwrap(), pq_bytes);
         // Fingerprint is the Ed25519 anchor's (kid), unchanged by the PQ key.
         assert_eq!(

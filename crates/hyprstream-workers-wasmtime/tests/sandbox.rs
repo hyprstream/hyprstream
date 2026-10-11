@@ -375,8 +375,10 @@ mod vfs_e2e {
         let alice_tx = rt.block_on(async { spawn_vfs_proxy(Arc::clone(&ns), alice.clone()) });
         let denied_tx = rt.block_on(async { spawn_vfs_proxy(Arc::clone(&ns), denied.clone()) });
 
-        let alice_h = hyprstream_workers_wasmtime::vfs::VfsProxyHandle::new(alice_tx, alice.clone());
-        let denied_h = hyprstream_workers_wasmtime::vfs::VfsProxyHandle::new(denied_tx, denied.clone());
+        let alice_h =
+            hyprstream_workers_wasmtime::vfs::VfsProxyHandle::new(alice_tx, alice.clone());
+        let denied_h =
+            hyprstream_workers_wasmtime::vfs::VfsProxyHandle::new(denied_tx, denied.clone());
 
         let sb_alice = Sandbox::from_bytes_for(&wasm, alice)
             .expect("load alice")

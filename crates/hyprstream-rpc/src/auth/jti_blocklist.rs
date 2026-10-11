@@ -174,7 +174,10 @@ impl InMemoryCredentialRevocationStore {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let mut map = self.revoked.write().expect("revocation store lock poisoned");
+            let mut map = self
+                .revoked
+                .write()
+                .expect("revocation store lock poisoned");
             map.retain(|_, exp| *exp > now);
         }
     }
@@ -232,7 +235,10 @@ impl CredentialRevocationStore for InMemoryCredentialRevocationStore {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let mut map = self.revoked.write().expect("revocation store lock poisoned");
+            let mut map = self
+                .revoked
+                .write()
+                .expect("revocation store lock poisoned");
             map.insert(id.clone(), expires_at);
             if map.len() > 10_000 {
                 drop(map);
@@ -298,8 +304,8 @@ impl RevocationRecord {
         let id = match (&self.jwt, &self.cwt) {
             (Some(jti), None) => CredentialId::jwt(self.iss.clone(), jti.clone()),
             (None, Some(cti)) => {
-                let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, cti)
-                    .ok()?;
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, cti).ok()?;
                 CredentialId::cwt(self.iss.clone(), bytes)
             }
             _ => return None,
@@ -365,7 +371,10 @@ impl FileBackedCredentialRevocationStore {
         let content = std::fs::read(path)?;
         // The complete portion ends just after the last newline; anything
         // beyond it is a torn fragment from a crash mid-append.
-        let complete_len = content.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let complete_len = content
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
         let mut loaded = 0usize;
         for line in content[..complete_len].split(|&b| b == b'\n') {
             if line.iter().all(u8::is_ascii_whitespace) {
@@ -460,8 +469,10 @@ impl CredentialRevocationStore for FileBackedCredentialRevocationStore {
         // the first publication), so a repeated revocation appends nothing —
         // a replayed revocation request cannot grow the log or force an
         // fsync per request.
-        let mut line = serde_json::to_string(&RevocationRecord::new(&id, expires_at))
-            .map_err(|e| RevocationPublishError::new(format!("record serialization failed: {e}")))?;
+        let mut line =
+            serde_json::to_string(&RevocationRecord::new(&id, expires_at)).map_err(|e| {
+                RevocationPublishError::new(format!("record serialization failed: {e}"))
+            })?;
         line.push('\n');
         {
             let mut file = self.file.lock();
@@ -510,7 +521,10 @@ mod tests {
         let id_a = CredentialId::jwt("https://a.example", "tok-1");
         let id_b = CredentialId::jwt("https://b.example", "tok-1");
 
-        store.revoke_credential(id_a.clone(), 9_999_999_999).await.unwrap();
+        store
+            .revoke_credential(id_a.clone(), 9_999_999_999)
+            .await
+            .unwrap();
 
         assert!(store.is_revoked(&id_a).await, "issuer A's token is revoked");
         assert!(
@@ -531,14 +545,20 @@ mod tests {
             issuer: "https://issuer.example".to_owned(),
             value: CredentialValue::Cwt(bytes.clone()),
         };
-        store.revoke_credential(cwt_id.clone(), 9_999_999_999).await.unwrap();
+        store
+            .revoke_credential(cwt_id.clone(), 9_999_999_999)
+            .await
+            .unwrap();
 
         // A JWT credential with the same bytes-as-UTF-8 as jti is NOT revoked.
         let jwt_id = CredentialId {
             issuer: "https://issuer.example".to_owned(),
             value: CredentialValue::Jwt(String::from_utf8(bytes).unwrap()),
         };
-        assert!(store.is_revoked(&cwt_id).await, "CWT cti credential is revoked");
+        assert!(
+            store.is_revoked(&cwt_id).await,
+            "CWT cti credential is revoked"
+        );
         assert!(
             !store.is_revoked(&jwt_id).await,
             "JWT jti credential with the same text is NOT revoked"
@@ -564,9 +584,18 @@ mod tests {
 
         // Fail-closed: invalid IDs report as revoked even though nothing was
         // explicitly revoked.
-        assert!(store.is_revoked(&empty_iss).await, "empty issuer → fail-closed");
-        assert!(store.is_revoked(&empty_jti).await, "empty jti → fail-closed");
-        assert!(store.is_revoked(&empty_cti).await, "empty cti → fail-closed");
+        assert!(
+            store.is_revoked(&empty_iss).await,
+            "empty issuer → fail-closed"
+        );
+        assert!(
+            store.is_revoked(&empty_jti).await,
+            "empty jti → fail-closed"
+        );
+        assert!(
+            store.is_revoked(&empty_cti).await,
+            "empty cti → fail-closed"
+        );
     }
 
     /// TTL cleanup evicts expired entries but keeps live ones.
@@ -576,7 +605,10 @@ mod tests {
         let live = CredentialId::jwt("https://a.example", "live");
         let expired = CredentialId::jwt("https://a.example", "expired");
 
-        store.revoke_credential(live.clone(), 9_999_999_999).await.unwrap();
+        store
+            .revoke_credential(live.clone(), 9_999_999_999)
+            .await
+            .unwrap();
         store.revoke_credential(expired.clone(), 1).await.unwrap(); // expired at time 1
 
         // Both entries are present before cleanup.
@@ -632,7 +664,10 @@ mod tests {
         // Revoke the credential: publish then evict.
         let store = InMemoryCredentialRevocationStore::new();
         let id = CredentialId::jwt(issuer, jti);
-        store.revoke_credential(id.clone(), now + 300).await.unwrap();
+        store
+            .revoke_credential(id.clone(), now + 300)
+            .await
+            .unwrap();
 
         // Publication: the blocklist reports revoked.
         assert!(store.is_revoked(&id).await, "credential must be published");
@@ -745,10 +780,16 @@ mod tests {
 
         // Revoke via the store's canonical API (publish then evict).
         let store = InMemoryCredentialRevocationStore::new();
-        store.revoke_credential(cwt_id.clone(), now + 300).await.unwrap();
+        store
+            .revoke_credential(cwt_id.clone(), now + 300)
+            .await
+            .unwrap();
 
         // Publication: the store reports revoked.
-        assert!(store.is_revoked(&cwt_id).await, "CWT credential must be published");
+        assert!(
+            store.is_revoked(&cwt_id).await,
+            "CWT credential must be published"
+        );
 
         // Eviction probe: the CWT entry is gone (already evicted by
         // revoke_credential's internal hook). Returns 0 because the
@@ -812,7 +853,10 @@ mod tests {
         // Probe: the subject IS cached (evicting its credential returns 1).
         let cred_id = CredentialId::jwt(issuer, jti);
         let evicted_before = revoke_verified_subject_credential(&cred_id);
-        assert_eq!(evicted_before, 1, "subject must be cached before session revocation");
+        assert_eq!(
+            evicted_before, 1,
+            "subject must be cached before session revocation"
+        );
 
         // Re-insert (the probe evicted it).
         remember_verified_claims(&subject, &claims, VerifiedKeyMaterial::Classical, None);
@@ -836,7 +880,10 @@ mod tests {
         .unwrap();
 
         // Publication: session is active before revocation.
-        assert!(!reg.is_revoked(&key).await, "session must be active before revoke");
+        assert!(
+            !reg.is_revoked(&key).await,
+            "session must be active before revoke"
+        );
 
         // Revoke the session — this publishes (marks revoked) then evicts
         // (flushes the generation, removing all cached handles).
@@ -928,7 +975,9 @@ mod tests {
             status: ActiveOrRevoked::Active,
             clearance_epoch: 0,
         };
-        reg.register_session(key.clone(), state.clone()).await.unwrap();
+        reg.register_session(key.clone(), state.clone())
+            .await
+            .unwrap();
         reg.revoke_session(&key).await.unwrap();
 
         // Re-registration must fail — revoked sessions are never reassigned.
@@ -983,8 +1032,12 @@ mod tests {
             clearance_epoch: 0,
         };
 
-        reg.register_session(oidc_key.clone(), oidc_state).await.unwrap();
-        reg.register_session(wl_key.clone(), wl_state).await.unwrap();
+        reg.register_session(oidc_key.clone(), oidc_state)
+            .await
+            .unwrap();
+        reg.register_session(wl_key.clone(), wl_state)
+            .await
+            .unwrap();
 
         // Revoke the OIDC session.
         reg.revoke_session(&oidc_key).await.unwrap();

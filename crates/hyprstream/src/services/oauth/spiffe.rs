@@ -10,12 +10,12 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Extension, Json,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, Signer as _, Verifier as _};
 use serde::{Deserialize, Serialize};
 

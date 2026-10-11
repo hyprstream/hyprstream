@@ -129,7 +129,9 @@ impl PythonShell {
 
     /// Run one op with `arg` as the UTF-8 argument; decode the reply.
     fn call(&mut self, op: PyOp, arg: &str) -> Result<PyResult> {
-        let (tag, body) = self.instance.call_op(PY_OP_EXPORT, op as i32, arg.as_bytes())?;
+        let (tag, body) = self
+            .instance
+            .call_op(PY_OP_EXPORT, op as i32, arg.as_bytes())?;
         let body = String::from_utf8_lossy(&body).into_owned();
         Ok(match tag {
             TAG_OK => PyResult::Ok(body),

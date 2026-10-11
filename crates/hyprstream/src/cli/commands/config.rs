@@ -166,7 +166,11 @@ pub struct ServicesConfigCli {
     ///
     /// Example: --services-startup registry,policy,worker,event
     /// Environment: HYPRSTREAM_SERVICES_STARTUP=registry,policy,worker,event
-    #[arg(long = "services-startup", env = "HYPRSTREAM_SERVICES_STARTUP", value_delimiter = ',')]
+    #[arg(
+        long = "services-startup",
+        env = "HYPRSTREAM_SERVICES_STARTUP",
+        value_delimiter = ','
+    )]
     #[serde(skip)]
     pub startup: Option<Vec<String>>,
 }

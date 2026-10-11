@@ -31,12 +31,12 @@
 // (and external `hyprstream_rpc::crypto::…`) paths keep compiling unchanged (#916).
 pub use hyprstream_crypto::{backend, cose_sign, cose_sign1, hmac, pq};
 
+pub mod broadcast_primitives;
 pub mod cose_encrypt;
 pub mod event_crypto;
 pub mod group_key;
 pub mod hybrid_kem;
 pub mod key_exchange;
-pub mod broadcast_primitives;
 pub mod signing;
 
 /// Policy-selected envelope/token signature suite.

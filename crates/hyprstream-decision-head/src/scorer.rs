@@ -201,7 +201,10 @@ mod tests {
             "P(true) is sigmoid(logit): {} vs {expected_p_true}",
             probs[1]
         );
-        assert!((probs[0] + probs[1] - 1.0).abs() < 1e-5, "[P(false), P(true)] sums to 1");
+        assert!(
+            (probs[0] + probs[1] - 1.0).abs() < 1e-5,
+            "[P(false), P(true)] sums to 1"
+        );
     }
 
     #[test]
@@ -219,7 +222,10 @@ mod tests {
             .double_value(&[]);
         let manual: f64 = probs.iter().enumerate().map(|(i, p)| i as f64 * p).sum();
         assert!((expected - manual).abs() < 1e-5, "{expected} vs {manual}");
-        assert!((0.0..=2.0).contains(&expected), "expectation within level range");
+        assert!(
+            (0.0..=2.0).contains(&expected),
+            "expectation within level range"
+        );
         let c = &output[0][0];
         assert_eq!(c.kind, QuestionKind::Score);
     }
@@ -249,8 +255,7 @@ mod tests {
     fn distillation_loss_backprops_into_the_shared_projection() {
         let vs = VarStore::new(Device::Cpu);
         let scorer = SharedScorer::new(&vs, 8);
-        let hidden = Tensor::randn([1, 2, 8], (Kind::Float, Device::Cpu))
-            .set_requires_grad(true);
+        let hidden = Tensor::randn([1, 2, 8], (Kind::Float, Device::Cpu)).set_requires_grad(true);
         let batch = vec![vec![anchors("c", QuestionKind::Choice, &[0, 1])]];
         let output = scorer.forward(&hidden, &batch).unwrap();
         let target = Tensor::from_slice(&[0.25, 0.75]).to_kind(Kind::Float);
@@ -273,7 +278,10 @@ mod tests {
         let output = scorer.forward(&hidden, &batch).unwrap();
         let target = Tensor::from_slice(&[0.0, 1.0, 0.0]).to_kind(Kind::Float);
         let loss = soft_target_kl(&output[0][0], &target).double_value(&[]);
-        assert!(loss.is_finite(), "zero target bins contribute nothing: {loss}");
+        assert!(
+            loss.is_finite(),
+            "zero target bins contribute nothing: {loss}"
+        );
     }
 
     #[test]
@@ -341,7 +349,11 @@ questions:
         assert_eq!(probs_vec(&questions[0]).len(), 2, "choice over 2 options");
         assert_eq!(probs_vec(&questions[1]).len(), 2, "score over 2 levels");
         assert!(questions[1].expected_value().is_some());
-        assert_eq!(probs_vec(&questions[2]).len(), 2, "noul [P(false), P(true)]");
+        assert_eq!(
+            probs_vec(&questions[2]).len(),
+            2,
+            "noul [P(false), P(true)]"
+        );
         assert!(questions[2].expected_value().is_none());
     }
 }

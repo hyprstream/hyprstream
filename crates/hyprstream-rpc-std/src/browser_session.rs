@@ -208,11 +208,7 @@ impl BrowserSession {
     /// `RpcClient` type generated TypeScript clients call `.call()` on —
     /// this does not instantiate `VfsShell`/`TclShell`.
     #[wasm_bindgen(js_name = "client")]
-    pub async fn client(
-        &self,
-        origin: &str,
-        service_name: &str,
-    ) -> Result<WasmRpcClient, JsError> {
+    pub async fn client(&self, origin: &str, service_name: &str) -> Result<WasmRpcClient, JsError> {
         self.fail_if_revoked()?;
         self.fail_if_expired()?;
         let inner = build_resolved_client(

@@ -29,7 +29,11 @@ pub fn window_block(title: Line<'_>, focused: bool) -> Block<'_> {
     Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(if focused { border_focused_style() } else { border_style() })
+        .border_style(if focused {
+            border_focused_style()
+        } else {
+            border_style()
+        })
         .title(title)
         .title_top(close_button())
         .style(Style::default().bg(BG))

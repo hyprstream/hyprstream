@@ -113,7 +113,10 @@ mod tests {
         full.insert::<Serve>();
         full.insert::<Manage>();
         full.insert::<Context>();
-        assert_eq!(format!("{}", full), "context,infer,manage,query,serve,train,write");
+        assert_eq!(
+            format!("{}", full),
+            "context,infer,manage,query,serve,train,write"
+        );
 
         // Empty
         let empty = CapabilitySet::new();

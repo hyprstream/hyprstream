@@ -112,10 +112,7 @@ impl<T: Display + Clone> SelectList<T> {
             } else {
                 Style::default()
             };
-            lines.push(Line::from(Span::styled(
-                format!("{marker}{item}"),
-                style,
-            )));
+            lines.push(Line::from(Span::styled(format!("{marker}{item}"), style)));
         }
 
         let paragraph = Paragraph::new(lines);
@@ -138,7 +135,10 @@ mod tests {
         // Can't go past end
         list.handle_key(&KeyPress::ArrowDown);
         assert_eq!(list.selected_index(), 2);
-        assert_eq!(list.handle_key(&KeyPress::Enter), WidgetResult::Confirmed("c"));
+        assert_eq!(
+            list.handle_key(&KeyPress::Enter),
+            WidgetResult::Confirmed("c")
+        );
     }
 
     #[test]
@@ -151,7 +151,10 @@ mod tests {
     #[test]
     fn test_escape() {
         let mut list = SelectList::new("Pick:", vec!["a"]);
-        assert_eq!(list.handle_key(&KeyPress::Escape), WidgetResult::<&str>::Cancelled);
+        assert_eq!(
+            list.handle_key(&KeyPress::Escape),
+            WidgetResult::<&str>::Cancelled
+        );
     }
 
     #[test]

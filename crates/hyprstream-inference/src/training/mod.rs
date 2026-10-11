@@ -23,8 +23,8 @@ pub mod tenant_delta;
 pub mod ttt;
 
 pub use adaptation_state::{
-    DeltaAdaptationState, AdaptationStrategy, GuardStatus, ResolveOutcome,
-    WritebackInfo, EvictedSnapshot,
+    AdaptationStrategy, DeltaAdaptationState, EvictedSnapshot, GuardStatus, ResolveOutcome,
+    WritebackInfo,
 };
 
 pub use checkpoint::{
@@ -38,15 +38,21 @@ pub use delta_pool::DeltaPool;
 
 pub use quality_filter::{FilterReason, FilterResult, QualityFilter, QualityFilterConfig};
 
-pub use tenant_delta::{TenantDelta, TenantDeltaConfig, SharedTenantDelta, serialize_state_dict_to_bytes, load_state_dict_from_bytes};
-
-pub use merge::{MergeStrategy, merge_state_dicts};
-
-pub use delta_reducer::{
-    Contribution, ContributionGate, ContributorState, DeltaReducer, NoopValidation, Provenance,
-    StackSvdReducer, ValidationHook, rank_cap_for_dtype_bytes, reduce_state_dicts,
+pub use tenant_delta::{
+    load_state_dict_from_bytes, serialize_state_dict_to_bytes, SharedTenantDelta, TenantDelta,
+    TenantDeltaConfig,
 };
 
-pub use ttt::{TTTConfig, TTTContext, TTTOverrides, TTTResult, TTTVerifier, TestTimeTrainer, RankOracle, RankOracleConfig, GradientGatingConfig};
+pub use merge::{merge_state_dicts, MergeStrategy};
+
+pub use delta_reducer::{
+    rank_cap_for_dtype_bytes, reduce_state_dicts, Contribution, ContributionGate, ContributorState,
+    DeltaReducer, NoopValidation, Provenance, StackSvdReducer, ValidationHook,
+};
+
+pub use ttt::{
+    GradientGatingConfig, RankOracle, RankOracleConfig, TTTConfig, TTTContext, TTTOverrides,
+    TTTResult, TTTVerifier, TestTimeTrainer,
+};
 
 pub use pipeline::{compute_ntp_loss_split, forward_train_pipeline, stage_ranges, TrainStage};

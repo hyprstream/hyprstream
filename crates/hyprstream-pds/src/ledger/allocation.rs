@@ -207,15 +207,15 @@ impl AllocationRecord {
     pub fn from_value(value: &DagCbor) -> Result<Self> {
         reject_unknown_fields(
             value,
-            &["grant", "unit", "amount", "epoch", "issuer", "holder", "class"],
+            &[
+                "grant", "unit", "amount", "epoch", "issuer", "holder", "class",
+            ],
             COLLECTION_NSID,
         )?;
         let grant = map_get_str(value, "grant", COLLECTION_NSID)?.to_owned();
-        let unit = parse_unit(
-            value
-                .get("unit")
-                .ok_or_else(|| anyhow::anyhow!("{COLLECTION_NSID}: missing required field \"unit\""))?,
-        )?;
+        let unit = parse_unit(value.get("unit").ok_or_else(|| {
+            anyhow::anyhow!("{COLLECTION_NSID}: missing required field \"unit\"")
+        })?)?;
         let amount = map_get_uint(value, "amount", COLLECTION_NSID)?;
         let epoch = map_get_uint(value, "epoch", COLLECTION_NSID)?;
         let issuer = map_get_str(value, "issuer", COLLECTION_NSID)?.to_owned();
@@ -294,11 +294,18 @@ mod tests {
         // schema has no such field, and unknown fields are rejected (#928 rule 1).
         let mut v = sample().to_value();
         if let DagCbor::Map(ref mut pairs) = v {
-            pairs.push((DagCbor::Text("legalName".into()), DagCbor::Text("Jane Doe".into())));
+            pairs.push((
+                DagCbor::Text("legalName".into()),
+                DagCbor::Text("Jane Doe".into()),
+            ));
             pairs.sort_by(|a, b| a.0.as_str().unwrap_or("").cmp(b.0.as_str().unwrap_or("")));
         }
-        let err = AllocationRecord::from_value(&v).expect_err("legal-identity field must be rejected");
-        assert!(err.to_string().contains("unknown field"), "unexpected: {err:#}");
+        let err =
+            AllocationRecord::from_value(&v).expect_err("legal-identity field must be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected: {err:#}"
+        );
     }
 
     #[test]
@@ -355,13 +362,19 @@ mod tests {
             "did:key:zHolder",
             GrantClass::Underwritten,
         );
-        assert!(mismatched.is_err(), "issuer != unit.issuer must be rejected");
+        assert!(
+            mismatched.is_err(),
+            "issuer != unit.issuer must be rejected"
+        );
     }
 
     #[test]
     fn record_validates_formats() {
         // Bad grant cid.
-        assert!(AllocationRecord::new("x", unit(), 1, 1, ISSUER, "did:key:z", GrantClass::Prepaid).is_err());
+        assert!(
+            AllocationRecord::new("x", unit(), 1, 1, ISSUER, "did:key:z", GrantClass::Prepaid)
+                .is_err()
+        );
         // Bad issuer did.
         assert!(AllocationRecord::new(
             "bafyreiexamplegrantcid1234567890abcdef",

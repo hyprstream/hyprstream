@@ -150,11 +150,7 @@ impl FlightClient {
 
         // Get flight info (schema and endpoints)
         let descriptor = FlightDescriptor::new_cmd(cmd_bytes);
-        let flight_info = self
-            .client
-            .get_flight_info(descriptor)
-            .await?
-            .into_inner();
+        let flight_info = self.client.get_flight_info(descriptor).await?.into_inner();
 
         // Get the ticket from the first endpoint
         let ticket = flight_info
@@ -201,10 +197,7 @@ impl FlightClient {
     /// Check if the server is reachable
     pub async fn health_check(&mut self) -> Result<(), FlightClientError> {
         // Simple health check - list actions
-        let _actions = self
-            .client
-            .list_actions(arrow_flight::Empty {})
-            .await?;
+        let _actions = self.client.list_actions(arrow_flight::Empty {}).await?;
         Ok(())
     }
 }
@@ -235,11 +228,7 @@ pub fn format_batches_as_table(batches: &[RecordBatch]) -> String {
     let mut output = String::new();
 
     // Calculate column widths
-    let mut widths: Vec<usize> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().len())
-        .collect();
+    let mut widths: Vec<usize> = schema.fields().iter().map(|f| f.name().len()).collect();
 
     for batch in batches {
         for (col_idx, col) in batch.columns().iter().enumerate() {

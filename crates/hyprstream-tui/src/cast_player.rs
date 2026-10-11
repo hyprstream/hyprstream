@@ -27,7 +27,7 @@ fn strip_dangerous_sequences(data: String) -> String {
             match chars.peek().copied() {
                 Some(']') | Some('P') | Some('_') | Some('^') => {
                     chars.next(); // consume the introducer
-                    // Skip until BEL or ST (\x1b\\)
+                                  // Skip until BEL or ST (\x1b\\)
                     let mut prev = '\0';
                     for ch in chars.by_ref() {
                         if ch == '\x07' {
@@ -91,7 +91,10 @@ impl CastFile {
 
     /// Parse with an optional idle time limit (in ms).
     /// Gaps between consecutive events exceeding the limit are compressed.
-    pub fn parse_with_idle_limit(content: &str, idle_limit_ms: Option<u64>) -> Result<Self, String> {
+    pub fn parse_with_idle_limit(
+        content: &str,
+        idle_limit_ms: Option<u64>,
+    ) -> Result<Self, String> {
         let mut lines = content.lines();
 
         let header_line = lines.next().ok_or("Empty cast file")?;
@@ -128,7 +131,9 @@ impl CastFile {
         if let Some(limit) = idle_limit_ms {
             let mut offset: u64 = 0;
             for i in 1..events.len() {
-                let gap = events[i].time_ms.saturating_sub(events[i - 1].time_ms + offset);
+                let gap = events[i]
+                    .time_ms
+                    .saturating_sub(events[i - 1].time_ms + offset);
                 if gap > limit {
                     offset += gap - limit;
                 }
@@ -195,10 +200,18 @@ impl CastPlayer {
         self.event_index >= self.cast.events.len() && self.elapsed_ms >= self.cast.duration_ms
     }
 
-    pub fn elapsed_ms(&self) -> u64 { self.elapsed_ms }
-    pub fn duration_ms(&self) -> u64 { self.cast.duration_ms }
-    pub fn event_index(&self) -> usize { self.event_index }
-    pub fn event_count(&self) -> usize { self.cast.events.len() }
+    pub fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+    pub fn duration_ms(&self) -> u64 {
+        self.cast.duration_ms
+    }
+    pub fn event_index(&self) -> usize {
+        self.event_index
+    }
+    pub fn event_count(&self) -> usize {
+        self.cast.events.len()
+    }
 
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;

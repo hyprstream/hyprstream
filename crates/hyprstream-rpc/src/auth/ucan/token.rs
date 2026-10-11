@@ -583,7 +583,12 @@ mod tests {
         let gateway = TestIdentity::generate();
         let mcp = TestIdentity::generate();
 
-        let root = signed_ucan(&user, &gateway.did(), vec![cap("mac://model/x", "infer")], vec![]);
+        let root = signed_ucan(
+            &user,
+            &gateway.did(),
+            vec![cap("mac://model/x", "infer")],
+            vec![],
+        );
         let leaf = signed_ucan(
             &gateway,
             &mcp.did(),
@@ -591,8 +596,16 @@ mod tests {
             vec![root.clone()],
         );
 
-        assert_eq!(leaf.audience(), &mcp.did(), "leaf audience = actor/presenter");
-        assert_eq!(leaf.issuer(), &gateway.did(), "leaf issuer = immediate (intermediate) issuer");
+        assert_eq!(
+            leaf.audience(),
+            &mcp.did(),
+            "leaf audience = actor/presenter"
+        );
+        assert_eq!(
+            leaf.issuer(),
+            &gateway.did(),
+            "leaf issuer = immediate (intermediate) issuer"
+        );
         assert_eq!(
             leaf.root_issuer(),
             &user.did(),

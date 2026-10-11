@@ -61,7 +61,8 @@ pub struct SettlementIssuerService {
 
 impl std::fmt::Debug for SettlementIssuerService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SettlementIssuerService").finish_non_exhaustive()
+        f.debug_struct("SettlementIssuerService")
+            .finish_non_exhaustive()
     }
 }
 
@@ -152,9 +153,7 @@ impl SettlementIssuer for SettlementIssuerService {
 
         // 6. If issuance succeeded, mark the settlement as issued.
         if outcome.is_ok() {
-            self.store
-                .mark_issued(&req.settlement_id)
-                .await?;
+            self.store.mark_issued(&req.settlement_id).await?;
         }
 
         Ok(IssueResponse {

@@ -28,7 +28,8 @@ pub mod model_client {
 
         let request_id = client.next_id();
         let payload = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(request_id);
             request.set_health_check(());
         })?;

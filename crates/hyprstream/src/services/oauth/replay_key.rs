@@ -52,7 +52,10 @@ pub fn client_assertion_jti(client_id: &str, jti: &str) -> ReplayKey {
 
 /// Digest a length-framed issuer/JTI tuple in the ATProto assertion domain.
 pub fn atproto_service_assertion_jti(issuer: &str, jti: &str) -> ReplayKey {
-    digest(b"atproto-service-assertion", &[issuer.as_bytes(), jti.as_bytes()])
+    digest(
+        b"atproto-service-assertion",
+        &[issuer.as_bytes(), jti.as_bytes()],
+    )
 }
 
 #[cfg(test)]

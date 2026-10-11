@@ -8,8 +8,8 @@ use hyprstream_session_store::primary::{
 };
 use hyprstream_session_store::Session;
 use hyprstream_session_store::{
-    Admission, Error, MIGRATION, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4, MIGRATION_V5, PROFILE,
-    PendingSession, ROLE_GRANTS, ROLE_GRANTS_V2, ROLE_GRANTS_V5, Source, Store,
+    Admission, Error, PendingSession, Source, Store, MIGRATION, MIGRATION_V2, MIGRATION_V3,
+    MIGRATION_V4, MIGRATION_V5, PROFILE, ROLE_GRANTS, ROLE_GRANTS_V2, ROLE_GRANTS_V5,
 };
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -159,7 +159,7 @@ async fn primary_scenarios(
         inventory(),
         vec![capability()],
     )
-        .unwrap();
+    .unwrap();
     let expected = ExpectedPrimary {
         issuer: HOST.into(),
         profile: PROFILE.into(),
@@ -243,27 +243,38 @@ async fn primary_scenarios(
         ("service:model", [41; 32]),
         ("user:alice", [42; 32]),
     ] {
-        assert!(authority.resolve(runtime, service, &key, &expected).await.is_err());
+        assert!(authority
+            .resolve(runtime, service, &key, &expected)
+            .await
+            .is_err());
     }
-    let no_capability = PrimaryLookup::new(HOST.into(), committed.generation, inventory(), vec![])
-        .unwrap();
+    let no_capability =
+        PrimaryLookup::new(HOST.into(), committed.generation, inventory(), vec![]).unwrap();
     assert!(no_capability
         .resolve(runtime, "service:model", &[42; 32], &expected)
         .await
         .is_err());
-    let stale_generation = PrimaryLookup::new(HOST.into(), [255; 32], inventory(), vec![capability()])
-        .unwrap();
+    let stale_generation =
+        PrimaryLookup::new(HOST.into(), [255; 32], inventory(), vec![capability()]).unwrap();
     assert!(stale_generation
         .resolve(runtime, "service:model", &[42; 32], &expected)
         .await
         .is_err());
     let changed_inventory = CollisionInventory::from_sources(
         &["fixture:changed".into()],
-        vec![InventorySource { id: "fixture:changed".into(), keys: vec![vec![0; 32]] }],
+        vec![InventorySource {
+            id: "fixture:changed".into(),
+            keys: vec![vec![0; 32]],
+        }],
     )
     .unwrap();
-    let stale_inventory = PrimaryLookup::new(HOST.into(), committed.generation, changed_inventory, vec![capability()])
-        .unwrap();
+    let stale_inventory = PrimaryLookup::new(
+        HOST.into(),
+        committed.generation,
+        changed_inventory,
+        vec![capability()],
+    )
+    .unwrap();
     assert!(stale_inventory
         .resolve(runtime, "service:model", &[42; 32], &expected)
         .await
@@ -347,12 +358,10 @@ async fn scenarios(socket: &str, database: &str) {
         "SELECT has_column_privilege('hs_policy_runtime', 'federate_session.sessions', 'proof_epoch', 'UPDATE')",
         &[],
     ).await.unwrap().get::<_, bool>(0));
-    assert!(
-        runtime
-            .batch_execute("UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1")
-            .await
-            .is_err()
-    );
+    assert!(runtime
+        .batch_execute("UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1")
+        .await
+        .is_err());
     for sql in [
         "SELECT * FROM federate_session.request_replay",
         "DELETE FROM federate_session.request_replay",
@@ -435,17 +444,23 @@ async fn scenarios(socket: &str, database: &str) {
     let mut reassigned_source = input(n, 5);
     reassigned_source.source.atproto_did = "did:plc:bcdefghijklmnopqrstuvwxy2".into();
     reassigned_source.session.subject = reassigned_source.source.atproto_did.clone();
-    assert!(matches!(
-        Store::admit(&mut runtime, &reassigned_source).await,
-        Err(Error::Conflict)
-    ), "an issuer/subject binding cannot be reassigned to another DID");
+    assert!(
+        matches!(
+            Store::admit(&mut runtime, &reassigned_source).await,
+            Err(Error::Conflict)
+        ),
+        "an issuer/subject binding cannot be reassigned to another DID"
+    );
     let mut reassigned_account = input(n, 6);
     reassigned_account.source.subject = "another-upstream-subject".into();
     reassigned_account.session.account_id = "another-account".into();
-    assert!(matches!(
-        Store::admit(&mut runtime, &reassigned_account).await,
-        Err(Error::Conflict)
-    ), "one DID cannot be admitted to a second local account UUID");
+    assert!(
+        matches!(
+            Store::admit(&mut runtime, &reassigned_account).await,
+            Err(Error::Conflict)
+        ),
+        "one DID cannot be admitted to a second local account UUID"
+    );
     assert_eq!(count(&admin, "sessions").await, 1);
     assert_eq!(count(&admin, "identity_bindings").await, 1);
     Store::revoke(&runtime, HOST, &committed.sid, &committed.generation)
@@ -589,15 +604,13 @@ async fn scenarios(socket: &str, database: &str) {
     let stored = rollback_session.expect("rollback admitted one session");
     assert!(Store::active(&reconnect, &stored).await.unwrap());
     assert!(stored.proof_epoch > committed.proof_epoch);
-    assert!(
-        admin
-            .execute(
-                "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1 WHERE sid=$1",
-                &[&stored.sid],
-            )
-            .await
-            .is_err()
-    );
+    assert!(admin
+        .execute(
+            "UPDATE federate_session.sessions SET proof_epoch=proof_epoch+1 WHERE sid=$1",
+            &[&stored.sid],
+        )
+        .await
+        .is_err());
     let namespace = [42u8; 32];
     let request_id = [43u8; 16];
     Store::consume_request_replay(&mut runtime, &stored, &namespace, &request_id, 30)
@@ -612,12 +625,10 @@ async fn scenarios(socket: &str, database: &str) {
         .await
         .unwrap();
     assert_eq!(count(&admin, "request_replay").await, 2);
-    assert!(
-        runtime
-            .batch_execute("DELETE FROM federate_session.request_replay")
-            .await
-            .is_err()
-    );
+    assert!(runtime
+        .batch_execute("DELETE FROM federate_session.request_replay")
+        .await
+        .is_err());
     let mut wrong_epoch = stored.clone();
     wrong_epoch.proof_epoch += 1;
     assert!(matches!(
@@ -636,7 +647,8 @@ async fn scenarios(socket: &str, database: &str) {
     let before_row = control
         .query_one("SELECT authority_generation, collision_inventory_id, enabled FROM federate_session.profile_state WHERE host=$1", &[&HOST])
         .await.unwrap();
-    let before: (Vec<u8>, Vec<u8>, bool) = (before_row.get(0), before_row.get(1), before_row.get(2));
+    let before: (Vec<u8>, Vec<u8>, bool) =
+        (before_row.get(0), before_row.get(1), before_row.get(2));
     assert!(before.2);
     assert!(control.execute("UPDATE federate_session.profile_state SET authority_generation=decode(repeat('06',32),'hex'), collision_inventory_id=decode(repeat('09',32),'hex') WHERE host=$1", &[&HOST]).await.is_err());
     let after_row = control
@@ -644,7 +656,10 @@ async fn scenarios(socket: &str, database: &str) {
         .await.unwrap();
     let after: (Vec<u8>, Vec<u8>, bool) = (after_row.get(0), after_row.get(1), after_row.get(2));
     assert_eq!(before, after);
-    control.batch_execute("UPDATE federate_session.profile_state SET enabled=false").await.unwrap();
+    control
+        .batch_execute("UPDATE federate_session.profile_state SET enabled=false")
+        .await
+        .unwrap();
     assert!(control.batch_execute("UPDATE federate_session.profile_state SET collision_inventory_id=decode(repeat('0a',32),'hex')").await.is_err());
     // Paired generation-only and generation+inventory rotations both succeed
     // only while disabled. The old session is never reactivated.
@@ -658,7 +673,12 @@ async fn scenarios(socket: &str, database: &str) {
     control.execute("UPDATE federate_session.profile_state SET authority_generation=$1, collision_inventory_id=$2 WHERE host=$3 AND enabled=false", &[&&[8u8;32][..], &&inventory().id()[..], &HOST]).await.unwrap();
     let reopened = control.execute("UPDATE federate_session.profile_state SET enabled=true WHERE host=$1 AND enabled=false AND authority_generation=$2 AND collision_inventory_id=$3", &[&HOST, &&[8u8;32][..], &&inventory().id()[..]]).await.unwrap();
     assert_eq!(reopened, 1);
-    let rotated = Store::admit(&mut runtime, &input_for(now(&admin).await, 90, [8;32], inventory().id())).await.unwrap();
+    let rotated = Store::admit(
+        &mut runtime,
+        &input_for(now(&admin).await, 90, [8; 32], inventory().id()),
+    )
+    .await
+    .unwrap();
     primary_scenarios(socket, database, &admin, &mut runtime, &rotated).await;
 }
 
@@ -744,7 +764,10 @@ async fn postgres_admission_causal() {
     admin.batch_execute("DELETE FROM federate_session.replay WHERE host='https://migration-binding.test' AND sid='verified-bad'; DELETE FROM federate_session.sessions WHERE host='https://migration-binding.test' AND sid='verified-bad'").await.unwrap();
     admin.batch_execute(MIGRATION_V5).await.unwrap();
     let backfilled: i64 = admin.query_one("SELECT count(*) FROM federate_session.identity_bindings WHERE host='https://migration-binding.test'", &[]).await.unwrap().get(0);
-    assert_eq!(backfilled, 1, "only consistent non-null verified history is backfilled");
+    assert_eq!(
+        backfilled, 1,
+        "only consistent non-null verified history is backfilled"
+    );
     admin.batch_execute("UPDATE federate_session.profile_state SET enabled=true WHERE host='https://migration-binding.test'").await.unwrap();
     assert!(
         Store::lookup(

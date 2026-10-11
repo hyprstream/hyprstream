@@ -166,7 +166,7 @@ pub fn muon_step(param: &Tensor, state: &mut MuonState, config: &MuonConfig) {
     let (rows, cols) = (param.size()[0] as f64, param.size()[1] as f64);
     let scale = (1.0f64.max(rows / cols)).sqrt();
     let decay = 1.0 - config.lr * config.weight_decay; // 1.0 when weight_decay=0
-    // p = p * decay - lr * scale * g_orth
+                                                       // p = p * decay - lr * scale * g_orth
     let updated = &param.data() * decay - &g_orth * (config.lr * scale);
     param.data().copy_(&updated);
 }
@@ -207,8 +207,7 @@ mod tests {
     /// are simple orthogonal-ish matrices from sequential values.
     fn well_conditioned_matrix(rows: i64, cols: i64) -> Tensor {
         // Use arange-based construction (deterministic, no random state)
-        let a = Tensor::arange(rows * cols, (Kind::Float, tch::Device::Cpu))
-            .reshape([rows, cols]);
+        let a = Tensor::arange(rows * cols, (Kind::Float, tch::Device::Cpu)).reshape([rows, cols]);
         // Add identity-like structure to improve conditioning
         let min_dim = rows.min(cols);
         let eye = Tensor::eye(min_dim, (Kind::Float, tch::Device::Cpu));

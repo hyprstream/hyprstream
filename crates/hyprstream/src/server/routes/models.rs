@@ -121,7 +121,7 @@ async fn list_models(
         &hyprstream_rpc::envelope::Subject::new(user.clone()),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,
@@ -204,7 +204,7 @@ async fn get_model_info(
         &hyprstream_rpc::envelope::Subject::new(user.clone()),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,
@@ -268,7 +268,7 @@ async fn download_model(
         &hyprstream_rpc::envelope::Subject::new(user.clone()),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,
@@ -408,7 +408,7 @@ async fn load_model(
         &hyprstream_rpc::envelope::Subject::new(user.clone()),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,
@@ -480,7 +480,7 @@ async fn unload_model(
         &hyprstream_rpc::envelope::Subject::new(user.clone()),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,
@@ -520,7 +520,7 @@ async fn refresh_cache(
         &hyprstream_rpc::envelope::Subject::new(user.clone()),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,

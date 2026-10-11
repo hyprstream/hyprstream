@@ -55,8 +55,7 @@ pub fn encode_labels(labels: &BTreeMap<String, String>) -> Option<String> {
 
 /// Parse the JSON storage form of a label map.
 pub fn decode_labels(json: &str) -> Result<BTreeMap<String, String>, Status> {
-    serde_json::from_str(json)
-        .map_err(|e| Status::internal(format!("Invalid labels JSON: {e}")))
+    serde_json::from_str(json).map_err(|e| Status::internal(format!("Invalid labels JSON: {e}")))
 }
 
 impl MetricRecord {
@@ -181,7 +180,9 @@ pub fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<MetricRecord>, Sta
 pub async fn create_schema_v2_tables(
     backend: &dyn crate::storage::StorageBackend,
 ) -> Result<(), Status> {
-    backend.create_table(METRICS_TABLE, &get_metrics_schema()).await?;
+    backend
+        .create_table(METRICS_TABLE, &get_metrics_schema())
+        .await?;
     backend
         .create_table(
             calibration::CALIBRATION_TABLE,

@@ -29,29 +29,25 @@
 
 use async_trait::async_trait;
 // GenerationRequest import removed — was only used by deleted ModelZmqClient
-use hyprstream_rpc_std::model_client::KVQuantType;
-use crate::runtime::RuntimeConfig;
 use crate::runtime::inference_profile::{
-    InferenceCompute, InferenceDeploymentProfile, InferenceInstanceId,
-    InferenceIsolationProfile,
+    InferenceCompute, InferenceDeploymentProfile, InferenceInstanceId, InferenceIsolationProfile,
 };
-use crate::services::{
-    EnvelopeContext,
-    PolicyClient,
-};
-use hyprstream_rpc_std::inference_client::InferenceClient;
-use hyprstream_rpc_std::registry_client::RegistryClient;
-use hyprstream_rpc_std::registry_client::{StageFilesRequest, CommitWithAuthorRequest};
+use crate::runtime::RuntimeConfig;
 use crate::services::WorktreeClientExt;
-use hyprstream_rpc_std::policy_client::PolicyCheck;
+use crate::services::{EnvelopeContext, PolicyClient};
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Context, Result};
+use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
-use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
+use hyprstream_rpc::transport::{EndpointType, TransportConfig};
+use hyprstream_rpc_std::inference_client::InferenceClient;
+use hyprstream_rpc_std::model_client::KVQuantType;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::{CommitWithAuthorRequest, StageFilesRequest};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -107,7 +103,6 @@ pub struct ModelLoadKey {
 // ============================================================================
 // ModelService (server-side)
 // ============================================================================
-
 
 /// Information about a loaded model
 pub struct LoadedModel {
@@ -188,7 +183,10 @@ const REVIEWED_STAGING_MODEL_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052
 
 impl StagingModelPin {
     pub(crate) fn reviewed() -> Result<Self> {
-        Self::new(REVIEWED_STAGING_MODEL_REF, git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?)
+        Self::new(
+            REVIEWED_STAGING_MODEL_REF,
+            git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?,
+        )
     }
 
     #[cfg(feature = "postgres")]
@@ -229,32 +227,47 @@ impl StagingModelPin {
         Self::from_settings(&profile, model_ref.as_deref(), oid.as_deref())
     }
 
-    fn from_settings(profile: &str, model_ref: Option<&str>, oid: Option<&str>) -> Result<Option<Self>> {
+    fn from_settings(
+        profile: &str,
+        model_ref: Option<&str>,
+        oid: Option<&str>,
+    ) -> Result<Option<Self>> {
         const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
         const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
         const OID: &str = "HYPRSTREAM_STAGING_MODEL_OID";
         if profile == "staging" {
             match (model_ref, oid) {
                 (None, None) => return Self::reviewed().map(Some),
-                (Some(model_ref), Some(oid)) => anyhow::ensure!(model_ref == REVIEWED_STAGING_MODEL_REF && oid == REVIEWED_STAGING_MODEL_OID,
-                    "staging override must match the complete reviewed model pin"),
-                _ => anyhow::bail!("{REF} and {OID} must either both be absent or both match the reviewed pin"),
+                (Some(model_ref), Some(oid)) => anyhow::ensure!(
+                    model_ref == REVIEWED_STAGING_MODEL_REF && oid == REVIEWED_STAGING_MODEL_OID,
+                    "staging override must match the complete reviewed model pin"
+                ),
+                _ => anyhow::bail!(
+                    "{REF} and {OID} must either both be absent or both match the reviewed pin"
+                ),
             }
             return Self::reviewed().map(Some);
         }
-        anyhow::ensure!(profile == "default", "{PROFILE} must be 'default' or 'staging'");
+        anyhow::ensure!(
+            profile == "default",
+            "{PROFILE} must be 'default' or 'staging'"
+        );
         match (model_ref, oid) {
             (None, None) => Ok(None),
             (Some(model_ref), Some(oid)) => {
-                anyhow::ensure!(oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                    "{OID} must be a full 40-character hexadecimal Git OID");
+                anyhow::ensure!(
+                    oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "{OID} must be a full 40-character hexadecimal Git OID"
+                );
                 Self::new(model_ref, git2::Oid::from_str(oid)?).map(Some)
             }
             _ => anyhow::bail!("{REF} and {OID} must be configured together"),
         }
     }
 
-    fn admits(&self, model_ref: &str) -> bool { self.model_ref == model_ref }
+    fn admits(&self, model_ref: &str) -> bool {
+        self.model_ref == model_ref
+    }
 }
 
 impl Default for ModelServiceConfig {
@@ -374,9 +387,13 @@ pub struct ModelService {
 struct SpawnPublicationGuard(Option<hyprstream_service::SpawnedService>);
 
 impl SpawnPublicationGuard {
-    fn new(handle: hyprstream_service::SpawnedService) -> Self { Self(Some(handle)) }
+    fn new(handle: hyprstream_service::SpawnedService) -> Self {
+        Self(Some(handle))
+    }
     fn publish(mut self) -> Result<hyprstream_service::SpawnedService> {
-        self.0.take().ok_or_else(|| anyhow!("spawn publication guard was already disarmed"))
+        self.0
+            .take()
+            .ok_or_else(|| anyhow!("spawn publication guard was already disarmed"))
     }
 }
 
@@ -384,12 +401,16 @@ impl Drop for SpawnPublicationGuard {
     fn drop(&mut self) {
         if let Some(mut handle) = self.0.take() {
             match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => { runtime.spawn(async move {
+                Ok(runtime) => {
+                    runtime.spawn(async move {
                     if let Err(error) = handle.stop().await {
                         tracing::error!(%error, "failed to reclaim unpublished inference worker");
                     }
-                }); }
-                Err(error) => tracing::error!(%error, "cannot reclaim unpublished inference worker outside Tokio runtime"),
+                });
+                }
+                Err(error) => {
+                    tracing::error!(%error, "cannot reclaim unpublished inference worker outside Tokio runtime");
+                }
             }
         }
     }
@@ -419,7 +440,12 @@ struct InterceptedLoadReservation {
 
 impl InterceptedLoadReservation {
     fn new(inner: Arc<ModelServiceInner>, instance: InferenceInstanceId, attempt: u64) -> Self {
-        Self { inner, instance, attempt, active: true }
+        Self {
+            inner,
+            instance,
+            attempt,
+            active: true,
+        }
     }
 
     fn release(&mut self) {
@@ -465,13 +491,17 @@ fn admit_in_process_tenant(
 
 impl Clone for ModelService {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
 impl std::ops::Deref for ModelService {
     type Target = ModelServiceInner;
-    fn deref(&self) -> &Self::Target { &self.inner }
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 /// Prefix-dispatch arm for the `modelRef` grammar (#395).
@@ -507,9 +537,15 @@ pub enum ModelRefDispatch<'a> {
 /// it performs no I/O and no validation, so it can be unit-tested in isolation.
 pub fn model_ref_dispatch(s: &str) -> ModelRefDispatch<'_> {
     if let Some(rest) = s.strip_prefix("at://") {
-        ModelRefDispatch::Federated { scheme: "at://", rest }
+        ModelRefDispatch::Federated {
+            scheme: "at://",
+            rest,
+        }
     } else if let Some(rest) = s.strip_prefix("did:") {
-        ModelRefDispatch::Federated { scheme: "did:", rest }
+        ModelRefDispatch::Federated {
+            scheme: "did:",
+            rest,
+        }
     } else {
         ModelRefDispatch::Local
     }
@@ -633,39 +669,42 @@ impl ModelService {
         // (plaintext Public path); the parallel NotificationService is removed.
         let event_publisher = EventPublisher::new("model")?;
 
-        Ok(Self { inner: Arc::new(ModelServiceInner {
-            loaded_models: RwLock::new(LruCache::new(cache_size)),
-            pending_loads: parking_lot::Mutex::new(HashMap::new()),
-            staging_pinned_artifacts: crate::storage::pinned_model::StagingPinnedArtifactCache::default(),
-            unloading_models: Mutex::new(HashSet::new()),
-            load_unload_gate: Mutex::new(()),
-            lifecycle_event_publish_gate: Mutex::new(()),
-            config,
-            signing_key,
-            policy_client,
-            #[cfg(feature = "postgres")]
-            federate_dispatch: None,
-            event_publisher,
-            registry,
-            transport,
-            policy_transport,
-            expected_audience: None,
-            jwt_key_source: None,
-            discovery_client: None,
-            fs_trees: dashmap::DashMap::new(),
-            load_terminals: TerminalStore::new(),
-            load_epoch: AtomicU64::new(0),
-            incarnation_generation: AtomicU64::new(0),
-            in_process_tenant: std::sync::OnceLock::new(),
-            producer_reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
-                hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
-            )),
-            moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
-            #[cfg(test)]
-            test_work_order_capture: Mutex::new(None),
-            #[cfg(test)]
-            before_unloaded_event: Mutex::new(None),
-        })})
+        Ok(Self {
+            inner: Arc::new(ModelServiceInner {
+                loaded_models: RwLock::new(LruCache::new(cache_size)),
+                pending_loads: parking_lot::Mutex::new(HashMap::new()),
+                staging_pinned_artifacts:
+                    crate::storage::pinned_model::StagingPinnedArtifactCache::default(),
+                unloading_models: Mutex::new(HashSet::new()),
+                load_unload_gate: Mutex::new(()),
+                lifecycle_event_publish_gate: Mutex::new(()),
+                config,
+                signing_key,
+                policy_client,
+                #[cfg(feature = "postgres")]
+                federate_dispatch: None,
+                event_publisher,
+                registry,
+                transport,
+                policy_transport,
+                expected_audience: None,
+                jwt_key_source: None,
+                discovery_client: None,
+                fs_trees: dashmap::DashMap::new(),
+                load_terminals: TerminalStore::new(),
+                load_epoch: AtomicU64::new(0),
+                incarnation_generation: AtomicU64::new(0),
+                in_process_tenant: std::sync::OnceLock::new(),
+                producer_reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
+                    hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+                )),
+                moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+                #[cfg(test)]
+                test_work_order_capture: Mutex::new(None),
+                #[cfg(test)]
+                before_unloaded_event: Mutex::new(None),
+            }),
+        })
     }
 
     /// Retain a direct work order only for an in-crate test. The production
@@ -767,11 +806,15 @@ impl ModelService {
     ) {
         let terminal = match result {
             Ok(endpoint) => Terminal {
-                value: ModelLoadTerminal::Loaded { endpoint: endpoint.clone() },
+                value: ModelLoadTerminal::Loaded {
+                    endpoint: endpoint.clone(),
+                },
                 latched_by: "model-service".to_owned(),
             },
             Err(e) => Terminal {
-                value: ModelLoadTerminal::LoadFailed { error: e.to_string() },
+                value: ModelLoadTerminal::LoadFailed {
+                    error: e.to_string(),
+                },
                 latched_by: "model-service".to_owned(),
             },
         };
@@ -813,34 +856,51 @@ impl ModelService {
 
         let attempt = self.allocate_load_epoch();
         pending.insert(instance.clone(), attempt);
-        Ok(InterceptedLoadAdmission::Accepted(InterceptedLoadReservation::new(
-            Arc::clone(&self.inner),
-            instance.clone(),
-            attempt,
-        )))
+        Ok(InterceptedLoadAdmission::Accepted(
+            InterceptedLoadReservation::new(Arc::clone(&self.inner), instance.clone(), attempt),
+        ))
     }
 
     fn validate_model_load_ref(&self, model_ref: &str) -> Result<()> {
         if let Some(pin) = &self.config.staging_model_pin {
-            anyhow::ensure!(pin.admits(model_ref), "Model.load is restricted to the configured staging modelRef");
+            anyhow::ensure!(
+                pin.admits(model_ref),
+                "Model.load is restricted to the configured staging modelRef"
+            );
         }
         Ok(())
     }
 
     async fn validate_staging_model_checkout(&self, instance: &InferenceInstanceId) -> Result<()> {
-        let Some(pin) = &self.config.staging_model_pin else { return Ok(()); };
+        let Some(pin) = &self.config.staging_model_pin else {
+            return Ok(());
+        };
         self.validate_model_load_ref(instance.model_ref())?;
         let model_ref = ModelRef::parse(instance.model_ref())?;
-        let tracked = self.registry.get_by_name(model_ref.name()).await
-            .map_err(|e| anyhow!("staging model '{}' not found in registry: {e}", model_ref.name()))?;
+        let tracked = self
+            .registry
+            .get_by_name(model_ref.name())
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "staging model '{}' not found in registry: {e}",
+                    model_ref.name()
+                )
+            })?;
         let repo_client = self.registry.repo(&tracked.id);
         let worktrees = repo_client.list_worktrees().await?;
         let branch = match &model_ref.git_ref {
             crate::storage::GitRef::Branch(branch) => branch,
             _ => anyhow::bail!("staging modelRef must select its configured local branch"),
         };
-        anyhow::ensure!(worktrees.iter().any(|worktree| worktree.branch_name == branch.as_str()),
-            "staging worktree for {}:{} not found", model_ref.name(), branch);
+        anyhow::ensure!(
+            worktrees
+                .iter()
+                .any(|worktree| worktree.branch_name == branch.as_str()),
+            "staging worktree for {}:{} not found",
+            model_ref.name(),
+            branch
+        );
         let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), branch)?;
         crate::storage::pinned_model::verify_selected_checkout(&path, pin.commit)
             .with_context(|| format!("admit staging worktree for {}", pin.model_ref))
@@ -982,19 +1042,18 @@ impl ModelService {
                     // subprocessor: they still see the caller's credential as
                     // a relayed delegated bearer under their own admission
                     // contract. No bearer ⇒ no remote relay (fail-closed).
-                    let relay_bearer = bearer
-                        .clone()
-                        .ok_or_else(|| anyhow!(
+                    let relay_bearer = bearer.clone().ok_or_else(|| {
+                        anyhow!(
                             "remote inference replica selection requires a relayable caller bearer"
-                        ))?;
+                        )
+                    })?;
                     let rpc = hyprstream_discovery::production_inference_rpc_client_at_transport(
                         &resolution_service_name,
                         &candidate.transport,
                         signing_key,
                         None,
                     )?;
-                    let client = InferenceClient::new(rpc)
-                        .with_delegated_bearer(relay_bearer);
+                    let client = InferenceClient::new(rpc).with_delegated_bearer(relay_bearer);
                     anyhow::ensure!(
                         client.is_ready().await?,
                         "remote inference replica is not ready"
@@ -1170,7 +1229,9 @@ impl ModelService {
             .iter()
             .filter(|(c, _)| *c != commit_cid)
             .find_map(|(_, b)| hyprstream_pds::record::ModelRecord::from_dag_cbor(b).ok())
-            .ok_or_else(|| anyhow!("getRecord CAR for {at_uri} contained no ai.hyprstream.model record"))?;
+            .ok_or_else(|| {
+                anyhow!("getRecord CAR for {at_uri} contained no ai.hyprstream.model record")
+            })?;
 
         // currentOid is a git-raw CID string → decode to the git OID hex.
         let cid = hyprstream_rpc::cid::decode_cid(&record.current_oid)
@@ -1279,7 +1340,10 @@ impl ModelService {
         // Get model path from registry
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.get_by_name.enter");
-        let tracked = self.registry.get_by_name(model_ref.name()).await
+        let tracked = self
+            .registry
+            .get_by_name(model_ref.name())
+            .await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.name(), e))?;
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.get_by_name.done");
@@ -1287,14 +1351,17 @@ impl ModelService {
 
         let branch_name = match &model_ref.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
-            crate::storage::GitRef::Commit(_) => repo_client.get_head().await
+            crate::storage::GitRef::Commit(_) => repo_client
+                .get_head()
+                .await
                 .context("resolve selected worktree branch for pinned commit")?,
             crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
                 anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
             }
-            crate::storage::GitRef::DefaultBranch => {
-                repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
-            }
+            crate::storage::GitRef::DefaultBranch => repo_client
+                .get_head()
+                .await
+                .unwrap_or_else(|_| "main".to_owned()),
         };
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.enter");
@@ -1302,7 +1369,11 @@ impl ModelService {
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.done");
         if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-            return Err(anyhow!("worktree for {}:{} not found", model_ref.name(), branch_name));
+            return Err(anyhow!(
+                "worktree for {}:{} not found",
+                model_ref.name(),
+                branch_name
+            ));
         }
         // Derive worktree path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
@@ -1316,7 +1387,10 @@ impl ModelService {
         }
 
         let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
-            anyhow::ensure!(model_ref_str == pin.model_ref, "staging modelRef changed after admission");
+            anyhow::ensure!(
+                model_ref_str == pin.model_ref,
+                "staging modelRef changed after admission"
+            );
             Some(
                 self.inner
                     .staging_pinned_artifacts
@@ -1328,7 +1402,8 @@ impl ModelService {
         } else {
             None
         };
-        let model_input_path = pinned_artifact.as_ref()
+        let model_input_path = pinned_artifact
+            .as_ref()
             .map_or(model_path.as_path(), |artifact| artifact.root());
 
         let endpoint = Self::inference_endpoint(instance);
@@ -1354,7 +1429,8 @@ impl ModelService {
         };
 
         // Obtain FsOps from the registry for path-contained adapter I/O
-        let fs: Option<hyprstream_rpc_std::registry_client::WorktreeClient> = Some(repo_client.worktree(&branch_name));
+        let fs: Option<hyprstream_rpc_std::registry_client::WorktreeClient> =
+            Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
         let spawner = hyprstream_service::ServiceSpawner::threaded();
@@ -1378,16 +1454,17 @@ impl ModelService {
         if let Some(ref artifact) = pinned_artifact {
             service_config = service_config.with_pinned_artifact(Arc::clone(artifact));
         }
-        let mut service_config = service_config.with_instance_identity(
-            instance.service_name(),
-            instance.tenant().to_owned(),
-            self.signing_key.verifying_key(),
-        )
-        .with_model_ref(instance.model_ref().to_owned())
-        .with_stream_plane(
-            Arc::clone(&self.producer_reach_config),
-            Arc::clone(&self.moq_origin),
-        );
+        let mut service_config = service_config
+            .with_instance_identity(
+                instance.service_name(),
+                instance.tenant().to_owned(),
+                self.signing_key.verifying_key(),
+            )
+            .with_model_ref(instance.model_ref().to_owned())
+            .with_stream_plane(
+                Arc::clone(&self.producer_reach_config),
+                Arc::clone(&self.moq_origin),
+            );
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
         }
@@ -1412,7 +1489,9 @@ impl ModelService {
         let network_reach = service_config.network_reach_handle();
         #[cfg(test)]
         crate::services::restart_diag::phase("inference.spawn.enter");
-        let service_handle = spawner.spawn(service_config).await
+        let service_handle = spawner
+            .spawn(service_config)
+            .await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
         let spawn_guard = SpawnPublicationGuard::new(service_handle);
         #[cfg(test)]
@@ -1427,11 +1506,13 @@ impl ModelService {
         // before init), timed out, or mismatched (instance/controller/generation)
         // all FAIL THE LOAD closed — no binding, no minting from this attempt.
         let expected_controller = self.signing_key.verifying_key().to_bytes();
-        const HANDOFF_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS);
+        const HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+            crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS,
+        );
         #[cfg(test)]
         crate::services::restart_diag::phase("incarnation.handoff.enter");
-        let incarnation_binding = match tokio::time::timeout(HANDOFF_TIMEOUT, incarnation_rx).await {
+        let incarnation_binding = match tokio::time::timeout(HANDOFF_TIMEOUT, incarnation_rx).await
+        {
             Err(_) => anyhow::bail!(
                 "pinned worker incarnation handoff timed out after {}s without a ready worker",
                 crate::services::inference::INCARNATION_HANDOFF_TIMEOUT_SECS
@@ -1468,22 +1549,23 @@ impl ModelService {
         )?;
 
         // Load TTT config from model's config.json (if TTT is enabled)
-        let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(model_input_path)
-            .and_then(|tc| {
-                if tc.is_enabled() && tc.mode == crate::config::TrainingMode::TestTimeTraining {
-                    Some(crate::training::ttt::TTTConfig {
-                        learning_rate: tc.ttt.learning_rate,
-                        gradient_steps: tc.ttt.gradient_steps,
-                        max_grad_norm: tc.ttt.max_grad_norm,
-                        min_input_length: tc.ttt.min_input_length,
-                        max_ttt_context: tc.ttt.max_ttt_context,
-                        enabled: true,
-                        ..crate::training::ttt::TTTConfig::default()
-                    })
-                } else {
-                    None
-                }
-            });
+        let ttt_config =
+            crate::runtime::model_config::ModelConfig::load_training_config(model_input_path)
+                .and_then(|tc| {
+                    if tc.is_enabled() && tc.mode == crate::config::TrainingMode::TestTimeTraining {
+                        Some(crate::training::ttt::TTTConfig {
+                            learning_rate: tc.ttt.learning_rate,
+                            gradient_steps: tc.ttt.gradient_steps,
+                            max_grad_norm: tc.ttt.max_grad_norm,
+                            min_input_length: tc.ttt.min_input_length,
+                            max_ttt_context: tc.ttt.max_ttt_context,
+                            enabled: true,
+                            ..crate::training::ttt::TTTConfig::default()
+                        })
+                    } else {
+                        None
+                    }
+                });
 
         // Load generation parameter defaults from model's generation_config.json
         let generation_defaults = crate::config::SamplingParams::from_model_path(model_input_path)
@@ -1610,11 +1692,7 @@ impl ModelService {
             let mut unloading = inner.unloading_models.lock().await;
             let inserted = unloading.insert(instance.clone());
             drop(unloading);
-            anyhow::ensure!(
-                inserted,
-                "Model {} is already unloading",
-                model_ref_str,
-            );
+            anyhow::ensure!(inserted, "Model {} is already unloading", model_ref_str,);
             let model = {
                 let mut cache = inner.loaded_models.write().await;
                 cache.pop_entry(instance).map(|(_, model)| model)
@@ -1674,7 +1752,10 @@ impl ModelService {
             },
         );
         if let Ok(payload) = serde_json::to_vec(&event) {
-            let _ = inner.event_publisher.publish("lifecycle", "unloaded", &payload).await;
+            let _ = inner
+                .event_publisher
+                .publish("lifecycle", "unloaded", &payload)
+                .await;
         }
         Ok(())
     }
@@ -1734,10 +1815,14 @@ impl ModelService {
                         reach: Self::model_reach(&model.network_transport),
                         loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                         last_used: model.last_used.elapsed().as_millis() as i64,
-                        online_training_config: model.ttt_config.as_ref()
+                        online_training_config: model
+                            .ttt_config
+                            .as_ref()
                             .map(Self::ttt_config_to_wire)
                             .unwrap_or_default(),
-                        generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
+                        generation_defaults: Self::sampling_params_to_wire(
+                            &model.generation_defaults,
+                        ),
                     })
                     .collect(),
                 cache
@@ -1785,7 +1870,10 @@ impl ModelService {
     }
 
     /// Return status entry for a specific model ref (0 or 1 element).
-    async fn model_status_single(&self, instance: &InferenceInstanceId) -> Vec<GenModelStatusEntry> {
+    async fn model_status_single(
+        &self,
+        instance: &InferenceInstanceId,
+    ) -> Vec<GenModelStatusEntry> {
         let _load_unload_gate = self.load_unload_gate.lock().await;
         if self.unloading_models.lock().await.contains(instance) {
             return vec![GenModelStatusEntry {
@@ -1807,7 +1895,9 @@ impl ModelService {
                     reach: Self::model_reach(&model.network_transport),
                     loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                     last_used: model.last_used.elapsed().as_millis() as i64,
-                    online_training_config: model.ttt_config.as_ref()
+                    online_training_config: model
+                        .ttt_config
+                        .as_ref()
                         .map(Self::ttt_config_to_wire)
                         .unwrap_or_default(),
                     generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
@@ -1837,13 +1927,18 @@ impl ModelService {
             ModelStatusResponse {
                 loaded: true,
                 reach: Self::model_reach(&model.network_transport),
-                online_training_config: model.ttt_config.as_ref()
+                online_training_config: model
+                    .ttt_config
+                    .as_ref()
                     .map(Self::ttt_config_to_wire)
                     .unwrap_or_default(),
                 ..Default::default()
             }
         } else {
-            ModelStatusResponse { loaded: false, ..Default::default() }
+            ModelStatusResponse {
+                loaded: false,
+                ..Default::default()
+            }
         }
     }
     /// Mint the per-request internal execution work order for one
@@ -1901,7 +1996,9 @@ impl ModelService {
             exp,
             jti: hex::encode(hyprstream_rpc::envelope::generate_nonce()),
             cnf: InternalWorkClaims::controller_cnf(&self.signing_key.verifying_key()),
-            owner_did: ctx.authenticated_pairwise_did().map(|d| d.as_str().to_owned()),
+            owner_did: ctx
+                .authenticated_pairwise_did()
+                .map(|d| d.as_str().to_owned()),
             caller: caller_snapshot,
         };
         Ok(encode_internal_work(&claims, &self.signing_key))
@@ -2042,54 +2139,83 @@ impl ModelService {
     }
 
     /// Load a LoRA adapter from a file
-    async fn load_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext, path: &str) -> Result<()> {
+    async fn load_lora(
+        &self,
+        model_ref_str: &str,
+        ctx: &EnvelopeContext,
+        path: &str,
+    ) -> Result<()> {
         // Text-payload variant (K3 finding B2): the generated dispatch
         // resource embeds the PAYLOAD (`inference:{path}`), so the work order
         // binds the exact adapter path rather than the method name.
-        let client = self.get_inference_client(model_ref_str, ctx,
-            hyprstream_rpc::auth::internal_work::InternalWorkScope::new(
-                format!("inference:{path}"),
-                "write",
-            ),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                hyprstream_rpc::auth::internal_work::InternalWorkScope::new(
+                    format!("inference:{path}"),
+                    "write",
+                ),
+            )
+            .await?;
         client.load_lora(path).await
     }
 
     /// Unload the current LoRA adapter
     async fn unload_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("unloadLora", "write"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("unloadLora", "write"),
+            )
+            .await?;
         client.unload_lora().await
     }
 
     /// Check if a LoRA adapter is loaded
     async fn has_lora(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<bool> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("hasLora", "query"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("hasLora", "query"),
+            )
+            .await?;
         client.has_lora().await
     }
 
     // Training loop control - forward to InferenceService via ZMQ
     async fn writeback_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("tttWriteback", "train"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("tttWriteback", "train"),
+            )
+            .await?;
         client.ttt_writeback().await
     }
 
     async fn evict_adaptation(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("tttEvict", "train"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("tttEvict", "train"),
+            )
+            .await?;
         client.ttt_evict().await
     }
 
     async fn zero_delta(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<()> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("tttZero", "manage"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("tttZero", "manage"),
+            )
+            .await?;
         client.ttt_zero().await
     }
 
@@ -2098,9 +2224,13 @@ impl ModelService {
         model_ref_str: &str,
         ctx: &EnvelopeContext,
     ) -> Result<hyprstream_rpc_std::inference_client::DeltaStatusResult> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("getDeltaStatus", "query"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("getDeltaStatus", "query"),
+            )
+            .await?;
         client.get_delta_status().await
     }
 
@@ -2109,9 +2239,13 @@ impl ModelService {
         model_ref_str: &str,
         ctx: &EnvelopeContext,
     ) -> Result<hyprstream_rpc_std::inference_client::SnapshotDeltaResult> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("snapshotDelta", "write"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("snapshotDelta", "write"),
+            )
+            .await?;
         client.snapshot_delta().await
     }
 
@@ -2121,140 +2255,206 @@ impl ModelService {
         ctx: &EnvelopeContext,
         data: &ExportPeftRequest,
     ) -> Result<ExportPeftResult> {
-        let client = self.get_inference_client(model_ref_str, ctx,
-            Self::inference_scope("exportPeftAdapter", "write"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref_str,
+                ctx,
+                Self::inference_scope("exportPeftAdapter", "write"),
+            )
+            .await?;
         client.export_peft_adapter(data).await
     }
-
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ModelHandler Implementation — generated dispatch for top-level + typed scope traits
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use hyprstream_rpc_std::model_client::{
-    ModelResponseVariant,
-    LoadedModelResponse, ErrorInfo, ModelHealthStatus,
-    StatusRequest,
-    ModelStatusEntry as GenModelStatusEntry, OnlineTrainingConfig as GenOnlineTrainingConfig,
-    GenerationDefaults as GenGenerationDefaults,
-    // Top-level request types
-    LoadModelRequest, UnloadModelRequest,
-    // TTT types (names follow inference.capnp via using-import)
-    LoraConfig, TrainStepRequest, TrainStepResult,
-    DeltaStatusResult,
-    SaveAdaptationRequest, SaveAdaptationResult,
-    SnapshotDeltaResult, ExportPeftRequest, ExportPeftResult,
-    WriteTttConfigRequest,
-    // Adapter types
-    AdapterInfo, MergeLoraRequest,
-    // Infer types (GenerationRequest follows inference.capnp name)
-    GenerationRequest, ChatTemplateRequest, ModelStatusResponse,
-    EmbedImagesRequest, EmbedImagesResponse,
-};
 use crate::services::generated::model_client::{
-    AdapterHandler, InferHandler, ModelHandler, TttHandler, dispatch_model, serialize_response,
+    dispatch_model, serialize_response, AdapterHandler, InferHandler, ModelHandler, TttHandler,
+};
+use hyprstream_rpc_std::model_client::{
+    // Adapter types
+    AdapterInfo,
+    ChatTemplateRequest,
+    DeltaStatusResult,
+    EmbedImagesRequest,
+    EmbedImagesResponse,
+    ErrorInfo,
+    ExportPeftRequest,
+    ExportPeftResult,
+    GenerationDefaults as GenGenerationDefaults,
+    // Infer types (GenerationRequest follows inference.capnp name)
+    GenerationRequest,
+    // Top-level request types
+    LoadModelRequest,
+    LoadedModelResponse,
+    // TTT types (names follow inference.capnp via using-import)
+    LoraConfig,
+    MergeLoraRequest,
+    ModelHealthStatus,
+    ModelResponseVariant,
+    ModelStatusEntry as GenModelStatusEntry,
+    ModelStatusResponse,
+    OnlineTrainingConfig as GenOnlineTrainingConfig,
+    SaveAdaptationRequest,
+    SaveAdaptationResult,
+    SnapshotDeltaResult,
+    StatusRequest,
+    TrainStepRequest,
+    TrainStepResult,
+    UnloadModelRequest,
+    WriteTttConfigRequest,
 };
 // AdaptationStrategy is now from inference_client (canonical source via using-import).
 // model_client types reference it directly — no conversion needed.
 
-
 #[async_trait::async_trait(?Send)]
 impl TttHandler for ModelService {
     async fn handle_init(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &LoraConfig,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &LoraConfig,
     ) -> Result<()> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("createLora", "write"),
-        ).await?;
+        let client = self
+            .get_inference_client(model_ref, ctx, Self::inference_scope("createLora", "write"))
+            .await?;
         client.create_lora(data).await
     }
 
     async fn handle_train(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &TrainStepRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &TrainStepRequest,
     ) -> Result<TrainStepResult> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("trainStep", "train"),
-        ).await?;
+        let client = self
+            .get_inference_client(model_ref, ctx, Self::inference_scope("trainStep", "train"))
+            .await?;
         client.train_step(data).await
     }
 
     async fn handle_train_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &TrainStepRequest,
-    ) -> Result<(hyprstream_rpc_std::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("trainStepStream", "train"),
-        ).await?;
-        let ephemeral_pubkey = ctx.ephemeral_pubkey()
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &TrainStepRequest,
+    ) -> Result<(
+        hyprstream_rpc_std::model_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
+        let client = self
+            .get_inference_client(
+                model_ref,
+                ctx,
+                Self::inference_scope("trainStepStream", "train"),
+            )
+            .await?;
+        let ephemeral_pubkey = ctx.ephemeral_pubkey().ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
         let stream_info = client.train_step_stream(data, ephemeral_pubkey).await?;
         Ok((stream_info, Box::pin(async {})))
     }
 
     async fn handle_writeback(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<()> {
         self.writeback_adaptation(model_ref, ctx).await
     }
 
     async fn handle_evict(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<()> {
         self.evict_adaptation(model_ref, ctx).await
     }
 
     async fn handle_zero(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<()> {
         self.zero_delta(model_ref, ctx).await
     }
 
     async fn handle_status(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<DeltaStatusResult> {
         self.get_delta_status_forward(model_ref, ctx).await
     }
 
     async fn handle_save(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &SaveAdaptationRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &SaveAdaptationRequest,
     ) -> Result<SaveAdaptationResult> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("saveAdaptation", "write"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref,
+                ctx,
+                Self::inference_scope("saveAdaptation", "write"),
+            )
+            .await?;
         client.save_adaptation(data).await
     }
 
     async fn handle_snapshot(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<SnapshotDeltaResult> {
         self.snapshot_delta_forward(model_ref, ctx).await
     }
 
     async fn handle_export(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &ExportPeftRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &ExportPeftRequest,
     ) -> Result<ExportPeftResult> {
         self.export_peft_adapter_forward(model_ref, ctx, data).await
     }
 
     async fn handle_write_ttt_config(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &WriteTttConfigRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &WriteTttConfigRequest,
     ) -> Result<()> {
         // 1. Parse/resolve model ref and resolve worktree path
         let parsed = self.resolve_model_ref(model_ref).await?;
-        let tracked = self.registry.get_by_name(parsed.name()).await
+        let tracked = self
+            .registry
+            .get_by_name(parsed.name())
+            .await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
 
         let branch_name = match &parsed.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
-            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+            _ => repo_client
+                .get_head()
+                .await
+                .unwrap_or_else(|_| "main".to_owned()),
         };
 
         let storage_paths = crate::storage::StoragePaths::new()?;
@@ -2266,11 +2466,31 @@ impl TttHandler for ModelService {
 
         // 2. Build HyprstreamTrainingConfig from request
         let ttt_config = crate::config::TTTTrainingConfig {
-            learning_rate: if data.learning_rate > 0.0 { data.learning_rate } else { 3e-4 },
-            gradient_steps: if data.gradient_steps > 0 { data.gradient_steps } else { 3 },
-            max_grad_norm: if data.max_grad_norm > 0.0 { data.max_grad_norm } else { 1.0 },
-            min_input_length: if data.min_input_length > 0 { data.min_input_length } else { 32 },
-            max_ttt_context: if data.max_ttt_context > 0 { data.max_ttt_context } else { 512 },
+            learning_rate: if data.learning_rate > 0.0 {
+                data.learning_rate
+            } else {
+                3e-4
+            },
+            gradient_steps: if data.gradient_steps > 0 {
+                data.gradient_steps
+            } else {
+                3
+            },
+            max_grad_norm: if data.max_grad_norm > 0.0 {
+                data.max_grad_norm
+            } else {
+                1.0
+            },
+            min_input_length: if data.min_input_length > 0 {
+                data.min_input_length
+            } else {
+                32
+            },
+            max_ttt_context: if data.max_ttt_context > 0 {
+                data.max_ttt_context
+            } else {
+                512
+            },
             rank_oracle: None,
             gradient_gating: None,
         };
@@ -2278,8 +2498,16 @@ impl TttHandler for ModelService {
         let training_config = crate::config::HyprstreamTrainingConfig {
             mode: crate::config::TrainingMode::TestTimeTraining,
             ttt: ttt_config,
-            lora_rank: if data.lora_rank > 0 { data.lora_rank as usize } else { crate::config::default_lora_rank() },
-            lora_alpha: if data.lora_alpha > 0.0 { Some(data.lora_alpha) } else { None },
+            lora_rank: if data.lora_rank > 0 {
+                data.lora_rank as usize
+            } else {
+                crate::config::default_lora_rank()
+            },
+            lora_alpha: if data.lora_alpha > 0.0 {
+                Some(data.lora_alpha)
+            } else {
+                None
+            },
             target_modules: if data.target_modules.is_empty() {
                 crate::config::default_target_modules()
             } else {
@@ -2289,18 +2517,23 @@ impl TttHandler for ModelService {
         };
 
         // 3. Write config.json
-        crate::runtime::model_config::ModelConfig::save_training_config(&model_path, &training_config)?;
+        crate::runtime::model_config::ModelConfig::save_training_config(
+            &model_path,
+            &training_config,
+        )?;
 
         // 4. Stage and commit via worktree-scoped API
         let wt = repo_client.worktree(&branch_name);
         wt.stage_files(&StageFilesRequest {
             files: vec!["config.json".to_owned()],
-        }).await?;
+        })
+        .await?;
         wt.commit_with_author(&CommitWithAuthorRequest {
             message: "Update hyprstream_training config via RPC".to_owned(),
             author_name: "hyprstream".to_owned(),
             author_email: "noreply@hyprstream.dev".to_owned(),
-        }).await?;
+        })
+        .await?;
 
         info!("TTT config written for {}", model_ref);
 
@@ -2325,66 +2558,96 @@ impl TttHandler for ModelService {
 #[async_trait::async_trait(?Send)]
 impl AdapterHandler for ModelService {
     async fn handle_load(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, value: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        value: &str,
     ) -> Result<()> {
         self.load_lora(model_ref, ctx, value).await
     }
 
     async fn handle_unload(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<()> {
         self.unload_lora(model_ref, ctx).await
     }
 
     async fn handle_status(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<bool> {
         self.has_lora(model_ref, ctx).await
     }
 
     async fn handle_inspect(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, value: &str,
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        value: &str,
     ) -> Result<AdapterInfo> {
         // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
         let parsed = self.resolve_model_ref(model_ref).await?;
-        let tracked = self.registry.get_by_name(parsed.name()).await
+        let tracked = self
+            .registry
+            .get_by_name(parsed.name())
+            .await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
         let branch_name = match &parsed.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
-            _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
+            _ => repo_client
+                .get_head()
+                .await
+                .unwrap_or_else(|_| "main".to_owned()),
         };
         let fs = repo_client.worktree(&branch_name);
 
         // Read adapter_config.json from the adapter directory
         let config_path = format!("{}/adapter_config.json", value);
-        let config_bytes = fs.read_file_chunked(&config_path).await
+        let config_bytes = fs
+            .read_file_chunked(&config_path)
+            .await
             .map_err(|e| anyhow!("Failed to read {}: {}", config_path, e))?;
         let config_json: serde_json::Value = serde_json::from_slice(&config_bytes)
             .map_err(|e| anyhow!("Failed to parse adapter_config.json: {}", e))?;
 
         // Verify adapter_model.safetensors exists
         let model_path = format!("{}/adapter_model.safetensors", value);
-        let stat = fs.stat_path(&model_path).await
+        let stat = fs
+            .stat_path(&model_path)
+            .await
             .map_err(|e| anyhow!("Failed to stat {}: {}", model_path, e))?;
         if !stat.exists {
             anyhow::bail!("adapter_model.safetensors not found in {}", value);
         }
 
         // Extract PEFT fields from config
-        let rank = config_json.get("r")
+        let rank = config_json
+            .get("r")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
-        let lora_alpha = config_json.get("lora_alpha")
+        let lora_alpha = config_json
+            .get("lora_alpha")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0) as f32;
-        let target_modules = config_json.get("target_modules")
+        let target_modules = config_json
+            .get("target_modules")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let base_model = config_json.get("base_model_name_or_path")
+        let base_model = config_json
+            .get("base_model_name_or_path")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
@@ -2403,12 +2666,15 @@ impl AdapterHandler for ModelService {
     }
 
     async fn handle_merge(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &MergeLoraRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &MergeLoraRequest,
     ) -> Result<()> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("mergeLora", "write"),
-        ).await?;
+        let client = self
+            .get_inference_client(model_ref, ctx, Self::inference_scope("mergeLora", "write"))
+            .await?;
         client.merge_lora(data).await
     }
 }
@@ -2416,40 +2682,64 @@ impl AdapterHandler for ModelService {
 #[async_trait::async_trait(?Send)]
 impl InferHandler for ModelService {
     async fn handle_generate_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &GenerationRequest,
-    ) -> Result<(hyprstream_rpc_std::model_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("generateStream", "infer"),
-        ).await?;
-        let ephemeral_pubkey = ctx.ephemeral_pubkey()
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &GenerationRequest,
+    ) -> Result<(
+        hyprstream_rpc_std::model_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
+        let client = self
+            .get_inference_client(
+                model_ref,
+                ctx,
+                Self::inference_scope("generateStream", "infer"),
+            )
+            .await?;
+        let ephemeral_pubkey = ctx.ephemeral_pubkey().ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
         let stream_info = client.generate_stream(data, ephemeral_pubkey).await?;
         Ok((stream_info, Box::pin(async {})))
     }
 
     async fn handle_apply_chat_template(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &ChatTemplateRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &ChatTemplateRequest,
     ) -> Result<String> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("applyChatTemplate", "query"),
-        ).await?;
+        let client = self
+            .get_inference_client(
+                model_ref,
+                ctx,
+                Self::inference_scope("applyChatTemplate", "query"),
+            )
+            .await?;
         client.apply_chat_template(data).await
     }
 
     async fn handle_embed(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        model_ref: &str, data: &EmbedImagesRequest,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &EmbedImagesRequest,
     ) -> Result<EmbedImagesResponse> {
-        let client = self.get_inference_client(model_ref, ctx,
-            Self::inference_scope("embed", "infer"),
-        ).await?;
+        let client = self
+            .get_inference_client(model_ref, ctx, Self::inference_scope("embed", "infer"))
+            .await?;
         client.embed(data).await
     }
 
     async fn handle_status(
-        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
     ) -> Result<ModelStatusResponse> {
         let instance = Self::inference_instance(ctx, model_ref)?;
         Ok(self.model_status(&instance).await)
@@ -2458,7 +2748,12 @@ impl InferHandler for ModelService {
 
 #[async_trait::async_trait(?Send)]
 impl ModelHandler for ModelService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         let subject = ctx.subject();
         let domain = ctx.domain()?;
         let object_label = crate::services::inference::inference_object_label();
@@ -2470,8 +2765,10 @@ impl ModelHandler for ModelService {
             operation: operation.to_owned(),
         };
         if ctx.is_federate_admitted() {
-            anyhow::ensure!(ctx.admitted_federate_operation(resource, operation),
-                "Federate request-local operation mismatch");
+            anyhow::ensure!(
+                ctx.admitted_federate_operation(resource, operation),
+                "Federate request-local operation mismatch"
+            );
             // The H2 request-use RPC has already performed the fresh Policy
             // check for this exact original holder, resource and operation,
             // and consumed the shared replay key. Generic Policy.check would
@@ -2484,19 +2781,31 @@ impl ModelHandler for ModelService {
             ctx.jwt_token(),
             &ctx.subject(),
             ctx.original_holder_evidence(),
-        ).await.unwrap_or_else(|e| {
-            warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
+        )
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                "Policy check failed for {} on {}: {} - denying access",
+                subject, resource, e
+            );
             false
         });
         if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            anyhow::bail!(
+                "Unauthorized: {} cannot {} on {}",
+                subject,
+                operation,
+                resource
+            )
         }
     }
 
     async fn handle_load(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &LoadModelRequest,
     ) -> Result<ModelResponseVariant> {
         let max_ctx = data.max_context.filter(|&n| n != 0);
@@ -2523,7 +2832,9 @@ impl ModelHandler for ModelService {
     }
 
     async fn handle_unload(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &UnloadModelRequest,
     ) -> Result<ModelResponseVariant> {
         let model_ref = &data.model_ref;
@@ -2539,7 +2850,9 @@ impl ModelHandler for ModelService {
     }
 
     async fn handle_status(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &StatusRequest,
     ) -> Result<ModelResponseVariant> {
         let tenant = ctx.domain()?;
@@ -2553,7 +2866,9 @@ impl ModelHandler for ModelService {
     }
 
     async fn handle_health_check(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
     ) -> Result<ModelResponseVariant> {
         let tenant = ctx.domain()?;
         let cache = self.loaded_models.read().await;
@@ -2576,13 +2891,12 @@ impl ModelHandler for ModelService {
 // 9P Filesystem Handler (FsHandler trait)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use hyprstream_rpc_std::model_client::{
-    NpWalk, NpOpen, NpRead, NpWrite, NpClunk, NpStatReq, NpCreate, NpRemove,
-    RWalk, ROpen, RRead, RWrite, RStat,
-    Qid as GenQid, NpStat as GenNpStat,
-};
+use crate::services::fs::{SyntheticNode, SyntheticQid, SyntheticTree};
 use crate::services::generated::model_client::FsHandler;
-use crate::services::fs::{SyntheticTree, SyntheticNode, SyntheticQid};
+use hyprstream_rpc_std::model_client::{
+    NpClunk, NpCreate, NpOpen, NpRead, NpRemove, NpStat as GenNpStat, NpStatReq, NpWalk, NpWrite,
+    Qid as GenQid, ROpen, RRead, RStat, RWalk, RWrite,
+};
 use hyprstream_vfs::DirEntry;
 
 impl ModelService {
@@ -2641,8 +2955,7 @@ impl ModelService {
                 let model = cache
                     .iter()
                     .find(|(instance, _)| {
-                        instance.tenant() == resolve_tenant
-                            && instance.service_name() == ref_name
+                        instance.tenant() == resolve_tenant && instance.service_name() == ref_name
                     })
                     .map(|(_, model)| model);
                 let is_loaded = model.is_some();
@@ -2655,74 +2968,114 @@ impl ModelService {
 
                 let mut children = std::collections::HashMap::new();
                 let status_owned = status_str.to_owned();
-                children.insert("status".to_owned(), SyntheticNode::ReadFile(
-                    Box::new(move || format!("{status_owned}\n").into_bytes()),
-                ));
-                children.insert("defaults".to_owned(), SyntheticNode::ReadFile(
-                    Box::new(move || defaults_json.clone()),
-                ));
-                children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
-                    handler: Box::new(|data, _subject| {
-                        let cmd = String::from_utf8_lossy(data).trim().to_owned();
-                        Ok(format!("ctl: {cmd}\n").into_bytes())
-                    }),
-                });
+                children.insert(
+                    "status".to_owned(),
+                    SyntheticNode::ReadFile(Box::new(move || {
+                        format!("{status_owned}\n").into_bytes()
+                    })),
+                );
+                children.insert(
+                    "defaults".to_owned(),
+                    SyntheticNode::ReadFile(Box::new(move || defaults_json.clone())),
+                );
+                children.insert(
+                    "ctl".to_owned(),
+                    SyntheticNode::CtlFile {
+                        handler: Box::new(|data, _subject| {
+                            let cmd = String::from_utf8_lossy(data).trim().to_owned();
+                            Ok(format!("ctl: {cmd}\n").into_bytes())
+                        }),
+                    },
+                );
                 Some(SyntheticNode::Dir { children })
             }),
         })
     }
 
     fn qid_to_gen(qid: &SyntheticQid) -> GenQid {
-        GenQid { qtype: qid.qtype, version: qid.version, path: qid.path }
+        GenQid {
+            qtype: qid.qtype,
+            version: qid.version,
+            path: qid.path,
+        }
     }
 }
 
 #[async_trait::async_trait(?Send)]
 impl FsHandler for ModelService {
-    async fn handle_walk(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, data: &NpWalk,
+    async fn handle_walk(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        data: &NpWalk,
     ) -> Result<RWalk> {
         let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
-        let (_fid, qid) = tree.walk(&data.wnames, &owner, Some(data.newfid))
+        let (_fid, qid) = tree
+            .walk(&data.wnames, &owner, Some(data.newfid))
             .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(RWalk { qid: Self::qid_to_gen(&qid) })
+        Ok(RWalk {
+            qid: Self::qid_to_gen(&qid),
+        })
     }
 
-    async fn handle_open(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, data: &NpOpen,
+    async fn handle_open(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        data: &NpOpen,
     ) -> Result<ROpen> {
         let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
         // Re-walk to get the fid, then open.
-        let (qid, iounit) = tree.open(data.fid, data.mode, &owner)
+        let (qid, iounit) = tree
+            .open(data.fid, data.mode, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(ROpen { qid: Self::qid_to_gen(&qid), iounit })
+        Ok(ROpen {
+            qid: Self::qid_to_gen(&qid),
+            iounit,
+        })
     }
 
-    async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, data: &NpRead,
+    async fn handle_read(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        data: &NpRead,
     ) -> Result<RRead> {
         let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
-        let bytes = tree.read(data.fid, data.offset, data.count, &owner)
+        let bytes = tree
+            .read(data.fid, data.offset, data.count, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(RRead { data: bytes })
     }
 
-    async fn handle_write(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, data: &NpWrite,
+    async fn handle_write(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        data: &NpWrite,
     ) -> Result<RWrite> {
         let tree = self.fs_tree(&ctx.domain()?);
         let subject = ctx.subject();
         let owner = subject.to_string();
-        let count = tree.write(data.fid, data.offset, &data.data, &owner, &subject)
+        let count = tree
+            .write(data.fid, data.offset, &data.data, &owner, &subject)
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(RWrite { count })
     }
 
-    async fn handle_clunk(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, data: &NpClunk,
+    async fn handle_clunk(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        data: &NpClunk,
     ) -> Result<()> {
         let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
@@ -2730,17 +3083,26 @@ impl FsHandler for ModelService {
         Ok(())
     }
 
-    async fn handle_stat(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, data: &NpStatReq,
+    async fn handle_stat(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        data: &NpStatReq,
     ) -> Result<RStat> {
         let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
-        let (qid, name) = tree.stat(data.fid, &owner)
+        let (qid, name) = tree
+            .stat(data.fid, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(RStat {
             stat: GenNpStat {
                 qid: Self::qid_to_gen(&qid),
-                mode: if qid.qtype & 0x80 != 0 { 0o040755 } else { 0o100644 },
+                mode: if qid.qtype & 0x80 != 0 {
+                    0o040755
+                } else {
+                    0o100644
+                },
                 atime: 0,
                 mtime: 0,
                 length: 0,
@@ -2752,14 +3114,22 @@ impl FsHandler for ModelService {
         })
     }
 
-    async fn handle_create(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, _data: &NpCreate,
+    async fn handle_create(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        _data: &NpCreate,
     ) -> Result<ROpen> {
         anyhow::bail!("create not supported on model fs")
     }
 
-    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _model_ref: &str, _data: &NpRemove,
+    async fn handle_remove(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _model_ref: &str,
+        _data: &NpRemove,
     ) -> Result<()> {
         anyhow::bail!("remove not supported on model fs")
     }
@@ -2802,10 +3172,10 @@ impl ModelService {
     fn try_parse_load_request(
         body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Option<(u64, ParsedLoadRequest)> {
-        use hyprstream_rpc_std::model_capnp::model_request;
-        use hyprstream_rpc_std::model_capnp::KVQuantType as CKV;
         use hyprstream_rpc::optional_capnp::option_uint32;
+        use hyprstream_rpc_std::model_capnp::model_request;
         use hyprstream_rpc_std::model_capnp::option_k_v_quant_type;
+        use hyprstream_rpc_std::model_capnp::KVQuantType as CKV;
         let req = body.root::<model_request::Reader>().ok()?;
         let request_id = req.get_id();
         match req.which().ok()? {
@@ -2820,7 +3190,14 @@ impl ModelService {
                     option_k_v_quant_type::Which::None(()) => CKV::None,
                     option_k_v_quant_type::Which::Some(v) => v.unwrap_or(CKV::None),
                 };
-                Some((request_id, ParsedLoadRequest { model_ref, max_context, kv_quant }))
+                Some((
+                    request_id,
+                    ParsedLoadRequest {
+                        model_ref,
+                        max_context,
+                        kv_quant,
+                    },
+                ))
             }
             _ => None,
         }
@@ -2847,23 +3224,31 @@ fn federate_model_operation(
     use hyprstream_rpc_std::model_capnp::{infer_request, model_request};
     let request = body.root::<model_request::Reader>()?;
     let (model_ref, resource, operation) = match request.which()? {
-        model_request::Which::Load(inner) => {
-            (inner?.get_model_ref()?.to_str()?.to_owned(), "model:Load".to_owned(), "write")
-        }
-        model_request::Which::Status(inner) => {
-            (inner?.get_model_ref()?.to_str()?.to_owned(), "model:Status".to_owned(), "query")
-        }
+        model_request::Which::Load(inner) => (
+            inner?.get_model_ref()?.to_str()?.to_owned(),
+            "model:Load".to_owned(),
+            "write",
+        ),
+        model_request::Which::Status(inner) => (
+            inner?.get_model_ref()?.to_str()?.to_owned(),
+            "model:Status".to_owned(),
+            "query",
+        ),
         model_request::Which::Infer(inner) => {
             let infer = inner?;
-            anyhow::ensure!(matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
-                "unsupported Federate inference method");
+            anyhow::ensure!(
+                matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
+                "unsupported Federate inference method"
+            );
             let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
             (model_ref.clone(), format!("model:{model_ref}"), "infer")
         }
         _ => anyhow::bail!("unsupported Federate Model method"),
     };
-    anyhow::ensure!(pin == &StagingModelPin::reviewed()? && pin.admits(&model_ref),
-        "Federate Model request is not the reviewed pinned staging model");
+    anyhow::ensure!(
+        pin == &StagingModelPin::reviewed()? && pin.admits(&model_ref),
+        "Federate Model request is not the reviewed pinned staging model"
+    );
     Ok((resource, operation.to_owned()))
 }
 
@@ -2871,9 +3256,13 @@ fn federate_model_operation(
 impl crate::services::RequestService for ModelService {
     fn accept_deferred_federate_credential(&self) -> bool {
         #[cfg(feature = "postgres")]
-        { self.federate_dispatch.is_some() }
+        {
+            self.federate_dispatch.is_some()
+        }
         #[cfg(not(feature = "postgres"))]
-        { false }
+        {
+            false
+        }
     }
 
     async fn admit_deferred_federate_request(
@@ -2881,22 +3270,41 @@ impl crate::services::RequestService for ModelService {
         ctx: &EnvelopeContext,
         body: &hyprstream_rpc::service::DecodedRequestBody,
         proof: &hyprstream_rpc::proof::parser::ParsedProof,
-    ) -> anyhow::Result<(hyprstream_rpc::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+    ) -> anyhow::Result<(
+        hyprstream_rpc::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+    )> {
         #[cfg(feature = "postgres")]
         {
-            let adapter = self.federate_dispatch.as_ref()
+            let adapter = self
+                .federate_dispatch
+                .as_ref()
                 .ok_or_else(|| anyhow!("Federate dispatch is disabled"))?;
-            let pin = self.config.staging_model_pin.as_ref()
-                .ok_or_else(|| anyhow!("Federate Model requires an immutable staging model pin"))?;
+            let pin =
+                self.config.staging_model_pin.as_ref().ok_or_else(|| {
+                    anyhow!("Federate Model requires an immutable staging model pin")
+                })?;
             let (resource, operation) = federate_model_operation(body, pin)?;
-            let (verified, holder) = adapter.admit(
-                ctx, proof, "model", FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID, body.bytes(),
-                &resource, &operation,
-            ).await?;
+            let (verified, holder) = adapter
+                .admit(
+                    ctx,
+                    proof,
+                    "model",
+                    FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID,
+                    body.bytes(),
+                    &resource,
+                    &operation,
+                )
+                .await?;
             Ok((verified, holder, resource, operation))
         }
         #[cfg(not(feature = "postgres"))]
-        { let _ = (ctx, body, proof); anyhow::bail!("Federate dispatch is disabled") }
+        {
+            let _ = (ctx, body, proof);
+            anyhow::bail!("Federate dispatch is disabled")
+        }
     }
 
     fn decode_request_body(
@@ -2909,7 +3317,11 @@ impl crate::services::RequestService for ModelService {
         crate::services::generated::model_client::decode_model_request_body(signed_body)
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         debug!(
             "Model request from {} (id={})",
             ctx.subject(),
@@ -2940,16 +3352,21 @@ impl crate::services::RequestService for ModelService {
             let model_ref = load_data.model_ref.clone();
             let reservation = match self.reserve_intercepted_load(&instance).await? {
                 InterceptedLoadAdmission::Loaded { reach } => {
-                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                        LoadedModelResponse { model_ref, reach },
-                    ))?;
+                    let response = serialize_response(
+                        request_id,
+                        &ModelResponseVariant::LoadResult(LoadedModelResponse { model_ref, reach }),
+                    )?;
                     return Ok((response, None));
                 }
                 InterceptedLoadAdmission::Pending => {
                     debug!("Model {} already being loaded, deduplicating", model_ref);
-                    let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                        LoadedModelResponse { model_ref, reach: Vec::new() },
-                    ))?;
+                    let response = serialize_response(
+                        request_id,
+                        &ModelResponseVariant::LoadResult(LoadedModelResponse {
+                            model_ref,
+                            reach: Vec::new(),
+                        }),
+                    )?;
                     return Ok((response, None));
                 }
                 InterceptedLoadAdmission::Accepted(reservation) => reservation,
@@ -2968,12 +3385,7 @@ impl crate::services::RequestService for ModelService {
                 let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                 let scope = format!("serve:model:{}", model_name);
                 match service
-                    .run_intercepted_load(
-                        &instance,
-                        load_max_context,
-                        load_kv_quant,
-                        reservation,
-                    )
+                    .run_intercepted_load(&instance, load_max_context, load_kv_quant, reservation)
                     .await
                 {
                     Ok(endpoint) => {
@@ -2987,8 +3399,12 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
-                            let _event_publish_gate = service.lifecycle_event_publish_gate.lock().await;
-                            let _ = service.event_publisher.publish("lifecycle", "loaded", &payload).await;
+                            let _event_publish_gate =
+                                service.lifecycle_event_publish_gate.lock().await;
+                            let _ = service
+                                .event_publisher
+                                .publish("lifecycle", "loaded", &payload)
+                                .await;
                             debug!("Published model.loaded event");
                         }
                     }
@@ -3003,16 +3419,24 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
-                            let _event_publish_gate = service.lifecycle_event_publish_gate.lock().await;
-                            let _ = service.event_publisher.publish("lifecycle", "failed", &payload).await;
+                            let _event_publish_gate =
+                                service.lifecycle_event_publish_gate.lock().await;
+                            let _ = service
+                                .event_publisher
+                                .publish("lifecycle", "failed", &payload)
+                                .await;
                         }
                     }
                 }
             });
 
-            let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
-                LoadedModelResponse { model_ref: response_model_ref, reach: Vec::new() },
-            ))?;
+            let response = serialize_response(
+                request_id,
+                &ModelResponseVariant::LoadResult(LoadedModelResponse {
+                    model_ref: response_model_ref,
+                    reach: Vec::new(),
+                }),
+            )?;
 
             return Ok((response, Some(continuation)));
         }
@@ -3046,9 +3470,7 @@ impl crate::services::RequestService for ModelService {
         Some(Arc::clone(&self.producer_reach_config))
     }
 
-    fn moq_origin_handle(
-        &self,
-    ) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
         Some(Arc::clone(&self.moq_origin))
     }
 
@@ -3074,8 +3496,6 @@ impl crate::services::RequestService for ModelService {
 // ModelZmqClient removed — use generated ModelClient directly.
 // Convenience methods (load/unload/status/infer_stream) are now inlined at call sites.
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3086,24 +3506,32 @@ mod tests {
         let pin = StagingModelPin::from_settings("staging", None, None)?
             .ok_or_else(|| anyhow!("staging pin missing"))?;
         let model_ref = pin.model_ref.as_str();
-        assert_eq!(model_ref.split_once(':').map(|(name, _)| name),
-            Some(StagingModelPin::reviewed_repo_name()));
+        assert_eq!(
+            model_ref.split_once(':').map(|(name, _)| name),
+            Some(StagingModelPin::reviewed_repo_name())
+        );
         let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(1);
             let mut infer = request.init_infer();
             infer.set_model_ref(model_ref);
             infer.init_generate_stream();
         })?;
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-        assert_eq!(federate_model_operation(&body, &pin)?,
-            (format!("model:{model_ref}"), "infer".into()));
-        let wrong_oid = StagingModelPin::new(model_ref,
-            git2::Oid::from_str("0000000000000000000000000000000000000001")?)?;
+        assert_eq!(
+            federate_model_operation(&body, &pin)?,
+            (format!("model:{model_ref}"), "infer".into())
+        );
+        let wrong_oid = StagingModelPin::new(
+            model_ref,
+            git2::Oid::from_str("0000000000000000000000000000000000000001")?,
+        )?;
         assert!(federate_model_operation(&body, &wrong_oid).is_err());
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(2);
             let mut infer = request.init_infer();
             infer.set_model_ref(model_ref);
@@ -3113,34 +3541,45 @@ mod tests {
         assert!(federate_model_operation(&body, &pin).is_err());
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(3);
             request.init_load().set_model_ref(model_ref);
         })?;
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-        assert_eq!(federate_model_operation(&body, &pin)?,
-            ("model:Load".into(), "write".into()));
+        assert_eq!(
+            federate_model_operation(&body, &pin)?,
+            ("model:Load".into(), "write".into())
+        );
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(4);
             request.init_status().set_model_ref(model_ref);
         })?;
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-        assert_eq!(federate_model_operation(&body, &pin)?,
-            ("model:Status".into(), "query".into()));
+        assert_eq!(
+            federate_model_operation(&body, &pin)?,
+            ("model:Status".into(), "query".into())
+        );
 
         for rejected in ["", "qwen2.5-0.5b-instruct:other", "attacker:main"] {
             let bytes = hyprstream_rpc::serialize_message(|message| {
-                let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                let mut request =
+                    message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
                 request.set_id(5);
                 request.init_status().set_model_ref(rejected);
             })?;
             let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-            assert!(federate_model_operation(&body, &pin).is_err(), "status accepted {rejected:?}");
+            assert!(
+                federate_model_operation(&body, &pin).is_err(),
+                "status accepted {rejected:?}"
+            );
         }
         let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(6);
             request.init_load().set_model_ref("attacker:main");
         })?;
@@ -3148,7 +3587,8 @@ mod tests {
         assert!(federate_model_operation(&body, &pin).is_err());
 
         let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request = message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
             request.set_id(7);
             let mut infer = request.init_infer();
             infer.set_model_ref("attacker:main");
@@ -3176,7 +3616,11 @@ mod tests {
         let oid = git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?;
         let pin = StagingModelPin::new("qwen2.5-0.5b-instruct:main", oid)?;
         assert!(pin.admits("qwen2.5-0.5b-instruct:main"));
-        for wrong in ["other-model:main", "qwen2.5-0.5b-instruct:other", "qwen2.5-0.5b-instruct"] {
+        for wrong in [
+            "other-model:main",
+            "qwen2.5-0.5b-instruct:other",
+            "qwen2.5-0.5b-instruct",
+        ] {
             assert!(!pin.admits(wrong));
         }
         assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
@@ -3263,30 +3707,30 @@ mod tests {
             SigningKey::from_bytes(&[0x46; 32]).verifying_key(),
         );
         let records = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::Registry::default()
-            .with(AuditLayer(Arc::clone(&records)));
+        let subscriber =
+            tracing_subscriber::Registry::default().with(AuditLayer(Arc::clone(&records)));
         tracing::subscriber::with_default(subscriber, || -> Result<()> {
             for model_ref in ["other-model:main", "qwen2.5-0.5b-instruct:main"] {
                 let bytes = hyprstream_rpc::serialize_message(|message| {
                     let mut request = message
-                        .init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                        .init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>(
+                    );
                     request.set_id(91);
                     request.init_load().set_model_ref(model_ref);
                 })?;
                 let body =
                     crate::services::generated::model_client::decode_model_request_body(&bytes)?;
-                let error = match
-                    futures::executor::block_on(service.handle_request(&context, &body))
-                {
-                    Err(error) => error,
-                    Ok(_) => anyhow::bail!(
+                let error =
+                    match futures::executor::block_on(service.handle_request(&context, &body)) {
+                        Err(error) => error,
+                        Ok(_) => anyhow::bail!(
                         "missing MAC clearance must deny the load before pin/ref status handling"
                     ),
-                };
+                    };
                 anyhow::ensure!(
-                    error
-                        .to_string()
-                        .contains("authorization denied: inference caller has no verified MAC clearance"),
+                    error.to_string().contains(
+                        "authorization denied: inference caller has no verified MAC clearance"
+                    ),
                     "denial must be authorization-specific, not a pin or registry error: {error}"
                 );
                 anyhow::ensure!(
@@ -3328,12 +3772,29 @@ mod tests {
         let pin = StagingModelPin::from_settings("staging", None, None)?
             .ok_or_else(|| anyhow!("staging profile must have reviewed pin"))?;
         assert!(pin.admits("qwen2.5-0.5b-instruct:main"));
-        assert!(StagingModelPin::from_settings("staging", Some("qwen2.5-0.5b-instruct:main"), None).is_err());
-        assert!(StagingModelPin::from_settings("staging", None, Some("18c562db6830c2ef6636b8eaf42fb479272052f7")).is_err());
-        assert!(StagingModelPin::from_settings("staging", Some("other:main"), Some("18c562db6830c2ef6636b8eaf42fb479272052f7")).is_err());
+        assert!(StagingModelPin::from_settings(
+            "staging",
+            Some("qwen2.5-0.5b-instruct:main"),
+            None
+        )
+        .is_err());
+        assert!(StagingModelPin::from_settings(
+            "staging",
+            None,
+            Some("18c562db6830c2ef6636b8eaf42fb479272052f7")
+        )
+        .is_err());
+        assert!(StagingModelPin::from_settings(
+            "staging",
+            Some("other:main"),
+            Some("18c562db6830c2ef6636b8eaf42fb479272052f7")
+        )
+        .is_err());
         assert!(StagingModelPin::from_settings("default", None, None)?.is_none());
         assert!(StagingModelPin::from_settings("default", Some("x:main"), None).is_err());
-        assert!(StagingModelPin::from_settings("default", Some("x:main"), Some("deadbeef")).is_err());
+        assert!(
+            StagingModelPin::from_settings("default", Some("x:main"), Some("deadbeef")).is_err()
+        );
         Ok(())
     }
 
@@ -3345,21 +3806,33 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return; };
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
             runtime.block_on(worker_shutdown.notified());
             let _ = std::fs::write(witness, b"stopped");
         });
         let handle = hyprstream_service::SpawnedService::thread(
-            "model-pin-guard-test".to_owned(), Some(worker), shutdown, None,
+            "model-pin-guard-test".to_owned(),
+            Some(worker),
+            shutdown,
+            None,
         );
         let result: Result<()> = async {
             let _guard = SpawnPublicationGuard::new(handle);
             anyhow::bail!("forced post-spawn pre-publication failure")
-        }.await;
+        }
+        .await;
         assert!(result.is_err());
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !stopped.exists() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
-        }).await?;
+            while !stopped.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
         assert_eq!(std::fs::read(stopped)?, b"stopped");
         Ok(())
     }
@@ -3391,14 +3864,18 @@ mod tests {
 
     fn loaded_term(endpoint: &str) -> Terminal<ModelLoadTerminal> {
         Terminal {
-            value: ModelLoadTerminal::Loaded { endpoint: endpoint.to_owned() },
+            value: ModelLoadTerminal::Loaded {
+                endpoint: endpoint.to_owned(),
+            },
             latched_by: "model-service".to_owned(),
         }
     }
 
     fn failed_term(err: &str) -> Terminal<ModelLoadTerminal> {
         Terminal {
-            value: ModelLoadTerminal::LoadFailed { error: err.to_owned() },
+            value: ModelLoadTerminal::LoadFailed {
+                error: err.to_owned(),
+            },
             latched_by: "model-service".to_owned(),
         }
     }
@@ -3429,7 +3906,9 @@ mod tests {
         assert!(!store.latch(key.clone(), failed_term("race")));
         assert_eq!(
             latched_value(&store, &key),
-            ModelLoadTerminal::Loaded { endpoint: "ep1".to_owned() }
+            ModelLoadTerminal::Loaded {
+                endpoint: "ep1".to_owned()
+            }
         );
     }
 
@@ -3456,11 +3935,15 @@ mod tests {
         // Both attempts' terminals are retained (monotonic per-epoch).
         assert_eq!(
             latched_value(&store, &k1),
-            ModelLoadTerminal::Loaded { endpoint: "ep1".to_owned() }
+            ModelLoadTerminal::Loaded {
+                endpoint: "ep1".to_owned()
+            }
         );
         assert_eq!(
             latched_value(&store, &k2),
-            ModelLoadTerminal::Loaded { endpoint: "ep2".to_owned() }
+            ModelLoadTerminal::Loaded {
+                endpoint: "ep2".to_owned()
+            }
         );
     }
 
@@ -3482,8 +3965,14 @@ mod tests {
             epoch: 2,
         };
         assert!(store.latch(ks.clone(), loaded_term("ep2")));
-        assert!(matches!(latched_value(&store, &kf), ModelLoadTerminal::LoadFailed { .. }));
-        assert!(matches!(latched_value(&store, &ks), ModelLoadTerminal::Loaded { .. }));
+        assert!(matches!(
+            latched_value(&store, &kf),
+            ModelLoadTerminal::LoadFailed { .. }
+        ));
+        assert!(matches!(
+            latched_value(&store, &ks),
+            ModelLoadTerminal::Loaded { .. }
+        ));
     }
 
     #[test]
@@ -3556,9 +4045,17 @@ mod tests {
     #[test]
     fn model_reach_networked_iroh_single_select() {
         let node_id = [0xEEu8; 32];
-        let iroh = TransportConfig::iroh(node_id, Vec::new(), Some("https://relay.example".to_owned()));
+        let iroh = TransportConfig::iroh(
+            node_id,
+            Vec::new(),
+            Some("https://relay.example".to_owned()),
+        );
         let reach = ModelService::model_reach(&iroh);
-        assert_eq!(reach.len(), 1, "single-select: exactly one reach per service");
+        assert_eq!(
+            reach.len(),
+            1,
+            "single-select: exactly one reach per service"
+        );
         match &reach[0] {
             WireTransportConfig::Iroh(i) => assert_eq!(i.node_id, node_id),
             other => panic!("expected wire Iroh reach, got {other:?}"),
@@ -3673,11 +4170,8 @@ mod tests {
 
     #[test]
     fn holder_bound_service_credentials_are_not_relayed_to_remote_replicas() {
-        let service = hyprstream_rpc::auth::Claims::new(
-            "service:registry".to_owned(),
-            0,
-            9_999_999_999,
-        );
+        let service =
+            hyprstream_rpc::auth::Claims::new("service:registry".to_owned(), 0, 9_999_999_999);
         let user = hyprstream_rpc::auth::Claims::new("alice".to_owned(), 0, 9_999_999_999);
 
         assert_eq!(
@@ -3809,7 +4303,8 @@ mod tests {
                 &mut std::io::Cursor::new(&payload),
                 capnp::message::ReaderOptions::new(),
             )?;
-            let request = reader.get_root::<hyprstream_rpc_std::inference_capnp::inference_request::Reader>()?;
+            let request = reader
+                .get_root::<hyprstream_rpc_std::inference_capnp::inference_request::Reader>()?;
             anyhow::ensure!(
                 matches!(
                     request.which()?,
@@ -3835,8 +4330,7 @@ mod tests {
                 "readiness used the wrong schema method discriminator"
             );
             anyhow::ensure!(
-                options.jwt == expected_jwt
-                    && options.delegated_bearer == expected_bearer,
+                options.jwt == expected_jwt && options.delegated_bearer == expected_bearer,
                 "readiness did not carry the expected bearer shape"
             );
             let should_fail = {
@@ -4361,8 +4855,14 @@ mod tests {
                 RouteDecision::NoHealthyCandidate => panic!("healthy replica set must place"),
             }
         }
-        assert!(saw_co_located, "some sessions must land on the co-located replica");
-        assert!(saw_remote, "some sessions must land on a remote replica (not always co-located)");
+        assert!(
+            saw_co_located,
+            "some sessions must land on the co-located replica"
+        );
+        assert!(
+            saw_remote,
+            "some sessions must land on a remote replica (not always co-located)"
+        );
     }
 
     /// Session affinity holds: the same session_id must classify identically
@@ -4378,10 +4878,20 @@ mod tests {
         ];
         let mut router = CellRouter::default();
         let now = Instant::now();
-        let first = ModelService::route_decision(&mut router, &load_state, co_located, "sess-sticky", now);
+        let first =
+            ModelService::route_decision(&mut router, &load_state, co_located, "sess-sticky", now);
         for _ in 0..5 {
-            let again = ModelService::route_decision(&mut router, &load_state, co_located, "sess-sticky", now);
-            assert_eq!(first, again, "same session must stick to the same replica within its lease");
+            let again = ModelService::route_decision(
+                &mut router,
+                &load_state,
+                co_located,
+                "sess-sticky",
+                now,
+            );
+            assert_eq!(
+                first, again,
+                "same session must stick to the same replica within its lease"
+            );
         }
     }
 
@@ -4398,20 +4908,27 @@ mod tests {
         ];
         let mut router = CellRouter::default();
         let now = Instant::now();
-        let first = ModelService::route_decision(&mut router, &load_state, co_located, "sess-B", now);
+        let first =
+            ModelService::route_decision(&mut router, &load_state, co_located, "sess-B", now);
         let first_node = match first {
             RouteDecision::CoLocated => co_located,
             RouteDecision::Remote(n) => n,
             RouteDecision::NoHealthyCandidate => panic!("healthy replica set must place"),
         };
         router.report_dial_fail(first_node, now);
-        let second = ModelService::route_decision(&mut router, &load_state, co_located, "sess-B", now);
+        let second =
+            ModelService::route_decision(&mut router, &load_state, co_located, "sess-B", now);
         let second_node = match second {
             RouteDecision::CoLocated => co_located,
             RouteDecision::Remote(n) => n,
-            RouteDecision::NoHealthyCandidate => panic!("two healthy replicas remain after one failure"),
+            RouteDecision::NoHealthyCandidate => {
+                panic!("two healthy replicas remain after one failure")
+            }
         };
-        assert_ne!(second_node, first_node, "must fail over off the down replica");
+        assert_ne!(
+            second_node, first_node,
+            "must fail over off the down replica"
+        );
     }
 
     /// Empty/all-excluded replica set classifies as `NoHealthyCandidate` (the
@@ -4451,10 +4968,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("co-location without a relay bearer failed: {error}"));
         // The co-located arm carries the work order as its DIRECT bearer via
         // the same locality gate get_inference_client uses (K3 finding M1).
-        let bearer_client =
-            ModelService::attach_work_order(routed, work_token.clone());
+        let bearer_client = ModelService::attach_work_order(routed, work_token.clone());
         assert!(
-            bearer_client.is_ready().await
+            bearer_client
+                .is_ready()
+                .await
                 .unwrap_or_else(|error| panic!("returned local client failed: {error}")),
             "readiness with the internal work bearer must succeed"
         );
@@ -4496,14 +5014,21 @@ mod tests {
         exclude_local(&mut model);
         let service = selector_model_service().await;
         let routed = service
-            .select_inference_routed(&mut model, "selector-remote-internal", Some(SELECTOR_BEARER))
+            .select_inference_routed(
+                &mut model,
+                "selector-remote-internal",
+                Some(SELECTOR_BEARER),
+            )
             .await
             .unwrap_or_else(|error| panic!("remote selection failed: {error}"));
         // The same locality gate get_inference_client applies: Remote ⇒ no
         // work-order overlay, the delegated relay shape is untouched.
-        let client = ModelService::attach_work_order(routed, "iw-foreign-controller-order".to_owned());
+        let client =
+            ModelService::attach_work_order(routed, "iw-foreign-controller-order".to_owned());
         assert!(
-            client.is_ready().await
+            client
+                .is_ready()
+                .await
                 .unwrap_or_else(|error| panic!("remote client failed: {error}")),
             "remote relay readiness must succeed with the delegated bearer only"
         );
@@ -4524,7 +5049,6 @@ mod tests {
             );
         }
     }
-
 
     // ========================================================================
     // User-approved single-service Model→Inference boundary (D5): mint side.
@@ -4557,10 +5081,8 @@ mod tests {
     fn running_worker() -> hyprstream_service::SpawnedService {
         // A live parked thread keeps the handle "running" for the guard; the
         // parked thread exits when the test process ends (no join needed).
-        let handle = std::thread::spawn(|| {
-            loop {
-                std::thread::park_timeout(std::time::Duration::from_secs(3600));
-            }
+        let handle = std::thread::spawn(|| loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(3600));
         });
         hyprstream_service::SpawnedService::thread(
             "s1-alive-worker".to_owned(),
@@ -4612,9 +5134,7 @@ mod tests {
     }
 
     fn panicking_unload_worker() -> hyprstream_service::SpawnedService {
-        let handle = std::thread::spawn(|| {
-            panic!("test worker panics before join")
-        });
+        let handle = std::thread::spawn(|| panic!("test worker panics before join"));
         hyprstream_service::SpawnedService::thread(
             "s1-panicking-unload-worker".to_owned(),
             Some(handle),
@@ -4632,12 +5152,13 @@ mod tests {
         let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
         let release = Arc::new(tokio::sync::Notify::new());
         let mut model = selector_loaded_model(Vec::new(), local_state);
-        model.service_handle = blocking_unload_worker(
-            armed_tx,
-            shutdown_observed_tx,
-            Arc::clone(&release),
-        );
-        service.loaded_models.write().await.put(instance.clone(), model);
+        model.service_handle =
+            blocking_unload_worker(armed_tx, shutdown_observed_tx, Arc::clone(&release));
+        service
+            .loaded_models
+            .write()
+            .await
+            .put(instance.clone(), model);
         // This is the real inner-load/outer-load handoff overlap: a worker is
         // visible in the cache while the load reservation still exists. The
         // unloading worker below blocks its join so both status APIs must
@@ -4655,14 +5176,15 @@ mod tests {
 
         let unload_service = service.clone();
         let unload_instance = instance.clone();
-        let caller = tokio::spawn(async move {
-            unload_service.unload_model(&unload_instance).await
-        });
+        let caller =
+            tokio::spawn(async move { unload_service.unload_model(&unload_instance).await });
 
         tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_observed_rx)
             .await
             .unwrap_or_else(|_| panic!("unload did not notify the blocking worker"))
-            .unwrap_or_else(|error| panic!("blocking worker dropped shutdown observation: {error}"));
+            .unwrap_or_else(|error| {
+                panic!("blocking worker dropped shutdown observation: {error}")
+            });
 
         caller.abort();
         assert!(
@@ -4746,7 +5268,11 @@ mod tests {
             selector_loaded_model(Vec::new(), Arc::new(BoundaryDialState::default())),
         );
         service.pending_loads.lock().insert(instance.clone(), 1);
-        service.unloading_models.lock().await.insert(instance.clone());
+        service
+            .unloading_models
+            .lock()
+            .await
+            .insert(instance.clone());
 
         let (all_status, single_status) = tokio::join!(
             service.model_status_all(instance.tenant()),
@@ -4847,7 +5373,8 @@ mod tests {
         // A late Drop from an earlier handoff must not erase a newer attempt
         // for the same instance. This is the attempt identity contract, not a
         // best-effort instance-wide cleanup.
-        let stale = InterceptedLoadReservation::new(Arc::clone(&service.inner), instance.clone(), 7);
+        let stale =
+            InterceptedLoadReservation::new(Arc::clone(&service.inner), instance.clone(), 7);
         service.pending_loads.lock().insert(instance.clone(), 8);
         drop(stale);
         assert_eq!(
@@ -4876,7 +5403,8 @@ mod tests {
 
         let unload_service = service.clone();
         let unload_instance = instance.clone();
-        let unload = tokio::spawn(async move { unload_service.unload_model(&unload_instance).await });
+        let unload =
+            tokio::spawn(async move { unload_service.unload_model(&unload_instance).await });
         before_publish_rx
             .await
             .unwrap_or_else(|error| panic!("unload did not reach event boundary: {error}"));
@@ -4903,7 +5431,11 @@ mod tests {
         let local_state = Arc::new(BoundaryDialState::default());
         let mut model = selector_loaded_model(Vec::new(), local_state);
         model.service_handle = panicking_unload_worker();
-        service.loaded_models.write().await.put(instance.clone(), model);
+        service
+            .loaded_models
+            .write()
+            .await
+            .put(instance.clone(), model);
 
         let error = match service.unload_model(&instance).await {
             Err(error) => error,
@@ -4984,7 +5516,10 @@ mod tests {
         // Positive control for the liveness guard itself: an entry whose
         // service handle reports running passes the guard.
         let worker = running_worker();
-        assert!(worker.is_running(), "live thread fixture must report running");
+        assert!(
+            worker.is_running(),
+            "live thread fixture must report running"
+        );
         let dead = dead_worker();
         assert!(!dead.is_running(), "dead fixture must report not-running");
         drop(worker);
@@ -4998,7 +5533,9 @@ mod tests {
         // controller), via direct value checks mirroring model.rs load logic.
         let instance = selector_instance();
         let expected_generation: u64 = 3;
-        let expected_controller = SigningKey::from_bytes(&[0x41; 32]).verifying_key().to_bytes();
+        let expected_controller = SigningKey::from_bytes(&[0x41; 32])
+            .verifying_key()
+            .to_bytes();
 
         let handoff = crate::services::inference::IncarnationHandoff {
             instance_service_name: instance.service_name(),
@@ -5090,7 +5627,10 @@ mod tests {
     ) -> Result<()> {
         let admin_worktree = repo.join("worktrees").join("main");
         let expected_gitfile = worktree.join(".git");
-        anyhow::ensure!(expected_gitfile.is_file(), "fixture main worktree has no Git file");
+        anyhow::ensure!(
+            expected_gitfile.is_file(),
+            "fixture main worktree has no Git file"
+        );
         anyhow::ensure!(
             resolve_gitdir_reference(&admin_worktree.join("gitdir"), false)?
                 == expected_gitfile.canonicalize()?,
@@ -5143,10 +5683,14 @@ mod tests {
 
     fn install_restart_fixture_auth(keys: &[SigningKey]) -> Result<()> {
         use hyprstream_rpc::crypto::CryptoPolicy;
-        use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, KeyedPqTrustStore, ResponseVerifyConfig};
+        use hyprstream_rpc::envelope::{
+            EnvelopeVerifyConfig, KeyedPqTrustStore, ResponseVerifyConfig,
+        };
 
         let _ = hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
-            hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(10_000),
+            hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(
+                10_000,
+            ),
         ));
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
             let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
@@ -5208,17 +5752,25 @@ mod tests {
             // its denial must be a credential binding failure, not a missing PQ anchor.
             let wrong_holder = SigningKey::from_bytes(&[0x94; 32]);
             install_restart_fixture_auth(&[
-                policy_key.clone(), registry_key.clone(), model_key.clone(), wrong_holder,
+                policy_key.clone(),
+                registry_key.clone(),
+                model_key.clone(),
+                wrong_holder,
             ])?;
-            let ca = hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
+            let ca =
+                hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
             let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
             let jwt_source = Arc::new(
-                hyprstream_rpc::auth::ClusterKeySource::new(ca.verifying_key(), RESTART_FIXTURE_ISSUER.to_owned())
-                    .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq)),
+                hyprstream_rpc::auth::ClusterKeySource::new(
+                    ca.verifying_key(),
+                    RESTART_FIXTURE_ISSUER.to_owned(),
+                )
+                .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq)),
             );
             let credentials = tempfile::TempDir::new()?;
             let model_token = restart_fixture_service_jwt(&credentials, "model", &ca, &model_key)?;
-            let registry_token = restart_fixture_service_jwt(&credentials, "registry", &ca, &registry_key)?;
+            let registry_token =
+                restart_fixture_service_jwt(&credentials, "registry", &ca, &registry_key)?;
             for (key, name) in [(&policy_key, "policy"), (&registry_key, "registry")] {
                 hyprstream_service::global_trust_store().insert(
                     key.verifying_key(),
@@ -5234,14 +5786,16 @@ mod tests {
 
             let policy_base = tempfile::TempDir::new()?;
             let policy_manager = Arc::new(crate::auth::PolicyManager::permissive().await?);
-            let (policy_transport, policy_endpoint) = restart_acceptance_inproc_endpoint("policy", &tag);
+            let (policy_transport, policy_endpoint) =
+                restart_acceptance_inproc_endpoint("policy", &tag);
             let policy_service = crate::services::PolicyService::new(
                 policy_manager,
                 Arc::new(policy_key.clone()),
                 crate::config::TokenConfig::default(),
                 Arc::new(RwLock::new(git2db::Git2DB::open(policy_base.path()).await?)),
                 policy_transport.clone(),
-            ).with_jwt_key_source(jwt_source.clone());
+            )
+            .with_jwt_key_source(jwt_source.clone());
             crate::services::restart_diag::phase("policy.spawn.enter");
             let manager = hyprstream_service::InprocManager::new();
             let policy_handle = manager.spawn(Box::new(policy_service)).await?;
@@ -5250,29 +5804,48 @@ mod tests {
             let registry_base = tempfile::TempDir::new()?;
             {
                 let mut registry_store = git2db::Git2DB::open(registry_base.path()).await?;
-                registry_store.register(git2db::RepoId::new())
+                registry_store
+                    .register(git2db::RepoId::new())
                     .name(model_name)
                     .worktree_path(repo)
                     .url(String::new())
-                    .exec().await?;
+                    .exec()
+                    .await?;
             }
-            let (registry_transport, registry_endpoint) = restart_acceptance_inproc_endpoint("registry", &tag);
+            let (registry_transport, registry_endpoint) =
+                restart_acceptance_inproc_endpoint("registry", &tag);
             let registry_policy = PolicyClient::for_local_endpoint_bootstrap(
-                &policy_endpoint, registry_key.clone(), policy_key.verifying_key(), Some(registry_token),
+                &policy_endpoint,
+                registry_key.clone(),
+                policy_key.verifying_key(),
+                Some(registry_token),
             )?;
             let registry_service = crate::services::RegistryService::new(
-                registry_base.path(), registry_policy, registry_transport, registry_key.clone(),
-            ).await?
-                .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
-                .with_jwt_key_source(jwt_source.clone());
+                registry_base.path(),
+                registry_policy,
+                registry_transport,
+                registry_key.clone(),
+            )
+            .await?
+            .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
+            .with_jwt_key_source(jwt_source.clone());
             crate::services::restart_diag::phase("registry.spawn.enter");
             let registry_handle = manager.spawn(Box::new(registry_service)).await?;
             crate::services::restart_diag::phase("registry.spawn.done");
             Ok(Self {
-                model_key, policy_key, registry_key, model_token,
-                policy_endpoint, registry_endpoint, policy_transport, jwt_source,
-                _registry_handle: registry_handle, _policy_handle: policy_handle,
-                _registry_base: registry_base, _policy_base: policy_base, _credentials: credentials,
+                model_key,
+                policy_key,
+                registry_key,
+                model_token,
+                policy_endpoint,
+                registry_endpoint,
+                policy_transport,
+                jwt_source,
+                _registry_handle: registry_handle,
+                _policy_handle: policy_handle,
+                _registry_base: registry_base,
+                _policy_base: policy_base,
+                _credentials: credentials,
             })
         }
 
@@ -5323,9 +5896,13 @@ mod tests {
     }
 
     fn assert_restart_dispatch_denied<T>(result: Result<T>, case: &str) -> Result<()> {
-        let error = result.err().ok_or_else(|| anyhow!("{case} reached the Registry handler"))?;
+        let error = result
+            .err()
+            .ok_or_else(|| anyhow!("{case} reached the Registry handler"))?;
         anyhow::ensure!(
-            error.to_string().contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
+            error
+                .to_string()
+                .contains(hyprstream_rpc::service::dispatch::DISPATCH_DENIED),
             "{case} failed outside the uniform dispatch boundary: {error}"
         );
         Ok(())
@@ -5335,7 +5912,8 @@ mod tests {
     /// configs are first-write globals, while the dispatch PEP is swappable.
     #[tokio::test]
     #[ignore = "requires first-write verify-config globals; run with --exact --test-threads=1"]
-    async fn restart_fixture_authenticated_hybrid_get_by_name_requires_model_holder() -> Result<()> {
+    async fn restart_fixture_authenticated_hybrid_get_by_name_requires_model_holder() -> Result<()>
+    {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::transport::in_memory::InMemoryTransport;
 
@@ -5349,57 +5927,97 @@ mod tests {
             resource: "registry:*".to_owned(),
             operation: "query".to_owned(),
         };
-        anyhow::ensure!(auth.model_policy_client()?.check(&policy_check).await?,
-            "model holder must reach real Policy dispatch");
+        anyhow::ensure!(
+            auth.model_policy_client()?.check(&policy_check).await?,
+            "model holder must reach real Policy dispatch"
+        );
         let found = model.get_by_name(model_name).await?;
-        anyhow::ensure!(found.name == model_name,
-            "the authenticated model lookup returned the wrong repository");
-        anyhow::ensure!(model.list().await?.iter().any(|entry| entry.name == model_name),
-            "Registry-to-Policy mediation lost the authenticated model caller");
+        anyhow::ensure!(
+            found.name == model_name,
+            "the authenticated model lookup returned the wrong repository"
+        );
+        anyhow::ensure!(
+            model
+                .list()
+                .await?
+                .iter()
+                .any(|entry| entry.name == model_name),
+            "Registry-to-Policy mediation lost the authenticated model caller"
+        );
 
         let client = |key: SigningKey, token: Option<String>| {
             RegistryClient::for_local_endpoint_bootstrap(
-                &auth.registry_endpoint, key, auth.registry_key.verifying_key(), token,
+                &auth.registry_endpoint,
+                key,
+                auth.registry_key.verifying_key(),
+                token,
             )
         };
-        let missing = client(auth.model_key.clone(), None)?.get_by_name(model_name).await;
+        let missing = client(auth.model_key.clone(), None)?
+            .get_by_name(model_name)
+            .await;
         assert_restart_dispatch_denied(missing, "tokenless model lookup")?;
-        let wrong_holder = client(SigningKey::from_bytes(&[0x94; 32]), Some(auth.model_token.clone()))?
-            .get_by_name(model_name).await;
+        let wrong_holder = client(
+            SigningKey::from_bytes(&[0x94; 32]),
+            Some(auth.model_token.clone()),
+        )?
+        .get_by_name(model_name)
+        .await;
         assert_restart_dispatch_denied(wrong_holder, "wrong holder with model token")?;
 
         let processor = hyprstream_rpc::dial::lookup_inproc(
-            auth.registry_endpoint.strip_prefix("inproc://")
+            auth.registry_endpoint
+                .strip_prefix("inproc://")
                 .ok_or_else(|| anyhow!("fixture Registry endpoint is not in-process"))?,
-        ).ok_or_else(|| anyhow!("fixture Registry handle was not retained"))?;
+        )
+        .ok_or_else(|| anyhow!("fixture Registry handle was not retained"))?;
         let classical = RpcClientImpl::new(
             ClassicalRestartSigner(auth.model_key.clone()),
             InMemoryTransport::new(processor),
             Some(auth.registry_key.verifying_key()),
-        ).with_default_jwt(auth.model_token.clone());
+        )
+        .with_default_jwt(auth.model_token.clone());
         let classical = RegistryClient::new(Arc::new(classical));
-        let classical_error = classical.get_by_name(model_name).await
-            .err().ok_or_else(|| anyhow!("classical signer reached Registry"))?;
-        anyhow::ensure!(classical_error.to_string().contains("mandatory Hybrid suite requires an ML-DSA-65 signer key"),
-            "classical signer failed for an unrelated reason: {classical_error}");
+        let classical_error = classical
+            .get_by_name(model_name)
+            .await
+            .err()
+            .ok_or_else(|| anyhow!("classical signer reached Registry"))?;
+        anyhow::ensure!(
+            classical_error
+                .to_string()
+                .contains("mandatory Hybrid suite requires an ML-DSA-65 signer key"),
+            "classical signer failed for an unrelated reason: {classical_error}"
+        );
 
         // This signer has its own valid model certificate, but no PQ anchor in
         // the process verifier. Credential authority cannot fill that gap.
         let unanchored_key = SigningKey::from_bytes(&[0x95; 32]);
-        let ca = hyprstream_rpc::node_identity::derive_purpose_key(&auth.policy_key, "hyprstream-jwt-v1");
+        let ca = hyprstream_rpc::node_identity::derive_purpose_key(
+            &auth.policy_key,
+            "hyprstream-jwt-v1",
+        );
         let unanchored_credentials = tempfile::TempDir::new()?;
-        let unanchored_token = restart_fixture_service_jwt(&unanchored_credentials, "model", &ca, &unanchored_key)?;
+        let unanchored_token =
+            restart_fixture_service_jwt(&unanchored_credentials, "model", &ca, &unanchored_key)?;
         let unanchored = client(unanchored_key, Some(unanchored_token))?
-            .get_by_name(model_name).await;
-        let unanchored_error = unanchored.err()
+            .get_by_name(model_name)
+            .await;
+        let unanchored_error = unanchored
+            .err()
             .ok_or_else(|| anyhow!("unanchored PQ signer reached Registry"))?;
-        anyhow::ensure!(unanchored_error.to_string() == "registry envelope admission failed",
-            "unanchored PQ signer failed outside envelope admission: {unanchored_error:#}");
-        anyhow::ensure!(unanchored_error.chain().any(|cause| matches!(
-            cause.downcast_ref::<hyprstream_rpc::EnvelopeError>(),
-            Some(hyprstream_rpc::EnvelopeError::PqSignatureInvalid(reason))
-                if reason == "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key"
-        )), "unanchored PQ signer failed for an unrelated admission reason: {unanchored_error:#}");
+        anyhow::ensure!(
+            unanchored_error.to_string() == "registry envelope admission failed",
+            "unanchored PQ signer failed outside envelope admission: {unanchored_error:#}"
+        );
+        anyhow::ensure!(
+            unanchored_error.chain().any(|cause| matches!(
+                cause.downcast_ref::<hyprstream_rpc::EnvelopeError>(),
+                Some(hyprstream_rpc::EnvelopeError::PqSignatureInvalid(reason))
+                    if reason == "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key"
+            )),
+            "unanchored PQ signer failed for an unrelated admission reason: {unanchored_error:#}"
+        );
         Ok(())
     }
 
@@ -5410,12 +6028,15 @@ mod tests {
             ).map_err(|_| anyhow!(
                 "HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_REPO must name the sealed local bare model repository"
             ))?);
-            anyhow::ensure!(repo.is_dir(), "restart acceptance model repository is not a directory");
+            anyhow::ensure!(
+                repo.is_dir(),
+                "restart acceptance model repository is not a directory"
+            );
             let model_name = std::env::var("HYPRSTREAM_RESTART_ACCEPTANCE_MODEL_NAME")
                 .unwrap_or_else(|_| "restart-acceptance-fixture".to_owned());
-            let instance_name = std::env::var("HYPRSTREAM_INSTANCE").map_err(|_| anyhow!(
-                "HYPRSTREAM_INSTANCE must be set to an isolated synthetic-guest namespace"
-            ))?;
+            let instance_name = std::env::var("HYPRSTREAM_INSTANCE").map_err(|_| {
+                anyhow!("HYPRSTREAM_INSTANCE must be set to an isolated synthetic-guest namespace")
+            })?;
             anyhow::ensure!(
                 instance_name.starts_with("restart-acceptance-"),
                 "HYPRSTREAM_INSTANCE must use the restart-acceptance-* isolated namespace"
@@ -5428,7 +6049,10 @@ mod tests {
                 worktree.join("config.json").is_file()
                     && worktree.join("tokenizer.json").is_file()
                     && std::fs::read_dir(&worktree)?.flatten().any(|entry| {
-                        entry.file_name().to_string_lossy().ends_with(".safetensors")
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".safetensors")
                     }),
                 "fixture must provide config.json, tokenizer.json, and safetensors weights"
             );
@@ -5437,10 +6061,7 @@ mod tests {
             let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
                 hyprstream_rpc::moq_event::MoqEventOrigin::new(),
             );
-            hyprstream_rpc::registry::init(
-                hyprstream_rpc::registry::EndpointMode::Inproc,
-                None,
-            );
+            hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
             anyhow::ensure!(
                 hyprstream_rpc::registry::global().mode()
                     == hyprstream_rpc::registry::EndpointMode::Inproc,
@@ -5454,7 +6075,10 @@ mod tests {
                 auth.model_key.clone(),
                 auth.model_policy_client()?,
                 auth.model_registry_client()?,
-                TransportConfig::inproc(format!("restart-acceptance-model-{}", hex::encode(hyprstream_rpc::envelope::generate_nonce()))),
+                TransportConfig::inproc(format!(
+                    "restart-acceptance-model-{}",
+                    hex::encode(hyprstream_rpc::envelope::generate_nonce())
+                )),
                 auth.policy_transport.clone(),
             )
             .await?
@@ -5505,7 +6129,13 @@ mod tests {
             .ok_or_else(|| anyhow!("temporary mismatched checkout path is not UTF-8"))?;
 
         git(&["init", "-b", "main", source_arg])?;
-        git(&["-C", source_arg, "config", "user.name", "restart-fixture-test"])?;
+        git(&[
+            "-C",
+            source_arg,
+            "config",
+            "user.name",
+            "restart-fixture-test",
+        ])?;
         git(&[
             "-C",
             source_arg,
@@ -5522,7 +6152,14 @@ mod tests {
                 .parent()
                 .ok_or_else(|| anyhow!("temporary expected checkout has no parent"))?,
         )?;
-        git(&["--git-dir", repo_arg, "worktree", "add", expected_arg, "main"])?;
+        git(&[
+            "--git-dir",
+            repo_arg,
+            "worktree",
+            "add",
+            expected_arg,
+            "main",
+        ])?;
         git(&[
             "--git-dir",
             repo_arg,
@@ -5566,9 +6203,12 @@ mod tests {
         anyhow::ensure!(claims.resource == "inference:HasLora" && claims.operation == "query");
         anyhow::ensure!(
             claims.owner_did.as_deref()
-                == Some(hyprstream_rpc::identity::Did::from_ed25519(
-                    &caller_key.verifying_key().to_bytes(),
-                ).as_str()),
+                == Some(
+                    hyprstream_rpc::identity::Did::from_ed25519(
+                        &caller_key.verifying_key().to_bytes(),
+                    )
+                    .as_str()
+                ),
             "work order owner DID must remain bound to the verified caller"
         );
         Ok(())
@@ -5682,14 +6322,27 @@ mod tests {
         crate::services::restart_diag::phase("worker_a.load.done");
         let (audience_a, incarnation_a) = {
             let cache = fixture.model.loaded_models.read().await;
-            let loaded = cache.peek(&fixture.instance)
+            let loaded = cache
+                .peek(&fixture.instance)
                 .ok_or_else(|| anyhow!("worker A missing after successful load"))?;
             (loaded.work_audience.clone(), loaded.incarnation.clone())
         };
-        let a_client = fixture.model.get_inference_client(&fixture.model_ref, &caller_a, scope.clone()).await?;
-        let mut old_order = fixture.model.take_test_work_order().await
+        let a_client = fixture
+            .model
+            .get_inference_client(&fixture.model_ref, &caller_a, scope.clone())
+            .await?;
+        let mut old_order = fixture
+            .model
+            .take_test_work_order()
+            .await
             .ok_or_else(|| anyhow!("test-only capture missed worker A work order"))?;
-        assert_restart_order_holder(&old_order, &fixture.model_key, &audience_a, "restart-caller-a", &caller_a_key)?;
+        assert_restart_order_holder(
+            &old_order,
+            &fixture.model_key,
+            &audience_a,
+            "restart-caller-a",
+            &caller_a_key,
+        )?;
         crate::services::restart_diag::phase("worker_a.call.enter");
         let _ = a_client.has_lora().await?;
         crate::services::restart_diag::phase("worker_a.call.done");
@@ -5700,7 +6353,12 @@ mod tests {
         fixture.model.unload_model(&fixture.instance).await?;
         crate::services::restart_diag::phase("worker_a.unload.done");
         anyhow::ensure!(
-            !fixture.model.loaded_models.read().await.contains(&fixture.instance),
+            !fixture
+                .model
+                .loaded_models
+                .read()
+                .await
+                .contains(&fixture.instance),
             "unload must remove worker A before B is created"
         );
         crate::services::restart_diag::phase("worker_b.load.enter");
@@ -5713,12 +6371,19 @@ mod tests {
         crate::services::restart_diag::phase("worker_b.load.done");
         let (audience_b, incarnation_b, worker_b) = {
             let cache = fixture.model.loaded_models.read().await;
-            let loaded = cache.peek(&fixture.instance)
+            let loaded = cache
+                .peek(&fixture.instance)
                 .ok_or_else(|| anyhow!("worker B missing after successful reload"))?;
-            (loaded.work_audience.clone(), loaded.incarnation.clone(), loaded.client.clone())
+            (
+                loaded.work_audience.clone(),
+                loaded.incarnation.clone(),
+                loaded.client.clone(),
+            )
         };
-        anyhow::ensure!(audience_a != audience_b && incarnation_a != incarnation_b,
-            "reload must install a fresh worker-generated incarnation");
+        anyhow::ensure!(
+            audience_a != audience_b && incarnation_a != incarnation_b,
+            "reload must install a fresh worker-generated incarnation"
+        );
 
         // This is the causal assertion: B receives A's real captured bearer
         // through generated dispatch. Its client response stays uniformly
@@ -5744,21 +6409,48 @@ mod tests {
         crate::services::restart_diag::phase("old_order.denial.done");
 
         // Fresh A work succeeds at B and carries the same original holder.
-        let b_client_for_a = fixture.model.get_inference_client(&fixture.model_ref, &caller_a, scope.clone()).await?;
-        let fresh_a_order = fixture.model.take_test_work_order().await
+        let b_client_for_a = fixture
+            .model
+            .get_inference_client(&fixture.model_ref, &caller_a, scope.clone())
+            .await?;
+        let fresh_a_order = fixture
+            .model
+            .take_test_work_order()
+            .await
             .ok_or_else(|| anyhow!("test-only capture missed worker B fresh order"))?;
-        assert_restart_order_holder(&fresh_a_order, &fixture.model_key, &audience_b, "restart-caller-a", &caller_a_key)?;
+        assert_restart_order_holder(
+            &fresh_a_order,
+            &fixture.model_key,
+            &audience_b,
+            "restart-caller-a",
+            &caller_a_key,
+        )?;
         crate::services::restart_diag::phase("fresh_a.call.enter");
         let _ = b_client_for_a.has_lora().await?;
         crate::services::restart_diag::phase("fresh_a.call.done");
 
         // Caller B gets a different holder-bound order; it cannot inherit A's
         // subject, caller snapshot, or pairwise owner DID.
-        let b_client_for_b = fixture.model.get_inference_client(&fixture.model_ref, &caller_b, scope).await?;
-        let fresh_b_order = fixture.model.take_test_work_order().await
+        let b_client_for_b = fixture
+            .model
+            .get_inference_client(&fixture.model_ref, &caller_b, scope)
+            .await?;
+        let fresh_b_order = fixture
+            .model
+            .take_test_work_order()
+            .await
             .ok_or_else(|| anyhow!("test-only capture missed caller B order"))?;
-        assert_restart_order_holder(&fresh_b_order, &fixture.model_key, &audience_b, "restart-caller-b", &caller_b_key)?;
-        anyhow::ensure!(fresh_a_order != fresh_b_order, "distinct caller requests require distinct work orders");
+        assert_restart_order_holder(
+            &fresh_b_order,
+            &fixture.model_key,
+            &audience_b,
+            "restart-caller-b",
+            &caller_b_key,
+        )?;
+        anyhow::ensure!(
+            fresh_a_order != fresh_b_order,
+            "distinct caller requests require distinct work orders"
+        );
         crate::services::restart_diag::phase("fresh_b.call.enter");
         let _ = b_client_for_b.has_lora().await?;
         crate::services::restart_diag::phase("fresh_b.call.done");
@@ -5778,23 +6470,16 @@ mod tests {
         let caller_exp = chrono::Utc::now().timestamp() + 3600;
         let ctx = boundary_caller_ctx(caller_exp);
         let token = service
-                                .mint_internal_work_token(
-                        &instance,
-                        &ctx,
-                        &scope,
-                        &audience_fixture(),
-                    )
+            .mint_internal_work_token(&instance, &ctx, &scope, &audience_fixture())
             .unwrap_or_else(|e| panic!("mint failed: {e}"));
 
         let model_key = SigningKey::from_bytes(&[0x41; 32]);
         let now = chrono::Utc::now().timestamp();
-        let claims = verify_internal_work(
-            &token,
-            &model_key.verifying_key(),
-            &audience_fixture(),
-            now,
-        )
-        .unwrap_or_else(|e| panic!("minted order must verify against the pinned controller: {e}"));
+        let claims =
+            verify_internal_work(&token, &model_key.verifying_key(), &audience_fixture(), now)
+                .unwrap_or_else(|e| {
+                    panic!("minted order must verify against the pinned controller: {e}")
+                });
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.tenant, "fixture-tenant");
         assert_eq!(claims.model, "fixture-model:main");
@@ -5846,16 +6531,19 @@ mod tests {
             SigningKey::from_bytes(&BOUNDARY_CALLER_KEY).verifying_key(),
         );
         assert!(
-            service.mint_internal_work_token(&instance, &bare, &scope, &audience_fixture()).is_err(),
+            service
+                .mint_internal_work_token(&instance, &bare, &scope, &audience_fixture())
+                .is_err(),
             "internal work without a verified caller identity must not mint"
         );
 
         // Expired caller credential: never minted.
         let expired = boundary_caller_ctx(chrono::Utc::now().timestamp() - 10);
         assert!(
-            service.mint_internal_work_token(&instance, &expired, &scope, &audience_fixture()).is_err(),
+            service
+                .mint_internal_work_token(&instance, &expired, &scope, &audience_fixture())
+                .is_err(),
             "internal work must not outlive an expired caller credential"
         );
     }
-
 }

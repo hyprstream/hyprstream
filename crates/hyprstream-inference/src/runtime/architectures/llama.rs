@@ -142,8 +142,7 @@ fn fp8_gemm_enabled() -> bool {
 /// the process-cached env gate cannot leak between scenarios. `1` means
 /// `apply()` returned a scaled-mm result; `2` means it took lazy dequant.
 #[cfg(test)]
-static FP8_APPLY_PATH: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+static FP8_APPLY_PATH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Quantize activations to FP8 e4m3 with per-token 1x128 block scales.
 ///
@@ -204,7 +203,9 @@ fn build_rowwise_requant(weight: &Tensor, scale: &Tensor) -> RowwiseRequant {
     let ws = weight.size(); // [K, N]
     let ss = scale.size(); // [K/128, N/128]
     let (br, bc) = (ws[0] / ss[0], ws[1] / ss[1]);
-    let w_f = (weight.to_kind(tch::Kind::Float).view([ss[0], br, ss[1], bc])
+    let w_f = (weight
+        .to_kind(tch::Kind::Float)
+        .view([ss[0], br, ss[1], bc])
         * scale.to_kind(tch::Kind::Float).view([ss[0], 1, ss[1], 1]))
     .reshape([ws[0], ws[1]]);
     let s_b = (w_f.abs().amax(0, false) / FP8_MAX).clamp_min(1e-12); // [N]
@@ -274,7 +275,7 @@ fn pack_scale_b_v2(scale: &Tensor) -> Tensor {
     let size = scale.size();
     let kb = size[0];
     let l4 = (kb + 3) / 4 * 4; // i64::div_ceil is unstable on this toolchain
-    // [N/128, K/128] contiguous, then zero-pad the K-block dim to L4.
+                               // [N/128, K/128] contiguous, then zero-pad the K-block dim to L4.
     let t = scale.to_kind(tch::Kind::Float).transpose(0, 1).contiguous();
     if l4 == kb {
         t
@@ -445,13 +446,25 @@ impl LinearProjection {
     /// Create projection from weight only (no bias, no scale).
     #[inline]
     pub(crate) fn new(weight: Tensor) -> Self {
-        Self { weight, bias: None, scale: None, scale_v2: None, rowwise: None }
+        Self {
+            weight,
+            bias: None,
+            scale: None,
+            scale_v2: None,
+            rowwise: None,
+        }
     }
 
     /// Create projection with weight and bias (no scale).
     #[inline]
     pub(crate) fn with_bias(weight: Tensor, bias: Tensor) -> Self {
-        Self { weight, bias: Some(bias), scale: None, scale_v2: None, rowwise: None }
+        Self {
+            weight,
+            bias: Some(bias),
+            scale: None,
+            scale_v2: None,
+            rowwise: None,
+        }
     }
 
     /// Create FP8 projection with block-wise scale `[K/128, N/128]` (the
@@ -471,7 +484,13 @@ impl LinearProjection {
         } else {
             None
         };
-        Self { weight, bias: None, scale: Some(scale), scale_v2: Some(scale_v2), rowwise }
+        Self {
+            weight,
+            bias: None,
+            scale: Some(scale),
+            scale_v2: Some(scale_v2),
+            rowwise,
+        }
     }
 
     /// Move all owned tensors to `device` (no-op per tensor already there).
@@ -483,10 +502,12 @@ impl LinearProjection {
             bias: self.bias.map(|b| b.to_device(device)),
             scale: self.scale.map(|s| s.to_device(device)),
             scale_v2: self.scale_v2.map(|s| s.to_device(device)),
-            rowwise: self.rowwise.map(|bs| Box::new(RowwiseRequant::new(
-                bs.weight.to_device(device),
-                bs.scale.to_device(device),
-            ))),
+            rowwise: self.rowwise.map(|bs| {
+                Box::new(RowwiseRequant::new(
+                    bs.weight.to_device(device),
+                    bs.scale.to_device(device),
+                ))
+            }),
         }
     }
 
@@ -527,8 +548,8 @@ impl LinearProjection {
                     // scale: [in/128, out/128] — apply block-wise via reshape+expand+reshape.
                     // This avoids repeat_interleave (which fully materializes a copy) by using
                     // a lazy expand view over the 128-element block strides.
-                    let ws = w_bf16.size();  // [in, out]
-                    let ss = scale.size();   // [in/128, out/128]
+                    let ws = w_bf16.size(); // [in, out]
+                    let ss = scale.size(); // [in/128, out/128]
                     let block_r = ws[0] / ss[0];
                     let block_c = ws[1] / ss[1];
                     // Block-wise dequantization via 4D broadcast multiply.
@@ -537,7 +558,9 @@ impl LinearProjection {
                     // the stride-zero view directly. The multiply output is contiguous,
                     // so the final reshape back to 2D is zero-copy.
                     let w_4d = w_bf16.view([ss[0], block_r, ss[1], block_c]);
-                    let s_4d = scale.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+                    let s_4d = scale
+                        .to_kind(tch::Kind::BFloat16)
+                        .view([ss[0], 1, ss[1], 1]);
                     (w_4d * s_4d).reshape([ws[0], ws[1]])
                 } else {
                     w_bf16
@@ -691,7 +714,7 @@ impl Default for LlamaConfig {
             max_position_embeddings: 4096,
             rms_norm_eps: 1e-5,
             vocab_size,
-            original_vocab_size: vocab_size,  // Same as vocab_size initially
+            original_vocab_size: vocab_size, // Same as vocab_size initially
             num_hidden_layers: 32,
             rope_theta: 10000.0,
             rope_scaling: None,
@@ -958,10 +981,14 @@ impl LlamaAttention {
                 if delta.has_module(name, self.layer_idx) {
                     let correction = delta.forward_2d(&hidden_states_2d, name, self.layer_idx)?;
                     if start_pos == 0 && self.layer_idx == 0 {
-                        tracing::info!("[TTT] Layer 0 {}: correction_norm={:.6}, proj_norm={:.4}, ratio={:.6}",
-                            name, correction.norm().double_value(&[]),
+                        tracing::info!(
+                            "[TTT] Layer 0 {}: correction_norm={:.6}, proj_norm={:.4}, ratio={:.6}",
+                            name,
+                            correction.norm().double_value(&[]),
                             proj.norm().double_value(&[]),
-                            correction.norm().double_value(&[]) / (proj.norm().double_value(&[]) + 1e-10));
+                            correction.norm().double_value(&[])
+                                / (proj.norm().double_value(&[]) + 1e-10)
+                        );
                     }
                     // #139/#440: coerce fp32 delta to base dtype before adding (shared helper).
                     let correction_size = correction.size();
@@ -1172,7 +1199,9 @@ impl LlamaAttention {
                     *proj = proj.f_add(&correction.to_kind(kind)).map_err(|e| {
                         anyhow::anyhow!(
                             "Delta correction shape mismatch at layer {} {}: {}",
-                            self.layer_idx, name, e
+                            self.layer_idx,
+                            name,
+                            e
                         )
                     })?;
                 }
@@ -1182,7 +1211,12 @@ impl LlamaAttention {
         let rows = batch_size * seq_len;
         let kv_heads = self.detect_kv_heads(k.size().iter().product::<i64>(), rows);
 
-        let mut q = q.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64]);
+        let mut q = q.reshape([
+            batch_size,
+            seq_len,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ]);
         let mut k = k.reshape([batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
         let v = v.reshape([batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
 
@@ -1259,13 +1293,16 @@ impl LlamaAttention {
         };
 
         // One masked batched attention for all rows.
-        let attn_output = self.compute_attention_masked(&q, &k_expanded, &v_expanded, Some(attn_mask))?;
+        let attn_output =
+            self.compute_attention_masked(&q, &k_expanded, &v_expanded, Some(attn_mask))?;
 
         let attn_output = attn_output.transpose(1, 2).contiguous();
         let attn_output =
             attn_output.reshape([batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
-        let attn_output_2d =
-            attn_output.reshape([batch_size * seq_len, (self.num_heads * self.head_dim) as i64]);
+        let attn_output_2d = attn_output.reshape([
+            batch_size * seq_len,
+            (self.num_heads * self.head_dim) as i64,
+        ]);
         let mut attn_output = self.o_proj.apply(&attn_output_2d);
 
         if let Some(delta) = delta {
@@ -1353,7 +1390,10 @@ impl LlamaAttention {
 
             // SAFETY: We just inserted the key above, so it must exist
             let rope = cache.get_mut(&key).ok_or_else(|| {
-                anyhow!("Internal error: RoPE cache entry missing for layer {}", self.layer_idx)
+                anyhow!(
+                    "Internal error: RoPE cache entry missing for layer {}",
+                    self.layer_idx
+                )
             })?;
 
             // Apply RoPE with the actual position_ids
@@ -1421,10 +1461,7 @@ impl LlamaAttention {
         let rrms = (mean + eps).reciprocal().sqrt();
 
         // Apply normalization and scale with norm weights
-        broadcast_mul(
-            &broadcast_mul(tensor, &rrms)?,
-            &norm_weight_reshaped,
-        )
+        broadcast_mul(&broadcast_mul(tensor, &rrms)?, &norm_weight_reshaped)
     }
 
     /// Fused scaled dot-product attention with causal masking.
@@ -1478,9 +1515,21 @@ impl LlamaAttention {
 
         // Upcast to FP32 for precise score computation (matches prior behavior).
         let upcast = original_kind != tch::Kind::Float;
-        let q = if upcast { q.to_kind(tch::Kind::Float) } else { q };
-        let k_t = if upcast { k_t.to_kind(tch::Kind::Float) } else { k_t };
-        let v = if upcast { v.to_kind(tch::Kind::Float) } else { v };
+        let q = if upcast {
+            q.to_kind(tch::Kind::Float)
+        } else {
+            q
+        };
+        let k_t = if upcast {
+            k_t.to_kind(tch::Kind::Float)
+        } else {
+            k_t
+        };
+        let v = if upcast {
+            v.to_kind(tch::Kind::Float)
+        } else {
+            v
+        };
         // Match the score dtype (FP32) so broadcast_add doesn't upcast/clash.
         let attn_mask = attn_mask.map(|m| {
             if m.kind() != tch::Kind::Float {
@@ -1514,7 +1563,8 @@ impl LlamaAttention {
                 // absolute position (k_len - q_len) + i, so it may attend keys
                 // 0..=(k_len - q_len + i). tril(0) would mask out all history
                 // whenever start_pos > 0 (e.g. partial prefill on a prefix hit).
-                let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, device)).tril(k_len - q_len);
+                let mask =
+                    Tensor::ones([q_len, k_len], (tch::Kind::Float, device)).tril(k_len - q_len);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
             }
@@ -1538,7 +1588,8 @@ impl LlamaAttention {
                 let cur = (q_len - start).min(CHUNK);
                 let q_chunk = q.narrow(2, start, cur); // [batch, heads, cur, dim]
                 let mut scores = q_chunk.matmul(&k_t) * (scale as f64); // [batch, heads, cur, k_len]
-                let mask = Tensor::ones([cur, k_len], (tch::Kind::Float, device)).tril(k_len - q_len + start);
+                let mask = Tensor::ones([cur, k_len], (tch::Kind::Float, device))
+                    .tril(k_len - q_len + start);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
                 outputs.push(scores.softmax(-1, tch::Kind::Float).matmul(&v)); // [batch, heads, cur, dim]
@@ -1569,16 +1620,15 @@ impl LlamaAttention {
 
         // Window mask: upper triangular starting from -(window_size-1)
         // This keeps positions where j >= i - window_size + 1
-        let window = Tensor::ones([seq_len, seq_len], (dtype, device))
-            .triu(1 - window_size as i64);
+        let window = Tensor::ones([seq_len, seq_len], (dtype, device)).triu(1 - window_size as i64);
 
         // Valid = causal AND window (element-wise multiplication of 0/1 masks)
         let valid_mask = &causal * &window;
 
         // Convert to additive mask: 0 where valid, -10000 where invalid
         // invalid = 1 - valid, then scale by -10000
-        let additive_mask = (Tensor::ones([seq_len, seq_len], (dtype, device)) - valid_mask)
-            * (-10000.0f64);
+        let additive_mask =
+            (Tensor::ones([seq_len, seq_len], (dtype, device)) - valid_mask) * (-10000.0f64);
 
         // Broadcast to [batch, heads, seq, seq]
         let mask = additive_mask
@@ -1772,7 +1822,10 @@ impl RMSNorm {
     /// Move the norm weight to `device` (#314 pipeline placement).
     #[inline]
     fn into_device(self, device: Device) -> Self {
-        Self { weight: self.weight.to_device(device), eps: self.eps }
+        Self {
+            weight: self.weight.to_device(device),
+            eps: self.eps,
+        }
     }
 }
 
@@ -1810,7 +1863,8 @@ impl LlamaModel {
 
         // Whole-model single-device map (this simplified path has no layers yet;
         // size the map to the declared depth so the invariant holds).
-        let device_map = LayerDeviceMap::single(*device, (config.num_hidden_layers as usize).max(1))?;
+        let device_map =
+            LayerDeviceMap::single(*device, (config.num_hidden_layers as usize).max(1))?;
 
         Ok(Self {
             config,
@@ -1824,7 +1878,7 @@ impl LlamaModel {
             lm_head: None,
             lm_head_transposed: None,
             kv_cache: None, // Cache initialized on first use
-            vs: None, // No VarStore for safetensors loading
+            vs: None,       // No VarStore for safetensors loading
         })
     }
 
@@ -1836,7 +1890,13 @@ impl LlamaModel {
     ) -> Result<Self> {
         // Parse config from weights if possible, otherwise use defaults
         let config = Self::detect_config_from_weights(weights)?;
-        Self::from_weights_with_config(weights, config, device, dtype, hyprstream_rpc_std::model_client::KVQuantType::None)
+        Self::from_weights_with_config(
+            weights,
+            config,
+            device,
+            dtype,
+            hyprstream_rpc_std::model_client::KVQuantType::None,
+        )
     }
 
     /// Create Llama model with explicit config (allows Qwen models to override)
@@ -1873,13 +1933,14 @@ impl LlamaModel {
                 let placed = if padded_vocab_size > vocab_size {
                     tracing::info!(
                         "Padding embedding vocab size from {} to {} (multiple of 64)",
-                        vocab_size, padded_vocab_size
+                        vocab_size,
+                        padded_vocab_size
                     );
 
                     // Create padded tensor filled with zeros (embeddings can be zero-initialized)
                     let padded = Tensor::zeros(
                         [padded_vocab_size as i64, hidden_size],
-                        (w.kind(), w.device())
+                        (w.kind(), w.device()),
                     );
 
                     // Copy original weights to the padded tensor
@@ -1901,7 +1962,8 @@ impl LlamaModel {
         if padded_vocab_size != original_vocab_size {
             tracing::info!(
                 "Updating config vocab_size from {} to padded size {}",
-                original_vocab_size, padded_vocab_size
+                original_vocab_size,
+                padded_vocab_size
             );
             config.vocab_size = padded_vocab_size;
         }
@@ -1923,7 +1985,8 @@ impl LlamaModel {
                 let padded_w = if padded_vocab_size > vocab_size {
                     tracing::info!(
                         "Padding lm_head vocab size from {} to {} (multiple of 64)",
-                        vocab_size, padded_vocab_size
+                        vocab_size,
+                        padded_vocab_size
                     );
 
                     // Create padded tensor filled with zeros
@@ -1931,7 +1994,7 @@ impl LlamaModel {
                     // The actual masking needs to happen after the matmul that produces logits
                     let padded = Tensor::zeros(
                         [padded_vocab_size as i64, hidden_size],
-                        (w.kind(), w.device())
+                        (w.kind(), w.device()),
                     );
 
                     // Copy original weights to the padded tensor
@@ -2212,7 +2275,7 @@ impl LlamaModel {
             let shape = embed.size();
             if shape.len() >= 2 {
                 config.vocab_size = shape[0] as u32;
-                config.original_vocab_size = shape[0] as u32;  // Initially same
+                config.original_vocab_size = shape[0] as u32; // Initially same
                 config.hidden_size = shape[1] as u32;
 
                 // Detect Gemma3 by vocab size (262144) and set specific parameters
@@ -2284,7 +2347,7 @@ impl LlamaModel {
                         config.head_dim = head_dim as u32;
                         found_config = true;
                         tracing::info!("Detected attention config: Q={} heads, KV={} heads, dim={}, total Q={}", 
-                                     config.num_attention_heads, config.num_key_value_heads, 
+                                     config.num_attention_heads, config.num_key_value_heads,
                                      config.head_dim, q_proj_out_dim);
                         break;
                     }
@@ -2374,23 +2437,27 @@ impl LlamaModel {
             let k_weight = c_attn_weight.narrow(1, proj_size, proj_size);
             let v_weight = c_attn_weight.narrow(1, proj_size * 2, proj_size);
 
-            let (q_proj, k_proj, v_proj) = if let Some(bias) = weights.get(&format!("{prefix}.self_attn.c_attn.bias")) {
-                tracing::debug!("Layer {}: Loading combined QKV bias (Qwen-style)", layer_idx);
-                let q_bias = bias.narrow(0, 0, proj_size);
-                let k_bias = bias.narrow(0, proj_size, proj_size);
-                let v_bias = bias.narrow(0, proj_size * 2, proj_size);
-                (
-                    LinearProjection::with_bias(q_weight, q_bias),
-                    LinearProjection::with_bias(k_weight, k_bias),
-                    LinearProjection::with_bias(v_weight, v_bias),
-                )
-            } else {
-                (
-                    LinearProjection::new(q_weight),
-                    LinearProjection::new(k_weight),
-                    LinearProjection::new(v_weight),
-                )
-            };
+            let (q_proj, k_proj, v_proj) =
+                if let Some(bias) = weights.get(&format!("{prefix}.self_attn.c_attn.bias")) {
+                    tracing::debug!(
+                        "Layer {}: Loading combined QKV bias (Qwen-style)",
+                        layer_idx
+                    );
+                    let q_bias = bias.narrow(0, 0, proj_size);
+                    let k_bias = bias.narrow(0, proj_size, proj_size);
+                    let v_bias = bias.narrow(0, proj_size * 2, proj_size);
+                    (
+                        LinearProjection::with_bias(q_weight, q_bias),
+                        LinearProjection::with_bias(k_weight, k_bias),
+                        LinearProjection::with_bias(v_weight, v_bias),
+                    )
+                } else {
+                    (
+                        LinearProjection::new(q_weight),
+                        LinearProjection::new(k_weight),
+                        LinearProjection::new(v_weight),
+                    )
+                };
 
             (q_proj, k_proj, v_proj)
         };
@@ -2590,7 +2657,7 @@ impl LlamaModel {
                 as u32,
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32,
-            original_vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32,  // Initially same
+            original_vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32, // Initially same
             num_hidden_layers,
             rope_theta: json
                 .get("rope_theta")
@@ -2600,7 +2667,8 @@ impl LlamaModel {
             hidden_activation: json
                 .get("hidden_activation")
                 .and_then(|v| v.as_str())
-                .unwrap_or("silu").to_owned(),
+                .unwrap_or("silu")
+                .to_owned(),
             query_pre_attn_scalar: json
                 .get("query_pre_attn_scalar")
                 .and_then(serde_json::Value::as_f64)
@@ -2620,13 +2688,16 @@ impl LlamaModel {
                     let mt = mt.to_lowercase();
                     match mt.as_str() {
                         "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen {
-                            version: if mt.starts_with("qwen3") { 3 }
-                                else if mt.starts_with("qwen2") { 2 }
-                                else { 1 },
+                            version: if mt.starts_with("qwen3") {
+                                3
+                            } else if mt.starts_with("qwen2") {
+                                2
+                            } else {
+                                1
+                            },
                             is_moe: false,
-                            context_length: json["max_position_embeddings"]
-                                .as_u64()
-                                .unwrap_or(4096) as usize,
+                            context_length: json["max_position_embeddings"].as_u64().unwrap_or(4096)
+                                as usize,
                         },
                         "mistral" => ModelArchitecture::Mistral,
                         "gemma" => ModelArchitecture::Gemma,
@@ -2639,9 +2710,7 @@ impl LlamaModel {
         // Parse rope scaling if present
         if let Some(rope_scaling) = json.get("rope_scaling") {
             config.rope_scaling = Some(RopeScaling {
-                scaling_type: rope_scaling["type"]
-                    .as_str()
-                    .unwrap_or("linear").to_owned(),
+                scaling_type: rope_scaling["type"].as_str().unwrap_or("linear").to_owned(),
                 factor: rope_scaling["factor"].as_f64().unwrap_or(8.0) as f32,
             });
         }
@@ -2781,14 +2850,22 @@ impl LlamaModel {
                 }) {
                     result?
                 } else {
-                    layer
-                        .self_attn
-                        .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+                    layer.self_attn.forward(
+                        &hidden_states,
+                        Some(&position_ids),
+                        None,
+                        start_pos,
+                        delta,
+                    )?
                 }
             } else {
-                layer
-                    .self_attn
-                    .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+                layer.self_attn.forward(
+                    &hidden_states,
+                    Some(&position_ids),
+                    None,
+                    start_pos,
+                    delta,
+                )?
             };
             hidden_states = residual + attn_output;
 
@@ -2849,7 +2926,7 @@ impl LlamaModel {
                     let mask_values = Tensor::full(
                         [mask_count],
                         -1e10_f64,
-                        (hidden_states.kind(), hidden_states.device())
+                        (hidden_states.kind(), hidden_states.device()),
                     );
 
                     if logits_shape.len() == 3 {
@@ -2868,7 +2945,9 @@ impl LlamaModel {
                             slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
                         }
                     } else {
-                        hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                        hidden_states
+                            .narrow(0, mask_start, mask_count)
+                            .copy_(&mask_values);
                     }
                 }
             }
@@ -2898,8 +2977,7 @@ impl LlamaModel {
         if mask_count <= 0 {
             return;
         }
-        let mask_values =
-            Tensor::full([mask_count], -1e10_f64, (logits.kind(), logits.device()));
+        let mask_values = Tensor::full([mask_count], -1e10_f64, (logits.kind(), logits.device()));
         match logits_shape.len() {
             3 => {
                 for b in 0..logits_shape[0] {
@@ -2936,7 +3014,11 @@ impl LlamaModel {
     /// Inherent impl behind the [`ModelOperations::forward_batched`] override.
     fn forward_batched_impl(
         &self,
-        sequences: &mut [(Vec<i64>, usize, std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>)],
+        sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
@@ -2955,7 +3037,10 @@ impl LlamaModel {
         let device = self.device;
 
         // Build the [B, q] input id tensor and embed it as one batch.
-        let flat_ids: Vec<i64> = sequences.iter().flat_map(|(t, ..)| t.iter().copied()).collect();
+        let flat_ids: Vec<i64> = sequences
+            .iter()
+            .flat_map(|(t, ..)| t.iter().copied())
+            .collect();
         let input_ids = Tensor::from_slice(&flat_ids)
             .reshape([batch_size as i64, q_len as i64])
             .to_device(device);
@@ -2966,15 +3051,14 @@ impl LlamaModel {
         let position_ids: Vec<Tensor> = start_positions
             .iter()
             .map(|&sp| {
-                Tensor::arange_start(
-                    sp as i64,
-                    (sp + q_len) as i64,
-                    (tch::Kind::Int64, device),
-                )
+                Tensor::arange_start(sp as i64, (sp + q_len) as i64, (tch::Kind::Int64, device))
             })
             .collect();
         // After this step each row holds start_pos + q_len cached tokens.
-        let kv_lens: Vec<i64> = start_positions.iter().map(|&sp| (sp + q_len) as i64).collect();
+        let kv_lens: Vec<i64> = start_positions
+            .iter()
+            .map(|&sp| (sp + q_len) as i64)
+            .collect();
         let kv_max = kv_lens.iter().copied().max().unwrap_or(0);
 
         // Additive attention mask [B, 1, q, kv_max]: row r, query i (absolute pos
@@ -2993,12 +3077,9 @@ impl LlamaModel {
                 let kv_len = kv_lens[r];
                 for i in 0..q_len as i64 {
                     let allowed_upto = sp + i; // inclusive causal bound
-                    // valid = (cols <= allowed_upto) & (cols < kv_len)
+                                               // valid = (cols <= allowed_upto) & (cols < kv_len)
                     let valid = cols.le(allowed_upto).logical_and(&cols.lt(kv_len));
-                    let row_mask = valid
-                        .logical_not()
-                        .to_kind(tch::Kind::Float)
-                        * neg; // 0 where valid, neg where invalid
+                    let row_mask = valid.logical_not().to_kind(tch::Kind::Float) * neg; // 0 where valid, neg where invalid
                     mask.select(0, r as i64)
                         .select(0, 0)
                         .select(0, i)
@@ -3161,14 +3242,22 @@ impl LlamaModel {
                 }) {
                     result?
                 } else {
-                    layer
-                        .self_attn
-                        .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+                    layer.self_attn.forward(
+                        &hidden_states,
+                        Some(&position_ids),
+                        None,
+                        start_pos,
+                        delta,
+                    )?
                 }
             } else {
-                layer
-                    .self_attn
-                    .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+                layer.self_attn.forward(
+                    &hidden_states,
+                    Some(&position_ids),
+                    None,
+                    start_pos,
+                    delta,
+                )?
             };
             hidden_states = residual + attn_output;
 
@@ -3216,8 +3305,7 @@ impl LlamaModel {
         // Training path: start_pos is always 0 → position_ids = 0..seq, built on
         // the input device and moved alongside `hidden` at each device boundary.
         let seq_len = hidden_states.size()[1];
-        let mut position_ids =
-            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
+        let mut position_ids = Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
 
         // No KV cache in the training path: full causal attention is recomputed
         // over the entire context every step (compute_attention applies the tril
@@ -3394,14 +3482,22 @@ impl ModelOperations for LlamaModel {
                 }) {
                     result?
                 } else {
-                    layer
-                        .self_attn
-                        .forward(&hidden_states, Some(&position_ids), None, start_pos, None)?
+                    layer.self_attn.forward(
+                        &hidden_states,
+                        Some(&position_ids),
+                        None,
+                        start_pos,
+                        None,
+                    )?
                 }
             } else {
-                layer
-                    .self_attn
-                    .forward(&hidden_states, Some(&position_ids), None, start_pos, None)?
+                layer.self_attn.forward(
+                    &hidden_states,
+                    Some(&position_ids),
+                    None,
+                    start_pos,
+                    None,
+                )?
             };
             hidden_states = residual + attn_output;
 
@@ -3448,7 +3544,7 @@ impl ModelOperations for LlamaModel {
                     let mask_values = Tensor::full(
                         [mask_count],
                         -1e10_f64,
-                        (hidden_states.kind(), hidden_states.device())
+                        (hidden_states.kind(), hidden_states.device()),
                     );
 
                     if logits_shape.len() == 3 {
@@ -3467,7 +3563,9 @@ impl ModelOperations for LlamaModel {
                             slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
                         }
                     } else {
-                        hidden_states.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                        hidden_states
+                            .narrow(0, mask_start, mask_count)
+                            .copy_(&mask_values);
                     }
                 }
             }
@@ -3533,10 +3631,14 @@ impl ModelOperations for LlamaModel {
             }) {
                 result?
             } else {
-                layer.self_attn.forward(&normed, position_ids, None, 0, None)?
+                layer
+                    .self_attn
+                    .forward(&normed, position_ids, None, 0, None)?
             }
         } else {
-            layer.self_attn.forward(&normed, position_ids, None, 0, None)?
+            layer
+                .self_attn
+                .forward(&normed, position_ids, None, 0, None)?
         };
 
         let hidden_states = residual + attn_output;
@@ -3572,7 +3674,9 @@ impl ModelOperations for LlamaModel {
 
         // Self-attention block with delta injection (no KV cache on training path)
         let normed = layer.input_layernorm.forward(hidden_states)?;
-        let attn_output = layer.self_attn.forward(&normed, position_ids, None, 0, Some(delta))?;
+        let attn_output = layer
+            .self_attn
+            .forward(&normed, position_ids, None, 0, Some(delta))?;
         let hidden_states = residual + attn_output;
 
         // FFN block with delta injection for MLP projections
@@ -3618,7 +3722,8 @@ impl ModelOperations for LlamaModel {
             // down to bf16 destroys gradients. Casting the (frozen) weight up is a no-op
             // during inference where both are already bf16.
             let lm_head = lm_head.to_kind(hidden_states.kind());
-            Ok(hidden_states.f_matmul(&lm_head)
+            Ok(hidden_states
+                .f_matmul(&lm_head)
                 .map_err(|e| anyhow!("lm_head matmul failed: {}", e))?)
         } else if let Some(output_proj) = &self.lm_head_transposed {
             let output_proj = output_proj.to_kind(hidden_states.kind());
@@ -3626,11 +3731,13 @@ impl ModelOperations for LlamaModel {
             if hs_shape.len() == 3 {
                 let (batch_size, seq_len, hidden_size) = (hs_shape[0], hs_shape[1], hs_shape[2]);
                 let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
-                let logits_2d = hidden_2d.f_matmul(&output_proj)
+                let logits_2d = hidden_2d
+                    .f_matmul(&output_proj)
                     .map_err(|e| anyhow!("lm_head transposed matmul failed: {}", e))?;
                 Ok(logits_2d.reshape([batch_size, seq_len, -1]))
             } else {
-                Ok(hidden_states.f_matmul(&output_proj)
+                Ok(hidden_states
+                    .f_matmul(&output_proj)
                     .map_err(|e| anyhow!("lm_head transposed matmul failed: {}", e))?)
             }
         } else {
@@ -3770,32 +3877,59 @@ mod pipeline_tests {
             (Tensor::arange(n, opt) * 0.017).sin().reshape(dims) * 0.05
         };
 
-        w.insert("model.embed_tokens.weight".to_owned(), randn(&[VOCAB, HIDDEN]));
+        w.insert(
+            "model.embed_tokens.weight".to_owned(),
+            randn(&[VOCAB, HIDDEN]),
+        );
         w.insert("model.norm.weight".to_owned(), Tensor::ones([HIDDEN], opt));
         w.insert("lm_head.weight".to_owned(), randn(&[VOCAB, HIDDEN]));
 
         for i in 0..LAYERS {
             let p = format!("model.layers.{i}");
             // attention projections: q/k/v are [heads*head_dim, hidden]; o is [hidden, heads*head_dim]
-            w.insert(format!("{p}.self_attn.q_proj.weight"), randn(&[HEADS * HEAD_DIM, HIDDEN]));
-            w.insert(format!("{p}.self_attn.k_proj.weight"), randn(&[HEADS * HEAD_DIM, HIDDEN]));
-            w.insert(format!("{p}.self_attn.v_proj.weight"), randn(&[HEADS * HEAD_DIM, HIDDEN]));
-            w.insert(format!("{p}.self_attn.o_proj.weight"), randn(&[HIDDEN, HEADS * HEAD_DIM]));
+            w.insert(
+                format!("{p}.self_attn.q_proj.weight"),
+                randn(&[HEADS * HEAD_DIM, HIDDEN]),
+            );
+            w.insert(
+                format!("{p}.self_attn.k_proj.weight"),
+                randn(&[HEADS * HEAD_DIM, HIDDEN]),
+            );
+            w.insert(
+                format!("{p}.self_attn.v_proj.weight"),
+                randn(&[HEADS * HEAD_DIM, HIDDEN]),
+            );
+            w.insert(
+                format!("{p}.self_attn.o_proj.weight"),
+                randn(&[HIDDEN, HEADS * HEAD_DIM]),
+            );
             // mlp
             w.insert(format!("{p}.mlp.gate_proj.weight"), randn(&[INTER, HIDDEN]));
             w.insert(format!("{p}.mlp.up_proj.weight"), randn(&[INTER, HIDDEN]));
             w.insert(format!("{p}.mlp.down_proj.weight"), randn(&[HIDDEN, INTER]));
             // norms
-            w.insert(format!("{p}.input_layernorm.weight"), Tensor::ones([HIDDEN], opt));
-            w.insert(format!("{p}.post_attention_layernorm.weight"), Tensor::ones([HIDDEN], opt));
+            w.insert(
+                format!("{p}.input_layernorm.weight"),
+                Tensor::ones([HIDDEN], opt),
+            );
+            w.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                Tensor::ones([HIDDEN], opt),
+            );
         }
         w
     }
 
     fn whole_model() -> LlamaModel {
         let mut w = tiny_weights();
-        LlamaModel::from_weights_with_config(&mut w, tiny_config(), &Device::Cpu, DType::Float, KVQuantType::None)
-            .unwrap()
+        LlamaModel::from_weights_with_config(
+            &mut w,
+            tiny_config(),
+            &Device::Cpu,
+            DType::Float,
+            KVQuantType::None,
+        )
+        .unwrap()
     }
 
     /// Orchestrate the pipeline path on a model the way an engine would:
@@ -3856,16 +3990,29 @@ mod pipeline_tests {
 
         let mut w0 = tiny_weights();
         let stage0 = LlamaModel::stage_from_weights_with_config(
-            &mut w0, tiny_config(), &map, 0..split, DType::Float, KVQuantType::None,
+            &mut w0,
+            tiny_config(),
+            &map,
+            0..split,
+            DType::Float,
+            KVQuantType::None,
         )
         .unwrap();
         assert_eq!(stage0.layer_offset, 0);
         assert!(stage0.embed_tokens.is_some(), "first stage keeps embed");
-        assert!(stage0.norm.is_none() && stage0.lm_head.is_none(), "first stage has no head");
+        assert!(
+            stage0.norm.is_none() && stage0.lm_head.is_none(),
+            "first stage has no head"
+        );
 
         let mut w1 = tiny_weights();
         let stage1 = LlamaModel::stage_from_weights_with_config(
-            &mut w1, tiny_config(), &map, split..LAYERS, DType::Float, KVQuantType::None,
+            &mut w1,
+            tiny_config(),
+            &map,
+            split..LAYERS,
+            DType::Float,
+            KVQuantType::None,
         )
         .unwrap();
         assert_eq!(stage1.layer_offset, split);
@@ -3899,12 +4046,23 @@ mod pipeline_tests {
         let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
         let mut w = tiny_weights();
         let stage = LlamaModel::stage_from_weights_with_config(
-            &mut w, tiny_config(), &map, 2..LAYERS, DType::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            &map,
+            2..LAYERS,
+            DType::Float,
+            KVQuantType::None,
         )
         .unwrap();
         let emb = Tensor::randn([1, 3, HIDDEN], (DType::Float, Device::Cpu));
-        assert!(stage.forward_layers(&emb, 0..2, 0, None).is_err(), "range below window");
-        assert!(stage.forward_layers(&emb, 2..LAYERS, 0, None).is_ok(), "owned range ok");
+        assert!(
+            stage.forward_layers(&emb, 0..2, 0, None).is_err(),
+            "range below window"
+        );
+        assert!(
+            stage.forward_layers(&emb, 2..LAYERS, 0, None).is_ok(),
+            "owned range ok"
+        );
     }
 
     #[test]
@@ -3925,7 +4083,12 @@ mod pipeline_tests {
         let mut w = tiny_weights();
         w.remove("model.norm.weight");
         let result = LlamaModel::stage_from_weights_with_config(
-            &mut w, tiny_config(), &map, 0..LAYERS, DType::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            &map,
+            0..LAYERS,
+            DType::Float,
+            KVQuantType::None,
         );
         match result {
             Ok(_) => panic!("last stage without norm weight must error"),
@@ -3940,7 +4103,10 @@ mod pipeline_tests {
         assert!(LlamaModel::parse_config(ok).is_ok());
         let missing = r#"{"hidden_size":16,"num_hidden_layers":4}"#;
         let err = LlamaModel::parse_config(missing).unwrap_err();
-        assert!(err.to_string().contains("num_attention_heads"), "got: {err}");
+        assert!(
+            err.to_string().contains("num_attention_heads"),
+            "got: {err}"
+        );
     }
 
     // ========================================================================
@@ -3967,9 +4133,7 @@ mod pipeline_tests {
         // graph). Seed by a STABLE per-key offset — HashMap iteration order is not
         // deterministic, so two independent `tiny_delta()` builds (whole vs split)
         // must agree key-for-key, not enumeration-index-for-index.
-        let key_offset = |key: &str| -> i64 {
-            key.bytes().map(|b| b as i64).sum::<i64>() % 17
-        };
+        let key_offset = |key: &str| -> i64 { key.bytes().map(|b| b as i64).sum::<i64>() % 17 };
         let _g = tch::no_grad_guard();
         for (k, a) in delta.lora_a.iter() {
             let n: i64 = a.size().iter().product();
@@ -3979,7 +4143,8 @@ mod pipeline_tests {
         }
         for (k, b) in delta.lora_b.iter() {
             let n: i64 = b.size().iter().product();
-            let vals = (Tensor::arange(n, (DType::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
+            let vals =
+                (Tensor::arange(n, (DType::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
             b.shallow_clone().copy_(&vals.reshape(b.size()));
         }
         delta
@@ -4012,7 +4177,10 @@ mod pipeline_tests {
         // --- (a) whole-model training forward over a single-device map ---
         let whole = whole_model();
         let whole_delta = tiny_delta();
-        let whole_stage = [TrainStage { model: &whole, range: 0..LAYERS }];
+        let whole_stage = [TrainStage {
+            model: &whole,
+            range: 0..LAYERS,
+        }];
         let loss_whole = compute_ntp_loss_split(&whole_stage, &input, Some(&whole_delta)).unwrap();
         loss_whole.backward();
         let whole_grads = grad_snapshot(&whole_delta);
@@ -4024,16 +4192,34 @@ mod pipeline_tests {
         let split = LAYERS / 2;
         let mut w0 = tiny_weights();
         let stage0 = LlamaModel::stage_from_weights_with_config(
-            &mut w0, tiny_config(), &map, 0..split, DType::Float, KVQuantType::None,
-        ).unwrap();
+            &mut w0,
+            tiny_config(),
+            &map,
+            0..split,
+            DType::Float,
+            KVQuantType::None,
+        )
+        .unwrap();
         let mut w1 = tiny_weights();
         let stage1 = LlamaModel::stage_from_weights_with_config(
-            &mut w1, tiny_config(), &map, split..LAYERS, DType::Float, KVQuantType::None,
-        ).unwrap();
+            &mut w1,
+            tiny_config(),
+            &map,
+            split..LAYERS,
+            DType::Float,
+            KVQuantType::None,
+        )
+        .unwrap();
         let split_delta = tiny_delta();
         let stages = [
-            TrainStage { model: &stage0, range: 0..split },
-            TrainStage { model: &stage1, range: split..LAYERS },
+            TrainStage {
+                model: &stage0,
+                range: 0..split,
+            },
+            TrainStage {
+                model: &stage1,
+                range: split..LAYERS,
+            },
         ];
         let loss_split = compute_ntp_loss_split(&stages, &input, Some(&split_delta)).unwrap();
         loss_split.backward();
@@ -4042,19 +4228,27 @@ mod pipeline_tests {
         // Losses must match (forward equivalence).
         let lw = loss_whole.double_value(&[]);
         let ls = loss_split.double_value(&[]);
-        assert!((lw - ls).abs() < 1e-4, "loss diverged: whole={lw} split={ls}");
+        assert!(
+            (lw - ls).abs() < 1e-4,
+            "loss diverged: whole={lw} split={ls}"
+        );
 
         // Per-key gradient norms must match within tolerance (backward equivalence).
         assert_eq!(whole_grads.len(), split_grads.len());
         for (k, &gw) in &whole_grads {
-            let gs = *split_grads.get(k).unwrap_or_else(|| panic!("missing grad {k}"));
+            let gs = *split_grads
+                .get(k)
+                .unwrap_or_else(|| panic!("missing grad {k}"));
             assert!(
                 (gw - gs).abs() <= 1e-4 + 1e-4 * gw.abs(),
                 "grad norm diverged for {k}: whole={gw} split={gs}"
             );
             // A non-trivial gradient must actually flow (guards against a silently
             // detached path that would make both sides spuriously equal at 0).
-            assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
+            assert!(
+                gw > 0.0,
+                "grad for {k} is zero — autograd path not exercised"
+            );
         }
     }
 
@@ -4063,18 +4257,26 @@ mod pipeline_tests {
     // ========================================================================
 
     use crate::runtime::kv_cache::KVCacheManager;
-    use std::sync::Arc;
     use parking_lot::Mutex;
+    use std::sync::Arc;
 
     fn fresh_cache() -> Arc<Mutex<KVCacheManager>> {
-        Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)))
+        Arc::new(Mutex::new(KVCacheManager::new(
+            LAYERS,
+            64,
+            KVQuantType::None,
+        )))
     }
 
     /// Decode logits (last position) for one sequence run through the trusted
     /// batch=1 path: prefill the prompt, then one decode step for `next_tok`.
     fn serial_decode_logits(prompt: &[i64], next_tok: i64) -> Tensor {
         let model = whole_model();
-        let cache = Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)));
+        let cache = Arc::new(Mutex::new(KVCacheManager::new(
+            LAYERS,
+            64,
+            KVQuantType::None,
+        )));
         // Inject a fresh isolated cache so the batch=1 path actually caches.
         let model = {
             let mut m = model;
@@ -4227,11 +4429,23 @@ mod pipeline_tests {
         let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
         let mut w = tiny_weights();
         let stage = LlamaModel::stage_from_weights_with_config(
-            &mut w, tiny_config(), &map, 2..LAYERS, DType::Float, KVQuantType::None,
-        ).unwrap();
+            &mut w,
+            tiny_config(),
+            &map,
+            2..LAYERS,
+            DType::Float,
+            KVQuantType::None,
+        )
+        .unwrap();
         let emb = Tensor::randn([1, 3, HIDDEN], (DType::Float, Device::Cpu));
-        assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
-        assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
+        assert!(
+            stage.forward_layers_train(&emb, 0..2, None).is_err(),
+            "range below window"
+        );
+        assert!(
+            stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(),
+            "owned range ok"
+        );
     }
 }
 
@@ -4239,7 +4453,12 @@ mod pipeline_tests {
 // FP8 _scaled_mm spike — CPU capability contract + numerics + microbenchmark.
 // ============================================================================
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout, clippy::print_stderr)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod fp8_gemm_tests {
     use super::*;
     use std::process::Command;
@@ -4293,7 +4512,13 @@ mod fp8_gemm_tests {
         }
         let gpu = std::env::var("CUDA_VISIBLE_DEVICES")
             .ok()
-            .and_then(|visible| visible.split(',').nth(device).map(str::trim).map(str::to_owned))
+            .and_then(|visible| {
+                visible
+                    .split(',')
+                    .nth(device)
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| device.to_string());
         let output = match Command::new("nvidia-smi")
@@ -4315,13 +4540,17 @@ mod fp8_gemm_tests {
         let capability = match String::from_utf8(output.stdout) {
             Ok(capability) => capability,
             Err(error) => {
-                eprintln!("skipping NVIDIA FP8 capability test: non-UTF-8 capability output: {error}");
+                eprintln!(
+                    "skipping NVIDIA FP8 capability test: non-UTF-8 capability output: {error}"
+                );
                 return None;
             }
         };
         let capability = capability.trim();
         let Some((major, minor)) = capability.split_once('.') else {
-            eprintln!("skipping NVIDIA FP8 capability test: malformed compute capability {capability:?}");
+            eprintln!(
+                "skipping NVIDIA FP8 capability test: malformed compute capability {capability:?}"
+            );
             return None;
         };
         match (major.parse(), minor.parse()) {
@@ -4341,7 +4570,9 @@ mod fp8_gemm_tests {
         let n: i64 = dims.iter().product();
         let idx = Tensor::arange(n, (Kind::Double, Device::Cpu)) + seed;
         let h = (idx * 12.9898).sin() * 43758.5453;
-        ((&h - h.floor()) * 2.0 - 1.0).to_kind(Kind::Float).reshape(dims)
+        ((&h - h.floor()) * 2.0 - 1.0)
+            .to_kind(Kind::Float)
+            .reshape(dims)
     }
 
     /// Asserted CPU capability contract for the shipped libtorch `_scaled_mm` with e4m3
@@ -4361,7 +4592,15 @@ mod fp8_gemm_tests {
         let one = Tensor::ones([1, 1], OPT);
         // v1 tensorwise: works, BF16 out.
         let out = a
-            .f_internal_scaled_mm(&b, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
+            .f_internal_scaled_mm(
+                &b,
+                &one,
+                &one,
+                None::<&Tensor>,
+                None::<&Tensor>,
+                Kind::BFloat16,
+                false,
+            )
             .expect("v1 tensorwise e4m3 must work on CPU");
         assert_eq!(out.size(), [m, n]);
         assert_eq!(out.kind(), Kind::BFloat16);
@@ -4375,20 +4614,42 @@ mod fp8_gemm_tests {
         let sa = Tensor::ones([m, 1], OPT);
         let sb = Tensor::ones([1, n], OPT);
         let err = a
-            .f_internal_scaled_mm(&b, &sa, &sb, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false)
+            .f_internal_scaled_mm(
+                &b,
+                &sa,
+                &sb,
+                None::<&Tensor>,
+                None::<&Tensor>,
+                Kind::BFloat16,
+                false,
+            )
             .expect_err("v1 rowwise must be rejected on CPU");
-        assert!(err.to_string().contains("per-tensor scaling"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("per-tensor scaling"),
+            "unexpected: {err}"
+        );
         // v2: not registered for CPU at all.
         let sa_refs = [&sa];
         let sb_refs = [&sb];
         let err = a
             .f_internal_scaled_mm_v2(
-                &b, &sa_refs, [RECIPE_BLOCKWISE_1X128], [NO_SWIZZLE],
-                &sb_refs, [RECIPE_BLOCKWISE_128X128], [NO_SWIZZLE],
-                None::<&Tensor>, Kind::BFloat16, [] as [i64; 0], false,
+                &b,
+                &sa_refs,
+                [RECIPE_BLOCKWISE_1X128],
+                [NO_SWIZZLE],
+                &sb_refs,
+                [RECIPE_BLOCKWISE_128X128],
+                [NO_SWIZZLE],
+                None::<&Tensor>,
+                Kind::BFloat16,
+                [] as [i64; 0],
+                false,
             )
             .expect_err("v2 must be unavailable on CPU");
-        assert!(err.to_string().contains("_scaled_mm_v2"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("_scaled_mm_v2"),
+            "unexpected: {err}"
+        );
     }
 
     /// The 1x128 activation quantizer: roundtrip q*scale ≈ x. This is the
@@ -4411,7 +4672,10 @@ mod fp8_gemm_tests {
         // `<=`). Subnormal-quantized outputs can exceed 2^-4 in relative
         // terms, but amax normalization keeps block magnitudes ≳ 448·2^-9,
         // well above the e4m3 subnormal floor — so the bound holds here.
-        assert!(rel <= 0.0625, "roundtrip max rel err {rel} exceeds e4m3 ulp bound");
+        assert!(
+            rel <= 0.0625,
+            "roundtrip max rel err {rel} exceeds e4m3 ulp bound"
+        );
         assert!(q.to_kind(Kind::Float).abs().max().double_value(&[]) <= 448.0);
     }
 
@@ -4434,16 +4698,22 @@ mod fp8_gemm_tests {
         // Quantize weight per 128x128 block (what the checkpoint stores).
         let w4 = w.view([k / 128, 128, n / 128, 128]);
         let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0; // [k/128, n/128]
-        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8);
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1]))
+            .clamp(-448.0, 448.0)
+            .to_kind(FP8);
         let w_deq = (wq.to_kind(Kind::Float) * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
 
         // Simulated scaled_mm: quantize activations, dequantize both, matmul.
         let (q, sa) = quantize_activations_1x128(&x);
-        let x_deq = (q.to_kind(Kind::Float).view([m, k / 128, 128]) * sa.unsqueeze(-1)).view([m, k]);
+        let x_deq =
+            (q.to_kind(Kind::Float).view([m, k / 128, 128]) * sa.unsqueeze(-1)).view([m, k]);
         let out_sim = x_deq.matmul(&w_deq);
 
         // (a) vs lazy-dequant baseline: BF16 cast of w_deq then matmul.
-        let out_lazy = x.to_kind(Kind::BFloat16).matmul(&w_deq.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
+        let out_lazy = x
+            .to_kind(Kind::BFloat16)
+            .matmul(&w_deq.to_kind(Kind::BFloat16))
+            .to_kind(Kind::Float);
         let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
         // (b) vs full-precision reference.
         let out_ref = x.matmul(&w);
@@ -4452,8 +4722,14 @@ mod fp8_gemm_tests {
         // ~2.3% RMS measured above, partially averaged over K=256
         // accumulation). The observed envelope is printed for the spike
         // report; assert conservative bounds.
-        assert!(rel_vs_ref < 0.10, "sim vs full-precision rel err {rel_vs_ref}");
-        assert!(rel_vs_lazy < 0.10, "sim vs lazy-dequant rel err {rel_vs_lazy}");
+        assert!(
+            rel_vs_ref < 0.10,
+            "sim vs full-precision rel err {rel_vs_ref}"
+        );
+        assert!(
+            rel_vs_lazy < 0.10,
+            "sim vs lazy-dequant rel err {rel_vs_lazy}"
+        );
         println!(
             "error envelope (frob rel): x_deq={:.4} w_deq={:.4} sim_vs_lazy={:.4} sim_vs_ref={:.4}",
             rel_frob_err(&x_deq, &x),
@@ -4493,9 +4769,10 @@ mod fp8_gemm_tests {
             let w4 = w.view([k / 128, 128, n / 128, 128]);
             let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
             let wq = (w4 / ws.view([k / 128, 1, n / 128, 1]))
-                .clamp(-448.0, 448.0).to_kind(FP8);
-            let w_deq_block = (wq.to_kind(Kind::Float)
-                * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
+                .clamp(-448.0, 448.0)
+                .to_kind(FP8);
+            let w_deq_block =
+                (wq.to_kind(Kind::Float) * ws.view([k / 128, 1, n / 128, 1])).view([k, n]);
 
             // Load-time rowwise requant from the FP8 checkpoint tensors.
             let rowwise = build_rowwise_requant(&wq.view([k, n]), &ws);
@@ -4508,17 +4785,23 @@ mod fp8_gemm_tests {
             let w_deq = rowwise.weight.to_kind(Kind::Float) * &rowwise.scale;
             let out_sim = x_deq.matmul(&w_deq);
 
-            let out_lazy = x.to_kind(Kind::BFloat16)
-                .matmul(&w_deq_block.to_kind(Kind::BFloat16)).to_kind(Kind::Float);
+            let out_lazy = x
+                .to_kind(Kind::BFloat16)
+                .matmul(&w_deq_block.to_kind(Kind::BFloat16))
+                .to_kind(Kind::Float);
             let rel_vs_lazy = rel_frob_err(&out_sim, &out_lazy);
             let out_ref = x.matmul(&w);
             let rel_vs_ref = rel_frob_err(&out_sim, &out_ref);
             worst_lazy = worst_lazy.max(rel_vs_lazy);
             worst_ref = worst_ref.max(rel_vs_ref);
-            assert!(rel_vs_lazy < 0.12,
-                "rowwise seed={seed} spread={spread} vs lazy err {rel_vs_lazy}");
-            assert!(rel_vs_ref < 0.12,
-                "rowwise seed={seed} spread={spread} vs reference err {rel_vs_ref}");
+            assert!(
+                rel_vs_lazy < 0.12,
+                "rowwise seed={seed} spread={spread} vs lazy err {rel_vs_lazy}"
+            );
+            assert!(
+                rel_vs_ref < 0.12,
+                "rowwise seed={seed} spread={spread} vs reference err {rel_vs_ref}"
+            );
             println!(
                 "rowwise envelope seed={seed} spread={spread}: sim_vs_lazy={rel_vs_lazy:.4} sim_vs_ref={rel_vs_ref:.4}"
             );
@@ -4550,10 +4833,7 @@ mod fp8_gemm_tests {
         let packed4 = pack_scale_b_v2(&det(&[4, 2], 10));
         assert_eq!(packed4.size(), [2, 4]);
         // with_scale derives scale_v2 automatically.
-        let proj = LinearProjection::with_scale(
-            det(&[256, 384], 11).to_kind(FP8),
-            det(&[2, 3], 9),
-        );
+        let proj = LinearProjection::with_scale(det(&[256, 384], 11).to_kind(FP8), det(&[2, 3], 9));
         assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [3, 4]);
     }
 
@@ -4617,7 +4897,11 @@ mod fp8_gemm_tests {
         for _ in 0..8 {
             assert!(arm(&latch).is_none());
         }
-        assert_eq!(attempts.get(), 1, "kernel must only be attempted before the latch trips");
+        assert_eq!(
+            attempts.get(),
+            1,
+            "kernel must only be attempted before the latch trips"
+        );
         assert_eq!(warnings.get(), 1, "warn-once per (device, recipe)");
         assert!(latch.is_failed(0, ScaledMmRecipe::BlockwiseV2));
         // The other recipe on the same device is unaffected.
@@ -4632,7 +4916,10 @@ mod fp8_gemm_tests {
         let scale = Tensor::ones([1, 2], OPT); // [in/128, out/128]
         let proj = LinearProjection::with_scale(w, scale);
         let x = det(&[3, 128], 7).to_kind(Kind::BFloat16);
-        assert!(proj.apply_fp8_scaled_mm(&x).is_none(), "CPU must decline the scaled_mm path");
+        assert!(
+            proj.apply_fp8_scaled_mm(&x).is_none(),
+            "CPU must decline the scaled_mm path"
+        );
         // Lazy fallback still computes.
         let out = proj.apply(&x);
         assert_eq!(out.size(), [3, 256]);
@@ -4648,9 +4935,16 @@ mod fp8_gemm_tests {
         };
         let gate_on = std::env::var("HYPRSTREAM_FP8_GEMM").as_deref() == Ok("1");
         let dequant_on = std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD").as_deref() == Ok("1");
-        assert_eq!(fp8_gemm_enabled(), gate_on, "FP8 gate env was not read independently");
-        assert_eq!(crate::config::default_fp8_dequant_load(), dequant_on,
-            "load-time dequant gate changed independently of its own env");
+        assert_eq!(
+            fp8_gemm_enabled(),
+            gate_on,
+            "FP8 gate env was not read independently"
+        );
+        assert_eq!(
+            crate::config::default_fp8_dequant_load(),
+            dequant_on,
+            "load-time dequant gate changed independently of its own env"
+        );
 
         let w = det(&[256, 256], 31).clamp(-2.0, 2.0).to_kind(FP8);
         let p = LinearProjection::with_scale(w, Tensor::ones([2, 2], OPT));
@@ -4659,45 +4953,81 @@ mod fp8_gemm_tests {
         if mode == "cpu" {
             // Negative control: with no CUDA device involved, production apply
             // must stay on lazy dequant even when the FP8 gate is enabled.
-            assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 2,
-                "CPU probe unexpectedly selected a scaled-mm path");
+            assert_eq!(
+                FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "CPU probe unexpectedly selected a scaled-mm path"
+            );
             println!("causal gate probe: CPU lazy fallback observed");
             return;
         }
 
         assert_eq!(mode, "sm120", "unknown FP8 gate probe mode");
-        assert!(gate_on && !dequant_on, "SM120 probe must be FP8-on/dequant-off");
+        assert!(
+            gate_on && !dequant_on,
+            "SM120 probe must be FP8-on/dequant-off"
+        );
         assert!(tch::Cuda::is_available(), "SM120 probe requires CUDA");
         let dev = Device::Cuda(0);
         let p = p.into_device(dev);
         let x_train = x_cpu.to_device(dev).set_requires_grad(true);
         let out_train = p.apply(&x_train);
-        assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 2,
-            "autograd-capable input unexpectedly selected scaled-mm");
+        assert_eq!(
+            FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "autograd-capable input unexpectedly selected scaled-mm"
+        );
         out_train.sum(Kind::Float).backward();
-        assert!(x_train.grad().defined(), "lazy matmul did not retain a backward path");
+        assert!(
+            x_train.grad().defined(),
+            "lazy matmul did not retain a backward path"
+        );
 
         let x = x_cpu.to_device(dev);
         let out = p.apply(&x);
         assert_eq!(out.size(), [2, 256]);
-        assert_eq!(FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst), 1,
-            "production apply did not return the gated scaled-mm result");
-        assert!(scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
-            "SM120 blockwise recipe did not latch off");
-        assert!(!scaled_mm_latch().is_failed(0, ScaledMmRecipe::RowwiseV1),
-            "SM120 rowwise recipe latched despite libtorch 2.11");
-        println!("causal gate probe: FP8 on selected rowwise after blockwise latch; dequant gate off");
+        assert_eq!(
+            FP8_APPLY_PATH.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "production apply did not return the gated scaled-mm result"
+        );
+        assert!(
+            scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
+            "SM120 blockwise recipe did not latch off"
+        );
+        assert!(
+            !scaled_mm_latch().is_failed(0, ScaledMmRecipe::RowwiseV1),
+            "SM120 rowwise recipe latched despite libtorch 2.11"
+        );
+        println!(
+            "causal gate probe: FP8 on selected rowwise after blockwise latch; dequant gate off"
+        );
     }
 
     #[test]
     fn fp8_e5m2_no_requant_probe() {
-        if std::env::var_os("HYPRSTREAM_FP8_E5M2_PROBE").is_none() { return; }
-        assert!(fp8_gemm_enabled(), "E5M2 allocation probe requires FP8 gate on");
+        if std::env::var_os("HYPRSTREAM_FP8_E5M2_PROBE").is_none() {
+            return;
+        }
+        assert!(
+            fp8_gemm_enabled(),
+            "E5M2 allocation probe requires FP8 gate on"
+        );
         reset_rowwise_requant_peak();
         let _projection = LinearProjection::with_scale(
-            det(&[256, 256], 41).to_kind(Kind::Float8e5m2), Tensor::ones([2, 2], OPT));
-        assert_eq!(rowwise_requant_live(), 0, "unsupported E5M2 construction retained a rowwise allocation");
-        assert_eq!(rowwise_requant_peak(), 0, "unsupported E5M2 construction invoked rowwise requantization");
+            det(&[256, 256], 41).to_kind(Kind::Float8e5m2),
+            Tensor::ones([2, 2], OPT),
+        );
+        assert_eq!(
+            rowwise_requant_live(),
+            0,
+            "unsupported E5M2 construction retained a rowwise allocation"
+        );
+        assert_eq!(
+            rowwise_requant_peak(),
+            0,
+            "unsupported E5M2 construction invoked rowwise requantization"
+        );
         println!("causal allocation probe: E5M2 did not construct rowwise requantization");
     }
 
@@ -4712,17 +5042,33 @@ mod fp8_gemm_tests {
             let exe = std::env::current_exe().expect("test executable path");
             let output = Command::new(exe)
                 .arg("--exact")
-                .arg(format!("runtime::architectures::llama::fp8_gemm_tests::{name}"))
+                .arg(format!(
+                    "runtime::architectures::llama::fp8_gemm_tests::{name}"
+                ))
                 .arg("--nocapture")
                 .env("HYPRSTREAM_FP8_GEMM", fp8)
                 .env("HYPRSTREAM_FP8_DEQUANT_LOAD", dequant)
                 .env("HYPRSTREAM_FP8_GATE_PROBE", probe)
                 .output()
                 .expect("spawn FP8 gate probe");
-            let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            assert!(output.status.success(), "FP8 gate probe {probe} failed: {}\n{transcript}", output.status);
-            assert!(transcript.contains("1 passed"), "FP8 gate probe {probe} did not execute exactly one test:\n{transcript}");
-            assert!(transcript.contains(marker), "FP8 gate probe {probe} missed expected marker {marker:?}:\n{transcript}");
+            let transcript = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success(),
+                "FP8 gate probe {probe} failed: {}\n{transcript}",
+                output.status
+            );
+            assert!(
+                transcript.contains("1 passed"),
+                "FP8 gate probe {probe} did not execute exactly one test:\n{transcript}"
+            );
+            assert!(
+                transcript.contains(marker),
+                "FP8 gate probe {probe} missed expected marker {marker:?}:\n{transcript}"
+            );
         }
 
         let cpu_marker = "causal gate probe: CPU lazy fallback observed";
@@ -4730,14 +5076,31 @@ mod fp8_gemm_tests {
         run_probe("fp8_gate_probe", "1", "0", "cpu", cpu_marker);
         run_probe("fp8_gate_probe", "0", "1", "cpu", cpu_marker);
         let exe = std::env::current_exe().expect("test executable path");
-        let output = Command::new(&exe).arg("--exact")
+        let output = Command::new(&exe)
+            .arg("--exact")
             .arg("runtime::architectures::llama::fp8_gemm_tests::fp8_e5m2_no_requant_probe")
-            .arg("--nocapture").env("HYPRSTREAM_FP8_GEMM", "1")
-            .env("HYPRSTREAM_FP8_E5M2_PROBE", "1").output().expect("spawn E5M2 allocation probe");
-        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(output.status.success(), "E5M2 allocation probe failed: {}\n{transcript}", output.status);
-        assert!(transcript.contains("1 passed") && transcript.contains("causal allocation probe: E5M2 did not construct rowwise requantization"),
-            "E5M2 allocation probe did not execute its expected child:\n{transcript}");
+            .arg("--nocapture")
+            .env("HYPRSTREAM_FP8_GEMM", "1")
+            .env("HYPRSTREAM_FP8_E5M2_PROBE", "1")
+            .output()
+            .expect("spawn E5M2 allocation probe");
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "E5M2 allocation probe failed: {}\n{transcript}",
+            output.status
+        );
+        assert!(
+            transcript.contains("1 passed")
+                && transcript.contains(
+                    "causal allocation probe: E5M2 did not construct rowwise requantization"
+                ),
+            "E5M2 allocation probe did not execute its expected child:\n{transcript}"
+        );
 
         if tch::Cuda::is_available() && matches!(nvidia_cuda_compute_capability(0), Some((12, _))) {
             run_probe("fp8_gate_probe", "1", "0", "sm120", "causal gate probe: FP8 on selected rowwise after blockwise latch; dequant gate off");
@@ -4755,8 +5118,16 @@ mod fp8_gemm_tests {
             .env("HYPRSTREAM_QWEN_FP8_PROBE", "1")
             .output()
             .expect("spawn Qwen FP8 metadata probe");
-        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(output.status.success(), "Qwen fused metadata probe failed: {}\n{transcript}", output.status);
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "Qwen fused metadata probe failed: {}\n{transcript}",
+            output.status
+        );
         assert!(transcript.contains("1 passed") && transcript.contains("Qwen fused FP8 allocation probe: source rowwise copies dropped before fused allocation"),
             "Qwen fused allocation probe did not execute its expected child:\n{transcript}");
     }
@@ -4778,26 +5149,34 @@ mod fp8_gemm_tests {
         let w = det_rand(&[k, n], 4) * 0.05;
         let w4 = w.view([k / 128, 128, n / 128, 128]);
         let ws = w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
-        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1])).clamp(-448.0, 448.0).to_kind(FP8).view([k, n]);
+        let wq = (w4 / ws.view([k / 128, 1, n / 128, 1]))
+            .clamp(-448.0, 448.0)
+            .to_kind(FP8)
+            .view([k, n]);
         // Flag is off in test env, so with_scale doesn't build the rowwise
         // pair — build it explicitly (exactly what the gated load path does).
         let mut proj = LinearProjection::with_scale(wq, ws.view([k / 128, n / 128]));
-        proj.rowwise = Some(Box::new(build_rowwise_requant(&proj.weight, proj.scale.as_ref().unwrap())));
+        proj.rowwise = Some(Box::new(build_rowwise_requant(
+            &proj.weight,
+            proj.scale.as_ref().unwrap(),
+        )));
         // Load-time pack: [N/128, L4] with L4 = round_up(2, 4) = 4.
         assert_eq!(proj.scale_v2.as_ref().unwrap().size(), [n / 128, 4]);
         let proj = proj.into_device(dev);
         let x = det_rand(&[m, k], 5).to_kind(Kind::BFloat16).to_device(dev);
 
         let out_lazy = proj.apply(&x); // flag off in tests → lazy dequant
-        let Some((cc_major, cc_minor)) = nvidia_cuda_compute_capability(0) else { return; };
+        let Some((cc_major, cc_minor)) = nvidia_cuda_compute_capability(0) else {
+            return;
+        };
         println!("CUDA device 0 compute capability: {cc_major}.{cc_minor}");
 
         if cc_major == 9 {
             // Hopper's supported path is blockwise v2. Its success must not
             // be mistaken for the Blackwell fallback/latch contract below.
-            let out = proj.try_blockwise_v2(0, &x, m, k).expect(
-                "SM90/Hopper must execute the blockwise v2 FP8 kernel",
-            );
+            let out = proj
+                .try_blockwise_v2(0, &x, m, k)
+                .expect("SM90/Hopper must execute the blockwise v2 FP8 kernel");
             assert!(
                 !scaled_mm_latch().is_failed(0, ScaledMmRecipe::BlockwiseV2),
                 "blockwise v2 latched despite a successful SM90 kernel call"
@@ -4849,22 +5228,34 @@ mod fp8_gemm_tests {
         let (bench_m, bench_k, bench_n) = (1, 5120, 5120);
         let bench_w = det_rand(&[bench_k, bench_n], 14) * 0.05;
         let bench_w4 = bench_w.view([bench_k / 128, 128, bench_n / 128, 128]);
-        let bench_scale = bench_w4.abs().amax(-1, false).amax(1, false).clamp_min(1e-12) / 448.0;
+        let bench_scale = bench_w4
+            .abs()
+            .amax(-1, false)
+            .amax(1, false)
+            .clamp_min(1e-12)
+            / 448.0;
         let bench_wq = (bench_w4 / bench_scale.view([bench_k / 128, 1, bench_n / 128, 1]))
             .clamp(-448.0, 448.0)
             .to_kind(FP8)
             .view([bench_k, bench_n]);
         let mut bench_proj = LinearProjection::with_scale(bench_wq, bench_scale);
-        bench_proj.rowwise = Some(Box::new(build_rowwise_requant(&bench_proj.weight, bench_proj.scale.as_ref().unwrap())));
+        bench_proj.rowwise = Some(Box::new(build_rowwise_requant(
+            &bench_proj.weight,
+            bench_proj.scale.as_ref().unwrap(),
+        )));
         let bench_proj = bench_proj.into_device(dev);
-        let bench_x = det_rand(&[bench_m, bench_k], 15).to_kind(Kind::BFloat16).to_device(dev);
+        let bench_x = det_rand(&[bench_m, bench_k], 15)
+            .to_kind(Kind::BFloat16)
+            .to_device(dev);
         let iters = 20;
         let lazy_us = mean_cuda_us(iters, || {
             let _ = std::hint::black_box(bench_proj.apply(&bench_x));
         });
         let rowwise_us = mean_cuda_us(iters, || {
             let _ = std::hint::black_box(
-                bench_proj.try_rowwise_v1(0, &bench_x, bench_m, bench_k).expect("rowwise benchmark kernel must run"),
+                bench_proj
+                    .try_rowwise_v1(0, &bench_x, bench_m, bench_k)
+                    .expect("rowwise benchmark kernel must run"),
             );
         });
         println!(
@@ -4910,7 +5301,13 @@ mod fp8_gemm_tests {
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             let _ = q.internal_scaled_mm(
-                &proj.weight, &one, &one, None::<&Tensor>, None::<&Tensor>, Kind::BFloat16, false,
+                &proj.weight,
+                &one,
+                &one,
+                None::<&Tensor>,
+                None::<&Tensor>,
+                Kind::BFloat16,
+                false,
             );
         }
         let smm_us = t0.elapsed().as_micros() as f64 / iters as f64;

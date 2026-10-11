@@ -25,8 +25,8 @@
 // substrate. Consumed by `pool::SandboxPool::acquire`.
 mod admission;
 pub mod backend;
-mod status;
 mod container;
+mod status;
 // CRI-client sandbox backend (#510) — gated behind `cri`. A tonic gRPC
 // client of an external, already-running CRI runtime service (containerd's
 // CRI plugin, or CRI-O) — the kubelet role, not an embedded runtime. Sibling
@@ -126,14 +126,14 @@ pub use admission::{
 pub use sandbox_fs::{
     InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,
 };
+pub use service::WorkerService;
 #[cfg(not(target_arch = "wasm32"))]
 pub use wanix_workload::{
     import_guest_namespace, inject_9p_socket, ImportedGuestNamespace, Injected9pServer,
     WanixGuestConfig, WanixInjection, ANN_WANIX_COMMAND, ENV_9P_SOCK, ENV_GUEST_EXPORT_SOCK,
 };
-pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
-pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
+pub use hyprstream_rpc::service::{EnvelopeContext, RequestService, ServiceHandle};
 
 /// CRI runtime version
 pub const RUNTIME_VERSION: &str = "0.1.0";

@@ -33,9 +33,9 @@ use async_trait::async_trait;
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
-use hyprstream_rpc_std::model_client::{ModelClient, ModelFsClient};
 use crate::services::ninep_bridge::{fid_key, map_err, parse_dir_stats, NinePBridge, RemoteFidKey};
 use crate::services::types::QTDIR;
+use hyprstream_rpc_std::model_client::{ModelClient, ModelFsClient};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Remote fid state

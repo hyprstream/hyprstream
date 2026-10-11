@@ -73,8 +73,12 @@ pub trait DnsProvider: Send + Sync {
 
     /// Delete the TXT record previously published by [`Self::publish_txt`].
     /// Must be idempotent (deleting a record that is already gone is success).
-    async fn delete_txt(&self, zone: &AccountZone, owner: &str, value: &str)
-        -> Result<(), DnsError>;
+    async fn delete_txt(
+        &self,
+        zone: &AccountZone,
+        owner: &str,
+        value: &str,
+    ) -> Result<(), DnsError>;
 
     /// Publish the wildcard A record (`*.<apex>`) for the delegated zone. The
     /// record covers exactly one label — `alice.<apex>` resolves, but
@@ -191,11 +195,13 @@ mod tests {
             Err(DnsError::Unconfigured(_, _))
         ));
         assert!(matches!(
-            p.publish_wildcard_a(&z, "127.0.0.1".parse().unwrap(), 60).await,
+            p.publish_wildcard_a(&z, "127.0.0.1".parse().unwrap(), 60)
+                .await,
             Err(DnsError::Unconfigured(_, _))
         ));
         assert!(matches!(
-            p.publish_wildcard_aaaa(&z, "::1".parse().unwrap(), 60).await,
+            p.publish_wildcard_aaaa(&z, "::1".parse().unwrap(), 60)
+                .await,
             Err(DnsError::Unconfigured(_, _))
         ));
         assert_eq!(p.backend(), "unconfigured");

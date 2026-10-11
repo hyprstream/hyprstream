@@ -29,6 +29,7 @@ use hyprstream_core::services::PolicyService;
 use hyprstream_rpc::auth::ClusterKeySource;
 use hyprstream_rpc::envelope::KeyedPqTrustStore;
 use hyprstream_rpc::node_identity::{derive_mesh_mldsa_key, derive_purpose_key};
+use hyprstream_rpc::service::{Continuation, DecodedRequestBody, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc_std::policy_client::{
@@ -36,7 +37,6 @@ use hyprstream_rpc_std::policy_client::{
     ResolveServiceKey, SessionKeyRef, SessionKeyRefContent,
 };
 use hyprstream_service::{InprocManager, ServiceManager as _};
-use hyprstream_rpc::service::{Continuation, DecodedRequestBody, EnvelopeContext, RequestService};
 
 const POLICY_ROOT_KEY: [u8; 32] = [0x52; 32];
 const OAUTH_KEY: [u8; 32] = [0x44; 32];
@@ -65,7 +65,14 @@ fn install_crypto() {
     // G1_FIXTURE_KEY (0x91, registered "relayg1", deliberately NOT relay-admitted) is PQ-anchored as
     // an identity substrate so its envelopes VERIFY — its denial must come from the relay-admission
     // gate, not from a missing PQ anchor.
-    for bytes in [POLICY_ROOT_KEY, OAUTH_KEY, RELAY_MODEL_KEY, USER_KEY, OUTSIDER_KEY, G1_FIXTURE_KEY] {
+    for bytes in [
+        POLICY_ROOT_KEY,
+        OAUTH_KEY,
+        RELAY_MODEL_KEY,
+        USER_KEY,
+        OUTSIDER_KEY,
+        G1_FIXTURE_KEY,
+    ] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -186,9 +193,8 @@ fn cluster_key_source(ca_jwt_key: &SigningKey) -> Arc<ClusterKeySource> {
     )
     .expect("fixture committed marker");
     std::fs::write(
-        committed_ledger_prefix.with_file_name(format!(
-            "committed-ledger-{GENERATION}-{DIGEST}.json"
-        )),
+        committed_ledger_prefix
+            .with_file_name(format!("committed-ledger-{GENERATION}-{DIGEST}.json")),
         format!(r#"{{"version":{GENERATION},"component_digest":"{DIGEST}"}}"#),
     )
     .expect("fixture committed ledger");
@@ -235,7 +241,11 @@ struct NativeHop {
     pq: Arc<dyn hyprstream_rpc::envelope::PqTrustStore>,
 }
 
-async fn native_hop(tag: &str, server_key: &SigningKey, client_key: &SigningKey) -> Result<NativeHop> {
+async fn native_hop(
+    tag: &str,
+    server_key: &SigningKey,
+    client_key: &SigningKey,
+) -> Result<NativeHop> {
     use hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler;
     use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler};
     hyprstream_rpc::transport::pq_provider::install_pq_crypto_provider()?;
@@ -254,7 +264,11 @@ async fn native_hop(tag: &str, server_key: &SigningKey, client_key: &SigningKey)
     .await?;
     let address = iroh::EndpointAddr::from_parts(
         server.endpoint_id(),
-        server.endpoint().bound_sockets().into_iter().map(iroh::TransportAddr::Ip),
+        server
+            .endpoint()
+            .bound_sockets()
+            .into_iter()
+            .map(iroh::TransportAddr::Ip),
     );
     let mut kem = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
     kem.bind(
@@ -262,18 +276,36 @@ async fn native_hop(tag: &str, server_key: &SigningKey, client_key: &SigningKey)
         hyprstream_rpc::node_identity::derive_mesh_kem_recipient(server_key)?.public(),
     );
     let pq = hyprstream_rpc::envelope::global_pq_store().expect("fixture PQ anchors");
-    Ok(NativeHop { network, server, address, kem: Arc::new(kem), pq })
+    Ok(NativeHop {
+        network,
+        server,
+        address,
+        kem: Arc::new(kem),
+        pq,
+    })
 }
 
 impl NativeHop {
-    async fn policy_client(&self, key: &SigningKey, server_vk: ed25519_dalek::VerifyingKey, default_jwt: Option<String>) -> Result<PolicyClient> {
+    async fn policy_client(
+        &self,
+        key: &SigningKey,
+        server_vk: ed25519_dalek::VerifyingKey,
+        default_jwt: Option<String>,
+    ) -> Result<PolicyClient> {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC;
         use hyprstream_rpc::transport::iroh_transport::IrohTransport;
-        let connection = self.network.connect(self.address.clone(), ALPN_HYPRSTREAM_RPC).await?;
-        let rpc = RpcClientImpl::new(LocalSigner::new(key.clone()), IrohTransport::new(connection), Some(server_vk))
-            .with_request_kem_store(self.kem.clone())
-            .with_response_pq_store(self.pq.clone());
+        let connection = self
+            .network
+            .connect(self.address.clone(), ALPN_HYPRSTREAM_RPC)
+            .await?;
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(key.clone()),
+            IrohTransport::new(connection),
+            Some(server_vk),
+        )
+        .with_request_kem_store(self.kem.clone())
+        .with_response_pq_store(self.pq.clone());
         let rpc = match default_jwt {
             Some(token) => rpc.with_default_jwt(token),
             None => rpc,
@@ -288,11 +320,7 @@ impl NativeHop {
     }
 }
 
-fn mint_user_token(
-    ca_jwt_key: &SigningKey,
-    user_key: &SigningKey,
-    sid: &str,
-) -> Result<String> {
+fn mint_user_token(ca_jwt_key: &SigningKey, user_key: &SigningKey, sid: &str) -> Result<String> {
     let now = chrono::Utc::now().timestamp();
     let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
         .with_issuer(ISSUER.to_owned())
@@ -302,12 +330,8 @@ fn mint_user_token(
         .with_sid(sid.to_owned())
         .with_cnf_jwk(user_key.verifying_key().as_bytes());
     let ca_pq = derive_mesh_mldsa_key(ca_jwt_key);
-    Ok(hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-        &claims, &ca_pq, ca_jwt_key,
-    ))
+    Ok(hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &ca_pq, ca_jwt_key))
 }
-
-
 
 // ── Test-only admission observation probe ─────────────────────────────
 
@@ -327,13 +351,16 @@ impl ProbeCounters {
         }
     }
     fn admission_denials(&self) -> usize {
-        self.admission_denials.load(std::sync::atomic::Ordering::SeqCst)
+        self.admission_denials
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     fn published_claims(&self) -> usize {
-        self.published_claims.load(std::sync::atomic::Ordering::SeqCst)
+        self.published_claims
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     fn handler_entries(&self) -> usize {
-        self.handler_entries.load(std::sync::atomic::Ordering::SeqCst)
+        self.handler_entries
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -349,23 +376,46 @@ impl RequestService for AdmissionProbe {
     fn decode_request_body(&self, signed_body: &[u8]) -> anyhow::Result<DecodedRequestBody> {
         RequestService::decode_request_body(&self.inner, signed_body)
     }
-    async fn handle_request(&self, ctx: &EnvelopeContext, body: &DecodedRequestBody) -> Result<(Vec<u8>, Option<Continuation>)> {
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &DecodedRequestBody,
+    ) -> Result<(Vec<u8>, Option<Continuation>)> {
         if self.armed.load(std::sync::atomic::Ordering::SeqCst) && ctx.cnf == self.observed_signer {
-            self.counters.handler_entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.counters
+                .handler_entries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         RequestService::handle_request(&self.inner, ctx, body).await
     }
-    fn name(&self) -> &str { RequestService::name(&self.inner) }
-    fn transport(&self) -> &TransportConfig { RequestService::transport(&self.inner) }
-    fn signing_key(&self) -> SigningKey { RequestService::signing_key(&self.inner) }
-    fn expected_audience(&self) -> Option<&str> { RequestService::expected_audience(&self.inner) }
+    fn name(&self) -> &str {
+        RequestService::name(&self.inner)
+    }
+    fn transport(&self) -> &TransportConfig {
+        RequestService::transport(&self.inner)
+    }
+    fn signing_key(&self) -> SigningKey {
+        RequestService::signing_key(&self.inner)
+    }
+    fn expected_audience(&self) -> Option<&str> {
+        RequestService::expected_audience(&self.inner)
+    }
     fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
         RequestService::jwt_key_source(&self.inner)
     }
-    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+    fn resolve_key_subject(
+        &self,
+        signer_pubkey: &[u8; 32],
+    ) -> Option<hyprstream_rpc::envelope::Subject> {
         RequestService::resolve_key_subject(&self.inner, signer_pubkey)
     }
-    fn cache_key_binding(&self, vk: ed25519_dalek::VerifyingKey, subject: &str, jwt: &str, expires_at: i64) {
+    fn cache_key_binding(
+        &self,
+        vk: ed25519_dalek::VerifyingKey,
+        subject: &str,
+        jwt: &str,
+        expires_at: i64,
+    ) {
         RequestService::cache_key_binding(&self.inner, vk, subject, jwt, expires_at);
     }
     fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
@@ -377,11 +427,21 @@ impl RequestService for AdmissionProbe {
     async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
         let result = RequestService::verify_claims(&self.inner, ctx).await;
         if self.armed.load(std::sync::atomic::Ordering::SeqCst) && ctx.cnf == self.observed_signer {
-            if result.is_err() && result.as_ref().unwrap_err().to_string().contains("not an authorized relay") {
-                self.counters.admission_denials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if result.is_err()
+                && result
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not an authorized relay")
+            {
+                self.counters
+                    .admission_denials
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             if ctx.claims().is_some() {
-                self.counters.published_claims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.counters
+                    .published_claims
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
         result
@@ -446,7 +506,10 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
     let _policy = spawn_policy(&tag).await?;
 
     let oauth_client = PolicyClient::for_local_endpoint_bootstrap(
-        &format!("inproc://{tag}"), oauth_key.clone(), root_key.verifying_key(), Some(oauth_wit.clone()),
+        &format!("inproc://{tag}"),
+        oauth_key.clone(),
+        root_key.verifying_key(),
+        Some(oauth_wit.clone()),
     )?;
     oauth_client
         .register_service_key(&RegisterServiceKey {
@@ -456,7 +519,10 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
         })
         .await?;
     let model_client = PolicyClient::for_local_endpoint_bootstrap(
-        &format!("inproc://{tag}"), relay_key.clone(), root_key.verifying_key(), Some(model_wit.clone()),
+        &format!("inproc://{tag}"),
+        relay_key.clone(),
+        root_key.verifying_key(),
+        Some(model_wit.clone()),
     )?;
     model_client
         .register_service_key(&RegisterServiceKey {
@@ -481,7 +547,9 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
 
     // A1. The relay presents its OWN credential: the issuer guard denies at
     // dispatch, before any handler. (Unchanged control.)
-    let honest_self = hop.policy_client(&relay_key, policy_vk, Some(model_wit.clone())).await?;
+    let honest_self = hop
+        .policy_client(&relay_key, policy_vk, Some(model_wit.clone()))
+        .await?;
     let error = honest_self
         .issue_token(&IssueToken {
             requested_scopes: Some(vec!["openid".to_owned()]),
@@ -520,7 +588,10 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
             operation: "manage".to_owned(),
         })
         .await?;
-    assert!(!allowed, "A2: a relayed user must not acquire oauth's grant");
+    assert!(
+        !allowed,
+        "A2: a relayed user must not acquire oauth's grant"
+    );
 
     // B. The real resolution RPC exposes the verification key only. It must
     // not turn OAuth's attestation into a harvestable delegated credential.
@@ -533,7 +604,10 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
         .into_iter()
         .find(|entry| entry.verifying_key == oauth_key.verifying_key().as_bytes())
         .expect("the registered OAuth verification key remains discoverable");
-    assert!(published.service_jwt.is_none(), "B: resolution must not disclose OAuth's credential");
+    assert!(
+        published.service_jwt.is_none(),
+        "B: resolution must not disclose OAuth's credential"
+    );
 
     // Holder binding remains mandatory even for an OAuth credential obtained
     // through some independent compromise: the relay cannot replay it.
@@ -552,7 +626,9 @@ async fn harvested_public_wit_relay_denies_after_vouching_removal() -> Result<()
         .expect_err("B: a foreign holder credential must deny at dispatch");
     assert!(
         error.to_string().contains("dispatch denied")
-            || error.to_string().contains("requires its bound holder signer"),
+            || error
+                .to_string()
+                .contains("requires its bound holder signer"),
         "B: expected fail-closed holder denial, got: {error:?}"
     );
 
@@ -661,7 +737,9 @@ async fn registered_non_relay_admitted_service_delegated_user_denies_on_wire() -
     // path. SERVICE_BASE_POLICIES contains NO policy:PolicyCheck/check grant
     // for service:relayg1, so accept_delegated_bearer denies it as a relay.
     let registered_client = PolicyClient::for_local_endpoint_bootstrap(
-        &format!("inproc://{tag}"), registered_key.clone(), root_key.verifying_key(),
+        &format!("inproc://{tag}"),
+        registered_key.clone(),
+        root_key.verifying_key(),
         Some(registered_wit.clone()),
     )?;
     registered_client
@@ -703,7 +781,10 @@ async fn registered_non_relay_admitted_service_delegated_user_denies_on_wire() -
         },
     };
     let active = direct.check_session(&check_session).await?;
-    assert!(active, "registered signer direct check_session must succeed");
+    assert!(
+        active,
+        "registered signer direct check_session must succeed"
+    );
 
     // Arm the probe: count admission denials and claims publication from
     // this point forward. The direct control is complete and successful.

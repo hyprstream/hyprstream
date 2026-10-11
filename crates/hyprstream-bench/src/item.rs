@@ -84,10 +84,7 @@ impl Item {
             body: QuestionBody::Choice {
                 options: options
                     .into_iter()
-                    .map(|name| ChoiceOption {
-                        name,
-                        rubric: None,
-                    })
+                    .map(|name| ChoiceOption { name, rubric: None })
                     .collect(),
             },
         };

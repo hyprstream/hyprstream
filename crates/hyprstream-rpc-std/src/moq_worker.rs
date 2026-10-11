@@ -127,7 +127,8 @@ impl MoqWorkerHandle {
     /// e.g. `"local/streams/{topic_hex}"` — not a track name; the token stream
     /// itself always lives on the single `STREAM_TRACK` within it) to the worker.
     pub async fn subscribe(&self, broadcast_path: &str) -> Result<(), JsError> {
-        let cmd = serde_json::json!({ "cmd": "subscribe", "broadcast": broadcast_path }).to_string();
+        let cmd =
+            serde_json::json!({ "cmd": "subscribe", "broadcast": broadcast_path }).to_string();
         let frame = encode_frame("__cmd__", cmd.as_bytes());
         self.dma
             .send(&frame)
@@ -331,9 +332,7 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
                 // Runs until the track closes (stream complete) or errors; then the
                 // outer loop resumes waiting for the next command. One inference
                 // stream per worker, so blocking the command loop here is intended.
-                if let Err(e) =
-                    run_subscribe(&dma, &url, &broadcast_path, cert_hashes).await
-                {
+                if let Err(e) = run_subscribe(&dma, &url, &broadcast_path, cert_hashes).await {
                     web_sys::console::error_1(&format!("[moq-worker] subscribe: {e}").into());
                     let err = encode_frame("__error__", e.as_bytes());
                     let _ = dma.send(&err).await;

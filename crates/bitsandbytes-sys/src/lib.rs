@@ -150,22 +150,8 @@ impl QuantState {
             QuantType::Fp4 => {
                 // FP4 codebook values
                 vec![
-                    0.0,
-                    0.0625,
-                    0.125,
-                    0.1875,
-                    0.25,
-                    0.3125,
-                    0.375,
-                    0.4375,
-                    0.5,
-                    0.5625,
-                    0.625,
-                    0.6875,
-                    0.75,
-                    0.8125,
-                    0.875,
-                    1.0,
+                    0.0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625,
+                    0.6875, 0.75, 0.8125, 0.875, 1.0,
                 ]
             }
         };
@@ -467,8 +453,13 @@ pub unsafe fn dequantize_blockwise_bf16_gpu(
     n: i32,
 ) {
     cdequantize_blockwise_bf16(
-        code_ptr, input_ptr, absmax_ptr, output_ptr,
-        blocksize, n, ptr::null_mut(),
+        code_ptr,
+        input_ptr,
+        absmax_ptr,
+        output_ptr,
+        blocksize,
+        n,
+        ptr::null_mut(),
     );
 }
 
@@ -500,8 +491,13 @@ pub unsafe fn dequantize_blockwise_fp16_gpu(
     n: i32,
 ) {
     cdequantize_blockwise_fp16(
-        code_ptr, input_ptr, absmax_ptr, output_ptr,
-        blocksize, n, ptr::null_mut(),
+        code_ptr,
+        input_ptr,
+        absmax_ptr,
+        output_ptr,
+        blocksize,
+        n,
+        ptr::null_mut(),
     );
 }
 
@@ -533,8 +529,13 @@ pub unsafe fn dequantize_4bit_nf4_bf16_gpu(
     n: i32,
 ) {
     cdequantize_blockwise_bf16_nf4(
-        code_ptr, input_ptr, absmax_ptr, output_ptr,
-        blocksize, n, ptr::null_mut(),
+        code_ptr,
+        input_ptr,
+        absmax_ptr,
+        output_ptr,
+        blocksize,
+        n,
+        ptr::null_mut(),
     );
 }
 
@@ -566,8 +567,13 @@ pub unsafe fn dequantize_4bit_fp4_bf16_gpu(
     n: i32,
 ) {
     cdequantize_blockwise_bf16_fp4(
-        code_ptr, input_ptr, absmax_ptr, output_ptr,
-        blocksize, n, ptr::null_mut(),
+        code_ptr,
+        input_ptr,
+        absmax_ptr,
+        output_ptr,
+        blocksize,
+        n,
+        ptr::null_mut(),
     );
 }
 
@@ -576,7 +582,10 @@ pub unsafe fn dequantize_4bit_fp4_bf16_gpu(
 // ============================================================================
 
 /// Quantize f32 data using 8-bit blockwise quantization (CPU implementation)
-pub fn quantize_blockwise_cpu_fp32(input: &[f32], blocksize: usize) -> Result<(Vec<u8>, QuantState)> {
+pub fn quantize_blockwise_cpu_fp32(
+    input: &[f32],
+    blocksize: usize,
+) -> Result<(Vec<u8>, QuantState)> {
     if input.is_empty() {
         return Err(BnbError::InvalidInput("input is empty".to_owned()));
     }

@@ -406,27 +406,58 @@ async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
 async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
     let (mut service, ctx) = fixture().await;
     let authority = service.authority.as_mut().unwrap();
-    authority.profile.client_scopes.insert(REGISTRY_LIST_SCOPE.into());
-    authority.profile.resource_scopes.insert(REGISTRY_LIST_SCOPE.into());
-    authority.policy.add_policy_with_domain(
-        ATPROTO_DID, "tenant", "registry:List", "query", "allow",
-    ).await.unwrap();
+    authority
+        .profile
+        .client_scopes
+        .insert(REGISTRY_LIST_SCOPE.into());
+    authority
+        .profile
+        .resource_scopes
+        .insert(REGISTRY_LIST_SCOPE.into());
+    authority
+        .policy
+        .add_policy_with_domain(ATPROTO_DID, "tenant", "registry:List", "query", "allow")
+        .await
+        .unwrap();
     let source_record = source();
-    let decision = service.prepare(&ctx, &source_record, &[REGISTRY_LIST_SCOPE.into()]).await.unwrap();
+    let decision = service
+        .prepare(&ctx, &source_record, &[REGISTRY_LIST_SCOPE.into()])
+        .await
+        .unwrap();
     assert_eq!(decision.scopes, [REGISTRY_LIST_SCOPE]);
     let session = session(&decision);
     let authority = service.authority.as_ref().unwrap();
     let now = chrono::Utc::now().timestamp();
-    authority.authorize_use(&session, &source_record.issuer, &source_record.atproto_did,
-        "registry:List", "query", now).await.unwrap();
+    authority
+        .authorize_use(
+            &session,
+            &source_record.issuer,
+            &source_record.atproto_did,
+            "registry:List",
+            "query",
+            now,
+        )
+        .await
+        .unwrap();
     for (resource, operation) in [
         ("registry:Get", "query"),
         ("registry:List", "write"),
         ("model:qwen2.5-0.5b-instruct:main", "infer"),
     ] {
-        assert!(authority.authorize_use(&session, &source_record.issuer,
-            &source_record.atproto_did, resource, operation, now).await.is_err(),
-            "Registry-only session admitted {resource}/{operation}");
+        assert!(
+            authority
+                .authorize_use(
+                    &session,
+                    &source_record.issuer,
+                    &source_record.atproto_did,
+                    resource,
+                    operation,
+                    now
+                )
+                .await
+                .is_err(),
+            "Registry-only session admitted {resource}/{operation}"
+        );
     }
 }
 
@@ -474,7 +505,11 @@ async fn h2_admission_uses_verified_did_without_a_local_account() {
 #[tokio::test]
 async fn h2_ambiguous_did_tenant_grants_fail_closed() {
     let (service, ctx) = fixture().await;
-    service.authority.as_ref().unwrap().policy
+    service
+        .authority
+        .as_ref()
+        .unwrap()
+        .policy
         .add_policy_with_domain(
             ATPROTO_DID,
             "another-tenant",
@@ -739,10 +774,20 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     let mut client = connect(&socket, &db).await;
     let (mut service, ctx) = fixture().await;
     let mut session_config = tokio_postgres::Config::new();
-    session_config.host_path(&socket).user("postgres").dbname(&db);
-    service.session_pool = Some(deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
-        session_config, tokio_postgres::NoTls,
-    )).runtime(deadpool_postgres::Runtime::Tokio1).max_size(2).build().unwrap());
+    session_config
+        .host_path(&socket)
+        .user("postgres")
+        .dbname(&db);
+    service.session_pool = Some(
+        deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            session_config,
+            tokio_postgres::NoTls,
+        ))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .max_size(2)
+        .build()
+        .unwrap(),
+    );
     let service = Arc::new(service);
     let requested = vec![STAGING_SCOPE.into()];
     let mut rpc_source = source();
@@ -750,12 +795,85 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     rpc_source.nonce = "rpc-nonce".into();
     rpc_source.token_hash = [8; 32];
     let created_at = chrono::Utc::now().timestamp();
-    let prepared = service.prepare_rpc(&ctx, rpc_source.clone(), requested.clone(), [10; 32], created_at, [44; 32], vec![55; 1952]).await.unwrap();
-    let parallel = service.prepare_rpc(&ctx, rpc_source.clone(), requested.clone(), [11; 32], created_at, [44; 32], vec![55; 1952]).await.unwrap();
-    let committed = service.commit_rpc(&ctx, prepared.handle, rpc_source.clone(), [10; 32], created_at, created_at + 60, [44; 32], vec![55; 1952]).await.unwrap();
-    assert!(Store::lookup_primary(&mut client, "https://host.test", &committed.sid, &[3; 32], &[7; 32]).await.unwrap().is_some());
-    assert!(service.commit_rpc(&ctx, prepared.handle, rpc_source.clone(), [10; 32], created_at, created_at + 60, [44; 32], vec![55; 1952]).await.is_err(), "one-use handle must not commit twice");
-    assert!(service.commit_rpc(&ctx, parallel.handle, rpc_source, [11; 32], created_at, created_at + 60, [44; 32], vec![55; 1952]).await.is_err(), "PostgreSQL must reject the same source through a second handle");
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            rpc_source.clone(),
+            requested.clone(),
+            [10; 32],
+            created_at,
+            [44; 32],
+            vec![55; 1952],
+        )
+        .await
+        .unwrap();
+    let parallel = service
+        .prepare_rpc(
+            &ctx,
+            rpc_source.clone(),
+            requested.clone(),
+            [11; 32],
+            created_at,
+            [44; 32],
+            vec![55; 1952],
+        )
+        .await
+        .unwrap();
+    let committed = service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            rpc_source.clone(),
+            [10; 32],
+            created_at,
+            created_at + 60,
+            [44; 32],
+            vec![55; 1952],
+        )
+        .await
+        .unwrap();
+    assert!(Store::lookup_primary(
+        &mut client,
+        "https://host.test",
+        &committed.sid,
+        &[3; 32],
+        &[7; 32]
+    )
+    .await
+    .unwrap()
+    .is_some());
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                prepared.handle,
+                rpc_source.clone(),
+                [10; 32],
+                created_at,
+                created_at + 60,
+                [44; 32],
+                vec![55; 1952]
+            )
+            .await
+            .is_err(),
+        "one-use handle must not commit twice"
+    );
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                parallel.handle,
+                rpc_source,
+                [11; 32],
+                created_at,
+                created_at + 60,
+                [44; 32],
+                vec![55; 1952]
+            )
+            .await
+            .is_err(),
+        "PostgreSQL must reject the same source through a second handle"
+    );
     let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
     let mut stale = challenge.clone();
     stale.tenant = "other".into();

@@ -181,11 +181,17 @@ impl StorageBackend for MemoryBackend {
 /// Acquire the store lock in a cfg-portable way.
 /// - `parking_lot::Mutex::lock()` returns `MutexGuard<T>` directly.
 /// - `std::sync::Mutex::lock()` returns `Result<MutexGuard<T>, PoisonError>`.
-fn store_lock(m: &Mutex<HashMap<Uuid, Vec<u8>>>) -> impl std::ops::DerefMut<Target = HashMap<Uuid, Vec<u8>>> + '_ {
+fn store_lock(
+    m: &Mutex<HashMap<Uuid, Vec<u8>>>,
+) -> impl std::ops::DerefMut<Target = HashMap<Uuid, Vec<u8>>> + '_ {
     #[cfg(not(target_os = "wasi"))]
-    { m.lock() }
+    {
+        m.lock()
+    }
     #[cfg(target_os = "wasi")]
-    { m.lock().unwrap_or_else(|e| e.into_inner()) }
+    {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 // ============================================================================
@@ -209,11 +215,7 @@ impl<B: StorageBackend> PrivateStore<B> {
     /// Encrypt `entries` and atomically write to storage.
     ///
     /// A fresh 12-byte nonce is generated from `OsRng` on every call.
-    pub fn save<T: Serialize>(
-        &self,
-        session_id: &Uuid,
-        entries: &[T],
-    ) -> anyhow::Result<()> {
+    pub fn save<T: Serialize>(&self, session_id: &Uuid, entries: &[T]) -> anyhow::Result<()> {
         let plaintext = serde_json::to_vec(entries)?;
         let aad = session_id.as_bytes();
 
@@ -224,7 +226,10 @@ impl<B: StorageBackend> PrivateStore<B> {
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce_bytes),
-                Payload { msg: &plaintext, aad },
+                Payload {
+                    msg: &plaintext,
+                    aad,
+                },
             )
             .map_err(|e| anyhow::anyhow!("AES-GCM encrypt: {}", e))?;
 
@@ -264,7 +269,10 @@ impl<B: StorageBackend> PrivateStore<B> {
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(nonce_bytes),
-                Payload { msg: ciphertext, aad },
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
             )
             .map_err(|e| anyhow::anyhow!("AES-GCM decrypt: {}", e))?;
 
@@ -330,7 +338,10 @@ impl<B: StorageBackend> PrivateStore<B> {
         let cipher = Aes256Gcm::new(self.key.as_ref().into());
         let plaintext = match cipher.decrypt(
             Nonce::from_slice(nonce_bytes),
-            Payload { msg: ciphertext, aad: Self::MANIFEST_AAD },
+            Payload {
+                msg: ciphertext,
+                aad: Self::MANIFEST_AAD,
+            },
         ) {
             Ok(p) => p,
             Err(_) => return Vec::new(),
@@ -346,7 +357,10 @@ impl<B: StorageBackend> PrivateStore<B> {
         let ciphertext = cipher
             .encrypt(
                 Nonce::from_slice(&nonce_bytes),
-                Payload { msg: &plaintext, aad: Self::MANIFEST_AAD },
+                Payload {
+                    msg: &plaintext,
+                    aad: Self::MANIFEST_AAD,
+                },
             )
             .map_err(|e| anyhow::anyhow!("manifest encrypt: {}", e))?;
         let mut file_data = Vec::with_capacity(12 + ciphertext.len());
@@ -441,13 +455,15 @@ mod tests {
         let store = PrivateStore::new(MemoryBackend::new(), test_key());
         let uuid = Uuid::new_v4();
         store.save(&uuid, &["data"]).unwrap();
-        store.register_conversation(ConversationMeta {
-            uuid,
-            model_ref: "m".to_owned(),
-            created_at: 1,
-            last_active: 1,
-            label: None,
-        }).unwrap();
+        store
+            .register_conversation(ConversationMeta {
+                uuid,
+                model_ref: "m".to_owned(),
+                created_at: 1,
+                last_active: 1,
+                label: None,
+            })
+            .unwrap();
         store.delete_conversation(&uuid).unwrap();
         assert!(store.list_all_conversations().is_empty());
         let loaded: Option<Vec<String>> = store.load(&uuid).unwrap();

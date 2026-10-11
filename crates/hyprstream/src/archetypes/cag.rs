@@ -102,9 +102,8 @@ impl ContextManifest {
     pub fn load(repo_path: &Path) -> Result<Self, std::io::Error> {
         let manifest_path = repo_path.join("context.json");
         let content = std::fs::read_to_string(&manifest_path)?;
-        serde_json::from_str(&content).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 

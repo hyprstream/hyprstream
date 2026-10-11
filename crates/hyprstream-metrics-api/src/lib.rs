@@ -21,16 +21,16 @@ pub mod storage;
 
 pub use aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
 pub use metrics::calibration::{
-    CALIBRATION_TABLE, CalibrationParams, CalibrationStore, ConformalParams, ConformalQuantile,
-    DecisionPrimitive, DirichletParams, OrdinalInterval, VersionTriple, calibration_params_schema,
-    mint_calib_version,
+    calibration_params_schema, mint_calib_version, CalibrationParams, CalibrationStore,
+    ConformalParams, ConformalQuantile, DecisionPrimitive, DirichletParams, OrdinalInterval,
+    VersionTriple, CALIBRATION_TABLE,
 };
 pub use metrics::decision_batch::{
-    DECISION_BATCH_TABLE, DecisionBatchMeta, DecisionBatchStore, decision_batch_schema,
-    mint_batch_id,
+    decision_batch_schema, mint_batch_id, DecisionBatchMeta, DecisionBatchStore,
+    DECISION_BATCH_TABLE,
 };
 pub use metrics::producer::MetricsProducer;
-pub use metrics::{METRICS_SCHEMA_VERSION, METRICS_TABLE, MetricRecord, create_schema_v2_tables};
+pub use metrics::{create_schema_v2_tables, MetricRecord, METRICS_SCHEMA_VERSION, METRICS_TABLE};
 pub use storage::StorageBackend;
 
 // Re-export Arrow so API consumers name the exact types the stores exchange.

@@ -21,9 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use iroh::endpoint::Connection;
 
-use crate::transport::rpc_session::{
-    RpcPendingStream, RpcPublishStub, SessionRpcTransport,
-};
+use crate::transport::rpc_session::{RpcPendingStream, RpcPublishStub, SessionRpcTransport};
 use crate::transport_traits::Transport;
 
 /// Wraps an iroh [`Connection`] as a [`Transport`] for RPC plane traffic.

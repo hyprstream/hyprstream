@@ -5,7 +5,9 @@
 //! - Caching prepared statements for reuse
 //! - Executing queries and streaming results
 
-use crate::query::{DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query, QueryExecutor, QueryPlanner};
+use crate::query::{
+    DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query, QueryExecutor, QueryPlanner,
+};
 use crate::storage::StorageBackend;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -205,7 +207,9 @@ impl QueryOrchestrator {
         stmt: &CachedStatement,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
         debug!("Executing prepared statement");
-        self.executor.execute_stream(Arc::clone(&stmt.physical_plan)).await
+        self.executor
+            .execute_stream(Arc::clone(&stmt.physical_plan))
+            .await
     }
 
     /// Execute a prepared statement and collect all results
@@ -314,7 +318,10 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
-        backend.create_table("test_table", &schema).await.map_err(status_to_df_error)?;
+        backend
+            .create_table("test_table", &schema)
+            .await
+            .map_err(status_to_df_error)?;
 
         // Create orchestrator
         let orchestrator = QueryOrchestrator::new(backend).await?;
@@ -336,10 +343,11 @@ mod tests {
         let backend = Arc::new(DuckDbBackend::new_in_memory().map_err(status_to_df_error)?);
         backend.init().await.map_err(status_to_df_error)?;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        backend.create_table("cache_test", &schema).await.map_err(status_to_df_error)?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        backend
+            .create_table("cache_test", &schema)
+            .await
+            .map_err(status_to_df_error)?;
 
         let orchestrator = QueryOrchestrator::new(backend).await?;
 
@@ -363,10 +371,11 @@ mod tests {
         let backend = Arc::new(DuckDbBackend::new_in_memory().map_err(status_to_df_error)?);
         backend.init().await.map_err(status_to_df_error)?;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        backend.create_table("close_test", &schema).await.map_err(status_to_df_error)?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        backend
+            .create_table("close_test", &schema)
+            .await
+            .map_err(status_to_df_error)?;
 
         let orchestrator = QueryOrchestrator::new(backend).await?;
 

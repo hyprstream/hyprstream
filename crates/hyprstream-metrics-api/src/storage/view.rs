@@ -46,7 +46,9 @@ impl From<SerializableSchema> for Schema {
                     match f.data_type.as_str() {
                         "Int64" => DataType::Int64,
                         "Float64" => DataType::Float64,
-                        "Timestamp(Nanosecond, None)" => DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        "Timestamp(Nanosecond, None)" => {
+                            DataType::Timestamp(TimeUnit::Nanosecond, None)
+                        }
                         // "Utf8" and all other types default to string
                         _ => DataType::Utf8,
                     },
@@ -76,7 +78,10 @@ pub struct ViewDefinition {
     pub group_by: Option<GroupBy>,
     pub window: Option<TimeWindow>,
     pub dependencies: HashSet<String>,
-    #[serde(serialize_with = "serialize_schema", deserialize_with = "deserialize_schema")]
+    #[serde(
+        serialize_with = "serialize_schema",
+        deserialize_with = "deserialize_schema"
+    )]
     pub schema: Arc<Schema>,
 }
 
@@ -131,7 +136,7 @@ impl ViewDefinition {
     /// Build the SQL definition for this view
     pub fn to_sql(&self) -> String {
         let mut sql = String::from("SELECT ");
-        
+
         // Add columns
         let mut first = true;
         for col in &self.columns {
@@ -147,7 +152,8 @@ impl ViewDefinition {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{}({}) as {}_{}",
+            sql.push_str(&format!(
+                "{}({}) as {}_{}",
                 agg.function,
                 agg.column,
                 agg.function.to_string().to_lowercase(),

@@ -62,7 +62,12 @@ impl ServiceQuery {
 
     /// Native MoQ-only capability query (the Event barrier has no RPC surface).
     pub fn network_moq(service_name: impl Into<String>) -> anyhow::Result<Self> {
-        Self::new(service_name, ["hyprstream-moq/1".to_owned()], ResolverProfile::NativeIrohRequired, 3)
+        Self::new(
+            service_name,
+            ["hyprstream-moq/1".to_owned()],
+            ResolverProfile::NativeIrohRequired,
+            3,
+        )
     }
 
     /// Construct the explicit browser/public-edge query. Browser clients use
@@ -520,7 +525,9 @@ impl RpcClient for ResolvedRpcClient {
             let p = payload.clone();
             let s = service.clone();
             async move {
-                c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral).await }
+                c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral)
+                    .await
+            }
         })
         .await
     }

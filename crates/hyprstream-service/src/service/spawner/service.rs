@@ -39,8 +39,11 @@ fn producer_moq_origin(
 ) -> Option<hyprstream_rpc::moq_stream::MoqStreamOrigin> {
     relay.or_else(|| {
         if required {
-            has_producer.then(|| hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
-                .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX).build())
+            has_producer.then(|| {
+                hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+                    .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
+                    .build()
+            })
         } else {
             hyprstream_rpc::moq_stream::global_moq_origin().cloned()
         }
@@ -78,9 +81,7 @@ impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
 }
 
 /// Reject a required native profile before any compatibility carrier can start.
-fn validate_required_iroh_enabled(
-    config: &hyprstream_rpc::service::QuicLoopConfig,
-) -> Result<()> {
+fn validate_required_iroh_enabled(config: &hyprstream_rpc::service::QuicLoopConfig) -> Result<()> {
     if config.iroh_required && !config.iroh_enabled {
         return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
             "network-iroh-required rejects iroh = false".to_owned(),
@@ -101,11 +102,9 @@ fn announce_iroh_bound(
     match callback {
         Some(callback) => match callback(service_name.to_owned(), node_id) {
             Ok(()) => Ok(()),
-            Err(error) if required => {
-                Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                    "network-iroh-required initial Iroh announcement failed: {error}"
-                )))
-            }
+            Err(error) if required => Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                "network-iroh-required initial Iroh announcement failed: {error}"
+            ))),
             Err(error) => {
                 tracing::warn!(service = %service_name, "Iroh announcement failed; continuing compatibility profile: {error}");
                 Ok(())
@@ -976,14 +975,15 @@ impl ThreadStopCompletion {
             if let Some(terminal) = receiver.borrow().clone() {
                 return match terminal {
                     ThreadStopTerminal::Stopped => Ok(()),
-                    ThreadStopTerminal::Failed(error) => Err(
-                        hyprstream_rpc::error::RpcError::SpawnFailed(error),
-                    ),
+                    ThreadStopTerminal::Failed(error) => {
+                        Err(hyprstream_rpc::error::RpcError::SpawnFailed(error))
+                    }
                 };
             }
             receiver.changed().await.map_err(|_| {
                 hyprstream_rpc::error::RpcError::SpawnFailed(
-                    "service thread stop completion owner exited without a terminal result".to_owned(),
+                    "service thread stop completion owner exited without a terminal result"
+                        .to_owned(),
                 )
             })?;
         }
@@ -1055,12 +1055,10 @@ impl SpawnedService {
                 .unwrap_or(false),
             ServiceKind::Thread {
                 handle, completion, ..
-            } => {
-                completion
-                    .as_ref()
-                    .map(|completion| completion.terminal.borrow().is_none())
-                    .unwrap_or_else(|| handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false))
-            }
+            } => completion
+                .as_ref()
+                .map(|completion| completion.terminal.borrow().is_none())
+                .unwrap_or_else(|| handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)),
             ServiceKind::Subprocess { pid_file, .. } => {
                 // Check if PID file exists and process is alive (signal 0)
                 if let Ok(pid_str) = std::fs::read_to_string(pid_file) {
@@ -1121,7 +1119,8 @@ impl SpawnedService {
                     // native join owner retains both the actual JoinHandle and
                     // registry registration until the worker is terminal.
                     let service_id = self.id.clone();
-                    let owned_completion = Arc::new(ThreadStopCompletion::new(registration.take(), h));
+                    let owned_completion =
+                        Arc::new(ThreadStopCompletion::new(registration.take(), h));
                     *completion = Some(Arc::clone(&owned_completion));
                     owned_completion.ensure_join_started(&service_id)?;
                     owned_completion.wait().await?;
@@ -1396,15 +1395,33 @@ mod tests {
 
     #[tokio::test]
     async fn native_producer_origins_do_not_expose_sibling_tracks() -> AnyhowResult<()> {
-        let first = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
-        let second = producer_moq_origin(true, None, true).ok_or_else(|| anyhow!("native producer origin missing"))?;
-        let _broadcast = first.producer().create_broadcast("local/streams/first").ok_or_else(|| anyhow!("first broadcast missing"))?;
-        assert!(first.consumer().announced_broadcast("local/streams/first").await.is_some());
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(100),
-            second.consumer().announced_broadcast("local/streams/first")).await.is_err());
+        let first = producer_moq_origin(true, None, true)
+            .ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let second = producer_moq_origin(true, None, true)
+            .ok_or_else(|| anyhow!("native producer origin missing"))?;
+        let _broadcast = first
+            .producer()
+            .create_broadcast("local/streams/first")
+            .ok_or_else(|| anyhow!("first broadcast missing"))?;
+        assert!(first
+            .consumer()
+            .announced_broadcast("local/streams/first")
+            .await
+            .is_some());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            second.consumer().announced_broadcast("local/streams/first")
+        )
+        .await
+        .is_err());
         assert!(producer_moq_origin(true, None, false).is_none());
-        let relayed = producer_moq_origin(true, Some(first), true).ok_or_else(|| anyhow!("relay origin missing"))?;
-        assert!(relayed.consumer().announced_broadcast("local/streams/first").await.is_some());
+        let relayed = producer_moq_origin(true, Some(first), true)
+            .ok_or_else(|| anyhow!("relay origin missing"))?;
+        assert!(relayed
+            .consumer()
+            .announced_broadcast("local/streams/first")
+            .await
+            .is_some());
         Ok(())
     }
 
@@ -1423,11 +1440,10 @@ mod tests {
             },
         );
 
-        let granted = hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new()
-            .with_authz(production_moq_authz(
-                Arc::clone(&admission),
-                Some(authorizer),
-            ));
+        let granted =
+            hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new().with_authz(
+                production_moq_authz(Arc::clone(&admission), Some(authorizer)),
+            );
         assert!(granted.authorizes_ingress(&producer, "local"));
         assert!(!granted.authorizes_ingress(&producer, "other"));
 
@@ -1519,14 +1535,18 @@ mod tests {
 
     impl Drop for GatedService {
         fn drop(&mut self) {
-            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(!self.panic_on_drop, "causal service destructor panic");
         }
     }
 
     #[async_trait::async_trait(?Send)]
     impl RequestService for GatedService {
-        fn decode_request_body(&self, signed_body: &[u8]) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> AnyhowResult<hyprstream_rpc::service::DecodedRequestBody> {
             self.echo.decode_request_body(signed_body)
         }
         async fn handle_request(
@@ -1536,7 +1556,10 @@ mod tests {
         ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
             anyhow::bail!("denied request reached handler: {}", body.bytes().len())
         }
-        async fn verify_claims(&self, _ctx: &mut hyprstream_rpc::service::EnvelopeContext) -> AnyhowResult<()> {
+        async fn verify_claims(
+            &self,
+            _ctx: &mut hyprstream_rpc::service::EnvelopeContext,
+        ) -> AnyhowResult<()> {
             self.entered.notify_one();
             self.release.notified().await;
             anyhow::bail!("gated claims denial")
@@ -1544,9 +1567,15 @@ mod tests {
         fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
             error.as_bytes().to_vec()
         }
-        fn name(&self) -> &str { "echo" }
-        fn transport(&self) -> &TransportConfig { &self.echo.transport }
-        fn signing_key(&self) -> SigningKey { self.echo.signing_key.clone() }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn transport(&self) -> &TransportConfig {
+            &self.echo.transport
+        }
+        fn signing_key(&self) -> SigningKey {
+            self.echo.signing_key.clone()
+        }
     }
 
     /// Test-only threaded owner with two independently armed shutdown waiters:
@@ -1601,8 +1630,9 @@ mod tests {
                         ))
                     })?,
                 );
-                let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
-                    bridge.clone();
+                let processor: Arc<
+                    dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor,
+                > = bridge.clone();
 
                 let (lifecycle_armed_tx, lifecycle_armed_rx) = tokio::sync::oneshot::channel();
                 let lifecycle_shutdown = Arc::clone(&shutdown);
@@ -1670,7 +1700,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn threaded_stop_broadcasts_to_lifecycle_and_inproc_with_retained_client() -> AnyhowResult<()> {
+    async fn threaded_stop_broadcasts_to_lifecycle_and_inproc_with_retained_client(
+    ) -> AnyhowResult<()> {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::in_memory::InMemoryTransport;
@@ -1723,9 +1754,12 @@ mod tests {
             "thread owner returned before the accepted request drained"
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec()))
-                .await?
-                .is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.call(b"late".to_vec())
+            )
+            .await?
+            .is_err(),
             "retained client must lose admission after endpoint unregister"
         );
 
@@ -1804,9 +1838,12 @@ mod tests {
             "first stop must broadcast to the lifecycle waiter before cancellation"
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec()))
-                .await?
-                .is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.call(b"late".to_vec())
+            )
+            .await?
+            .is_err(),
             "endpoint removal must reject retained-client late admission"
         );
 
@@ -2010,7 +2047,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_direct_thread_stop_retains_terminal_after_all_waiters_drop() -> AnyhowResult<()> {
+    async fn cancelled_direct_thread_stop_retains_terminal_after_all_waiters_drop(
+    ) -> AnyhowResult<()> {
         let (armed_tx, armed_rx) = std::sync::mpsc::channel();
         let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
         let release = Arc::new(Notify::new());
@@ -2070,15 +2108,23 @@ mod tests {
             let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let service = GatedService {
                 echo: EchoService::new(transport, key.clone()),
-                entered: entered.clone(), release: release.clone(), dropped: dropped.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+                dropped: dropped.clone(),
                 panic_on_drop: false,
             };
             let owner: Box<dyn Spawnable> = if unified {
                 Box::new(UnifiedServiceConfig::new(service, None))
-            } else { Box::new(service) };
+            } else {
+                Box::new(service)
+            };
             let shutdown = Arc::new(Notify::new());
             struct Cleanup(Arc<Notify>);
-            impl Drop for Cleanup { fn drop(&mut self) { self.0.notify_one(); } }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
             let _cleanup = Cleanup(shutdown.clone());
             let stopped = shutdown.clone();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -2086,10 +2132,14 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await??;
             let processor = hyprstream_rpc::dial::lookup_inproc(&endpoint)
                 .ok_or_else(|| anyhow::anyhow!("missing ready processor"))?;
-            let client = Arc::new(RpcClientImpl::new(
-                LocalSigner::new(key.clone()), InMemoryTransport::new(processor),
-                Some(key.verifying_key()),
-            ).with_response_pq_store(store.clone()));
+            let client = Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(key.clone()),
+                    InMemoryTransport::new(processor),
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(store.clone()),
+            );
             let caller = client.clone();
             let response = tokio::spawn(async move { caller.call(b"accepted".to_vec()).await });
             tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
@@ -2098,16 +2148,31 @@ mod tests {
                 while hyprstream_rpc::dial::lookup_inproc(&endpoint).is_some() {
                     tokio::task::yield_now().await;
                 }
-            }).await?;
-            assert!(!task.is_finished(), "owner returned while accepted request is gated");
+            })
+            .await?;
+            assert!(
+                !task.is_finished(),
+                "owner returned while accepted request is gated"
+            );
             assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
             // Endpoint removal follows admission closure, so this retained
             // client must be rejected while the accepted call is still gated.
-            assert!(tokio::time::timeout(std::time::Duration::from_secs(5), client.call(b"late".to_vec())).await?.is_err());
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.call(b"late".to_vec())
+            )
+            .await?
+            .is_err());
             release.notify_one();
-            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), response).await???, hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes());
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), response).await???,
+                hyprstream_rpc::service::dispatch::DISPATCH_DENIED.as_bytes()
+            );
             tokio::time::timeout(std::time::Duration::from_secs(5), task).await???;
-            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "retained client pinned service");
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "retained client pinned service"
+            );
             assert!(client.call(b"late".to_vec()).await.is_err());
         }
         Ok(())
@@ -2118,16 +2183,27 @@ mod tests {
         for unified in [false, true] {
             let (key, _) = generate_signing_keypair();
             let service = GatedService {
-                echo: EchoService::new(TransportConfig::inproc(format!("bridge-panic-owner-{unified}")), key),
-                entered: Arc::new(Notify::new()), release: Arc::new(Notify::new()),
-                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)), panic_on_drop: true,
+                echo: EchoService::new(
+                    TransportConfig::inproc(format!("bridge-panic-owner-{unified}")),
+                    key,
+                ),
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                panic_on_drop: true,
             };
             let owner: Box<dyn Spawnable> = if unified {
                 Box::new(UnifiedServiceConfig::new(service, None))
-            } else { Box::new(service) };
+            } else {
+                Box::new(service)
+            };
             let shutdown = Arc::new(Notify::new());
             struct Cleanup(Arc<Notify>);
-            impl Drop for Cleanup { fn drop(&mut self) { self.0.notify_one(); } }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
             let _cleanup = Cleanup(shutdown.clone());
             let stopped = shutdown.clone();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -2248,7 +2324,9 @@ mod tests {
             anyhow::ensure!(name == "echo" && node != [0; 32], "actual bound carrier");
             bound_tx.send(())?;
             loop {
-                if callback_cancellation.is_cancelled() { anyhow::bail!("publication cancelled"); }
+                if callback_cancellation.is_cancelled() {
+                    anyhow::bail!("publication cancelled");
+                }
                 match publication_rx.recv_timeout(Duration::from_millis(10)) {
                     Ok(true) => return Ok(()),
                     Ok(false) => anyhow::bail!("publication rejected"),
@@ -2268,8 +2346,14 @@ mod tests {
         });
         bound_rx.recv_timeout(Duration::from_secs(20))?;
         let mut message = [0; 128];
-        assert!(socket.recv(&mut message).is_err(), "no READY while publication pending");
-        assert!(matches!(ready_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(
+            socket.recv(&mut message).is_err(),
+            "no READY while publication pending"
+        );
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         assert!(!rpc_path.exists(), "required RPC never binds IPC");
         match outcome.as_str() {
             "success" => {
@@ -2285,23 +2369,35 @@ mod tests {
             _ => anyhow::bail!("unknown case"),
         }
         let result = done_rx.recv_timeout(Duration::from_secs(20))?;
-        worker.join().map_err(|_| anyhow::anyhow!("service thread panicked"))?;
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("service thread panicked"))?;
         assert_eq!(result.is_ok(), outcome == "success");
         assert!(cancellation.is_cancelled());
         assert!(!rpc_path.exists());
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-        assert!(socket.recv(&mut message).is_err(), "failure/cancellation cannot emit READY");
+        assert!(
+            socket.recv(&mut message).is_err(),
+            "failure/cancellation cannot emit READY"
+        );
         Ok(())
     }
 
     #[test]
     fn required_profile_requires_announcement_while_compatibility_continues() {
         let mut required = loop_config(true, true, None);
-        let error = match announce_iroh_bound(required.on_iroh_bound.take(), required.iroh_required, "echo", [0x11; 32]) {
+        let error = match announce_iroh_bound(
+            required.on_iroh_bound.take(),
+            required.iroh_required,
+            "echo",
+            [0x11; 32],
+        ) {
             Ok(()) => panic!("required profile accepted a missing announcement callback"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("no initial Iroh announcement callback"));
+        assert!(error
+            .to_string()
+            .contains("no initial Iroh announcement callback"));
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut compatibility = loop_config(
@@ -2315,7 +2411,12 @@ mod tests {
                 }
             })),
         );
-        if let Err(error) = announce_iroh_bound(compatibility.on_iroh_bound.take(), compatibility.iroh_required, "echo", [0x22; 32]) {
+        if let Err(error) = announce_iroh_bound(
+            compatibility.on_iroh_bound.take(),
+            compatibility.iroh_required,
+            "echo",
+            [0x22; 32],
+        ) {
             panic!("compatibility profile did not continue after announcement failure: {error}");
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2343,7 +2444,13 @@ mod tests {
                 shutdown.notify_one();
             },
         );
-        assert!(result.is_err(), "cancelled first publication cannot permit readiness");
-        assert!(cancellation.is_cancelled(), "shutdown must reach the blocked publication");
+        assert!(
+            result.is_err(),
+            "cancelled first publication cannot permit readiness"
+        );
+        assert!(
+            cancellation.is_cancelled(),
+            "shutdown must reach the blocked publication"
+        );
     }
 }

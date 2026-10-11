@@ -124,22 +124,14 @@ impl DispatchLabel {
         let mut text = format!("{}:{}", self.level, self.assurance);
         if !names.is_empty() {
             text.push(':');
-            text.push_str(
-                &names
-                    .iter()
-                    .map(|(_, n)| *n)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
+            text.push_str(&names.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(","));
         }
         Some(text)
     }
 
     /// Whether this is exactly the system-low label.
     pub fn is_system_low(&self) -> bool {
-        self.level == "public"
-            && self.assurance == "unverified"
-            && self.compartment_bits.is_empty()
+        self.level == "public" && self.assurance == "unverified" && self.compartment_bits.is_empty()
     }
 }
 
@@ -281,7 +273,11 @@ fn parse_label_text(text: &str, map: &InitialLabelMap) -> Result<DispatchLabel, 
         return Err(format!(
             "label '{text}' must be '<level>:<assurance>[:<compartments>]' \
              ({} colon-separated components, found {})",
-            if parts.len() < 2 { "too few" } else { "too many" },
+            if parts.len() < 2 {
+                "too few"
+            } else {
+                "too many"
+            },
             parts.len()
         ));
     }
@@ -502,13 +498,22 @@ mod tests {
     #[test]
     fn public_reasons_must_be_trimmed_nonempty() {
         // A valid trimmed reason passes through EXACTLY as declared.
-        assert_eq!(parse_dispatch_public_reason("circularity").unwrap(), "circularity");
+        assert_eq!(
+            parse_dispatch_public_reason("circularity").unwrap(),
+            "circularity"
+        );
         assert_eq!(
             parse_dispatch_public_reason("no padding on either side").unwrap(),
             "no padding on either side"
         );
         // Surrounding whitespace of any shape is a schema error, not a trim.
-        for padded in ["  padded  ", " leading", "trailing ", "\ttabbed\t", "\nnew\n"] {
+        for padded in [
+            "  padded  ",
+            " leading",
+            "trailing ",
+            "\ttabbed\t",
+            "\nnew\n",
+        ] {
             let err = parse_dispatch_public_reason(padded).unwrap_err();
             assert!(err.contains("padded"), "{padded:?}: {err}");
         }

@@ -248,7 +248,11 @@ impl std::fmt::Display for FilterReason {
 mod tests {
     use super::*;
 
-    fn make_metrics(perplexity: f32, repetition: f32, entropy_var: f32) -> GenerationQualityMetrics {
+    fn make_metrics(
+        perplexity: f32,
+        repetition: f32,
+        entropy_var: f32,
+    ) -> GenerationQualityMetrics {
         GenerationQualityMetrics {
             perplexity,
             avg_entropy: 2.0,

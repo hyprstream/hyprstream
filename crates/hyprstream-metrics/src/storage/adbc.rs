@@ -2,11 +2,10 @@ use crate::storage::cache::{CacheEviction, CacheManager};
 use crate::storage::view::{ViewDefinition, ViewMetadata};
 use crate::storage::{Credentials, StorageBackend};
 use adbc_core::{
-    driver_manager::ManagedConnection,
-    Connection, Database, Driver, Optionable, Statement,
+    driver_manager::ManagedConnection, Connection, Database, Driver, Optionable, Statement,
 };
+use arrow_array::builder::{Int64Builder, StringBuilder};
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_array::builder::{StringBuilder, Int64Builder};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -169,7 +168,9 @@ impl StorageBackend for AdbcBackend {
                 .iter()
                 .map(|field| match field.data_type() {
                     DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-                    DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    DataType::Float64 => {
+                        Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef
+                    }
                     _ => Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
                 })
                 .collect();
@@ -201,7 +202,8 @@ impl StorageBackend for AdbcBackend {
             .new_statement()
             .map_err(|e| Status::internal(format!("Failed to create statement: {}", e)))?;
 
-        let sql = crate::storage::StorageUtils::generate_insert_sql(table_name, batch.num_columns());
+        let sql =
+            crate::storage::StorageUtils::generate_insert_sql(table_name, batch.num_columns());
 
         stmt.set_sql_query(&sql)
             .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
@@ -223,7 +225,7 @@ impl StorageBackend for AdbcBackend {
 
         // Create SQL view
         let create_view_sql = crate::storage::StorageUtils::generate_view_sql(name, &definition);
-        
+
         stmt.set_sql_query(&create_view_sql)
             .map_err(|e| Status::internal(format!("Failed to set query: {}", e)))?;
 
@@ -261,7 +263,11 @@ impl StorageBackend for AdbcBackend {
 
         let mut created_at_builder = Int64Builder::new();
         created_at_builder.append_value(
-            metadata.created_at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64
+            metadata
+                .created_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
         );
 
         let batch = RecordBatch::try_new(
@@ -304,7 +310,11 @@ impl StorageBackend for AdbcBackend {
         view_name_builder.append_value(name);
 
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("view_name", DataType::Utf8, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "view_name",
+                DataType::Utf8,
+                false,
+            )])),
             vec![Arc::new(view_name_builder.finish())],
         )
         .map_err(|e| Status::internal(format!("Failed to create batch: {}", e)))?;
@@ -317,24 +327,28 @@ impl StorageBackend for AdbcBackend {
             .map_err(|e| Status::internal(format!("Failed to execute query: {}", e)))?;
 
         if let Some(batch) = reader.next() {
-            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
-            
+            let batch =
+                batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+
             let definition_json = batch
                 .column_by_name("view_definition")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>())
                 .ok_or_else(|| Status::internal("Invalid view_definition column"))?
                 .value(0);
 
-            let definition: ViewDefinition = serde_json::from_str(definition_json)
-                .map_err(|e| Status::internal(format!("Failed to deserialize view definition: {}", e)))?;
+            let definition: ViewDefinition =
+                serde_json::from_str(definition_json).map_err(|e| {
+                    Status::internal(format!("Failed to deserialize view definition: {}", e))
+                })?;
 
-            let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(
-                batch
-                    .column_by_name("created_at")
-                    .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-                    .ok_or_else(|| Status::internal("Invalid created_at column"))?
-                    .value(0) as u64
-            );
+            let created_at = SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(
+                    batch
+                        .column_by_name("created_at")
+                        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+                        .ok_or_else(|| Status::internal("Invalid created_at column"))?
+                        .value(0) as u64,
+                );
 
             Ok(ViewMetadata {
                 name: name.to_string(),
@@ -361,7 +375,8 @@ impl StorageBackend for AdbcBackend {
 
         let mut views = Vec::new();
         while let Some(batch) = reader.next() {
-            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+            let batch =
+                batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
             let view_names = batch
                 .column_by_name("view_name")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>())
@@ -401,7 +416,11 @@ impl StorageBackend for AdbcBackend {
         view_name_builder.append_value(name);
 
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("view_name", DataType::Utf8, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "view_name",
+                DataType::Utf8,
+                false,
+            )])),
             vec![Arc::new(view_name_builder.finish())],
         )
         .map_err(|e| Status::internal(format!("Failed to create batch: {}", e)))?;
@@ -439,7 +458,8 @@ impl StorageBackend for AdbcBackend {
 
         let mut tables = Vec::new();
         while let Some(batch) = reader.next() {
-            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+            let batch =
+                batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
             let table_names = batch
                 .column_by_name("table_name")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>())
@@ -471,7 +491,8 @@ impl StorageBackend for AdbcBackend {
 
         let mut fields = Vec::new();
         while let Some(batch) = reader.next() {
-            let batch = batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
+            let batch =
+                batch.map_err(|e| Status::internal(format!("Failed to read batch: {}", e)))?;
 
             let names = batch
                 .column_by_name("column_name")

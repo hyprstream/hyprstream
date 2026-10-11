@@ -76,9 +76,9 @@ pub mod ledger;
 pub mod list_record;
 pub mod mst;
 pub mod name_record;
-pub mod placement;
 #[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
 pub mod pgsql_kv;
+pub mod placement;
 pub mod rds;
 pub mod record;
 pub mod repo_authority;
@@ -96,10 +96,9 @@ pub use did_op::{
     DID_OP_SIGNATURE_CONTEXT, DID_OP_VERSION,
 };
 pub use hosted_account::{
-    AccountRecord, AllocatedAccountName, DirectoryHostedAccountStore, HostedAccountMint,
-    PendingHostedAccountMint, SealedHostedAccount, is_hosted_account_staging_directory,
-    ACCOUNT_RECORD_VERSION,
-    ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
+    is_hosted_account_staging_directory, AccountRecord, AllocatedAccountName,
+    DirectoryHostedAccountStore, HostedAccountMint, PendingHostedAccountMint, SealedHostedAccount,
+    ACCOUNT_RECORD_VERSION, ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
 };
 pub use hosted_did_document::{
     SealedHostedDidDocument, DID_DOCUMENT_MEDIA_TYPE, DID_DOCUMENT_PATH, DID_OPERATION_LOG_PATH,

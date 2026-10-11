@@ -8,12 +8,12 @@ use axum::{
     Extension, Router,
 };
 use futures::stream::StreamExt;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::model_client::ModelClient;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, trace};
-use hyprstream_rpc_std::inference_client::GenerationRequest;
-use hyprstream_rpc_std::model_client::ModelClient;
 
 use crate::{
     api::{
@@ -216,7 +216,8 @@ fn model_client_for_request(
     state: &ServerState,
     jwt_token: Option<&str>,
 ) -> anyhow::Result<ModelClient> {
-    ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
+    ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
         (*state.signing_key).clone(),
         jwt_token.map(str::to_owned),
     )
@@ -463,16 +464,14 @@ async fn chat_completions(
         .unwrap_or_default();
     let templated_prompt = match model_client
         .infer(&request.model)
-        .apply_chat_template(
-            &hyprstream_rpc_std::model_client::ChatTemplateRequest {
-                messages: rpc_messages.clone(),
-                add_generation_prompt: true,
-                tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
-                max_tokens: request.max_tokens.map(|v| v as u32),
-                enable_thinking: None,
-                template_vars_json: None,
-            },
-        )
+        .apply_chat_template(&hyprstream_rpc_std::model_client::ChatTemplateRequest {
+            messages: rpc_messages.clone(),
+            add_generation_prompt: true,
+            tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
+            max_tokens: request.max_tokens.map(|v| v as u32),
+            enable_thinking: None,
+            template_vars_json: None,
+        })
         .await
     {
         Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
@@ -489,7 +488,10 @@ async fn chat_completions(
                 .into_response();
         }
     };
-    info!("Template applied, prompt length: {}", templated_prompt.len());
+    info!(
+        "Template applied, prompt length: {}",
+        templated_prompt.len()
+    );
 
     // Build generation request with templated prompt
     let gen_params = crate::config::SamplingParams::from(&state.config.sampling_defaults)
@@ -711,7 +713,9 @@ async fn stream_chat(
             Ok(client) => client,
             Err(e) => {
                 error!("Failed to create authenticated ModelClient: {}", e);
-                let _ = tx.send(Err(anyhow::anyhow!("Client creation failed: {}", e))).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("Client creation failed: {}", e)))
+                    .await;
                 return;
             }
         };
@@ -722,16 +726,14 @@ async fn stream_chat(
             .unwrap_or_default();
         let templated_prompt = match model_client
             .infer(&model_name)
-            .apply_chat_template(
-                &hyprstream_rpc_std::model_client::ChatTemplateRequest {
-                    messages: rpc_messages.clone(),
-                    add_generation_prompt: true,
-                    tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
-                    max_tokens: request.max_tokens.map(|v| v as u32),
-                    enable_thinking: None,
-                    template_vars_json: None,
-                },
-            )
+            .apply_chat_template(&hyprstream_rpc_std::model_client::ChatTemplateRequest {
+                messages: rpc_messages.clone(),
+                add_generation_prompt: true,
+                tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
+                max_tokens: request.max_tokens.map(|v| v as u32),
+                enable_thinking: None,
+                template_vars_json: None,
+            })
             .await
         {
             Ok(prompt_str) => {
@@ -1087,16 +1089,14 @@ async fn completions(
 
     let templated_prompt = match model_client
         .infer(&request.model)
-        .apply_chat_template(
-            &hyprstream_rpc_std::model_client::ChatTemplateRequest {
-                messages: rpc_messages.clone(),
-                add_generation_prompt: true,
-                tools_json: None,
-                max_tokens: request.max_tokens.map(|v| v as u32),
-                enable_thinking: None,
-                template_vars_json: None,
-            },
-        )
+        .apply_chat_template(&hyprstream_rpc_std::model_client::ChatTemplateRequest {
+            messages: rpc_messages.clone(),
+            add_generation_prompt: true,
+            tools_json: None,
+            max_tokens: request.max_tokens.map(|v| v as u32),
+            enable_thinking: None,
+            template_vars_json: None,
+        })
         .await
     {
         Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
@@ -1213,7 +1213,8 @@ async fn list_models(
     State(state): State<ServerState>,
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    let (user, domain, jwt_token, _) = match extract_auth(auth_user.as_ref().map(|Extension(u)| u)) {
+    let (user, domain, jwt_token, _) = match extract_auth(auth_user.as_ref().map(|Extension(u)| u))
+    {
         Ok(identity) => identity,
         Err(_) => {
             return (
@@ -1240,7 +1241,7 @@ async fn list_models(
         &hyprstream_rpc::envelope::Subject::new(user),
     )
     .await
-        .unwrap_or(false)
+    .unwrap_or(false)
     {
         return (
             StatusCode::FORBIDDEN,
@@ -1305,9 +1306,7 @@ async fn list_models(
 ///
 /// `inference_client::ToolCall` is already the same type as `openai_compat::ToolCall`
 /// (re-exported via `pub use`), so only `content` and `tool_call_id` need unwrapping.
-fn to_rpc_messages(
-    msgs: &[ChatMessage],
-) -> Vec<hyprstream_rpc_std::inference_client::ChatMessage> {
+fn to_rpc_messages(msgs: &[ChatMessage]) -> Vec<hyprstream_rpc_std::inference_client::ChatMessage> {
     use hyprstream_rpc_std::inference_client::ChatMessage as RpcMsg;
     msgs.iter()
         .map(|m| RpcMsg {

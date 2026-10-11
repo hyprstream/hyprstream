@@ -10,8 +10,8 @@
 
 #![allow(dead_code, clippy::type_complexity)]
 
-use super::{ArchitectureConfig, ModelArchitecture, ModelOperations, VisionEncoderType};
 use super::config::AttentionType;
+use super::{ArchitectureConfig, ModelArchitecture, ModelOperations, VisionEncoderType};
 use crate::runtime::kv_cache::LayerKVCache;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -91,7 +91,7 @@ pub struct VisionEncoderConfig {
     pub image_size: usize,
     pub patch_size: usize,
     pub num_layers: usize,
-    pub num_patches: usize,  // (image_size / patch_size)^2
+    pub num_patches: usize, // (image_size / patch_size)^2
     pub num_attention_heads: Option<usize>,
     pub intermediate_size: Option<usize>,
 }
@@ -101,7 +101,7 @@ pub struct VisionEncoderConfig {
 pub struct ProjectorConfig {
     pub input_dim: usize,
     pub output_dim: usize,
-    pub hidden_dim: Option<usize>,  // For 2-layer MLP
+    pub hidden_dim: Option<usize>, // For 2-layer MLP
 }
 
 /// Generation pipeline configuration
@@ -110,7 +110,7 @@ pub struct GenerationConfig {
     pub vq_config: VQModelConfig,
     pub gen_aligner_config: ProjectorConfig,
     pub gen_head_config: VisionHeadConfig,
-    pub image_token_size: usize,  // Vocabulary size for image tokens
+    pub image_token_size: usize, // Vocabulary size for image tokens
 }
 
 /// VQ-VAE model configuration
@@ -125,13 +125,13 @@ pub struct VQModelConfig {
 pub struct VisionHeadConfig {
     pub input_dim: usize,
     pub hidden_dim: usize,
-    pub output_dim: usize,  // image_token_size
+    pub output_dim: usize, // image_token_size
 }
 
 /// Main Janus multimodal model
 pub struct JanusModel {
     /// Core components (required)
-    language_model: Box<dyn ModelOperations>,  // Reuse existing models!
+    language_model: Box<dyn ModelOperations>, // Reuse existing models!
     vision_encoder: VisionEncoder,
     vision_aligner: MlpProjector,
 
@@ -146,7 +146,7 @@ pub struct JanusModel {
 
     /// Optimization: Cache last vision encoding
     /// Uses Mutex instead of RefCell for thread safety (Send requirement)
-    vision_cache: parking_lot::Mutex<Option<(Vec<u8>, Tensor)>>,  // (input_hash, features)
+    vision_cache: parking_lot::Mutex<Option<(Vec<u8>, Tensor)>>, // (input_hash, features)
 }
 
 /// Vision encoder implementations
@@ -172,16 +172,12 @@ impl VisionEncoder {
         dtype: DType,
     ) -> Result<Self> {
         match &config.encoder_type {
-            VisionEncoderType::SigLIP { .. } => {
-                Ok(Self::SigLIP(SigLIPVisionTower::from_weights(
-                    config, weights, prefix, device, dtype,
-                )?))
-            }
-            VisionEncoderType::CLIP { .. } => {
-                Ok(Self::CLIP(CLIPVisionTower::from_weights(
-                    config, weights, prefix, device, dtype,
-                )?))
-            }
+            VisionEncoderType::SigLIP { .. } => Ok(Self::SigLIP(SigLIPVisionTower::from_weights(
+                config, weights, prefix, device, dtype,
+            )?)),
+            VisionEncoderType::CLIP { .. } => Ok(Self::CLIP(CLIPVisionTower::from_weights(
+                config, weights, prefix, device, dtype,
+            )?)),
             _ => Err(anyhow!("Unsupported vision encoder type")),
         }
     }
@@ -209,7 +205,7 @@ impl SigLIPVisionTower {
             num_hidden_layers: config.num_layers,
             num_attention_heads: config.num_attention_heads.unwrap_or(16),
             intermediate_size: config.intermediate_size.unwrap_or(config.hidden_size * 4),
-            use_attention_pool: false,  // Janus does NOT use attention pooling - needs all 576 patches
+            use_attention_pool: false, // Janus does NOT use attention pooling - needs all 576 patches
         };
 
         let model = super::siglip::SigLIPVisionTransformer::from_weights(
@@ -246,11 +242,15 @@ impl CLIPVisionTower {
     ) -> Result<Self> {
         // TODO: Implement CLIP vision encoder similar to SigLIP
         // CLIP and SigLIP have very similar architectures
-        Err(anyhow!("CLIP vision encoder not yet implemented - use SigLIP instead"))
+        Err(anyhow!(
+            "CLIP vision encoder not yet implemented - use SigLIP instead"
+        ))
     }
 
     fn forward(&self, _images: &Tensor) -> Result<Tensor> {
-        Err(anyhow!("CLIP vision encoder not yet implemented - use SigLIP instead"))
+        Err(anyhow!(
+            "CLIP vision encoder not yet implemented - use SigLIP instead"
+        ))
     }
 }
 
@@ -282,7 +282,7 @@ impl VisionTransformerLayer {
             weights,
             &format!("{prefix}.mlp"),
             hidden_size,
-            hidden_size * 4,  // Standard 4x expansion
+            hidden_size * 4, // Standard 4x expansion
             device,
             dtype,
         )?;
@@ -374,7 +374,7 @@ impl MultiHeadAttention {
         out_proj = out_proj.to_kind(dtype);
 
         // Infer num_heads from weight shapes
-        let num_heads = 16;  // Standard for many vision models, could be made configurable
+        let num_heads = 16; // Standard for many vision models, could be made configurable
         let head_dim = hidden_size / num_heads;
 
         Ok(Self {
@@ -396,22 +396,40 @@ impl MultiHeadAttention {
         let v = x.matmul(&self.v_proj.transpose(0, 1));
 
         // Reshape for multi-head attention
-        let q = q.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
-            .transpose(1, 2);  // [B, H, N, D]
-        let k = k.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let q = q
+            .reshape([
+                batch_size,
+                seq_len,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2); // [B, H, N, D]
+        let k = k
+            .reshape([
+                batch_size,
+                seq_len,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
-        let v = v.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let v = v
+            .reshape([
+                batch_size,
+                seq_len,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
 
         // Scaled dot-product attention
         let scale = (self.head_dim as f64).sqrt();
-        let scores = q.matmul(&k.transpose(-2, -1))
-            .divide_scalar(scale);
+        let scores = q.matmul(&k.transpose(-2, -1)).divide_scalar(scale);
         let attn_weights = scores.softmax(-1, scores.kind());
         let attn_output = attn_weights.matmul(&v);
 
         // Reshape back
-        let attn_output = attn_output.transpose(1, 2)
+        let attn_output = attn_output
+            .transpose(1, 2)
             .reshape([batch_size, seq_len, -1]);
 
         // Output projection
@@ -455,7 +473,7 @@ impl Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let mut output = x.matmul(&self.fc1.transpose(0, 1));
-        output = output.gelu("none");  // GELU activation
+        output = output.gelu("none"); // GELU activation
         output = output.matmul(&self.fc2.transpose(0, 1));
         Ok(output)
     }
@@ -483,18 +501,16 @@ impl LayerNorm {
         weight = weight.to_device(device);
         weight = weight.to_kind(dtype);
 
-        let bias = weights
-            .get(&format!("{prefix}.bias"))
-            .map(|b| {
-                let mut b = b.shallow_clone();
-                b = b.to_device(device);
-                b.to_kind(dtype)
-            });
+        let bias = weights.get(&format!("{prefix}.bias")).map(|b| {
+            let mut b = b.shallow_clone();
+            b = b.to_device(device);
+            b.to_kind(dtype)
+        });
 
         Ok(Self {
             weight,
             bias,
-            eps: 1e-5,  // Standard epsilon
+            eps: 1e-5, // Standard epsilon
         })
     }
 
@@ -533,9 +549,7 @@ impl MlpProjector {
 
         // Debug: log available keys
         debug!("Loading MLP projector with prefix: {}", prefix);
-        let aligner_keys: Vec<_> = weights.keys()
-            .filter(|k| k.starts_with(prefix))
-            .collect();
+        let aligner_keys: Vec<_> = weights.keys().filter(|k| k.starts_with(prefix)).collect();
         debug!("Available aligner keys: {:?}", aligner_keys);
 
         let mut layers = Vec::new();
@@ -635,7 +649,7 @@ pub struct GenerationPipeline {
     vq_model: VQModel,
     gen_aligner: MlpProjector,
     gen_head: VisionHead,
-    gen_embed: Tensor,  // [image_token_size, hidden_size]
+    gen_embed: Tensor, // [image_token_size, hidden_size]
 }
 
 /// VQ-VAE model for image generation
@@ -664,12 +678,7 @@ impl JanusModel {
             Self::extract_weights_by_prefix(&weights)?;
 
         // Load language model
-        let language_model = Self::load_language_model(
-            language_weights,
-            &config,
-            device,
-            dtype,
-        )?;
+        let language_model = Self::load_language_model(language_weights, &config, device, dtype)?;
 
         // Load vision encoder
         // Janus stores vision weights under vision_model.vision_tower prefix
@@ -722,10 +731,10 @@ impl JanusModel {
     fn extract_weights_by_prefix(
         weights: &HashMap<String, Tensor>,
     ) -> Result<(
-        HashMap<String, Tensor>,  // language_model.*
-        HashMap<String, Tensor>,  // vision_model.*
-        HashMap<String, Tensor>,  // aligner.*
-        HashMap<String, Tensor>,  // gen_* components - currently unused
+        HashMap<String, Tensor>, // language_model.*
+        HashMap<String, Tensor>, // vision_model.*
+        HashMap<String, Tensor>, // aligner.*
+        HashMap<String, Tensor>, // gen_* components - currently unused
     )> {
         let mut language_weights = HashMap::new();
         let mut vision_weights = HashMap::new();
@@ -745,7 +754,12 @@ impl JanusModel {
             }
         }
 
-        Ok((language_weights, vision_weights, aligner_weights, _gen_weights))
+        Ok((
+            language_weights,
+            vision_weights,
+            aligner_weights,
+            _gen_weights,
+        ))
     }
 
     /// Load the language model component
@@ -781,17 +795,29 @@ impl JanusModel {
 
         // If we have images, process them and insert into sequence
         if let (Some(images), Some(seq_mask), Some(emb_mask)) =
-            (pixel_values, images_seq_mask, images_emb_mask) {
-
+            (pixel_values, images_seq_mask, images_emb_mask)
+        {
             let images_shape = images.size();
 
             // Handle both [batch, 3, h, w] and [batch, n_images, 3, h, w] formats
             let (batch_size, n_images, channels, height, width) = if images_shape.len() == 4 {
                 // Single image: [batch, 3, h, w] → treat as [batch, 1, 3, h, w]
-                (images_shape[0], 1, images_shape[1], images_shape[2], images_shape[3])
+                (
+                    images_shape[0],
+                    1,
+                    images_shape[1],
+                    images_shape[2],
+                    images_shape[3],
+                )
             } else if images_shape.len() == 5 {
                 // Multiple images: [batch, n_images, 3, h, w]
-                (images_shape[0], images_shape[1], images_shape[2], images_shape[3], images_shape[4])
+                (
+                    images_shape[0],
+                    images_shape[1],
+                    images_shape[2],
+                    images_shape[3],
+                    images_shape[4],
+                )
             } else {
                 return Err(anyhow!(
                     "Unexpected pixel_values shape: {:?}. Expected [batch, 3, h, w] or [batch, n_images, 3, h, w]",
@@ -801,7 +827,12 @@ impl JanusModel {
 
             debug!(
                 "Processing {} images: batch={}, n_images={}, shape=[{}, {}, {}]",
-                n_images * batch_size, batch_size, n_images, height, width, channels
+                n_images * batch_size,
+                batch_size,
+                n_images,
+                height,
+                width,
+                channels
             );
 
             // Reshape from [batch, n_images, 3, h, w] → [batch*n_images, 3, h, w]
@@ -836,8 +867,8 @@ impl JanusModel {
 
             // Reshape from [batch*n_images, num_patches, hidden]
             // to [batch, n_images*num_patches, hidden]
-            let image_embeds_reshaped = image_embeds
-                .reshape([batch_size, n_images * num_patches, language_hidden]);
+            let image_embeds_reshaped =
+                image_embeds.reshape([batch_size, n_images * num_patches, language_hidden]);
 
             debug!(
                 "Image embeddings reshaped: {:?}",
@@ -862,9 +893,9 @@ impl JanusModel {
             // because emb_mask contains the ground truth number of image tokens (576)
             let emb_mask_shape = emb_mask.size();
             let emb_mask_patches = if emb_mask_shape.len() == 3 {
-                emb_mask_shape[2]  // [batch, n_images, num_patches] → extract num_patches
+                emb_mask_shape[2] // [batch, n_images, num_patches] → extract num_patches
             } else {
-                emb_mask_shape[1]  // [batch, num_patches] → extract num_patches
+                emb_mask_shape[1] // [batch, num_patches] → extract num_patches
             };
 
             let emb_mask_flat = if emb_mask_shape.len() == 2 {
@@ -953,7 +984,7 @@ impl JanusModel {
             let batch_emb_mask = emb_mask.get(b);
 
             // Find all positions where seq_mask is True
-            let seq_positions = batch_seq_mask.nonzero();  // [N, 1]
+            let seq_positions = batch_seq_mask.nonzero(); // [N, 1]
             let num_positions = seq_positions.size()[0];
 
             if num_positions == 0 {
@@ -963,12 +994,15 @@ impl JanusModel {
             // Find all valid image embeddings
             let emb_mask_flat = batch_emb_mask.reshape([-1]);
             let image_flat = batch_image_embeds.reshape([-1, hidden_dim]);
-            let valid_image_embeds = image_flat.masked_select(&emb_mask_flat.unsqueeze(-1))
+            let valid_image_embeds = image_flat
+                .masked_select(&emb_mask_flat.unsqueeze(-1))
                 .reshape([num_positions, hidden_dim]);
 
             debug!(
                 "Batch {}: Merging {} image embeddings at {} positions",
-                b, valid_image_embeds.size()[0], num_positions
+                b,
+                valid_image_embeds.size()[0],
+                num_positions
             );
 
             // Do the replacement: for each True position, use corresponding image embedding
@@ -1006,7 +1040,8 @@ impl ModelOperations for JanusModel {
 
     fn forward_from_embeddings(&self, embeddings: &Tensor, start_pos: usize) -> Result<Tensor> {
         // Delegate to language model's forward_from_embeddings
-        self.language_model.forward_from_embeddings(embeddings, start_pos)
+        self.language_model
+            .forward_from_embeddings(embeddings, start_pos)
     }
 
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
@@ -1056,7 +1091,8 @@ impl ModelOperations for JanusModel {
     }
 
     fn reshape_for_attention(&self, tensor: &Tensor, is_key_value: bool) -> Result<Tensor> {
-        self.language_model.reshape_for_attention(tensor, is_key_value)
+        self.language_model
+            .reshape_for_attention(tensor, is_key_value)
     }
 
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
@@ -1141,15 +1177,18 @@ impl JanusPlaceholderConfig {
     pub fn from_tokenizer(tokenizer: &tokenizers::Tokenizer) -> Result<Self> {
         let vocab = tokenizer.get_vocab(true);
 
-        let image_placeholder_id = vocab.get("<image_placeholder>")
+        let image_placeholder_id = vocab
+            .get("<image_placeholder>")
             .copied()
             .ok_or_else(|| anyhow!("Tokenizer missing <image_placeholder> token"))?;
 
-        let image_start_id = vocab.get("<begin_of_image>")
+        let image_start_id = vocab
+            .get("<begin_of_image>")
             .copied()
             .ok_or_else(|| anyhow!("Tokenizer missing <begin_of_image> token"))?;
 
-        let image_end_id = vocab.get("<end_of_image>")
+        let image_end_id = vocab
+            .get("<end_of_image>")
             .copied()
             .ok_or_else(|| anyhow!("Tokenizer missing <end_of_image> token"))?;
 
@@ -1223,7 +1262,10 @@ pub fn replace_janus_placeholders(
 
         let seq_len = input_ids.len();
         let images_seq_mask = Tensor::zeros([1, seq_len as i64], (DType::Bool, device));
-        let images_emb_mask = Tensor::zeros([1, 1, config.num_image_tokens as i64], (DType::Bool, device));
+        let images_emb_mask = Tensor::zeros(
+            [1, 1, config.num_image_tokens as i64],
+            (DType::Bool, device),
+        );
 
         return Ok(JanusPlaceholderReplacement {
             input_ids: input_ids_tensor,
@@ -1233,7 +1275,10 @@ pub fn replace_janus_placeholders(
         });
     }
 
-    debug!("Found {} image placeholder(s) at positions: {:?}", num_images, placeholder_indices);
+    debug!(
+        "Found {} image placeholder(s) at positions: {:?}",
+        num_images, placeholder_indices
+    );
 
     // Build new token sequence with replacements
     let mut new_tokens = Vec::new();
@@ -1245,7 +1290,10 @@ pub fn replace_janus_placeholders(
 
         // Replace placeholder with: <boi> + 576 x <image> + <eoi>
         new_tokens.push(config.image_start_id as i64);
-        new_tokens.extend(std::iter::repeat_n(config.image_token_id as i64, config.num_image_tokens));
+        new_tokens.extend(std::iter::repeat_n(
+            config.image_token_id as i64,
+            config.num_image_tokens,
+        ));
         new_tokens.push(config.image_end_id as i64);
 
         last_pos = placeholder_idx + 1;
@@ -1292,7 +1340,10 @@ pub fn replace_janus_placeholders(
             if current_pos >= seq_mask.len() {
                 return Err(anyhow!(
                     "Placeholder replacement exceeded sequence length: pos={}, len={}, image={}/{}",
-                    current_pos, seq_mask.len(), img_idx + 1, num_images
+                    current_pos,
+                    seq_mask.len(),
+                    img_idx + 1,
+                    num_images
                 ));
             }
             seq_mask[current_pos] = true;
@@ -1303,16 +1354,21 @@ pub fn replace_janus_placeholders(
         current_pos += 1;
     }
 
-    let images_seq_mask = Tensor::from_slice(&seq_mask.iter().map(|&b| if b { 1u8 } else { 0u8 }).collect::<Vec<_>>())
-        .to_kind(DType::Bool)
-        .to_device(device)
-        .unsqueeze(0); // [1, expanded_seq_len]
+    let images_seq_mask = Tensor::from_slice(
+        &seq_mask
+            .iter()
+            .map(|&b| if b { 1u8 } else { 0u8 })
+            .collect::<Vec<_>>(),
+    )
+    .to_kind(DType::Bool)
+    .to_device(device)
+    .unsqueeze(0); // [1, expanded_seq_len]
 
     // Create images_emb_mask: all vision embeddings are valid
     // Shape: [1, num_images, num_image_tokens] - all True
     let images_emb_mask = Tensor::ones(
         [1, num_images as i64, config.num_image_tokens as i64],
-        (DType::Bool, device)
+        (DType::Bool, device),
     );
 
     Ok(JanusPlaceholderReplacement {

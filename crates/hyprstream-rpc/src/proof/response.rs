@@ -385,7 +385,7 @@ mod tests {
         let v = CborValue::Map(vec![
             (CborValue::Integer(1.into()), CborValue::Integer(9.into())),
             (CborValue::Integer(2.into()), CborValue::Integer(2.into())), // old combined "unary encrypted"
-            (CborValue::Integer(3.into()), kem_map(ALG_ML_KEM_768)), // old kem at key 3
+            (CborValue::Integer(3.into()), kem_map(ALG_ML_KEM_768)),      // old kem at key 3
         ]);
         assert!(ResponseBinding::decode(&v).is_err());
     }

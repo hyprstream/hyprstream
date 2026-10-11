@@ -397,7 +397,7 @@ impl PublicRepoStore {
         Ok(())
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create public repo store at {path:?}"))?;
@@ -417,7 +417,7 @@ impl PublicRepoStore {
         anyhow::bail!("public repository store requires the `rocksdb` feature")
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn snapshot(&self, did: &str) -> Result<Option<PublicRepoSnapshot>> {
         validate_did(did)?;
         // Iteration and the head lookup must observe the same database
@@ -499,7 +499,7 @@ impl PublicRepoStore {
         anyhow::bail!("public repository store requires the `rocksdb` feature")
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn public_genesis_bytes(&self, did: &str) -> Result<Option<Vec<u8>>> {
         let bytes = self.db.get_pinned(format!("{GENESIS_PREFIX}{did}"))?;
         if let Some(bytes) = &bytes {
@@ -516,7 +516,7 @@ impl PublicRepoStore {
         anyhow::bail!("public repository store requires the `rocksdb` feature")
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn seed_public_genesis(
         &self,
         did: &str,
@@ -603,7 +603,7 @@ impl PublicRepoStore {
         anyhow::bail!("public repository store requires the `rocksdb` feature")
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn intent(&self, did: &str, request_id: &str) -> Result<Option<PublicationIntent>> {
         let Some(bytes) = self.db.get(intent_key(did, request_id))? else {
             return Ok(None);
@@ -618,7 +618,7 @@ impl PublicRepoStore {
         anyhow::bail!("public repository store requires the `rocksdb` feature")
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn write_transaction(
         &self,
         did: &str,
@@ -845,7 +845,7 @@ impl PublicRepoWriter {
         self.prepare_external_record_locked(request, condition, None)
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn prepare_external_record_locked(
         &self,
         request: PublicCreateRequest,
@@ -1121,7 +1121,7 @@ impl PublicRepoWriter {
     /// Old blocks and publication intents remain immutable for original retries.
     /// This in-process boundary does not subscribe to external key rotations;
     /// account lifecycle wiring must route promotion through it.
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     pub fn promote_signing_key(
         &self,
         principal: &str,
@@ -1181,7 +1181,7 @@ impl PublicRepoWriter {
         self.create_record_with_condition(request, condition)
     }
 
-#[cfg(feature = "rocksdb")]
+    #[cfg(feature = "rocksdb")]
     fn create_record_with_condition(
         &self,
         request: PublicCreateRequest,
@@ -1525,10 +1525,8 @@ impl HostedAccountPublicRepoWriter {
             .ok_or_else(|| {
                 PublicRepoWriteError::Authorization(anyhow!("hosted account is not locally owned"))
             })?;
-        let (native_bytes, public_bytes) = self
-            .genesis_bytes(&request.did)
-            .await?
-            .ok_or_else(|| {
+        let (native_bytes, public_bytes) =
+            self.genesis_bytes(&request.did).await?.ok_or_else(|| {
                 PublicRepoWriteError::Authorization(anyhow!(
                     "hosted account has no repository genesis"
                 ))

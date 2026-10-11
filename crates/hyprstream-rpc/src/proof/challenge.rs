@@ -186,11 +186,8 @@ impl ChallengeManager {
             return Some(current.clone());
         }
         let window_end = now + self.window_seconds;
-        let fresh = ServerChallenge::new(
-            generator(),
-            window_end,
-            window_end + self.overlap_seconds,
-        );
+        let fresh =
+            ServerChallenge::new(generator(), window_end, window_end + self.overlap_seconds);
         chals.retain(|c| c.accept_until > now);
         chals.push(fresh.clone());
         Some(fresh)
@@ -287,7 +284,9 @@ mod tests {
         assert_eq!(new, 1035);
         assert_ne!(
             old,
-            mgr.current(1002).expect("a current challenge exists").accept_until,
+            mgr.current(1002)
+                .expect("a current challenge exists")
+                .accept_until,
             "the matched deadline must not be the current challenge's deadline"
         );
         // The retention window follows the matched deadline.

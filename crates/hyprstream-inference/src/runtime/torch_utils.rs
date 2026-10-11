@@ -73,8 +73,14 @@ where
 /// This is a common operation that can OOM, so we provide a dedicated wrapper
 /// with clear error messages.
 pub fn safe_to_device(tensor: &Tensor, device: Device) -> Result<Tensor> {
-    safe_tensor_op(|| tensor.to_device(device))
-        .map_err(|e| anyhow!("Failed to_device({:?}): {} | shape: {:?}", device, e, tensor.size()))
+    safe_tensor_op(|| tensor.to_device(device)).map_err(|e| {
+        anyhow!(
+            "Failed to_device({:?}): {} | shape: {:?}",
+            device,
+            e,
+            tensor.size()
+        )
+    })
 }
 
 /// Safely allocate a tensor (zeros, ones, randn, etc.)
@@ -83,8 +89,15 @@ pub fn safe_to_device(tensor: &Tensor, device: Device) -> Result<Tensor> {
 pub fn safe_zeros(shape: &[i64], kind_device: (tch::Kind, Device)) -> Result<Tensor> {
     let (kind, device) = kind_device;
     let size_mb = estimate_tensor_size_mb(shape, kind);
-    safe_tensor_op(|| Tensor::zeros(shape, (kind, device)))
-        .map_err(|e| anyhow!("Failed to allocate tensor on {:?}: {} | shape: {:?} ({:.1} MB)", device, e, shape, size_mb))
+    safe_tensor_op(|| Tensor::zeros(shape, (kind, device))).map_err(|e| {
+        anyhow!(
+            "Failed to allocate tensor on {:?}: {} | shape: {:?} ({:.1} MB)",
+            device,
+            e,
+            shape,
+            size_mb
+        )
+    })
 }
 
 /// Estimate tensor size in megabytes
@@ -93,9 +106,12 @@ pub fn estimate_tensor_size_mb(shape: &[i64], dtype: tch::Kind) -> f64 {
     let bytes_per_element = match dtype {
         tch::Kind::Double | tch::Kind::Int64 => 8,
         tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Int16 => 2,
-        tch::Kind::Int8 | tch::Kind::Uint8
-            | tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2
-            | tch::Kind::Float8e4m3fnuz | tch::Kind::Float8e5m2fnuz => 1,
+        tch::Kind::Int8
+        | tch::Kind::Uint8
+        | tch::Kind::Float8e4m3fn
+        | tch::Kind::Float8e5m2
+        | tch::Kind::Float8e4m3fnuz
+        | tch::Kind::Float8e5m2fnuz => 1,
         // Float, Int, and all other types default to 4 bytes
         _ => 4,
     };
@@ -123,9 +139,7 @@ pub fn check_gpu_memory(device: Device) -> Result<(usize, usize)> {
                     // Return dummy values - this API needs tch-rs support
                     Ok((0, 0))
                 }
-                Err(_) => {
-                    Err(anyhow!("GPU device {} is not accessible", device_idx))
-                }
+                Err(_) => Err(anyhow!("GPU device {} is not accessible", device_idx)),
             }
         }
         Device::Cpu => {
@@ -191,9 +205,7 @@ mod tests {
 
     #[test]
     fn test_safe_tensor_op_cpu() {
-        let result = safe_tensor_op(|| {
-            Tensor::zeros([10, 10], (tch::Kind::Float, Device::Cpu))
-        });
+        let result = safe_tensor_op(|| Tensor::zeros([10, 10], (tch::Kind::Float, Device::Cpu)));
         assert!(result.is_ok());
     }
 }

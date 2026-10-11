@@ -190,10 +190,7 @@ fn enrol_one(
         bail!("entry names no enrollment policy");
     }
     if entry.not_after <= now {
-        bail!(
-            "enrollment validity ({}) is already past",
-            entry.not_after
-        );
+        bail!("enrollment validity ({}) is already past", entry.not_after);
     }
     if entry.components.is_empty() {
         bail!("entry pins no component keys");
@@ -203,7 +200,10 @@ fn enrol_one(
     for component in &entry.components {
         let kid = hex::decode(&component.kid_hex).context("kid is not hex")?;
         if kid.is_empty() || kid.len() > hyprstream_rpc::proof::MAX_KID_BYTES {
-            bail!("kid must be 1..{} bytes", hyprstream_rpc::proof::MAX_KID_BYTES);
+            bail!(
+                "kid must be 1..{} bytes",
+                hyprstream_rpc::proof::MAX_KID_BYTES
+            );
         }
         let public = hex::decode(&component.public_hex).context("public key is not hex")?;
 
@@ -308,7 +308,9 @@ pub fn foreign_protocol_keys(
     oauth: Option<&crate::config::OAuthConfig>,
     secrets_dir: Option<&Path>,
 ) -> HashSet<Vec<u8>> {
-    use hyprstream_rpc::did_key::{decode_multikey, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB};
+    use hyprstream_rpc::did_key::{
+        decode_multikey, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB,
+    };
 
     let mut keys = HashSet::new();
 
@@ -346,7 +348,8 @@ pub fn foreign_protocol_keys(
 /// the overlap check compares raw component keys — a hybrid entry contributes
 /// two foreign keys, either of which a proof manifest is forbidden to reuse.
 fn collect_bootstrap_pubkeys(secrets_dir: &Path, keys: &mut HashSet<Vec<u8>>) {
-    let Ok(entries) = crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(secrets_dir) else {
+    let Ok(entries) = crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(secrets_dir)
+    else {
         return;
     };
     for entry in entries.values() {
@@ -544,9 +547,7 @@ mod tests {
     /// proof manifest cannot relabel the JWT/WIT issuance anchor as a signer.
     #[test]
     fn local_ca_pubkeys_count_as_foreign() {
-        use crate::auth::identity_store::{
-            write_ca_ml_dsa_verifying_key, write_ca_verifying_key,
-        };
+        use crate::auth::identity_store::{write_ca_ml_dsa_verifying_key, write_ca_verifying_key};
 
         let ca_ed = SigningKey::generate(&mut OsRng);
         let ca_pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca_ed);
@@ -670,9 +671,7 @@ mod tests {
         entry.role = ManifestRole::Approver;
         entry.principal = "approver".into();
         let without = build(vec![entry.clone()]);
-        assert!(without
-            .resolve_approver(b"client-1")
-            .is_none());
+        assert!(without.resolve_approver(b"client-1").is_none());
 
         entry.approver_role = Some("security".into());
         let with = build(vec![entry]);
@@ -686,11 +685,15 @@ mod tests {
         let mut entry = primary_entry(&key);
         entry.role = ManifestRole::Service;
         let without = build(vec![entry.clone()]);
-        assert!(without.resolve_service("registry.svc.hyprstream.test").is_none());
+        assert!(without
+            .resolve_service("registry.svc.hyprstream.test")
+            .is_none());
 
         entry.service_domain = Some("registry.svc.hyprstream.test".into());
         let with = build(vec![entry]);
-        assert!(with.resolve_service("registry.svc.hyprstream.test").is_some());
+        assert!(with
+            .resolve_service("registry.svc.hyprstream.test")
+            .is_some());
         assert!(with.resolve_service("other.svc.hyprstream.test").is_none());
     }
 

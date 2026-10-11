@@ -78,11 +78,7 @@ impl ShiftSplit {
     ) -> Result<Self, MetricError> {
         let fit: Vec<String> = fit_families.into_iter().map(Into::into).collect();
         let eval: Vec<String> = eval_families.into_iter().map(Into::into).collect();
-        let mut overlap: Vec<String> = eval
-            .iter()
-            .filter(|f| fit.contains(f))
-            .cloned()
-            .collect();
+        let mut overlap: Vec<String> = eval.iter().filter(|f| fit.contains(f)).cloned().collect();
         overlap.sort();
         overlap.dedup();
         if !overlap.is_empty() {

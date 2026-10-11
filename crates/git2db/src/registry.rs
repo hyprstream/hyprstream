@@ -172,11 +172,11 @@ impl Git2DB {
         // Check if directory exists AND is a git repository
         // (directory might exist but not be initialized, e.g., from Docker volume mount)
         let rp = registry_path.clone();
-        let is_valid_repo = tokio::task::spawn_blocking(move || {
-            Repository::open(&rp).is_ok()
-        }).await.unwrap_or(false);
-        let is_git_repo = registry_path.join(".git").exists()
-            || (registry_path.exists() && is_valid_repo);
+        let is_valid_repo = tokio::task::spawn_blocking(move || Repository::open(&rp).is_ok())
+            .await
+            .unwrap_or(false);
+        let is_git_repo =
+            registry_path.join(".git").exists() || (registry_path.exists() && is_valid_repo);
 
         // Create or open registry repo
         if is_git_repo {
@@ -184,10 +184,7 @@ impl Git2DB {
             let rp = registry_path.clone();
             tokio::task::spawn_blocking(move || {
                 GitManager::global().get_repository(&rp).map_err(|e| {
-                    Git2DBError::repository(
-                        &rp,
-                        format!("Failed to open registry repository: {e}"),
-                    )
+                    Git2DBError::repository(&rp, format!("Failed to open registry repository: {e}"))
                 })
             })
             .await
@@ -197,10 +194,7 @@ impl Git2DB {
             info!("Initializing new model registry at {:?}", registry_path);
 
             fs::create_dir_all(&registry_path).await.map_err(|e| {
-                Git2DBError::repository(
-                    &registry_path,
-                    format!("Failed to create directory: {e}"),
-                )
+                Git2DBError::repository(&registry_path, format!("Failed to create directory: {e}"))
             })?;
 
             // Restrict registry directory — may contain URLs with embedded tokens
@@ -237,9 +231,8 @@ impl Git2DB {
 
             // Create initial registry.json
             let metadata = RegistryMetadata::default();
-            let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-                Git2DBError::internal(format!("Failed to serialize metadata: {e}"))
-            })?;
+            let json = serde_json::to_string_pretty(&metadata)
+                .map_err(|e| Git2DBError::internal(format!("Failed to serialize metadata: {e}")))?;
             fs::write(registry_path.join("registry.json"), &json)
                 .await
                 .map_err(|e| {
@@ -275,7 +268,9 @@ impl Git2DB {
 
                 let sig = GitManager::global()
                     .create_signature(None, None)
-                    .map_err(|e| Git2DBError::internal(format!("Failed to create signature: {e}")))?;
+                    .map_err(|e| {
+                        Git2DBError::internal(format!("Failed to create signature: {e}"))
+                    })?;
 
                 let tree_id = {
                     let mut index = repo.index().map_err(|e| {
@@ -284,10 +279,7 @@ impl Git2DB {
                     index
                         .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
                         .map_err(|e| {
-                            Git2DBError::repository(
-                                &rp,
-                                format!("Failed to stage files: {e}"),
-                            )
+                            Git2DBError::repository(&rp, format!("Failed to stage files: {e}"))
                         })?;
                     index.write().map_err(|e| {
                         Git2DBError::repository(&rp, format!("Failed to write index: {e}"))
@@ -310,10 +302,7 @@ impl Git2DB {
                     &[],
                 )
                 .map_err(|e| {
-                    Git2DBError::repository(
-                        &rp,
-                        format!("Failed to create initial commit: {e}"),
-                    )
+                    Git2DBError::repository(&rp, format!("Failed to create initial commit: {e}"))
                 })?;
 
                 Ok(())
@@ -345,11 +334,21 @@ impl Git2DB {
         let config = Git2DBConfig::load()
             .map_err(|e| Git2DBError::internal(format!("Failed to load configuration: {e}")))?;
         // Debug logging for configuration
-        info!("Worktree driver configuration loaded: '{}'", config.worktree.driver);
+        info!(
+            "Worktree driver configuration loaded: '{}'",
+            config.worktree.driver
+        );
 
-        let driver_config = config.worktree.driver
+        let driver_config = config
+            .worktree
+            .driver
             .parse::<StorageDriver>()
-            .map_err(|e| Git2DBError::internal(format!("Invalid storage driver config '{}': {}", config.worktree.driver, e)))?;
+            .map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Invalid storage driver config '{}': {}",
+                    config.worktree.driver, e
+                ))
+            })?;
 
         info!("Parsed driver configuration: {:?}", driver_config);
 
@@ -407,17 +406,20 @@ impl Git2DB {
         let self_uuid = registry_self_uuid();
         if !registry.metadata.repositories.contains_key(&self_uuid) {
             info!("Registering .registry as self-tracked repository");
-            registry.metadata.repositories.insert(self_uuid, TrackedRepository {
-                id: RepoId::from_uuid(self_uuid),
-                name: Some(".registry".to_owned()),
-                url: format!("file://{}", registry.registry_path.display()),
-                worktree_path: registry.registry_path.clone(),
-                tracking_ref: GitRef::DefaultBranch,
-                remotes: Vec::new(),
-                registered_at: Utc::now().timestamp(),
-                current_oid: None,
-                metadata: HashMap::new(),
-            });
+            registry.metadata.repositories.insert(
+                self_uuid,
+                TrackedRepository {
+                    id: RepoId::from_uuid(self_uuid),
+                    name: Some(".registry".to_owned()),
+                    url: format!("file://{}", registry.registry_path.display()),
+                    worktree_path: registry.registry_path.clone(),
+                    tracking_ref: GitRef::DefaultBranch,
+                    remotes: Vec::new(),
+                    registered_at: Utc::now().timestamp(),
+                    current_oid: None,
+                    metadata: HashMap::new(),
+                },
+            );
             registry.save_metadata().await?;
             registry.commit_changes("Register .registry as self-tracked repository")?;
         }
@@ -553,10 +555,7 @@ impl Git2DB {
                 true, // use gitlink
             )
             .map_err(|e| {
-                Git2DBError::submodule(
-                    repo_id.to_string(),
-                    format!("Failed to add submodule: {e}"),
-                )
+                Git2DBError::submodule(repo_id.to_string(), format!("Failed to add submodule: {e}"))
             })?;
         }
 
@@ -637,10 +636,7 @@ impl Git2DB {
                 true, // use gitlink
             )
             .map_err(|e| {
-                Git2DBError::submodule(
-                    repo_id.to_string(),
-                    format!("Failed to add submodule: {e}"),
-                )
+                Git2DBError::submodule(repo_id.to_string(), format!("Failed to add submodule: {e}"))
             })?;
         }
 
@@ -693,15 +689,15 @@ impl Git2DB {
     pub async fn remove_repository(&mut self, id: &RepoId) -> Git2DBResult<()> {
         // Guard: cannot remove the self-tracked .registry entry
         if id.0 == registry_self_uuid() {
-            return Err(Git2DBError::internal("Cannot remove the self-tracked .registry entry"));
+            return Err(Git2DBError::internal(
+                "Cannot remove the self-tracked .registry entry",
+            ));
         }
 
         // Get repository info before removal
         let repo_info = self
             .get_by_id(id)
-            .ok_or_else(|| {
-                Git2DBError::invalid_repository(id.to_string(), "Repository not found")
-            })?
+            .ok_or_else(|| Git2DBError::invalid_repository(id.to_string(), "Repository not found"))?
             .clone();
 
         info!("Removing repository {}", id);
@@ -801,9 +797,7 @@ impl Git2DB {
                 fs::remove_dir_all(&submodule_work_path)
                     .await
                     .map_err(|e| {
-                        Git2DBError::internal(format!(
-                            "Failed to remove submodule directory: {e}"
-                        ))
+                        Git2DBError::internal(format!("Failed to remove submodule directory: {e}"))
                     })?;
             }
         } else {
@@ -1005,7 +999,10 @@ impl Git2DB {
             Git2DBError::internal(format!("Failed to canonicalize target {:?}: {e}", path))
         })?;
         let canonical_base = self.base_dir.canonicalize().map_err(|e| {
-            Git2DBError::internal(format!("Failed to canonicalize base {:?}: {e}", self.base_dir))
+            Git2DBError::internal(format!(
+                "Failed to canonicalize base {:?}: {e}",
+                self.base_dir
+            ))
         })?;
         if !canonical_target.starts_with(&canonical_base) {
             return Err(Git2DBError::internal(format!(
@@ -1016,7 +1013,6 @@ impl Git2DB {
         Ok(())
     }
 
-  
     /// Initialize and update all submodules
     ///
     /// Equivalent to:
@@ -1098,11 +1094,8 @@ impl Git2DB {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(
-                &metadata_path,
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .await;
+            let _ =
+                fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o600)).await;
         }
 
         Ok(())
@@ -1335,11 +1328,10 @@ mod tests {
             // Verify commit was created
             let head = repo.head()?;
             let commit = head.peel_to_commit()?;
-            let msg = commit.message().ok_or_else(|| crate::Git2DBError::internal("no commit message"))?;
-            assert!(
-                msg.contains("recovery"),
-                "Recovery commit should exist"
-            );
+            let msg = commit
+                .message()
+                .ok_or_else(|| crate::Git2DBError::internal("no commit message"))?;
+            assert!(msg.contains("recovery"), "Recovery commit should exist");
         }
         Ok(())
     }

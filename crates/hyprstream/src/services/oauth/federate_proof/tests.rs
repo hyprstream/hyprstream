@@ -406,7 +406,9 @@ async fn h3b_each_authority_binding_and_epoch_is_checked() {
         |r| r.created_at = NOW as i64 + 1,
         |r| r.proof_epoch = 0,
         |r| r.proof_epoch = u64::MAX,
-        |r| { r.collision_inventory_id.pop(); },
+        |r| {
+            r.collision_inventory_id.pop();
+        },
         |r| r.account_id.clear(),
         |r| r.grant_revision.clear(),
     ];

@@ -528,8 +528,7 @@ mod tests {
             .join(format!(".roster.json.tmp-{}", std::process::id()));
         std::fs::write(&stale, b"interrupted earlier attempt")?;
         renewal_tick(&store, &ingest, secrets.path(), 86_400, Some(&roster), now)?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&roster)?)?;
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&roster)?)?;
         assert_eq!(parsed["services"].as_array().expect("services").len(), 2);
         assert_eq!(
             std::fs::read(&stale)?,
@@ -601,8 +600,7 @@ mod tests {
             .find(|state| state.did == foreign_did)
             .expect("foreign record still accepted");
         assert_eq!(foreign_after.epoch, 0, "foreign record must not be renewed");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&roster)?)?;
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&roster)?)?;
         let services = parsed["services"].as_array().expect("services");
         assert_eq!(services.len(), 2);
         assert!(

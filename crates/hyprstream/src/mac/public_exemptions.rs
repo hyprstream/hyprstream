@@ -251,7 +251,10 @@ impl std::fmt::Display for RegistryError {
                 write!(f, "exemption {id:?} has an empty justification")
             }
             Self::UnknownFaceHandler(id) => {
-                write!(f, "exemption {id:?} references a handler unused by its declared face")
+                write!(
+                    f,
+                    "exemption {id:?} references a handler unused by its declared face"
+                )
             }
         }
     }
@@ -349,7 +352,11 @@ mod tests {
         let expected = [
             ("root-health", RouteMethod::Get, "/"),
             ("health", RouteMethod::Get, "/health"),
-            ("oauth-protected-resource", RouteMethod::Get, "/.well-known/oauth-protected-resource"),
+            (
+                "oauth-protected-resource",
+                RouteMethod::Get,
+                "/.well-known/oauth-protected-resource",
+            ),
             ("export9p", RouteMethod::Get, "/.well-known/export9p"),
             ("wire-planes", RouteMethod::Get, "/.well-known/planes"),
             ("ninep-ws", RouteMethod::Get, "/9p"),
@@ -359,26 +366,35 @@ mod tests {
                 "/.well-known/hyprstream/browser-provisioning/:service",
             ),
         ];
-        assert_eq!(main, expected, "main-app public face drifted from the reviewed snapshot");
+        assert_eq!(
+            main, expected,
+            "main-app public face drifted from the reviewed snapshot"
+        );
     }
 
     /// The at9p-verify face owns exactly its single verification route.
     #[test]
     fn at9p_verify_face_snapshot_is_pinned() {
-        let verify: Vec<(&'static str, RouteMethod, &'static str)> =
-            for_face(HttpFace::At9pVerify).map(|e| (e.id, e.method, e.path)).collect();
+        let verify: Vec<(&'static str, RouteMethod, &'static str)> = for_face(HttpFace::At9pVerify)
+            .map(|e| (e.id, e.method, e.path))
+            .collect();
         let expected = [("at9p-verify", RouteMethod::Post, "/at9p/verify")];
-        assert_eq!(verify, expected, "at9p-verify public face drifted from the reviewed snapshot");
+        assert_eq!(
+            verify, expected,
+            "at9p-verify public face drifted from the reviewed snapshot"
+        );
     }
 
     /// The two faces are disjoint: no route id or (method, path) is claimed by
     /// both faces — a route is owned by exactly one reviewed exemption.
     #[test]
     fn faces_are_disjoint() {
-        let main: std::collections::HashSet<_> =
-            for_face(HttpFace::MainApp).map(|e| (e.method, e.path)).collect();
-        let verify: std::collections::HashSet<_> =
-            for_face(HttpFace::At9pVerify).map(|e| (e.method, e.path)).collect();
+        let main: std::collections::HashSet<_> = for_face(HttpFace::MainApp)
+            .map(|e| (e.method, e.path))
+            .collect();
+        let verify: std::collections::HashSet<_> = for_face(HttpFace::At9pVerify)
+            .map(|e| (e.method, e.path))
+            .collect();
         let overlap: Vec<_> = main.intersection(&verify).collect();
         assert!(
             overlap.is_empty(),
@@ -391,7 +407,10 @@ mod tests {
     #[test]
     fn require_resolves_registered_and_rejects_unknown() {
         assert_eq!(require(HttpFace::MainApp, "health").path, "/health");
-        assert_eq!(require(HttpFace::At9pVerify, "at9p-verify").path, "/at9p/verify");
+        assert_eq!(
+            require(HttpFace::At9pVerify, "at9p-verify").path,
+            "/at9p/verify"
+        );
     }
 
     #[test]

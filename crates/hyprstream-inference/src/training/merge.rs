@@ -37,7 +37,10 @@ impl MergeStrategy {
             "replace" => Ok(Self::Replace),
             "additive" => Ok(Self::Additive { weight }),
             "do_merge" | "doMerge" | "DO-Merge" => Ok(Self::DoMerge { weight }),
-            _ => Err(anyhow!("Unknown merge strategy: '{}'. Use 'replace', 'additive', or 'do_merge'.", name)),
+            _ => Err(anyhow!(
+                "Unknown merge strategy: '{}'. Use 'replace', 'additive', or 'do_merge'.",
+                name
+            )),
         }
     }
 }
@@ -238,7 +241,11 @@ mod tests {
         let result = do_merge(&a, &a, 0.5).unwrap();
 
         let diff: f64 = (&result - &a).abs().sum(Kind::Float).double_value(&[]);
-        assert!(diff < 1e-5, "DO-merge with self at w=0.5 should be identity, diff={}", diff);
+        assert!(
+            diff < 1e-5,
+            "DO-merge with self at w=0.5 should be identity, diff={}",
+            diff
+        );
     }
 
     #[test]
@@ -248,7 +255,11 @@ mod tests {
 
         let result = do_merge(&a, &b, 1.0).unwrap();
         let diff: f64 = (&result - &b).abs().sum(Kind::Float).double_value(&[]);
-        assert!(diff < 1e-5, "DO-merge at w=1.0 should be replacement, diff={}", diff);
+        assert!(
+            diff < 1e-5,
+            "DO-merge at w=1.0 should be replacement, diff={}",
+            diff
+        );
     }
 
     #[test]
@@ -311,9 +322,18 @@ mod tests {
 
     #[test]
     fn test_strategy_from_name() {
-        assert!(matches!(MergeStrategy::from_name("replace", 0.5).unwrap(), MergeStrategy::Replace));
-        assert!(matches!(MergeStrategy::from_name("additive", 0.5).unwrap(), MergeStrategy::Additive { .. }));
-        assert!(matches!(MergeStrategy::from_name("do_merge", 0.3).unwrap(), MergeStrategy::DoMerge { .. }));
+        assert!(matches!(
+            MergeStrategy::from_name("replace", 0.5).unwrap(),
+            MergeStrategy::Replace
+        ));
+        assert!(matches!(
+            MergeStrategy::from_name("additive", 0.5).unwrap(),
+            MergeStrategy::Additive { .. }
+        ));
+        assert!(matches!(
+            MergeStrategy::from_name("do_merge", 0.3).unwrap(),
+            MergeStrategy::DoMerge { .. }
+        ));
         assert!(MergeStrategy::from_name("unknown", 0.5).is_err());
     }
 }

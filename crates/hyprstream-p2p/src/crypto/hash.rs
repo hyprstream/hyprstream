@@ -26,7 +26,6 @@ pub fn sha256_data(data: &[u8]) -> crate::Result<Sha256Hash> {
     sha256_git(data)
 }
 
-
 /// Hash a string to create an identifier
 pub fn hash_string(s: &str) -> String {
     sha256_hex(s.as_bytes())
@@ -50,7 +49,10 @@ mod tests {
 
         let hex = sha256_hex(data);
         assert_eq!(hex.len(), 64);
-        assert_eq!(hex, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            hex,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]

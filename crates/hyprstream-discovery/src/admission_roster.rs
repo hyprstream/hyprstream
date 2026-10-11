@@ -198,8 +198,7 @@ impl CachedRoster {
             let gate = RefreshGate(Arc::clone(&self.refreshing));
             if self.stored().is_none() {
                 let entries = Arc::new((self.load)());
-                *self.snapshot.lock() =
-                    Some((std::time::Instant::now(), Arc::clone(&entries)));
+                *self.snapshot.lock() = Some((std::time::Instant::now(), Arc::clone(&entries)));
                 drop(gate);
                 return entries;
             }
@@ -264,10 +263,7 @@ pub fn derived_service_name(state: &AcceptedIdentityState, now_unix_ms: i64) -> 
     // in name derivation or uniqueness counting either — otherwise an
     // expired foreign claim would make the genuine identity ambiguously
     // denied forever (review round 2).
-    if state.epoch == 0
-        || state.expires_at_unix_ms.is_none()
-        || !state.is_live(now_unix_ms)
-    {
+    if state.epoch == 0 || state.expires_at_unix_ms.is_none() || !state.is_live(now_unix_ms) {
         return None;
     }
     let mut matched = None;
@@ -325,7 +321,11 @@ pub fn derived_tenant_resolver(roster: Arc<dyn DeploymentRosterSource>) -> PeerT
     Arc::new(move |peer: &PeerIdentity| {
         peer.subject.as_deref().and_then(|did| {
             let snapshot = roster.roster();
-            roster_tenant(&snapshot, did, hyprstream_rpc::envelope::current_timestamp())
+            roster_tenant(
+                &snapshot,
+                did,
+                hyprstream_rpc::envelope::current_timestamp(),
+            )
         })
     })
 }
@@ -343,7 +343,11 @@ pub fn require_service_self_binding(
     proof: &MoqlAdmissionProof,
 ) -> Result<()> {
     let snapshot = roster.roster();
-    let resolved = roster_service_name(&snapshot, &proof.did, hyprstream_rpc::envelope::current_timestamp());
+    let resolved = roster_service_name(
+        &snapshot,
+        &proof.did,
+        hyprstream_rpc::envelope::current_timestamp(),
+    );
     anyhow::ensure!(
         resolved.as_deref() == Some(service_name),
         "native {} identity {} does not uniquely resolve to accepted deployment service '{}' in the checkpoint store",
@@ -465,8 +469,14 @@ mod tests {
         let now = hyprstream_rpc::envelope::current_timestamp();
         // A deployment-shaped capsule: exactly one factory service entry,
         // successor epoch, bounded unexpired expiry.
-        assert_eq!(derived_service_name(&state(&["#event"]), now), Some("event"));
-        assert_eq!(derived_service_name(&state(&["#streams"]), now), Some("streams"));
+        assert_eq!(
+            derived_service_name(&state(&["#event"]), now),
+            Some("event")
+        );
+        assert_eq!(
+            derived_service_name(&state(&["#streams"]), now),
+            Some("streams")
+        );
         // Foreign public-RPC records carry arbitrary #id entries.
         assert_eq!(derived_service_name(&state(&["#ns"]), now), None);
         // Unknown factory names never match, with or without foreign siblings.
@@ -476,7 +486,10 @@ mod tests {
         assert_eq!(derived_service_name(&state(&[]), now), None);
         // Ambiguous: a capsule matching two factory services is not
         // deployment-shaped; deny rather than pick.
-        assert_eq!(derived_service_name(&state(&["#event", "#streams"]), now), None);
+        assert_eq!(
+            derived_service_name(&state(&["#event", "#streams"]), now),
+            None
+        );
         // Non-# entries are skipped, not matched.
         assert_eq!(derived_service_name(&state(&["event"]), now), None);
         // Deployment invariants: genesis (epoch 0) and unbounded states never
@@ -521,8 +534,14 @@ mod tests {
         // impossible under the former DID-keyed config map.
         let successor = "did:at9p:successor";
         states.write().remove(did);
-        states.write().insert(successor.to_owned(), state(&["#event"]));
-        assert_eq!(resolver(&peer(did)), None, "superseded DID must stop resolving");
+        states
+            .write()
+            .insert(successor.to_owned(), state(&["#event"]));
+        assert_eq!(
+            resolver(&peer(did)),
+            None,
+            "superseded DID must stop resolving"
+        );
         assert_eq!(
             resolver(&peer(successor)).as_deref(),
             Some(LOCAL_TENANT),
@@ -546,7 +565,10 @@ mod tests {
         assert_eq!(roster_tenant(&roster, squatter, now), None);
         // With the squatter gone the genuine identity derives again.
         let clean: Vec<RosterEntry> = vec![(genuine.to_owned(), state(&["#model"]))];
-        assert_eq!(roster_tenant(&clean, genuine, now).as_deref(), Some(LOCAL_TENANT));
+        assert_eq!(
+            roster_tenant(&clean, genuine, now).as_deref(),
+            Some(LOCAL_TENANT)
+        );
         // An EXPIRED squatter never counts: the genuine identity keeps
         // deriving while an expired foreign claim sits in the store.
         let mut expired_squat = state(&["#model"]);
@@ -605,14 +627,13 @@ mod tests {
 
     #[test]
     fn cached_roster_serves_within_ttl_and_refreshes_after() {
-        let states: Arc<parking_lot::RwLock<Vec<RosterEntry>>> =
-            Arc::new(parking_lot::RwLock::new(vec![(
-                "did:at9p:event".to_owned(),
-                state(&["#event"]),
-            )]));
+        let states: Arc<parking_lot::RwLock<Vec<RosterEntry>>> = Arc::new(
+            parking_lot::RwLock::new(vec![("did:at9p:event".to_owned(), state(&["#event"]))]),
+        );
         let load = {
             let states = Arc::clone(&states);
-            Arc::new(move || states.read().clone()) as Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>
+            Arc::new(move || states.read().clone())
+                as Arc<dyn Fn() -> Vec<RosterEntry> + Send + Sync>
         };
         let now = hyprstream_rpc::envelope::current_timestamp();
         // Zero TTL: the first lookup loads synchronously; later refreshes
@@ -635,11 +656,17 @@ mod tests {
         // Long TTL: the snapshot is served as-is until it expires — the
         // polling recheck path trades bounded staleness for not re-verifying
         // the whole store at 10 Hz per session.
-        states.write().push(("did:at9p:event".to_owned(), state(&["#event"])));
+        states
+            .write()
+            .push(("did:at9p:event".to_owned(), state(&["#event"])));
         let cold = CachedRoster::new(Arc::clone(&load), std::time::Duration::from_secs(3600));
         assert_eq!(cold.roster().len(), 1);
         states.write().clear();
-        assert_eq!(cold.roster().len(), 1, "long-TTL cache must keep serving the snapshot");
+        assert_eq!(
+            cold.roster().len(),
+            1,
+            "long-TTL cache must keep serving the snapshot"
+        );
     }
 
     /// A refresh in progress must not block concurrent lookups, and after
@@ -662,9 +689,9 @@ mod tests {
         assert_eq!(roster.current().len(), 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::thread::sleep(std::time::Duration::from_millis(10)); // TTL lapses
-        // Expired lookup schedules the refresh on a background thread and
-        // returns the stale snapshot IMMEDIATELY — the 300 ms scan must not
-        // run on this (simulated runtime) thread.
+                                                                  // Expired lookup schedules the refresh on a background thread and
+                                                                  // returns the stale snapshot IMMEDIATELY — the 300 ms scan must not
+                                                                  // run on this (simulated runtime) thread.
         let started = std::time::Instant::now();
         let served = roster.current();
         assert_eq!(served.len(), 1, "caller must serve the stale snapshot");
@@ -700,7 +727,9 @@ mod tests {
             Arc::new(move || vec![(did.to_owned(), state(&["#event"]))]);
         require_publisher_roster(
             &roster,
-            &["event".to_owned(), "model".to_owned()].into_iter().collect(),
+            &["event".to_owned(), "model".to_owned()]
+                .into_iter()
+                .collect(),
         )
         .expect_err("a configured publisher with no live state must refuse spawn");
         require_publisher_roster(&roster, &["event".to_owned()].into_iter().collect())

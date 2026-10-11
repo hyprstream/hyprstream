@@ -24,7 +24,7 @@
 //! ```
 
 use crate::callback_config::{AuthMode, CallbackConfig};
-use git2::{FetchOptions, RemoteCallbacks, build::CheckoutBuilder};
+use git2::{build::CheckoutBuilder, FetchOptions, RemoteCallbacks};
 
 /// Trust posture for a clone/fetch operation.
 ///

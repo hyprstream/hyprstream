@@ -152,9 +152,18 @@ impl TerminalApp for CastPlayerApp {
                     self.player.seek_backward(3000);
                     true
                 }
-                KeyPress::Char(b'1') => { self.select_log(0); true }
-                KeyPress::Char(b'2') => { self.select_log(1); true }
-                KeyPress::Char(b'3') => { self.select_log(2); true }
+                KeyPress::Char(b'1') => {
+                    self.select_log(0);
+                    true
+                }
+                KeyPress::Char(b'2') => {
+                    self.select_log(1);
+                    true
+                }
+                KeyPress::Char(b'3') => {
+                    self.select_log(2);
+                    true
+                }
                 _ => false,
             },
         }

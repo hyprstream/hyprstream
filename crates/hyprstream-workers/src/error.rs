@@ -17,7 +17,9 @@ pub enum WorkerError {
     #[error("Sandbox already exists: {0}")]
     SandboxAlreadyExists(String),
 
-    #[error("Sandbox in invalid state for operation: {sandbox_id} is {state}, expected {expected}")]
+    #[error(
+        "Sandbox in invalid state for operation: {sandbox_id} is {state}, expected {expected}"
+    )]
     SandboxInvalidState {
         sandbox_id: String,
         state: String,
@@ -28,7 +30,10 @@ pub enum WorkerError {
     PoolExhausted { max: usize },
 
     #[error("Sandbox timeout: {operation} took longer than {timeout_secs}s")]
-    SandboxTimeout { operation: String, timeout_secs: u64 },
+    SandboxTimeout {
+        operation: String,
+        timeout_secs: u64,
+    },
 
     // ─────────────────────────────────────────────────────────────────────
     // Admission control errors (#525 P2 — SandboxPool::acquire decision engine)

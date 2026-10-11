@@ -48,9 +48,7 @@ pub enum Error {
     },
 
     /// A question's recorded anchor count does not match its spec arity when scoring.
-    #[error(
-        "question {question_id:?} ({kind}) expects {expected} anchor(s), got {found}"
-    )]
+    #[error("question {question_id:?} ({kind}) expects {expected} anchor(s), got {found}")]
     QuestionArityMismatch {
         /// The mismatched question id.
         question_id: String,

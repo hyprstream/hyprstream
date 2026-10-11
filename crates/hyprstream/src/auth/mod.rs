@@ -6,6 +6,8 @@
 //! Also provides JWT token authentication with Ed25519 signatures.
 
 pub(crate) mod age_seal;
+#[cfg(any(feature = "pglite", feature = "postgres"))]
+mod cipher_glue;
 pub mod device_challenge;
 #[cfg_attr(not(feature = "pglite"), allow(dead_code))]
 pub mod encrypted_columns;
@@ -13,25 +15,23 @@ pub mod federation;
 pub mod federation_admission;
 pub mod id_token_verify;
 pub mod identity_store;
-pub mod jwt;
 pub mod jwks_fetcher;
+pub mod jwt;
 pub mod key_rotation;
 pub mod mesh_trust;
-pub mod proof_enrollment;
 pub mod op_log;
-#[cfg(any(feature = "pglite", feature = "postgres"))]
-mod cipher_glue;
 #[cfg(feature = "pglite")]
 pub mod pglite_store;
-#[cfg(feature = "postgres")]
-pub mod postgres_store;
-#[cfg(feature = "postgres-replay")]
-pub mod postgres_replay;
 mod policy_file_adapter;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
+#[cfg(feature = "postgres-replay")]
+pub mod postgres_replay;
+#[cfg(feature = "postgres")]
+pub mod postgres_store;
 mod production_user_store;
+pub mod proof_enrollment;
 // The legacy RocksDB credential/device store (the `rocksdb` feature, valkey
 // precedent). Production UserStore admission is PGlite under credential-pds;
 // the rocksdb-backed DeviceStore and refresh-token store remain the only
@@ -57,8 +57,6 @@ pub use op_log::{
 };
 #[cfg(feature = "pglite")]
 pub use pglite_store::PgliteUserStore;
-#[cfg(feature = "postgres")]
-pub use postgres_store::PostgresUserStore;
 pub use policy_manager::{
     federation_registration_resource, global_policy_manager, set_global_policy_manager,
     write_policy_file, PolicyError, PolicyManager,
@@ -67,6 +65,8 @@ pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{
     get_template, get_templates, PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES,
 };
+#[cfg(feature = "postgres")]
+pub use postgres_store::PostgresUserStore;
 pub use production_user_store::ProductionUserStore;
 #[cfg(feature = "rocksdb")]
 pub use rocksdb_store::RocksDbUserStore;

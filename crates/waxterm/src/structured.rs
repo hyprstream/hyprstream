@@ -31,7 +31,11 @@ pub struct StructuredBackend<W: Write> {
 
 impl<W: Write> StructuredBackend<W> {
     pub fn new(writer: W, width: u16, height: u16) -> Self {
-        Self { writer, width, height }
+        Self {
+            writer,
+            width,
+            height,
+        }
     }
 
     /// Get the underlying writer.
@@ -75,7 +79,8 @@ impl<W: Write> Backend for StructuredBackend<W> {
             self.writer.write_all(&pack_color(cell.bg).to_le_bytes())?;
 
             // Modifiers
-            self.writer.write_all(&(cell.modifier.bits()).to_le_bytes())?;
+            self.writer
+                .write_all(&(cell.modifier.bits()).to_le_bytes())?;
         }
 
         self.writer.flush()
@@ -187,7 +192,10 @@ pub fn unpack_color(packed: u32) -> Color {
 /// Returns `(cols, rows, cells)` where cells is a vec of `(x, y, symbol, fg, bg, modifiers)`.
 pub fn decode_structured(data: &[u8]) -> io::Result<(u16, u16, Vec<DecodedCell>)> {
     if data.len() < 8 || data[..4] != STRUCTURED_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid structured frame magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid structured frame magic",
+        ));
     }
 
     let cols = u16::from_le_bytes([data[4], data[5]]);
@@ -262,11 +270,16 @@ mod tests {
         buffer[(0, 0)].set_symbol("A");
         buffer[(1, 0)].set_symbol("B");
 
-        let cells: Vec<_> = buffer.content().iter().enumerate().map(|(i, cell)| {
-            let x = (i % 2) as u16;
-            let y = (i / 2) as u16;
-            (x, y, cell)
-        }).collect();
+        let cells: Vec<_> = buffer
+            .content()
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let x = (i % 2) as u16;
+                let y = (i / 2) as u16;
+                (x, y, cell)
+            })
+            .collect();
 
         backend.draw(cells.into_iter()).unwrap();
 
@@ -284,15 +297,24 @@ mod tests {
 
         let rect = Rect::new(0, 0, 3, 1);
         let mut buffer = Buffer::empty(rect);
-        buffer[(0, 0)].set_symbol("X").set_style(Style::new().fg(Color::Red).bg(Color::Blue));
+        buffer[(0, 0)]
+            .set_symbol("X")
+            .set_style(Style::new().fg(Color::Red).bg(Color::Blue));
         buffer[(1, 0)].set_symbol("Y");
-        buffer[(2, 0)].set_symbol("Z").set_style(Style::new().fg(Color::Rgb(255, 128, 0)));
+        buffer[(2, 0)]
+            .set_symbol("Z")
+            .set_style(Style::new().fg(Color::Rgb(255, 128, 0)));
 
-        let cells: Vec<_> = buffer.content().iter().enumerate().map(|(i, cell)| {
-            let x = (i % 3) as u16;
-            let y = (i / 3) as u16;
-            (x, y, cell)
-        }).collect();
+        let cells: Vec<_> = buffer
+            .content()
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let x = (i % 3) as u16;
+                let y = (i / 3) as u16;
+                (x, y, cell)
+            })
+            .collect();
 
         backend.draw(cells.into_iter()).unwrap();
 
@@ -309,11 +331,20 @@ mod tests {
     #[test]
     fn test_color_roundtrip() {
         let colors = [
-            Color::Reset, Color::Black, Color::Red, Color::White,
-            Color::Rgb(255, 128, 0), Color::Indexed(42),
+            Color::Reset,
+            Color::Black,
+            Color::Red,
+            Color::White,
+            Color::Rgb(255, 128, 0),
+            Color::Indexed(42),
         ];
         for c in &colors {
-            assert_eq!(unpack_color(pack_color(*c)), *c, "roundtrip failed for {:?}", c);
+            assert_eq!(
+                unpack_color(pack_color(*c)),
+                *c,
+                "roundtrip failed for {:?}",
+                c
+            );
         }
     }
 

@@ -11,7 +11,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use async_trait::async_trait;
 use hyprstream_metrics::aggregation::{AggregateFunction, GroupBy, TimeWindow};
-use hyprstream_metrics::metrics::{MetricRecord, create_record_batch, get_metrics_schema};
+use hyprstream_metrics::metrics::{create_record_batch, get_metrics_schema, MetricRecord};
 use hyprstream_metrics::query::QueryOrchestrator;
 use hyprstream_metrics::storage::view::{AggregationSpec, ViewDefinition};
 #[allow(unused_imports)]
@@ -21,23 +21,16 @@ use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 use tracing::{error, trace};
 
-use crate::services::{Continuation, EnvelopeContext, RequestService};
-use hyprstream_rpc_std::policy_client::PolicyClient;
-use hyprstream_rpc_std::policy_client::PolicyCheck;
-use hyprstream_rpc_std::metrics_client::{
-    MetricsResponseVariant,
-    ErrorInfo,
-    AggregateRow, GroupEntry,
-    HealthInfo, ViewInfo,
-    IngestRequest,
-    MetricQuery,
-    ViewSpec,
-    AggregationFunc,
-    StreamInfo,
-};
 use crate::services::generated::metrics_client::{
-    MetricsHandler, dispatch_metrics, serialize_response,
+    dispatch_metrics, serialize_response, MetricsHandler,
 };
+use crate::services::{Continuation, EnvelopeContext, RequestService};
+use hyprstream_rpc_std::metrics_client::{
+    AggregateRow, AggregationFunc, ErrorInfo, GroupEntry, HealthInfo, IngestRequest, MetricQuery,
+    MetricsResponseVariant, StreamInfo, ViewInfo, ViewSpec,
+};
+use hyprstream_rpc_std::policy_client::PolicyCheck;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 
 // ============================================================================
 // MetricsInner
@@ -111,11 +104,17 @@ fn validate_identifier(name: &str) -> Result<()> {
         anyhow::bail!("identifier must not be empty");
     }
     let valid = name.chars().enumerate().all(|(i, c)| {
-        if i == 0 { c.is_ascii_alphabetic() || c == '_' }
-        else { c.is_ascii_alphanumeric() || c == '_' }
+        if i == 0 {
+            c.is_ascii_alphabetic() || c == '_'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
     });
     if !valid {
-        anyhow::bail!("invalid identifier {:?}: only [a-zA-Z_][a-zA-Z0-9_]* allowed", name);
+        anyhow::bail!(
+            "invalid identifier {:?}: only [a-zA-Z_][a-zA-Z0-9_]* allowed",
+            name
+        );
     }
     Ok(())
 }
@@ -153,9 +152,7 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
     // AggregateRow.timestamp will be 0 for structured aggregate queries.
     // NOTE: timestamp is stored and compared in milliseconds (Unix epoch ms).
     // The MetricRecord.timestamp field, ingest path, and window filter all use ms.
-    let mut sql = format!(
-        "SELECT {agg} AS value{group_select} FROM metrics"
-    );
+    let mut sql = format!("SELECT {agg} AS value{group_select} FROM metrics");
 
     if !q.metric_id.is_empty() {
         sql.push_str(&format!(
@@ -165,7 +162,11 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
     }
 
     if q.window_secs > 0 {
-        let clause = if q.metric_id.is_empty() { "WHERE" } else { "AND" };
+        let clause = if q.metric_id.is_empty() {
+            "WHERE"
+        } else {
+            "AND"
+        };
         // timestamp is stored as milliseconds; window_secs * 1000 for ms comparison
         sql.push_str(&format!(
             " {clause} timestamp >= epoch_ms(now()) - ({} * 1000)",
@@ -190,7 +191,12 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 
 #[async_trait(?Send)]
 impl MetricsHandler for MetricsService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         let subject = ctx.subject().to_string();
         // Metrics and their DuckDB view registry are node-global. MetricRecord
         // carries an optional tenant *data* label (schema v2), but authorization
@@ -214,7 +220,12 @@ impl MetricsHandler for MetricsService {
         if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            anyhow::bail!(
+                "Unauthorized: {} cannot {} on {}",
+                subject,
+                operation,
+                resource
+            )
         }
     }
 
@@ -231,7 +242,8 @@ impl MetricsHandler for MetricsService {
             }
         }
 
-        let rust_records: Vec<MetricRecord> = data.records
+        let rust_records: Vec<MetricRecord> = data
+            .records
             .iter()
             .map(|r| MetricRecord {
                 metric_id: r.metric_id.clone(),
@@ -252,8 +264,7 @@ impl MetricsHandler for MetricsService {
             })
             .collect();
 
-        let batch = create_record_batch(&rust_records)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let batch = create_record_batch(&rust_records).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         self.inner
             .orchestrator
@@ -288,12 +299,14 @@ impl MetricsHandler for MetricsService {
         let mut rows: Vec<AggregateRow> = Vec::new();
         for batch in &batches {
             let n = batch.num_rows();
-            let value_col = batch
-                .column_by_name("value")
-                .and_then(|c| c.as_any().downcast_ref::<hyprstream_metrics::arrow::array::Float64Array>());
-            let ts_col = batch
-                .column_by_name("timestamp")
-                .and_then(|c| c.as_any().downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>());
+            let value_col = batch.column_by_name("value").and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<hyprstream_metrics::arrow::array::Float64Array>()
+            });
+            let ts_col = batch.column_by_name("timestamp").and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
+            });
 
             for i in 0..n {
                 let value = value_col.map(|c| c.value(i)).unwrap_or(0.0);
@@ -301,25 +314,33 @@ impl MetricsHandler for MetricsService {
 
                 let mut group_values: Vec<GroupEntry> = Vec::new();
                 for col_name in &q.group_by {
-                    let col = batch.column_by_name(col_name.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("group_by column {:?} not found in result", col_name))?;
-                    let val = col.as_any()
-                        .downcast_ref::<hyprstream_metrics::arrow::array::StringArray>()
-                        .ok_or_else(|| anyhow::anyhow!(
+                    let col = batch.column_by_name(col_name.as_str()).ok_or_else(|| {
+                        anyhow::anyhow!("group_by column {:?} not found in result", col_name)
+                    })?;
+                    let val =
+                        col.as_any()
+                            .downcast_ref::<hyprstream_metrics::arrow::array::StringArray>()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
                             "group_by column {:?} has type {:?}; only Utf8/String columns are \
                              supported for group_by (metrics schema: metric_id is Utf8; \
                              timestamp and value_running_window_count are Int64 — not groupable)",
                             col_name, col.data_type()
-                        ))?
-                        .value(i)
-                        .to_owned();
+                        )
+                            })?
+                            .value(i)
+                            .to_owned();
                     group_values.push(GroupEntry {
                         key: col_name.clone(),
                         value: val,
                     });
                 }
 
-                rows.push(AggregateRow { value, group_values, timestamp });
+                rows.push(AggregateRow {
+                    value,
+                    group_values,
+                    timestamp,
+                });
             }
         }
 
@@ -371,7 +392,9 @@ impl MetricsHandler for MetricsService {
                                 publisher.wait_for_consumer(),
                             )
                             .await
-                            .map_err(|_| anyhow::anyhow!("queryStream consumer demand timeout"))??;
+                            .map_err(|_| {
+                                anyhow::anyhow!("queryStream consumer demand timeout")
+                            })??;
                             // Use DuckDB directly — DataFusionPlanner registers tables
                             // as empty MemTables, so orchestrator.query() returns no rows.
                             let storage = inner.orchestrator.storage();
@@ -403,7 +426,9 @@ impl MetricsHandler for MetricsService {
                                     .map_err(|e| anyhow::anyhow!("IPC write: {e}"))?;
                             }
 
-                            writer.finish().map_err(|e| anyhow::anyhow!("IPC finish: {e}"))?;
+                            writer
+                                .finish()
+                                .map_err(|e| anyhow::anyhow!("IPC finish: {e}"))?;
                             drop(writer);
                             publisher
                                 .publish_data(&buf)
@@ -587,7 +612,8 @@ impl MetricsHandler for MetricsService {
                         0
                     }
                     Some(c) => {
-                        let v = c.as_any()
+                        let v = c
+                            .as_any()
                             .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
                             .map(|a| a.value(0) as u64)
                             .or_else(|| {
@@ -633,7 +659,9 @@ impl RequestService for MetricsService {
         crate::services::generated::metrics_client::decode_metrics_request_body(signed_body)
     }
 
-    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+    fn producer_reach_config_handle(
+        &self,
+    ) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.inner.stream_channel.reach_config_handle())
     }
 
@@ -646,7 +674,11 @@ impl RequestService for MetricsService {
         ctx: &EnvelopeContext,
         body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        trace!("Metrics request from {} (id={})", ctx.subject(), ctx.request_id);
+        trace!(
+            "Metrics request from {} (id={})",
+            ctx.subject(),
+            ctx.request_id
+        );
         dispatch_metrics(self, ctx, body).await
     }
 
@@ -697,16 +729,16 @@ mod tests {
     use hyprstream_rpc::stream_consumer::StreamPayload;
     use hyprstream_rpc::streaming::{derive_client_stream_keys, StreamVerifier};
     use hyprstream_rpc::transport::TransportConfig;
-    use moq_net::Track;
     use hyprstream_service::{InprocManager, ServiceManager};
+    use moq_net::Track;
 
     use crate::auth::PolicyManager;
+    use crate::services::PolicyService;
     use hyprstream_rpc_std::metrics_client::{
         AggregationFunc, IngestRequest, MetricQuery, MetricRecord as CMetricRecord, MetricsClient,
         ViewSpec,
     };
-        use hyprstream_rpc_std::policy_client::PolicyClient;
-    use crate::services::PolicyService;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     /// Spin up an in-memory MetricsService and return its typed client, manager, and backend.
     async fn start_metrics_service(
         tag: &str,
@@ -788,16 +820,16 @@ mod tests {
             (&metrics_signing_key, metrics_subject),
             (&client_signing_key, client_subject),
         ] {
-        hyprstream_service::global_trust_store().insert(
+            hyprstream_service::global_trust_store().insert(
                 key.verifying_key(),
-            hyprstream_service::Attestation {
-                scopes: std::collections::HashSet::new(),
+                hyprstream_service::Attestation {
+                    scopes: std::collections::HashSet::new(),
                     subject: Some(subject.to_owned()),
-                jwt: None,
-                expires_at: 0,
-                attested_by: None,
-            },
-        );
+                    jwt: None,
+                    expires_at: 0,
+                    attested_by: None,
+                },
+            );
         }
 
         let policy_tag = format!("test-policy-{tag}");
@@ -1299,7 +1331,9 @@ mod tests {
             })
             .collect();
         assert!(
-            groups.iter().any(|g| g.contains("\"primitive\":\"choice\"")),
+            groups
+                .iter()
+                .any(|g| g.contains("\"primitive\":\"choice\"")),
             "expected canonical label JSON group, got {groups:?}"
         );
     }
@@ -1413,7 +1447,11 @@ mod tests {
             .expect("query sum");
 
         assert_eq!(rows.len(), 1);
-        assert!((rows[0].value - 300.0).abs() < 1e-6, "SUM should be 300.0, got {}", rows[0].value);
+        assert!(
+            (rows[0].value - 300.0).abs() < 1e-6,
+            "SUM should be 300.0, got {}",
+            rows[0].value
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1475,10 +1513,19 @@ mod tests {
             );
         }
 
-        let after = backend.list_tables().await.expect("list tables after raw SQL");
+        let after = backend
+            .list_tables()
+            .await
+            .expect("list tables after raw SQL");
         let after_rows = metrics_row_count(&backend).await;
-        assert_eq!(before, after, "raw SQL rejection must precede storage execution");
-        assert_eq!(before_rows, after_rows, "raw SQL rejection must prevent DML");
+        assert_eq!(
+            before, after,
+            "raw SQL rejection must precede storage execution"
+        );
+        assert_eq!(
+            before_rows, after_rows,
+            "raw SQL rejection must prevent DML"
+        );
         assert!(!after.iter().any(|name| name == "query_owned"));
 
         drop(client);
@@ -1490,10 +1537,19 @@ mod tests {
             None,
         )
         .expect("reopen metrics database");
-        let reopened_tables = reopened.list_tables().await.expect("list tables after reopen");
+        let reopened_tables = reopened
+            .list_tables()
+            .await
+            .expect("list tables after reopen");
         let reopened_rows = metrics_row_count(&reopened).await;
-        assert_eq!(before, reopened_tables, "raw SQL must not mutate persisted schema");
-        assert_eq!(before_rows, reopened_rows, "raw SQL must not mutate persisted rows");
+        assert_eq!(
+            before, reopened_tables,
+            "raw SQL must not mutate persisted schema"
+        );
+        assert_eq!(
+            before_rows, reopened_rows,
+            "raw SQL must not mutate persisted rows"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1542,25 +1598,28 @@ mod tests {
             .await
             .expect("ingest");
         let stream = client
-            .query_stream(&MetricQuery {
-                sql: String::new(),
-                metric_id: "stream.metric".to_owned(),
-                window_secs: 0,
-                aggregation: AggregationFunc::Sum,
-                group_by: vec![],
-                limit_rows: 0,
-                ephemeral_pubkey: client_pub.to_bytes().to_vec(),
-            }, [0u8; 32])
+            .query_stream(
+                &MetricQuery {
+                    sql: String::new(),
+                    metric_id: "stream.metric".to_owned(),
+                    window_secs: 0,
+                    aggregation: AggregationFunc::Sum,
+                    group_by: vec![],
+                    limit_rows: 0,
+                    ephemeral_pubkey: client_pub.to_bytes().to_vec(),
+                },
+                [0u8; 32],
+            )
             .await
             .expect("structured queryStream");
-        assert!(!stream.stream_id.is_empty(), "queryStream must return a stream id");
+        assert!(
+            !stream.stream_id.is_empty(),
+            "queryStream must return a stream id"
+        );
 
-        let (mac_key, enc_key, topic) = derive_client_stream_keys(
-            &client_secret,
-            &client_pub.to_bytes(),
-            &stream.dh_public,
-        )
-        .expect("derive stream keys");
+        let (mac_key, enc_key, topic) =
+            derive_client_stream_keys(&client_secret, &client_pub.to_bytes(), &stream.dh_public)
+                .expect("derive stream keys");
         let origin = hyprstream_rpc::moq_stream::global_moq_origin()
             .expect("metrics test origin initialized");
         let broadcast = tokio::time::timeout(
@@ -1578,22 +1637,17 @@ mod tests {
         let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
         let mut payloads = Vec::new();
         for _ in 0..2 {
-            let mut group = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                track.next_group(),
-            )
-            .await
-            .expect("stream group timeout")
-            .expect("stream group read")
-            .expect("stream ended before terminal frame");
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                group.read_frame(),
-            )
-            .await
-            .expect("stream frame timeout")
-            .expect("stream frame read")
-            .expect("stream group had no frame");
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.next_group())
+                    .await
+                    .expect("stream group timeout")
+                    .expect("stream group read")
+                    .expect("stream ended before terminal frame");
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                .await
+                .expect("stream frame timeout")
+                .expect("stream frame read")
+                .expect("stream group had no frame");
             payloads.extend(
                 hyprstream_rpc::moq_stream::verify_moq_frame(&mut verifier, &topic, &frame)
                     .expect("verify stream frame"),
@@ -1622,7 +1676,9 @@ mod tests {
             .expect("structured stream value column");
         assert_eq!(values.value(0), 11.0, "streamed SUM should be 11.0");
         assert!(
-            payloads.iter().any(|payload| matches!(payload, StreamPayload::Complete(_))),
+            payloads
+                .iter()
+                .any(|payload| matches!(payload, StreamPayload::Complete(_))),
             "structured query stream must terminate after publishing its result"
         );
     }
@@ -1640,8 +1696,7 @@ mod tests {
         // demand wait and time out before they can prepare or execute SQL.
         let mut blocked_streams = Vec::new();
         for index in 0..hyprstream_rpc::streaming::DEFAULT_MAX_CONCURRENT_STREAMS_PER_SERVICE {
-            let (_client_secret, client_pub) =
-                hyprstream_rpc::crypto::generate_ephemeral_keypair();
+            let (_client_secret, client_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
             let stream = client
                 .query_stream(
                     &MetricQuery {
@@ -1664,8 +1719,7 @@ mod tests {
         // announcement is therefore a direct admission-release signal: it
         // cannot be created until a no-subscriber continuation reaches its
         // bounded timeout and drops its permit.
-        let (_sentinel_secret, sentinel_pub) =
-            hyprstream_rpc::crypto::generate_ephemeral_keypair();
+        let (_sentinel_secret, sentinel_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
         let started = std::time::Instant::now();
         let sentinel = client
             .query_stream(
@@ -1705,14 +1759,12 @@ mod tests {
             .subscribe_track(&Track::new(STREAM_TRACK))
             .expect("subscribe to sentinel stream");
         for _ in 0..2 {
-            let mut group = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                track.next_group(),
-            )
-            .await
-            .expect("sentinel stream group timeout")
-            .expect("sentinel stream group read")
-            .expect("sentinel stream ended before terminal frame");
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.next_group())
+                    .await
+                    .expect("sentinel stream group timeout")
+                    .expect("sentinel stream group read")
+                    .expect("sentinel stream ended before terminal frame");
             tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
                 .await
                 .expect("sentinel stream frame timeout")

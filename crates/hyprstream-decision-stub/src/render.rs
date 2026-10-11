@@ -24,8 +24,9 @@ pub fn entry_to_json(entry: &Entry) -> Value {
     match entry {
         Entry::Null => Value::Null,
         Entry::Bool(value) => Value::Bool(*value),
-        Entry::Number(value) => serde_json::Number::from_f64(*value)
-            .map_or(Value::Null, Value::Number),
+        Entry::Number(value) => {
+            serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+        }
         Entry::Str(text) => Value::String(text.clone()),
         Entry::Seq(items) => Value::Array(items.iter().map(entry_to_json).collect()),
         Entry::Map(pairs) => Value::Object(
@@ -74,10 +75,7 @@ fn render_one(question: &hyprstream_decision::spec::QuestionSpec, row: &AnswerRo
             let labels = question.labels();
             let probabilities = value.probabilities();
             let argmax = confidence::argmax_index(&probabilities).unwrap_or(0);
-            out.insert(
-                "choice".to_owned(),
-                Value::String(labels[argmax].clone()),
-            );
+            out.insert("choice".to_owned(), Value::String(labels[argmax].clone()));
             out.insert(
                 "probabilities".to_owned(),
                 probability_map(&labels, &probabilities),
@@ -100,10 +98,8 @@ fn render_one(question: &hyprstream_decision::spec::QuestionSpec, row: &AnswerRo
             let probabilities = value.probabilities();
             out.insert(
                 "score".to_owned(),
-                serde_json::Number::from_f64(f64::from(confidence::expected_score(
-                    &probabilities,
-                )))
-                .map_or(Value::Null, Value::Number),
+                serde_json::Number::from_f64(f64::from(confidence::expected_score(&probabilities)))
+                    .map_or(Value::Null, Value::Number),
             );
             out.insert(
                 "legend".to_owned(),
@@ -140,7 +136,10 @@ fn render_one(question: &hyprstream_decision::spec::QuestionSpec, row: &AnswerRo
         }
         // Kind mismatches are unreachable: answers are produced from the same IR.
         _ => {
-            out.insert("error".to_owned(), Value::String("kind mismatch".to_owned()));
+            out.insert(
+                "error".to_owned(),
+                Value::String("kind mismatch".to_owned()),
+            );
         }
     }
     Value::Object(out)
@@ -190,8 +189,13 @@ questions:
         assert!(noul["noul"].as_f64().unwrap_or_else(|| panic!("p")) >= 0.0);
 
         let choice = &answers["tone"];
-        let probabilities = choice["probabilities"].as_object().unwrap_or_else(|| panic!("map"));
-        let sum: f64 = probabilities.values().map(|v| v.as_f64().unwrap_or_else(|| panic!("p"))).sum();
+        let probabilities = choice["probabilities"]
+            .as_object()
+            .unwrap_or_else(|| panic!("map"));
+        let sum: f64 = probabilities
+            .values()
+            .map(|v| v.as_f64().unwrap_or_else(|| panic!("p")))
+            .sum();
         assert!((sum - 1.0).abs() <= f64::from(CONSUMER_SUM_TOLERANCE));
         let argmax = probabilities
             .iter()
@@ -205,11 +209,18 @@ questions:
         assert_eq!(choice["choice"].as_str(), argmax.map(String::as_str));
 
         let score = &answers["severity"];
-        let levels = score["probabilities"].as_object().unwrap_or_else(|| panic!("map"));
+        let levels = score["probabilities"]
+            .as_object()
+            .unwrap_or_else(|| panic!("map"));
         assert_eq!(levels.len(), 3);
         let expected: f64 = levels
             .iter()
-            .map(|(level, p)| level.parse::<f64>().unwrap_or_else(|error| panic!("index: {error}")) * p.as_f64().unwrap_or_else(|| panic!("p")))
+            .map(|(level, p)| {
+                level
+                    .parse::<f64>()
+                    .unwrap_or_else(|error| panic!("index: {error}"))
+                    * p.as_f64().unwrap_or_else(|| panic!("p"))
+            })
             .sum();
         let rendered = score["score"].as_f64().unwrap_or_else(|| panic!("score"));
         assert!(

@@ -120,7 +120,10 @@ impl std::fmt::Display for VerifyError {
                 write!(f, "item #{index} ({id}) diverged from the frozen manifest")
             }
             Self::DesignationChanged { family } => {
-                write!(f, "family {family} designation changed — firewall violation")
+                write!(
+                    f,
+                    "family {family} designation changed — firewall violation"
+                )
             }
         }
     }

@@ -62,11 +62,7 @@ impl ImagePreprocessConfig {
 ///
 /// # Returns
 /// Tensor of shape [1, 3, H, W] ready for vision encoder
-pub fn load_image(
-    path: &Path,
-    config: &ImagePreprocessConfig,
-    device: Device,
-) -> Result<Tensor> {
+pub fn load_image(path: &Path, config: &ImagePreprocessConfig, device: Device) -> Result<Tensor> {
     debug!("Loading image from: {}", path.display());
 
     // Load image using image crate
@@ -85,15 +81,10 @@ pub fn load_image(
 
     // Convert to tensor [H, W, C]
     let (width, height) = img.dimensions();
-    let img_vec: Vec<f32> = img
-        .into_raw()
-        .iter()
-        .map(|&x| x as f32 / 255.0)
-        .collect();
+    let img_vec: Vec<f32> = img.into_raw().iter().map(|&x| x as f32 / 255.0).collect();
 
     // Reshape to [H, W, C]
-    let tensor = Tensor::from_slice(&img_vec)
-        .reshape([height as i64, width as i64, 3]);
+    let tensor = Tensor::from_slice(&img_vec).reshape([height as i64, width as i64, 3]);
 
     // Transpose to [C, H, W]
     let tensor = tensor.permute([2, 0, 1]);
@@ -129,14 +120,9 @@ pub fn load_image_from_bytes(
     );
 
     let (width, height) = img.dimensions();
-    let img_vec: Vec<f32> = img
-        .into_raw()
-        .iter()
-        .map(|&x| x as f32 / 255.0)
-        .collect();
+    let img_vec: Vec<f32> = img.into_raw().iter().map(|&x| x as f32 / 255.0).collect();
 
-    let tensor = Tensor::from_slice(&img_vec)
-        .reshape([height as i64, width as i64, 3]);
+    let tensor = Tensor::from_slice(&img_vec).reshape([height as i64, width as i64, 3]);
 
     let tensor = tensor.permute([2, 0, 1]);
     let tensor = normalize_tensor(&tensor, &config.mean, &config.std)?;
@@ -177,10 +163,7 @@ pub fn load_images(
 ///
 /// # Returns
 /// Tensor of shape [1, 3, H, W] with random solid color
-pub fn create_fallback_image(
-    config: &ImagePreprocessConfig,
-    device: Device,
-) -> Result<Tensor> {
+pub fn create_fallback_image(config: &ImagePreprocessConfig, device: Device) -> Result<Tensor> {
     warn!("Creating fallback minimal image (no image provided)");
 
     // Generate random RGB pixel values [0, 1]
@@ -243,11 +226,7 @@ pub struct ImageInput {
 
 impl ImageInput {
     /// Create from a file path
-    pub fn from_path(
-        path: &Path,
-        config: &ImagePreprocessConfig,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn from_path(path: &Path, config: &ImagePreprocessConfig, device: Device) -> Result<Self> {
         let tensor = load_image(path, config, device)?;
         Ok(Self {
             tensor,
@@ -338,7 +317,13 @@ mod tests {
         // After normalization: (1.0 - 0.5) / 0.5 = 1.0
         let expected = Tensor::ones([3, 224, 224], (Kind::Float, device));
 
-        assert!((normalized - expected).abs().mean(Kind::Float).double_value(&[]) < 1e-6);
+        assert!(
+            (normalized - expected)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[])
+                < 1e-6
+        );
     }
 
     #[test]

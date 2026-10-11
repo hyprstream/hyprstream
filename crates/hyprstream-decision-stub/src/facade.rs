@@ -91,7 +91,10 @@ async fn post_system_one(
             Value::Number(serde_json::Number::from(value as u64)),
         );
     };
-    push_int("input_tokens", serialize::serialized_bytes(&request.set).div_ceil(4));
+    push_int(
+        "input_tokens",
+        serialize::serialized_bytes(&request.set).div_ceil(4),
+    );
     push_int("output_tokens", output_tokens);
 
     let mut response = Map::new();
@@ -107,12 +110,7 @@ async fn post_system_one(
 
     let body = serde_json::to_string(&Value::Object(response))
         .unwrap_or_else(|_| r#"{"detail":"serialization failed"}"#.to_owned());
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        body,
-    )
-        .into_response()
+    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
 }
 
 async fn get_models() -> Response {
@@ -130,16 +128,24 @@ async fn get_models() -> Response {
             }
         ]
     });
-    (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Bind the facade on `listener` and serve it in the background. Returns the bound
 /// address (use `:0` for an ephemeral port) and a handle that stops the server on abort.
-pub async fn serve(listener: std::net::TcpListener) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+pub async fn serve(
+    listener: std::net::TcpListener,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::from_std(listener).unwrap_or_else(|error| panic!("tokio listener: {error}"));
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .unwrap_or_else(|error| panic!("tokio listener: {error}"));
         axum::serve(listener, router())
             .await
             .unwrap_or_else(|error| panic!("facade server: {error}"));
@@ -153,8 +159,11 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_round_trip() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("bind: {error}"));
-        let (address, server) = serve(listener).await.unwrap_or_else(|error| panic!("serve: {error}"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("bind: {error}"));
+        let (address, server) = serve(listener)
+            .await
+            .unwrap_or_else(|error| panic!("serve: {error}"));
         let client = reqwest::Client::new();
         let response = client
             .post(format!("http://{address}/v1/systemone"))
@@ -167,16 +176,25 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("request: {error}"));
         assert_eq!(response.status(), 200);
-        let body: Value = response.json().await.unwrap_or_else(|error| panic!("json: {error}"));
-        assert_eq!(body["model"], STUB_MODEL_VERSION, "alias resolves to the versioned id");
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("json: {error}"));
+        assert_eq!(
+            body["model"], STUB_MODEL_VERSION,
+            "alias resolves to the versioned id"
+        );
         assert_eq!(body["answers"]["tone"]["type"], "choice");
         server.abort();
     }
 
     #[tokio::test]
     async fn missing_auth_is_401() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("bind: {error}"));
-        let (address, server) = serve(listener).await.unwrap_or_else(|error| panic!("serve: {error}"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("bind: {error}"));
+        let (address, server) = serve(listener)
+            .await
+            .unwrap_or_else(|error| panic!("serve: {error}"));
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/systemone"))
             .header("content-type", "application/json")
@@ -185,15 +203,24 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("request: {error}"));
         assert_eq!(response.status(), 401);
-        let body: Value = response.json().await.unwrap_or_else(|error| panic!("json: {error}"));
-        assert!(body["detail"].is_string(), "FastAPI simple detail shape: {body}");
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("json: {error}"));
+        assert!(
+            body["detail"].is_string(),
+            "FastAPI simple detail shape: {body}"
+        );
         server.abort();
     }
 
     #[tokio::test]
     async fn invalid_question_is_422_fastapi_shape() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("bind: {error}"));
-        let (address, server) = serve(listener).await.unwrap_or_else(|error| panic!("serve: {error}"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("bind: {error}"));
+        let (address, server) = serve(listener)
+            .await
+            .unwrap_or_else(|error| panic!("serve: {error}"));
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/systemone"))
             .header("authorization", "Bearer test")
@@ -203,10 +230,19 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("request: {error}"));
         assert_eq!(response.status(), 422);
-        let body: Value = response.json().await.unwrap_or_else(|error| panic!("json: {error}"));
-        let detail = body["detail"].as_array().unwrap_or_else(|| panic!("detail list"));
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("json: {error}"));
+        let detail = body["detail"]
+            .as_array()
+            .unwrap_or_else(|| panic!("detail list"));
         assert!(!detail.is_empty());
-        assert!(detail[0]["loc"].is_array() && detail[0]["msg"].is_string() && detail[0]["type"].is_string());
+        assert!(
+            detail[0]["loc"].is_array()
+                && detail[0]["msg"].is_string()
+                && detail[0]["type"].is_string()
+        );
         server.abort();
     }
 }

@@ -55,7 +55,7 @@
 //! yields the same CID string (no randomness, no timestamps, no canonicalization
 //! ambiguity). Round-tripping `decode(encode(x)) == x` holds for all valid CIDs.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use data_encoding::BASE32_NOPAD;
 
 // ---------------------------------------------------------------------------

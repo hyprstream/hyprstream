@@ -464,7 +464,9 @@ pub fn ensure_event_client_origin(path: std::path::PathBuf) {
 
 /// Install a client origin without opening any local socket.
 pub fn install_event_network_client_origin() -> Option<MoqEventOrigin> {
-    if global_moq_event_origin().is_some() { return None; }
+    if global_moq_event_origin().is_some() {
+        return None;
+    }
     let origin = MoqEventOrigin::new();
     init_global_moq_event_origin(origin.clone()).then_some(origin)
 }
@@ -476,7 +478,13 @@ pub async fn run_event_network_link(
     transport: &crate::transport::TransportConfig,
     proof: &crate::transport::moql_admission::MoqlAdmissionProof,
 ) -> Result<()> {
-    anyhow::ensure!(matches!(transport.endpoint, crate::transport::EndpointType::Iroh { .. }), "Event network link requires Iroh");
+    anyhow::ensure!(
+        matches!(
+            transport.endpoint,
+            crate::transport::EndpointType::Iroh { .. }
+        ),
+        "Event network link requires Iroh"
+    );
     let stream = crate::dial::dial_stream_authenticated(transport, proof).await?;
     let client = moq_net::Client::new().with_origin(origin.producer());
     let session = stream.connect_moq(&client).await?;

@@ -247,8 +247,11 @@ mod tests {
         // delegator: Secret / {0,1} ; actor: Confidential / {1,2}. Both PqHybrid.
         let delegator =
             SecurityContext::new(Level::Secret, comps(&[0, 1]), VerifiedKeyMaterial::PqHybrid);
-        let actor =
-            SecurityContext::new(Level::Confidential, comps(&[1, 2]), VerifiedKeyMaterial::PqHybrid);
+        let actor = SecurityContext::new(
+            Level::Confidential,
+            comps(&[1, 2]),
+            VerifiedKeyMaterial::PqHybrid,
+        );
         let meet = SecurityContext::delegated_meet(&delegator, &actor);
 
         assert_eq!(meet.level(), Level::Confidential, "min level");
@@ -269,7 +272,11 @@ mod tests {
         let actor = SecurityContext::new(Level::Secret, comps(&[]), VerifiedKeyMaterial::Classical);
         let meet = SecurityContext::delegated_meet(&delegator, &actor);
 
-        assert_eq!(meet.assurance(), Assurance::Classical, "assurance is the actor's (signer)");
+        assert_eq!(
+            meet.assurance(),
+            Assurance::Classical,
+            "assurance is the actor's (signer)"
+        );
         let pqhybrid_object = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[]));
         assert!(
             !meet.can_access(&pqhybrid_object),
@@ -280,8 +287,14 @@ mod tests {
     #[test]
     fn delegated_fails_closed_if_either_principal_unresolved() {
         let ctx = SecurityContext::new(Level::Secret, comps(&[0]), VerifiedKeyMaterial::PqHybrid);
-        assert!(SecurityContext::delegated(None, Some(&ctx)).is_none(), "missing delegator ⇒ deny");
-        assert!(SecurityContext::delegated(Some(&ctx), None).is_none(), "missing actor ⇒ deny");
+        assert!(
+            SecurityContext::delegated(None, Some(&ctx)).is_none(),
+            "missing delegator ⇒ deny"
+        );
+        assert!(
+            SecurityContext::delegated(Some(&ctx), None).is_none(),
+            "missing actor ⇒ deny"
+        );
         assert!(SecurityContext::delegated(None, None).is_none());
         assert!(SecurityContext::delegated(Some(&ctx), Some(&ctx)).is_some());
     }
@@ -321,7 +334,8 @@ mod tests {
     #[test]
     fn from_clearance_does_not_raise_assurance() {
         // policy assigned Classical, key is PqHybrid → stays Classical (no raise).
-        let claimed = SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        let claimed =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         let ctx = SecurityContext::from_clearance(claimed, VerifiedKeyMaterial::PqHybrid);
         assert_eq!(ctx.assurance(), Assurance::Classical);
     }
@@ -329,7 +343,8 @@ mod tests {
     #[test]
     fn classical_context_cannot_dominate_pqc_object() {
         let ctx = SecurityContext::new(Level::Secret, comps(&[0]), VerifiedKeyMaterial::Classical);
-        let pqc_object = SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let pqc_object =
+            SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
         assert!(!ctx.can_access(&pqc_object));
     }
 

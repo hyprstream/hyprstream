@@ -5,20 +5,20 @@
 fn btop_sequences_render_correctly() {
     // Simulate btop's startup + rendering sequences
     let seq = concat!(
-        "\x1b[?1049h",                              // enter alt screen
-        "\x1b[?25l",                                // hide cursor
-        "\x1b[H\x1b[2J",                            // home + clear
+        "\x1b[?1049h",                             // enter alt screen
+        "\x1b[?25l",                               // hide cursor
+        "\x1b[H\x1b[2J",                           // home + clear
         "\x1b[38;2;255;100;0m\x1b[48;2;20;20;40m", // truecolor fg+bg
         "btop header text here",
         "\x1b[0m",
-        "\x1b[2;1H",                                // move to row 2
+        "\x1b[2;1H", // move to row 2
         "block: \u{2588}\u{2593}\u{2592}\u{2591} done",
         "\x1b[3;1H",
         "box: \u{250c}\u{2500}\u{252c}\u{2500}\u{2510}",
-        "\x1b[?2026h",                              // sync output — should be silently ignored
+        "\x1b[?2026h", // sync output — should be silently ignored
         "\x1b[4;1H",
         "after sync mode: visible?",
-        "\x1b[?1l\x1b>",                            // decrst mode 1 + DECKPNM
+        "\x1b[?1l\x1b>", // decrst mode 1 + DECKPNM
         "\x1b[5;1H",
         "after deckpnm",
     );
@@ -107,7 +107,8 @@ fn btop_truecolor_sgr_parsed() {
     let cells = line.cells();
 
     // The text cells should have the right chars
-    let text: String = cells.iter()
+    let text: String = cells
+        .iter()
         .take(6)
         .filter(|c| c.width() > 0)
         .map(|c| c.char())
@@ -116,8 +117,5 @@ fn btop_truecolor_sgr_parsed() {
 
     // The first cell should have truecolor foreground
     let pen = cells[0].pen();
-    assert!(
-        pen.foreground().is_some(),
-        "expected fg color, got none"
-    );
+    assert!(pen.foreground().is_some(), "expected fg color, got none");
 }

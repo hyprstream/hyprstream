@@ -19,14 +19,24 @@ use std::sync::Arc;
 // A replacement server has the same authenticated identity but new sockets.
 // MemoryLookup::add_endpoint_info augments hints, retaining retired addresses;
 // replace them atomically so classifier controls do not race stale routing.
-fn replace_endpoint_hint(lookup: &iroh::address_lookup::memory::MemoryLookup, server: &IrohSubstrate) {
+fn replace_endpoint_hint(
+    lookup: &iroh::address_lookup::memory::MemoryLookup,
+    server: &IrohSubstrate,
+) {
     let current = iroh::EndpointAddr::from_parts(
         server.endpoint_id(),
-        server.endpoint().bound_sockets().into_iter().map(iroh::TransportAddr::Ip),
+        server
+            .endpoint()
+            .bound_sockets()
+            .into_iter()
+            .map(iroh::TransportAddr::Ip),
     );
     assert!(lookup.set_endpoint_info(current.clone()).is_some());
     assert_eq!(
-        lookup.get_endpoint_info(server.endpoint_id()).unwrap().into_endpoint_addr(),
+        lookup
+            .get_endpoint_info(server.endpoint_id())
+            .unwrap()
+            .into_endpoint_addr(),
         current,
         "replacement fixture must publish only its current sockets",
     );
@@ -212,7 +222,8 @@ impl hyprstream_rpc::service::RequestService for RegistryReadinessResponder {
             ctx.subject().name() == Some("service:oai"),
             "readiness caller is not authenticated as service:oai"
         );
-        let request = body.root::<hyprstream_rpc_std::registry_capnp::registry_request::Reader<'_>>()?;
+        let request =
+            body.root::<hyprstream_rpc_std::registry_capnp::registry_request::Reader<'_>>()?;
         anyhow::ensure!(
             matches!(
                 request.which()?,
@@ -396,8 +407,11 @@ fn required_oauth_runtime_clients_reach_policy_and_discovery_over_iroh() -> Resu
     hyprstream_rpc::proof::admission::hold_single_verifier_lease(replay_lease)
         .map_err(|_| anyhow::anyhow!("test replay lease already installed"))?;
     hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
-        hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(10_000),
-    )).map_err(|_| anyhow::anyhow!("test replay store already installed"))?;
+        hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(
+            10_000,
+        ),
+    ))
+    .map_err(|_| anyhow::anyhow!("test replay store already installed"))?;
     // Production publishes the authority stores before constructing any
     // service factory. This isolated child bypasses main, so install the same
     // fail-closed revocation seam before presenting the jti-bearing OAI WIT.

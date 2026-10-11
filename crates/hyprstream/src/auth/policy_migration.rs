@@ -10,12 +10,12 @@
 /// already dot-namespaced strings as well as completely unknown strings.
 pub fn migrate_action(action: &str) -> Option<&'static str> {
     match action {
-        "infer"   => Some("infer.generate"),
-        "train"   => Some("ttt.train"),
-        "query"   => Some("query.status"),
-        "write"   => Some("persist.save"),
-        "serve"   => Some("serve.api"),
-        "manage"  => Some("ttt.writeback"),
+        "infer" => Some("infer.generate"),
+        "train" => Some("ttt.train"),
+        "query" => Some("query.status"),
+        "write" => Some("persist.save"),
+        "serve" => Some("serve.api"),
+        "manage" => Some("ttt.writeback"),
         "context" => Some("context.augment"),
         _ => None,
     }
@@ -73,12 +73,12 @@ mod tests {
     #[test]
     fn test_migrate_all_flat_actions() {
         for (flat, expected) in [
-            ("infer",   "infer.generate"),
-            ("train",   "ttt.train"),
-            ("query",   "query.status"),
-            ("write",   "persist.save"),
-            ("serve",   "serve.api"),
-            ("manage",  "ttt.writeback"),
+            ("infer", "infer.generate"),
+            ("train", "ttt.train"),
+            ("query", "query.status"),
+            ("write", "persist.save"),
+            ("serve", "serve.api"),
+            ("manage", "ttt.writeback"),
             ("context", "context.augment"),
         ] {
             let csv = format!("p, alice, *, model:*, {flat}, allow");

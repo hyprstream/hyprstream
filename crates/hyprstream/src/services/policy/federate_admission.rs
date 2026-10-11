@@ -122,10 +122,7 @@ pub(super) struct RequestUseReader {
 }
 
 impl RequestUseReader {
-    pub(super) fn new(
-        admission: Arc<AdmissionService>,
-        pool: deadpool_postgres::Pool,
-    ) -> Self {
+    pub(super) fn new(admission: Arc<AdmissionService>, pool: deadpool_postgres::Pool) -> Self {
         Self {
             admission,
             pool,
@@ -392,7 +389,10 @@ fn candidate_tenants(
     // with check_with_domain.
     for (rules, subject_index, tenant_index) in [(policies, 0, 1), (domain_groups, 0, 2)] {
         for rule in rules {
-            if rule.get(subject_index).is_some_and(|subject| subject == did) {
+            if rule
+                .get(subject_index)
+                .is_some_and(|subject| subject == did)
+            {
                 if let Some(tenant) = rule
                     .get(tenant_index)
                     .filter(|tenant| !tenant.is_empty() && *tenant != "*")
@@ -547,7 +547,10 @@ impl Authorities {
             (did.starts_with("did:plc:") || did.starts_with("did:web:")) && did.len() <= 255,
             "session subject is not an ATProto DID"
         );
-        ensure!(source_atproto_did == did, "source DID does not match session principal");
+        ensure!(
+            source_atproto_did == did,
+            "source DID does not match session principal"
+        );
         ensure!(
             session.account_id == federate_account_id(&self.profile.host, did),
             "session account binding changed"

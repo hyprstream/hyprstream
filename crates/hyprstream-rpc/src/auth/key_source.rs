@@ -30,7 +30,7 @@
 #![allow(clippy::disallowed_types)]
 
 use anyhow::Result;
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -680,7 +680,8 @@ impl JwksKeySource {
         // resolution must not depend on it. Never overrides a JWKS-published
         // (rotated) key because it's keyed on the exact CA thumbprint.
         if self.is_local(issuer) {
-            if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key) {
+            if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key)
+            {
                 if ca_kid == kid_str {
                     return Ok(ca_key);
                 }
@@ -892,7 +893,9 @@ mod tests {
             Box::pin(async move { anyhow::bail!("network must not be used") })
         });
         let jwks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "https://pds.example.test/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "https://pds.example.test/oauth/jwks".to_owned(),
+            },
             configured.to_owned(),
             fetcher,
         )
@@ -958,18 +961,16 @@ mod tests {
 
         // Local issuer but a different kid -> CA fallback does NOT fire; the
         // JWKS fetch is attempted and fails -> error (not the CA key).
-        assert!(
-            ks.get_key("http://localhost:9080", Some("some-other-kid"))
-                .await
-                .is_err()
-        );
+        assert!(ks
+            .get_key("http://localhost:9080", Some("some-other-kid"))
+            .await
+            .is_err());
 
         // Non-local issuer is untrusted in isolated mode regardless of kid.
-        assert!(
-            ks.get_key("https://evil.example.com", Some("some-other-kid"))
-                .await
-                .is_err()
-        );
+        assert!(ks
+            .get_key("https://evil.example.com", Some("some-other-kid"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1091,7 +1092,7 @@ mod tests {
     /// kid-new/signed-by-kid-old substitution.
     #[tokio::test]
     async fn jwks_named_kid_cannot_substitute_another_published_key() -> anyhow::Result<()> {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use ed25519_dalek::Signer as _;
 
         let old = SigningKey::from_bytes(&[0x31; 32]);
@@ -1099,7 +1100,9 @@ mod tests {
         let new_kid = crate::auth::jwt::kid_for_key(&new);
         let jwks = mock_jwks_json(&[&old, &new]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -1137,13 +1140,18 @@ mod tests {
         let sk_b = SigningKey::from_bytes(&[0x22; 32]);
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
 
         let result = ks.get_key("http://localhost", None).await;
-        assert!(result.is_err(), "multi-key no-kid get_key must refuse arbitrary selection");
+        assert!(
+            result.is_err(),
+            "multi-key no-kid get_key must refuse arbitrary selection"
+        );
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
             msg.contains("multiple Ed25519 keys") && msg.contains("no kid"),
@@ -1164,7 +1172,9 @@ mod tests {
 
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -1190,7 +1200,9 @@ mod tests {
 
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );

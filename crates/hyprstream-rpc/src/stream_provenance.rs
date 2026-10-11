@@ -117,17 +117,22 @@ pub fn verify_provenance(
         .ok_or_else(|| anyhow!("stream provenance: no anchored ML-DSA-65 key for signer"))?;
 
     let aad = provenance_external_aad();
-    verify_composite(sig, &ed_vk, Some(&pq_vk), signed_region, &aad, /* require_pq */ true)
-        .map_err(|e| anyhow!("stream provenance: signature verification failed: {e}"))?;
+    verify_composite(
+        sig,
+        &ed_vk,
+        Some(&pq_vk),
+        signed_region,
+        &aad,
+        /* require_pq */ true,
+    )
+    .map_err(|e| anyhow!("stream provenance: signature verification failed: {e}"))?;
     Ok(())
 }
 
 /// Reconstruct the canonical signed region from a parsed (wire) StreamBlock by
 /// re-encoding it with the `provenance` field cleared (#321). Byte-identical to
 /// the publisher's pre-provenance [`crate::streaming::encode_stream_block`].
-pub fn signed_region_from_block(
-    block: &streaming_capnp::stream_block::Reader,
-) -> Result<Vec<u8>> {
+pub fn signed_region_from_block(block: &streaming_capnp::stream_block::Reader) -> Result<Vec<u8>> {
     use streaming_capnp::stream_payload::Which;
 
     let prev_mac = block.get_prev_mac()?;
@@ -232,7 +237,10 @@ mod tests {
         let empty_store = KeyedPqTrustStore::new();
         let enrolled = |k: &[u8; 32]| *k == kid;
         let res = verify_provenance(&signer_kid, &sig, region, &empty_store, &enrolled);
-        assert!(res.is_err(), "signer without an anchored PQ key must be rejected");
+        assert!(
+            res.is_err(),
+            "signer without an anchored PQ key must be rejected"
+        );
     }
 
     #[test]

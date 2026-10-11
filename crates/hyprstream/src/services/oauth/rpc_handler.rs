@@ -12,16 +12,15 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
-use crate::auth::{UserFilter, decode_pubkey_base64};
+use crate::auth::{decode_pubkey_base64, UserFilter};
+use crate::services::generated::oauth_client::{dispatch_oauth, serialize_response, OauthHandler};
 use hyprstream_rpc_std::oauth_client::{
-    AddPubkey, ErrorInfo, ListUsers,
-    OauthResponseVariant, PubkeyEntry as RpcPubkeyEntry, RemovePubkey, RegisterUser, UpdateUser,
-    UserInfo as RpcUserInfo, UserListResult,
+    AddPubkey, ErrorInfo, ListUsers, OauthResponseVariant, PubkeyEntry as RpcPubkeyEntry,
+    RegisterUser, RemovePubkey, UpdateUser, UserInfo as RpcUserInfo, UserListResult,
 };
-use crate::services::generated::oauth_client::{OauthHandler, dispatch_oauth, serialize_response};
 
-use super::user_service::{self, UserUpdate};
 use super::state::OAuthState;
+use super::user_service::{self, UserUpdate};
 
 /// Local-control RPC handler for OAuth user management.
 ///
@@ -65,15 +64,19 @@ impl OAuthRpcHandler {
             active: info.active,
             external_id: info.external_id.clone().unwrap_or_default(),
             atproto_did: info.atproto_did.clone(),
-            pubkeys: info.pubkeys.iter().map(|pk| hyprstream_rpc_std::oauth_client::PubkeyEntry {
-                fingerprint: pk.fingerprint.clone(),
-                pubkey_base64: pk.pubkey_base64.clone(),
-                label: pk.label.clone().unwrap_or_default(),
-                created_at: pk.created_at,
-                last_used_at: pk.last_used_at.unwrap_or(0),
-                algorithm: pk.algorithm.as_str().to_owned(),
-                pq_pubkey: pk.pq_pubkey.clone().unwrap_or_default(),
-            }).collect(),
+            pubkeys: info
+                .pubkeys
+                .iter()
+                .map(|pk| hyprstream_rpc_std::oauth_client::PubkeyEntry {
+                    fingerprint: pk.fingerprint.clone(),
+                    pubkey_base64: pk.pubkey_base64.clone(),
+                    label: pk.label.clone().unwrap_or_default(),
+                    created_at: pk.created_at,
+                    last_used_at: pk.last_used_at.unwrap_or(0),
+                    algorithm: pk.algorithm.as_str().to_owned(),
+                    pq_pubkey: pk.pq_pubkey.clone().unwrap_or_default(),
+                })
+                .collect(),
         }
     }
 }
@@ -97,10 +100,13 @@ impl OauthHandler for OAuthRpcHandler {
         // Relay the verified caller credential, never ask as this OAuth deputy
         // (whose own grant permits account administration). Policy derives the
         // subject and tenant from that credential, not request body fields.
-        let bearer = ctx.jwt_token().ok_or_else(|| {
-            anyhow!("OAuth user management requires a verified caller bearer")
-        })?;
-        let allowed = self.state.policy_client.clone()
+        let bearer = ctx
+            .jwt_token()
+            .ok_or_else(|| anyhow!("OAuth user management requires a verified caller bearer"))?;
+        let allowed = self
+            .state
+            .policy_client
+            .clone()
             .with_delegated_bearer(bearer.to_owned())
             .check(&hyprstream_rpc_std::policy_client::PolicyCheck {
                 subject: String::new(),
@@ -122,7 +128,9 @@ impl OauthHandler for OAuthRpcHandler {
         let svc = self.user_service()?;
         let pubkey_b64 = data.pubkey_base64.as_deref().unwrap_or("");
         let info = svc.register(&data.username, pubkey_b64).await?;
-        Ok(OauthResponseVariant::RegisterUserResult(Self::user_info_to_rpc(&info)))
+        Ok(OauthResponseVariant::RegisterUserResult(
+            Self::user_info_to_rpc(&info),
+        ))
     }
 
     async fn handle_get_user(
@@ -133,7 +141,9 @@ impl OauthHandler for OAuthRpcHandler {
     ) -> Result<OauthResponseVariant> {
         let svc = self.user_service()?;
         match svc.get(username).await? {
-            Some(info) => Ok(OauthResponseVariant::GetUserResult(Self::user_info_to_rpc(&info))),
+            Some(info) => Ok(OauthResponseVariant::GetUserResult(Self::user_info_to_rpc(
+                &info,
+            ))),
             None => Ok(OauthResponseVariant::Error(ErrorInfo {
                 message: format!("User '{}' not found", username),
                 code: "NOT_FOUND".to_owned(),
@@ -155,11 +165,7 @@ impl OauthHandler for OAuthRpcHandler {
             } else {
                 Some(data.filter.clone())
             },
-            active_only: if data.active_only {
-                Some(true)
-            } else {
-                None
-            },
+            active_only: if data.active_only { Some(true) } else { None },
             count: if data.count > 0 {
                 Some(data.count as usize)
             } else {
@@ -188,14 +194,28 @@ impl OauthHandler for OAuthRpcHandler {
     ) -> Result<OauthResponseVariant> {
         let svc = self.user_service()?;
         let update = UserUpdate {
-            name: data.name.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
-            email: data.email.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
-            external_id: data.external_id.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
+            name: data
+                .name
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s.clone())),
+            email: data
+                .email
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s.clone())),
+            external_id: data
+                .external_id
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s.clone())),
             email_verified: None,
             atproto_did: None,
         };
         match svc.update(&data.username, update).await {
-            Ok(info) => Ok(OauthResponseVariant::UpdateUserResult(Self::user_info_to_rpc(&info))),
+            Ok(info) => Ok(OauthResponseVariant::UpdateUserResult(
+                Self::user_info_to_rpc(&info),
+            )),
             Err(e) => Ok(OauthResponseVariant::Error(ErrorInfo {
                 message: e.to_string(),
                 code: "NOT_FOUND".to_owned(),
@@ -293,7 +313,6 @@ impl OauthHandler for OAuthRpcHandler {
         ))
     }
 }
-
 
 #[async_trait(?Send)]
 impl RequestService for OAuthRpcHandler {

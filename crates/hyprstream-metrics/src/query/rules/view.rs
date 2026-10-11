@@ -3,16 +3,16 @@ use crate::storage::StorageBackend;
 use datafusion::error::Result;
 use datafusion::logical_expr::{LogicalPlan, TableScan};
 use datafusion::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
-use datafusion_common::tree_node::Transformed;
 use datafusion::sql::TableReference;
+use datafusion_common::tree_node::Transformed;
 #[cfg(test)]
 use {
+    async_trait::async_trait,
+    datafusion::catalog::Session,
     datafusion::datasource::{TableProvider, TableType},
     datafusion::logical_expr::{Expr, TableSource},
     datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan},
-    datafusion::catalog::Session,
     datafusion_common::DFSchema,
-    async_trait::async_trait,
     duckdb::arrow::datatypes::SchemaRef,
 };
 
@@ -172,17 +172,26 @@ impl OptimizerRule for ViewOptimizationRule {
         true
     }
 
-    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
         // Get matching view and rewrite plan
         // Note: This is a blocking operation, but it's acceptable for testing
-        let views = futures::executor::block_on(self.storage.list_views())
-            .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to list views: {e}")))?;
-        
+        let views = futures::executor::block_on(self.storage.list_views()).map_err(|e| {
+            datafusion::error::DataFusionError::Internal(format!("Failed to list views: {e}"))
+        })?;
+
         // For each view, check if it can be used for this query
         for view_name in views {
-            let view = futures::executor::block_on(self.storage.get_view(&view_name))
-                .map_err(|e| datafusion::error::DataFusionError::Internal(format!("Failed to get view metadata: {e}")))?;
-            
+            let view =
+                futures::executor::block_on(self.storage.get_view(&view_name)).map_err(|e| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Failed to get view metadata: {e}"
+                    ))
+                })?;
+
             if self.can_use_view(&plan, &view)? {
                 let new_plan = self.rewrite_with_view(&plan, &view)?;
                 return Ok(Transformed::yes(new_plan));
@@ -195,20 +204,20 @@ impl OptimizerRule for ViewOptimizationRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::view::ViewDefinition;
     use crate::storage::duckdb::DuckDbBackend;
+    use crate::storage::view::ViewDefinition;
     use duckdb::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
     #[tokio::test]
     async fn test_view_optimization() -> Result<()> {
         // Create test backend
-        let backend = Arc::new(DuckDbBackend::new_in_memory().map_err(|e|
+        let backend = Arc::new(DuckDbBackend::new_in_memory().map_err(|e| {
             datafusion::error::DataFusionError::Internal(format!("Failed to create backend: {e}"))
-        )?);
-        backend.init().await.map_err(|e|
+        })?);
+        backend.init().await.map_err(|e| {
             datafusion::error::DataFusionError::Internal(format!("Failed to init backend: {e}"))
-        )?;
+        })?;
 
         // Create source table
         let source_schema = Arc::new(Schema::new(vec![
@@ -218,9 +227,9 @@ mod tests {
         backend
             .create_table("test_source", &source_schema)
             .await
-            .map_err(|e|
+            .map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!("Failed to create table: {e}"))
-            )?;
+            })?;
 
         // Create view
         let view_def = ViewDefinition::new(
@@ -237,23 +246,22 @@ mod tests {
         backend
             .create_view("test_view", view_def)
             .await
-            .map_err(|e|
+            .map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!("Failed to create view: {e}"))
-            )?;
+            })?;
 
         // Create optimizer rule
         let rule = ViewOptimizationRule::new(backend);
 
         // Create test plan
         let arrow_schema = source_schema.as_ref().clone();
-        let df_schema = DFSchema::try_from(arrow_schema.clone())
-            .map_err(|e|
-                datafusion::error::DataFusionError::Internal(format!("Failed to convert schema: {e}"))
-            )?;
+        let df_schema = DFSchema::try_from(arrow_schema.clone()).map_err(|e| {
+            datafusion::error::DataFusionError::Internal(format!("Failed to convert schema: {e}"))
+        })?;
         let plan = LogicalPlan::TableScan(TableScan {
             table_name: "test_source".into(),
             source: Arc::new(EmptyTableProvider {
-                schema: Arc::new(df_schema.clone().into())
+                schema: Arc::new(df_schema.clone().into()),
             }),
             projection: None,
             projected_schema: Arc::new(df_schema),
@@ -262,7 +270,10 @@ mod tests {
         });
 
         // Apply optimization
-        let transformed = rule.rewrite(plan.clone(), &datafusion::optimizer::OptimizerContext::new())?;
+        let transformed = rule.rewrite(
+            plan.clone(),
+            &datafusion::optimizer::OptimizerContext::new(),
+        )?;
 
         // Verify plan was rewritten to use view
         match transformed.data {

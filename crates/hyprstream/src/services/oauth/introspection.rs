@@ -71,7 +71,10 @@ async fn introspect_jwt(
 
     (
         StatusCode::OK,
-        [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(serde_json::json!({
             "active": true,
             "token_type": "Bearer",
@@ -118,7 +121,10 @@ async fn introspect_refresh(
             };
             (
                 StatusCode::OK,
-                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+                [
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::PRAGMA, "no-cache"),
+                ],
                 Json(serde_json::json!({
                     "active": true,
                     "token_type": "refresh_token",
@@ -137,7 +143,10 @@ async fn introspect_refresh(
 fn inactive_response() -> Response {
     (
         StatusCode::OK,
-        [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(serde_json::json!({"active": false})),
     )
         .into_response()

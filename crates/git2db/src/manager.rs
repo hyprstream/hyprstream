@@ -3,9 +3,9 @@
 //! This module provides centralized Git management following hyprstream's patterns
 //! for thread safety and connection pooling.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use dashmap::DashMap;
-use git2::{Repository, Signature, build::RepoBuilder};
+use git2::{build::RepoBuilder, Repository, Signature};
 use hyprstream_containedfs::contained_join;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;

@@ -61,7 +61,9 @@ pub fn build_mesh_pq_trust_store(oauth: &OAuthConfig) -> KeyedPqTrustStore {
         let pq_vk = match hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pq_bytes) {
             Ok(vk) => vk,
             Err(e) => {
-                tracing::error!("mesh_peer '{label}': invalid ML-DSA-65 verifying key, skipping: {e}");
+                tracing::error!(
+                    "mesh_peer '{label}': invalid ML-DSA-65 verifying key, skipping: {e}"
+                );
                 continue;
             }
         };
@@ -186,7 +188,10 @@ mod tests {
     fn empty_mesh_peers_yields_empty_store() {
         let oauth = OAuthConfig::default();
         let store = build_mesh_pq_trust_store(&oauth);
-        assert!(store.is_empty(), "absent mesh_peers must produce an empty store");
+        assert!(
+            store.is_empty(),
+            "absent mesh_peers must produce an empty store"
+        );
     }
 
     #[test]
@@ -204,7 +209,10 @@ mod tests {
 
         let oauth = oauth_with_peers(vec![(
             "peer-a",
-            MeshPeerConfig { ed25519_multibase: ed_mb, mldsa65_multibase: pq_mb },
+            MeshPeerConfig {
+                ed25519_multibase: ed_mb,
+                mldsa65_multibase: pq_mb,
+            },
         )]);
         let store = build_mesh_pq_trust_store(&oauth);
         assert_eq!(store.len(), 1, "one valid peer must produce one binding");
@@ -237,7 +245,10 @@ mod tests {
             },
         )]);
         let store = build_mesh_pq_trust_store(&oauth);
-        assert!(store.is_empty(), "malformed entry must be skipped, not trusted");
+        assert!(
+            store.is_empty(),
+            "malformed entry must be skipped, not trusted"
+        );
     }
 
     #[test]
@@ -254,7 +265,10 @@ mod tests {
         );
         let oauth = oauth_with_peers(vec![(
             "gpu-node-3",
-            MeshPeerConfig { ed25519_multibase: ed_mb, mldsa65_multibase: pq_mb },
+            MeshPeerConfig {
+                ed25519_multibase: ed_mb,
+                mldsa65_multibase: pq_mb,
+            },
         )]);
 
         let roster = build_mesh_identity_roster(&oauth);
@@ -277,7 +291,10 @@ mod tests {
             },
         )]);
         let roster = build_mesh_identity_roster(&oauth);
-        assert!(roster.is_empty(), "malformed entry must be skipped, not enrolled");
+        assert!(
+            roster.is_empty(),
+            "malformed entry must be skipped, not enrolled"
+        );
     }
 
     #[test]
@@ -302,8 +319,10 @@ mod tests {
         dir: &std::path::Path,
         entries: Vec<(&str, crate::auth::identity_store::BootstrapPubkey)>,
     ) {
-        let map: std::collections::HashMap<String, _> =
-            entries.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+        let map: std::collections::HashMap<String, _> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
         crate::auth::identity_store::write_bootstrap_pubkeys_hybrid(dir, &map)
             .expect("write bootstrap-pubkeys");
     }
@@ -344,7 +363,10 @@ mod tests {
         let mut store = KeyedPqTrustStore::new();
         let anchored = seed_bootstrap_pq_bindings(&mut store, dir.path());
         assert_eq!(anchored, 0, "a classical-only file must anchor nothing");
-        assert!(store.is_empty(), "a classical-only file must change nothing");
+        assert!(
+            store.is_empty(),
+            "a classical-only file must change nothing"
+        );
     }
 
     #[test]

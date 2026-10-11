@@ -12,10 +12,7 @@ pub(super) struct SessionPrimaryReader {
 }
 
 impl SessionPrimaryReader {
-    pub(super) fn new(
-        pool: deadpool_postgres::Pool,
-        authority: PrimaryLookup,
-    ) -> Self {
+    pub(super) fn new(pool: deadpool_postgres::Pool, authority: PrimaryLookup) -> Self {
         Self {
             pool,
             authority,

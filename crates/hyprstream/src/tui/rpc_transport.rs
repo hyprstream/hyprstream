@@ -60,15 +60,16 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
-                let model_client = match crate::tui::service::production_model_client(sk_inner.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(format!(
-                            "Failed to create ModelClient: {e}"
-                        )));
-                        return;
-                    }
-                };
+                let model_client =
+                    match crate::tui::service::production_model_client(sk_inner.clone()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(ChatEvent::StreamError(format!(
+                                "Failed to create ModelClient: {e}"
+                            )));
+                            return;
+                        }
+                    };
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -245,9 +246,8 @@ pub fn make_tool_caller(
 )> {
     let sk = signing_key.clone();
     let token_key = signing_key.clone();
-    let token_provider: ServiceTokenProvider = Arc::new(move || {
-        super::service::required_service_token(&token_key)
-    });
+    let token_provider: ServiceTokenProvider =
+        Arc::new(move || super::service::required_service_token(&token_key));
     make_tool_caller_with_token_provider(sk, token_provider)
 }
 
@@ -323,7 +323,9 @@ fn make_tool_caller_with_token_provider(
                     // would eventually fail valid tool calls.
                     let token_c = match current_service_token(&token_provider_c) {
                         Ok(token) => token,
-                        Err(e) => return format!("error: TUI MCP service credential unavailable: {e}"),
+                        Err(e) => {
+                            return format!("error: TUI MCP service credential unavailable: {e}")
+                        }
                     };
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -399,10 +401,15 @@ mod tests {
 
     #[test]
     fn current_service_token_is_refreshed_each_time() -> anyhow::Result<()> {
-        let tokens = Arc::new(parking_lot::Mutex::new(vec!["renewed".to_owned(), "initial".to_owned()]));
+        let tokens = Arc::new(parking_lot::Mutex::new(vec![
+            "renewed".to_owned(),
+            "initial".to_owned(),
+        ]));
         let tokens_for_provider = Arc::clone(&tokens);
         let provider: ServiceTokenProvider = Arc::new(move || {
-            tokens_for_provider.lock().pop()
+            tokens_for_provider
+                .lock()
+                .pop()
                 .ok_or_else(|| anyhow::anyhow!("credential no longer available"))
         });
         assert_eq!(current_service_token(&provider)?, "initial");

@@ -12,15 +12,14 @@ use ed25519_dalek::SigningKey;
 use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
 use hyprstream_rpc_std::inference_client::InferenceClient;
 use hyprstream_rpc_std::model_client::ModelClient;
-use hyprstream_rpc_std::{
-    inference_client, model_client, policy_client, registry_client,
-    worker_client, workflow_client,
-};
-use hyprstream_rpc_std::discovery_client::DiscoveryClient;
 use hyprstream_rpc_std::registry_client::RegistryClient;
 use hyprstream_rpc_std::worker_client::WorkerClient;
+use hyprstream_rpc_std::{
+    inference_client, model_client, policy_client, registry_client, worker_client, workflow_client,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MethodSchemaLike trait — unifies per-module MethodSchema types
@@ -401,15 +400,27 @@ async fn dispatch_top_level(
 ) -> Result<Value> {
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client: RegistryClient = RegistryClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client = ModelClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client = InferenceClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_method(method, args).await
         }
         "policy" => {
@@ -431,7 +442,11 @@ async fn dispatch_top_level(
             // factory still has to be started (`[worker.workflow] enabled = true`)
             // for this dispatch to reach a live service; the explicit provider
             // resolves the registered endpoint and errors clearly if nothing is listening.
-            let client = workflow_client::WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client = workflow_client::WorkflowClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_method(method, args).await
         }
         _ => bail!("Unknown service: {}", service),
@@ -446,7 +461,10 @@ async fn dispatch_top_level(
 /// Compatibility standalone uses the installed service trust key and
 /// deterministic local REP transport.
 fn create_discovery_client(signing_key: &SigningKey) -> Result<DiscoveryClient> {
-    create_discovery_client_for_profile(signing_key, hyprstream_discovery::native_network_required())
+    create_discovery_client_for_profile(
+        signing_key,
+        hyprstream_discovery::native_network_required(),
+    )
 }
 
 fn create_discovery_client_for_profile(
@@ -465,7 +483,11 @@ fn create_discovery_client_for_profile(
     }
 
     if network_required {
-        return DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), None);
+        return DiscoveryClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key.clone(),
+            None,
+        );
     }
 
     let discovery_key = hyprstream_service::global_trust_store()
@@ -494,15 +516,27 @@ async fn dispatch_scoped_dynamic(
 ) -> Result<Value> {
     match service {
         "registry" => {
-            let client: RegistryClient = RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client: RegistryClient = RegistryClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client = ModelClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let client = WorkerClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         // "workflow" has no scoped sub-resources (unlike worker's
@@ -787,7 +821,10 @@ mod tests {
             .await
             .expect_err("ping must fail closed when no resolver is installed");
         let text = error.to_string();
-        assert!(text.contains("Discovery service trust key is not installed"), "unexpected compatibility denial: {text}");
+        assert!(
+            text.contains("Discovery service trust key is not installed"),
+            "unexpected compatibility denial: {text}"
+        );
     }
 
     #[tokio::test]
@@ -802,7 +839,10 @@ mod tests {
                 .env("HYPRSTREAM_DISCOVERY_PING_REQUIRED_CHILD", "1")
                 .status()
                 .unwrap();
-            assert!(status.success(), "isolated required-mode child failed: {status}");
+            assert!(
+                status.success(),
+                "isolated required-mode child failed: {status}"
+            );
             return;
         }
 
@@ -838,7 +878,10 @@ mod tests {
                 .env("HYPRSTREAM_DISCOVERY_PING_INSTALLED_CHILD", "1")
                 .status()
                 .unwrap();
-            assert!(status.success(), "isolated remote-node child failed: {status}");
+            assert!(
+                status.success(),
+                "isolated remote-node child failed: {status}"
+            );
             return;
         }
 
@@ -902,12 +945,14 @@ mod tests {
             reach_transport.clone(),
         )
         .with_auth_provider(Box::new(CompatAllowAll));
-        let bridge = Arc::new(hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
-            service,
-            Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
-            0,
-        )
-        .unwrap());
+        let bridge = Arc::new(
+            hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+                service,
+                Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
+                0,
+            )
+            .unwrap(),
+        );
         let shutdown = Arc::new(Notify::new());
         let (ready_tx, ready_rx) = oneshot::channel();
         let server_shutdown = Arc::clone(&shutdown);
@@ -929,13 +974,14 @@ mod tests {
 
         // The client bootstrap installed (authenticated: pinned discovery key)
         // — in production this is the DID-anchored remote-node network client.
-        let installed = hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
-            &reach_transport,
-            caller_key.clone(),
-            service_vk,
-            None,
-        )
-        .unwrap();
+        let installed =
+            hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_transport_bootstrap(
+                &reach_transport,
+                caller_key.clone(),
+                service_vk,
+                None,
+            )
+            .unwrap();
         hyprstream_discovery::install_bootstrap_discovery_client_fixture(installed)
             .expect("install bootstrap client fixture");
 
@@ -1059,7 +1105,10 @@ mod tests {
                 .env("HYPRSTREAM_DISCOVERY_PING_COMPAT_CHILD", "1")
                 .status()
                 .unwrap();
-            assert!(status.success(), "isolated compatibility child failed: {status}");
+            assert!(
+                status.success(),
+                "isolated compatibility child failed: {status}"
+            );
             return;
         }
 
@@ -1122,12 +1171,14 @@ mod tests {
             transport.clone(),
         )
         .with_auth_provider(Box::new(CompatAllowAll));
-        let bridge = Arc::new(hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
-            service,
-            Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
-            0,
-        )
-        .unwrap());
+        let bridge = Arc::new(
+            hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+                service,
+                Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
+                0,
+            )
+            .unwrap(),
+        );
         let shutdown = Arc::new(Notify::new());
         let (ready_tx, ready_rx) = oneshot::channel();
         let server_shutdown = Arc::clone(&shutdown);

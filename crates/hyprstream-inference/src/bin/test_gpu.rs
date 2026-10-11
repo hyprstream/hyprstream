@@ -72,7 +72,11 @@ fn compute_smoke(device: Device) -> anyhow::Result<()> {
     );
     let y_cpu = tch::Tensor::f_softmax(&x_c.f_matmul(&w_c)?.f_add(&b_c)?, -1, Kind::Float)?;
 
-    let max_diff = y_gpu.f_to_device(Device::Cpu)?.f_sub(&y_cpu)?.f_abs()?.f_max()?;
+    let max_diff = y_gpu
+        .f_to_device(Device::Cpu)?
+        .f_sub(&y_cpu)?
+        .f_abs()?
+        .f_max()?;
     let max_diff = f32::try_from(&max_diff)?;
     println!(
         "GPU compute smoke: softmax(matmul+bias) on {device:?} — max |GPU−CPU| = {max_diff:.2e}"
@@ -84,7 +88,9 @@ fn compute_smoke(device: Device) -> anyhow::Result<()> {
     // fp16 path too — HIP matmul requires matching dtypes (see torch_engine
     // TTT notes) and inference weights are commonly half precision. Tolerance
     // is loose: fp16 input rounding on ±N(0,16) dot products, not exact math.
-    let y_h = x.f_to_kind(Kind::Half)?.f_matmul(&w.f_to_kind(Kind::Half)?)?;
+    let y_h = x
+        .f_to_kind(Kind::Half)?
+        .f_matmul(&w.f_to_kind(Kind::Half)?)?;
     let h_diff = y_h
         .f_to_device(Device::Cpu)?
         .f_to_kind(Kind::Float)?

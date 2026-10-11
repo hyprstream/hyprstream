@@ -45,13 +45,12 @@ mod service;
 mod standalone;
 mod systemd;
 
-pub use standalone::StandaloneBackend;
 pub use process::ProcessSpawner;
 pub use service::{
-    DualSpawnable, ServiceKind, ServiceMode,
-    ServiceSpawner, Spawnable, SpawnedService,
-    InprocManager, UnifiedServiceConfig,
+    DualSpawnable, InprocManager, ServiceKind, ServiceMode, ServiceSpawner, Spawnable,
+    SpawnedService, UnifiedServiceConfig,
 };
+pub use standalone::StandaloneBackend;
 pub use systemd::SystemdBackend;
 
 use std::ffi::OsString;

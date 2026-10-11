@@ -71,10 +71,10 @@ impl QwenAdapter {
         );
 
         // Create the model using Llama implementation with Qwen config
-        let model = LlamaModel::from_weights_with_config(weights, config, device, dtype, kv_quant_type)?;
+        let model =
+            LlamaModel::from_weights_with_config(weights, config, device, dtype, kv_quant_type)?;
         Ok(Box::new(model))
     }
-
 
     /// Check if weights contain Qwen-specific patterns
     pub fn is_qwen_model(weights: &HashMap<String, Tensor>) -> bool {

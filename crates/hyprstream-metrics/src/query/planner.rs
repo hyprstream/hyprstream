@@ -1,13 +1,13 @@
+use crate::error::StatusWrapper;
 use crate::query::rules::view::ViewOptimizationRule;
 use crate::storage::StorageBackend;
 use datafusion::arrow::datatypes::Schema;
-use crate::error::StatusWrapper;
+use datafusion::datasource::memory::MemTable;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::optimizer::OptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::datasource::memory::MemTable;
 use std::sync::Arc;
 
 /// Represents a query that can be planned and executed
@@ -75,9 +75,15 @@ impl DataFusionPlanner {
         planner.add_default_rules();
 
         // Register tables from storage
-        let tables = storage.list_tables().await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
+        let tables = storage
+            .list_tables()
+            .await
+            .map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
         for table_name in tables {
-            let schema = storage.get_table_schema(&table_name).await.map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
+            let schema = storage
+                .get_table_schema(&table_name)
+                .await
+                .map_err(|e| Into::<DataFusionError>::into(StatusWrapper(e)))?;
             // Use vec![vec![]] to provide one empty partition (required by MemTable)
             planner.ctx.register_table(
                 &table_name,
@@ -97,9 +103,8 @@ impl DataFusionPlanner {
     /// Add default optimization rules
     fn add_default_rules(&mut self) {
         // Add view optimization rule
-        self.optimizations.push(Box::new(ViewOptimizationRule::new(
-            self.storage.clone(),
-        )));
+        self.optimizations
+            .push(Box::new(ViewOptimizationRule::new(self.storage.clone())));
     }
 }
 
@@ -206,7 +211,10 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
-        backend.create_table("test_table", &schema).await.map_err(status_to_df_error)?;
+        backend
+            .create_table("test_table", &schema)
+            .await
+            .map_err(status_to_df_error)?;
 
         // Create planner with backend
         let planner = DataFusionPlanner::new(backend).await?;

@@ -105,7 +105,10 @@ async fn valid_source_and_both_signatures_only() {
         .verify(source(&v, &t).await, &[9; 32], &ed, &pq, NOW + 1)
         .unwrap();
     assert_eq!(evidence.source.subject, "opaque-sub");
-    assert_eq!(evidence.source.atproto_did, "did:plc:abcdefghijklmnopqrstuvwx");
+    assert_eq!(
+        evidence.source.atproto_did,
+        "did:plc:abcdefghijklmnopqrstuvwx"
+    );
     assert_eq!(evidence.source.jti, "source-id");
     assert_eq!(evidence.binding.tenant, "test-tenant");
     for bad in 0..6 {
@@ -202,15 +205,28 @@ async fn federated_identity_claim_requires_exact_atproto_connector_and_did() {
     ] {
         let mut c = claims();
         c["federated_claims"] = claim;
-        assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_err());
+        assert!(v
+            .source(&token(&c), CODE, commitment(), NOW, None)
+            .await
+            .is_err());
     }
     let mut c = claims();
-    c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:web:users.example:alice"});
-    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_err());
+    c["federated_claims"] =
+        json!({"connector_id":"atproto","user_id":"did:web:users.example:alice"});
+    assert!(v
+        .source(&token(&c), CODE, commitment(), NOW, None)
+        .await
+        .is_err());
     c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:web:users.example"});
-    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_ok());
+    assert!(v
+        .source(&token(&c), CODE, commitment(), NOW, None)
+        .await
+        .is_ok());
     c["federated_claims"] = json!({"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx","future_claim":"ignored"});
-    assert!(v.source(&token(&c), CODE, commitment(), NOW, None).await.is_ok());
+    assert!(v
+        .source(&token(&c), CODE, commitment(), NOW, None)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]

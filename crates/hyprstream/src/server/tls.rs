@@ -59,15 +59,29 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
         crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
     } else {
         // Both paths guaranteed Some when use_self_signed() returns false
-        let cert_path = config.cert_path.as_ref()
+        let cert_path = config
+            .cert_path
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tls.cert_path must be set when tls.key_path is set"))?;
-        let key_path = config.key_path.as_ref()
+        let key_path = config
+            .key_path
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tls.key_path must be set when tls.cert_path is set"))?;
 
-        let cert_pem = std::fs::read(cert_path)
-            .map_err(|e| anyhow::anyhow!("failed to read tls.cert_path '{}': {}", cert_path.display(), e))?;
-        let key_pem = std::fs::read(key_path)
-            .map_err(|e| anyhow::anyhow!("failed to read tls.key_path '{}': {}", key_path.display(), e))?;
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read tls.cert_path '{}': {}",
+                cert_path.display(),
+                e
+            )
+        })?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read tls.key_path '{}': {}",
+                key_path.display(),
+                e
+            )
+        })?;
 
         let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
             .next()
@@ -135,7 +149,14 @@ pub async fn resolve_rustls_config(
     if let (Some(cert), Some(key)) = (service_cert, service_key) {
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to load per-service TLS from {:?}/{:?}: {}", cert, key, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to load per-service TLS from {:?}/{:?}: {}",
+                    cert,
+                    key,
+                    e
+                )
+            })?;
         return Ok(Some(ResolvedTlsConfig::ordinary(rustls_config)));
     }
 
@@ -230,14 +251,13 @@ pub async fn resolve_rustls_config(
 ///
 /// For self-hosted ACME, point `acme_directory` at a step-ca or Pebble URL.
 /// See `docs/tls.md` for operator guidance.
-async fn init_acme_rustls_config(
-    tls_config: &TlsConfig,
-) -> anyhow::Result<ResolvedTlsConfig> {
+async fn init_acme_rustls_config(tls_config: &TlsConfig) -> anyhow::Result<ResolvedTlsConfig> {
     use rustls_acme::AcmeConfig;
 
-    let domain = tls_config.acme_domain.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("[tls] mode = \"acme\" requires acme_domain to be set")
-    })?;
+    let domain = tls_config
+        .acme_domain
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("[tls] mode = \"acme\" requires acme_domain to be set"))?;
     let contact = tls_config.acme_contact.as_deref().unwrap_or("");
     let cache_dir = tls_config.acme_cache_dir.clone().unwrap_or_else(|| {
         dirs::cache_dir()
@@ -258,8 +278,14 @@ async fn init_acme_rustls_config(
         acme = acme.directory(dir_url);
     }
 
-    info!("ACME TLS: obtaining certificate for domain '{}' from {}", domain,
-        tls_config.acme_directory.as_deref().unwrap_or("Let's Encrypt"));
+    info!(
+        "ACME TLS: obtaining certificate for domain '{}' from {}",
+        domain,
+        tls_config
+            .acme_directory
+            .as_deref()
+            .unwrap_or("Let's Encrypt")
+    );
 
     let mut state = acme.state();
     let rustls_server_config = acme_https_config(state.resolver());
@@ -312,9 +338,8 @@ pub fn bind_listener(
     rustls_config: Option<ResolvedTlsConfig>,
     service_name: &str,
 ) -> Result<BoundHttpListener, RpcError> {
-    let std_listener = std::net::TcpListener::bind(addr).map_err(|e| {
-        RpcError::SpawnFailed(format!("{service_name} HTTP(S) bind failed: {e}"))
-    })?;
+    let std_listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTP(S) bind failed: {e}")))?;
     std_listener.set_nonblocking(true).map_err(|e| {
         RpcError::SpawnFailed(format!(
             "{service_name} HTTP(S) set_nonblocking failed: {e}"
@@ -324,9 +349,7 @@ pub fn bind_listener(
         Some(tls) => Ok(BoundHttpListener::Https(std_listener, tls)),
         None => Ok(BoundHttpListener::Http(
             tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
-                RpcError::SpawnFailed(format!(
-                    "{service_name} HTTP listener adoption failed: {e}"
-                ))
+                RpcError::SpawnFailed(format!("{service_name} HTTP listener adoption failed: {e}"))
             })?,
         )),
     }
@@ -361,13 +384,17 @@ pub async fn serve_bound(
                     .handle(handle)
                     .serve(app.into_make_service())
                     .await
-                    .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}")))?;
+                    .map_err(|e| {
+                        RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}"))
+                    })?;
             } else {
                 axum_server::from_tcp_rustls(std_listener, tls.rustls)
                     .handle(handle)
                     .serve(app.into_make_service())
                     .await
-                    .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}")))?;
+                    .map_err(|e| {
+                        RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}"))
+                    })?;
             }
         }
         BoundHttpListener::Http(listener) => {
@@ -379,7 +406,9 @@ pub async fn serve_bound(
                     info!("{name} received shutdown signal");
                 })
                 .await
-                .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTP server error: {e}")))?;
+                .map_err(|e| {
+                    RpcError::SpawnFailed(format!("{service_name} HTTP server error: {e}"))
+                })?;
         }
     }
 
@@ -399,7 +428,11 @@ pub async fn serve_app(
     shutdown: Arc<Notify>,
     service_name: &str,
 ) -> Result<(), RpcError> {
-    let scheme = if rustls_config.is_some() { "https" } else { "http" };
+    let scheme = if rustls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     info!("{service_name} listening on {scheme}://{addr}");
 
     let bound = bind_listener(addr, rustls_config, service_name)?;
@@ -497,7 +530,6 @@ mod acme_tests {
     }
 }
 
-
 #[cfg(test)]
 mod bound_serve_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -514,8 +546,7 @@ mod bound_serve_tests {
     /// bounded. Same helper OAuth and OAI call before their readiness
     /// signals.
     #[tokio::test]
-    async fn bound_https_serves_verified_client_and_shuts_down_bounded()
-    -> anyhow::Result<()> {
+    async fn bound_https_serves_verified_client_and_shuts_down_bounded() -> anyhow::Result<()> {
         hyprstream_rpc::transport::install_pq_crypto_provider()?;
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
@@ -534,13 +565,16 @@ mod bound_serve_tests {
             "BoundServeTest",
         )?;
 
-        let app = axum::Router::new().route(
-            "/bound-serve-probe",
-            get(|| async { "bound-serve-ok" }),
-        );
+        let app =
+            axum::Router::new().route("/bound-serve-probe", get(|| async { "bound-serve-ok" }));
         let shutdown = Arc::new(Notify::new());
         let shutdown_signal = Arc::clone(&shutdown);
-        let server = tokio::spawn(serve_bound(bound, app, Arc::clone(&shutdown), "BoundServeTest"));
+        let server = tokio::spawn(serve_bound(
+            bound,
+            app,
+            Arc::clone(&shutdown),
+            "BoundServeTest",
+        ));
 
         // Client trusts the served certificate and verifies "localhost"
         // normally; no dangerous verification-disabling configuration.
@@ -598,9 +632,7 @@ mod bound_serve_tests {
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let cert = generated.cert.der().clone();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(
-                generated.key_pair.serialize_der(),
-            ),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()),
         );
         let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -611,8 +643,7 @@ mod bound_serve_tests {
         // No ACME event loop is needed for this regression: the supplied
         // certificate serves ordinary HTTPS while the acceptor owns the
         // separate TLS-ALPN challenge handshake path.
-        let acme_state = rustls_acme::AcmeConfig::new(["localhost"])
-            .state();
+        let acme_state = rustls_acme::AcmeConfig::new(["localhost"]).state();
         let acme_acceptor = acme_state.axum_acceptor(Arc::clone(&server_config));
         let tls = ResolvedTlsConfig {
             rustls: axum_server::tls_rustls::RustlsConfig::from_config(server_config),
@@ -623,10 +654,7 @@ mod bound_serve_tests {
         let addr = probe.local_addr()?;
         drop(probe);
         let bound = bind_listener(addr, Some(tls), "BoundAcmeServeTest")?;
-        let app = axum::Router::new().route(
-            "/bound-acme-probe",
-            get(|| async { "bound-acme-ok" }),
-        );
+        let app = axum::Router::new().route("/bound-acme-probe", get(|| async { "bound-acme-ok" }));
         let shutdown = Arc::new(Notify::new());
         let shutdown_signal = Arc::clone(&shutdown);
         let server = tokio::spawn(serve_bound(
@@ -671,5 +699,4 @@ mod bound_serve_tests {
             .expect("graceful shutdown must complete Ok");
         Ok(())
     }
-
 }

@@ -444,21 +444,23 @@ fn audit_grant_outcome(
 ) -> Result<GrantDecision, GrantError> {
     use crate::auth::scope_action_from_name;
     use crate::mac::audit::{AuditRecord, DecisionReason, DelegationPrincipal};
-    use crate::mac::te::{
-        ACTION_UNRECOGNIZED, Action, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT,
-    };
+    use crate::mac::te::{Action, ACTION_UNRECOGNIZED, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT};
     use hyprstream_rpc::auth::mac::SecurityLabel;
 
     let (decision, reason) = match result {
         Ok(GrantDecision::Permit(_)) => (Decision::Permit, DecisionReason::Permit),
-        Ok(GrantDecision::Escalate { .. }) => (Decision::Escalate, DecisionReason::GrantOverCeiling),
+        Ok(GrantDecision::Escalate { .. }) => {
+            (Decision::Escalate, DecisionReason::GrantOverCeiling)
+        }
         Err(GrantError::Chain(_)) => (Decision::Deny, DecisionReason::GrantChainInvalid),
         Err(GrantError::OverCeiling { .. }) => (Decision::Deny, DecisionReason::GrantOverCeiling),
         Err(GrantError::InsufficientClearance) => (Decision::Deny, DecisionReason::GrantFloorDeny),
         Err(GrantError::MissingSenderBinding) => {
             (Decision::Deny, DecisionReason::GrantMissingSenderBinding)
         }
-        Err(GrantError::UnlabeledSubject) => (Decision::Deny, DecisionReason::GrantUnlabeledSubject),
+        Err(GrantError::UnlabeledSubject) => {
+            (Decision::Deny, DecisionReason::GrantUnlabeledSubject)
+        }
         Err(GrantError::EmptyGrant) => (Decision::Deny, DecisionReason::GrantEmptyGrant),
         // Constructed below, never as the pre-audit decision — but exhaustive
         // match requires a reachable-if-mis-called arm. Records as a deny.
@@ -469,7 +471,7 @@ fn audit_grant_outcome(
         .map(Action::from)
         .unwrap_or(ACTION_UNRECOGNIZED);
     let record = AuditRecord {
-        seq: 0,          // the sink (WalAuditStore) assigns the real seq.
+        seq: 0,               // the sink (WalAuditStore) assigns the real seq.
         prev_hash: [0u8; 32], // the sink assigns the real chain link.
         ts_unix_nanos: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -479,7 +481,9 @@ fn audit_grant_outcome(
         generation: 0, // grant decisions are not TE-matrix-generation-versioned.
         policy_hash: None,
         subject_type: GRANT_PATH_SUBJECT,
-        subject_clearance: subject.map(|s| *s.clearance()).unwrap_or_else(SecurityLabel::bottom),
+        subject_clearance: subject
+            .map(|s| *s.clearance())
+            .unwrap_or_else(SecurityLabel::bottom),
         // #680/#681: on a delegated grant the delegator (authority source) is
         // recorded here; `subject_clearance` above is the effective met context
         // the gates evaluated. Same GRANT_PATH_SUBJECT sentinel type — the
@@ -512,7 +516,9 @@ fn audit_grant_outcome(
                 let _ = sink.record(&deny_record);
                 Err(GrantError::AuditUnavailable)
             } else {
-                tracing::error!("MAC grant-path audit write failed on a Deny decision (deny still enforced)");
+                tracing::error!(
+                    "MAC grant-path audit write failed on a Deny decision (deny still enforced)"
+                );
                 result.clone()
             }
         }
@@ -1176,7 +1182,8 @@ mod tests {
             }
         }
         fn fail_next_write(&self) {
-            self.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn records(&self) -> Vec<crate::mac::audit::AuditRecord> {
             self.records.lock().clone()
@@ -1187,7 +1194,10 @@ mod tests {
             &self,
             record: &crate::mac::audit::AuditRecord,
         ) -> Result<(), crate::mac::audit::AuditError> {
-            if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(crate::mac::audit::AuditError::Io("injected failure".into()));
             }
             self.records.lock().push(record.clone());
@@ -1249,7 +1259,11 @@ mod tests {
         // The delegator (authority source): a DISTINCT clearance from the met
         // subject (`cleared_subject` is Secret/{0,1}), so the record must not
         // conflate the two.
-        let delegator = SecurityContext::new(Level::Secret, comps(&[0, 1, 2]), VerifiedKeyMaterial::PqHybrid);
+        let delegator = SecurityContext::new(
+            Level::Secret,
+            comps(&[0, 1, 2]),
+            VerifiedKeyMaterial::PqHybrid,
+        );
 
         let decision = audited_evaluate_grant(
             &grant,

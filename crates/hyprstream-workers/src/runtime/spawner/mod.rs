@@ -38,21 +38,21 @@
 
 // Re-export all spawner types from hyprstream-service
 pub use hyprstream_service::{
-    // Core types
-    StandaloneBackend,
     ProcessBackend,
     ProcessConfig,
     ProcessKind,
     ProcessSpawner,
-    SpawnedProcess,
-    SpawnerBackend,
-    SystemdBackend,
     // ServiceSpawner types
     ServiceKind,
     ServiceMode,
     ServiceSpawner,
     Spawnable,
+    SpawnedProcess,
     SpawnedService,
+    SpawnerBackend,
+    // Core types
+    StandaloneBackend,
+    SystemdBackend,
 };
 
 // Compatibility aliases for legacy code

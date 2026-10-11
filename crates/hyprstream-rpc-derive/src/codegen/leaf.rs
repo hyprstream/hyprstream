@@ -238,7 +238,10 @@ fn walk_level(
         } else {
             format!("{prefix_sym}.{}", arm.name)
         };
-        let nested = scopes.iter().find(|sc| sc.factory_name == arm.name).is_some()
+        let nested = scopes
+            .iter()
+            .find(|sc| sc.factory_name == arm.name)
+            .is_some()
             || descend_struct(resolved, arm.type_name).is_some();
         let mut effective = inherited.clone();
         if arm.scope.is_empty() && !arm.scope_exempt {
@@ -254,14 +257,20 @@ fn walk_level(
             if let Some(label_map) = label_map {
                 if let Err(error) = parse_dispatch_mac(arm.dispatch_mac, label_map) {
                     effective.validation_error.get_or_insert_with(|| {
-                        format!("method leaf '{}': $dispatchMac {:?}: {error}", symbolic, arm.dispatch_mac)
+                        format!(
+                            "method leaf '{}': $dispatchMac {:?}: {error}",
+                            symbolic, arm.dispatch_mac
+                        )
                     });
                 }
             }
         }
         if arm.dispatch_mac_present && arm.dispatch_public_present {
             effective.validation_error.get_or_insert_with(|| {
-                format!("method '{}' carries BOTH $dispatchMac and $dispatchPublic", symbolic)
+                format!(
+                    "method '{}' carries BOTH $dispatchMac and $dispatchPublic",
+                    symbolic
+                )
             });
         } else if arm.dispatch_public_present && nested {
             effective.validation_error.get_or_insert_with(|| {
@@ -270,9 +279,9 @@ fn walk_level(
         }
         if arm.mutation_semantics_present {
             if let Err(error) = parse_mutation_semantics(arm.mutation_semantics) {
-                effective.validation_error.get_or_insert_with(|| {
-                    format!("method '{}': {error}", symbolic)
-                });
+                effective
+                    .validation_error
+                    .get_or_insert_with(|| format!("method '{}': {error}", symbolic));
             }
         }
 
@@ -452,7 +461,10 @@ pub fn generate_body_decoder(service_name: &str, resolved: &ResolvedSchema) -> T
 /// produce an unlabeled runtime row.
 pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema) -> TokenStream {
     let leaves = collect_method_leaves(resolved);
-    let decode_fn = format_ident!("decode_{}_request_body", to_snake_case(&to_pascal_case(service_name)));
+    let decode_fn = format_ident!(
+        "decode_{}_request_body",
+        to_snake_case(&to_pascal_case(service_name))
+    );
 
     let label_map = match InitialLabelMap::load() {
         Ok(map) => map,
@@ -477,79 +489,79 @@ pub fn generate_method_policy_rows(service_name: &str, resolved: &ResolvedSchema
         let (authentication, signature_policy, public_reason, target_label) = match (
             has_mac, has_public,
         ) {
-                (false, false) => {
-                    let msg = format!(
-                        "method leaf '{}.{}' has neither a $dispatchMac nor a \
+            (false, false) => {
+                let msg = format!(
+                    "method leaf '{}.{}' has neither a $dispatchMac nor a \
                          $dispatchPublic annotation; every generated dispatch-policy \
                          row must derive from exactly one of the pair (v16 §6). Public \
                          is never inherited from a selector.",
-                        service_name, leaf.symbolic
-                    );
-                    return quote! { ::core::compile_error!(#msg); };
-                }
-                (true, true) => {
-                    let msg = format!(
-                        "method leaf '{}.{}' carries BOTH $dispatchMac and $dispatchPublic; \
+                    service_name, leaf.symbolic
+                );
+                return quote! { ::core::compile_error!(#msg); };
+            }
+            (true, true) => {
+                let msg = format!(
+                    "method leaf '{}.{}' carries BOTH $dispatchMac and $dispatchPublic; \
                          exactly one dispatch annotation per leaf (v16 §6)",
-                        service_name, leaf.symbolic
-                    );
-                    return quote! { ::core::compile_error!(#msg); };
-                }
-                (false, true) => {
-                    let reason = match parse_dispatch_public_reason(&leaf.dispatch_public) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return quote! { ::core::compile_error!(#e); };
-                        }
-                    };
-                    if !leaf.scope.is_empty() {
-                        let msg = format!(
-                            "method leaf '{}.{}' is $dispatchPublic but also declares the \
+                    service_name, leaf.symbolic
+                );
+                return quote! { ::core::compile_error!(#msg); };
+            }
+            (false, true) => {
+                let reason = match parse_dispatch_public_reason(&leaf.dispatch_public) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return quote! { ::core::compile_error!(#e); };
+                    }
+                };
+                if !leaf.scope.is_empty() {
+                    let msg = format!(
+                        "method leaf '{}.{}' is $dispatchPublic but also declares the \
                              $scope({}) action; a control-plane-scoped method cannot be \
                              dispatch-public (v16 §6)",
-                            service_name, leaf.symbolic, leaf.scope
+                        service_name, leaf.symbolic, leaf.scope
+                    );
+                    return quote! { ::core::compile_error!(#msg); };
+                }
+                (
+                    quote! { hyprstream_rpc::proof::policy::AuthenticationRequirement::UnauthenticatedAllowed },
+                    quote! {
+                        hyprstream_rpc::proof::policy::SignaturePolicy::UnauthenticatedOrTokenBound {
+                            suite: hyprstream_rpc::proof::policy::CryptoSuite::Hybrid,
+                        }
+                    },
+                    quote! { Some(#reason) },
+                    quote! { hyprstream_rpc::proof::policy::SYSTEM_LOW_LABEL },
+                )
+            }
+            (true, false) => {
+                let label = match parse_dispatch_mac(&leaf.dispatch_mac, &label_map) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let msg = format!(
+                            "method leaf '{}.{}' $dispatchMac {:?}: {e}",
+                            service_name, leaf.symbolic, leaf.dispatch_mac
                         );
                         return quote! { ::core::compile_error!(#msg); };
                     }
-                    (
-                        quote! { hyprstream_rpc::proof::policy::AuthenticationRequirement::UnauthenticatedAllowed },
-                        quote! {
-                            hyprstream_rpc::proof::policy::SignaturePolicy::UnauthenticatedOrTokenBound {
-                                suite: hyprstream_rpc::proof::policy::CryptoSuite::Hybrid,
-                            }
-                        },
-                        quote! { Some(#reason) },
-                        quote! { hyprstream_rpc::proof::policy::SYSTEM_LOW_LABEL },
-                    )
-                }
-                (true, false) => {
-                    let label = match parse_dispatch_mac(&leaf.dispatch_mac, &label_map) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let msg = format!(
-                                "method leaf '{}.{}' $dispatchMac {:?}: {e}",
-                                service_name, leaf.symbolic, leaf.dispatch_mac
-                            );
-                            return quote! { ::core::compile_error!(#msg); };
+                };
+                let level = level_tokens(label.level);
+                let assurance = assurance_tokens(label.assurance);
+                let bits = &label.compartment_bits;
+                (
+                    quote! { hyprstream_rpc::proof::policy::AuthenticationRequirement::CredentialRequired },
+                    quote! {
+                        hyprstream_rpc::proof::policy::SignaturePolicy::TokenBound {
+                            suite: hyprstream_rpc::proof::policy::CryptoSuite::Hybrid,
                         }
-                    };
-                    let level = level_tokens(label.level);
-                    let assurance = assurance_tokens(label.assurance);
-                    let bits = &label.compartment_bits;
-                    (
-                        quote! { hyprstream_rpc::proof::policy::AuthenticationRequirement::CredentialRequired },
-                        quote! {
-                            hyprstream_rpc::proof::policy::SignaturePolicy::TokenBound {
-                                suite: hyprstream_rpc::proof::policy::CryptoSuite::Hybrid,
-                            }
-                        },
-                        quote! { None },
-                        quote! {
-                            hyprstream_rpc::proof::policy::dispatch_label(#level, #assurance, &[#(#bits),*])
-                        },
-                    )
-                }
-            };
+                    },
+                    quote! { None },
+                    quote! {
+                        hyprstream_rpc::proof::policy::dispatch_label(#level, #assurance, &[#(#bits),*])
+                    },
+                )
+            }
+        };
 
         // §4.8/§6.1: authorization scope and application effects are separate
         // axes. A query/subscribe leaf may explicitly classify bounded session
@@ -1052,7 +1064,10 @@ mod tests {
     fn a_local_public_leaf_clears_inherited_mac_for_that_leaf_only() {
         let mut inner = union_struct(
             "InnerRequest",
-            vec![union_field("public_leaf", "Void", 0), union_field("mac_leaf", "Void", 1)],
+            vec![
+                union_field("public_leaf", "Void", 0),
+                union_field("mac_leaf", "Void", 1),
+            ],
         );
         inner.union_arms = vec![
             UnionArm {
@@ -1103,7 +1118,8 @@ mod tests {
             .expect("MAC leaf");
         assert!(public.dispatch_public_present && !public.dispatch_mac_present);
         assert!(!mac.dispatch_public_present && mac.dispatch_mac_present);
-        let generated = generate_method_policy_rows("svc", &ResolvedSchema::from(schema)).to_string();
+        let generated =
+            generate_method_policy_rows("svc", &ResolvedSchema::from(schema)).to_string();
         assert!(!generated.contains("compile_error"), "{generated}");
     }
 
@@ -1353,7 +1369,7 @@ mod tests {
         let ledger = dispatch_variant("sendInput", "Text", "write", MAC, "");
         let generated =
             generate_method_policy_rows("tui", &simple_schema(vec![natural, keyed, ledger]))
-        .to_string();
+                .to_string();
         for variant in [
             "MutationSemantics :: NaturallyIdempotent",
             "MutationSemantics :: IdempotencyKeyRequired",

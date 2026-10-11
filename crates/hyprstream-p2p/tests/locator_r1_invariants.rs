@@ -563,11 +563,7 @@ fn walk_flags_public_enum_variant_string_field() {
         &mut v,
     );
     assert!(
-        v.unapproved
-            .iter()
-            .filter(|m| m.contains("String"))
-            .count()
-            >= 2,
+        v.unapproved.iter().filter(|m| m.contains("String")).count() >= 2,
         "both tuple and struct-style enum variant String fields must be flagged: {:?}",
         v.unapproved
     );

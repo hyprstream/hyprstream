@@ -4,14 +4,14 @@
 //! adaptations across requests. Deltas are trained via SGD and can be persisted
 //! to content-addressed storage or merged into permanent adapter files.
 
+use super::muon::{MuonConfig, MuonState};
 use anyhow::{anyhow, Result};
+use safetensors::tensor::{SafeTensors, TensorView};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 use tch::nn::VarStore;
 use tch::{Device, Kind, Tensor};
-use safetensors::tensor::{TensorView, SafeTensors};
-use super::muon::{MuonConfig, MuonState};
 
 /// Extract LoRA components from hierarchical tensor names
 /// e.g., "base_model.model.layers.5.self_attn.q_proj.lora_A.weight" -> Some((5, "q_proj", "lora_a"))
@@ -25,19 +25,18 @@ pub fn extract_lora_components(tensor_name: &str) -> Option<(usize, String, Stri
             let module = parts[i - 1];
             if matches!(
                 module,
-                "q_proj"
-                    | "k_proj"
-                    | "v_proj"
-                    | "o_proj"
-                    | "gate_proj"
-                    | "up_proj"
-                    | "down_proj"
+                "q_proj" | "k_proj" | "v_proj" | "o_proj" | "gate_proj" | "up_proj" | "down_proj"
             ) {
                 // Find layer index: look for "layers" followed by a number
-                let layer_idx = parts.iter()
+                let layer_idx = parts
+                    .iter()
                     .zip(parts.iter().skip(1))
                     .find_map(|(&a, &b)| {
-                        if a == "layers" { b.parse::<usize>().ok() } else { None }
+                        if a == "layers" {
+                            b.parse::<usize>().ok()
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or(0);
                 return Some((layer_idx, module.to_owned(), normalized));
@@ -167,19 +166,19 @@ fn default_target_modules() -> Vec<String> {
     vec!["q_proj".to_owned(), "v_proj".to_owned()]
 }
 fn default_learning_rate() -> f64 {
-    1e-3  // Muon's Newton-Schulz amplifies effective step ~22x for rank-8 B matrices;
-          // 1e-3 gives effective step ~0.023, 3x the previous 3e-4 while staying stable.
+    1e-3 // Muon's Newton-Schulz amplifies effective step ~22x for rank-8 B matrices;
+         // 1e-3 gives effective step ~0.023, 3x the previous 3e-4 while staying stable.
 }
 fn default_max_accumulated_steps() -> u64 {
     300
 }
 fn default_decay_lambda() -> f64 {
-    0.0  // Weight decay fights LoRA-B (initialized to zero) — keep off by default.
-         // The field is now wired to MuonConfig.weight_decay so it works if configured.
+    0.0 // Weight decay fights LoRA-B (initialized to zero) — keep off by default.
+        // The field is now wired to MuonConfig.weight_decay so it works if configured.
 }
 fn default_muon_momentum_config() -> f64 {
-    0.9  // Reduced from 0.95 to match higher LR. Product lr*momentum/(1-momentum)
-         // stays controlled: 1e-3 * 0.9/0.1 = 0.009.
+    0.9 // Reduced from 0.95 to match higher LR. Product lr*momentum/(1-momentum)
+        // stays controlled: 1e-3 * 0.9/0.1 = 0.009.
 }
 
 impl Default for TenantDeltaConfig {
@@ -341,16 +340,11 @@ impl TenantDelta {
                 let layer_path = root.sub(format!("layer_{}", layer_idx)).sub(module_name);
 
                 // A: Kaiming uniform initialization [rank, in_features]
-                let a = layer_path.kaiming_uniform(
-                    "lora_a",
-                    &[layer_rank as i64, *in_features as i64],
-                );
+                let a =
+                    layer_path.kaiming_uniform("lora_a", &[layer_rank as i64, *in_features as i64]);
 
                 // B: Zero initialization [out_features, rank]
-                let b = layer_path.zeros(
-                    "lora_b",
-                    &[*out_features as i64, layer_rank as i64],
-                );
+                let b = layer_path.zeros("lora_b", &[*out_features as i64, layer_rank as i64]);
 
                 lora_a.insert(key.clone(), a);
                 lora_b.insert(key.clone(), b);
@@ -420,7 +414,8 @@ impl TenantDelta {
 
     /// Check if this delta has a module at the given layer
     pub fn has_module(&self, module_name: &str, layer_idx: usize) -> bool {
-        self.lora_a.contains_key(&format!("{}.{}", layer_idx, module_name))
+        self.lora_a
+            .contains_key(&format!("{}.{}", layer_idx, module_name))
     }
 
     /// Compute LoRA correction for a given module at a specific layer: output += scaling * (x @ A^T) @ B^T
@@ -434,16 +429,23 @@ impl TenantDelta {
     /// LoRA correction tensor [batch, seq_len, out_features]
     pub fn forward(&self, x: &Tensor, module_name: &str, layer_idx: usize) -> Result<Tensor> {
         let key = format!("{}.{}", layer_idx, module_name);
-        let a = self.lora_a.get(&key)
+        let a = self
+            .lora_a
+            .get(&key)
             .ok_or_else(|| anyhow!("Module '{}' not found in delta", key))?;
-        let b = self.lora_b.get(&key)
+        let b = self
+            .lora_b
+            .get(&key)
             .ok_or_else(|| anyhow!("Module '{}' B not found in delta", key))?;
 
         // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
         let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
 
         // Narrow to effective rank (view, no copy)
-        let eff_rank = self.effective_ranks.get(&key).copied()
+        let eff_rank = self
+            .effective_ranks
+            .get(&key)
+            .copied()
             .unwrap_or_else(|| a.size()[0] as usize) as i64;
         let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
         let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
@@ -455,9 +457,11 @@ impl TenantDelta {
         // device-agnostic no-op when x already matches a.kind().
         let input_kind = x.kind();
         let x = x.to_kind(a.kind());
-        let intermediate = x.f_matmul(&a_eff.tr())
+        let intermediate = x
+            .f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul A failed for '{}': {}", key, e))?;
-        let output = intermediate.f_matmul(&b_eff.tr())
+        let output = intermediate
+            .f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul B failed for '{}': {}", key, e))?;
 
         Ok((output * scaling).to_kind(input_kind))
@@ -481,16 +485,23 @@ impl TenantDelta {
     /// LoRA correction tensor [tokens, out_features]
     pub fn forward_2d(&self, x: &Tensor, module_name: &str, layer_idx: usize) -> Result<Tensor> {
         let key = format!("{}.{}", layer_idx, module_name);
-        let a = self.lora_a.get(&key)
+        let a = self
+            .lora_a
+            .get(&key)
             .ok_or_else(|| anyhow!("Module '{}' not found in delta", key))?;
-        let b = self.lora_b.get(&key)
+        let b = self
+            .lora_b
+            .get(&key)
             .ok_or_else(|| anyhow!("Module '{}' B not found in delta", key))?;
 
         // Per-key scaling (C7 fix): use per-key alpha/rank, fall back to global scaling
         let scaling = self.scaling_map.get(&key).copied().unwrap_or(self.scaling);
 
         // Narrow to effective rank (view, no copy)
-        let eff_rank = self.effective_ranks.get(&key).copied()
+        let eff_rank = self
+            .effective_ranks
+            .get(&key)
+            .copied()
             .unwrap_or_else(|| a.size()[0] as usize) as i64;
         let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
         let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
@@ -512,9 +523,11 @@ impl TenantDelta {
         // keeping the existing TTT behavior byte-identical.
         let a_eff = a_eff.to_device(input_device);
         let b_eff = b_eff.to_device(input_device);
-        let intermediate = x.f_matmul(&a_eff.tr())
+        let intermediate = x
+            .f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
-        let output = intermediate.f_matmul(&b_eff.tr())
+        let output = intermediate
+            .f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul B failed for '{}': {}", key, e))?;
 
         Ok((output * scaling).to_kind(input_kind))
@@ -565,7 +578,10 @@ impl TenantDelta {
 
         // Persist effective ranks as scalar metadata tensors
         for (key, &rank) in &self.effective_ranks {
-            state.insert(format!("{}.__effective_rank", key), Tensor::from_slice(&[rank as i64]));
+            state.insert(
+                format!("{}.__effective_rank", key),
+                Tensor::from_slice(&[rank as i64]),
+            );
         }
 
         // Persist Muon momentum buffers
@@ -705,7 +721,8 @@ impl TenantDelta {
             let clamped = rank.clamp(1, max_r);
             self.effective_ranks.insert(key.to_owned(), clamped);
             // Recalculate scaling: alpha / effective_rank
-            self.scaling_map.insert(key.to_owned(), self.alpha as f64 / clamped as f64);
+            self.scaling_map
+                .insert(key.to_owned(), self.alpha as f64 / clamped as f64);
         }
     }
 }
@@ -744,30 +761,50 @@ impl TenantDelta {
             let tenant_b = tenant_guard.lora_b.get(key);
 
             // Use per-key scaling if available (C7 fix), else fall back to global
-            let base_scaling = base_guard.scaling_map.get(key).copied().unwrap_or(base_guard.scaling);
-            let tenant_scaling = tenant_guard.scaling_map.get(key).copied().unwrap_or(tenant_guard.scaling);
+            let base_scaling = base_guard
+                .scaling_map
+                .get(key)
+                .copied()
+                .unwrap_or(base_guard.scaling);
+            let tenant_scaling = tenant_guard
+                .scaling_map
+                .get(key)
+                .copied()
+                .unwrap_or(tenant_guard.scaling);
 
             // Narrow to effective_rank before composition — matches forward_2d behavior.
             // Without this, compose operates on dormant rank dimensions (near-zero values
             // that waste FLOPs and may introduce noise from untrained parameters).
             let narrow_a = |a: &Tensor, guard: &TenantDelta| -> Tensor {
-                let eff = guard.effective_ranks.get(key).copied()
+                let eff = guard
+                    .effective_ranks
+                    .get(key)
+                    .copied()
                     .unwrap_or_else(|| a.size()[0] as usize) as i64;
                 a.narrow(0, 0, eff)
             };
             let narrow_b = |b: &Tensor, guard: &TenantDelta| -> Tensor {
-                let eff = guard.effective_ranks.get(key).copied()
+                let eff = guard
+                    .effective_ranks
+                    .get(key)
+                    .copied()
                     .unwrap_or_else(|| b.size()[1] as usize) as i64;
                 b.narrow(1, 0, eff)
             };
 
             // Check if effective ranks match for this specific key
             let base_eff_rank = base_a.map(|a| {
-                base_guard.effective_ranks.get(key).copied()
+                base_guard
+                    .effective_ranks
+                    .get(key)
+                    .copied()
                     .unwrap_or_else(|| a.size()[0] as usize)
             });
             let tenant_eff_rank = tenant_a.map(|a| {
-                tenant_guard.effective_ranks.get(key).copied()
+                tenant_guard
+                    .effective_ranks
+                    .get(key)
+                    .copied()
                     .unwrap_or_else(|| a.size()[0] as usize)
             });
             let ranks_match = base_eff_rank == tenant_eff_rank;
@@ -853,7 +890,7 @@ impl TenantDelta {
             muon_states: HashMap::new(),
             muon_config: MuonConfig::default(),
             scaling_map: HashMap::new(), // scaling=1.0 already baked in during composition
-            scaling: 1.0, // Already pre-scaled during composition
+            scaling: 1.0,                // Already pre-scaled during composition
             rank,
             device,
             target_modules: all_modules,
@@ -877,12 +914,13 @@ impl TenantDelta {
     }
 }
 
-
 /// Extract raw bytes, dtype, and shape from a tch::Tensor for safetensors serialization.
 ///
 /// Extracts raw bytes from a tensor for safetensors serialization.
 /// Moves to CPU and makes contiguous if needed.
-fn tensor_to_safetensors_data(tensor: &Tensor) -> Result<(safetensors::Dtype, Vec<usize>, Vec<u8>)> {
+fn tensor_to_safetensors_data(
+    tensor: &Tensor,
+) -> Result<(safetensors::Dtype, Vec<usize>, Vec<u8>)> {
     let cpu_tensor = tensor.to(tch::Device::Cpu).contiguous();
     let kind = cpu_tensor.kind();
     let dtype = match kind {
@@ -895,14 +933,21 @@ fn tensor_to_safetensors_data(tensor: &Tensor) -> Result<(safetensors::Dtype, Ve
         Kind::Int16 => safetensors::Dtype::I16,
         Kind::Int8 => safetensors::Dtype::I8,
         Kind::Uint8 => safetensors::Dtype::U8,
-        other => return Err(anyhow!("Unsupported tensor kind for safetensors: {:?}", other)),
+        other => {
+            return Err(anyhow!(
+                "Unsupported tensor kind for safetensors: {:?}",
+                other
+            ))
+        }
     };
     let shape: Vec<usize> = cpu_tensor.size().iter().map(|&d| d as usize).collect();
     let numel: usize = shape.iter().try_fold(1usize, |acc, &dim| {
-        acc.checked_mul(dim).ok_or_else(|| anyhow!("Tensor numel overflow: shape {:?}", shape))
+        acc.checked_mul(dim)
+            .ok_or_else(|| anyhow!("Tensor numel overflow: shape {:?}", shape))
     })?;
     let elem_size = kind.elt_size_in_bytes();
-    let byte_len = numel.checked_mul(elem_size)
+    let byte_len = numel
+        .checked_mul(elem_size)
         .ok_or_else(|| anyhow!("Tensor byte length overflow: {} * {}", numel, elem_size))?;
     let mut bytes = vec![0u8; byte_len];
     cpu_tensor.copy_data_u8(&mut bytes, numel);
@@ -996,12 +1041,20 @@ impl TenantDelta {
         for (key, a_tensor) in &lora_a {
             let a_shape = a_tensor.size();
             if a_shape.len() != 2 {
-                return Err(anyhow!("LoRA A tensor '{}' has invalid rank: expected 2, got {}", key, a_shape.len()));
+                return Err(anyhow!(
+                    "LoRA A tensor '{}' has invalid rank: expected 2, got {}",
+                    key,
+                    a_shape.len()
+                ));
             }
             if let Some(b_tensor) = lora_b.get(key) {
                 let b_shape = b_tensor.size();
                 if b_shape.len() != 2 {
-                    return Err(anyhow!("LoRA B tensor '{}' has invalid rank: expected 2, got {}", key, b_shape.len()));
+                    return Err(anyhow!(
+                        "LoRA B tensor '{}' has invalid rank: expected 2, got {}",
+                        key,
+                        b_shape.len()
+                    ));
                 }
                 // A is [rank, in_dim], B is [out_dim, rank] — inner dims must match
                 if a_shape[0] != b_shape[1] {
@@ -1076,7 +1129,10 @@ impl TenantDelta {
 }
 
 /// Convert a safetensors TensorView to a tch::Tensor
-fn safetensors_view_to_tensor(view: &safetensors::tensor::TensorView<'_>, device: Device) -> Result<Tensor> {
+fn safetensors_view_to_tensor(
+    view: &safetensors::tensor::TensorView<'_>,
+    device: Device,
+) -> Result<Tensor> {
     let dtype = view.dtype();
     let kind = match dtype {
         safetensors::Dtype::F32 => Kind::Float,
@@ -1121,15 +1177,14 @@ fn serialize_tensor_pairs_to_bytes(
     let views: Vec<(String, TensorView<'_>)> = tensor_data
         .iter()
         .map(|(key, dtype, shape, bytes)| {
-            let view = TensorView::new(*dtype, shape.clone(), bytes)
-                .unwrap_or_else(|_| unreachable!("TensorView construction with valid dtype/shape/bytes"));
+            let view = TensorView::new(*dtype, shape.clone(), bytes).unwrap_or_else(|_| {
+                unreachable!("TensorView construction with valid dtype/shape/bytes")
+            });
             (key.clone(), view)
         })
         .collect();
-    let data_refs: Vec<(&str, TensorView<'_>)> = views
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.clone()))
-        .collect();
+    let data_refs: Vec<(&str, TensorView<'_>)> =
+        views.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
     safetensors::tensor::serialize(data_refs, &None)
         .map_err(|e| anyhow!("safetensors serialization failed: {}", e))
@@ -1140,7 +1195,9 @@ fn serialize_tensor_pairs_to_bytes(
 /// This replaces direct `Tensor::save_multi()` calls, allowing writes through FsOps.
 pub fn serialize_state_dict_to_bytes(state_dict: &HashMap<String, Tensor>) -> Result<Vec<u8>> {
     serialize_tensor_pairs_to_bytes(
-        state_dict.iter().map(|(k, v)| (k.clone(), v.shallow_clone())),
+        state_dict
+            .iter()
+            .map(|(k, v)| (k.clone(), v.shallow_clone())),
     )
 }
 
@@ -1158,7 +1215,6 @@ pub fn load_state_dict_from_bytes(data: &[u8]) -> Result<HashMap<String, Tensor>
     }
     Ok(result)
 }
-
 
 /// Estimate tensor memory in bytes
 fn tensor_bytes(t: &Tensor) -> usize {
@@ -1253,7 +1309,10 @@ mod tests {
             .abs()
             .sum(Kind::Float)
             .double_value(&[]);
-        assert!(diff1 < 1e-6, "State dict roundtrip should preserve layer 1 values");
+        assert!(
+            diff1 < 1e-6,
+            "State dict roundtrip should preserve layer 1 values"
+        );
     }
 
     /// The weight epoch starts at 0 and advances on every in-place weight
@@ -1274,7 +1333,11 @@ mod tests {
         // load_state_dict() restores weights in place (rollback path) → epoch advances.
         let state = delta.extract_state_dict();
         delta.load_state_dict(&state).unwrap();
-        assert_eq!(delta.weight_epoch(), 2, "state restore bumps the weight epoch");
+        assert_eq!(
+            delta.weight_epoch(),
+            2,
+            "state restore bumps the weight epoch"
+        );
     }
 
     #[test]
@@ -1393,7 +1456,10 @@ mod tests {
                 }
             }
         }
-        assert!(has_grad, "Delta A/B matrices should have gradients after backward()");
+        assert!(
+            has_grad,
+            "Delta A/B matrices should have gradients after backward()"
+        );
     }
 
     #[test]
@@ -1410,7 +1476,10 @@ mod tests {
 
     #[test]
     fn test_effective_rank_default_is_max() {
-        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let config = TenantDeltaConfig {
+            rank: 8,
+            ..Default::default()
+        };
         let dims = test_module_dims();
         let delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
@@ -1422,7 +1491,10 @@ mod tests {
 
     #[test]
     fn test_effective_rank_forward() {
-        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let config = TenantDeltaConfig {
+            rank: 8,
+            ..Default::default()
+        };
         let dims = test_module_dims();
         let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
@@ -1440,7 +1512,10 @@ mod tests {
 
     #[test]
     fn test_set_effective_rank_clamped() {
-        let config = TenantDeltaConfig { rank: 8, ..Default::default() };
+        let config = TenantDeltaConfig {
+            rank: 8,
+            ..Default::default()
+        };
         let dims = test_module_dims();
         let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
@@ -1455,7 +1530,11 @@ mod tests {
 
     #[test]
     fn test_effective_rank_scaling_adjusts() {
-        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let config = TenantDeltaConfig {
+            rank: 8,
+            alpha: 4.0,
+            ..Default::default()
+        };
         let dims = test_module_dims();
         let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
@@ -1472,10 +1551,13 @@ mod tests {
     #[test]
     fn test_effective_rank_with_layer_overrides() {
         let mut overrides = HashMap::new();
-        overrides.insert(0, LayerDeltaConfig {
-            rank: 16,
-            target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
-        });
+        overrides.insert(
+            0,
+            LayerDeltaConfig {
+                rank: 16,
+                target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+            },
+        );
         let config = TenantDeltaConfig {
             rank: 8,
             layer_overrides: Some(overrides),
@@ -1491,7 +1573,11 @@ mod tests {
 
     #[test]
     fn test_state_dict_round_trip_preserves_effective_ranks() {
-        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let config = TenantDeltaConfig {
+            rank: 8,
+            alpha: 4.0,
+            ..Default::default()
+        };
         let dims = test_module_dims();
         let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
@@ -1519,16 +1605,23 @@ mod tests {
 
     #[test]
     fn test_state_dict_round_trip_preserves_muon_momentum() {
-        let config = TenantDeltaConfig { rank: 8, alpha: 4.0, ..Default::default() };
+        let config = TenantDeltaConfig {
+            rank: 8,
+            alpha: 4.0,
+            ..Default::default()
+        };
         let dims = test_module_dims();
         let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
 
         // Simulate a Muon step populating momentum for one key
         let key = "0.q_proj".to_owned();
         let fake_momentum = Tensor::randn([8, 512], (Kind::Float, Device::Cpu));
-        delta.muon_states.insert(key.clone(), super::super::muon::MuonState {
-            momentum_buffer: Some(fake_momentum.copy()),
-        });
+        delta.muon_states.insert(
+            key.clone(),
+            super::super::muon::MuonState {
+                momentum_buffer: Some(fake_momentum.copy()),
+            },
+        );
 
         let state = delta.extract_state_dict();
 
@@ -1537,9 +1630,12 @@ mod tests {
 
         // Load into a fresh delta that has the same Muon state key
         let mut delta2 = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
-        delta2.muon_states.insert(key.clone(), super::super::muon::MuonState {
-            momentum_buffer: None,
-        });
+        delta2.muon_states.insert(
+            key.clone(),
+            super::super::muon::MuonState {
+                momentum_buffer: None,
+            },
+        );
         delta2.load_state_dict(&state).unwrap();
 
         // Verify momentum buffer restored
@@ -1549,6 +1645,9 @@ mod tests {
             .abs()
             .sum(Kind::Float)
             .double_value(&[]);
-        assert!(diff < 1e-6, "Muon momentum should be preserved through state_dict round-trip");
+        assert!(
+            diff < 1e-6,
+            "Muon momentum should be preserved through state_dict round-trip"
+        );
     }
 }

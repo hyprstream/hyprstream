@@ -80,11 +80,7 @@ fn emit_struct_interface(out: &mut String, s: &StructDef, schema: &ParsedSchema)
         // type so the alias can reference it.
         for f in &union_fields {
             if let Some(leaves) = super::group_arm_leaves(s, f) {
-                emit_group_interface(
-                    out,
-                    &super::group_arm_type_name(&s.name, &f.name),
-                    leaves,
-                );
+                emit_group_interface(out, &super::group_arm_type_name(&s.name, &f.name), leaves);
             }
         }
         let shared_fields = super::shared_union_fields(s);

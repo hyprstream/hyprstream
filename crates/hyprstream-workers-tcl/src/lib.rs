@@ -63,8 +63,8 @@ impl TclShell {
         // parse/pdump/pclear: debug internals, not for users
         // apply/eval/subst/uplevel: evaluate arbitrary code, enabling injection via field output
         for cmd in &[
-            "source", "exit", "puts", "rename", "global", "time",
-            "parse", "pdump", "pclear", "apply", "eval", "subst", "uplevel",
+            "source", "exit", "puts", "rename", "global", "time", "parse", "pdump", "pclear",
+            "apply", "eval", "subst", "uplevel",
         ] {
             if interp.has_command(cmd) {
                 interp.remove_command(cmd);
@@ -171,11 +171,7 @@ impl TclShell {
             return Err(format!("invalid command name \"{cmd_name}\""));
         }
         let cmd_path = format!("/bin/{cmd_name}");
-        let raw_args = script
-            .trim()
-            .strip_prefix(cmd_name)
-            .unwrap_or("")
-            .trim();
+        let raw_args = script.trim().strip_prefix(cmd_name).unwrap_or("").trim();
 
         // Evaluate args through the Tcl evaluator to resolve variable and
         // command substitutions (e.g., `[cat /config/token]` → actual value).
@@ -195,7 +191,10 @@ impl TclShell {
         let subject = ctx.subject.clone();
 
         // Phase 1: Try ctl (service actions — CtlFile nodes).
-        if let Ok(resp) = namespace.ctl(&cmd_path, evaluated_args.as_bytes(), &subject).await {
+        if let Ok(resp) = namespace
+            .ctl(&cmd_path, evaluated_args.as_bytes(), &subject)
+            .await
+        {
             return Ok(String::from_utf8_lossy(&resp).into_owned());
         }
 
@@ -266,7 +265,10 @@ mod tests {
         async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             let exists = self.files.contains_key(&path)
-                || self.files.keys().any(|k| k.starts_with(&format!("{path}/")));
+                || self
+                    .files
+                    .keys()
+                    .any(|k| k.starts_with(&format!("{path}/")));
             if !exists && !path.is_empty() {
                 return Err(MountError::NotFound(path));
             }
@@ -276,7 +278,12 @@ mod tests {
             }))
         }
 
-        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(
+            &self,
+            _fid: &mut Fid,
+            _mode: u8,
+            _caller: &Subject,
+        ) -> Result<(), MountError> {
             Ok(())
         }
 
@@ -287,7 +294,9 @@ mod tests {
             _count: u32,
             _caller: &Subject,
         ) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let wb = inner.write_buf.lock().unwrap();
             if !wb.is_empty() {
                 let start = offset as usize;
@@ -300,7 +309,9 @@ mod tests {
             match self.files.get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
-                    if start >= data.len() { return Ok(vec![]); }
+                    if start >= data.len() {
+                        return Ok(vec![]);
+                    }
                     Ok(data[start..].to_vec())
                 }
                 None => Err(MountError::NotFound(inner.path.clone())),
@@ -314,13 +325,18 @@ mod tests {
             data: &[u8],
             _caller: &Subject,
         ) -> Result<u32, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            *inner.write_buf.lock().unwrap() = format!("ok: {}", String::from_utf8_lossy(data)).into_bytes();
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            *inner.write_buf.lock().unwrap() =
+                format!("ok: {}", String::from_utf8_lossy(data)).into_bytes();
             Ok(data.len() as u32)
         }
 
         async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let prefix = if inner.path.is_empty() {
                 String::new()
             } else {
@@ -350,7 +366,9 @@ mod tests {
         }
 
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
 
@@ -384,10 +402,13 @@ mod tests {
     async fn eval_cat() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("cat /config/temperature").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("cat /config/temperature").await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "0.7");
     }
 
@@ -395,10 +416,13 @@ mod tests {
     async fn eval_cat_multi() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("cat /config/temperature /config/status").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("cat /config/temperature /config/status").await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "0.7loaded");
     }
 
@@ -406,10 +430,12 @@ mod tests {
     async fn eval_cat_not_found() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("cat /config/nonexistent").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("cat /config/nonexistent").await
+            })
+            .await;
         assert!(result.is_err());
     }
 
@@ -417,10 +443,13 @@ mod tests {
     async fn eval_ls() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("ls /config").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("ls /config").await
+            })
+            .await
+            .unwrap();
         assert!(result.contains("temperature"));
         assert!(result.contains("status"));
     }
@@ -429,10 +458,13 @@ mod tests {
     async fn eval_ls_root() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("ls").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("ls").await
+            })
+            .await
+            .unwrap();
         assert!(result.contains("srv"));
         assert!(result.contains("config"));
         assert!(result.contains("bin"));
@@ -442,10 +474,12 @@ mod tests {
     async fn eval_write() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("write /bin/load qwen3:main").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("write /bin/load qwen3:main").await
+            })
+            .await;
         assert!(result.is_ok());
     }
 
@@ -453,10 +487,13 @@ mod tests {
     async fn eval_ctl() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("ctl /bin/load qwen3:main").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("ctl /bin/load qwen3:main").await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "ok: qwen3:main");
     }
 
@@ -464,10 +501,13 @@ mod tests {
     async fn eval_help() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("help").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("help").await
+            })
+            .await
+            .unwrap();
         assert!(result.contains("cat"));
         assert!(result.contains("ls"));
         assert!(result.contains("ctl"));
@@ -480,10 +520,13 @@ mod tests {
     async fn eval_mount() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("mount").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("mount").await
+            })
+            .await
+            .unwrap();
         assert!(result.contains("/config"));
         assert!(result.contains("/srv/model"));
         assert!(result.contains("/bin"));
@@ -493,10 +536,13 @@ mod tests {
     async fn eval_mount_specific() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("mount /config").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("mount /config").await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "mounted: /config");
     }
 
@@ -504,10 +550,12 @@ mod tests {
     async fn eval_mount_not_found() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("mount /nonexistent").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("mount /nonexistent").await
+            })
+            .await;
         assert!(result.is_err());
     }
 
@@ -515,10 +563,15 @@ mod tests {
     async fn eval_tcl_builtins() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("set x [cat /config/temperature]; string length $x").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell
+                    .eval("set x [cat /config/temperature]; string length $x")
+                    .await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "3");
     }
 
@@ -526,10 +579,13 @@ mod tests {
     async fn eval_tcl_expr() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("expr {2 + 3}").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("expr {2 + 3}").await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "5");
     }
 
@@ -537,10 +593,13 @@ mod tests {
     async fn unknown_resolves_cmd() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("load qwen3:main").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("load qwen3:main").await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "ok: qwen3:main");
     }
 
@@ -548,10 +607,12 @@ mod tests {
     async fn unknown_fails_cleanly() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("nonexistent_command arg1 arg2").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("nonexistent_command arg1 arg2").await
+            })
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
@@ -586,10 +647,12 @@ mod tests {
     async fn source_command_removed() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("source /etc/passwd").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("source /etc/passwd").await
+            })
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
@@ -598,10 +661,12 @@ mod tests {
     async fn exit_command_removed() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("exit").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("exit").await
+            })
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid command name"));
     }
@@ -610,10 +675,12 @@ mod tests {
     async fn puts_command_removed() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("puts hello").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("puts hello").await
+            })
+            .await;
         assert!(result.is_err());
     }
 
@@ -621,10 +688,12 @@ mod tests {
     async fn rename_command_removed() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("rename cat {}").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("rename cat {}").await
+            })
+            .await;
         assert!(result.is_err());
     }
 
@@ -632,10 +701,12 @@ mod tests {
     async fn time_command_removed() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("time {expr 1} 999999").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("time {expr 1} 999999").await
+            })
+            .await;
         assert!(result.is_err());
     }
 
@@ -643,10 +714,12 @@ mod tests {
     async fn cmd_name_path_traversal_rejected() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.eval("../srv/model/ctl something").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.eval("../srv/model/ctl something").await
+            })
+            .await;
         assert!(result.is_err());
     }
 
@@ -654,15 +727,17 @@ mod tests {
     async fn safe_commands_still_work() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let results = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            vec![
-                s.eval("expr {2 + 3}").await,
-                s.eval("set x hello; string length $x").await,
-                s.eval("if {1} {set y yes}").await,
-                s.eval("list a b c").await,
-            ]
-        }).await;
+        let results = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                vec![
+                    s.eval("expr {2 + 3}").await,
+                    s.eval("set x hello; string length $x").await,
+                    s.eval("if {1} {set y yes}").await,
+                    s.eval("list a b c").await,
+                ]
+            })
+            .await;
         assert_eq!(results[0].as_ref().unwrap(), "5");
         assert_eq!(results[1].as_ref().unwrap(), "5");
         assert_eq!(results[2].as_ref().unwrap(), "yes");
@@ -673,11 +748,13 @@ mod tests {
     async fn instruction_limit_catches_infinite_loop() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut shell = TclShell::new(test_subject(), ns);
-            shell.set_instruction_limit(500);
-            shell.eval("while {1} {}").await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut shell = TclShell::new(test_subject(), ns);
+                shell.set_instruction_limit(500);
+                shell.eval("while {1} {}").await
+            })
+            .await;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("instruction limit"),
@@ -691,10 +768,14 @@ mod tests {
     async fn json_parse_object() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] name"#).await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] name"#)
+                    .await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "alice");
     }
 
@@ -702,10 +783,14 @@ mod tests {
     async fn json_parse_number() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] age"#).await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"dict get [json parse {{"name":"alice","age":30}}] age"#)
+                    .await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "30");
     }
 
@@ -713,10 +798,14 @@ mod tests {
     async fn json_parse_nested() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"dict get [dict get [json parse {{"data":{"x":1}}}] data] x"#).await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"dict get [dict get [json parse {{"data":{"x":1}}}] data] x"#)
+                    .await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "1");
     }
 
@@ -724,10 +813,12 @@ mod tests {
     async fn json_parse_invalid() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"json parse {not json}"#).await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"json parse {not json}"#).await
+            })
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid JSON"));
     }
@@ -736,10 +827,13 @@ mod tests {
     async fn json_parse_array() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"lindex [json parse {[1, 2, 3]}] 1"#).await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"lindex [json parse {[1, 2, 3]}] 1"#).await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "2");
     }
 
@@ -747,10 +841,14 @@ mod tests {
     async fn json_parse_bool_null() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"dict get [json parse {{"flag":true,"empty":null}}] flag"#).await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"dict get [json parse {{"flag":true,"empty":null}}] flag"#)
+                    .await
+            })
+            .await
+            .unwrap();
         assert_eq!(result, "1");
     }
 
@@ -758,10 +856,12 @@ mod tests {
     async fn json_unknown_subcommand() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval(r#"json encode {something}"#).await
-        }).await;
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval(r#"json encode {something}"#).await
+            })
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown subcommand"));
     }
@@ -770,10 +870,13 @@ mod tests {
     async fn json_in_help() {
         let ns = make_namespace();
         let local = tokio::task::LocalSet::new();
-        let result = local.run_until(async {
-            let mut s = TclShell::new(test_subject(), ns);
-            s.eval("help").await
-        }).await.unwrap();
+        let result = local
+            .run_until(async {
+                let mut s = TclShell::new(test_subject(), ns);
+                s.eval("help").await
+            })
+            .await
+            .unwrap();
         assert!(result.contains("json"));
     }
 }

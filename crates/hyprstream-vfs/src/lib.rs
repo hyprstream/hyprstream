@@ -46,14 +46,16 @@ mod zero_open;
 pub use devfile::{ControlFile, DevFileState, DevFuture, DynamicDir, FieldFile, NoSetter};
 pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
-pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
-pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
 pub use mac_pep::NamespaceAction;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mac_pep::{
-    DenyAllNamespace, DenyAllSubjects, DenyUnlabeledResolver, NamespaceAccessDecider,
-    NamespacePep, SubjectContextResolver,
+    DenyAllNamespace, DenyAllSubjects, DenyUnlabeledResolver, NamespaceAccessDecider, NamespacePep,
+    SubjectContextResolver,
 };
+pub use mount::{
+    DirEntry, Fid, Mount, MountError, Stat, DMDIR, ORCLOSE, ORDWR, OREAD, OTRUNC, OWRITE,
+};
+pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use fuse_adapter::FuseFileSystemMount;

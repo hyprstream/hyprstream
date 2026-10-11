@@ -191,13 +191,7 @@ impl StreamingWeightProvider {
                 }
                 safetensors::Dtype::F16 => {
                     let cpu_tensor = unsafe {
-                        Tensor::from_blob(
-                            data.as_ptr(),
-                            &shape,
-                            &[],
-                            tch::Kind::Half,
-                            Device::Cpu,
-                        )
+                        Tensor::from_blob(data.as_ptr(), &shape, &[], tch::Kind::Half, Device::Cpu)
                     };
 
                     // Convert dtype if needed
@@ -219,13 +213,7 @@ impl StreamingWeightProvider {
                 }
                 safetensors::Dtype::F32 => {
                     let cpu_tensor = unsafe {
-                        Tensor::from_blob(
-                            data.as_ptr(),
-                            &shape,
-                            &[],
-                            tch::Kind::Float,
-                            Device::Cpu,
-                        )
+                        Tensor::from_blob(data.as_ptr(), &shape, &[], tch::Kind::Float, Device::Cpu)
                     };
 
                     // Convert to target dtype
@@ -247,7 +235,8 @@ impl StreamingWeightProvider {
                 dtype => {
                     return Err(anyhow::anyhow!(
                         "Tensor '{}' has unsupported dtype {:?}. Supported: F16, BF16, F32",
-                        name, dtype
+                        name,
+                        dtype
                     ));
                 }
             };

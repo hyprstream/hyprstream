@@ -16,8 +16,8 @@ use inquire::{Confirm, Select, Text};
 use hyprstream_tui::wizard::backend::*;
 
 use crate::cli::service_handlers::{
-    build_version, format_size, handle_service_install,
-    is_binary_installed, print_check, CheckStatus, InstallPlan,
+    build_version, format_size, handle_service_install, is_binary_installed, print_check,
+    CheckStatus, InstallPlan,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,8 +173,11 @@ pub async fn handle_wizard(
     let config_services = config_services.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        let mut backend =
-            crate::cli::bootstrap_manager::BootstrapManager::new(rt, models_dir.clone(), config_services.clone());
+        let mut backend = crate::cli::bootstrap_manager::BootstrapManager::new(
+            rt,
+            models_dir.clone(),
+            config_services.clone(),
+        );
         run_text_wizard(&mut backend, &options, &models_dir, &config_services)
     })
     .await??;
@@ -239,10 +242,20 @@ fn run_text_wizard(
     text_phase_binary_install(non_interactive)?;
 
     // Phase 3: Policy template selection
-    text_phase_templates(backend, non_interactive, options.enable_federation, &mut summary)?;
+    text_phase_templates(
+        backend,
+        non_interactive,
+        options.enable_federation,
+        &mut summary,
+    )?;
 
     // Phase 4: User/role creation
-    text_phase_users(backend, non_interactive, &options.initial_user_role, &mut summary)?;
+    text_phase_users(
+        backend,
+        non_interactive,
+        &options.initial_user_role,
+        &mut summary,
+    )?;
 
     // Phase 5: Token generation
     text_phase_tokens(backend, non_interactive, &mut summary)?;
@@ -251,7 +264,12 @@ fn run_text_wizard(
     text_phase_deployment_trust(options, models_dir, &mut summary)?;
 
     // Phase 7: Service startup
-    text_phase_services(backend, config_services, non_interactive, options.start_services)?;
+    text_phase_services(
+        backend,
+        config_services,
+        non_interactive,
+        options.start_services,
+    )?;
 
     // Summary
     print_summary(&summary);
@@ -329,7 +347,10 @@ fn text_phase_binary_install(non_interactive: bool) -> Result<()> {
     );
     println!("    Target: {}/hyprstream", plan.bin_dir.display());
     if plan.available_space > 0 {
-        println!("    Disk:   {} available", format_size(plan.available_space));
+        println!(
+            "    Disk:   {} available",
+            format_size(plan.available_space)
+        );
     }
     println!();
 
@@ -379,7 +400,11 @@ fn text_phase_binary_install(non_interactive: bool) -> Result<()> {
             }
         }
         Err(e) => {
-            print_check("Binary", CheckStatus::Fail, &format!("installation failed: {e}"));
+            print_check(
+                "Binary",
+                CheckStatus::Fail,
+                &format!("installation failed: {e}"),
+            );
         }
     }
 
@@ -445,7 +470,11 @@ fn text_phase_templates(
     if non_interactive {
         if let Some(first) = templates.first() {
             backend.apply_template(&first.name);
-            print_check("Template", CheckStatus::Ok, &format!("applied '{}'", first.name));
+            print_check(
+                "Template",
+                CheckStatus::Ok,
+                &format!("applied '{}'", first.name),
+            );
             summary.templates_applied.push(first.name.clone());
         }
         if enable_federation {
@@ -472,7 +501,11 @@ fn text_phase_templates(
         if let Some(template) = templates.iter().find(|t| t.name == template_name) {
             backend.apply_template(&template.name);
             backend.save_policies();
-            print_check("Template", CheckStatus::Ok, &format!("applied '{}'", template.name));
+            print_check(
+                "Template",
+                CheckStatus::Ok,
+                &format!("applied '{}'", template.name),
+            );
             summary.templates_applied.push(template.name.clone());
         }
     }
@@ -512,7 +545,9 @@ fn apply_federation_template(backend: &mut impl WizardBackend, summary: &mut Tex
         CheckStatus::Ok,
         &format!("applied '{FEDERATION_TEMPLATE}'"),
     );
-    summary.templates_applied.push(FEDERATION_TEMPLATE.to_owned());
+    summary
+        .templates_applied
+        .push(FEDERATION_TEMPLATE.to_owned());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -638,11 +673,9 @@ fn text_phase_tokens(
         let local_user = backend.local_username();
         let result = backend.generate_token(&local_user, "90d");
         print_token_result(&local_user, &result);
-        summary.tokens_generated.push((
-            local_user,
-            token_preview(&result.token),
-            result.expires,
-        ));
+        summary
+            .tokens_generated
+            .push((local_user, token_preview(&result.token), result.expires));
         println!();
         return Ok(());
     }
@@ -758,9 +791,12 @@ fn text_phase_deployment_trust(
     if let ceremony::CeremonyPlan::ChooseToken { tokens, rationale } = &plan {
         println!("    {rationale}.");
         let labels: Vec<String> = tokens.iter().map(ceremony::DetectedToken::label).collect();
-        let chosen = Select::new("  Which token should hold the deployment root?", labels.clone())
-            .prompt()
-            .map_err(|e| anyhow::anyhow!("no token was chosen: {e}"))?;
+        let chosen = Select::new(
+            "  Which token should hold the deployment root?",
+            labels.clone(),
+        )
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("no token was chosen: {e}"))?;
         let index = labels
             .iter()
             .position(|label| *label == chosen)
@@ -883,16 +919,16 @@ fn text_phase_deployment_trust(
     };
 
     println!();
-    for (step, command) in ceremony::ceremony_commands(&inputs)?.into_iter().enumerate() {
+    for (step, command) in ceremony::ceremony_commands(&inputs)?
+        .into_iter()
+        .enumerate()
+    {
         println!("    Ceremony step {}/4...", step + 1);
         crate::cli::trust::handle_trust_command(command)?;
     }
 
     let record = ceremony::mode_record(&mode, &break_glass, &rationale);
-    std::fs::write(
-        paths.mode_record(),
-        serde_json::to_vec_pretty(&record)?,
-    )?;
+    std::fs::write(paths.mode_record(), serde_json::to_vec_pretty(&record)?)?;
 
     print_check("Deployment trust", CheckStatus::Ok, mode.grade_label());
     println!();
@@ -900,7 +936,10 @@ fn text_phase_deployment_trust(
     println!("      {}", paths.public_ca().display());
     println!("      {}", paths.authority_log().display());
     println!("      {}", paths.authority_checkpoint().display());
-    println!("    Keep {} offline — it never belongs on a deployed host.", paths.authority_key().display());
+    println!(
+        "    Keep {} offline — it never belongs on a deployed host.",
+        paths.authority_key().display()
+    );
     println!();
 
     summary.deployment_trust = Some(format!("{} — {}", mode.mode_id(), mode.grade_label()));
@@ -972,8 +1011,7 @@ fn prompt_break_glass(
                     .map_err(|e| anyhow::anyhow!("no backup destination was entered: {e}"))?;
                 let destination = std::path::PathBuf::from(destination.trim());
                 println!("    Choose a passphrase and store it apart from the file itself.");
-                let recipient =
-                    ceremony::generate_passphrase_encrypted_identity(&destination)?;
+                let recipient = ceremony::generate_passphrase_encrypted_identity(&destination)?;
                 match ceremony::classify_identity_file(
                     &std::fs::read_to_string(&destination).unwrap_or_default(),
                 ) {
@@ -1332,10 +1370,8 @@ mod wizard_launch_routing_tests {
     /// whether BootstrapManager's launch routing runs at all.
     #[test]
     fn services_phase_requested_start_polls_to_done() -> Result<()> {
-        let mut backend = ServicesPhaseBackend::with_poll_script(vec![
-            OpStatus::InProgress,
-            OpStatus::Done,
-        ]);
+        let mut backend =
+            ServicesPhaseBackend::with_poll_script(vec![OpStatus::InProgress, OpStatus::Done]);
         text_phase_services(&mut backend, &["policy".to_owned()], true, true)?;
         assert_eq!(
             backend.start_calls.get(),

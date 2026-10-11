@@ -28,10 +28,7 @@ use crate::transport::{EndpointType, TransportConfig};
 
 /// Signal startup readiness: fire the `on_ready` oneshot (spawner waits on it)
 /// and notify systemd (`Type=notify`).
-fn signal_ready(
-    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
-    notify_systemd: bool,
-) {
+fn signal_ready(on_ready: Option<tokio::sync::oneshot::Sender<()>>, notify_systemd: bool) {
     if let Some(tx) = on_ready {
         let _ = tx.send(());
     }

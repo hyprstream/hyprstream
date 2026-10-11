@@ -1,9 +1,9 @@
 //! Purpose-bound hybrid holder evidence for read-only Policy queries.
 //! This is deliberately not a credential, envelope signature, or v16 proof.
 
-use crate::envelope::{RequestEnvelope, MAX_TIMESTAMP_AGE_MS};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+use crate::envelope::{RequestEnvelope, MAX_TIMESTAMP_AGE_MS};
 use crate::transport_traits::Signer;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{FromCapnp, ToCapnp};
@@ -76,7 +76,11 @@ fn transcript_from_parts(
     let target_len = u16::try_from(target.len())?;
     let operation_len = operation.map_or(0, str::len);
     let mut bytes = Vec::with_capacity(160 + target.len() + operation_len);
-    bytes.extend_from_slice(if operation.is_some() { PURPOSE_V2 } else { PURPOSE });
+    bytes.extend_from_slice(if operation.is_some() {
+        PURPOSE_V2
+    } else {
+        PURPOSE
+    });
     bytes.extend_from_slice(signer);
     bytes.extend_from_slice(&target_len.to_be_bytes());
     bytes.extend_from_slice(target.as_bytes());
@@ -112,10 +116,9 @@ pub async fn sign<S: Signer>(
         .pq_pubkey()
         .ok_or_else(|| anyhow!("hybrid witness signer required"))?;
     #[cfg(not(target_arch = "wasm32"))]
-    let operation = request
-        .service_domain
-        .as_deref()
-        .and_then(|service| crate::proof::policy::mediated_operation_for_request(service, &request.payload).ok());
+    let operation = request.service_domain.as_deref().and_then(|service| {
+        crate::proof::policy::mediated_operation_for_request(service, &request.payload).ok()
+    });
     #[cfg(target_arch = "wasm32")]
     let operation: Option<String> = None;
     let payload = transcript_with_operation(request, &ed, expires, operation.as_deref())?;
@@ -128,7 +131,11 @@ pub async fn sign<S: Signer>(
         .await?
         .ok_or_else(|| anyhow!("hybrid witness signature required"))?;
     let cose = assemble_composite_nested_pq_bound((ed.to_vec(), ed_sig), (pq, pq_sig))?;
-    let mut witness = if operation.is_some() { WITNESS_V2_MAGIC.to_vec() } else { Vec::new() };
+    let mut witness = if operation.is_some() {
+        WITNESS_V2_MAGIC.to_vec()
+    } else {
+        Vec::new()
+    };
     witness.extend_from_slice(&expires.to_be_bytes());
     witness.extend_from_slice(&cose);
     ensure!(
@@ -165,7 +172,8 @@ pub fn package(request: &RequestEnvelope, signer: &[u8; 32]) -> Option<Vec<u8>> 
 #[cfg(not(target_arch = "wasm32"))]
 fn package_v2(request: &RequestEnvelope, signer: &[u8; 32]) -> Option<Vec<u8>> {
     let target = request.service_domain.as_deref()?;
-    let operation = crate::proof::policy::mediated_operation_for_request(target, &request.payload).ok()?;
+    let operation =
+        crate::proof::policy::mediated_operation_for_request(target, &request.payload).ok()?;
     package_v2_for_operation(request, signer, &operation)
 }
 
@@ -190,8 +198,20 @@ fn package_v2_for_operation(
     }
 
     let mut bytes = Vec::with_capacity(
-        EVIDENCE_V2_MAGIC.len() + signer.len() + 2 + target.len() + 4 + credential.len()
-            + 32 + 8 + 16 + 8 + 2 + operation.len() + 2 + witness.len(),
+        EVIDENCE_V2_MAGIC.len()
+            + signer.len()
+            + 2
+            + target.len()
+            + 4
+            + credential.len()
+            + 32
+            + 8
+            + 16
+            + 8
+            + 2
+            + operation.len()
+            + 2
+            + witness.len(),
     );
     bytes.extend_from_slice(EVIDENCE_V2_MAGIC);
     bytes.extend_from_slice(signer);
@@ -292,12 +312,19 @@ fn verify_with_store(
         .ok_or_else(|| anyhow!("witness holder PQ anchor missing"))?;
     let ed = ed25519_dalek::VerifyingKey::from_bytes(&signer)?;
     crate::crypto::cose_sign::verify_composite(&witness[8..], &ed, Some(&pq), &payload, AAD, true)?;
-    Ok(VerifiedWitness { request, signer, operation: None })
+    Ok(VerifiedWitness {
+        request,
+        signer,
+        operation: None,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn take_bytes<'a>(remaining: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
-    ensure!(length <= remaining.len(), "truncated compact witness evidence");
+    ensure!(
+        length <= remaining.len(),
+        "truncated compact witness evidence"
+    );
     let (value, rest) = remaining.split_at(length);
     *remaining = rest;
     Ok(value)
@@ -305,8 +332,8 @@ fn take_bytes<'a>(remaining: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn verify_v2(bytes: &[u8], mediator: &str) -> Result<VerifiedWitness> {
-    let store = crate::envelope::global_pq_store()
-        .ok_or_else(|| anyhow!("witness PQ anchors missing"))?;
+    let store =
+        crate::envelope::global_pq_store().ok_or_else(|| anyhow!("witness PQ anchors missing"))?;
     verify_v2_with_store(bytes, mediator, Some(store.as_ref()))
 }
 
@@ -316,7 +343,10 @@ fn verify_v2_with_store(
     mediator: &str,
     store: Option<&dyn crate::envelope::PqTrustStore>,
 ) -> Result<VerifiedWitness> {
-    ensure!(bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES, "mediated evidence too large");
+    ensure!(
+        bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES,
+        "mediated evidence too large"
+    );
     let mut remaining = bytes
         .strip_prefix(EVIDENCE_V2_MAGIC)
         .ok_or_else(|| anyhow!("wrong compact witness evidence type"))?;
@@ -334,7 +364,10 @@ fn verify_v2_with_store(
     let iat = i64::from_be_bytes(take_bytes(&mut remaining, 8)?.try_into()?);
     let operation_len = u16::from_be_bytes(take_bytes(&mut remaining, 2)?.try_into()?) as usize;
     let operation = std::str::from_utf8(take_bytes(&mut remaining, operation_len)?)?;
-    ensure!(!operation.is_empty() && operation.len() <= 128, "invalid mediated operation");
+    ensure!(
+        !operation.is_empty() && operation.len() <= 128,
+        "invalid mediated operation"
+    );
     let witness_len = u16::from_be_bytes(take_bytes(&mut remaining, 2)?.try_into()?) as usize;
     let witness = take_bytes(&mut remaining, witness_len)?;
     ensure!(remaining.is_empty(), "trailing compact witness evidence");
@@ -344,18 +377,28 @@ fn verify_v2_with_store(
             && witness.len() <= MAX_WITNESS_BYTES,
         "invalid compact authorization witness size"
     );
-    let expires = i64::from_be_bytes(
-        witness[WITNESS_V2_MAGIC.len()..WITNESS_V2_MAGIC.len() + 8].try_into()?,
-    );
+    let expires =
+        i64::from_be_bytes(witness[WITNESS_V2_MAGIC.len()..WITNESS_V2_MAGIC.len() + 8].try_into()?);
     let now = crate::envelope::current_timestamp();
     ensure!(
-        expires == iat.checked_add(MAX_TIMESTAMP_AGE_MS).ok_or_else(|| anyhow!("witness expiry overflow"))?
+        expires
+            == iat
+                .checked_add(MAX_TIMESTAMP_AGE_MS)
+                .ok_or_else(|| anyhow!("witness expiry overflow"))?
             && now <= expires
             && i128::from(iat) - i128::from(now) <= 30_000,
         "authorization witness expired or outside freshness window"
     );
     let payload = transcript_from_parts(
-        target, credential, payload_hash, request_id, nonce, iat, &signer, expires, Some(operation),
+        target,
+        credential,
+        payload_hash,
+        request_id,
+        nonce,
+        iat,
+        &signer,
+        expires,
+        Some(operation),
     )?;
     let store = store.ok_or_else(|| anyhow!("witness PQ anchors missing"))?;
     let pq = store
@@ -363,7 +406,12 @@ fn verify_v2_with_store(
         .ok_or_else(|| anyhow!("witness holder PQ anchor missing"))?;
     let ed = ed25519_dalek::VerifyingKey::from_bytes(&signer)?;
     crate::crypto::cose_sign::verify_composite(
-        &witness[WITNESS_V2_MAGIC.len() + 8..], &ed, Some(&pq), &payload, AAD, true,
+        &witness[WITNESS_V2_MAGIC.len() + 8..],
+        &ed,
+        Some(&pq),
+        &payload,
+        AAD,
+        true,
     )?;
     let mut request = RequestEnvelope::new(Vec::new())
         .with_jwt_token(credential.to_owned())
@@ -372,7 +420,11 @@ fn verify_v2_with_store(
     request.nonce = nonce;
     request.iat = iat;
     request.authorization_witness = Some(witness.to_vec().into());
-    Ok(VerifiedWitness { request, signer, operation: Some(operation.to_owned()) })
+    Ok(VerifiedWitness {
+        request,
+        signer,
+        operation: Some(operation.to_owned()),
+    })
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -501,7 +553,9 @@ mod tests {
 
     #[tokio::test]
     async fn compact_witness_keeps_large_body_holder_and_operation_bindings() -> Result<()> {
-        use crate::crypto::cose_sign::{assemble_composite_nested_pq_bound, inner_tbs_pq_bound, outer_tbs};
+        use crate::crypto::cose_sign::{
+            assemble_composite_nested_pq_bound, inner_tbs_pq_bound, outer_tbs,
+        };
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x93; 32]);
         let signer = LocalSigner::new(key.clone());
@@ -515,13 +569,22 @@ mod tests {
             .with_jwt_token("credential-placeholder".to_owned())
             .with_service_domain("registry")?;
         let operation = "query";
-        let expires = request.iat.checked_add(MAX_TIMESTAMP_AGE_MS)
+        let expires = request
+            .iat
+            .checked_add(MAX_TIMESTAMP_AGE_MS)
             .ok_or_else(|| anyhow!("fixture expiry overflow"))?;
         let ed = signer.pubkey();
-        let pq = signer.pq_pubkey().ok_or_else(|| anyhow!("fixture PQ key missing"))?;
+        let pq = signer
+            .pq_pubkey()
+            .ok_or_else(|| anyhow!("fixture PQ key missing"))?;
         let payload = transcript_with_operation(&request, &ed, expires, Some(operation))?;
-        let ed_sig = signer.sign(&inner_tbs_pq_bound(ed.to_vec(), &pq, &payload, AAD)).await?.to_vec();
-        let pq_sig = signer.pq_sign(&outer_tbs(pq.clone(), &payload, &ed_sig, AAD)).await?
+        let ed_sig = signer
+            .sign(&inner_tbs_pq_bound(ed.to_vec(), &pq, &payload, AAD))
+            .await?
+            .to_vec();
+        let pq_sig = signer
+            .pq_sign(&outer_tbs(pq.clone(), &payload, &ed_sig, AAD))
+            .await?
             .ok_or_else(|| anyhow!("fixture PQ signature missing"))?;
         let cose = assemble_composite_nested_pq_bound((ed.to_vec(), ed_sig), (pq, pq_sig))?;
         let mut witness = WITNESS_V2_MAGIC.to_vec();
@@ -534,11 +597,19 @@ mod tests {
         assert!(evidence.len() <= MAX_MEDIATED_EVIDENCE_BYTES);
         let verified = verify_v2_with_store(&evidence, "registry", Some(&store))?;
         assert_eq!(verified.operation.as_deref(), Some(operation));
-        assert_eq!(verified.request.payload, Vec::<u8>::new(), "the large body is never copied into mediation evidence");
+        assert_eq!(
+            verified.request.payload,
+            Vec::<u8>::new(),
+            "the large body is never copied into mediation evidence"
+        );
         assert_eq!(verified.request.request_id, request.request_id);
 
-        let payload_hash_offset = EVIDENCE_V2_MAGIC.len() + 32 + 2 + "registry".len()
-            + 4 + "credential-placeholder".len();
+        let payload_hash_offset = EVIDENCE_V2_MAGIC.len()
+            + 32
+            + 2
+            + "registry".len()
+            + 4
+            + "credential-placeholder".len();
         let mut changed_hash = evidence.clone();
         changed_hash[payload_hash_offset] ^= 1;
         assert!(verify_v2_with_store(&changed_hash, "registry", Some(&store)).is_err());

@@ -8,20 +8,19 @@
 //! - macOS: APFS
 //! - Windows: ReFS, Dev Drive
 
-use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
+use super::driver::{Driver, DriverFactory, DriverOpts, WorktreeHandle};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::path::Path;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 #[cfg(feature = "reflink")]
 use reflink_copy::reflink;
 
 #[cfg(feature = "reflink")]
-inventory::submit!(DriverFactory::new(
-    "reflink",
-    || Box::new(ReflinkDriver::new())
-));
+inventory::submit!(DriverFactory::new("reflink", || Box::new(
+    ReflinkDriver::new()
+)));
 
 /// Reflink storage driver with cross-platform CoW support
 ///
@@ -107,7 +106,6 @@ impl Driver for ReflinkDriver {
         false
     }
 
-    
     #[cfg(feature = "reflink")]
     async fn create_worktree(&self, opts: &DriverOpts) -> Git2DBResult<WorktreeHandle> {
         // Strict: worktree path must not exist
@@ -133,10 +131,16 @@ impl Driver for ReflinkDriver {
         let worktree_path = opts.worktree_path.clone();
 
         // Step 1: Create git worktree with rollback
-        match self.create_git_worktree(&opts.base_repo, &worktree_path, &opts.ref_spec).await {
+        match self
+            .create_git_worktree(&opts.base_repo, &worktree_path, &opts.ref_spec)
+            .await
+        {
             Ok(_) => {
                 // Step 2: Replace working files with reflinks from base
-                match self.reflink_working_files(&opts.base_repo, &worktree_path).await {
+                match self
+                    .reflink_working_files(&opts.base_repo, &worktree_path)
+                    .await
+                {
                     Ok(_) => {
                         info!(
                             "Successfully created reflink worktree at {}",
@@ -169,8 +173,11 @@ impl Driver for ReflinkDriver {
     }
 
     async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
-        let worktrees_dir = base_repo.parent()
-            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+        let worktrees_dir = base_repo
+            .parent()
+            .ok_or_else(|| {
+                Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path")
+            })?
             .join("worktrees");
 
         let mut worktrees = Vec::new();
@@ -185,9 +192,11 @@ impl Driver for ReflinkDriver {
             let worktree_path = entry.path();
 
             // Skip non-directories and git's internal directories
-            if !worktree_path.is_dir() || worktree_path.file_name().is_some_and(|name| {
-                name.to_string_lossy().starts_with(".git")
-            }) {
+            if !worktree_path.is_dir()
+                || worktree_path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".git"))
+            {
                 continue;
             }
 
@@ -200,15 +209,27 @@ impl Driver for ReflinkDriver {
         Ok(worktrees)
     }
 
-    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
-        let worktrees_dir = base_repo.parent()
-            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+    async fn get_worktree(
+        &self,
+        base_repo: &Path,
+        branch: &str,
+    ) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktrees_dir = base_repo
+            .parent()
+            .ok_or_else(|| {
+                Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path")
+            })?
             .join("worktrees");
         let worktree_path = hyprstream_containedfs::contained_join(&worktrees_dir, branch)
-            .map_err(|e| Git2DBError::invalid_path(worktrees_dir, format!("Path containment: {e}")))?;
+            .map_err(|e| {
+                Git2DBError::invalid_path(worktrees_dir, format!("Path containment: {e}"))
+            })?;
 
         if worktree_path.exists() && worktree_path.join(".git").exists() {
-            Ok(Some(WorktreeHandle::new(worktree_path, "reflink".to_owned())))
+            Ok(Some(WorktreeHandle::new(
+                worktree_path,
+                "reflink".to_owned(),
+            )))
         } else {
             Ok(None)
         }
@@ -241,9 +262,7 @@ impl ReflinkDriver {
         })?;
 
         let commit = object.peel_to_commit().map_err(|e| {
-            Git2DBError::internal(format!(
-                "Ref '{ref_spec}' does not point to a commit: {e}"
-            ))
+            Git2DBError::internal(format!("Ref '{ref_spec}' does not point to a commit: {e}"))
         })?;
 
         // Check if this is a branch
@@ -279,9 +298,9 @@ impl ReflinkDriver {
                 .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
             let wt_repo = git2::Repository::open(worktree_path)?;
-            wt_repo.set_head_detached(commit.id()).map_err(|e| {
-                Git2DBError::internal(format!("Failed to set detached HEAD: {e}"))
-            })?;
+            wt_repo
+                .set_head_detached(commit.id())
+                .map_err(|e| Git2DBError::internal(format!("Failed to set detached HEAD: {e}")))?;
 
             wt_repo
                 .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
@@ -334,17 +353,17 @@ impl ReflinkDriver {
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
         {
-            let entry = entry.map_err(|e| {
-                Git2DBError::internal(format!("Failed to walk directory: {e}"))
-            })?;
+            let entry = entry
+                .map_err(|e| Git2DBError::internal(format!("Failed to walk directory: {e}")))?;
 
             if !entry.file_type().is_file() {
                 continue;
             }
 
-            let rel_path = entry.path().strip_prefix(target).map_err(|e| {
-                Git2DBError::internal(format!("Failed to get relative path: {e}"))
-            })?;
+            let rel_path = entry
+                .path()
+                .strip_prefix(target)
+                .map_err(|e| Git2DBError::internal(format!("Failed to get relative path: {e}")))?;
 
             // Prevent path traversal
             if rel_path.components().any(|c| c.as_os_str() == "..") {
@@ -362,9 +381,7 @@ impl ReflinkDriver {
                 continue;
             }
 
-            let file_size = std::fs::metadata(&base_file)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let file_size = std::fs::metadata(&base_file).map(|m| m.len()).unwrap_or(0);
 
             std::fs::remove_file(target_file).map_err(|e| {
                 Git2DBError::internal(format!("Failed to remove {}: {}", target_file.display(), e))

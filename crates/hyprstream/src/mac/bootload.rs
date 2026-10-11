@@ -38,10 +38,10 @@ use crate::mac::compiled::{
     sign_policy, CompiledPolicy, PolicyApproval, PolicyDistError, PolicyLoader,
 };
 use crate::mac::compiler::{compile, PermissionMap};
+use crate::mac::install_compiled_policy;
 use crate::mac::lattice::{Lattice, LatticeVersion, SecurityLabel};
 use crate::mac::permission_map::ScopePermissionMap;
 use crate::mac::te::SubjectType;
-use crate::mac::install_compiled_policy;
 
 /// Errors from the boot path. All fail-closed: on any error nothing is installed
 /// and [`crate::mac::compiled_policy`] stays `None` (the resolver keeps denying).

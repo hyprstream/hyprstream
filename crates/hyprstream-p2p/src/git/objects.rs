@@ -1,10 +1,13 @@
 //! Git object utilities for GitTorrent SHA256 operations
 
-use crate::{types::{GitHash, ObjectFormat, Sha256Hash, GitRefs}, Result, Error};
 use crate::crypto::hash::sha256_git;
-use std::path::Path;
+use crate::{
+    types::{GitHash, GitRefs, ObjectFormat, Sha256Hash},
+    Error, Result,
+};
+use git2::{ObjectType, Oid, Repository};
 use std::collections::HashMap;
-use git2::{Repository, ObjectType, Oid};
+use std::path::Path;
 
 /// Check if a repository is exportable (has git-daemon-export-ok file)
 pub fn is_exportable<P: AsRef<Path>>(repo_path: P) -> bool {
@@ -145,7 +148,11 @@ pub async fn extract_commit_objects(repo_path: &Path, commit_hash: &str) -> Resu
         }
     }
 
-    tracing::info!("Extracted {} objects for commit {}", objects.len(), commit_hash);
+    tracing::info!(
+        "Extracted {} objects for commit {}",
+        objects.len(),
+        commit_hash
+    );
     Ok(objects)
 }
 
@@ -201,11 +208,11 @@ pub struct TreeEntry {
 /// Tree entry modes
 #[derive(Debug, Clone, PartialEq)]
 pub enum TreeEntryMode {
-    File,        // 100644
-    Executable,  // 100755
-    Directory,   // 040000
-    Symlink,     // 120000
-    Gitlink,     // 160000 (submodule)
+    File,       // 100644
+    Executable, // 100755
+    Directory,  // 040000
+    Symlink,    // 120000
+    Gitlink,    // 160000 (submodule)
 }
 
 /// Git tree object data
@@ -217,7 +224,9 @@ pub struct TreeObject {
 /// Parse a commit object from git format
 pub fn parse_commit_object(data: &[u8]) -> Result<CommitObject> {
     // Parse git object header: "commit <size>\0<content>"
-    let null_pos = data.iter().position(|&b| b == 0)
+    let null_pos = data
+        .iter()
+        .position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
 
     let header = std::str::from_utf8(&data[..null_pos])?;
@@ -238,7 +247,13 @@ pub fn parse_commit_object(data: &[u8]) -> Result<CommitObject> {
     for (i, line) in content_str.lines().enumerate() {
         if line.is_empty() {
             // Empty line indicates start of commit message
-            message_start = Some(content_str.lines().skip(i + 1).collect::<Vec<_>>().join("\n"));
+            message_start = Some(
+                content_str
+                    .lines()
+                    .skip(i + 1)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             break;
         }
 
@@ -273,7 +288,9 @@ pub fn parse_commit_object(data: &[u8]) -> Result<CommitObject> {
 /// width instead of a hardcoded 20.
 pub fn parse_tree_object(data: &[u8], format: ObjectFormat) -> Result<TreeObject> {
     // Parse git object header: "tree <size>\0<content>"
-    let null_pos = data.iter().position(|&b| b == 0)
+    let null_pos = data
+        .iter()
+        .position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
 
     let header = std::str::from_utf8(&data[..null_pos])?;
@@ -288,11 +305,14 @@ pub fn parse_tree_object(data: &[u8], format: ObjectFormat) -> Result<TreeObject
 
     while !content.is_empty() {
         // Parse mode and name (terminated by null byte)
-        let null_pos = content.iter().position(|&b| b == 0)
+        let null_pos = content
+            .iter()
+            .position(|&b| b == 0)
             .ok_or_else(|| Error::other("Invalid tree entry format"))?;
 
         let entry_header = std::str::from_utf8(&content[..null_pos])?;
-        let space_pos = entry_header.find(' ')
+        let space_pos = entry_header
+            .find(' ')
             .ok_or_else(|| Error::other("Invalid tree entry header"))?;
 
         let mode_str = &entry_header[..space_pos];
@@ -336,7 +356,9 @@ pub fn parse_tree_object(data: &[u8], format: ObjectFormat) -> Result<TreeObject
 /// Parse a blob object from git format
 pub fn parse_blob_object(data: &[u8]) -> Result<Vec<u8>> {
     // Parse git object header: "blob <size>\0<content>"
-    let null_pos = data.iter().position(|&b| b == 0)
+    let null_pos = data
+        .iter()
+        .position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
 
     let header = std::str::from_utf8(&data[..null_pos])?;
@@ -357,7 +379,9 @@ pub fn parse_blob_object(data: &[u8]) -> Result<Vec<u8>> {
 /// object being parsed (`GitHash::object_format`).
 pub fn parse_object_references(object_data: &[u8], format: ObjectFormat) -> Result<Vec<GitHash>> {
     // Determine object type and parse accordingly
-    let null_pos = object_data.iter().position(|&b| b == 0)
+    let null_pos = object_data
+        .iter()
+        .position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
 
     let header = std::str::from_utf8(&object_data[..null_pos])?;
@@ -423,10 +447,8 @@ pub fn hash_to_oid(hash: &GitHash) -> Result<Oid> {
     // git2 0.20.3 still primarily uses SHA1 Oids
     // SHA256 support in libgit2 1.9.2 is available but not yet exposed in git2-rs
     match hash {
-        GitHash::Sha1(_) => {
-            Oid::from_str(&hash.to_hex())
-                .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {e}")))
-        }
+        GitHash::Sha1(_) => Oid::from_str(&hash.to_hex())
+            .map_err(|e| Error::other(format!("Cannot convert hash to Oid: {e}"))),
         GitHash::Sha256(_) => {
             // SHA256 git repos are not yet widely supported
             // When git2 exposes SHA256 Oid support, this will work
@@ -442,16 +464,21 @@ pub fn oid_to_sha256(oid: Oid) -> Result<Sha256Hash> {
     if oid_str.len() == 64 {
         Sha256Hash::new(oid_str)
     } else {
-        Err(Error::other("SHA1 hashes are no longer supported, use SHA256"))
+        Err(Error::other(
+            "SHA1 hashes are no longer supported, use SHA256",
+        ))
     }
 }
 
 // Keep legacy function for backwards compatibility during migration
 #[deprecated(note = "Use hash_to_oid instead - it supports GitHash enum")]
 pub fn sha256_to_oid(hash: &Sha256Hash) -> Result<Oid> {
-    Oid::from_str(hash.as_str()).map_err(|e| Error::other(format!("Cannot convert SHA256 to Oid (git2 limitation): {e}")))
+    Oid::from_str(hash.as_str()).map_err(|e| {
+        Error::other(format!(
+            "Cannot convert SHA256 to Oid (git2 limitation): {e}"
+        ))
+    })
 }
-
 
 /// Extract git references from a repository
 pub async fn extract_git_refs(repo_path: &Path) -> Result<GitRefs> {
@@ -487,14 +514,13 @@ pub async fn extract_git_refs(repo_path: &Path) -> Result<GitRefs> {
     })
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use git2::Repository;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     /// Build the raw bytes of a git tree object with a single entry whose OID
     /// is `oid` bytes wide, e.g. `"tree <size>\0100644 file\0<oid...>"`.
@@ -583,14 +609,7 @@ mod tests {
         let tree = repo.find_tree(tree_id)?;
         let sig = git2::Signature::now("Test", "test@example.com")?;
 
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Initial commit",
-            &tree,
-            &[],
-        )?;
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?;
 
         // Extract objects
         let objects = extract_objects(temp_dir.path()).await?;

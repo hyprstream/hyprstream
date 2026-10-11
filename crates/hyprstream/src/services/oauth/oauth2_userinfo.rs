@@ -54,20 +54,31 @@ pub async fn fetch_oauth2_claims(
         other if other.is_null() => {
             return Err(anyhow!("userinfo '{}' field is null", mapping.sub));
         }
-        _ => return Err(anyhow!("userinfo '{}' field missing or wrong type", mapping.sub)),
+        _ => {
+            return Err(anyhow!(
+                "userinfo '{}' field missing or wrong type",
+                mapping.sub
+            ))
+        }
     };
 
     // Extract optional string fields — null is acceptable.
-    let name = mapping.name.as_deref()
+    let name = mapping
+        .name
+        .as_deref()
         .map(|field| raw[field].clone())
         .unwrap_or(serde_json::Value::Null);
 
-    let email = mapping.email.as_deref()
+    let email = mapping
+        .email
+        .as_deref()
         .map(|field| raw[field].clone())
         .unwrap_or(serde_json::Value::Null);
 
     // Extract email_verified — absent or null field → false.
-    let email_verified: bool = mapping.email_verified.as_deref()
+    let email_verified: bool = mapping
+        .email_verified
+        .as_deref()
         .and_then(|field| {
             let v = &raw[field];
             match v {

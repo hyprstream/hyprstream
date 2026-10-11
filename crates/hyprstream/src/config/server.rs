@@ -24,7 +24,10 @@ pub struct CorsConfig {
     /// explicitly in Bearer/DPoP headers, never in ambient browser credentials.
     /// Operators may still configure an exact origin list; pairing that list
     /// with `allow_credentials = true` preserves the legacy deployment posture.
-    #[serde(default = "default_cors_origins", deserialize_with = "deserialize_cors_origins")]
+    #[serde(
+        default = "default_cors_origins",
+        deserialize_with = "deserialize_cors_origins"
+    )]
     pub allowed_origins: Vec<String>,
 
     /// Allow ambient browser credentials (cookies or HTTP authentication).
@@ -679,6 +682,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "mTLS client-cert verification")]
     fn mtls_guard_rejects_client_auth_even_alongside_no_auth() {
-        assert_no_mtls_verifier("builder.with_no_client_auth(); builder.with_client_auth_cert(cert)");
+        assert_no_mtls_verifier(
+            "builder.with_no_client_auth(); builder.with_client_auth_cert(cert)",
+        );
     }
 }

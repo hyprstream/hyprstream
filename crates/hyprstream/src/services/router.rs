@@ -843,7 +843,10 @@ mod tests {
         // the least-loaded node.
         let _ = router.place("sess-A", &set, now).unwrap();
         let p = router.place("sess-B", &set, now).unwrap();
-        assert_eq!(p.replica_id, set[1].replica_id, "Spread must pick least-loaded");
+        assert_eq!(
+            p.replica_id, set[1].replica_id,
+            "Spread must pick least-loaded"
+        );
     }
 
     // ---- Failure detection: dial-fail → reassign ----
@@ -859,7 +862,10 @@ mod tests {
         assert!(was_new, "first down-mark must be a transition");
         // Next placement must rebind to a different node.
         let p2 = router.place("sess-A", &set, now).unwrap();
-        assert_ne!(p2.replica_id, p1.replica_id, "down node must not be reselected");
+        assert_ne!(
+            p2.replica_id, p1.replica_id,
+            "down node must not be reselected"
+        );
         assert!(
             p2.rebound,
             "reassignment after down must record a new binding"

@@ -112,7 +112,10 @@ impl DedupDomain {
         compartment: Option<Compartment>,
         trust_boundary: TrustBoundary,
     ) -> Result<Self, InvalidDedupDomain> {
-        if algorithm.validate_digest_len(digest_length as usize).is_err() {
+        if algorithm
+            .validate_digest_len(digest_length as usize)
+            .is_err()
+        {
             return Err(InvalidDedupDomain {
                 algorithm,
                 digest_length,
@@ -167,7 +170,9 @@ impl DedupDomain {
 /// Error returned by [`DedupDomain::new`] when the `(algorithm, digest_length)`
 /// pair is not a well-formed multihash pair (e.g. sha1/32, blake3/48).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid dedup domain: algorithm {algorithm:?} does not accept digest length {digest_length}")]
+#[error(
+    "invalid dedup domain: algorithm {algorithm:?} does not accept digest length {digest_length}"
+)]
 pub struct InvalidDedupDomain {
     pub algorithm: HashAlgo,
     pub digest_length: u16,
@@ -182,7 +187,11 @@ mod tests {
     fn default_domain_maps_to_root() {
         let d = DedupDomain::local_default();
         assert!(d.is_default());
-        assert_eq!(d.relative_path(), PathBuf::new(), "default domain is the root");
+        assert_eq!(
+            d.relative_path(),
+            PathBuf::new(),
+            "default domain is the root"
+        );
     }
 
     #[test]
@@ -228,8 +237,8 @@ mod tests {
         // root (Blake3/32/None/Local); we want to compare two real sub-paths and
         // see the length encoded in each.
         let tenant = Some(Compartment::new("tenant:acme"));
-        let w256 = DedupDomain::new(HashAlgo::Blake3, 32, tenant.clone(), TrustBoundary::Local)
-            .unwrap();
+        let w256 =
+            DedupDomain::new(HashAlgo::Blake3, 32, tenant.clone(), TrustBoundary::Local).unwrap();
         let w512 = DedupDomain::new(HashAlgo::Blake3, 64, tenant, TrustBoundary::Local).unwrap();
         let p256 = w256.relative_path();
         let p512 = w512.relative_path();
@@ -267,7 +276,8 @@ mod tests {
         let d = DedupDomain::local_tenant(Compartment::new("../../etc/passwd"));
         let p = d.relative_path();
         assert!(
-            p.components().all(|c| !matches!(c, std::path::Component::ParentDir)),
+            p.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir)),
             "compartment name must never yield a `..` component: {p:?}"
         );
     }

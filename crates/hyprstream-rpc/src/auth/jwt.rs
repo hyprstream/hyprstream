@@ -10,7 +10,7 @@
 //! - Payload: Claims (sub, exp, iat)
 //! - Signature: Ed25519 over `base64url(header).base64url(payload)`
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
@@ -1207,28 +1207,15 @@ mod tests {
         let signer = make_key(0x11);
         let unrelated = make_key(0x99);
         let claims = Claims::new("no-match".to_owned(), 0, 9_999_999_999);
-        let token = encode_with_header(
-            &claims,
-            &signer,
-            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
-        );
-        assert!(decode_with_any_key_lenient(
-            &token,
-            &[unrelated.verifying_key()],
-            None
-        )
-        .is_err());
+        let token = encode_with_header(&claims, &signer, r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
+        assert!(decode_with_any_key_lenient(&token, &[unrelated.verifying_key()], None).is_err());
     }
 
     #[test]
     fn decode_with_any_key_empty_set_fails_closed() {
         let signer = make_key(0x22);
         let claims = Claims::new("empty".to_owned(), 0, 9_999_999_999);
-        let token = encode_with_header(
-            &claims,
-            &signer,
-            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
-        );
+        let token = encode_with_header(&claims, &signer, r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
         assert!(decode_with_any_key_lenient(&token, &[], None).is_err());
     }
 

@@ -34,11 +34,11 @@ use nydus_storage::backend::{BlobBackend, BlobBufReader};
 use crate::config::ImageConfig;
 use crate::error::{Result, WorkerError};
 
-use hyprstream_rpc_std::worker_client::{
-    AuthConfig as GenAuthConfig, FilesystemIdentifier, FilesystemUsage, ImageInfo,
-    ImageSpec, ImageStatusResult,
-};
 use super::manifest::{AuthConfig, ImageReference, ManifestFetcher, ManifestResult};
+use hyprstream_rpc_std::worker_client::{
+    AuthConfig as GenAuthConfig, FilesystemIdentifier, FilesystemUsage, ImageInfo, ImageSpec,
+    ImageStatusResult,
+};
 
 /// RAFS-backed image store with Dragonfly-native blob fetching
 ///
@@ -76,8 +76,9 @@ pub struct RafsStore {
 impl RafsStore {
     /// Create a new RafsStore with configuration
     pub fn new(config: ImageConfig) -> Result<Self> {
-        let manifest_fetcher = ManifestFetcher::new()
-            .map_err(|e| WorkerError::RafsError(format!("failed to create manifest fetcher: {e}")))?;
+        let manifest_fetcher = ManifestFetcher::new().map_err(|e| {
+            WorkerError::RafsError(format!("failed to create manifest fetcher: {e}"))
+        })?;
 
         Ok(Self {
             blobs_dir: config.blobs_dir.clone(),
@@ -106,17 +107,29 @@ impl RafsStore {
         self.ensure_dirs().await?;
 
         // 1. Parse image reference
-        let img_ref = ImageReference::parse(image_ref)
-            .map_err(|e| WorkerError::ImageParseFailed {
+        let img_ref =
+            ImageReference::parse(image_ref).map_err(|e| WorkerError::ImageParseFailed {
                 image: image_ref.to_owned(),
                 reason: e.to_string(),
             })?;
 
         // Convert CRI auth (GenAuthConfig with String fields) to manifest auth (Option<String> fields)
         let manifest_auth = auth.map(|a| AuthConfig {
-            username: if a.username.is_empty() { None } else { Some(a.username.clone()) },
-            password: if a.password.is_empty() { None } else { Some(a.password.clone()) },
-            token: if a.auth.is_empty() { None } else { Some(a.auth.clone()) },
+            username: if a.username.is_empty() {
+                None
+            } else {
+                Some(a.username.clone())
+            },
+            password: if a.password.is_empty() {
+                None
+            } else {
+                Some(a.password.clone())
+            },
+            token: if a.auth.is_empty() {
+                None
+            } else {
+                Some(a.auth.clone())
+            },
         });
 
         // 2. Fetch manifest
@@ -138,9 +151,9 @@ impl RafsStore {
                     .manifests
                     .iter()
                     .find(|m| {
-                        m.platform.as_ref().is_some_and(|p| {
-                            p.os == "linux" && p.architecture == "amd64"
-                        })
+                        m.platform
+                            .as_ref()
+                            .is_some_and(|p| p.os == "linux" && p.architecture == "amd64")
                     })
                     .or_else(|| idx.manifests.first())
                     .ok_or_else(|| WorkerError::ImagePullFailed {
@@ -154,7 +167,11 @@ impl RafsStore {
                 );
 
                 self.manifest_fetcher
-                    .fetch_platform_manifest(&img_ref, &platform_manifest.digest, manifest_auth.as_ref())
+                    .fetch_platform_manifest(
+                        &img_ref,
+                        &platform_manifest.digest,
+                        manifest_auth.as_ref(),
+                    )
                     .await
                     .map_err(|e| WorkerError::ImagePullFailed {
                         image: image_ref.to_owned(),
@@ -170,10 +187,17 @@ impl RafsStore {
         );
 
         // 4. Download config blob via nydus-storage
-        let config_path = self.blobs_dir.join(digest_to_filename(&manifest.config.digest));
+        let config_path = self
+            .blobs_dir
+            .join(digest_to_filename(&manifest.config.digest));
         if !config_path.exists() {
-            self.download_blob(&img_ref, &manifest.config.digest, &config_path, manifest_auth.as_ref())
-                .await?;
+            self.download_blob(
+                &img_ref,
+                &manifest.config.digest,
+                &config_path,
+                manifest_auth.as_ref(),
+            )
+            .await?;
             tracing::debug!(digest = %manifest.config.digest, "Downloaded config");
         }
 
@@ -291,9 +315,7 @@ impl RafsStore {
         auth: Option<&AuthConfig>,
     ) -> Result<()> {
         // Extract blob ID from digest (remove "sha256:" prefix)
-        let blob_id = digest
-            .strip_prefix("sha256:")
-            .unwrap_or(digest).to_owned(); // Convert to owned String for 'static lifetime
+        let blob_id = digest.strip_prefix("sha256:").unwrap_or(digest).to_owned(); // Convert to owned String for 'static lifetime
 
         // Create nydus-storage Registry backend config
         let registry_config = self.create_registry_config(img_ref, &blob_id, auth);
@@ -315,9 +337,7 @@ impl RafsStore {
             })?;
 
         rx.await.map_err(|e| {
-            WorkerError::RafsError(format!(
-                "blob download thread exited without a result: {e}"
-            ))
+            WorkerError::RafsError(format!("blob download thread exited without a result: {e}"))
         })?
     }
 
@@ -531,7 +551,8 @@ impl RafsStore {
                 match path.extension().and_then(|e| e.to_str()) {
                     Some("json") => {
                         if let Ok(metadata_str) = std::fs::read_to_string(&path) {
-                            if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&metadata_str)
+                            if let Ok(metadata) =
+                                serde_json::from_str::<ImageMetadata>(&metadata_str)
                             {
                                 referenced.insert(digest_to_filename(&metadata.config_digest));
                                 for layer in &metadata.layers {

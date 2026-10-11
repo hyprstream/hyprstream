@@ -456,7 +456,9 @@ mod tests {
     #[tokio::test]
     async fn public_stream_is_allowed_even_anonymous() {
         let authz = DefaultAuthorizer::permissive();
-        let decision = authz.authorize(&PeerIdentity::anonymous(), "alice/s/t/i").await;
+        let decision = authz
+            .authorize(&PeerIdentity::anonymous(), "alice/s/t/i")
+            .await;
         assert_eq!(decision, SubscribeDecision::Allow);
         assert!(decision.is_allowed());
     }
@@ -464,9 +466,13 @@ mod tests {
     #[tokio::test]
     async fn private_stream_without_gate_is_denied() {
         // All-private classifier, no gate installed → fail-closed deny.
-        let authz =
-            DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), None);
-        let decision = authz.authorize(&PeerIdentity::authenticated("did:key:z6Mk..."), "alice/s/t/i").await;
+        let authz = DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), None);
+        let decision = authz
+            .authorize(
+                &PeerIdentity::authenticated("did:key:z6Mk..."),
+                "alice/s/t/i",
+            )
+            .await;
         assert_eq!(decision, SubscribeDecision::Deny);
     }
 
@@ -476,11 +482,11 @@ mod tests {
         let gate: PolicyGate = Arc::new(|peer: &PeerIdentity, _track: &str| {
             peer.subject.as_deref() == Some("alice-node")
         });
-        let authz =
-            DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), Some(gate));
+        let authz = DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), Some(gate));
 
-        let allowed =
-            authz.authorize(&PeerIdentity::authenticated("alice-node"), "alice/s/t/i").await;
+        let allowed = authz
+            .authorize(&PeerIdentity::authenticated("alice-node"), "alice/s/t/i")
+            .await;
         assert_eq!(allowed, SubscribeDecision::Allow);
     }
 
@@ -489,16 +495,18 @@ mod tests {
         let gate: PolicyGate = Arc::new(|peer: &PeerIdentity, _track: &str| {
             peer.subject.as_deref() == Some("alice-node")
         });
-        let authz =
-            DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), Some(gate));
+        let authz = DefaultAuthorizer::new(Arc::new(|_| Visibility::Private), Some(gate));
 
         // Different subject → denied.
-        let denied =
-            authz.authorize(&PeerIdentity::authenticated("mallory-node"), "alice/s/t/i").await;
+        let denied = authz
+            .authorize(&PeerIdentity::authenticated("mallory-node"), "alice/s/t/i")
+            .await;
         assert_eq!(denied, SubscribeDecision::Deny);
 
         // Anonymous peer on a private stream → denied (fail-closed).
-        let anon = authz.authorize(&PeerIdentity::anonymous(), "alice/s/t/i").await;
+        let anon = authz
+            .authorize(&PeerIdentity::anonymous(), "alice/s/t/i")
+            .await;
         assert_eq!(anon, SubscribeDecision::Deny);
     }
 
@@ -512,24 +520,29 @@ mod tests {
                 Visibility::Private
             }
         });
-        let gate: PolicyGate = Arc::new(|peer: &PeerIdentity, _| {
-            peer.subject.as_deref() == Some("priv-allowed")
-        });
+        let gate: PolicyGate =
+            Arc::new(|peer: &PeerIdentity, _| peer.subject.as_deref() == Some("priv-allowed"));
         let authz = DefaultAuthorizer::new(visibility, Some(gate));
 
         // Public stream: open even to anonymous.
         assert_eq!(
-            authz.authorize(&PeerIdentity::anonymous(), "pub/s/t/i").await,
+            authz
+                .authorize(&PeerIdentity::anonymous(), "pub/s/t/i")
+                .await,
             SubscribeDecision::Allow
         );
         // Private stream: authorized subject allowed.
         assert_eq!(
-            authz.authorize(&PeerIdentity::authenticated("priv-allowed"), "alice/s/t/i").await,
+            authz
+                .authorize(&PeerIdentity::authenticated("priv-allowed"), "alice/s/t/i")
+                .await,
             SubscribeDecision::Allow
         );
         // Private stream: other subject denied.
         assert_eq!(
-            authz.authorize(&PeerIdentity::authenticated("nope"), "alice/s/t/i").await,
+            authz
+                .authorize(&PeerIdentity::authenticated("nope"), "alice/s/t/i")
+                .await,
             SubscribeDecision::Deny
         );
     }
@@ -565,8 +578,7 @@ mod scope_tests {
         let _b1 = producer.create_broadcast("bob/streams/run-9/i0").unwrap();
 
         // Scope a consumer to tenant "alice".
-        let mut scoped =
-            tenant_scoped_consumer(&base, "alice").expect("alice scope should exist");
+        let mut scoped = tenant_scoped_consumer(&base, "alice").expect("alice scope should exist");
 
         // Drain everything currently announced through the scoped cursor.
         // `OriginAnnounce` is `(path, Some(broadcast))` for an announce and
@@ -599,12 +611,14 @@ mod scope_tests {
         let base = producer.consume();
         let _b1 = producer.create_broadcast("bob/streams/run-9/i0").unwrap();
 
-        let scoped =
-            tenant_scoped_consumer(&base, "alice").expect("alice scope should exist");
+        let scoped = tenant_scoped_consumer(&base, "alice").expect("alice scope should exist");
 
         // bob/... is outside alice's scope → not reachable.
         let reached = scoped.announced_broadcast("bob/streams/run-9/i0").await;
-        assert!(reached.is_none(), "alice-scoped consumer must not reach bob's broadcast");
+        assert!(
+            reached.is_none(),
+            "alice-scoped consumer must not reach bob's broadcast"
+        );
     }
 
     // ── #1271: MAC-backed subscribe authorizer ─────────────────────────────
@@ -648,11 +662,12 @@ mod scope_tests {
             SubscribeDecision::Deny
         );
         assert_eq!(
-            authz.authorize(&PeerIdentity::authenticated("did:web:x"), "t").await,
+            authz
+                .authorize(&PeerIdentity::authenticated("did:web:x"), "t")
+                .await,
             SubscribeDecision::Deny
         );
-        let config =
-            crate::transport::iroh_moq::MoqAuthzConfig::default().with_authorizer(authz);
+        let config = crate::transport::iroh_moq::MoqAuthzConfig::default().with_authorizer(authz);
         assert_eq!(
             config
                 .authorize_without_track_hook(&PeerIdentity::authenticated("did:web:x"))

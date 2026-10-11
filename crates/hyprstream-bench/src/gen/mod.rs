@@ -53,11 +53,7 @@ fn item_seed(config: &BenchConfig, family: Family, stratum: Stratum, kind: u64, 
         .position(|f| *f == family)
         .map_or(0, |position| position as u64);
     let stratum_tag = u64::from(stratum == Stratum::NearMiss);
-    config.seed_base
-        ^ (family_tag << 48)
-        ^ (stratum_tag << 44)
-        ^ (kind << 36)
-        ^ u64::from(index)
+    config.seed_base ^ (family_tag << 48) ^ (stratum_tag << 44) ^ (kind << 36) ^ u64::from(index)
 }
 
 /// Generate the full benchmark: all families × base strata × kinds × seeds,

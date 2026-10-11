@@ -154,7 +154,8 @@ pub fn provision_services(
     roster_export: Option<&Path>,
 ) -> Result<()> {
     ensure!(
-        (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS).contains(&valid_for_seconds),
+        (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS)
+            .contains(&valid_for_seconds),
         "service identity lifetime must be {}..{} seconds",
         MIN_SERVICE_IDENTITY_TTL_SECS,
         MAX_SERVICE_IDENTITY_TTL_SECS
@@ -233,9 +234,13 @@ pub fn inspect_services(config: &HyprConfig, services: &[String]) -> Result<Vec<
     let secrets = provisioning_secrets_dir(config)?;
     let keys = load_roster_keys(&secrets, services)?;
     let directory = hyprstream_service::deployment_data_dir()?.join("pds-store");
-    let store = open_checkpoint_store(config, &directory, true)?
-        .with_at9p_deployment_verifier(verifier);
-    inspect_verified_roster(&store, &keys, &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
+    let store =
+        open_checkpoint_store(config, &directory, true)?.with_at9p_deployment_verifier(verifier);
+    inspect_verified_roster(
+        &store,
+        &keys,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    )
 }
 
 fn validate_service_roster(services: &[String]) -> Result<()> {
@@ -252,10 +257,13 @@ fn validate_service_roster(services: &[String]) -> Result<()> {
 }
 
 fn load_roster_keys(secrets: &Path, services: &[String]) -> Result<Vec<(String, SigningKey)>> {
-    services.iter().map(|name| {
-        load_existing_service_signing_key(secrets, name, SecretsProfile::SharedDirectory)
-            .map(|key| (name.clone(), key))
-    }).collect()
+    services
+        .iter()
+        .map(|name| {
+            load_existing_service_signing_key(secrets, name, SecretsProfile::SharedDirectory)
+                .map(|key| (name.clone(), key))
+        })
+        .collect()
 }
 
 fn inspect_verified_roster(
@@ -271,10 +279,19 @@ fn inspect_verified_roster(
     for (name, key) in keys {
         let service_id = format!("#{name}");
         let mut matching = states.iter().filter(|state| {
-            state.current.services.iter().any(|service| service.id == service_id)
+            state
+                .current
+                .services
+                .iter()
+                .any(|service| service.id == service_id)
         });
-        let state = matching.next().with_context(|| format!("no accepted identity for service {name}"))?;
-        ensure!(matching.next().is_none(), "multiple accepted identities match service {name}");
+        let state = matching
+            .next()
+            .with_context(|| format!("no accepted identity for service {name}"))?;
+        ensure!(
+            matching.next().is_none(),
+            "multiple accepted identities match service {name}"
+        );
         admitted.push((name.as_str(), key, state.clone()));
     }
     let entries = build_verified_roster_entries(store, &admitted, now_text)?;
@@ -283,8 +300,13 @@ fn inspect_verified_roster(
     Ok(bytes)
 }
 
-fn serialize_verified_roster_manifest(services: Vec<VerifiedServiceRosterEntry>) -> Result<Vec<u8>> {
-    ensure!(!services.is_empty(), "refusing to export an empty verified service roster");
+fn serialize_verified_roster_manifest(
+    services: Vec<VerifiedServiceRosterEntry>,
+) -> Result<Vec<u8>> {
+    ensure!(
+        !services.is_empty(),
+        "refusing to export an empty verified service roster"
+    );
     let manifest = VerifiedServiceRosterManifest {
         schema: VERIFIED_ROSTER_SCHEMA,
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -499,7 +521,9 @@ pub(crate) fn provision_one(
         format!("iroh://{}", hex::encode(carrier.verifying_key().to_bytes())),
     )?;
     endpoint.request_kem = Some(
-        hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?.public().encode(),
+        hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?
+            .public()
+            .encode(),
     );
     let service = ServiceEntry::new(&service_id, ServiceType::NinePExport, endpoint)?;
     let states = store.accepted_at9p_states()?;
@@ -587,8 +611,14 @@ mod tests {
 
     // Inventory contents and names (including directories) without relying on
     // atime, which a read may legitimately update at the filesystem layer.
-    fn filesystem_contents(root: &Path) -> Result<std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>> {
-        fn visit(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>) -> Result<()> {
+    fn filesystem_contents(
+        root: &Path,
+    ) -> Result<std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            out: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        ) -> Result<()> {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -615,23 +645,44 @@ mod tests {
         let accepted_model = provision_one(&store, &ingest, "model", &model, now, 86400)?;
         let accepted_event = provision_one(&store, &ingest, "event", &event, now, 86400)?;
         let credentials = dir.path().join("retained-credentials");
-        crate::auth::identity_store::write_secret(&credentials.join("model"), "signing-key", &model.to_bytes())?;
-        crate::auth::identity_store::write_secret(&credentials.join("event"), "signing-key", &event.to_bytes())?;
+        crate::auth::identity_store::write_secret(
+            &credentials.join("model"),
+            "signing-key",
+            &model.to_bytes(),
+        )?;
+        crate::auth::identity_store::write_secret(
+            &credentials.join("event"),
+            "signing-key",
+            &event.to_bytes(),
+        )?;
         drop(ingest);
         drop(store);
         let before = filesystem_contents(dir.path())?;
         let keys = load_roster_keys(&credentials, &["model".into(), "event".into()])?;
         let readonly = PdsRecordStore::open_readonly(dir.path())?
             .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
-        let bytes = inspect_verified_roster(&readonly, &keys, &now.to_rfc3339_opts(SecondsFormat::Secs, true))?;
+        let bytes = inspect_verified_roster(
+            &readonly,
+            &keys,
+            &now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        )?;
         let document: serde_json::Value = serde_json::from_slice(&bytes)?;
         assert_eq!(document["schema"], VERIFIED_ROSTER_SCHEMA);
-        assert_eq!(document["services"].as_array().context("services")?.len(), 2);
+        assert_eq!(
+            document["services"].as_array().context("services")?.len(),
+            2
+        );
         for (index, state) in [accepted_model, accepted_event].iter().enumerate() {
             assert_eq!(document["services"][index]["did"], state.did);
             assert_eq!(document["services"][index]["epoch"], state.epoch);
-            assert_eq!(document["services"][index]["accepted_head_digest"], hex::encode(state.head_digest));
-            assert_eq!(document["services"][index]["expires_at"], state.expires_at.as_deref().context("expiry")?);
+            assert_eq!(
+                document["services"][index]["accepted_head_digest"],
+                hex::encode(state.head_digest)
+            );
+            assert_eq!(
+                document["services"][index]["expires_at"],
+                state.expires_at.as_deref().context("expiry")?
+            );
         }
         assert!(!String::from_utf8(bytes)?.contains(&hex::encode(model.to_bytes())));
         assert_eq!(filesystem_contents(dir.path())?, before);
@@ -665,12 +716,32 @@ mod tests {
             .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
         // A successful first member cannot produce a partial JSON result when
         // a later requested service is missing or its retained key mismatches.
-        assert!(inspect_verified_roster(&readonly, &[("model".into(), key.clone()), ("event".into(), key.clone())], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
-        assert!(inspect_verified_roster(&readonly, &[("model".into(), SigningKey::from_bytes(&[0x77; 32]))], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
-        assert!(inspect_verified_roster(&readonly, &[("model".into(), key.clone())], &(now + Duration::hours(25)).to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(inspect_verified_roster(
+            &readonly,
+            &[("model".into(), key.clone()), ("event".into(), key.clone())],
+            &now.to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+        .is_err());
+        assert!(inspect_verified_roster(
+            &readonly,
+            &[("model".into(), SigningKey::from_bytes(&[0x77; 32]))],
+            &now.to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+        .is_err());
+        assert!(inspect_verified_roster(
+            &readonly,
+            &[("model".into(), key.clone())],
+            &(now + Duration::hours(25)).to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+        .is_err());
         let wrong_verifier = PdsRecordStore::open_readonly(dir.path())?
             .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x78; 32]).verifying_key());
-        assert!(inspect_verified_roster(&wrong_verifier, &[("model".into(), key)], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(inspect_verified_roster(
+            &wrong_verifier,
+            &[("model".into(), key)],
+            &now.to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+        .is_err());
         assert_eq!(filesystem_contents(dir.path())?, before);
         Ok(())
     }
@@ -685,12 +756,20 @@ mod tests {
         // Tamper only in fixture setup, then close the writer before capturing
         // the failed reader's complete on-disk before/after evidence.
         let db = rocksdb::DB::open(&rocksdb::Options::default(), dir.path())?;
-        db.put(format!("at9p-checkpoint\0{}", accepted.subject_cid512), b"invalid checkpoint")?;
+        db.put(
+            format!("at9p-checkpoint\0{}", accepted.subject_cid512),
+            b"invalid checkpoint",
+        )?;
         drop(db);
         let before = filesystem_contents(dir.path())?;
         let readonly = PdsRecordStore::open_readonly(dir.path())?
             .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
-        assert!(inspect_verified_roster(&readonly, &[("model".into(), key)], &now.to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(inspect_verified_roster(
+            &readonly,
+            &[("model".into(), key)],
+            &now.to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+        .is_err());
         assert_eq!(filesystem_contents(dir.path())?, before);
         Ok(())
     }
@@ -704,7 +783,12 @@ mod tests {
         let before = filesystem_contents(dir.path())?;
         let readonly = PdsRecordStore::open_readonly(dir.path())?
             .with_at9p_acceptance_identity(SigningKey::from_bytes(&[0x61; 32]).verifying_key());
-        assert!(inspect_verified_roster(&readonly, &[("model".into(), SigningKey::from_bytes(&[0x62; 32]))], &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)).is_err());
+        assert!(inspect_verified_roster(
+            &readonly,
+            &[("model".into(), SigningKey::from_bytes(&[0x62; 32]))],
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
+        .is_err());
         assert!(readonly.first_boot_pending()?);
         assert_eq!(filesystem_contents(dir.path())?, before);
         assert!(validate_service_roster(&[]).is_err());
@@ -717,19 +801,28 @@ mod tests {
     fn deployment_bootstrap_rejects_invalid_roster_and_lifetime_before_credentials() {
         let config = HyprConfig::default();
         assert!(provision_services(&config, &["model".to_owned()], 599, None).is_err());
-        assert!(
-            provision_services(&config, &["model".to_owned()], MAX_SERVICE_IDENTITY_TTL_SECS + 1, None)
-                .is_err()
-        );
-        assert!(
-            provision_services(&config, &["model".to_owned()], MAX_SERVICE_IDENTITY_TTL_SECS, None)
-                .is_err()
-        );
+        assert!(provision_services(
+            &config,
+            &["model".to_owned()],
+            MAX_SERVICE_IDENTITY_TTL_SECS + 1,
+            None
+        )
+        .is_err());
+        assert!(provision_services(
+            &config,
+            &["model".to_owned()],
+            MAX_SERVICE_IDENTITY_TTL_SECS,
+            None
+        )
+        .is_err());
         assert!(provision_services(&config, &[], 86400, None).is_err());
-        assert!(
-            provision_services(&config, &["model".to_owned(), "model".to_owned()], 86400, None)
-                .is_err()
-        );
+        assert!(provision_services(
+            &config,
+            &["model".to_owned(), "model".to_owned()],
+            86400,
+            None
+        )
+        .is_err());
         assert!(
             provision_services(&config, &["../not-a-service".to_owned()], 86400, None).is_err()
         );
@@ -899,8 +992,15 @@ mod tests {
         let first = provision_one(&store, &ingest, "model", &key, now, 86400)?;
         assert_eq!(first.epoch, 1);
         assert!(!first.terminal);
-        assert_eq!(first.current.services[0].endpoint.request_kem.as_deref(),
-            Some(hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&key)?.public().encode().as_slice()));
+        assert_eq!(
+            first.current.services[0].endpoint.request_kem.as_deref(),
+            Some(
+                hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&key)?
+                    .public()
+                    .encode()
+                    .as_slice()
+            )
+        );
         hyprstream_service::NativeServiceAnnouncement::from_accepted_state("model", &key, &first)?;
         let retry = provision_one(
             &store,
@@ -950,7 +1050,8 @@ mod tests {
         let first = provision_one(&store, &ingest, "model", &key, now, 86400)?;
         let wrong_key = SigningKey::from_bytes(&[0x65; 32]);
         let error = provision_one(&store, &ingest, "model", &wrong_key, now, 86400)
-            .err().context("an enrolled service cannot be treated as absent after a key change")?;
+            .err()
+            .context("an enrolled service cannot be treated as absent after a key change")?;
         assert!(error.to_string().contains("hybrid key does not match"));
         let states = store.accepted_at9p_states()?;
         assert_eq!(states.len(), 1);
@@ -969,17 +1070,28 @@ mod tests {
         // genesis/checkpoint path, with the same service ID but a different key.
         let other = SigningKey::from_bytes(&[0x66; 32]);
         let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&other);
-        let pair = HybridKeyPair::new(other.verifying_key().to_bytes().to_vec(), ml_dsa_sk_to_vk_bytes(&pq))?;
+        let pair = HybridKeyPair::new(
+            other.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq),
+        )?;
         let body = CapsuleBody::new(vec![pair], first.current.services.clone())?;
         let capsule = sign_capsule(body, &other, &pq)?;
-        let duplicate = ingest.ingest_genesis(&format!("did:at9p:{}", capsule.cid512()?), &capsule.to_dag_cbor()?)?;
+        let duplicate = ingest.ingest_genesis(
+            &format!("did:at9p:{}", capsule.cid512()?),
+            &capsule.to_dag_cbor()?,
+        )?;
         let error = provision_one(&store, &ingest, "model", &key, now, 86400)
-            .err().context("matching a key cannot hide a second service authority")?;
+            .err()
+            .context("matching a key cannot hide a second service authority")?;
         assert!(error.to_string().contains("multiple accepted identities"));
         let states = store.accepted_at9p_states()?;
         assert_eq!(states.len(), 2);
-        assert!(states.iter().any(|state| state.head_digest == first.head_digest));
-        assert!(states.iter().any(|state| state.head_digest == duplicate.head_digest));
+        assert!(states
+            .iter()
+            .any(|state| state.head_digest == first.head_digest));
+        assert!(states
+            .iter()
+            .any(|state| state.head_digest == duplicate.head_digest));
         Ok(())
     }
 
@@ -1113,10 +1225,7 @@ mod tests {
             86400,
         )?;
         assert_eq!(renewed.epoch, first.epoch + 1);
-        let admitted = [
-            ("model", &key, first.clone()),
-            ("event", &event_key, event),
-        ];
+        let admitted = [("model", &key, first.clone()), ("event", &event_key, event)];
         let entries = build_verified_roster_entries(&store, &admitted, &now_text)?;
         assert_eq!(entries[0].did, renewed.did);
         assert_eq!(entries[0].epoch, renewed.epoch);
@@ -1165,13 +1274,11 @@ mod tests {
         // Unsafe output targets fail without touching the store directory.
         let entries = build_verified_roster_entries(&store, &good, &now_text)?;
         assert!(write_verified_roster_manifest(dir.path(), entries.clone()).is_err());
-        assert!(
-            write_verified_roster_manifest(
-                &out_dir.path().join("missing-parent").join("roster.json"),
-                entries,
-            )
-            .is_err()
-        );
+        assert!(write_verified_roster_manifest(
+            &out_dir.path().join("missing-parent").join("roster.json"),
+            entries,
+        )
+        .is_err());
         assert!(!out_dir.path().join("missing-parent").exists());
         Ok(())
     }
@@ -1203,8 +1310,7 @@ mod tests {
         let body = CapsuleBody::new(vec![pair], vec![service])?;
         let capsule = sign_capsule(body, &genesis, &pq)?;
         let genesis_did = format!("did:at9p:{}", capsule.cid512()?);
-        let genesis_state =
-            ingest.ingest_genesis(&genesis_did, &capsule.to_dag_cbor()?)?;
+        let genesis_state = ingest.ingest_genesis(&genesis_did, &capsule.to_dag_cbor()?)?;
         assert_eq!(genesis_state.epoch, 0);
         assert!(genesis_state.expires_at.is_none());
         let now_text = now.to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -1234,10 +1340,7 @@ mod tests {
         assert_eq!(services.len(), 1);
         assert_eq!(services[0]["service"], "model");
         assert_eq!(services[0]["did"], first.did);
-        assert_eq!(
-            services[0]["epoch"],
-            serde_json::Value::from(first.epoch)
-        );
+        assert_eq!(services[0]["epoch"], serde_json::Value::from(first.epoch));
         assert_eq!(
             services[0]["expires_at"].as_str().context("expires_at")?,
             first.expires_at.as_deref().context("first expiry")?

@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use hyprstream_rpc::auth::{
-    CredentialId, CredentialRevocationStore, CredentialValue, RevocationPublishError,
-    SessionKey, SessionRegisterError, SessionRegistry, SessionRevokeError, SessionState,
+    CredentialId, CredentialRevocationStore, CredentialValue, RevocationPublishError, SessionKey,
+    SessionRegisterError, SessionRegistry, SessionRevokeError, SessionState,
 };
 use hyprstream_rpc::crypto::SigningKey;
 use hyprstream_service::ServiceContext;
@@ -122,7 +122,9 @@ impl PolicyAuthoritySessionRegistry {
     pub fn with_client_provider(
         provider: impl Fn() -> anyhow::Result<Arc<PolicyClient>> + Send + Sync + 'static,
     ) -> Self {
-        Self { client_provider: Arc::new(provider) }
+        Self {
+            client_provider: Arc::new(provider),
+        }
     }
 
     /// Follow the exact service key's renewed trust-store JWT for the process
@@ -131,7 +133,12 @@ impl PolicyAuthoritySessionRegistry {
         Self::with_client_provider(move || {
             let token = crate::services::factories::service_token(&signing_key)
                 .context("current service JWT unavailable for session authority")?;
-            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(token)).map(Arc::new)
+            PolicyClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key.clone(),
+                Some(token),
+            )
+            .map(Arc::new)
         })
     }
 }
@@ -156,21 +163,19 @@ impl SessionRegistry for PolicyAuthoritySessionRegistry {
             expires_at: state.expires_at,
             clearance_epoch: state.clearance_epoch,
         };
-        let client = (self.client_provider)()
-            .map_err(|_| -> SessionRegisterError { hyprstream_rpc::auth::SessionPublicationFailed.into() })?;
-        client
-            .register_session(&request)
-            .await
-            .map_err(|e| {
-                let message = e.to_string();
-                if message.contains("already exists") {
-                    hyprstream_rpc::auth::SessionExists.into()
-                } else if message.contains("durably") || message.contains("not initialized") {
-                    hyprstream_rpc::auth::SessionPublicationFailed.into()
-                } else {
-                    hyprstream_rpc::auth::InvalidSessionRecord.into()
-                }
-            })
+        let client = (self.client_provider)().map_err(|_| -> SessionRegisterError {
+            hyprstream_rpc::auth::SessionPublicationFailed.into()
+        })?;
+        client.register_session(&request).await.map_err(|e| {
+            let message = e.to_string();
+            if message.contains("already exists") {
+                hyprstream_rpc::auth::SessionExists.into()
+            } else if message.contains("durably") || message.contains("not initialized") {
+                hyprstream_rpc::auth::SessionPublicationFailed.into()
+            } else {
+                hyprstream_rpc::auth::InvalidSessionRecord.into()
+            }
+        })
     }
 
     async fn revoke_session(&self, key: &SessionKey) -> Result<(), SessionRevokeError> {
@@ -195,7 +200,7 @@ impl SessionRegistry for PolicyAuthoritySessionRegistry {
         match tokio::time::timeout(CHECK_TIMEOUT, async {
             (self.client_provider)()?.check_session(&request).await
         })
-            .await
+        .await
         {
             // true = active and known; anything else is not active.
             Ok(Ok(active)) => !active,
@@ -235,7 +240,9 @@ impl PolicyAuthorityRevocationStore {
     pub fn with_client_provider(
         provider: impl Fn() -> anyhow::Result<Arc<PolicyClient>> + Send + Sync + 'static,
     ) -> Self {
-        Self { client_provider: Arc::new(provider) }
+        Self {
+            client_provider: Arc::new(provider),
+        }
     }
 
     /// Follow the exact service key's renewed trust-store JWT for the process
@@ -244,7 +251,12 @@ impl PolicyAuthorityRevocationStore {
         Self::with_client_provider(move || {
             let token = crate::services::factories::service_token(&signing_key)
                 .context("current service JWT unavailable for revocation authority")?;
-            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key.clone(), Some(token)).map(Arc::new)
+            PolicyClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key.clone(),
+                Some(token),
+            )
+            .map(Arc::new)
         })
     }
 }
@@ -256,9 +268,11 @@ impl CredentialRevocationStore for PolicyAuthorityRevocationStore {
             credential: credential_id_to_ref(id),
         };
         match tokio::time::timeout(CHECK_TIMEOUT, async {
-            (self.client_provider)()?.check_credential_revocation(&request).await
+            (self.client_provider)()?
+                .check_credential_revocation(&request)
+                .await
         })
-            .await
+        .await
         {
             Ok(Ok(revoked)) => revoked,
             Ok(Err(e)) => {
@@ -332,22 +346,21 @@ pub async fn init_process_authority_stores(
     if hosts_policy {
         let data_dir = ctx.deployment_data_dir()?;
         let credentials_path = data_dir.join("credential-revocations.jsonl");
-        let store = hyprstream_rpc::auth::FileBackedCredentialRevocationStore::open(
-            &credentials_path,
-        )
-        .with_context(|| {
-            format!("open credential-revocation store {}", credentials_path.display())
-        })?;
+        let store =
+            hyprstream_rpc::auth::FileBackedCredentialRevocationStore::open(&credentials_path)
+                .with_context(|| {
+                    format!(
+                        "open credential-revocation store {}",
+                        credentials_path.display()
+                    )
+                })?;
         hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(store))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         tracing::info!(path = %credentials_path.display(), "Credential revocation authority store initialized (durable)");
 
         let sessions_path = data_dir.join("sessions.jsonl");
-        let sessions =
-            hyprstream_rpc::auth::FileBackedSessionRegistry::open(&sessions_path)
-                .with_context(|| {
-                    format!("open session registry {}", sessions_path.display())
-                })?;
+        let sessions = hyprstream_rpc::auth::FileBackedSessionRegistry::open(&sessions_path)
+            .with_context(|| format!("open session registry {}", sessions_path.display()))?;
         hyprstream_rpc::auth::set_global_session_registry(Arc::new(sessions))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         tracing::info!(path = %sessions_path.display(), "Session authority registry initialized (durable)");
@@ -388,21 +401,23 @@ pub async fn init_process_authority_stores(
             session: session_key_to_ref(&session_probe),
         };
         let revocation_probe = tokio::time::timeout(CHECK_TIMEOUT, async {
-            (store.client_provider)()?.check_credential_revocation(&request).await
+            (store.client_provider)()?
+                .check_credential_revocation(&request)
+                .await
         })
         .await;
         let session_probe_result = tokio::time::timeout(CHECK_TIMEOUT, async {
-            (sessions.client_provider)()?.check_session(&session_request).await
+            (sessions.client_provider)()?
+                .check_session(&session_request)
+                .await
         })
         .await;
         match (revocation_probe, session_probe_result) {
             (Ok(Ok(false)), Ok(Ok(false))) => {
-                hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
-                    store,
-                ))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(store))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 hyprstream_rpc::auth::set_global_session_registry(Arc::new(sessions))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 tracing::info!(
                     "Revocation/session authority reachable; RPC client stores published"
                 );

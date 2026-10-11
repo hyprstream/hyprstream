@@ -225,7 +225,8 @@ async fn admission_server_with_identity(
     let handler = IrohMoqProtocolHandler::new()
         .with_authz(MoqAuthzConfig::default().with_admission(authenticator));
     let producer = handler.origin_producer().clone();
-    let substrate = IrohSubstrate::new(server_carrier_secret, handler, NoopHandler::new("rpc")).await?;
+    let substrate =
+        IrohSubstrate::new(server_carrier_secret, handler, NoopHandler::new("rpc")).await?;
     Ok(AdmissionServer {
         substrate,
         producer,
@@ -273,9 +274,14 @@ async fn admitted_client(
     )
     .await?;
     let conn = client.connect(server_addr.clone(), ALPN_MOQ_LITE).await?;
-    prove_moql_admission(&conn, proof, *client.endpoint_id().as_bytes(), ADMISSION_TIMEOUT)
-        .await
-        .map_err(|e| anyhow!("admission rejected: {e}"))?;
+    prove_moql_admission(
+        &conn,
+        proof,
+        *client.endpoint_id().as_bytes(),
+        ADMISSION_TIMEOUT,
+    )
+    .await
+    .map_err(|e| anyhow!("admission rejected: {e}"))?;
     let session = Session::raw(conn);
     let client_origin: OriginProducer = Origin::random().produce();
     let consumer = client_origin.consume();
@@ -641,7 +647,10 @@ async fn live_relay_of_a_genuine_proof_is_rejected_on_the_second_connection() ->
     let (control, control_session, _consumer) =
         admitted_client(&server_addr, &proof(&alice, server.server_identity.clone())).await?;
     let resolved = server.resolver_calls.load(Ordering::SeqCst);
-    assert!(resolved >= 1, "direct admission must reach the tenant resolver");
+    assert!(
+        resolved >= 1,
+        "direct admission must reach the tenant resolver"
+    );
 
     // ── the relay: two terminated connections, admission frames forwarded live ─
     let relay_endpoint = Arc::new(std::sync::OnceLock::new());

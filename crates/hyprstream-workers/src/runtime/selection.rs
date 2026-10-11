@@ -718,7 +718,10 @@ mod tests {
         // never an isolation downgrade to the auto-excluded tier.
         let regs = vec![&EXPLICIT_ONLY, &LOW];
         let r = select_registration("auto", &regs, |_| true).unwrap();
-        assert_eq!(r.name, "low-tier", "auto must skip the auto-excluded backend");
+        assert_eq!(
+            r.name, "low-tier",
+            "auto must skip the auto-excluded backend"
+        );
     }
 
     #[test]
@@ -749,16 +752,28 @@ mod tests {
         assert!(msg.contains("prerequisites are missing"), "got: {msg}");
         assert!(msg.contains("fail-closed"), "got: {msg}");
         // Must not name the weaker backend it could have silently fallen back to.
-        assert!(!msg.contains("low-tier"), "must not mention a downgrade target: {msg}");
+        assert!(
+            !msg.contains("low-tier"),
+            "must not mention a downgrade target: {msg}"
+        );
     }
 
     #[test]
     fn unknown_name_errors_listing_registry() {
         let err = select_registration("bogus", &regs(), |_| true).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("unknown sandbox backend 'bogus'"), "got: {msg}");
-        assert!(msg.contains("high-tier"), "should list registered names: {msg}");
-        assert!(msg.contains("low-tier"), "should list registered names: {msg}");
+        assert!(
+            msg.contains("unknown sandbox backend 'bogus'"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("high-tier"),
+            "should list registered names: {msg}"
+        );
+        assert!(
+            msg.contains("low-tier"),
+            "should list registered names: {msg}"
+        );
     }
 
     // ── 9P-socket-injection capability gate (#506), fail-closed ──
@@ -814,13 +829,15 @@ mod tests {
         // Explicitly asking for an incapable backend when the capability is
         // required errors — and must NOT silently swap in a capable one.
         let regs = vec![&HIGH, &NINEP_LOW];
-        let err =
-            select_registration_with_cap("high-tier", &regs, |_| true, true).unwrap_err();
+        let err = select_registration_with_cap("high-tier", &regs, |_| true, true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("9P socket injection"), "got: {msg}");
         assert!(msg.contains("fail-closed"), "got: {msg}");
         // Must not name the capable backend it could have swapped to.
-        assert!(!msg.contains("ninep-low"), "must not suggest a silent swap: {msg}");
+        assert!(
+            !msg.contains("ninep-low"),
+            "must not suggest a silent swap: {msg}"
+        );
     }
 
     #[test]
@@ -845,7 +862,10 @@ mod tests {
         // nspawn is registered under the `nspawn` feature and IS capable (host --bind).
         #[cfg(feature = "nspawn")]
         {
-            assert!(backend_injects_9p_socket("nspawn"), "nspawn can bind a host UDS");
+            assert!(
+                backend_injects_9p_socket("nspawn"),
+                "nspawn can bind a host UDS"
+            );
             assert!(require_9p_socket_capability("nspawn").is_ok());
             // Case-insensitive, mirroring name matching.
             assert!(backend_injects_9p_socket("NSPAWN"));
@@ -858,7 +878,10 @@ mod tests {
         let oci = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "oci")
             .expect("oci registered under the oci feature");
-        assert!(oci.injects_9p_socket, "oci bind-mounts a host UDS → capable");
+        assert!(
+            oci.injects_9p_socket,
+            "oci bind-mounts a host UDS → capable"
+        );
     }
 
     #[cfg(feature = "nspawn")]
@@ -867,7 +890,10 @@ mod tests {
         let nspawn = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "nspawn")
             .expect("nspawn registered under the nspawn feature");
-        assert!(nspawn.injects_9p_socket, "nspawn --bind can inject a host UDS");
+        assert!(
+            nspawn.injects_9p_socket,
+            "nspawn --bind can inject a host UDS"
+        );
     }
 
     #[cfg(feature = "kata")]
@@ -1061,7 +1087,10 @@ mod tests {
         let nspawn = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "nspawn")
             .expect("nspawn registered under the nspawn feature");
-        assert!(oci.auto_selectable, "oci is a real isolation tier → auto-selectable");
+        assert!(
+            oci.auto_selectable,
+            "oci is a real isolation tier → auto-selectable"
+        );
         assert!(
             oci.priority > nspawn.priority,
             "rootless OCI must outrank nspawn for auto-selection"
@@ -1197,7 +1226,10 @@ mod tests {
         let regs = three_tier_regs();
 
         let r = select_registration("auto", &regs, |reg| reg.name != "high-tier").unwrap();
-        assert_eq!(r.name, "mid-tier", "first degradation: high unavailable -> mid");
+        assert_eq!(
+            r.name, "mid-tier",
+            "first degradation: high unavailable -> mid"
+        );
 
         let r = select_registration("auto", &regs, |reg| reg.name == "low-tier").unwrap();
         assert_eq!(r.name, "low-tier", "second degradation: only low remains");
@@ -1219,11 +1251,16 @@ mod tests {
         // if high is also down it must land on low (skipping mid), not error.
         let regs = three_tier_regs();
         let r = select_registration("auto", &regs, |reg| reg.name != "mid-tier").unwrap();
-        assert_eq!(r.name, "high-tier", "high still available, mid down -> high wins");
+        assert_eq!(
+            r.name, "high-tier",
+            "high still available, mid down -> high wins"
+        );
 
-        let r =
-            select_registration("auto", &regs, |reg| reg.name == "low-tier").unwrap();
-        assert_eq!(r.name, "low-tier", "high and mid down -> falls through mid to low");
+        let r = select_registration("auto", &regs, |reg| reg.name == "low-tier").unwrap();
+        assert_eq!(
+            r.name, "low-tier",
+            "high and mid down -> falls through mid to low"
+        );
     }
 
     // ── unavailable_reason (#348 selection diagnostics) ──
@@ -1246,7 +1283,12 @@ mod tests {
     // feeds the real inventory into this same pipeline.
 
     fn candidate(name: &'static str, priority: i32, auto: bool, avail: bool) -> BackendCandidate {
-        BackendCandidate { name, priority, auto_selectable: auto, available: avail }
+        BackendCandidate {
+            name,
+            priority,
+            auto_selectable: auto,
+            available: avail,
+        }
     }
 
     /// Reusable copy of `explain_selection`'s pipeline over an explicit candidate
@@ -1270,8 +1312,12 @@ mod tests {
             candidate("nspawn", 10, true, true),
         ];
         let report = explain_over(&cands);
-        let selected: Vec<&str> =
-            report.candidates.iter().filter(|o| o.selected).map(|o| o.candidate.name).collect();
+        let selected: Vec<&str> = report
+            .candidates
+            .iter()
+            .filter(|o| o.selected)
+            .map(|o| o.candidate.name)
+            .collect();
         assert_eq!(selected, vec!["kata"], "highest-priority available wins");
         assert_eq!(report.requested, "auto");
     }
@@ -1285,12 +1331,27 @@ mod tests {
             candidate("nspawn", 10, true, true),
         ];
         let report = explain_over(&cands);
-        let kata = report.candidates.iter().find(|o| o.candidate.name == "kata").unwrap();
+        let kata = report
+            .candidates
+            .iter()
+            .find(|o| o.candidate.name == "kata")
+            .unwrap();
         assert!(!kata.selected);
-        assert_eq!(kata.rejection_reason.as_deref(), Some(unavailable_reason("kata").as_str()));
-        assert!(kata.rejection_reason.as_deref().unwrap().contains("cloud-hypervisor"));
+        assert_eq!(
+            kata.rejection_reason.as_deref(),
+            Some(unavailable_reason("kata").as_str())
+        );
+        assert!(kata
+            .rejection_reason
+            .as_deref()
+            .unwrap()
+            .contains("cloud-hypervisor"));
         // nspawn (available, auto-eligible) is the winner.
-        let nspawn = report.candidates.iter().find(|o| o.candidate.name == "nspawn").unwrap();
+        let nspawn = report
+            .candidates
+            .iter()
+            .find(|o| o.candidate.name == "nspawn")
+            .unwrap();
         assert!(nspawn.selected);
     }
 
@@ -1304,11 +1365,26 @@ mod tests {
             candidate("nspawn", 10, true, true),
         ];
         let report = explain_over(&cands);
-        let wasm = report.candidates.iter().find(|o| o.candidate.name == "wasm").unwrap();
+        let wasm = report
+            .candidates
+            .iter()
+            .find(|o| o.candidate.name == "wasm")
+            .unwrap();
         assert!(!wasm.selected);
-        assert!(wasm.rejection_reason.as_deref().unwrap().contains("explicit-name-only"));
-        let nspawn = report.candidates.iter().find(|o| o.candidate.name == "nspawn").unwrap();
-        assert!(nspawn.selected, "auto must pick the auto-eligible backend, never the excluded one");
+        assert!(wasm
+            .rejection_reason
+            .as_deref()
+            .unwrap()
+            .contains("explicit-name-only"));
+        let nspawn = report
+            .candidates
+            .iter()
+            .find(|o| o.candidate.name == "nspawn")
+            .unwrap();
+        assert!(
+            nspawn.selected,
+            "auto must pick the auto-eligible backend, never the excluded one"
+        );
     }
 
     #[test]
@@ -1316,20 +1392,30 @@ mod tests {
         // The explain trace and the authoritative `select_registration` path must
         // agree on which backend `"auto"` yields, over the same candidate set.
         const A: BackendRegistration = BackendRegistration {
-            name: "high-tier", priority: 100, auto_selectable: true,
-            injects_9p_socket: false, mounts_fuse_vfs: false,
-            is_available: || true, construct: never_available,
+            name: "high-tier",
+            priority: 100,
+            auto_selectable: true,
+            injects_9p_socket: false,
+            mounts_fuse_vfs: false,
+            is_available: || true,
+            construct: never_available,
         };
         const B: BackendRegistration = BackendRegistration {
-            name: "low-tier", priority: 10, auto_selectable: true,
-            injects_9p_socket: false, mounts_fuse_vfs: false,
-            is_available: || true, construct: never_available,
+            name: "low-tier",
+            priority: 10,
+            auto_selectable: true,
+            injects_9p_socket: false,
+            mounts_fuse_vfs: false,
+            is_available: || true,
+            construct: never_available,
         };
         let regs = vec![&A, &B];
         let winner = select_registration("auto", &regs, |_| true).unwrap();
 
-        let cands: Vec<BackendCandidate> =
-            regs.iter().map(|r| BackendCandidate::from_registration(r)).collect();
+        let cands: Vec<BackendCandidate> = regs
+            .iter()
+            .map(|r| BackendCandidate::from_registration(r))
+            .collect();
         let report = explain_over(&cands);
         let explained = report
             .candidates
@@ -1337,7 +1423,10 @@ mod tests {
             .find(|o| o.selected)
             .map(|o| o.candidate.name)
             .unwrap();
-        assert_eq!(explained, winner.name, "explain winner must match select_registration");
+        assert_eq!(
+            explained, winner.name,
+            "explain winner must match select_registration"
+        );
     }
 
     #[test]

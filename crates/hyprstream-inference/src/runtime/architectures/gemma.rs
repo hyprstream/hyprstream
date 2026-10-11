@@ -271,13 +271,7 @@ impl GemmaAttention {
         Ok(kv
             .unsqueeze(3) // [batch, seq, num_kv_heads, 1, head_dim]
             .expand(
-                [
-                    batch_size,
-                    seq_len,
-                    num_kv_heads,
-                    repeat_factor,
-                    head_dim,
-                ],
+                [batch_size, seq_len, num_kv_heads, repeat_factor, head_dim],
                 false,
             )
             .reshape([batch_size, seq_len, self.num_heads as i64, head_dim]))
@@ -299,11 +293,8 @@ impl GemmaAttention {
             .collect::<Vec<_>>();
 
         // Create position indices
-        let _positions = Tensor::arange(seq_len, (DType::Int64, device)).to_dtype(
-            DType::Float,
-            false,
-            false,
-        );
+        let _positions =
+            Tensor::arange(seq_len, (DType::Int64, device)).to_dtype(DType::Float, false, false);
 
         // Compute sin and cos for each position and frequency
         let mut sin_vals = Vec::new();
@@ -470,7 +461,7 @@ impl GemmaMLP {
         // Apply activation based on config
         let gate = match self.activation.as_str() {
             "gelu_pytorch_tanh" => self.gelu_pytorch_tanh(&gate_pre_activation)?,
-            _ => gate_pre_activation.silu(),  // silu is default
+            _ => gate_pre_activation.silu(), // silu is default
         };
 
         let up = hidden_2d.matmul(&self.up_proj.transpose(0, 1));
@@ -641,10 +632,7 @@ impl GemmaModel {
         tracing::info!("Loading Gemma model");
         tracing::info!("  - GELU PyTorch tanh activation");
         tracing::info!("  - Sliding window attention (512 tokens)");
-        tracing::info!(
-            "  - QK-norm with scalar {:?}",
-            config.query_pre_attn_scalar
-        );
+        tracing::info!("  - QK-norm with scalar {:?}", config.query_pre_attn_scalar);
         tracing::info!(
             "  - RoPE theta: global={}, local={}",
             config.rope_theta,
@@ -979,7 +967,8 @@ impl GemmaModel {
             hidden_activation: config
                 .get("hidden_activation")
                 .and_then(|v| v.as_str())
-                .unwrap_or("silu").to_owned(),
+                .unwrap_or("silu")
+                .to_owned(),
         })
     }
 }
@@ -1119,7 +1108,7 @@ impl ModelOperations for GemmaModel {
     fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
         // Gemma uses RMSNorm
         let x2 = square_tensor(tensor)?;
-        let mean = x2.mean_dim(&[-1i64][..], true, tensor.kind());  // Preserve input precision
+        let mean = x2.mean_dim(&[-1i64][..], true, tensor.kind()); // Preserve input precision
         let rrms = (mean + self.config.rms_norm_eps as f64).reciprocal().sqrt();
         broadcast_mul(tensor, &rrms)
     }
@@ -1242,14 +1231,18 @@ mod tests {
         let kv_tensor = Tensor::randn([1, 21, 1024], (DType::Float, device));
 
         // Reshape for key/value (MQA)
-        let reshaped = model.reshape_for_attention(&kv_tensor, true).expect("test: reshape kv");
+        let reshaped = model
+            .reshape_for_attention(&kv_tensor, true)
+            .expect("test: reshape kv");
         assert_eq!(reshaped.size(), &[1, 21, 4, 256]); // 4 KV heads, 256 head_dim
 
         // Test tensor for query with shape [1, 21, 4096] (16 * 256)
         let q_tensor = Tensor::randn([1, 21, 4096], (DType::Float, device));
 
         // Reshape for query
-        let reshaped = model.reshape_for_attention(&q_tensor, false).expect("test: reshape q");
+        let reshaped = model
+            .reshape_for_attention(&q_tensor, false)
+            .expect("test: reshape q");
         assert_eq!(reshaped.size(), &[1, 21, 16, 256]); // 16 Q heads, 256 head_dim
     }
 
@@ -1276,7 +1269,9 @@ mod tests {
         let kv = Tensor::randn([2, 10, 4, 256], (DType::Float, device));
 
         // Expand to match 16 query heads
-        let expanded = attn.expand_kv_for_mqa(&kv).expect("test: expand kv for mqa");
+        let expanded = attn
+            .expand_kv_for_mqa(&kv)
+            .expect("test: expand kv for mqa");
         assert_eq!(expanded.size(), &[2, 10, 16, 256]);
     }
 }
