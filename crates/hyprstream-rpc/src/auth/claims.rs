@@ -545,6 +545,35 @@ impl Claims {
         Ok(Some(generation))
     }
 
+    /// Set the trusted signer-inventory digest for the stateless Federate
+    /// proof profile. This binds a short-lived credential to the host's current
+    /// verifier inventory without naming a database or session row.
+    pub fn with_federate_signer_inventory(mut self, inventory: [u8; 32]) -> Self {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        self.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode(inventory));
+        self
+    }
+
+    /// Parse the signed Federate signer-inventory digest in its sole canonical
+    /// base64url encoding. Callers decide whether the all-zero value is valid
+    /// for their configured inventory.
+    pub fn federate_signer_inventory(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let Some(encoded) = self.hs_signer_inventory_v1.as_deref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(encoded.len() == 43, "invalid signer inventory digest length");
+        let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+        let inventory: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signer inventory digest length"))?;
+        anyhow::ensure!(
+            URL_SAFE_NO_PAD.encode(inventory) == encoded,
+            "noncanonical signer inventory digest"
+        );
+        Ok(Some(inventory))
+    }
+
     /// Recognize the fixed host/client even when one profile marker was
     /// removed by a faulty issuer or token transformation.
     pub fn is_reserved_federate_staging_credential(&self) -> bool {
@@ -1560,5 +1589,30 @@ mod id_token_tests {
         }
         assert!(Claims::new("alice".into(), 1, 2)
             .session_authority_generation().unwrap().is_none());
+    }
+
+    #[test]
+    fn federate_signer_inventory_is_signed_jwt_only_and_canonical() {
+        let original = [0x24; 32];
+        let claims = Claims::new("alice".into(), 1, 2)
+            .with_federate_signer_inventory(original);
+        assert_eq!(claims.federate_signer_inventory().unwrap(), Some(original));
+        let json = serde_json::to_vec(&claims).unwrap();
+        let decoded: Claims = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.federate_signer_inventory().unwrap(), Some(original));
+        let mut malformed = decoded.clone();
+        for bad in [
+            "",
+            "A",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+        ] {
+            malformed.hs_signer_inventory_v1 = Some(bad.into());
+            assert!(malformed.federate_signer_inventory().is_err(), "accepted {bad:?}");
+        }
+        assert!(Claims::new("alice".into(), 1, 2)
+            .federate_signer_inventory()
+            .unwrap()
+            .is_none());
     }
 }

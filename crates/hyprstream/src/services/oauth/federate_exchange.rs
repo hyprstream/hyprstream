@@ -260,14 +260,14 @@ pub(crate) fn committed_claims(
         .with_federate_signer_suite(B64.encode(signer_suite_thumbprint(
             hyprstream_session_store::SUITE,
             &[&session.ed_public, &session.pq_public],
-        )));
+        )))
+        .with_federate_signer_inventory(session.collision_inventory_id);
     claims.iss = session.host.clone();
     claims.aud = Some(session.resource.clone());
     claims.client_id = Some(session.client_id.clone());
     claims.tenant = Some(session.tenant.clone());
     claims.scope = Some(scope);
     claims.hs_signer_pq_key_v1 = Some(B64.encode(&session.pq_public));
-    claims.hs_signer_inventory_v1 = Some(B64.encode(session.collision_inventory_id));
     claims.hs_source_issuer_v1 = Some(source_issuer.to_owned());
     claims.hs_source_subject_v1 = Some(source_subject.to_owned());
     claims.cnf = Some(Cnf {

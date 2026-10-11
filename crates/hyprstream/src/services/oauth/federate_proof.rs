@@ -79,9 +79,10 @@ impl CredentialHandle {
         let pq_public = URL_SAFE_NO_PAD.decode(pq_encoded).map_err(|_| Error::Denied)?;
         let source_issuer = claims.hs_source_issuer_v1.as_deref().ok_or(Error::Denied)?;
         let source_subject = claims.hs_source_subject_v1.as_deref().ok_or(Error::Denied)?;
-        let inventory = claims.hs_signer_inventory_v1.as_deref().ok_or(Error::Denied)?;
-        let inventory_bytes = URL_SAFE_NO_PAD.decode(inventory).map_err(|_| Error::Denied)?;
-        let generation: [u8; 32] = inventory_bytes.try_into().map_err(|_| Error::Denied)?;
+        let generation = claims
+            .federate_signer_inventory()
+            .map_err(|_| Error::Denied)?
+            .ok_or(Error::Denied)?;
         let sid = claims.sid.as_deref().ok_or(Error::Denied)?;
         let subject = claims.sub.as_str();
         let tenant = claims.tenant.as_deref().ok_or(Error::Denied)?;
@@ -101,7 +102,7 @@ impl CredentialHandle {
             || jwk.crv != "Ed25519"
             || URL_SAFE_NO_PAD.encode(ed) != jwk.x
             || URL_SAFE_NO_PAD.encode(suite_thumbprint) != suite
-            || URL_SAFE_NO_PAD.encode(generation) != inventory
+            || claims.session_authority_generation().map_err(|_| Error::Denied)?.is_some()
             || pq_public.len() != 1952
             || URL_SAFE_NO_PAD.encode(&pq_public) != pq_encoded
             || ml_dsa_vk_from_bytes(&pq_public).is_err()

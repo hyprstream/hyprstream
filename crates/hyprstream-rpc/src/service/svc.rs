@@ -1566,21 +1566,22 @@ pub trait RequestService: 'static {
         };
 
         // Federate's browser proof key is intentionally distinct from the
-        // envelope/relay key. The ordinary cnf→envelope binding below cannot
-        // authenticate it, and its dynamic proof/session/replay adapter is not
-        // installed in this source slice. Reject the signed marker AND the
-        // reserved issuer/client pair here, before publishing identity or a
-        // key→subject cache entry; stripping the marker cannot downgrade to a
-        // static credential. A future adapter must replace this denial only
-        // after complete request-local proof and authority admission exists.
+        // envelope/relay key. Reserved credentials use the signed signer
+        // inventory digest, not a server-side session generation. Reject
+        // malformed or mixed profiles here before publishing identity or
+        // caching a key binding; the serving adapter still verifies holder
+        // proof, shared replay, and fresh Policy authority before dispatch.
         if verified.has_federate_profile_marker()
             || verified.is_reserved_federate_staging_credential() {
-            let generation = verified.session_authority_generation()?;
+            let inventory = verified.federate_signer_inventory()?;
+            let session_generation = verified.session_authority_generation()?;
             anyhow::ensure!(
                 self.accept_deferred_federate_credential()
                     && matches!(self.name(), "registry" | "model")
                     && verified.is_reserved_federate_staging_credential()
-                    && generation.is_some_and(|value| value != [0; 32])
+                    && verified.hs_profile.as_deref() == Some("federate-session-v1")
+                    && inventory.is_some_and(|value| value != [0; 32])
+                    && session_generation.is_none()
                     && protected.typ == "at+jwt"
                     && !ctx.is_local_caller
                     && !delegated
@@ -2410,7 +2411,7 @@ mod empty_iss_gate_tests {
     }
 
     #[tokio::test]
-    async fn reserved_client_without_generation_cannot_fall_back_to_static_jwt() {
+    async fn reserved_client_without_inventory_cannot_fall_back_to_static_jwt() {
         let (mut svc, ca) = mock_service();
         svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
             ca.verifying_key(),
@@ -2446,7 +2447,8 @@ mod empty_iss_gate_tests {
             .with_sid("sid-a")
             .with_scope(Some("query:registry:List".into()))
             .with_cnf_jwk(&holder)
-            .with_session_authority_generation([7; 32]);
+            .with_federate_signer_suite("fixture-suite".into())
+            .with_federate_signer_inventory([7; 32]);
         let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
         ctx.cnf = relay;
         svc.verify_claims(&mut ctx).await.expect("reserved JWT snapshot may defer");
@@ -2456,14 +2458,32 @@ mod empty_iss_gate_tests {
         assert!(ctx.verified_direct_jwt().is_none());
         assert!(svc.cached_subjects.lock().is_empty());
 
-        let mut stripped = claims;
-        stripped.hs_session_authority_generation = None;
+        let mut stripped = claims.clone();
+        stripped.hs_signer_inventory_v1 = None;
         let mut ctx = ctx_with_token(crate::auth::jwt::encode(&stripped, &ca), false);
         ctx.cnf = relay;
         assert!(svc.verify_claims(&mut ctx).await.is_err());
         assert!(ctx.deferred_federate_credential().is_none());
         assert!(ctx.subject().is_anonymous());
         assert!(svc.cached_subjects.lock().is_empty());
+
+        let mut mixed = claims.clone();
+        mixed.hs_session_authority_generation =
+            Some(URL_SAFE_NO_PAD.encode([8; 32]));
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&mixed, &ca), false);
+        ctx.cnf = relay;
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.deferred_federate_credential().is_none());
+        assert!(ctx.subject().is_anonymous());
+
+        let mut malformed = claims;
+        malformed.hs_signer_inventory_v1 =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into());
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&malformed, &ca), false);
+        ctx.cnf = relay;
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.deferred_federate_credential().is_none());
+        assert!(ctx.subject().is_anonymous());
     }
 
     #[tokio::test]
@@ -2478,6 +2498,7 @@ mod empty_iss_gate_tests {
 
         let ed = SigningKey::from_bytes(&[61; 32]);
         let (pq, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let proof_pq_public = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk);
         let kid = crate::auth::composite_kid(&pq_vk, &ed.verifying_key());
         let key_set = std::sync::Arc::new(CompositeKeySet::default());
         key_set
@@ -2504,8 +2525,12 @@ mod empty_iss_gate_tests {
         );
 
         let holder = SigningKey::from_bytes(&[62; 32]).verifying_key().to_bytes();
+        let suite_thumbprint = crate::auth::signer_suite_thumbprint(
+            crate::auth::SUITE_HYBRID_ED25519_MLDSA65,
+            &[&holder, &proof_pq_public],
+        );
         let now = chrono::Utc::now().timestamp();
-        let claims = Claims::new("alice".into(), now, now + 300)
+        let mut claims = Claims::new("did:plc:3f7ldey5bivhfjapwqi2sljy".into(), now, now + 300)
             .with_issuer(crate::auth::claims::FEDERATE_STAGING_HOST.into())
             .with_audience(Some(crate::auth::claims::FEDERATE_STAGING_HOST.into()))
             .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
@@ -2513,8 +2538,12 @@ mod empty_iss_gate_tests {
             .with_sid("sid-hybrid")
             .with_scope(Some("query:registry:List".into()))
             .with_cnf_jwk(&holder)
-            .with_session_authority_generation([7; 32])
+            .with_federate_signer_suite(URL_SAFE_NO_PAD.encode(suite_thumbprint))
+            .with_federate_signer_inventory([7; 32])
             .with_jti();
+        claims.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode(proof_pq_public));
+        claims.hs_source_issuer_v1 = Some("https://login.federate.to".into());
+        claims.hs_source_subject_v1 = Some("opaque-atproto-connector-subject".into());
         let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid}"}}"#);
         let token = composite_token(&header, &claims, &pq, &ed, false);
         let mut ctx = ctx_with_token(token, false);
@@ -2523,7 +2552,11 @@ mod empty_iss_gate_tests {
         svc.verify_claims(&mut ctx)
             .await
             .expect("hybrid Federate access token should pass Hybrid verification");
-        assert!(ctx.deferred_federate_credential().is_some());
+        let (verified_claims, _) = ctx
+            .deferred_federate_credential()
+            .expect("stateless Federate token should be deferred");
+        assert_eq!(verified_claims.federate_signer_inventory().unwrap(), Some([7; 32]));
+        assert!(verified_claims.session_authority_generation().unwrap().is_none());
         assert!(ctx.subject().is_anonymous());
         assert!(ctx.claims().is_none());
     }
