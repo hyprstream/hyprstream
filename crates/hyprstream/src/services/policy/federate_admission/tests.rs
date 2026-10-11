@@ -911,10 +911,13 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .batch_execute(hyprstream_session_store::MIGRATION_V5)
         .await
         .unwrap();
-    control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
-        &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
     let (mut service, ctx) = fixture().await;
+    let authority = service.authority.as_ref().unwrap();
+    let serving_generation = authority.serving_generation;
+    let collision_inventory_id = authority.local_collision_inventory_id;
+    control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
+        &[&"https://host.test", &hyprstream_session_store::PROFILE, &&serving_generation[..], &&collision_inventory_id[..]]).await.unwrap();
     let mut session_config = tokio_postgres::Config::new();
     session_config
         .host_path(&socket)
@@ -978,8 +981,8 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &mut client,
         "https://host.test",
         &committed.sid,
-        &[3; 32],
-        &[7; 32]
+        &serving_generation,
+        &collision_inventory_id
     )
     .await
     .unwrap()
@@ -1118,7 +1121,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     );
     let receipt = receipt.expect("accepted read-to-commit race must not be rejected");
     assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+        .lookup(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .unwrap()
         .is_some());
@@ -1138,8 +1141,8 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &mut client,
         "https://host.test",
         &receipt.sid,
-        &[3; 32],
-        &[7; 32],
+        &serving_generation,
+        &collision_inventory_id,
     )
     .await
     .unwrap()
@@ -1317,7 +1320,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     control
         .execute(
             "UPDATE federate_session.profile_state SET authority_generation=$3 WHERE host=$1 AND profile=$2",
-            &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8; 32][..]],
+            &[&"https://host.test", &hyprstream_session_store::PROFILE, &&serving_generation[..]],
         )
         .await
         .unwrap();
@@ -1345,7 +1348,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     );
     assert!(a.is_err() && b.is_err());
     assert!(service
-        .revoke(&ctx, &client, &receipt.sid, &[3; 32])
+        .revoke(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .unwrap());
     request_use.request_id = vec![14; 16];
@@ -1363,7 +1366,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .await
         .is_err());
     assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+        .lookup(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .unwrap()
         .is_none());
@@ -1371,8 +1374,8 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &mut client,
         "https://host.test",
         &receipt.sid,
-        &[3; 32],
-        &[7; 32]
+        &serving_generation,
+        &collision_inventory_id
     )
     .await
     .unwrap()
@@ -1387,7 +1390,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .await
         .unwrap();
     assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+        .lookup(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .is_err());
     drop(client);
