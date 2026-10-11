@@ -293,7 +293,9 @@ pub(crate) fn authorized_committed_claims(
     resolver: &dyn super::token_exchange::SubjectContextResolver,
 ) -> Result<Claims, federate_source::Error> {
     let claims = committed_claims(session, now, source_issuer, source_subject)?;
-    let context = resolver.resolve(&claims.sub).ok_or(federate_source::Error::Unavailable)?;
+    let context = resolver
+        .resolve(&claims.sub)
+        .ok_or(federate_source::Error::Unavailable)?;
     Ok(claims.with_clearance(*context.clearance()))
 }
 
@@ -433,7 +435,10 @@ mod tests {
         );
         assert!(value.get("hs_session_authority_generation").is_none());
         assert_eq!(value["hs_source_issuer_v1"], federate_source::ISSUER);
-        assert_eq!(value["hs_source_subject_v1"], "opaque-atproto-connector-subject");
+        assert_eq!(
+            value["hs_source_subject_v1"],
+            "opaque-atproto-connector-subject"
+        );
         assert_eq!(
             value["cnf"],
             json!({"jwk":{"kty":"OKP","crv":"Ed25519","x":B64.encode(session.ed_public)}})
@@ -459,14 +464,26 @@ mod tests {
         assert_eq!(body["session_id"], session.sid);
         let mut invalid = session.clone();
         invalid.proof_epoch = 0;
-        assert!(committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err());
+        assert!(
+            committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err()
+        );
         invalid = session.clone();
         invalid.client_id = "other".into();
-        assert!(committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err());
+        assert!(
+            committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err()
+        );
         invalid = session.clone();
         invalid.tenant = "*".into();
-        assert!(committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err());
-        assert!(committed_claims(&session, 1_800_000_000, "https://attacker.invalid", "subject").is_err());
+        assert!(
+            committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err()
+        );
+        assert!(committed_claims(
+            &session,
+            1_800_000_000,
+            "https://attacker.invalid",
+            "subject"
+        )
+        .is_err());
         assert!(committed_claims(&session, 1_800_000_000, federate_source::ISSUER, "").is_err());
         Ok(())
     }

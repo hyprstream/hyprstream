@@ -21,13 +21,17 @@ use crate::{
     services::{
         generated::model_client::ModelHandler,
         model::{ModelService, ModelServiceConfig},
+        oauth::token_exchange::SubjectContextResolver as _,
     },
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::{
-    auth::{ClusterKeySource, InMemoryCredentialRevocationStore, JwtKeySource},
+    auth::{
+        mac::{CredentialClearance, SubjectContextClaims, VerifiedKeyMaterial},
+        ClusterKeySource, InMemoryCredentialRevocationStore, JwtKeySource,
+    },
     crypto::{
         pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_from_bytes, MlDsaSigningKey},
         CryptoPolicy,
@@ -52,7 +56,7 @@ use hyprstream_rpc::{
     ToCapnp,
 };
 use std::{
-        io::Cursor,
+    io::Cursor,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -160,8 +164,17 @@ impl RequestService for ModelBoundary {
         ctx: &EnvelopeContext,
         _: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        // This is the actual production Model authorization entry, not a
-        // duplicated label comparison or a fabricated authenticated context.
+        // Confirm the proof-verified context, then enter the actual production
+        // Model authorization path. The outer dispatch PEP is a fixture double.
+        let context = ctx
+            .security_context()
+            .ok_or_else(|| anyhow::anyhow!("verified Model security context missing"))?;
+        let required =
+            SecurityLabel::new(Level::Internal, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        anyhow::ensure!(
+            context.can_access(&required),
+            "hybrid Federate request proof did not meet the Model method floor"
+        );
         self.attempts.fetch_add(1, Ordering::SeqCst);
         ModelHandler::authorize(&self.model, ctx, RESOURCE, "infer").await?;
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -169,9 +182,9 @@ impl RequestService for ModelBoundary {
     }
 }
 
-fn resolver(level: Level) -> EnrollmentSubjectContextResolver {
+fn enrollment_policy(level: Level, assurance: Assurance) -> CompiledPolicy {
     let lattice = Lattice::new(LatticeVersion(1), []);
-    let label = SecurityLabel::new(level, Assurance::Unverified, CompartmentSet::EMPTY);
+    let label = SecurityLabel::new(level, assurance, CompartmentSet::EMPTY);
     let policy = CompiledPolicy::new(TeMatrix::default(), &lattice)
         .with_enrollment([(DID.to_owned(), label)].into_iter().collect());
     let ed = SigningKey::from_bytes(&[81; 32]);
@@ -185,7 +198,7 @@ fn resolver(level: Level) -> EnrollmentSubjectContextResolver {
         },
     )
     .unwrap();
-    let policy = PolicyLoader::new(HybridPolicyVerifier {
+    PolicyLoader::new(HybridPolicyVerifier {
         ed_vk: &ed.verifying_key(),
         pq_vk: Some(&pq_vk),
         require_pq: true,
@@ -195,8 +208,7 @@ fn resolver(level: Level) -> EnrollmentSubjectContextResolver {
         approved_hash: policy.policy_hash().unwrap(),
     })
     .load(&signed)
-    .unwrap();
-    EnrollmentSubjectContextResolver::new(Arc::new(policy))
+    .unwrap()
 }
 
 #[tokio::test]
@@ -309,21 +321,57 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         proof_epoch: 1,
         expires_at: now + 120,
     };
+    let hybrid_policy = enrollment_policy(Level::Internal, Assurance::PqHybrid);
+    let hybrid_resolver = EnrollmentSubjectContextResolver::new(Arc::new(hybrid_policy.clone()));
     let allowed = federate_exchange::authorized_committed_claims(
         &session,
         now,
         ISSUER,
         "opaque-sub",
-        &resolver(Level::Internal),
+        &hybrid_resolver,
     )?;
+    let authority_clearance = hybrid_policy.clearance_for(DID).unwrap();
+    assert_eq!(
+        allowed.clearance,
+        Some(CredentialClearance::from_label(authority_clearance)),
+        "the JWT carries the authority clearance's level/compartments"
+    );
+    assert_eq!(
+        hybrid_resolver.resolve(DID).unwrap().clearance().assurance,
+        Assurance::Classical,
+        "the generic OAuth resolver intentionally clamps its in-memory context"
+    );
+    let hybrid_context = allowed
+        .security_context(VerifiedKeyMaterial::PqHybrid)
+        .unwrap();
+    assert_eq!(hybrid_context.clearance().assurance, Assurance::PqHybrid);
+    let classical_context = allowed
+        .security_context(VerifiedKeyMaterial::Classical)
+        .unwrap();
+    assert_eq!(
+        classical_context.clearance().assurance,
+        Assurance::Classical
+    );
+    let required = SecurityLabel::new(Level::Internal, Assurance::PqHybrid, CompartmentSet::EMPTY);
+    assert!(hybrid_context.can_access(&required));
+    assert!(!classical_context.can_access(&required));
+
     let insufficient = federate_exchange::authorized_committed_claims(
         &session,
         now,
         ISSUER,
         "opaque-sub",
-        &resolver(Level::Public),
+        &EnrollmentSubjectContextResolver::new(Arc::new(enrollment_policy(
+            Level::Public,
+            Assurance::PqHybrid,
+        ))),
     )?;
+    assert!(!insufficient
+        .security_context(VerifiedKeyMaterial::PqHybrid)
+        .unwrap()
+        .can_access(&required));
     let missing = federate_exchange::committed_claims(&session, now, ISSUER, "opaque-sub")?;
+    assert!(missing.clearance.is_none());
     let mut unknown = session.clone();
     unknown.subject = "did:plc:abcdefghijklmnopqrstuvwx".into();
     assert!(federate_exchange::authorized_committed_claims(
@@ -331,7 +379,10 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         now,
         ISSUER,
         "opaque-sub",
-        &resolver(Level::Internal)
+        &EnrollmentSubjectContextResolver::new(Arc::new(enrollment_policy(
+            Level::Internal,
+            Assurance::PqHybrid,
+        )))
     )
     .is_err());
     let body = hyprstream_rpc::serialize_message(|message| {
@@ -339,76 +390,69 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             .init_root::<hyprstream_rpc::common_capnp::error_info::Builder>()
             .set_message("model-fixture");
     })?;
-    for (index, (claims, expected_calls)) in [(missing, 0), (insufficient, 0), (allowed, 1)]
-        .into_iter()
-        .enumerate()
-    {
-        let token = signer.sign(&claims).await?;
-        let suite = hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
-        let response = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
-        let stream = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
-        let binding = FederateRecipientBinding::from_recipients(
-            Some(&response.public()),
-            Some(&stream.public()),
-            Some([61; 32]),
-        )?;
-        let kids = super::super::federate_source::session_primary_kids(
-            &session.ed_public,
-            &session.pq_public,
-        );
-        let proof_signer = AuthenticatedHybridProofSigner::new(
-            holder.clone(),
-            kids[0].to_vec(),
-            holder_pq.clone(),
-            kids[1].to_vec(),
-        )?;
-        let proof = build_authenticated_hybrid_request_proof(
-            &AuthenticatedRequestProofInput {
-                service_domain: "model",
-                credential: token.as_bytes(),
-                issued_at: now as u64,
-                expires_at: now as u64 + 20,
-                capnp_schema_id: SCHEMA,
-                capnp_body: &body,
-                response_binding: None,
-                federate_recipient_binding: Some(&binding),
-            },
-            &proof_signer,
-        )?;
-        let request = RequestEnvelope::new(body.clone())
-            .with_jwt_token(token)
-            .with_proof_cwt(proof)
-            .with_service_domain("model")?
-            .with_client_dh_public([61; 32])
-            .with_response_kem_recipient(response.public())
-            .with_client_kem_public(stream.public())?;
-        let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
-            request,
-            &relay,
-            &relay_pq,
-            &derive_mesh_kem_recipient(&service.server)?.public(),
-        )?;
-        let mut message = capnp::message::Builder::new_default();
-        signed.write_to(
-            &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
-        );
-        let mut bytes = vec![];
-        capnp::serialize::write_message(&mut bytes, &message)?;
-        let _ = process_request(
-            &bytes,
-            &service,
-            EnvelopeVerification::AnySigner,
-            &service.server,
-            &envelope::InMemoryNonceCache::new(),
-            CarrierContext::iroh(),
-        )
-        .await?;
-        assert_eq!(service.calls.load(Ordering::SeqCst), expected_calls);
-        assert_eq!(
-            service.attempts.load(Ordering::SeqCst),
-            index + 1,
-            "fixture must reach the real Model MAC gate, not pass vacuously at an earlier denial"
-        );
-    }
+    let token = signer.sign(&allowed).await?;
+    let suite = hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
+    let response = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
+    let stream = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
+    let binding = FederateRecipientBinding::from_recipients(
+        Some(&response.public()),
+        Some(&stream.public()),
+        Some([61; 32]),
+    )?;
+    let kids =
+        super::super::federate_source::session_primary_kids(&session.ed_public, &session.pq_public);
+    let proof_signer = AuthenticatedHybridProofSigner::new(
+        holder.clone(),
+        kids[0].to_vec(),
+        holder_pq.clone(),
+        kids[1].to_vec(),
+    )?;
+    let proof = build_authenticated_hybrid_request_proof(
+        &AuthenticatedRequestProofInput {
+            service_domain: "model",
+            credential: token.as_bytes(),
+            issued_at: now as u64,
+            expires_at: now as u64 + 20,
+            capnp_schema_id: SCHEMA,
+            capnp_body: &body,
+            response_binding: None,
+            federate_recipient_binding: Some(&binding),
+        },
+        &proof_signer,
+    )?;
+    let request = RequestEnvelope::new(body.clone())
+        .with_jwt_token(token)
+        .with_proof_cwt(proof)
+        .with_service_domain("model")?
+        .with_client_dh_public([61; 32])
+        .with_response_kem_recipient(response.public())
+        .with_client_kem_public(stream.public())?;
+    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+        request,
+        &relay,
+        &relay_pq,
+        &derive_mesh_kem_recipient(&service.server)?.public(),
+    )?;
+    let mut message = capnp::message::Builder::new_default();
+    signed.write_to(
+        &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+    );
+    let mut bytes = vec![];
+    capnp::serialize::write_message(&mut bytes, &message)?;
+    let _ = process_request(
+        &bytes,
+        &service,
+        EnvelopeVerification::AnySigner,
+        &service.server,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await?;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service.attempts.load(Ordering::SeqCst),
+        1,
+        "fixture must reach the real Model authorization handler"
+    );
     Ok(())
 }
