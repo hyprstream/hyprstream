@@ -573,10 +573,15 @@ where
             Ok(admitted) => admitted,
             Err(_) => return dispatch_denied("Federate request admission denied"),
         };
-        if ctx.commit_deferred_federate(&verified, holder_ed, resource, operation).is_err() {
+        if ctx.commit_deferred_federate(
+            &verified,
+            holder_ed,
+            resource.clone(),
+            operation.clone(),
+        ).is_err() {
             return dispatch_denied("Federate holder/subject mismatch");
         }
-        deferred_federate_replay = Some((replay_key, replay_expiry));
+        deferred_federate_replay = Some((replay_key, replay_expiry, resource, operation));
         verified_proof = Some(verified);
     }
 
@@ -797,22 +802,35 @@ where
     }
     }
 
-    // Federate uses the same shared replay store as the generic proof path,
-    // but its holder/session/Policy checks run in the service adapter above.
-    // Keep the verified replay key pending until the generated method-policy
-    // and mandatory MAC gates have also succeeded. The store's atomic
-    // check-and-insert immediately before handler dispatch preserves the
-    // one-execution guarantee for concurrent duplicates without consuming
-    // replay capacity for a request denied by either later authorization gate.
+    // Fresh Policy authorization and the durable session-bound replay consume
+    // are one transaction in Policy. Defer that call until every local method
+    // and MAC gate has passed, so an otherwise valid proof denied here remains
+    // retryable. It is the final authorization gate before handler dispatch.
     if deferred_federate {
-        let Some(proof) = parsed_proof.as_ref() else {
-            return dispatch_denied("Federate holder proof missing");
-        };
-        let Some((replay_key, replay_expiry)) = deferred_federate_replay.as_ref() else {
+        let Some((replay_key, replay_expiry, resource, operation)) =
+            deferred_federate_replay.as_ref()
+        else {
             return dispatch_denied("Federate replay admission unavailable");
         };
+        if service
+            .commit_deferred_federate_request(
+                &ctx,
+                resource,
+                operation,
+                replay_key,
+                *replay_expiry,
+            )
+            .await
+            .is_err()
+        {
+            warn!("{} Federate Policy/replay admission denied", service.name());
+            return dispatch_denied("dispatch denied");
+        }
         let Some(replay_store) = crate::proof::admission::global_proof_replay_store() else {
             return dispatch_denied("Federate replay admission unavailable");
+        };
+        let Some(proof) = parsed_proof.as_ref() else {
+            return dispatch_denied("Federate holder proof missing");
         };
         match crate::proof::admission::admit_request_proof(
             replay_store,

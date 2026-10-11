@@ -142,6 +142,19 @@ impl RequestService for ModelBoundary {
             proof.claims.exp,
         ))
     }
+    async fn commit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(ctx.admitted_federate_operation(resource, operation));
+        anyhow::ensure!(replay_key.request_id != [0; 16]);
+        anyhow::ensure!(replay_expiry > chrono::Utc::now().timestamp() as u64);
+        Ok(())
+    }
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

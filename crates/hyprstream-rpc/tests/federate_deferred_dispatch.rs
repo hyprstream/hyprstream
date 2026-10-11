@@ -270,6 +270,7 @@ struct Service {
     expected_body: Vec<u8>,
     revoked: AtomicBool,
     calls: AtomicUsize,
+    policy_admissions: AtomicUsize,
 }
 
 impl Service {
@@ -286,6 +287,7 @@ impl Service {
             expected_body: f.body.clone(),
             revoked: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            policy_admissions: AtomicUsize::new(0),
         }
     }
 }
@@ -371,6 +373,20 @@ impl RequestService for Service {
             replay_key,
             proof.claims.exp,
         ))
+    }
+    async fn commit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> Result<()> {
+        ensure!(ctx.admitted_federate_operation(resource, operation));
+        ensure!(replay_expiry > 0);
+        ensure!(replay_key.signer_thumbprint == [9; 32]);
+        self.policy_admissions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
     async fn handle_request(
         &self,
@@ -691,17 +707,19 @@ async fn federate_replay_waits_for_mac_and_remains_atomic_for_duplicates() -> Re
         CLIENT_DH,
     );
 
-    // A mandatory-MAC denial happens after the service's fresh Policy result.
-    // It must not consume shared replay state; correcting authorization lets
-    // the identical signed request retry successfully.
+    // A mandatory-MAC denial happens before the service's final fresh Policy
+    // admission. It must not consume replay state; correcting authorization
+    // lets the identical signed request retry successfully.
     MAC_ALLOW.store(false, Ordering::SeqCst);
     let denied = send(&service, &request).await?;
     assert_denial_has_no_success_payload(&denied);
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(service.policy_admissions.load(Ordering::SeqCst), 0);
 
     MAC_ALLOW.store(true, Ordering::SeqCst);
     send(&service, &request).await?;
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(service.policy_admissions.load(Ordering::SeqCst), 1);
 
     // Two dispatches racing with the same fresh proof share the atomic replay
     // admission store. At most one reaches the handler.

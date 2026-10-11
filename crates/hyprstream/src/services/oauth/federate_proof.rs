@@ -102,6 +102,23 @@ impl CredentialHandle {
         Self::from_claims_snapshot(claims, token)
     }
 
+    /// The dispatcher calls this only after the holder proof has been
+    /// committed to the request context. The claims and token remain the
+    /// exact facts verified by the envelope verifier; no caller-supplied
+    /// identity is accepted here.
+    fn from_committed_context(ctx: &EnvelopeContext) -> Result<Self> {
+        if !ctx.is_federate_admitted() {
+            return Err(Error::Denied);
+        }
+        let claims = ctx.claims().ok_or(Error::Denied)?;
+        let token = ctx.jwt_token().ok_or(Error::Denied)?;
+        let header = parse_protected_header(token).map_err(|_| Error::Denied)?;
+        if header.typ != "at+jwt" {
+            return Err(Error::Denied);
+        }
+        Self::from_claims_snapshot(claims, token)
+    }
+
     /// Fixture-accessible parser of already signed facts. Never call on an
     /// unverified JWT; only `from_verified_context` is a production entry.
     fn from_claims_snapshot(claims: &Claims, token: &str) -> Result<Self> {
@@ -302,8 +319,6 @@ impl DispatchAdapter {
         service: &str,
         schema_id: u64,
         body: &[u8],
-        resource: &str,
-        operation: &str,
     ) -> Result<(
         VerifiedProof,
         [u8; 32],
@@ -320,7 +335,7 @@ impl DispatchAdapter {
             in_flight: &self.in_flight,
         };
         let request = Request { proof: raw, credential: ctx.deferred_federate_credential().ok_or(Error::Denied)?.1.as_bytes(), service, schema_id, body };
-        let (verified, active) = consumer.verify_with_primary(
+        let verified = consumer.verify(
             &handle, &request, &local,
             || chrono::Utc::now().timestamp().max(0) as u64,
         ).await?;
@@ -329,6 +344,33 @@ impl DispatchAdapter {
         {
             return Err(Error::Denied);
         }
+        let e = &handle.expected;
+        let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
+            signer_thumbprint: verified.replay_thumbprint,
+            request_id: proof.claims.request_id,
+        };
+        let replay_expiry = proof.claims.exp.min(e.expires_at as u64);
+        Ok((verified, e.ed_public, replay_key, replay_expiry))
+    }
+
+    /// Run the fresh Policy check and its durable replay consume only after
+    /// the dispatcher has passed generated method-policy and MAC checks.
+    pub(crate) async fn commit_request_use(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        if replay_expiry <= now || !ctx.admitted_federate_operation(resource, operation) {
+            return Err(Error::Denied);
+        }
+        let handle = CredentialHandle::from_committed_context(ctx)?;
+        let active = SignedCredentialPrimaryProvider
+            .resolve_current(&handle)
+            .await?;
         let e = &handle.expected;
         let data = AdmitFederateRequest {
             issuer: e.issuer.clone(),
@@ -345,20 +387,21 @@ impl DispatchAdapter {
             collision_inventory_id: active.collision_inventory_id,
             expires_at: e.expires_at,
             proof_epoch: active.proof_epoch,
-            verified_namespace: verified.replay_thumbprint.to_vec(),
-            request_id: proof.claims.request_id.to_vec(),
+            verified_namespace: replay_key.signer_thumbprint.to_vec(),
+            request_id: replay_key.request_id.to_vec(),
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let admitted = self.client.admit_federate_request(&data).await
+        let admitted = self
+            .client
+            .admit_federate_request(&data)
+            .await
             .map_err(|_| Error::Unavailable)?;
-        if !admitted { return Err(Error::Denied); }
-        let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
-            signer_thumbprint: verified.replay_thumbprint,
-            request_id: proof.claims.request_id,
-        };
-        let replay_expiry = proof.claims.exp.min(e.expires_at as u64);
-        Ok((verified, e.ed_public, replay_key, replay_expiry))
+        if admitted {
+            Ok(())
+        } else {
+            Err(Error::Denied)
+        }
     }
 }
 

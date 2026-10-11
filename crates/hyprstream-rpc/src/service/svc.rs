@@ -1189,11 +1189,11 @@ pub trait RequestService: 'static {
         false
     }
 
-    /// Admit one decoded Federate request before identity publication, MAC,
-    /// replay bypass and handler entry. Implementations must bind the original
-    /// holder's hybrid proof to the exact body/leaf/resource/action, resolve
-    /// the current session and consume durable Policy replay. The default
-    /// never confers a caller identity.
+    /// Verify the original holder's proof and bind it to the exact decoded
+    /// body/leaf/resource/action before identity publication. This stage must
+    /// not consume replay state: generated method-policy and MAC authorization
+    /// still run afterward. Durable Policy admission happens in
+    /// `commit_deferred_federate_request` only after those gates pass.
     async fn admit_deferred_federate_request(
         &self,
         _ctx: &EnvelopeContext,
@@ -1208,6 +1208,21 @@ pub trait RequestService: 'static {
         u64,
     )> {
         anyhow::bail!("Federate request admission is disabled")
+    }
+
+    /// Perform fresh Policy admission and durable replay consumption after the
+    /// generated method-policy and mandatory MAC gates, immediately before
+    /// handler dispatch. Implementations must fail closed if the durable
+    /// admission service is unavailable. The default never admits a request.
+    async fn commit_deferred_federate_request(
+        &self,
+        _ctx: &EnvelopeContext,
+        _resource: &str,
+        _operation: &str,
+        _replay_key: &crate::proof::admission::ProofReplayKey,
+        _replay_expiry: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Federate durable request admission is disabled")
     }
 
     /// Verify an `iw+jwt` internal execution work order presented as the
