@@ -159,8 +159,9 @@ pub struct Claims {
     /// standalone service credentials (no session lifecycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    /// Federate's signed, canonical 32-byte authority generation. This is
-    /// JWT-only: an envelope claims field cannot assert session authority.
+    /// Signed generation for profiles that use server-side session authority.
+    /// Stateless Federate proof credentials use `hs_signer_inventory_v1`
+    /// instead. This is JWT-only; envelope claims cannot assert this state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hs_session_authority_generation: Option<String>,
     /// Exact opt-in Federate PoP/COSE subprofile. This is not authority on its
@@ -172,6 +173,21 @@ pub struct Claims {
     /// confirmation method: `cnf.jwk` remains the sole confirmation key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hs_signer_suite_v1: Option<String>,
+    /// The public ML-DSA-65 half of the COSE proof key pair. It is safe to
+    /// carry in the issuer-signed credential and lets a verifier validate the
+    /// holder proof without resolving a session row just to recover a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_pq_key_v1: Option<String>,
+    /// Digest of the issuer's trusted signer inventory at login. This expires
+    /// stale proof credentials after an inventory change without a session DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_inventory_v1: Option<String>,
+    /// Signed login provenance. `sub` remains the canonical ATProto DID;
+    /// these claims retain the upstream OIDC identity used to establish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_source_issuer_v1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_source_subject_v1: Option<String>,
     /// Workload credential family session ID (`workload_session_id`) — a
     /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
     /// credentials of an enrolled workload family (e.g. a service-JWT
@@ -280,6 +296,10 @@ impl std::fmt::Debug for Claims {
             .field("hs_session_authority_generation", &self.hs_session_authority_generation)
             .field("hs_profile", &self.hs_profile)
             .field("hs_signer_suite_v1", &self.hs_signer_suite_v1)
+            .field("hs_signer_pq_key_v1", &self.hs_signer_pq_key_v1)
+            .field("hs_signer_inventory_v1", &self.hs_signer_inventory_v1)
+            .field("hs_source_issuer_v1", &self.hs_source_issuer_v1)
+            .field("hs_source_subject_v1", &self.hs_source_subject_v1)
             .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
             .field("client_id", &self.client_id)
@@ -385,6 +405,10 @@ impl FromCapnp for Claims {
             hs_session_authority_generation: None,
             hs_profile: None,
             hs_signer_suite_v1: None,
+            hs_signer_pq_key_v1: None,
+            hs_signer_inventory_v1: None,
+            hs_source_issuer_v1: None,
+            hs_source_subject_v1: None,
             workload_session_id: None,
             aud,
             client_id: None,
@@ -449,6 +473,10 @@ impl Claims {
             hs_session_authority_generation: None,
             hs_profile: None,
             hs_signer_suite_v1: None,
+            hs_signer_pq_key_v1: None,
+            hs_signer_inventory_v1: None,
+            hs_source_issuer_v1: None,
+            hs_source_subject_v1: None,
             workload_session_id: None,
             aud: None,
             client_id: None,
@@ -492,9 +520,9 @@ impl Claims {
         self
     }
 
-    /// Set the signed Federate generation in its one canonical encoding.
-    /// This does not make a token eligible for dispatch; current profile,
-    /// session, proof, replay and Policy checks remain mandatory.
+    /// Set a session-authority generation in its one canonical encoding.
+    /// This does not make a token eligible for dispatch; profile, proof,
+    /// replay and Policy checks remain mandatory.
     pub fn with_session_authority_generation(mut self, generation: [u8; 32]) -> Self {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         self.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode(generation));
@@ -502,7 +530,7 @@ impl Claims {
     }
 
     /// Parse the signed generation without accepting padding, alternate
-    /// alphabets, truncation, or a wire-provided database locator.
+    /// alphabets, truncation, or a wire-provided state locator.
     pub fn session_authority_generation(&self) -> anyhow::Result<Option<[u8; 32]>> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         let Some(encoded) = self.hs_session_authority_generation.as_deref() else {
@@ -517,7 +545,7 @@ impl Claims {
         Ok(Some(generation))
     }
 
-    /// Recognize the fixed host/client even when the generation claim was
+    /// Recognize the fixed host/client even when one profile marker was
     /// removed by a faulty issuer or token transformation.
     pub fn is_reserved_federate_staging_credential(&self) -> bool {
         self.iss == FEDERATE_STAGING_HOST
@@ -530,10 +558,15 @@ impl Claims {
         self.hs_session_authority_generation.is_some()
             || self.hs_profile.is_some()
             || self.hs_signer_suite_v1.is_some()
+            || self.hs_signer_pq_key_v1.is_some()
+            || self.hs_signer_inventory_v1.is_some()
+            || self.hs_source_issuer_v1.is_some()
+            || self.hs_source_subject_v1.is_some()
     }
 
     /// Stamp the exact Federate profile and its ordered hybrid-suite digest.
-    /// Issuers must still commit session admission before signing the JWT.
+    /// This marker alone is never authority; the reserved path also verifies
+    /// the signed source binding, holder proof, replay admission and live Policy.
     pub fn with_federate_signer_suite(mut self, thumbprint_b64url: String) -> Self {
         self.hs_profile = Some("federate-session-v1".to_owned());
         self.hs_signer_suite_v1 = Some(thumbprint_b64url);

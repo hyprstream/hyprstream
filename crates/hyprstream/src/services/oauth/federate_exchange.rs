@@ -219,6 +219,8 @@ impl ExchangeRequest {
 pub(crate) fn committed_claims(
     session: &Session,
     now: i64,
+    source_issuer: &str,
+    source_subject: &str,
 ) -> Result<Claims, federate_source::Error> {
     if session.host != federate_source::HOST
         || session.client_id != federate_source::CLIENT
@@ -230,8 +232,12 @@ pub(crate) fn committed_claims(
         || session.ed_public.iter().all(|byte| *byte == 0)
         || session.pq_public.len() != 1952
         || session.proof_epoch <= 0
+        || session.generation != session.collision_inventory_id
         || session.expires_at <= now
         || session.expires_at > now.saturating_add(300)
+        || source_issuer != federate_source::ISSUER
+        || source_subject.is_empty()
+        || source_subject.len() > 256
     {
         return Err(federate_source::Error::Invalid);
     }
@@ -251,7 +257,6 @@ pub(crate) fn committed_claims(
     let mut claims = Claims::new(session.subject.clone(), now, session.expires_at)
         .with_sid(session.sid.clone())
         .with_jti()
-        .with_session_authority_generation(session.generation)
         .with_federate_signer_suite(B64.encode(signer_suite_thumbprint(
             hyprstream_session_store::SUITE,
             &[&session.ed_public, &session.pq_public],
@@ -261,6 +266,10 @@ pub(crate) fn committed_claims(
     claims.client_id = Some(session.client_id.clone());
     claims.tenant = Some(session.tenant.clone());
     claims.scope = Some(scope);
+    claims.hs_signer_pq_key_v1 = Some(B64.encode(&session.pq_public));
+    claims.hs_signer_inventory_v1 = Some(B64.encode(session.collision_inventory_id));
+    claims.hs_source_issuer_v1 = Some(source_issuer.to_owned());
+    claims.hs_source_subject_v1 = Some(source_subject.to_owned());
     claims.cnf = Some(Cnf {
         jwk: Some(CnfJwk {
             kty: "OKP".into(),
@@ -290,8 +299,10 @@ impl ExchangeResponse {
         token: String,
         session: &Session,
         now: i64,
+        source_issuer: &str,
+        source_subject: &str,
     ) -> Result<Self, federate_source::Error> {
-        committed_claims(session, now)?;
+        committed_claims(session, now, source_issuer, source_subject)?;
         if token.is_empty() || token.len() > MAX_SOURCE_TOKEN * 2 {
             return Err(federate_source::Error::Invalid);
         }
@@ -378,7 +389,7 @@ mod tests {
             ed_public: [1; 32],
             pq_public: vec![2; 1952],
             generation: [3; 32],
-            collision_inventory_id: [4; 32],
+            collision_inventory_id: [3; 32],
             proof_epoch: 1,
             expires_at: 1_800_000_120,
         }
@@ -388,13 +399,26 @@ mod tests {
     #[test]
     fn committed_session_mints_only_exact_pop_claim_shape() -> anyhow::Result<()> {
         let session = committed_session();
-        let claims = committed_claims(&session, 1_800_000_000)?;
+        let claims = committed_claims(
+            &session,
+            1_800_000_000,
+            federate_source::ISSUER,
+            "opaque-atproto-connector-subject",
+        )?;
         let value = serde_json::to_value(&claims)?;
         assert_eq!(value["hs_profile"], PROFILE);
         assert_eq!(value["iss"], federate_source::HOST);
         assert_eq!(value["aud"], federate_source::HOST);
         assert_eq!(value["sid"], session.sid);
         assert_eq!(value["scope"], "query:registry:List");
+        assert_eq!(value["hs_signer_pq_key_v1"], B64.encode(&session.pq_public));
+        assert_eq!(
+            value["hs_signer_inventory_v1"],
+            B64.encode(session.collision_inventory_id)
+        );
+        assert!(value.get("hs_session_authority_generation").is_none());
+        assert_eq!(value["hs_source_issuer_v1"], federate_source::ISSUER);
+        assert_eq!(value["hs_source_subject_v1"], "opaque-atproto-connector-subject");
         assert_eq!(
             value["cnf"],
             json!({"jwk":{"kty":"OKP","crv":"Ed25519","x":B64.encode(session.ed_public)}})
@@ -406,7 +430,13 @@ mod tests {
                 &[&session.ed_public, &session.pq_public]
             ))
         );
-        let response = ExchangeResponse::committed("a.b.c".into(), &session, 1_800_000_000)?;
+        let response = ExchangeResponse::committed(
+            "a.b.c".into(),
+            &session,
+            1_800_000_000,
+            federate_source::ISSUER,
+            "opaque-atproto-connector-subject",
+        )?;
         let body = serde_json::to_value(response)?;
         assert_eq!(body["token_type"], "PoP");
         assert_eq!(body["issued_token_type"], ACCESS_TOKEN_TYPE);
@@ -414,13 +444,15 @@ mod tests {
         assert_eq!(body["session_id"], session.sid);
         let mut invalid = session.clone();
         invalid.proof_epoch = 0;
-        assert!(committed_claims(&invalid, 1_800_000_000).is_err());
+        assert!(committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err());
         invalid = session.clone();
         invalid.client_id = "other".into();
-        assert!(committed_claims(&invalid, 1_800_000_000).is_err());
+        assert!(committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err());
         invalid = session.clone();
         invalid.tenant = "*".into();
-        assert!(committed_claims(&invalid, 1_800_000_000).is_err());
+        assert!(committed_claims(&invalid, 1_800_000_000, federate_source::ISSUER, "subject").is_err());
+        assert!(committed_claims(&session, 1_800_000_000, "https://attacker.invalid", "subject").is_err());
+        assert!(committed_claims(&session, 1_800_000_000, federate_source::ISSUER, "").is_err());
         Ok(())
     }
 

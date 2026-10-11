@@ -37,12 +37,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
 #[cfg(feature = "postgres")]
-#[path = "policy_primary.rs"]
-pub(in crate::services) mod primary;
-#[cfg(feature = "postgres")]
-#[path = "policy_session_db.rs"]
-pub(in crate::services) mod session_db;
-#[cfg(feature = "postgres")]
 #[path = "policy_inventory.rs"]
 pub(in crate::services) mod inventory;
 
@@ -152,9 +146,6 @@ pub struct PolicyService {
     /// Source-only OAuth→Policy challenge RPC. No production installer yet.
     #[cfg(feature = "postgres")]
     federate_admission: Option<Arc<federate_admission::AdmissionService>>,
-    /// Source-only: never installed by any runtime factory in H3a.
-    #[cfg(feature = "postgres")]
-    session_primary: Option<primary::SessionPrimaryReader>,
     /// Disabled until the authenticated serving adapter and causal RPC tests
     /// are installed. No constructor currently populates this field.
     #[cfg(feature = "postgres")]
@@ -229,8 +220,6 @@ impl PolicyService {
             #[cfg(feature = "postgres")]
             federate_admission: None,
             #[cfg(feature = "postgres")]
-            session_primary: None,
-            #[cfg(feature = "postgres")]
             federate_request_use: None,
             policy_manager,
             signing_key,
@@ -257,32 +246,27 @@ impl PolicyService {
         }
     }
 
-    /// Install the complete, fail-closed Federate runtime after the factory
-    /// has verified the TLS database role, active profile and collision
-    /// inventory. No reader is installed from a partial or inferred config.
+    /// Install the stateless Federate runtime after the factory has verified
+    /// the trusted service enrollment and complete collision inventory. Only
+    /// shared request-proof replay uses PostgreSQL; credentials and `sid` do
+    /// not require a session-row lookup.
     #[cfg(feature = "postgres")]
     pub(super) fn with_federate_runtime(
         mut self,
         enrollment: Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>,
-        pool: deadpool_postgres::Pool,
         serving_generation: [u8; 32],
         collision_inventory_id: [u8; 32],
-        primary_authority: hyprstream_session_store::primary::PrimaryLookup,
     ) -> Self {
         let admission = Arc::new(federate_admission::AdmissionService::configured(
             Arc::clone(&self.policy_manager),
             enrollment,
             serving_generation,
             collision_inventory_id,
-            pool.clone(),
-        ));
-        self.session_primary = Some(primary::SessionPrimaryReader::new(
-            pool.clone(),
-            primary_authority,
+            None,
         ));
         self.federate_request_use = Some(federate_admission::RequestUseReader::new(
             Arc::clone(&admission),
-            pool,
+            None,
         ));
         self.federate_admission = Some(admission);
         self
@@ -1392,12 +1376,6 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
         data: &hyprstream_rpc_std::policy_client::ResolveSessionPrimary,
     ) -> Result<PolicyResponseVariant> {
-        #[cfg(feature = "postgres")]
-        if let Some(reader) = &self.session_primary {
-            if let Ok(record) = reader.resolve(ctx, data).await {
-                return Ok(PolicyResponseVariant::ResolveSessionPrimaryResult(record));
-            }
-        }
         let _ = (ctx, data);
         Ok(PolicyResponseVariant::Error(ErrorInfo {
             code: "SESSION_PRIMARY_DENIED".into(),

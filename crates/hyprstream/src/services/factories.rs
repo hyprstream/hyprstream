@@ -78,13 +78,9 @@ fn policy_client_for_transport(
 fn federate_dispatch_for_service(
     policy_client: PolicyClient,
 ) -> anyhow::Result<Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>> {
-    if std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_URL_FILE").is_none() {
+    if hyprstream_rpc::proof::enrollment::global_enrollment_resolver().is_none() {
         return Ok(None);
     }
-    anyhow::ensure!(
-        std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_SSLROOTCERT_FILE").is_some(),
-        "Federate session DB CA file must be configured with its URL file"
-    );
     let adapter = crate::services::oauth::federate_proof::DispatchAdapter::from_global_enrollment(
         policy_client,
     )?;
@@ -1212,93 +1208,34 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     policy_service = policy_service.with_jwt_key_source(ctx.cluster_key_source());
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
 
-    // The Federate runtime is enabled only by an explicit, file-backed TLS
-    // session-store configuration. Never infer a live database locator from
-    // OIDC input; partial configuration is a startup error and absent local
-    // configuration keeps the feature fail-closed for development.
+    // Federate identity and grants are stateless. Policy owns the current
+    // tenant/grant decision; the shared proof-replay backend is installed by
+    // the common RPC startup path. Do not require session rows or a profile
+    // bootstrap for short-lived signed credentials.
     #[cfg(feature = "postgres")]
     {
-        let session_url_configured =
-            std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_URL_FILE").is_some();
-        let session_ca_configured =
-            std::env::var_os("HYPRSTREAM_FEDERATE_SESSION_SSLROOTCERT_FILE").is_some();
-        anyhow::ensure!(
-            session_url_configured == session_ca_configured,
-            "Federate session DB URL and CA file must be configured together"
-        );
-        if session_url_configured {
-            let (enrollment, session_pool, serving_generation, collision_inventory, primary) =
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        let enrollment = crate::auth::service_enrollment::global_service_enrollment()
-                            .cloned()
-                            .ok_or_else(|| anyhow::anyhow!(
-                                "Federate Policy runtime requires service-enrollment.json"
-                            ))?;
-                        let bootstrap = crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(
-                            &secrets_dir,
-                        )?;
-                        let required_services = hyprstream_service::list_factories()
-                            .map(|factory| factory.name)
-                            .collect::<Vec<_>>();
-                        let collision_inventory = crate::services::policy::inventory::
-                            complete_collision_inventory(
-                                &config.oauth,
-                                &secrets_dir,
-                                ctx.signing_key(),
-                                &required_services,
-                            )?;
-                        let session_db = crate::services::policy::session_db::PolicySessionPool::
-                            from_env()
-                            .await?;
-                        let serving_generation = session_db
-                            .active_profile(
-                                crate::services::oauth::federate_source::HOST,
-                                collision_inventory.id(),
-                            )
-                            .await?;
-                        let session_pool = session_db.into_pool();
-                        let mut capabilities = Vec::new();
-                        for service in ["oauth", "registry", "model"] {
-                            let key = bootstrap.get(service).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Federate primary lookup lacks enrolled service {service}"
-                                )
-                            })?;
-                            capabilities.push(
-                                hyprstream_session_store::primary::LookupCapability {
-                                    service: format!("service:{service}"),
-                                    service_key: key.ed25519.to_bytes(),
-                                    tenant: "*".into(),
-                                    resource: crate::services::oauth::federate_source::HOST.into(),
-                                },
-                            );
-                        }
-                        let primary = hyprstream_session_store::primary::PrimaryLookup::new(
-                            crate::services::oauth::federate_source::HOST.into(),
-                            serving_generation,
-                            collision_inventory.clone(),
-                            capabilities,
-                        )?;
-                        Ok::<_, anyhow::Error>((
-                            enrollment,
-                            session_pool,
-                            serving_generation,
-                            collision_inventory,
-                            primary,
-                        ))
-                    })
-                })?;
+        if let Some(enrollment) = crate::auth::service_enrollment::global_service_enrollment()
+            .cloned()
+        {
+            let required_services = hyprstream_service::list_factories()
+                .map(|factory| factory.name)
+                .collect::<Vec<_>>();
+            let collision_inventory = crate::services::policy::inventory::
+                complete_collision_inventory(
+                    &config.oauth,
+                    &secrets_dir,
+                    ctx.signing_key(),
+                    &required_services,
+                )?;
+            let inventory_id = collision_inventory.id();
             policy_service = policy_service.with_federate_runtime(
                 enrollment,
-                session_pool,
-                serving_generation,
-                collision_inventory.id(),
-                primary,
+                inventory_id,
+                inventory_id,
             );
-            info!("Federate Policy session and request-use authorities installed");
+            info!("Federate stateless Policy and request-use authorities installed");
         } else {
-            tracing::warn!("Federate Policy runtime disabled: session DB URL/CA files are not configured");
+            tracing::warn!("Federate Policy runtime disabled: service enrollment is unavailable");
         }
     }
 

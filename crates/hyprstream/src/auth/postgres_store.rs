@@ -817,9 +817,10 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
     Ok(assemble_pool(cfg, ca_file, max_connections)?.pool)
 }
 
-/// Reuse the production CA-pinned, hostname-verifying pool for a role-scoped
-/// replay or Federate Policy connection.
+/// Reuse the production CA-pinned, hostname-verifying pool for the role-scoped
+/// replay store.
 /// The caller supplies a role-scoped URL read from a credential file.
+#[cfg(feature = "postgres-replay")]
 pub(crate) fn build_verified_postgres_pool(
     database_url: &str,
     ca_file: &std::path::Path,

@@ -1,5 +1,5 @@
--- Migration-owner only. Permanently binds one Dex source identity, one verified
--- ATProto DID, and one local account UUID within each host/profile boundary.
+-- Migration-owner only. Permanently binds one Dex source identity to one
+-- verified ATProto DID and its host-scoped deterministic internal UUID.
 BEGIN;
 DO $$
 BEGIN

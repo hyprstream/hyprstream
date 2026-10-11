@@ -176,6 +176,9 @@ impl FederateIssuer {
         }
         let (expected, ed_key, pq_key) = pending.challenge.expected_session();
         let source = pending.request.verify_source(&self.verifier, now).await?;
+        let (source_issuer, source_subject) = source.provenance();
+        let source_issuer = source_issuer.to_owned();
+        let source_subject = source_subject.to_owned();
         let (ed, pq) = request.signatures()?;
         let verified = pending.challenge.verify(source, &id, &ed, &pq, now)?;
         let committed = tokio::time::timeout(
@@ -196,13 +199,24 @@ impl FederateIssuer {
             return Err(federate_source::Error::Unavailable);
         }
         let now = i64::try_from(now).map_err(|_| federate_source::Error::Invalid)?;
-        let claims = super::federate_exchange::committed_claims(&committed, now)?;
+        let claims = super::federate_exchange::committed_claims(
+            &committed,
+            now,
+            &source_issuer,
+            &source_subject,
+        )?;
         let token = tokio::time::timeout(Duration::from_secs(2), self.signer.sign(&claims))
             .await
             .map_err(|_| federate_source::Error::Unavailable)?;
         let token = token.map_err(|_| federate_source::Error::Unavailable)?;
         let response_now = chrono::Utc::now().timestamp();
-        super::federate_exchange::ExchangeResponse::committed(token, &committed, response_now)
+        super::federate_exchange::ExchangeResponse::committed(
+            token,
+            &committed,
+            response_now,
+            &source_issuer,
+            &source_subject,
+        )
     }
 }
 

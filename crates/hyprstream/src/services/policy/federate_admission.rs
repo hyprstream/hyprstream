@@ -100,7 +100,8 @@ struct Authorities {
 }
 
 /// Default denies before any authority or DB access. The verified ATProto DID
-/// is the human principal; admission does not require a local UserStore row.
+/// is the human principal. OIDC `(issuer, sub)` remains login provenance; no
+/// local UserStore row is required to establish the Hyprstream identity.
 #[derive(Default)]
 pub(super) struct AdmissionService {
     authority: Option<Authorities>,
@@ -116,7 +117,7 @@ pub(super) struct AdmissionService {
 #[allow(dead_code)]
 pub(super) struct RequestUseReader {
     admission: Arc<AdmissionService>,
-    pool: deadpool_postgres::Pool,
+    pool: Option<deadpool_postgres::Pool>,
     capacity: Semaphore,
     clock_skew_secs: i64,
 }
@@ -124,7 +125,7 @@ pub(super) struct RequestUseReader {
 impl RequestUseReader {
     pub(super) fn new(
         admission: Arc<AdmissionService>,
-        pool: deadpool_postgres::Pool,
+        pool: Option<deadpool_postgres::Pool>,
     ) -> Self {
         Self {
             admission,
@@ -183,9 +184,49 @@ impl RequestUseReader {
                 && data.proof_epoch <= i64::MAX as u64,
             "serving profile mismatch"
         );
+        if self.pool.is_none() {
+            let did = data.subject.as_str();
+            let now = chrono::Utc::now().timestamp();
+            ensure!(
+                (did.starts_with("did:plc:") || did.starts_with("did:web:"))
+                    && did.len() <= 255
+                    && data.expires_at <= now.saturating_add(300)
+                    && data.proof_epoch == 1,
+                "invalid stateless Federate credential"
+            );
+            ensure!(
+                data.scopes.iter().all(|scope| {
+                    authority.profile.client_scopes.contains(scope)
+                        && authority.profile.resource_scopes.contains(scope)
+                }),
+                "credential exceeds the Federate scope ceiling"
+            );
+            ensure!(
+                data.scopes.iter().any(|text| {
+                    Scope::parse(text).is_ok_and(|scope| {
+                        scope.action == data.operation
+                            && scope.policy_resource() == data.resource
+                    })
+                }),
+                "operation is outside the signed scope"
+            );
+            let _permit = self.capacity.try_acquire()?;
+            ensure!(
+                authority
+                    .policy
+                    .check_with_domain(did, &data.tenant, &data.resource, &data.operation)
+                    .await,
+                "current DID tenant grant denied"
+            );
+            return Ok(());
+        }
         let _permit = self.capacity.try_acquire()?;
         tokio::time::timeout(Duration::from_secs(2), async {
-            let mut client = self.pool.get().await?;
+            let pool = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Federate session pool unavailable"))?;
+            let mut client = pool.get().await?;
             let primary = Store::lookup_primary(
                 &mut client,
                 &authority.profile.host,
@@ -265,7 +306,7 @@ impl AdmissionService {
         enrollment: Arc<ServiceEnrollmentManifest>,
         serving_generation: [u8; 32],
         local_collision_inventory_id: [u8; 32],
-        session_pool: deadpool_postgres::Pool,
+        session_pool: Option<deadpool_postgres::Pool>,
     ) -> Self {
         let scopes = BTreeSet::from([
             "infer:model:qwen2.5-0.5b-instruct:main".to_owned(),
@@ -289,7 +330,7 @@ impl AdmissionService {
                 local_collision_inventory_id,
             }),
             capacity: Some(Semaphore::new(32)),
-            session_pool: Some(session_pool),
+            session_pool,
             pending: Mutex::default(),
         }
     }
@@ -392,7 +433,10 @@ fn candidate_tenants(
     // with check_with_domain.
     for (rules, subject_index, tenant_index) in [(policies, 0, 1), (domain_groups, 0, 2)] {
         for rule in rules {
-            if rule.get(subject_index).is_some_and(|subject| subject == did) {
+            if rule
+                .get(subject_index)
+                .is_some_and(|subject| subject == did)
+            {
                 if let Some(tenant) = rule
                     .get(tenant_index)
                     .filter(|tenant| !tenant.is_empty() && *tenant != "*")
@@ -587,10 +631,6 @@ impl AdmissionService {
         pq_public: Vec<u8>,
     ) -> Result<PreparedDecision> {
         self.authority(ctx)?;
-        ensure!(
-            self.session_pool.is_some(),
-            "Federate session writer disabled"
-        );
         let now = chrono::Utc::now().timestamp();
         ensure!(challenge_id != [0; 32], "invalid challenge ID");
         ensure!(pq_public.len() == 1952, "invalid PQ public key");
@@ -660,11 +700,7 @@ impl AdmissionService {
         ed_public: [u8; 32],
         pq_public: Vec<u8>,
     ) -> Result<Session> {
-        self.authority(ctx)?;
-        let pool = self
-            .session_pool
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Federate session writer disabled"))?;
+        let authority = self.authority(ctx)?;
         let pending = self
             .pending
             .lock()
@@ -683,23 +719,51 @@ impl AdmissionService {
             "challenge/source binding changed"
         );
         ensure!(pq_public.len() == 1952, "invalid PQ public key");
-        let mut client = tokio::time::timeout(Duration::from_secs(2), pool.get()).await??;
-        self.redeem(
-            ctx,
-            &mut client,
-            PossessionEvidence {
-                source,
-                ed_public,
-                pq_public,
-                sid: uuid::Uuid::new_v4().to_string(),
-                requested: pending.requested,
-                challenge: pending.decision,
-                created_at,
-                expires_at,
-                session_expires_at: pending.source.expires_at.min(now + 300),
-            },
+        if let Some(pool) = &self.session_pool {
+            let mut client = tokio::time::timeout(Duration::from_secs(2), pool.get()).await??;
+            return self
+                .redeem(
+                    ctx,
+                    &mut client,
+                    PossessionEvidence {
+                        source,
+                        ed_public,
+                        pq_public,
+                        sid: uuid::Uuid::new_v4().to_string(),
+                        requested: pending.requested,
+                        challenge: pending.decision,
+                        created_at,
+                        expires_at,
+                        session_expires_at: pending.source.expires_at.min(now + 300),
+                    },
+                )
+                .await;
+        }
+        let current = tokio::time::timeout(
+            Duration::from_secs(2),
+            authority.decision(&source, &pending.requested),
         )
-        .await
+        .await??;
+        ensure!(current == pending.decision, "challenge decision changed");
+        let session_expires_at = pending.source.expires_at.min(now + 300);
+        ensure!(session_expires_at > now, "source credential expired");
+        Ok(Session {
+            host: authority.profile.host.clone(),
+            sid: uuid::Uuid::new_v4().to_string(),
+            account_id: current.account_id,
+            subject: current.subject,
+            tenant: current.tenant,
+            client_id: authority.profile.client.clone(),
+            resource: authority.profile.resource.clone(),
+            scopes: current.scopes,
+            grant_revision: current.revision,
+            ed_public,
+            pq_public,
+            generation: current.generation,
+            collision_inventory_id: current.collision_inventory_id,
+            proof_epoch: 1,
+            expires_at: session_expires_at,
+        })
     }
 
     fn authority(&self, ctx: &EnvelopeContext) -> Result<&Authorities> {

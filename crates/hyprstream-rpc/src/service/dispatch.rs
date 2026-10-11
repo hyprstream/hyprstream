@@ -698,8 +698,9 @@ where
     // 2e. Replay admission (§5.2 step 7). Deliberately last: the pipeline
     // admits the replay key only after policy evaluation, so rejected and
     // denied requests never consume store capacity.
-    // Federate's H1 replay key was consumed in the request-local Policy RPC;
-    // its session-bound namespace is not eligible for this generic store.
+    // Federate's original-holder proof is admitted by the request-local
+    // serving adapter after its fresh Policy check; it uses this same shared
+    // replay store with the signed hybrid-key namespace.
     if !deferred_federate {
     if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
       let proof_admission = (|| -> Result<()> {
