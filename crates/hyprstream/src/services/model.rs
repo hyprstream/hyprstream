@@ -2881,7 +2881,14 @@ impl crate::services::RequestService for ModelService {
         ctx: &EnvelopeContext,
         body: &hyprstream_rpc::service::DecodedRequestBody,
         proof: &hyprstream_rpc::proof::parser::ParsedProof,
-    ) -> anyhow::Result<(hyprstream_rpc::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+    ) -> anyhow::Result<(
+        hyprstream_rpc::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         #[cfg(feature = "postgres")]
         {
             let adapter = self.federate_dispatch.as_ref()
@@ -2889,11 +2896,11 @@ impl crate::services::RequestService for ModelService {
             let pin = self.config.staging_model_pin.as_ref()
                 .ok_or_else(|| anyhow!("Federate Model requires an immutable staging model pin"))?;
             let (resource, operation) = federate_model_operation(body, pin)?;
-            let (verified, holder) = adapter.admit(
+            let (verified, holder, replay_key, replay_expiry) = adapter.admit(
                 ctx, proof, "model", FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID, body.bytes(),
                 &resource, &operation,
             ).await?;
-            Ok((verified, holder, resource, operation))
+            Ok((verified, holder, resource, operation, replay_key, replay_expiry))
         }
         #[cfg(not(feature = "postgres"))]
         { let _ = (ctx, body, proof); anyhow::bail!("Federate dispatch is disabled") }

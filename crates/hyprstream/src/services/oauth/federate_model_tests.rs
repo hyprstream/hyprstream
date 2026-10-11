@@ -52,8 +52,7 @@ use hyprstream_rpc::{
     ToCapnp,
 };
 use std::{
-    collections::HashSet,
-    io::Cursor,
+        io::Cursor,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -70,7 +69,6 @@ struct ModelBoundary {
     transport: TransportConfig,
     keys: Arc<dyn JwtKeySource>,
     revocations: InMemoryCredentialRevocationStore,
-    seen: parking_lot::Mutex<HashSet<[u8; 16]>>,
     attempts: AtomicUsize,
     calls: AtomicUsize,
 }
@@ -112,7 +110,14 @@ impl RequestService for ModelBoundary {
         ctx: &EnvelopeContext,
         body: &DecodedRequestBody,
         proof: &ParsedProof,
-    ) -> Result<(VerifiedProof, [u8; 32], String, String)> {
+    ) -> Result<(
+        VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         let verified = super::super::federate_proof::verify_dispatch_fixture(
             ctx,
             "model",
@@ -124,11 +129,18 @@ impl RequestService for ModelBoundary {
             ctx.deferred_federate_credential().unwrap().0.sub == DID,
             "fixture grant denied"
         );
-        anyhow::ensure!(
-            self.seen.lock().insert(proof.claims.request_id),
-            "fixture replay denied"
-        );
-        Ok((verified.0, verified.1, RESOURCE.into(), "infer".into()))
+        let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
+            signer_thumbprint: verified.0.replay_thumbprint,
+            request_id: proof.claims.request_id,
+        };
+        Ok((
+            verified.0,
+            verified.1,
+            RESOURCE.into(),
+            "infer".into(),
+            replay_key,
+            proof.claims.exp,
+        ))
     }
     async fn handle_request(
         &self,
@@ -223,6 +235,9 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     let pair = super::tests::oauth_signing_pair(71);
     let (_dir, key_set) = super::tests::composite_signer_fixture(1, vec![pair.clone()]);
     let signer = super::HybridFederateSigner::new(key_set)?;
+    let _ = hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+        hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(128),
+    ));
     let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
         hyprstream_rpc::moq_event::MoqEventOrigin::new(),
     );
@@ -260,7 +275,6 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
                 .with_ca_composite_key(pair.ml_dsa().clone()),
         ),
         revocations: InMemoryCredentialRevocationStore::new(),
-        seen: Default::default(),
         attempts: AtomicUsize::new(0),
         calls: AtomicUsize::new(0),
     };

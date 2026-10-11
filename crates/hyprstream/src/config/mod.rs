@@ -2181,13 +2181,22 @@ pub struct PolicyServiceConfig {
     pub boot_policy: Option<MacBootPolicyConfig>,
 }
 
-/// Both independently provisioned artifacts are mandatory when configured.
+/// Both independently provisioned artifacts and their expected policy pin are
+/// mandatory when configured. Keep this generation/hash pin in the
+/// OS-owned deployment configuration, outside the replaceable artifact
+/// directory. Deploy a new pin and matching artifacts as one release; a
+/// mismatch fails startup closed. Recovery restores the matching backed-up
+/// config and artifacts. Lowering the pin is an explicit rollback decision.
 /// Trust keys are never supplied by these files or this configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MacBootPolicyConfig {
     pub policy_path: PathBuf,
     pub approval_path: PathBuf,
+    pub expected_generation: u64,
+    /// Hex-encoded 32-byte compiled policy hash, independently pinned by the
+    /// OS-owned deployment configuration.
+    pub expected_policy_hash: String,
 }
 
 /// Discovery service configuration.

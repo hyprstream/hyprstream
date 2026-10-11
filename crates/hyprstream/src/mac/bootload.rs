@@ -95,7 +95,18 @@ fn load_boot_policy_files(
         &std::fs::read(&artifacts.approval_path).context("cannot read signed MAC approval")?,
     )
     .context("invalid signed MAC approval JSON")?;
-    verify_boot_policy(&signed, &approval, authority)
+    let policy = verify_boot_policy(&signed, &approval, authority)?;
+    let expected_hash: [u8; 32] = hex::decode(&artifacts.expected_policy_hash)
+        .context("expected MAC boot-policy hash must be hexadecimal")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected MAC boot-policy hash must be exactly 32 bytes"))?;
+    check_reviewed_policy(
+        &policy,
+        artifacts.expected_generation,
+        &expected_hash,
+    )
+    .context("configured MAC boot-policy rollback pin rejected")?;
+    Ok(policy)
 }
 
 fn verify_boot_policy(
@@ -470,11 +481,21 @@ mod tests {
         SigningKey,
         MlDsaSigningKey,
     ) {
+        boot_artifacts_at_generation(7)
+    }
+
+    fn boot_artifacts_at_generation(generation: u32) -> (
+        SignedPolicy,
+        SignedApproval,
+        crate::auth::identity_store::BootstrapPubkey,
+        SigningKey,
+        MlDsaSigningKey,
+    ) {
         let ed = SigningKey::generate(&mut OsRng);
         let (pq, pq_vk) = ml_dsa_generate_keypair();
         let policy = CompiledPolicy::new(
             crate::mac::te::TeMatrix::default(),
-            &Lattice::new(LatticeVersion(7), []),
+            &Lattice::new(LatticeVersion(generation), []),
         )
         .with_enrollment(BTreeMap::from([(
             "did:key:zApprovedBootFixture".to_owned(),
@@ -493,7 +514,12 @@ mod tests {
         )
         .unwrap();
         let binding =
-            ApprovalBinding::new(&grant_with(vec![]), 7, policy.policy_hash().unwrap()).unwrap();
+            ApprovalBinding::new(
+                &grant_with(vec![]),
+                policy.generation,
+                policy.policy_hash().unwrap(),
+            )
+            .unwrap();
         let approval = SignedApproval::sign(binding, &ed, &pq).unwrap();
         let authority =
             crate::auth::identity_store::BootstrapPubkey::hybrid(ed.verifying_key(), pq_vk);
@@ -503,10 +529,13 @@ mod tests {
     #[test]
     fn configured_boot_files_load_reviewed_enrollment_without_te_authority() {
         let (signed, approval, authority, _, _) = boot_artifacts();
+        let expected = verify_boot_policy(&signed, &approval, &authority).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::MacBootPolicyConfig {
             policy_path: dir.path().join("policy.json"),
             approval_path: dir.path().join("approval.json"),
+            expected_generation: expected.generation,
+            expected_policy_hash: hex::encode(expected.policy_hash().unwrap()),
         };
         std::fs::write(&config.policy_path, serde_json::to_vec(&signed).unwrap()).unwrap();
         std::fs::write(
@@ -537,6 +566,103 @@ mod tests {
     }
 
     #[test]
+    fn configured_boot_pin_rejects_older_valid_pair_after_restart_reload() {
+        let (current_signed, current_approval, authority, ed, pq) =
+            boot_artifacts_at_generation(7);
+        let current = verify_boot_policy(&current_signed, &current_approval, &authority).unwrap();
+        let older = CompiledPolicy::new(
+            crate::mac::te::TeMatrix::default(),
+            &Lattice::new(LatticeVersion(6), []),
+        )
+        .with_enrollment(current.enrollment.clone());
+        let older_signed = sign_policy(
+            &older,
+            &HybridPolicySigner {
+                ed_sk: &ed,
+                pq_sk: Some(&pq),
+            },
+        )
+        .unwrap();
+        let older_binding = ApprovalBinding::new(
+            &grant_with(vec![]),
+            older.generation,
+            older.policy_hash().unwrap(),
+        )
+        .unwrap();
+        let older_approval = SignedApproval::sign(older_binding, &ed, &pq).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::MacBootPolicyConfig {
+            policy_path: dir.path().join("policy.json"),
+            approval_path: dir.path().join("approval.json"),
+            expected_generation: current.generation,
+            expected_policy_hash: hex::encode(current.policy_hash().unwrap()),
+        };
+
+        // A process restart rereads the same OS-owned generation/hash pin.
+        // The current pair therefore remains loadable after restart.
+        std::fs::write(
+            &config.policy_path,
+            serde_json::to_vec(&current_signed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &config.approval_path,
+            serde_json::to_vec(&current_approval).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_boot_policy_files(&config, &authority)
+                .unwrap()
+                .generation,
+            7
+        );
+        assert_eq!(
+            load_boot_policy_files(&config, &authority)
+                .unwrap()
+                .generation,
+            7
+        );
+
+        // Both older artifacts are genuinely signed by the trusted authority
+        // and approve each other. Replacing them together still cannot roll
+        // back the independently provisioned OS-owned pin.
+        std::fs::write(
+            &config.policy_path,
+            serde_json::to_vec(&older_signed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &config.approval_path,
+            serde_json::to_vec(&older_approval).unwrap(),
+        )
+        .unwrap();
+        let error = load_boot_policy_files(&config, &authority).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("generation mismatch"),
+            "{error:#}"
+        );
+
+        // Recovery is restoring the matching backed-up release, not accepting
+        // whichever valid signed pair happens to be on disk.
+        std::fs::write(
+            &config.policy_path,
+            serde_json::to_vec(&current_signed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &config.approval_path,
+            serde_json::to_vec(&current_approval).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_boot_policy_files(&config, &authority)
+                .unwrap()
+                .generation,
+            7
+        );
+    }
+
+    #[test]
     fn configured_boot_rejects_validly_signed_allow_and_escalation_rules() {
         use crate::mac::te::{Action, ObjectType, TeMatrix, TeRule};
         let (signed, approval, authority, ed, pq) = boot_artifacts();
@@ -547,10 +673,8 @@ mod tests {
             action: Action(1),
         };
         let dir = tempfile::tempdir().unwrap();
-        let config = crate::config::MacBootPolicyConfig {
-            policy_path: dir.path().join("policy.json"),
-            approval_path: dir.path().join("approval.json"),
-        };
+        let policy_path = dir.path().join("policy.json");
+        let approval_path = dir.path().join("approval.json");
         for matrix in [
             TeMatrix::from_allow([rule]),
             TeMatrix::new(Default::default(), [rule].into_iter().collect()),
@@ -565,6 +689,12 @@ mod tests {
                 },
             )
             .unwrap();
+            let config = crate::config::MacBootPolicyConfig {
+                policy_path: policy_path.clone(),
+                approval_path: approval_path.clone(),
+                expected_generation: policy.generation,
+                expected_policy_hash: hex::encode(policy.policy_hash().unwrap()),
+            };
             let approval = SignedApproval::sign(
                 ApprovalBinding::new(
                     &grant_with(vec![]),
@@ -622,6 +752,8 @@ mod tests {
         let config = crate::config::MacBootPolicyConfig {
             policy_path: dir.path().join("policy.json"),
             approval_path: dir.path().join("approval.json"),
+            expected_generation: 7,
+            expected_policy_hash: hex::encode([0u8; 32]),
         };
         let err = install_configured_boot_policy(&config, dir.path(), false).unwrap_err();
         assert!(err.to_string().contains("OS-owned"));
@@ -646,6 +778,10 @@ mod tests {
                 .boot_policy
                 .is_none()
         );
+        assert!(serde_json::from_str::<crate::config::PolicyServiceConfig>(
+            r#"{"boot_policy":{"policy_path":"policy.json","approval_path":"approval.json","expected_generation":7,"expected_policy_hash":"0000000000000000000000000000000000000000000000000000000000000000"}}"#,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -670,6 +806,8 @@ mod tests {
         let config = crate::config::MacBootPolicyConfig {
             policy_path: output.join("signed-policy.json"),
             approval_path: output.join("signed-approval.json"),
+            expected_generation: policy.generation,
+            expected_policy_hash: hex::encode(hash),
         };
         let loaded = load_boot_policy_files(&config, &derived_authority).unwrap();
         assert_eq!(loaded.policy_hash().unwrap(), hash);

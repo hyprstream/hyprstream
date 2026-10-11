@@ -1199,7 +1199,14 @@ pub trait RequestService: 'static {
         _ctx: &EnvelopeContext,
         _body: &crate::service::DecodedRequestBody,
         _proof: &crate::proof::parser::ParsedProof,
-    ) -> anyhow::Result<(crate::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+    ) -> anyhow::Result<(
+        crate::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        crate::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         anyhow::bail!("Federate request admission is disabled")
     }
 

@@ -4,7 +4,8 @@
 //! and static proof enrollment; no session-store URL is required. The adapter
 //! accepts only a host JWT already signature-verified by the RPC layer, gets
 //! the hybrid proof key from that signed credential, asks Policy for a fresh
-//! grant decision, then consumes shared replay state before dispatch. No
+//! grant decision, then returns replay admission data for dispatch to consume
+//! only after the generated method-policy and mandatory MAC checks. No
 //! subject-keyed positive cache or browser-selected DB locator is used.
 
 use std::{sync::Arc, time::Duration};
@@ -303,7 +304,12 @@ impl DispatchAdapter {
         body: &[u8],
         resource: &str,
         operation: &str,
-    ) -> Result<(VerifiedProof, [u8; 32])> {
+    ) -> Result<(
+        VerifiedProof,
+        [u8; 32],
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         let handle = CredentialHandle::from_verified_context(ctx)?;
         let raw = ctx.request_proof_cwt().ok_or(Error::Denied)?;
         let consumer = Consumer {
@@ -347,28 +353,12 @@ impl DispatchAdapter {
         let admitted = self.client.admit_federate_request(&data).await
             .map_err(|_| Error::Unavailable)?;
         if !admitted { return Err(Error::Denied); }
-        let replay_store = hyprstream_rpc::proof::admission::global_proof_replay_store()
-            .ok_or(Error::Unavailable)?;
         let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
             signer_thumbprint: verified.replay_thumbprint,
             request_id: proof.claims.request_id,
         };
         let replay_expiry = proof.claims.exp.min(e.expires_at as u64);
-        match hyprstream_rpc::proof::admission::admit_request_proof(
-            replay_store,
-            proof.disposition,
-            &replay_key,
-            replay_expiry,
-        ) {
-            hyprstream_rpc::proof::admission::ProofAdmissionResult::Admitted => {}
-            hyprstream_rpc::proof::admission::ProofAdmissionResult::Replayed => {
-                return Err(Error::Denied);
-            }
-            hyprstream_rpc::proof::admission::ProofAdmissionResult::Failed => {
-                return Err(Error::Unavailable);
-            }
-        }
-        Ok((verified, e.ed_public))
+        Ok((verified, e.ed_public, replay_key, replay_expiry))
     }
 }
 

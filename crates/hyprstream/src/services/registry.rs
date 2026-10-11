@@ -3376,7 +3376,14 @@ impl RequestService for RegistryService {
         ctx: &EnvelopeContext,
         body: &hyprstream_rpc::service::DecodedRequestBody,
         proof: &hyprstream_rpc::proof::parser::ParsedProof,
-    ) -> anyhow::Result<(hyprstream_rpc::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+    ) -> anyhow::Result<(
+        hyprstream_rpc::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         #[cfg(feature = "postgres")]
         {
             let adapter = self.federate_dispatch.as_ref()
@@ -3384,11 +3391,11 @@ impl RequestService for RegistryService {
             let pin = crate::services::model::StagingModelPin::from_env()?
                 .ok_or_else(|| anyhow::anyhow!("Federate Registry requires a staging model pin"))?;
             let (resource, operation) = federate_registry_operation(body, &pin)?;
-            let (verified, holder) = adapter.admit(
+            let (verified, holder, replay_key, replay_expiry) = adapter.admit(
                 ctx, proof, "registry", FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID, body.bytes(),
                 &resource, &operation,
             ).await?;
-            Ok((verified, holder, resource, operation))
+            Ok((verified, holder, resource, operation, replay_key, replay_expiry))
         }
         #[cfg(not(feature = "postgres"))]
         { let _ = (ctx, body, proof); anyhow::bail!("Federate dispatch is disabled") }

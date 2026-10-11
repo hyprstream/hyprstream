@@ -5,10 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod support;
-
 use std::{
-    collections::HashSet,
     io::Cursor,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,7 +17,6 @@ use anyhow::{ensure, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer as _, SigningKey};
-use parking_lot::Mutex;
 use hyprstream_rpc::{
     auth::{Claims, ClusterKeySource, InMemoryCredentialRevocationStore, JwtKeySource},
     crypto::{
@@ -30,6 +26,7 @@ use hyprstream_rpc::{
     envelope::{self, EnvelopeVerification, RequestEnvelope, SignedEnvelope},
     node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key},
     proof::{
+        admission::{set_global_proof_replay_store, InMemoryProofReplayStore},
         build::{
             build_authenticated_hybrid_request_proof, AuthenticatedHybridProofSigner,
             AuthenticatedRequestProofInput,
@@ -46,6 +43,7 @@ use hyprstream_rpc::{
     transport::{carrier::CarrierContext, TransportConfig},
     ToCapnp,
 };
+use hyprstream_rpc::auth::mac::{install_mac_dispatch_pep, MacDecision, MacDispatchPep};
 use sha2::{Digest, Sha256};
 
 const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
@@ -54,6 +52,26 @@ const TEST_DID: &str = "did:plc:3f7ldey5bivhfjapwqi2sljy";
 const SOURCE_ISSUER: &str = "https://login.federate.to";
 const SCHEMA: u64 = 0xe7339d5d26ab3076;
 const CLIENT_DH: [u8; 32] = [0x61; 32];
+
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static MAC_ALLOW: AtomicBool = AtomicBool::new(true);
+
+struct TestPep;
+
+impl MacDispatchPep for TestPep {
+    fn check(
+        &self,
+        _: &EnvelopeContext,
+        _: &str,
+        _: Option<&[u16]>,
+    ) -> MacDecision {
+        if MAC_ALLOW.load(Ordering::SeqCst) {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoPepInstalled)
+        }
+    }
+}
 
 struct Fixture {
     ca: SigningKey,
@@ -96,7 +114,10 @@ fn fixture() -> &'static Fixture {
             set_global_method_policy(Box::new(table)).is_ok(),
             "isolated method policy"
         );
-        support::install_explicit_dispatch_pep();
+        install_mac_dispatch_pep(Arc::new(TestPep));
+        let _ = set_global_proof_replay_store(Box::new(
+            InMemoryProofReplayStore::single_verifier_instance(128),
+        ));
         let body = hyprstream_rpc::serialize_message(|message| {
             message
                 .init_root::<hyprstream_rpc::common_capnp::error_info::Builder>()
@@ -247,7 +268,6 @@ struct Service {
     key_source: Arc<dyn JwtKeySource>,
     revocations: InMemoryCredentialRevocationStore,
     expected_body: Vec<u8>,
-    seen: Mutex<HashSet<[u8; 16]>>,
     revoked: AtomicBool,
     calls: AtomicUsize,
 }
@@ -264,7 +284,6 @@ impl Service {
             ),
             revocations: InMemoryCredentialRevocationStore::new(),
             expected_body: f.body.clone(),
-            seen: Mutex::new(HashSet::new()),
             revoked: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
         }
@@ -308,7 +327,14 @@ impl RequestService for Service {
         ctx: &EnvelopeContext,
         body: &DecodedRequestBody,
         proof: &ParsedProof,
-    ) -> Result<(VerifiedProof, [u8; 32], String, String)> {
+    ) -> Result<(
+        VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         let (claims, exact_token) = ctx
             .deferred_federate_credential()
             .ok_or_else(|| anyhow::anyhow!("not deferred"))?;
@@ -328,10 +354,10 @@ impl RequestService for Service {
             "proof does not bind exact credential/schema"
         );
         ensure!(!self.revoked.load(Ordering::SeqCst), "authority revoked");
-        ensure!(
-            self.seen.lock().insert(proof.claims.request_id),
-            "replay"
-        );
+        let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
+            signer_thumbprint: [9; 32],
+            request_id: proof.claims.request_id,
+        };
         Ok((
             VerifiedProof {
                 replay_thumbprint: [9; 32],
@@ -342,6 +368,8 @@ impl RequestService for Service {
             fixture().holder.verifying_key().to_bytes(),
             "model:qwen2.5-0.5b-instruct:main".into(),
             "infer".into(),
+            replay_key,
+            proof.claims.exp,
         ))
     }
     async fn handle_request(
@@ -448,6 +476,8 @@ async fn send(service: &Service, bytes: &[u8]) -> Result<Vec<u8>> {
 
 #[tokio::test]
 async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
+    let _guard = TEST_LOCK.lock().await;
+    MAC_ALLOW.store(true, Ordering::SeqCst);
     let f = fixture();
     let service = Service::new();
     let bearer = token(TEST_DID);
@@ -534,6 +564,8 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
 
 #[tokio::test]
 async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
+    let _guard = TEST_LOCK.lock().await;
+    MAC_ALLOW.store(true, Ordering::SeqCst);
     let f = fixture();
     let service = Service::new();
     let bearer = token(TEST_DID);
@@ -640,4 +672,52 @@ async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
     .await
     .unwrap();
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn federate_replay_waits_for_mac_and_remains_atomic_for_duplicates() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let f = fixture();
+    let service = Service::new();
+    let bearer = token(TEST_DID);
+    let (response, stream) = recipients();
+    let proof_bytes = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
+    let request = wire(
+        &bearer,
+        proof_bytes,
+        &f.body,
+        &response,
+        &stream,
+        CLIENT_DH,
+    );
+
+    // A mandatory-MAC denial happens after the service's fresh Policy result.
+    // It must not consume shared replay state; correcting authorization lets
+    // the identical signed request retry successfully.
+    MAC_ALLOW.store(false, Ordering::SeqCst);
+    let denied = send(&service, &request).await?;
+    assert_denial_has_no_success_payload(&denied);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    MAC_ALLOW.store(true, Ordering::SeqCst);
+    send(&service, &request).await?;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+
+    // Two dispatches racing with the same fresh proof share the atomic replay
+    // admission store. At most one reaches the handler.
+    let (response, stream) = recipients();
+    let proof_bytes = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
+    let concurrent = wire(
+        &bearer,
+        proof_bytes,
+        &f.body,
+        &response,
+        &stream,
+        CLIENT_DH,
+    );
+    let (first, second) = tokio::join!(send(&service, &concurrent), send(&service, &concurrent));
+    first?;
+    second?;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 2);
+    Ok(())
 }
