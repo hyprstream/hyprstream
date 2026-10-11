@@ -516,9 +516,10 @@ pub(crate) fn mint_local_token(
         Ok(ref c) => (c.oauth.issuer_url(), c.oai.resource_url()),
         Err(_) => {
             // Fallback to defaults when config is not available
+            let local_origin = "http://localhost";
             (
-                "http://localhost:6791".to_owned(),
-                "http://localhost:6789".to_owned(),
+                format!("{local_origin}:6791"),
+                format!("{local_origin}:6789"),
             )
         }
     };
