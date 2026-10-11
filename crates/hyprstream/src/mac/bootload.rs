@@ -115,9 +115,15 @@ fn verify_boot_policy(
         pq_vk: Some(pq_vk),
         require_pq: true,
     };
-    Ok(PolicyLoader::new(verifier)
+    let policy = PolicyLoader::new(verifier)
         .with_approval(PolicyApproval::from_verified(binding))
-        .load(signed)?)
+        .load(signed)?;
+    let (allow, escalate) = policy.matrix.sorted_rules();
+    ensure!(
+        allow.is_empty() && escalate.is_empty(),
+        "configured MAC boot policy is enrollment-only: TE allow and escalation rules must be empty"
+    );
+    Ok(policy)
 }
 
 /// One-shot offline authority action, never called by daemon boot. The operator
@@ -528,6 +534,59 @@ mod tests {
         assert!(load_boot_policy_files(&config, &authority).is_err());
         std::fs::remove_file(&config.policy_path).unwrap();
         assert!(load_boot_policy_files(&config, &authority).is_err());
+    }
+
+    #[test]
+    fn configured_boot_rejects_validly_signed_allow_and_escalation_rules() {
+        use crate::mac::te::{Action, ObjectType, TeMatrix, TeRule};
+        let (signed, approval, authority, ed, pq) = boot_artifacts();
+        let enrolled = verify_boot_policy(&signed, &approval, &authority).unwrap();
+        let rule = TeRule {
+            subject_type: SubjectType(1),
+            object_type: ObjectType(1),
+            action: Action(1),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::MacBootPolicyConfig {
+            policy_path: dir.path().join("policy.json"),
+            approval_path: dir.path().join("approval.json"),
+        };
+        for matrix in [
+            TeMatrix::from_allow([rule]),
+            TeMatrix::new(Default::default(), [rule].into_iter().collect()),
+        ] {
+            let mut policy = enrolled.clone();
+            policy.matrix = matrix;
+            let signed = sign_policy(
+                &policy,
+                &HybridPolicySigner {
+                    ed_sk: &ed,
+                    pq_sk: Some(&pq),
+                },
+            )
+            .unwrap();
+            let approval = SignedApproval::sign(
+                ApprovalBinding::new(
+                    &grant_with(vec![]),
+                    policy.generation,
+                    policy.policy_hash().unwrap(),
+                )
+                .unwrap(),
+                &ed,
+                &pq,
+            )
+            .unwrap();
+            // Both signatures and the exact hash/generation are genuine.
+            // The configured file-loader boundary must still reject TE authority.
+            std::fs::write(&config.policy_path, serde_json::to_vec(&signed).unwrap()).unwrap();
+            std::fs::write(
+                &config.approval_path,
+                serde_json::to_vec(&approval).unwrap(),
+            )
+            .unwrap();
+            let error = load_boot_policy_files(&config, &authority).unwrap_err();
+            assert!(error.to_string().contains("enrollment-only"), "{error:#}");
+        }
     }
 
     #[test]
