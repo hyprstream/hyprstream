@@ -5394,12 +5394,14 @@ mod resolver_startup_controls {
         let production = source
             .split("mod resolver_startup_controls {")
             .next()
-            .expect("production binary source");
+            .expect("production binary source")
+            .split_whitespace()
+            .collect::<String>();
         let startup = production
-            .find("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
+            .find("install_process_production_resolver(&signing_key,&config,service_token.clone()).await")
             .expect("trusted startup boundary");
         let install = production[startup..]
-            .find("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
+            .find("install_process_production_resolver(&signing_key,&config,service_token.clone()).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
             .find(
@@ -5407,17 +5409,15 @@ mod resolver_startup_controls {
             )
             .expect("first generated client");
         let command_dispatch = production[startup..]
-            .find("match matches.subcommand()")
+            .find("matchmatches.subcommand()")
             .expect("top-level command dispatch");
         assert!(install < first_generated);
         assert!(first_generated < command_dispatch);
-        assert!(production.contains(
-            "load_service_jwt_for_profile(\n                        &secrets, name, profile,"
-        ));
-        assert!(production.contains("signing_key.clone(),\n                service_token,"));
+        assert!(production.contains("load_service_jwt_for_profile(&secrets,name,profile,"));
+        assert!(production.contains("signing_key.clone(),service_token,"));
         assert_eq!(
             production
-                .matches("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
+                .matches("install_process_production_resolver(&signing_key,&config,service_token.clone()).await")
                 .count(),
             1
         );
@@ -5488,7 +5488,9 @@ mod resolver_startup_controls {
         let worker = source
             .find("let worker_client = if worker_already_running")
             .expect("worker client selection");
-        let worker_selection = &source[worker..worker + 500];
+        let worker_selection = source[worker..worker + 500]
+            .split_whitespace()
+            .collect::<String>();
         assert!(worker_selection.contains(
             "WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider"
         ));

@@ -1704,18 +1704,22 @@ mod tests {
         let arm_end = production[arm_start..]
             .find("_ => anyhow::bail!(\"Unknown service: {service}\")")
             .expect("the workflow arm must be followed by the catch-all match arm");
-        let workflow_arm = &production[arm_start..arm_start + arm_end];
+        // The production source is intentionally checked structurally here,
+        // so make the assertions insensitive to rustfmt's line wrapping.
+        let workflow_arm = production[arm_start..arm_start + arm_end]
+            .split_whitespace()
+            .collect::<String>();
 
         assert!(
-            workflow_arm.contains("WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)"),
+            workflow_arm.contains("WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,signing_key,None,)?;"),
             "workflow arm must dial with the explicit provider — no direct bearer"
         );
         assert!(
-            workflow_arm.contains("if let Some(bearer) = ctx.token.as_ref()"),
+            workflow_arm.contains("ifletSome(bearer)=ctx.token.as_ref()"),
             "workflow arm must branch on the caller's verified token"
         );
         assert!(
-            workflow_arm.contains("client = client.with_delegated_bearer(bearer.clone());"),
+            workflow_arm.contains("client=client.with_delegated_bearer(bearer.clone());"),
             "workflow arm must relay the caller token via with_delegated_bearer, not a direct bearer"
         );
         assert!(
