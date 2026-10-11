@@ -88,10 +88,13 @@ pub struct SharedScorer {
 }
 
 impl SharedScorer {
-    /// Create the scorer under `vs.root()` with the backbone's hidden size.
-    pub fn new(vs: &nn::VarStore, hidden_dim: i64) -> Self {
+    /// Create the scorer under `path` with the backbone's hidden size. The caller
+    /// scopes the path (e.g. `vs.root().sub("scorer")` on the combined model
+    /// `VarStore`) so the projection never collides with backbone parameter names
+    /// when head and backbone share one checkpoint.
+    pub fn new(path: &nn::Path, hidden_dim: i64) -> Self {
         Self {
-            projection: nn::linear(vs.root(), hidden_dim, 1, Default::default()),
+            projection: nn::linear(path, hidden_dim, 1, Default::default()),
         }
     }
 
@@ -166,7 +169,7 @@ mod tests {
     #[test]
     fn choice_and_score_readouts_are_distributions() {
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, 6, 8], (Kind::Float, Device::Cpu));
         let batch = vec![vec![
             anchors("c", QuestionKind::Choice, &[0, 1, 2]),
@@ -187,7 +190,7 @@ mod tests {
     #[test]
     fn noul_readout_is_sigmoid_in_label_order() {
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, 1, 8], (Kind::Float, Device::Cpu));
         let batch = vec![vec![anchors("n", QuestionKind::Noul, &[0])]];
         let output = scorer.forward(&hidden, &batch).unwrap();
@@ -201,13 +204,16 @@ mod tests {
             "P(true) is sigmoid(logit): {} vs {expected_p_true}",
             probs[1]
         );
-        assert!((probs[0] + probs[1] - 1.0).abs() < 1e-5, "[P(false), P(true)] sums to 1");
+        assert!(
+            (probs[0] + probs[1] - 1.0).abs() < 1e-5,
+            "[P(false), P(true)] sums to 1"
+        );
     }
 
     #[test]
     fn score_expected_value_is_the_expectation_over_levels() {
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, 3, 8], (Kind::Float, Device::Cpu));
         let batch = vec![vec![anchors("s", QuestionKind::Score, &[0, 1, 2])]];
         let output = scorer.forward(&hidden, &batch).unwrap();
@@ -219,7 +225,10 @@ mod tests {
             .double_value(&[]);
         let manual: f64 = probs.iter().enumerate().map(|(i, p)| i as f64 * p).sum();
         assert!((expected - manual).abs() < 1e-5, "{expected} vs {manual}");
-        assert!((0.0..=2.0).contains(&expected), "expectation within level range");
+        assert!(
+            (0.0..=2.0).contains(&expected),
+            "expectation within level range"
+        );
         let c = &output[0][0];
         assert_eq!(c.kind, QuestionKind::Score);
     }
@@ -230,7 +239,7 @@ mod tests {
         // order permutes its logits identically (the architectural half of order
         // robustness; the data half is P1.3's mandatory permutation augmentation).
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, 4, 8], (Kind::Float, Device::Cpu));
         let forward = |positions: &[u32]| {
             let batch = vec![vec![anchors("c", QuestionKind::Choice, positions)]];
@@ -248,9 +257,8 @@ mod tests {
     #[test]
     fn distillation_loss_backprops_into_the_shared_projection() {
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
-        let hidden = Tensor::randn([1, 2, 8], (Kind::Float, Device::Cpu))
-            .set_requires_grad(true);
+        let scorer = SharedScorer::new(&vs.root(), 8);
+        let hidden = Tensor::randn([1, 2, 8], (Kind::Float, Device::Cpu)).set_requires_grad(true);
         let batch = vec![vec![anchors("c", QuestionKind::Choice, &[0, 1])]];
         let output = scorer.forward(&hidden, &batch).unwrap();
         let target = Tensor::from_slice(&[0.25, 0.75]).to_kind(Kind::Float);
@@ -267,13 +275,16 @@ mod tests {
     #[test]
     fn soft_target_kl_ignores_zero_mass_bins() {
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, 3, 8], (Kind::Float, Device::Cpu));
         let batch = vec![vec![anchors("s", QuestionKind::Score, &[0, 1, 2])]];
         let output = scorer.forward(&hidden, &batch).unwrap();
         let target = Tensor::from_slice(&[0.0, 1.0, 0.0]).to_kind(Kind::Float);
         let loss = soft_target_kl(&output[0][0], &target).double_value(&[]);
-        assert!(loss.is_finite(), "zero target bins contribute nothing: {loss}");
+        assert!(
+            loss.is_finite(),
+            "zero target bins contribute nothing: {loss}"
+        );
     }
 
     #[test]
@@ -281,7 +292,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scorer.ot");
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, 2, 8], (Kind::Float, Device::Cpu));
         let batch = vec![vec![anchors("c", QuestionKind::Choice, &[0, 1])]];
         let before = scorer.forward(&hidden, &batch).unwrap();
@@ -289,7 +300,7 @@ mod tests {
         vs.save(&path).unwrap();
 
         let mut vs2 = VarStore::new(Device::Cpu);
-        let scorer2 = SharedScorer::new(&vs2, 8);
+        let scorer2 = SharedScorer::new(&vs2.root(), 8);
         vs2.load(&path).unwrap();
         let after = scorer2.forward(&hidden, &batch).unwrap();
         let after = Vec::<f64>::try_from(after[0][0].logits.to_kind(Kind::Double)).unwrap();
@@ -299,7 +310,7 @@ mod tests {
     #[test]
     fn batch_mismatch_fails_loudly() {
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([2, 2, 8], (Kind::Float, Device::Cpu));
         let batch = vec![vec![anchors("n", QuestionKind::Noul, &[0])]];
         let error = scorer.forward(&hidden, &batch).unwrap_err();
@@ -333,7 +344,7 @@ questions:
         let encoded = encoder.encode(&set).unwrap();
         let tokens = encoded.token_count() as i64;
         let vs = VarStore::new(Device::Cpu);
-        let scorer = SharedScorer::new(&vs, 8);
+        let scorer = SharedScorer::new(&vs.root(), 8);
         let hidden = Tensor::randn([1, tokens, 8], (Kind::Float, Device::Cpu));
         let output = scorer.forward(&hidden, &[encoded.questions]).unwrap();
         let questions = &output[0];
@@ -341,7 +352,11 @@ questions:
         assert_eq!(probs_vec(&questions[0]).len(), 2, "choice over 2 options");
         assert_eq!(probs_vec(&questions[1]).len(), 2, "score over 2 levels");
         assert!(questions[1].expected_value().is_some());
-        assert_eq!(probs_vec(&questions[2]).len(), 2, "noul [P(false), P(true)]");
+        assert_eq!(
+            probs_vec(&questions[2]).len(),
+            2,
+            "noul [P(false), P(true)]"
+        );
         assert!(questions[2].expected_value().is_none());
     }
 }
