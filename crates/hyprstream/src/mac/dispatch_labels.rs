@@ -311,7 +311,9 @@ impl DeclaredDispatchTable {
     ) -> Option<&DispatchMethodPolicy> {
         // Existing declarations name top-level leaves only. A nested path must
         // not inherit the row of either its first or last discriminant.
-        let [method] = method? else { return None; };
+        let [method] = method? else {
+            return None;
+        };
         self.methods
             .iter()
             .find(|row| row.id.service == service_domain && row.id.method == *method)
@@ -1027,8 +1029,7 @@ mod tests {
                 SecurityLabel::bottom()
             };
             assert_eq!(
-                row.label,
-                expected_label,
+                row.label, expected_label,
                 "declared row {name} must retain its reviewed schema/bootstrap label"
             );
             assert!(!row.justification.is_empty());
@@ -1063,8 +1064,14 @@ mod tests {
             (inference_methods::CREATE_LORA_STREAM, "createLoraStream"),
             (inference_methods::LOAD_LORA_STREAM, "loadLoraStream"),
             (inference_methods::SAVE_LORA_STREAM, "saveLoraStream"),
-            (inference_methods::SAVE_ADAPTATION_STREAM, "saveAdaptationStream"),
-            (inference_methods::SNAPSHOT_DELTA_STREAM, "snapshotDeltaStream"),
+            (
+                inference_methods::SAVE_ADAPTATION_STREAM,
+                "saveAdaptationStream",
+            ),
+            (
+                inference_methods::SNAPSHOT_DELTA_STREAM,
+                "snapshotDeltaStream",
+            ),
             (
                 inference_methods::EXPORT_PEFT_ADAPTER_STREAM,
                 "exportPeftAdapterStream",
@@ -1080,8 +1087,7 @@ mod tests {
             assert_eq!(row.method_name, *name);
             assert_eq!(row.id.service, "inference");
             assert_eq!(
-                row.label,
-                INFERENCE_METHOD_LABEL,
+                row.label, INFERENCE_METHOD_LABEL,
                 "inference.{name} must retain its schema-declared hybrid label"
             );
             assert!(!row.justification.is_empty());
@@ -1108,12 +1114,23 @@ mod tests {
         );
         // Hybrid-enrolled runtime services hold the hybrid clearance; the
         // bootstrap identity-lifecycle services stay at the floor.
-        const HYBRID_SERVICES: &[&str] = &["discovery", "event", "inference", "model", "oai", "oauth", "policy", "registry", "streams"];
+        const HYBRID_SERVICES: &[&str] = &[
+            "discovery",
+            "event",
+            "inference",
+            "model",
+            "oai",
+            "oauth",
+            "policy",
+            "registry",
+            "streams",
+        ];
         for row in table.clearances() {
             let is_hybrid = HYBRID_SERVICES.contains(&row.service);
             let expected_clearance = match row.service {
                 "oauth" => OAUTH_ISSUANCE_LABEL,
-                "discovery" | "event" | "model" | "oai" | "inference" | "policy" | "registry" | "streams" => HYBRID_SERVICE_CLEARANCE,
+                "discovery" | "event" | "model" | "oai" | "inference" | "policy" | "registry"
+                | "streams" => HYBRID_SERVICE_CLEARANCE,
                 _ => BOOTSTRAP_SERVICE_CLEARANCE,
             };
             assert_eq!(row.clearance, expected_clearance);
@@ -1171,25 +1188,48 @@ mod tests {
     #[test]
     fn native_announce_row_matches_schema_and_requires_hybrid_identity() {
         let mut message = capnp::message::Builder::new_default();
-        message.init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>()
+        message
+            .init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>()
             .init_announce();
         let bytes = capnp::serialize::write_message_to_words(&message);
-        let method = hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap();
+        let method =
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap();
         assert_eq!(method, discovery_methods::ANNOUNCE);
         let table = DeclaredDispatchTable::production();
         let row = table.resolve_row("discovery", Some(&[method])).unwrap();
         assert_eq!(row.method_name, "announce");
         assert_eq!(row.label, HYBRID_SERVICE_CLEARANCE);
         let pep = DeclaredDispatchPep::new(table);
-        for service in ["policy", "discovery", "registry", "event", "streams", "model", "oai", "oauth"] {
+        for service in [
+            "policy",
+            "discovery",
+            "registry",
+            "event",
+            "streams",
+            "model",
+            "oai",
+            "oauth",
+        ] {
             let clearance = table.service_clearance(service).unwrap();
-            assert!(SecurityContext::from_clearance(clearance, hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid).can_access(&row.label));
-            assert!(!SecurityContext::from_clearance(clearance, hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical).can_access(&row.label));
+            assert!(SecurityContext::from_clearance(
+                clearance,
+                hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid
+            )
+            .can_access(&row.label));
+            assert!(!SecurityContext::from_clearance(
+                clearance,
+                hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical
+            )
+            .can_access(&row.label));
             let ctx = EnvelopeContext::for_test_authenticated_subject(
                 hyprstream_rpc::Subject::new(format!("service:{service}")),
                 ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]).verifying_key(),
             );
-            assert_eq!(pep.check(&ctx, "discovery", Some(&[method])), MacDecision::Deny(MacDenyReason::NoClearance), "bearerless identity cannot announce");
+            assert_eq!(
+                pep.check(&ctx, "discovery", Some(&[method])),
+                MacDecision::Deny(MacDenyReason::NoClearance),
+                "bearerless identity cannot announce"
+            );
         }
         assert!(table.resolve_row("discovery", Some(&[method, 0])).is_none());
         assert!(table.resolve_row("discovery", Some(&[u16::MAX])).is_none());
@@ -1274,7 +1314,11 @@ mod tests {
 
         // Unknown service denies the same way.
         assert_eq!(
-            pep.check(&caller, "ghost", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
+            pep.check(
+                &caller,
+                "ghost",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
 
@@ -1348,7 +1392,11 @@ mod tests {
         // that is the fabricated-anonymous-clearance hole this slice closes.
         let ghost = service_subject_ctx("ghost", 0x62);
         assert_eq!(
-            pep.check(&ghost, "policy", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
+            pep.check(
+                &ghost,
+                "policy",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
             MacDecision::Deny(MacDenyReason::NoClearance),
             "undeclared service subject must deny NoClearance"
         );
@@ -1356,7 +1404,11 @@ mod tests {
         // A non-service (user) identity has no service clearance.
         let user = user_subject_ctx();
         assert_eq!(
-            pep.check(&user, "policy", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
+            pep.check(
+                &user,
+                "policy",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
 
@@ -1388,7 +1440,11 @@ mod tests {
         ] {
             let ctx = service_subject_ctx(service, 0x63);
             assert_eq!(
-                pep.check(&ctx, "policy", Some(&[policy_methods::REGISTER_SERVICE_KEY])),
+                pep.check(
+                    &ctx,
+                    "policy",
+                    Some(&[policy_methods::REGISTER_SERVICE_KEY])
+                ),
                 MacDecision::Permit,
                 "declared service:{service} must permit the declared bootstrap call"
             );

@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::transport::backoff::LazyState;
-use crate::transport::iroh_substrate::{ALPN_HYPRSTREAM_RPC, OwnedIrohClientEndpoint};
+use crate::transport::iroh_substrate::{OwnedIrohClientEndpoint, ALPN_HYPRSTREAM_RPC};
 use crate::transport::iroh_transport::{IrohPendingStream, IrohPublishStub, IrohTransport};
 use crate::transport_traits::Transport;
 
@@ -145,7 +145,11 @@ pub struct LazyIrohTransport {
 impl LazyIrohTransport {
     /// Create a lazy transport for the iroh peer identified by `node_id`. No
     /// connection is made until the first `send()`.
-    pub fn new(node_id: [u8; 32], direct_addrs: Vec<SocketAddr>, relay_url: Option<String>) -> Self {
+    pub fn new(
+        node_id: [u8; 32],
+        direct_addrs: Vec<SocketAddr>,
+        relay_url: Option<String>,
+    ) -> Self {
         Self {
             node_id,
             direct_addrs,
@@ -193,8 +197,12 @@ impl LazyIrohTransport {
         use iroh::{EndpointAddr, EndpointId, TransportAddr};
         let id = EndpointId::from_bytes(&self.node_id)
             .map_err(|e| anyhow!("invalid iroh node_id: {e}"))?;
-        let mut transport_addrs: Vec<TransportAddr> =
-            self.direct_addrs.iter().copied().map(TransportAddr::Ip).collect();
+        let mut transport_addrs: Vec<TransportAddr> = self
+            .direct_addrs
+            .iter()
+            .copied()
+            .map(TransportAddr::Ip)
+            .collect();
         if let Some(url) = &self.relay_url {
             let relay = url
                 .parse()
@@ -212,10 +220,15 @@ impl LazyIrohTransport {
             return Ok(transport.clone());
         }
         if let Some(remaining) = guard.backoff.cooldown_remaining() {
-            return if self.availability_backoff.load(std::sync::atomic::Ordering::Relaxed) {
+            return if self
+                .availability_backoff
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 Err(IrohPeerUnavailable::ReconnectBackoff.into())
             } else {
-                Err(anyhow!("iroh peer is in reconnect backoff — retry in {remaining:.1?}"))
+                Err(anyhow!(
+                    "iroh peer is in reconnect backoff — retry in {remaining:.1?}"
+                ))
             };
         }
         let endpoint = self.dial_endpoint().ok_or_else(|| {
@@ -225,15 +238,13 @@ impl LazyIrohTransport {
             )
         })?;
         let addr = self.endpoint_addr()?;
-        match tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            endpoint.connect(addr, ALPN_HYPRSTREAM_RPC),
-        )
-        .await
+        match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_HYPRSTREAM_RPC))
+            .await
         {
             Err(_) => {
                 guard.backoff.record_failure();
-                self.availability_backoff.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.availability_backoff
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Err(IrohPeerUnavailable::ConnectTimeout.into())
             }
             Ok(Err(e)) => {
@@ -245,7 +256,8 @@ impl LazyIrohTransport {
                         ..
                     }
                 );
-                self.availability_backoff.store(unavailable, std::sync::atomic::Ordering::Relaxed);
+                self.availability_backoff
+                    .store(unavailable, std::sync::atomic::Ordering::Relaxed);
                 if unavailable {
                     Err(IrohPeerUnavailable::AddressDiscovery(e).into())
                 } else {
@@ -254,7 +266,8 @@ impl LazyIrohTransport {
             }
             Ok(Ok(conn)) => {
                 guard.backoff.record_success();
-                self.availability_backoff.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.availability_backoff
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 let transport = IrohTransport::new(conn);
                 guard.cached = Some(transport.clone());
                 Ok(transport)
@@ -268,7 +281,8 @@ impl LazyIrohTransport {
         let mut guard = self.state.lock().await;
         guard.cached = None;
         guard.backoff.record_failure();
-        self.availability_backoff.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.availability_backoff
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -278,9 +292,10 @@ impl Transport for LazyIrohTransport {
     type Pub = IrohPublishStub;
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        let transport = self.connected().await.map_err(|error| {
-            crate::transport_traits::PreDispatchTransportError::new(error)
-        })?;
+        let transport = self
+            .connected()
+            .await
+            .map_err(crate::transport_traits::PreDispatchTransportError::new)?;
 
         // Our deadline is authoritative so a per-request timeout (busy peer —
         // keep the session) is distinguishable from a transport-fatal error
@@ -290,7 +305,8 @@ impl Transport for LazyIrohTransport {
             .unwrap_or(DEFAULT_TIMEOUT);
         let inner_ceiling_ms = deadline.as_millis().saturating_mul(2).min(i32::MAX as u128) as i32;
 
-        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await {
+        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await
+        {
             Err(_elapsed) => Err(anyhow!("iroh RPC timeout after {deadline:?}")),
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => {
@@ -329,19 +345,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_iroh_absent_peer_is_typed_availability_before_dispatch() {
         let client = IrohSubstrate::new_test(
-            fresh_key(), NoopHandler::new("client moq"), NoopHandler::new("client rpc"),
-        ).await.unwrap();
-        let peer = ed25519_dalek::SigningKey::from_bytes(&fresh_key()).verifying_key().to_bytes();
+            fresh_key(),
+            NoopHandler::new("client moq"),
+            NoopHandler::new("client rpc"),
+        )
+        .await
+        .unwrap();
+        let peer = ed25519_dalek::SigningKey::from_bytes(&fresh_key())
+            .verifying_key()
+            .to_bytes();
         // Minimal test carrier has neither a relay nor address lookup. No
         // server exists, so these bytes can never have reached a handler.
-        let transport = LazyIrohTransport::new_with_endpoint(peer, vec![], None, client.endpoint().clone());
-        let error = transport.send(b"not-dispatched".to_vec(), Some(100)).await.unwrap_err();
-        assert!(crate::transport_traits::is_pre_dispatch_transport_error(&error));
-        assert!(error.chain().any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()));
+        let transport =
+            LazyIrohTransport::new_with_endpoint(peer, vec![], None, client.endpoint().clone());
+        let error = transport
+            .send(b"not-dispatched".to_vec(), Some(100))
+            .await
+            .unwrap_err();
+        assert!(crate::transport_traits::is_pre_dispatch_transport_error(
+            &error
+        ));
+        assert!(error
+            .chain()
+            .any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()));
         assert!(transport.state.lock().await.cached.is_none());
         // Backoff preserves its explicit availability provenance.
-        let error = transport.send(b"still-not-dispatched".to_vec(), Some(100)).await.unwrap_err();
-        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<IrohPeerUnavailable>(), Some(IrohPeerUnavailable::ReconnectBackoff))));
+        let error = transport
+            .send(b"still-not-dispatched".to_vec(), Some(100))
+            .await
+            .unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<IrohPeerUnavailable>(),
+            Some(IrohPeerUnavailable::ReconnectBackoff)
+        )));
         drop(transport);
         client.shutdown().await.unwrap();
     }
@@ -349,7 +385,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_iroh_connects_on_first_send_and_caches() {
         // Echo server substrate.
-        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
+        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler)
+            .await
+            .unwrap();
         let server_id = server.endpoint_id();
         let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
 
@@ -368,8 +406,12 @@ mod tests {
         .unwrap();
 
         let node_id: [u8; 32] = *server_id.as_bytes();
-        let t = LazyIrohTransport::new_with_endpoint(node_id, direct, None, client.endpoint().clone());
-        assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
+        let t =
+            LazyIrohTransport::new_with_endpoint(node_id, direct, None, client.endpoint().clone());
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "no connection before first send"
+        );
 
         // EchoHandler echoes the bytes written on the bidi stream, which is the
         // same shape SessionRpcTransport::send uses (write payload → read to
@@ -380,7 +422,10 @@ mod tests {
         // QuinnRpcServer, which IrohTransport shares via SessionRpcTransport.)
         let resp = t.send(b"ping".to_vec(), Some(4_000)).await.unwrap();
         assert_eq!(resp, b"ping");
-        assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
+        assert!(
+            t.state.lock().await.cached.is_some(),
+            "session cached after first send"
+        );
 
         // Release the cached connection and endpoint clone before draining both
         // routers. Abruptly dropping the client substrate while `t` still held a
@@ -394,7 +439,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_node_id_rejected() {
         // Server we'll dial the *address* of, but with a different identity.
-        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
+        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler)
+            .await
+            .unwrap();
         let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
 
         // Dial from this test's own endpoint (see `lazy_iroh_connects_*` above and
@@ -410,22 +457,38 @@ mod tests {
 
         // A *valid* but wrong EndpointId (a third node's), so this tests handshake
         // identity rejection — not a malformed key.
-        let other = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("o1"), NoopHandler::new("o2"))
-            .await
-            .unwrap();
+        let other =
+            IrohSubstrate::new_test(fresh_key(), NoopHandler::new("o1"), NoopHandler::new("o2"))
+                .await
+                .unwrap();
         let wrong_id: [u8; 32] = *other.endpoint_id().as_bytes();
 
-        let t = LazyIrohTransport::new_with_endpoint(wrong_id, direct, None, client.endpoint().clone());
+        let t =
+            LazyIrohTransport::new_with_endpoint(wrong_id, direct, None, client.endpoint().clone());
         let res = tokio::time::timeout(Duration::from_secs(8), t.send(b"x".to_vec(), Some(3_000)))
             .await
             .expect("send must complete (with an error) — wrong identity should reject, not hang");
         let error = res.expect_err("dialing a server's address under a wrong EndpointId must fail");
-        assert!(!error.chain().any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()),
-            "a peer-identity handshake rejection must not become retryable availability");
-        assert!(t.state.lock().await.cached.is_none(), "a failed handshake caches nothing");
-        let backoff_error = t.send(b"x".to_vec(), Some(3_000)).await.expect_err("rejection backoff");
-        assert!(!backoff_error.chain().any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()),
-            "backoff must retain the prior permanent failure classification");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()),
+            "a peer-identity handshake rejection must not become retryable availability"
+        );
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "a failed handshake caches nothing"
+        );
+        let backoff_error = t
+            .send(b"x".to_vec(), Some(3_000))
+            .await
+            .expect_err("rejection backoff");
+        assert!(
+            !backoff_error
+                .chain()
+                .any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()),
+            "backoff must retain the prior permanent failure classification"
+        );
 
         // As above, release the transport's endpoint clone before cleanly
         // draining every substrate owned by this test.

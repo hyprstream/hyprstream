@@ -32,9 +32,9 @@
 use anyhow::{anyhow, Result};
 use tch::Tensor;
 
+use super::tenant_delta::TenantDelta;
 use crate::runtime::architectures::ModelOperations;
 use crate::runtime::device_pool::LayerDeviceMap;
-use super::tenant_delta::TenantDelta;
 
 /// A single pipeline stage: the stage model plus the global layer range it owns.
 ///

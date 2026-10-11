@@ -61,7 +61,12 @@ mod tests {
             parse_mutation_semantics("transaction-ledger-required"),
             Ok(DeclaredMutationSemantics::TransactionLedgerRequired)
         );
-        for invalid in ["", " naturally-idempotent", "automatic", "NaturallyIdempotent"] {
+        for invalid in [
+            "",
+            " naturally-idempotent",
+            "automatic",
+            "NaturallyIdempotent",
+        ] {
             assert!(parse_mutation_semantics(invalid).is_err(), "{invalid:?}");
         }
     }

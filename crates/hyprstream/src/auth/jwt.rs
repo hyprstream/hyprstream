@@ -3,13 +3,12 @@
 //! Re-exports EdDSA signing from hyprstream-rpc and adds ES256 (P-256) signing.
 
 pub use hyprstream_rpc::auth::{
-    decode, decode_with_any_key, decode_with_any_key_lenient,
-    decode_with_federation_candidates, decode_with_key, encode, encode_service_jwt, Claims,
-    JwtError,
+    decode, decode_with_any_key, decode_with_any_key_lenient, decode_with_federation_candidates,
+    decode_with_key, encode, encode_service_jwt, Claims, JwtError,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use p256::ecdsa::{SigningKey as Es256SigningKey, signature::Signer};
+use p256::ecdsa::{signature::Signer, SigningKey as Es256SigningKey};
 
 /// Encode and sign an OAuth 2.0 access token with ES256 (P-256 ECDSA).
 ///
@@ -50,7 +49,10 @@ fn es256_coordinates(signing_key: &Es256SigningKey) -> ([u8; 32], [u8; 32]) {
 /// Compute the RFC 7638 JWK Thumbprint for a P-256 signing key.
 pub fn es256_kid(signing_key: &Es256SigningKey) -> String {
     let (x, y) = es256_coordinates(signing_key);
-    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Es256 { x: &x, y: &y })
+    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Es256 {
+        x: &x,
+        y: &y,
+    })
 }
 
 /// Build a JWK (serde_json::Value) for JWKS publishing from a P-256 signing key.
@@ -87,12 +89,11 @@ pub fn encode_ml_dsa_65(
     };
     let vk = ml_dsa::Keypair::verifying_key(signing_key);
     let vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+    let kid =
+        hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Akp {
             alg: "ML-DSA-65",
             pub_bytes: &vk_bytes,
-        },
-    );
+        });
     let header = format!(r#"{{"alg":"ML-DSA-65","typ":"at+jwt","kid":"{}"}}"#, kid);
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
@@ -124,7 +125,10 @@ pub fn encode_composite_ml_dsa_65_ed25519(
     };
     let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
     let kid = composite_kid(&vk, &ed25519_key.verifying_key());
-    let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#, kid);
+    let header = format!(
+        r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#,
+        kid
+    );
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
         tracing::error!("JWT claims serialization failed: {}", _e);
@@ -159,7 +163,10 @@ pub fn encode_composite_service_jwt(
     };
     let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
     let kid = composite_kid(&vk, &ed25519_key.verifying_key());
-    let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#, kid);
+    let header = format!(
+        r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#,
+        kid
+    );
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
         tracing::error!("JWT claims serialization failed: {}", _e);
@@ -235,16 +242,13 @@ fn encode_service_jwt_hybrid_with_key_set(
 }
 
 /// Build a JWK for an ML-DSA-65 key (`kty: "AKP"`).
-pub fn ml_dsa_65_jwk(
-    vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
-) -> serde_json::Value {
+pub fn ml_dsa_65_jwk(vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey) -> serde_json::Value {
     let vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(vk);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+    let kid =
+        hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Akp {
             alg: "ML-DSA-65",
             pub_bytes: &vk_bytes,
-        },
-    );
+        });
     serde_json::json!({
         "kty": "AKP",
         "alg": "ML-DSA-65",
@@ -408,11 +412,13 @@ mod tests {
         assert!(decoded.jti.is_some());
 
         // Verify signature
-        use p256::ecdsa::{Signature, signature::Verifier};
+        use p256::ecdsa::{signature::Verifier, Signature};
         let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         let signature = Signature::from_slice(&sig_bytes).unwrap();
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        key.verifying_key().verify(signing_input.as_bytes(), &signature).unwrap();
+        key.verifying_key()
+            .verify(signing_input.as_bytes(), &signature)
+            .unwrap();
     }
 
     #[test]
@@ -498,8 +504,13 @@ mod tests {
 
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let decoded = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
-        ).unwrap();
+            &token,
+            &ml_dsa_vk,
+            &ed25519_vk,
+            None,
+            &dispatch,
+        )
+        .unwrap();
         assert_eq!(decoded.sub, "bob");
         assert!(decoded.jti.is_some());
     }
@@ -532,14 +543,20 @@ mod tests {
     fn composite_wrong_ed25519_key_rejects() {
         let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let wrong_ed25519_vk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let wrong_ed25519_vk =
+            ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
 
         let claims = Claims::new("bob".to_owned(), 0, 9_999_999_999);
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         assert!(hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &wrong_ed25519_vk, None, &dispatch,
-        ).is_err());
+            &token,
+            &ml_dsa_vk,
+            &wrong_ed25519_vk,
+            None,
+            &dispatch,
+        )
+        .is_err());
     }
 
     #[test]
@@ -560,8 +577,13 @@ mod tests {
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let err = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
-        ).unwrap_err();
+            &token,
+            &ml_dsa_vk,
+            &ed25519_vk,
+            None,
+            &dispatch,
+        )
+        .unwrap_err();
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }
 
@@ -581,8 +603,11 @@ mod tests {
         // Token without aud should be accepted even when expected_aud is set
         let token = encode_ml_dsa_65(&claims, &sk);
         assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
-            &token, &vk, Some("https://example.com"),
-        ).is_ok());
+            &token,
+            &vk,
+            Some("https://example.com"),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -591,9 +616,12 @@ mod tests {
         let mut claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
         claims.aud = Some("https://wrong.example.com".to_owned());
         let token = encode_ml_dsa_65(&claims, &sk);
-        let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
-            &token, &vk, Some("https://example.com"),
-        ).unwrap_err();
-        assert!(matches!(err, hyprstream_rpc::auth::JwtError::InvalidAudience));
+        let err =
+            hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, Some("https://example.com"))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            hyprstream_rpc::auth::JwtError::InvalidAudience
+        ));
     }
 }

@@ -143,7 +143,9 @@ impl CheckpointRecord {
         let head_hash = map_get_str(value, "headHash", COLLECTION_NSID)?.to_owned();
         let state_roots = value
             .get("stateRoots")
-            .ok_or_else(|| anyhow::anyhow!("{COLLECTION_NSID}: missing required field \"stateRoots\""))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("{COLLECTION_NSID}: missing required field \"stateRoots\"")
+            })?
             .as_list()?
             .iter()
             .map(parse_state_root)
@@ -226,7 +228,10 @@ mod tests {
     fn no_legal_identity_field_is_representable() {
         let mut v = sample().to_value();
         if let DagCbor::Map(ref mut pairs) = v {
-            pairs.push((DagCbor::Text("operatorName".into()), DagCbor::Text("Acme LLC".into())));
+            pairs.push((
+                DagCbor::Text("operatorName".into()),
+                DagCbor::Text("Acme LLC".into()),
+            ));
             pairs.sort_by(|a, b| a.0.as_str().unwrap_or("").cmp(b.0.as_str().unwrap_or("")));
         }
         assert!(CheckpointRecord::from_value(&v).is_err());

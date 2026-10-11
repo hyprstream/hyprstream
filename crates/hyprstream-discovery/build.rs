@@ -20,6 +20,9 @@ fn main() {
     let source = Path::new(&dep_out).join("discovery.cgr");
     let target = Path::new(&out_dir).join("discovery.cgr");
     fs::copy(&source, &target).unwrap_or_else(|e| {
-        panic!("failed to stage discovery.cgr from {}: {e}", source.display())
+        panic!(
+            "failed to stage discovery.cgr from {}: {e}",
+            source.display()
+        )
     });
 }

@@ -16,29 +16,31 @@ pub mod query;
 pub mod storage;
 pub mod utils;
 
-pub use hyprstream_metrics_api::aggregation;
 pub use aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
 pub use checkpoint::{
     Checkpoint, CheckpointConfig, CheckpointManager, CheckpointMetadata, RecoveryManager,
     RecoveryStatus, RegistryClient, RegistryError,
 };
+pub use hyprstream_metrics_api::aggregation;
 pub use metrics::calibration::{
-    CALIBRATION_TABLE, CalibrationParams, CalibrationStore, ConformalParams, ConformalQuantile,
-    DecisionPrimitive, DirichletParams, OrdinalInterval, VersionTriple, calibration_params_schema,
-    mint_calib_version,
+    calibration_params_schema, mint_calib_version, CalibrationParams, CalibrationStore,
+    ConformalParams, ConformalQuantile, DecisionPrimitive, DirichletParams, OrdinalInterval,
+    VersionTriple, CALIBRATION_TABLE,
 };
 pub use metrics::decision_batch::{
-    DECISION_BATCH_TABLE, DecisionBatchMeta, DecisionBatchStore, decision_batch_schema,
-    mint_batch_id,
+    decision_batch_schema, mint_batch_id, DecisionBatchMeta, DecisionBatchStore,
+    DECISION_BATCH_TABLE,
 };
 pub use metrics::producer::MetricsProducer;
-pub use metrics::{METRICS_SCHEMA_VERSION, METRICS_TABLE, create_schema_v2_tables};
+pub use metrics::{create_schema_v2_tables, METRICS_SCHEMA_VERSION, METRICS_TABLE};
 pub use query::{
     CachedStatement, DataFusionExecutor, DataFusionPlanner, ExecutorConfig, Query,
     QueryOrchestrator,
 };
+pub use storage::context::{
+    context_schema, ContextRecord, ContextStore, SearchResult, DEFAULT_EMBEDDING_DIM,
+};
 pub use storage::StorageBackend;
-pub use storage::context::{ContextRecord, ContextStore, SearchResult, context_schema, DEFAULT_EMBEDDING_DIM};
 
 // Re-export Arrow types from DuckDB for consistency
 pub use duckdb::arrow;

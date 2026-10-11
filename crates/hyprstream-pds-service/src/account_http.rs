@@ -8,14 +8,14 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use async_trait::async_trait;
 use axum::{
-    Router,
     extract::{Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority},
+    http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
+    Router,
 };
 use hyprstream_pds::{
     AccountLabel, AccountRecord, GenesisDidOp, SealedHostedAccount, SealedHostedDidDocument,
@@ -456,10 +456,9 @@ async fn serve_artifact(
 
 fn negative_response(status: StatusCode) -> Response {
     let mut response = status.into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -538,21 +537,21 @@ mod tests {
     use axum::{body::to_bytes, http::Request};
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use hyprstream_pds::dag_cbor::DagCbor;
     use hyprstream_pds::did_op::{
-        GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
-        RecoveryKeyEnrollment, UserRotationKey, sign_genesis,
+        sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+        RecoveryKeyEnrollment, UserRotationKey,
     };
     use hyprstream_pds::{
-        AllocatedAccountName, Cid, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE, HostedAccountMint,
+        AllocatedAccountName, Cid, HostedAccountMint, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
     };
-    use hyprstream_pds::dag_cbor::DagCbor;
-    use hyprstream_rpc::Subject;
     use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
+    use hyprstream_rpc::Subject;
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
     use rand::rngs::OsRng;
     use tower::ServiceExt;
 
-    use crate::{PDS_ACCOUNT_RECORD_FILE, PDS_ACCOUNTS_DIRECTORY};
+    use crate::{PDS_ACCOUNTS_DIRECTORY, PDS_ACCOUNT_RECORD_FILE};
 
     struct PermitReads;
 
@@ -634,10 +633,7 @@ mod tests {
                 SyntheticNode::dir().with_child(
                     "alice",
                     SyntheticNode::dir()
-                        .with_child(
-                            PDS_ACCOUNT_RECORD_FILE,
-                            SyntheticNode::file(record_file),
-                        )
+                        .with_child(PDS_ACCOUNT_RECORD_FILE, SyntheticNode::file(record_file))
                         .with_child(DID_DOCUMENT_FILE, SyntheticNode::file(document_file))
                         .with_child(GENESIS_DID_OP_FILE, SyntheticNode::file(log_file)),
                 ),
@@ -673,7 +669,9 @@ mod tests {
             AllocatedAccountName::new("alice", "did:web:alice.tormentnexus.social".to_owned())
                 .unwrap();
         let mint = HostedAccountMint::begin(name, rotations).unwrap();
-        let document = mint.seal_did_document("https://alternate.example.com").unwrap();
+        let document = mint
+            .seal_did_document("https://alternate.example.com")
+            .unwrap();
         let pending = mint
             .prepare_genesis(document, GenesisRepoHead::EmptyRepo)
             .unwrap();
@@ -1038,12 +1036,8 @@ mod tests {
             }
         }
         assert!(replaced, "account record must contain atproto_key");
-        let rebound = mounted_directory_with_files(
-            Some(record_value.encode()),
-            Some(document),
-            Some(log),
-        )
-        .0;
+        let rebound =
+            mounted_directory_with_files(Some(record_value.encode()), Some(document), Some(log)).0;
         rebound
             .store
             .refresh_hosted_did_index(&rebound.authority)
@@ -1059,7 +1053,11 @@ mod tests {
     #[tokio::test]
     async fn mounted_directory_rejects_non_genesis_current_operation_on_every_route() {
         let (original, document, log, record) = mounted_directory();
-        original.store.refresh_hosted_did_index(&original.authority).await.unwrap();
+        original
+            .store
+            .refresh_hosted_did_index(&original.authority)
+            .await
+            .unwrap();
         assert!(original.lookup("alice").await.unwrap().is_some());
 
         // Change only current_op: host, document, key, and sealed genesis
@@ -1078,23 +1076,42 @@ mod tests {
             }
         }
         assert!(replaced, "account record must contain current_op");
-        let invalid = mounted_directory_with_files(
-            Some(record_value.encode()), Some(document), Some(log),
-        ).0;
-        invalid.store.refresh_hosted_did_index(&invalid.authority).await.unwrap();
-        let error = invalid.lookup("alice").await.expect_err("current op must be sealed genesis");
-        assert!(error.to_string().contains("current operation is not genesis"));
+        let invalid =
+            mounted_directory_with_files(Some(record_value.encode()), Some(document), Some(log)).0;
+        invalid
+            .store
+            .refresh_hosted_did_index(&invalid.authority)
+            .await
+            .unwrap();
+        let error = invalid
+            .lookup("alice")
+            .await
+            .expect_err("current op must be sealed genesis");
+        assert!(error
+            .to_string()
+            .contains("current operation is not genesis"));
         let app = router(DEFAULT_ACCOUNT_ZONE, invalid).unwrap();
-        for path in ["/.well-known/did.json", "/.well-known/atproto-did", "/.well-known/did-log.json"] {
-            let response = app.clone().oneshot(
-                Request::builder()
-                    .uri(path)
-                    .header(header::HOST, "alice.tormentnexus.social")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            ).await.unwrap();
+        for path in [
+            "/.well-known/did.json",
+            "/.well-known/atproto-did",
+            "/.well-known/did-log.json",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::HOST, "alice.tormentnexus.social")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+            assert!(to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty());
         }
     }
 
@@ -1117,12 +1134,9 @@ mod tests {
         }
         assert!(replaced, "account record must contain genesis_op");
         let rebound_record = record_value.encode();
-        let rebound = mounted_directory_with_files(
-            Some(rebound_record),
-            Some(document),
-            Some(alternate_log),
-        )
-        .0;
+        let rebound =
+            mounted_directory_with_files(Some(rebound_record), Some(document), Some(alternate_log))
+                .0;
         rebound
             .store
             .refresh_hosted_did_index(&rebound.authority)

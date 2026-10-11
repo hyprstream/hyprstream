@@ -13,11 +13,11 @@ use tracing::{debug, info, instrument, warn};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::device_pool::DevicePool;
-use hyprstream_rpc_std::model_client::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
-use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
-use hyprstream_rpc_std::registry_client::WorktreeClient;
+use super::torch_utils::{estimate_tensor_size_mb, safe_to_device};
 use crate::worktree_ext::WorktreeClientExt;
+use hyprstream_rpc_std::model_client::KVQuantType;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
 
 /// Strict-loader opt-in (#315): when set truthy, multi-shard models that lack a
 /// `model.safetensors.index.json` manifest are rejected instead of silently
@@ -27,7 +27,12 @@ const STRICT_LOADER_ENV: &str = "HYPRSTREAM_STRICT_LOADER";
 
 fn strict_loader_enabled() -> bool {
     std::env::var(STRICT_LOADER_ENV)
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -106,7 +111,9 @@ pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tenso
     let mut converted = 0;
 
     for key in fp8_keys {
-        let Some(weight) = weights.remove(&key) else { continue };
+        let Some(weight) = weights.remove(&key) else {
+            continue;
+        };
         let scale_key = format!("{key}_scale_inv");
         let scale = weights.remove(&scale_key);
         if let Some(s) = &scale {
@@ -145,7 +152,9 @@ pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tenso
             let ss = scale.size();
             let block_r = ws[0] / ss[0];
             let block_c = ws[1] / ss[1];
-            let s_4d = scale.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+            let s_4d = scale
+                .to_kind(tch::Kind::BFloat16)
+                .view([ss[0], 1, ss[1], 1]);
             // In-place broadcast multiply on a block view of the contiguous
             // BF16 buffer; the buffer already IS the 2D result (the 4D view
             // is zero-copy). On the (practically unreachable) kernel error,
@@ -195,7 +204,10 @@ fn maybe_dequantize_fp8_weights_at_load(
     }
     let converted = dequantize_fp8_weights_at_load(weights);
     if converted > 0 {
-        info!("Dequantized {} FP8 weight tensor(s) to BF16 at load", converted);
+        info!(
+            "Dequantized {} FP8 weight tensor(s) to BF16 at load",
+            converted
+        );
     }
 }
 
@@ -288,7 +300,10 @@ impl ModelFactory {
             // Look for first shard file
             let shard_files = Self::find_shard_files(model_path)?;
             if shard_files.is_empty() {
-                return Err(anyhow!("No model weights found in {}", model_path.display()));
+                return Err(anyhow!(
+                    "No model weights found in {}",
+                    model_path.display()
+                ));
             }
             shard_files[0].clone()
         };
@@ -310,10 +325,9 @@ impl ModelFactory {
             match tensor.dtype() {
                 safetensors::Dtype::F16 => f16_count += 1,
                 safetensors::Dtype::BF16 => bf16_count += 1,
-                safetensors::Dtype::F8_E4M3
-                | safetensors::Dtype::F8_E5M2 => fp8_count += 1,
+                safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2 => fp8_count += 1,
                 safetensors::Dtype::F32 => f32_count += 1,
-                _ => {},
+                _ => {}
             }
         }
 
@@ -375,7 +389,9 @@ impl ModelFactory {
             info!("Using KV cache quantization: {:?}", kv_quant_type);
         }
         if fp8_dequant_load {
-            info!("FP8 dequant-at-load enabled: FP8 weights will be materialized as BF16 during load");
+            info!(
+                "FP8 dequant-at-load enabled: FP8 weights will be materialized as BF16 during load"
+            );
         }
         if let Some(pool) = device_pool {
             if !pool.is_single() {
@@ -394,14 +410,18 @@ impl ModelFactory {
 
         // Decide eligibility across the whole checkpoint before the first
         // shard can allocate a draft tensor. A later shard may reveal layer 1.
-        let mtp_shards = if shard_files.len() <= 1 && model_path.join("model.safetensors").exists() {
+        let mtp_shards = if shard_files.len() <= 1 && model_path.join("model.safetensors").exists()
+        {
             vec![model_path.join("model.safetensors")]
         } else {
             shard_files.clone()
         };
         let speculative_decoding = Self::mtp_loading_policy(
-            model_path, &mtp_shards, mtp_runtime_supported(speculative_decoding, kv_quant_type),
-        ).await?;
+            model_path,
+            &mtp_shards,
+            mtp_runtime_supported(speculative_decoding, kv_quant_type),
+        )
+        .await?;
 
         if !shard_files.is_empty() && shard_files.len() > 1 {
             // Use incremental loading for large sharded models
@@ -409,12 +429,35 @@ impl ModelFactory {
                 "📦 Using incremental loading for {} shards",
                 shard_files.len()
             );
-            Self::create_incremental(model_path, device, dtype, shard_files, max_context, kv_quant_type, device_pool, fp8_dequant_load, speculative_decoding).await
+            Self::create_incremental(
+                model_path,
+                device,
+                dtype,
+                shard_files,
+                max_context,
+                kv_quant_type,
+                device_pool,
+                fp8_dequant_load,
+                speculative_decoding,
+            )
+            .await
         } else {
             // Standard loading for single files or small models
-            let weights = Self::load_weights(model_path, device, dtype, speculative_decoding).await?;
+            let weights =
+                Self::load_weights(model_path, device, dtype, speculative_decoding).await?;
             let config = ModelConfig::load(model_path, &weights)?;
-            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool, fp8_dequant_load, speculative_decoding)?;
+            let model = Self::create_model_from_config(
+                config,
+                weights,
+                device,
+                dtype,
+                max_context,
+                kv_quant_type,
+                model_path,
+                device_pool,
+                fp8_dequant_load,
+                speculative_decoding,
+            )?;
             info!("✅ ModelFactory: Model created successfully");
             Ok(model)
         }
@@ -573,7 +616,10 @@ impl ModelFactory {
         info!(
             "📋 Index file lists {} shard(s): {:?}",
             paths.len(),
-            paths.iter().map(|p| p.file_name().unwrap_or_default()).collect::<Vec<_>>()
+            paths
+                .iter()
+                .map(|p| p.file_name().unwrap_or_default())
+                .collect::<Vec<_>>()
         );
         Ok(paths)
     }
@@ -760,15 +806,17 @@ impl ModelFactory {
                     let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
                         format!("failed to mmap required stage shard {}", shard.display())
                     })?;
-                    let tensors = safetensors::SafeTensors::deserialize(&mmap).with_context(|| {
-                        format!("failed to parse required stage shard {}", shard.display())
-                    })?;
+                    let tensors =
+                        safetensors::SafeTensors::deserialize(&mmap).with_context(|| {
+                            format!("failed to parse required stage shard {}", shard.display())
+                        })?;
                     Self::record_stage_tensor_metadata(tensors, names, shard, &mut metadata)?;
                 }
                 ResolvedWeight::Owned(bytes) => {
-                    let tensors = safetensors::SafeTensors::deserialize(&bytes).with_context(|| {
-                        format!("failed to parse required stage shard {}", shard.display())
-                    })?;
+                    let tensors =
+                        safetensors::SafeTensors::deserialize(&bytes).with_context(|| {
+                            format!("failed to parse required stage shard {}", shard.display())
+                        })?;
                     Self::record_stage_tensor_metadata(tensors, names, shard, &mut metadata)?;
                 }
             }
@@ -789,7 +837,10 @@ impl ModelFactory {
                     shard.display()
                 )
             })?;
-            if metadata.insert(name.clone(), view.shape().to_vec()).is_some() {
+            if metadata
+                .insert(name.clone(), view.shape().to_vec())
+                .is_some()
+            {
                 bail!("authoritative stage plan contains duplicate tensor `{name}`");
             }
         }
@@ -1178,7 +1229,14 @@ impl ModelFactory {
             info!("Loading shard {}/{}", idx + 1, shard_files.len());
 
             // Load shard weights directly to GPU to minimize CPU memory usage
-            Self::load_safetensors_file(shard_file, &mut all_weights, device, dtype, speculative_decoding).await?;
+            Self::load_safetensors_file(
+                shard_file,
+                &mut all_weights,
+                device,
+                dtype,
+                speculative_decoding,
+            )
+            .await?;
 
             // Note: In a true streaming implementation, we would:
             // 1. Load layer weights
@@ -1189,7 +1247,18 @@ impl ModelFactory {
 
         // Load config and create model
         let config = ModelConfig::load(model_path, &all_weights)?;
-        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type, model_path, device_pool, fp8_dequant_load, speculative_decoding)?;
+        let model = Self::create_model_from_config(
+            config,
+            all_weights,
+            device,
+            dtype,
+            max_context,
+            kv_quant_type,
+            model_path,
+            device_pool,
+            fp8_dequant_load,
+            speculative_decoding,
+        )?;
 
         info!("Model loaded");
         Ok(model)
@@ -1207,7 +1276,14 @@ impl ModelFactory {
         let single_file = model_path.join("model.safetensors");
         if single_file.exists() {
             info!("Loading model.safetensors");
-            Self::load_safetensors_file(&single_file, &mut all_weights, device, dtype, speculative_decoding).await?;
+            Self::load_safetensors_file(
+                &single_file,
+                &mut all_weights,
+                device,
+                dtype,
+                speculative_decoding,
+            )
+            .await?;
             return Ok(all_weights);
         }
 
@@ -1229,7 +1305,14 @@ impl ModelFactory {
             shard_files.sort();
             info!("Loading {} weight shards", shard_files.len());
             for shard_file in shard_files {
-                Self::load_safetensors_file(&shard_file, &mut all_weights, device, dtype, speculative_decoding).await?;
+                Self::load_safetensors_file(
+                    &shard_file,
+                    &mut all_weights,
+                    device,
+                    dtype,
+                    speculative_decoding,
+                )
+                .await?;
             }
             return Ok(all_weights);
         }
@@ -1249,7 +1332,8 @@ impl ModelFactory {
         dtype: DType,
         speculative_decoding: bool,
     ) -> Result<()> {
-        Self::load_safetensors_file_inner(path, None, weights, device, dtype, speculative_decoding).await
+        Self::load_safetensors_file_inner(path, None, weights, device, dtype, speculative_decoding)
+            .await
     }
 
     /// Load only `selected` tensor names from one safetensors shard.
@@ -1304,7 +1388,11 @@ impl ModelFactory {
                 let mmap = unsafe { Mmap::map(&file)? };
                 let tensors = safetensors::SafeTensors::deserialize(&mmap)?;
                 Self::create_tensors_from_safetensors_selected(
-                    tensors, selected, weights, device, dtype,
+                    tensors,
+                    selected,
+                    weights,
+                    device,
+                    dtype,
                     speculative_decoding,
                 )
             }
@@ -1312,14 +1400,22 @@ impl ModelFactory {
                 let tensor_data = Self::load_file_with_pointer_detection(&path_buf).await?;
                 let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
                 Self::create_tensors_from_safetensors_selected(
-                    tensors, selected, weights, device, dtype,
+                    tensors,
+                    selected,
+                    weights,
+                    device,
+                    dtype,
                     speculative_decoding,
                 )
             }
             ResolvedWeight::Owned(tensor_data) => {
                 let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
                 Self::create_tensors_from_safetensors_selected(
-                    tensors, selected, weights, device, dtype,
+                    tensors,
+                    selected,
+                    weights,
+                    device,
+                    dtype,
                     speculative_decoding,
                 )
             }
@@ -1371,7 +1467,10 @@ impl ModelFactory {
         }
         #[cfg(feature = "xet")]
         {
-            debug!("Un-smudged LFS pointer, resolving via git2db::lfs fallback: {}", path.display());
+            debug!(
+                "Un-smudged LFS pointer, resolving via git2db::lfs fallback: {}",
+                path.display()
+            );
             let config = git2db::XetConfig::default();
             let storage = git2db::LfsStorage::new(&config)
                 .await
@@ -1424,7 +1523,14 @@ impl ModelFactory {
         dtype: DType,
         speculative_decoding: bool,
     ) -> Result<()> {
-        Self::create_tensors_from_safetensors_selected(tensors, None, weights, device, dtype, speculative_decoding)
+        Self::create_tensors_from_safetensors_selected(
+            tensors,
+            None,
+            weights,
+            device,
+            dtype,
+            speculative_decoding,
+        )
     }
 
     fn create_tensors_from_safetensors_selected(
@@ -1456,11 +1562,7 @@ impl ModelFactory {
         };
         let tensor_count = tensors_list.len();
 
-        info!(
-            "Loading {} tensors to device {:?}",
-            tensor_count,
-            device
-        );
+        info!("Loading {} tensors to device {:?}", tensor_count, device);
 
         for (idx, (name, tensor_view)) in tensors_list.into_iter().enumerate() {
             // Runtime policy reaches every file/FsOps path. Skip the draft head
@@ -1492,10 +1594,7 @@ impl ModelFactory {
                 safetensors::Dtype::BF16 => {
                     // Verify target dtype matches
                     if dtype != tch::Kind::BFloat16 && dtype != tch::Kind::Half {
-                        return Err(anyhow!(
-                            "Model dtype BF16 but target dtype is {:?}",
-                            dtype
-                        ));
+                        return Err(anyhow!("Model dtype BF16 but target dtype is {:?}", dtype));
                     }
 
                     // Create tensor from borrowed data, then make an owned copy
@@ -1533,21 +1632,12 @@ impl ModelFactory {
                 safetensors::Dtype::F16 => {
                     // Verify target dtype matches
                     if dtype != tch::Kind::Half && dtype != tch::Kind::BFloat16 {
-                        return Err(anyhow!(
-                            "Model dtype F16 but target dtype is {:?}",
-                            dtype
-                        ));
+                        return Err(anyhow!("Model dtype F16 but target dtype is {:?}", dtype));
                     }
 
                     // Create tensor from borrowed data
                     let borrowed_tensor = unsafe {
-                        Tensor::from_blob(
-                            data.as_ptr(),
-                            &shape,
-                            &[],
-                            tch::Kind::Half,
-                            Device::Cpu,
-                        )
+                        Tensor::from_blob(data.as_ptr(), &shape, &[], tch::Kind::Half, Device::Cpu)
                     };
 
                     // Make an owned copy to prevent use-after-free
@@ -1572,13 +1662,7 @@ impl ModelFactory {
                 safetensors::Dtype::F32 => {
                     // Support F32 as well for completeness
                     let borrowed_tensor = unsafe {
-                        Tensor::from_blob(
-                            data.as_ptr(),
-                            &shape,
-                            &[],
-                            tch::Kind::Float,
-                            Device::Cpu,
-                        )
+                        Tensor::from_blob(data.as_ptr(), &shape, &[], tch::Kind::Float, Device::Cpu)
                     };
 
                     // Make an owned copy
@@ -1589,12 +1673,7 @@ impl ModelFactory {
                         tch::Kind::Half => cpu_tensor.to_kind(tch::Kind::Half),
                         tch::Kind::BFloat16 => cpu_tensor.to_kind(tch::Kind::BFloat16),
                         tch::Kind::Float => cpu_tensor,
-                        _ => {
-                            return Err(anyhow!(
-                                "Cannot convert F32 to target dtype {:?}",
-                                dtype
-                            ))
-                        }
+                        _ => return Err(anyhow!("Cannot convert F32 to target dtype {:?}", dtype)),
                     };
 
                     // Transfer to target device if needed (with OOM handling)
@@ -1603,7 +1682,11 @@ impl ModelFactory {
                         if idx % 100 == 0 || tensor_size_mb > 10.0 {
                             info!(
                                 "Transferring tensor {}/{} to GPU: {} ({:.2} MB, total: {:.2} MB)",
-                                idx + 1, tensor_count, name, tensor_size_mb, total_size_mb
+                                idx + 1,
+                                tensor_count,
+                                name,
+                                tensor_size_mb,
+                                total_size_mb
                             );
                         }
 
@@ -1698,7 +1781,9 @@ impl ModelFactory {
         // Weights are available here, enabling Tier 3 for unknown models.
         // Result cached to .analysis/layer_profile.json; non-fatal if it fails.
         // Runs in sync/blocking context (called from spawn_blocking), safe for SVD.
-        if let Err(e) = crate::runtime::ttn_profile::get_layer_profile(model_path, &config, Some(&weights)) {
+        if let Err(e) =
+            crate::runtime::ttn_profile::get_layer_profile(model_path, &config, Some(&weights))
+        {
             tracing::warn!("TTN profile analysis failed (non-fatal): {e}");
         }
 
@@ -1730,7 +1815,15 @@ impl ModelFactory {
             }
             ModelArchitecture::Qwen => {
                 info!("Creating Qwen model");
-                Self::create_qwen_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
+                Self::create_qwen_model(
+                    config,
+                    weights,
+                    device,
+                    dtype,
+                    max_context,
+                    kv_quant_type,
+                    device_pool,
+                )
             }
             ModelArchitecture::Gemma => {
                 info!("Creating Gemma model");
@@ -1763,7 +1856,15 @@ impl ModelFactory {
                         device
                     );
                 }
-                Self::create_qwen3_5_model(config, weights, device, dtype, max_context, kv_quant_type, speculative_decoding)
+                Self::create_qwen3_5_model(
+                    config,
+                    weights,
+                    device,
+                    dtype,
+                    max_context,
+                    kv_quant_type,
+                    speculative_decoding,
+                )
             }
             ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
         }
@@ -1785,7 +1886,10 @@ impl ModelFactory {
         // Apply max_context override if specified
         let effective_max_pos = max_context.unwrap_or(config.max_position_embeddings);
         if max_context.is_some() {
-            info!("Overriding max_position_embeddings: {} -> {}", config.max_position_embeddings, effective_max_pos);
+            info!(
+                "Overriding max_position_embeddings: {} -> {}",
+                config.max_position_embeddings, effective_max_pos
+            );
         }
 
         // Convert unified config to LlamaConfig
@@ -1799,7 +1903,7 @@ impl ModelFactory {
             max_position_embeddings: effective_max_pos as u32,
             rms_norm_eps: config.rms_norm_eps,
             vocab_size: config.vocab_size as u32,
-            original_vocab_size: config.vocab_size as u32,  // Will be updated if padding is applied
+            original_vocab_size: config.vocab_size as u32, // Will be updated if padding is applied
             num_hidden_layers: config.num_hidden_layers as u32,
             rope_theta: config.rope_theta,
             rope_scaling: None,
@@ -1947,7 +2051,7 @@ impl ModelFactory {
         _kv_quant_type: KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         use super::architectures::janus::{
-            JanusModel, JanusConfig, VisionEncoderConfig, ProjectorConfig,
+            JanusConfig, JanusModel, ProjectorConfig, VisionEncoderConfig,
         };
         use super::architectures::VisionEncoderType;
 
@@ -1971,7 +2075,7 @@ impl ModelFactory {
                 original_vocab_size: config.vocab_size as u32,
                 num_hidden_layers: config.num_hidden_layers as u32,
                 rope_theta: config.rope_theta,
-                rope_scaling: None,  // TODO: Convert from config.rope_scaling
+                rope_scaling: None, // TODO: Convert from config.rope_scaling
                 hidden_activation: config.hidden_activation.clone(),
                 query_pre_attn_scalar: config.query_pre_attn_scalar,
                 use_qk_norm: config.use_qk_norm,
@@ -1982,7 +2086,7 @@ impl ModelFactory {
             }),
             vision_config: VisionEncoderConfig {
                 encoder_type: VisionEncoderType::SigLIP {
-                    hidden_size: 1024,  // From config: vision_config.hidden_size
+                    hidden_size: 1024, // From config: vision_config.hidden_size
                     image_size: 384,
                     patch_size: 16,
                     num_layers: 24,
@@ -1991,16 +2095,16 @@ impl ModelFactory {
                 image_size: 384,
                 patch_size: 16,
                 num_layers: 24,
-                num_patches: (384 / 16) * (384 / 16),  // 576 patches
-                num_attention_heads: Some(16),  // From config: vision_config.num_attention_heads
-                intermediate_size: Some(4096),  // From config: vision_config.intermediate_size
+                num_patches: (384 / 16) * (384 / 16), // 576 patches
+                num_attention_heads: Some(16), // From config: vision_config.num_attention_heads
+                intermediate_size: Some(4096), // From config: vision_config.intermediate_size
             },
             aligner_config: ProjectorConfig {
-                input_dim: 1024,  // Vision hidden size (matches vision_config.hidden_size)
-                output_dim: config.hidden_size,  // Language model hidden size
-                hidden_dim: Some(config.hidden_size),  // 2-layer MLP
+                input_dim: 1024, // Vision hidden size (matches vision_config.hidden_size)
+                output_dim: config.hidden_size, // Language model hidden size
+                hidden_dim: Some(config.hidden_size), // 2-layer MLP
             },
-            generation_config: None,  // No image generation for now
+            generation_config: None, // No image generation for now
             device: *device,
             dtype,
         };
@@ -2056,7 +2160,11 @@ impl ModelFactory {
                 patch_size: 16,
                 temporal_patch_size: 2,
                 spatial_merge_size: 2,
-                out_hidden_size: if config.vision_out_hidden_size > 0 { config.vision_out_hidden_size } else { 3584 },
+                out_hidden_size: if config.vision_out_hidden_size > 0 {
+                    config.vision_out_hidden_size
+                } else {
+                    3584
+                },
                 rms_norm_eps: 1e-6,
             })
         } else {
@@ -2102,16 +2210,32 @@ impl ModelFactory {
         let shard_names = Self::find_shard_names_fs(fs).await?;
 
         let speculative_decoding = Self::mtp_loading_policy_fs(
-            model_path, fs, &shard_names, mtp_runtime_supported(speculative_decoding, kv_quant_type),
-        ).await?;
+            model_path,
+            fs,
+            &shard_names,
+            mtp_runtime_supported(speculative_decoding, kv_quant_type),
+        )
+        .await?;
 
         if shard_names.len() > 1 {
             info!("Loading {} weight shards via FsOps", shard_names.len());
         }
 
-        let weights = Self::load_weights_fs(fs, &shard_names, device, dtype, speculative_decoding).await?;
+        let weights =
+            Self::load_weights_fs(fs, &shard_names, device, dtype, speculative_decoding).await?;
         let config = ModelConfig::load(model_path, &weights)?;
-        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool, fp8_dequant_load, speculative_decoding)?;
+        let model = Self::create_model_from_config(
+            config,
+            weights,
+            device,
+            dtype,
+            max_context,
+            kv_quant_type,
+            model_path,
+            device_pool,
+            fp8_dequant_load,
+            speculative_decoding,
+        )?;
         info!("Model created successfully via FsOps");
         Ok(model)
     }
@@ -2137,7 +2261,7 @@ impl ModelFactory {
                 | safetensors::Dtype::F8_E4M3
                 | safetensors::Dtype::F8_E5M2 => bf16_count += 1,
                 safetensors::Dtype::F32 => f32_count += 1,
-                _ => {},
+                _ => {}
             }
         }
 
@@ -2159,7 +2283,12 @@ impl ModelFactory {
     /// Find shard file names via FsOps (returns relative paths).
     async fn find_shard_names_fs(fs: &WorktreeClient) -> Result<Vec<String>> {
         // Check for single file first
-        if fs.stat_path("model.safetensors").await.map(|s| s.exists).unwrap_or(false) {
+        if fs
+            .stat_path("model.safetensors")
+            .await
+            .map(|s| s.exists)
+            .unwrap_or(false)
+        {
             return Ok(vec!["model.safetensors".to_owned()]);
         }
 
@@ -2167,9 +2296,7 @@ impl ModelFactory {
         let entries = fs.list_dir_path(".").await?;
         let mut shard_names: Vec<String> = entries
             .into_iter()
-            .filter(|e| {
-                e.name.starts_with("model-") && e.name.ends_with(".safetensors")
-            })
+            .filter(|e| e.name.starts_with("model-") && e.name.ends_with(".safetensors"))
             .map(|e| e.name)
             .collect();
 
@@ -2193,12 +2320,23 @@ impl ModelFactory {
 
         for (idx, name) in shard_names.iter().enumerate() {
             if shard_names.len() > 1 {
-                info!("Loading shard {}/{} via FsOps: {}", idx + 1, shard_names.len(), name);
+                info!(
+                    "Loading shard {}/{} via FsOps: {}",
+                    idx + 1,
+                    shard_names.len(),
+                    name
+                );
             }
 
             let data = fs.read_file_chunked(name).await?;
             let tensors = safetensors::SafeTensors::deserialize(&data)?;
-            Self::create_tensors_from_safetensors(tensors, &mut all_weights, device, dtype, speculative_decoding)?;
+            Self::create_tensors_from_safetensors(
+                tensors,
+                &mut all_weights,
+                device,
+                dtype,
+                speculative_decoding,
+            )?;
         }
 
         Ok(all_weights)
@@ -2324,30 +2462,47 @@ mod stage_subset_tests {
             if sharded {
                 let base = tiny_dense_tensors(true);
                 write_shard(dir.path(), "model-00001-of-00001.safetensors", &base);
-                write_shard(dir.path(), "mtp.safetensors", &[FixtureTensor::i64("mtp.unmaterializable")]);
-                let mut entries: Vec<_> = base.iter().map(|tensor|
-                    (tensor.name.as_str(), "model-00001-of-00001.safetensors")
-                ).collect();
+                write_shard(
+                    dir.path(),
+                    "mtp.safetensors",
+                    &[FixtureTensor::i64("mtp.unmaterializable")],
+                );
+                let mut entries: Vec<_> = base
+                    .iter()
+                    .map(|tensor| (tensor.name.as_str(), "model-00001-of-00001.safetensors"))
+                    .collect();
                 entries.push(("mtp.unmaterializable", "mtp.safetensors"));
                 write_index(dir.path(), &entries);
             }
             for enabled in [false, true] {
                 let configured = crate::config::RuntimeConfig {
-                    use_gpu: false, speculative_decoding: enabled, ..Default::default()
+                    use_gpu: false,
+                    speculative_decoding: enabled,
+                    ..Default::default()
                 };
-                let config: crate::config::RuntimeConfig = toml::from_str(
-                    &toml::to_string(&configured).unwrap(),
-                ).unwrap();
+                let config: crate::config::RuntimeConfig =
+                    toml::from_str(&toml::to_string(&configured).unwrap()).unwrap();
                 let result = ModelFactory::create(
-                    dir.path(), &Device::Cpu, DType::Float, Some(16), KVQuantType::None,
-                    None, false, config.speculative_decoding,
-                ).await;
+                    dir.path(),
+                    &Device::Cpu,
+                    DType::Float,
+                    Some(16),
+                    KVQuantType::None,
+                    None,
+                    false,
+                    config.speculative_decoding,
+                )
+                .await;
                 if enabled {
                     let error = result.err().expect("enabled MTP reaches unsupported dtype");
                     assert!(error.to_string().contains("mtp.unmaterializable"));
                     assert!(error.to_string().contains("unsupported dtype"));
                 } else {
-                    assert!(result.is_ok(), "disabled MTP was materialized: {:?}", result.err());
+                    assert!(
+                        result.is_ok(),
+                        "disabled MTP was materialized: {:?}",
+                        result.err()
+                    );
                 }
             }
         }
@@ -2356,10 +2511,14 @@ mod stage_subset_tests {
     #[test]
     fn mtp_fsops_materializer_obeys_loading_policy() {
         let dir = tempfile::tempdir().unwrap();
-        write_shard(dir.path(), "weights.safetensors", &[
-            FixtureTensor::f32("model.norm.weight", &[4], 1.0),
-            FixtureTensor::f32("mtp.norm.weight", &[4], 1.0),
-        ]);
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[
+                FixtureTensor::f32("model.norm.weight", &[4], 1.0),
+                FixtureTensor::f32("mtp.norm.weight", &[4], 1.0),
+            ],
+        );
         let bytes = std::fs::read(dir.path().join("weights.safetensors")).unwrap();
         for enabled in [false, true] {
             let mut weights = HashMap::new();
@@ -2367,8 +2526,12 @@ mod stage_subset_tests {
             // read changes byte acquisition, not pre-allocation selection.
             ModelFactory::create_tensors_from_safetensors(
                 safetensors::SafeTensors::deserialize(&bytes).unwrap(),
-                &mut weights, &Device::Cpu, DType::Float, enabled,
-            ).unwrap();
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                enabled,
+            )
+            .unwrap();
             assert!(weights.contains_key("model.norm.weight"));
             assert_eq!(weights.contains_key("mtp.norm.weight"), enabled);
         }
@@ -2564,12 +2727,10 @@ mod stage_subset_tests {
                     mtp_runtime_supported(requested, kv),
                 );
                 if requested && kv == KVQuantType::None {
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("mtp.unmaterializable")
-                    );
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("mtp.unmaterializable"));
                 } else {
                     result.unwrap();
                     assert_eq!(weights.len(), 1);
@@ -2610,12 +2771,10 @@ mod stage_subset_tests {
                 allowed,
             );
             if marker == "mtp.layers.0.norm.weight" {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("mtp.unmaterializable")
-                );
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("mtp.unmaterializable"));
             } else {
                 result.unwrap();
                 assert_eq!(weights.len(), 1);
@@ -2857,17 +3016,15 @@ size 4096\n",
         .unwrap();
 
         let plan = ModelFactory::stage_weight_plan(dir.path(), 1, 0..1).unwrap();
-        let preflight_error = ModelFactory::stage_tensor_metadata(&plan).await.unwrap_err();
+        let preflight_error = ModelFactory::stage_tensor_metadata(&plan)
+            .await
+            .unwrap_err();
         assert_pointer_resolution_error(preflight_error);
 
-        let selected_error = ModelFactory::load_weights_for_stage_plan(
-            plan,
-            0..1,
-            &Device::Cpu,
-            DType::Float,
-        )
-        .await
-        .unwrap_err();
+        let selected_error =
+            ModelFactory::load_weights_for_stage_plan(plan, 0..1, &Device::Cpu, DType::Float)
+                .await
+                .unwrap_err();
         assert_pointer_resolution_error(selected_error);
     }
 
@@ -3108,7 +3265,11 @@ mod fp8_dequant_tests {
         let vals: Vec<f32> = (0..(rows * cols))
             .map(|i| {
                 let mag = [0.5f32, 1.0, 2.0][(i % 3) as usize];
-                if i % 2 == 1 { -mag } else { mag }
+                if i % 2 == 1 {
+                    -mag
+                } else {
+                    mag
+                }
             })
             .collect();
         Tensor::from_slice(&vals)
@@ -3139,7 +3300,11 @@ mod fp8_dequant_tests {
 
         assert_eq!(converted, 1);
         let w = weights.get("w.weight").expect("weight kept");
-        assert_eq!(w.kind(), DType::BFloat16, "FP8 weight must be materialized as BF16");
+        assert_eq!(
+            w.kind(),
+            DType::BFloat16,
+            "FP8 weight must be materialized as BF16"
+        );
         assert!(
             !weights.contains_key("w.weight_scale_inv"),
             "block scale must be dropped after load-time dequant"
@@ -3155,7 +3320,11 @@ mod fp8_dequant_tests {
         let expected: Vec<f32> = (0..16)
             .map(|i| {
                 let mag = [0.25f32, 0.5, 1.0][(i % 3) as usize];
-                if i % 2 == 1 { -mag } else { mag }
+                if i % 2 == 1 {
+                    -mag
+                } else {
+                    mag
+                }
             })
             .collect();
         let expected = Tensor::from_slice(&expected).reshape([4, 4]);

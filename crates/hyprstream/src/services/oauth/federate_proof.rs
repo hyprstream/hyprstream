@@ -10,9 +10,10 @@
 
 use std::{sync::Arc, time::Duration};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::VerifyingKey;
 use hyprstream_rpc::{
-    auth::{Claims, Scope, parse_protected_header, signer_suite::signer_suite_thumbprint},
+    auth::{parse_protected_header, signer_suite::signer_suite_thumbprint, Claims, Scope},
     crypto::pq::ml_dsa_vk_from_bytes,
     proof::{
         enrollment::{
@@ -24,9 +25,10 @@ use hyprstream_rpc::{
     },
     service::EnvelopeContext,
 };
-use hyprstream_rpc_std::policy_client::{AdmitFederateRequest, PolicyClient, ResolveSessionPrimary, SessionPrimary};
+use hyprstream_rpc_std::policy_client::{
+    AdmitFederateRequest, PolicyClient, ResolveSessionPrimary, SessionPrimary,
+};
 use hyprstream_session_store::{primary::ExpectedPrimary, PROFILE, SUITE};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -259,17 +261,30 @@ impl DispatchAdapter {
         let handle = CredentialHandle::from_verified_context(ctx)?;
         let raw = ctx.request_proof_cwt().ok_or(Error::Denied)?;
         let consumer = Consumer {
-            provider: Some(Arc::new(PolicyPrimaryProvider { client: self.client.clone() })),
+            provider: Some(Arc::new(PolicyPrimaryProvider {
+                client: self.client.clone(),
+            })),
         };
         let local = LocalPolicy {
             static_enrollments: self.static_enrollments.as_ref(),
             in_flight: &self.in_flight,
         };
-        let request = Request { proof: raw, credential: ctx.deferred_federate_credential().ok_or(Error::Denied)?.1.as_bytes(), service, schema_id, body };
-        let (verified, active) = consumer.verify_with_primary(
-            &handle, &request, &local,
-            || chrono::Utc::now().timestamp().max(0) as u64,
-        ).await?;
+        let request = Request {
+            proof: raw,
+            credential: ctx
+                .deferred_federate_credential()
+                .ok_or(Error::Denied)?
+                .1
+                .as_bytes(),
+            service,
+            schema_id,
+            body,
+        };
+        let (verified, active) = consumer
+            .verify_with_primary(&handle, &request, &local, || {
+                chrono::Utc::now().timestamp().max(0) as u64
+            })
+            .await?;
         if verified.primary_principal.as_deref() != Some(handle.expected.subject.as_str())
             || verified.primary_suite != SUITE
         {
@@ -296,9 +311,14 @@ impl DispatchAdapter {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let admitted = self.client.admit_federate_request(&data).await
+        let admitted = self
+            .client
+            .admit_federate_request(&data)
+            .await
             .map_err(|_| Error::Unavailable)?;
-        if !admitted { return Err(Error::Denied); }
+        if !admitted {
+            return Err(Error::Denied);
+        }
         Ok((verified, e.ed_public))
     }
 }

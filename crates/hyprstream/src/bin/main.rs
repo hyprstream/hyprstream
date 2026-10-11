@@ -6,43 +6,103 @@
 
 // Standard library imports
 use anyhow::{Context as _, Result};
-use clap::{Arg, Args as ClapArgs, Command as ClapCommand, FromArgMatches, Subcommand as ClapSubcommand};
+use clap::{
+    Arg, Args as ClapArgs, Command as ClapCommand, FromArgMatches, Subcommand as ClapSubcommand,
+};
 use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::{
-    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TrustCommand, TuiAction,
-    WorkerAction,
+    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TrustCommand,
+    TuiAction, WorkerAction,
+};
+use hyprstream_core::cli::commands::{
+    PolicyCommand, RoleCommand, TokenCommand, UserCommand, UserKeysCommand,
 };
 use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuickCommand};
 use hyprstream_core::cli::schema_cli;
 use hyprstream_core::cli::{
-    handle_branch, handle_checkout, handle_clone, handle_infer, handle_info, handle_list,
-    handle_load, handle_notify_command, parse_filters, parse_status_filter, handle_policy_apply, handle_policy_apply_template, handle_policy_check,
-    handle_policy_diff, handle_policy_edit, handle_policy_history, handle_policy_list_templates,
-    handle_policy_rollback, handle_policy_show, handle_policy_role_add, handle_policy_role_remove,
-    handle_policy_role_list, handle_pull, handle_remote_add, handle_remote_list,
-    handle_remote_remove, handle_remote_rename, handle_remote_set_url, handle_remove,
-    handle_sign_challenge, handle_status, handle_token_create, handle_unload, handle_training_batch,
-    handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
-    handle_worktree_info, handle_worktree_list, handle_worktree_remove,
-    handle_user_create, handle_user_list, handle_user_register, handle_user_remove,
-    handle_user_keys_list, handle_user_keys_import, handle_user_keys_remove,
-    load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
+    handle_branch,
+    handle_checkout,
+    handle_clone,
     // Worker handlers
-    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
-    handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
-    handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
-    handle_worker_terminal, handle_worker_stop,
+    handle_images_df,
+    handle_images_list,
+    handle_images_pull,
+    handle_images_rm,
+    handle_infer,
+    handle_info,
+    handle_list,
+    handle_load,
+    handle_notify_command,
+    handle_policy_apply,
+    handle_policy_apply_template,
+    handle_policy_check,
+    handle_policy_diff,
+    handle_policy_edit,
+    handle_policy_history,
+    handle_policy_list_templates,
+    handle_policy_role_add,
+    handle_policy_role_list,
+    handle_policy_role_remove,
+    handle_policy_rollback,
+    handle_policy_show,
+    handle_pull,
+    handle_remote_add,
+    handle_remote_list,
+    handle_remote_remove,
+    handle_remote_rename,
+    handle_remote_set_url,
+    handle_remove,
     // Service handlers
-    handle_service_install, handle_service_provision_policy_templates,
-    handle_service_start, handle_service_status,
-    handle_service_stop, handle_service_uninstall,
+    handle_service_install,
+    handle_service_provision_policy_templates,
+    handle_service_start,
+    handle_service_status,
+    handle_service_stop,
+    handle_service_uninstall,
+    handle_sign_challenge,
+    handle_status,
+    handle_token_create,
+    handle_training_batch,
+    handle_training_checkpoint,
+    handle_training_infer,
+    handle_training_init,
+    handle_unload,
+    handle_user_create,
+    handle_user_keys_import,
+    handle_user_keys_list,
+    handle_user_keys_remove,
+    handle_user_list,
+    handle_user_register,
+    handle_user_remove,
+    handle_worker_exec,
+    handle_worker_list,
+    handle_worker_restart,
+    handle_worker_rm,
+    handle_worker_run,
+    handle_worker_start,
+    handle_worker_stats,
+    handle_worker_status,
+    handle_worker_stop,
+    handle_worker_terminal,
+    handle_worktree_add,
+    handle_worktree_info,
+    handle_worktree_list,
+    handle_worktree_remove,
+    load_or_generate_signing_key,
+    parse_filters,
+    parse_status_filter,
+    AppContext,
+    DeviceConfig,
+    DevicePreference,
+    RuntimeConfig,
 };
-use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand, UserKeysCommand};
 
 #[cfg(feature = "experimental")]
-use hyprstream_core::cli::{handle_commit, handle_merge, handle_promote, handle_push, MergeOptions};
+use hyprstream_core::cli::{
+    handle_commit, handle_merge, handle_promote, handle_push, MergeOptions,
+};
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
@@ -55,11 +115,11 @@ use hyprstream_workers::ImageConfig;
 use hyprstream_workers::PoolConfig;
 use std::sync::Arc;
 // Unified service manager API
-use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
-use hyprstream_rpc::transport::TransportConfig;
-use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::events::EventPublisher;
+use hyprstream_rpc::registry::SocketKind;
+use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
+use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
 
 fn supports_tui() -> bool {
     use std::io::IsTerminal;
@@ -89,13 +149,13 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use opentelemetry_sdk::Resource;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(any(not(feature = "otel"), target_arch = "wasm32"))]
 use tracing_subscriber::EnvFilter;
 #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI builder
@@ -127,47 +187,35 @@ fn build_cli() -> ClapCommand {
     app = app.subcommand(schema_cli::build_tool_command());
 
     // Quick workflows (derive-based subcommands)
-    app = app.subcommand(
-        <QuickCommand as ClapSubcommand>::augment_subcommands(
-            ClapCommand::new("quick")
-                .about("Quick workflows \u{2014} multi-step convenience commands"),
-        ),
-    );
+    app = app.subcommand(<QuickCommand as ClapSubcommand>::augment_subcommands(
+        ClapCommand::new("quick").about("Quick workflows \u{2014} multi-step convenience commands"),
+    ));
 
     // Service management (derive-based subcommands)
-    app = app.subcommand(
-        <ServiceAction as ClapSubcommand>::augment_subcommands(
-            ClapCommand::new("service").about("Service management and lifecycle commands"),
-        ),
-    );
+    app = app.subcommand(<ServiceAction as ClapSubcommand>::augment_subcommands(
+        ClapCommand::new("service").about("Service management and lifecycle commands"),
+    ));
 
     // Out-of-band deployment trust authority tooling.
-    app = app.subcommand(
-        <TrustCommand as ClapSubcommand>::augment_subcommands(
-            ClapCommand::new("trust").about("Mint and verify deployment trust artifacts"),
-        ),
-    );
+    app = app.subcommand(<TrustCommand as ClapSubcommand>::augment_subcommands(
+        ClapCommand::new("trust").about("Mint and verify deployment trust artifacts"),
+    ));
 
     // TUI display server (derive-based subcommands)
-    app = app.subcommand(
-        <TuiAction as ClapSubcommand>::augment_subcommands(
-            ClapCommand::new("tui").about("TUI display server \u{2014} terminal multiplexer with session persistence"),
-        ),
-    );
+    app = app.subcommand(<TuiAction as ClapSubcommand>::augment_subcommands(
+        ClapCommand::new("tui")
+            .about("TUI display server \u{2014} terminal multiplexer with session persistence"),
+    ));
 
     // Flight SQL client (derive-based args)
-    app = app.subcommand(
-        <FlightArgs as ClapArgs>::augment_args(
-            ClapCommand::new("flight").about("Flight SQL client to query datasets"),
-        ),
-    );
+    app = app.subcommand(<FlightArgs as ClapArgs>::augment_args(
+        ClapCommand::new("flight").about("Flight SQL client to query datasets"),
+    ));
 
     // User management (derive-based subcommands)
-    app = app.subcommand(
-        <UserCommand as ClapSubcommand>::augment_subcommands(
-            ClapCommand::new("user").about("Manage local user credentials"),
-        ),
-    );
+    app = app.subcommand(<UserCommand as ClapSubcommand>::augment_subcommands(
+        ClapCommand::new("user").about("Manage local user credentials"),
+    ));
 
     // PDS home attachment (RFC 8628 device authorization)
     app = app.subcommand(
@@ -365,14 +413,14 @@ fn build_cli() -> ClapCommand {
     );
 
     // Native MAC status/inspection (epic #547).
-    app = app.subcommand(
-        ClapCommand::new("mac")
-            .about("Native MAC (mandatory access control) status and inspection")
-            .subcommand(
-                ClapCommand::new("genesis")
-                    .about("Show the MAC genesis coverage report (activation coverage-gate evidence)"),
-            ),
-    );
+    app =
+        app.subcommand(
+            ClapCommand::new("mac")
+                .about("Native MAC (mandatory access control) status and inspection")
+                .subcommand(ClapCommand::new("genesis").about(
+                    "Show the MAC genesis coverage report (activation coverage-gate evidence)",
+                )),
+        );
 
     app
 }
@@ -408,12 +456,12 @@ where
     // Check GPU availability early if required
     if matches!(config.device.preference, DevicePreference::RequireGPU)
         && std::env::var("CUDA_VISIBLE_DEVICES").is_err()
-            && std::env::var("HIP_VISIBLE_DEVICES").is_err()
-            && !std::path::Path::new("/usr/local/cuda").exists()
-            && !std::path::Path::new("/opt/rocm").exists()
-        {
-            anyhow::bail!("GPU required but no CUDA or ROCm installation detected. Set CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES, or install CUDA/ROCm.");
-        }
+        && std::env::var("HIP_VISIBLE_DEVICES").is_err()
+        && !std::path::Path::new("/usr/local/cuda").exists()
+        && !std::path::Path::new("/opt/rocm").exists()
+    {
+        anyhow::bail!("GPU required but no CUDA or ROCm installation detected. Set CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES, or install CUDA/ROCm.");
+    }
 
     // Set environment hints for the runtime config
     match config.device.preference {
@@ -505,9 +553,7 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
 
             opentelemetry_sdk::metrics::SdkMeterProvider::builder()
                 .with_resource(resource.clone())
-                .with_reader(
-                    opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build(),
-                )
+                .with_reader(opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build())
                 .build()
         }
         TelemetryProvider::Stdout => opentelemetry_sdk::metrics::SdkMeterProvider::builder()
@@ -645,7 +691,8 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
+                let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(
+                    &hyprstream_discovery::ProductionRpcClientProvider,
                     signing_key,
                     None,
                 )?;
@@ -693,9 +740,7 @@ fn handle_quick_command(
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
-            || async move {
-                handle_branch(ctx.registry(), &model, &name, from, policy).await
-            },
+            || async move { handle_branch(ctx.registry(), &model, &name, from, policy).await },
         ),
 
         QuickCommand::Checkout {
@@ -714,13 +759,7 @@ fn handle_quick_command(
                     None => GitRef::DefaultBranch,
                 };
                 let model_ref = ModelRef::with_ref(model, git_ref_parsed);
-                handle_checkout(
-                    ctx.registry(),
-                    &model_ref.to_string(),
-                    create_branch,
-                    force,
-                )
-                .await
+                handle_checkout(ctx.registry(), &model_ref.to_string(), create_branch, force).await
             },
         ),
 
@@ -734,9 +773,7 @@ fn handle_quick_command(
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
-            || async move {
-                handle_pull(ctx.registry(), &model, remote, branch, rebase).await
-            },
+            || async move { handle_pull(ctx.registry(), &model, remote, branch, rebase).await },
         ),
 
         QuickCommand::Remove {
@@ -750,14 +787,7 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move {
-                handle_remove(
-                    ctx.registry(),
-                    &model,
-                    force,
-                    registry_only,
-                    files_only,
-                )
-                .await
+                handle_remove(ctx.registry(), &model, force, registry_only, files_only).await
             },
         ),
 
@@ -771,9 +801,7 @@ fn handle_quick_command(
                 device: DeviceConfig::request_gpu(),
                 multi_threaded: true,
             },
-            || async move {
-                handle_load(&model, max_context, kv_quant.into(), wait, signing_key).await
-            },
+            || async move { handle_load(&model, max_context, kv_quant.into(), wait, signing_key).await },
         ),
 
         QuickCommand::Unload { model } => with_runtime(
@@ -789,9 +817,7 @@ fn handle_quick_command(
                 device: DeviceConfig::request_cpu(),
                 multi_threaded: true,
             },
-            || async move {
-                handle_notify_command(command, signing_key).await
-            },
+            || async move { handle_notify_command(command, signing_key).await },
         ),
 
         QuickCommand::Worktree { command } => with_runtime(
@@ -805,9 +831,7 @@ fn handle_quick_command(
                         model,
                         branch,
                         policy,
-                    } => {
-                        handle_worktree_add(ctx.registry(), &model, &branch, policy).await
-                    }
+                    } => handle_worktree_add(ctx.registry(), &model, &branch, policy).await,
                     WorktreeQuickCommand::List { model, all } => {
                         handle_worktree_list(ctx.registry(), &model, all).await
                     }
@@ -818,10 +842,7 @@ fn handle_quick_command(
                         model,
                         branch,
                         force,
-                    } => {
-                        handle_worktree_remove(ctx.registry(), &model, &branch, force)
-                            .await
-                    }
+                    } => handle_worktree_remove(ctx.registry(), &model, &branch, force).await,
                 }
             },
         ),
@@ -875,14 +896,7 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move {
-                handle_promote(
-                    ctx.registry(),
-                    &model,
-                    &branch,
-                    author_name,
-                    author_email,
-                )
-                .await
+                handle_promote(ctx.registry(), &model, &branch, author_name, author_email).await
             },
         ),
 
@@ -899,15 +913,7 @@ fn handle_quick_command(
                 multi_threaded: true,
             },
             || async move {
-                handle_push(
-                    ctx.registry(),
-                    &model,
-                    remote,
-                    branch,
-                    set_upstream,
-                    force,
-                )
-                .await
+                handle_push(ctx.registry(), &model, remote, branch, set_upstream, force).await
             },
         ),
 
@@ -1074,16 +1080,7 @@ fn handle_quick_command(
                         message,
                         push,
                         remote,
-                    } => {
-                        handle_training_checkpoint(
-                            registry,
-                            &model,
-                            message,
-                            push,
-                            &remote,
-                        )
-                        .await
-                    }
+                    } => handle_training_checkpoint(registry, &model, message, push, &remote).await,
                 }
             },
         ),
@@ -1106,9 +1103,7 @@ fn handle_quick_command(
                 let policy_csv_path = policies_dir.join("policy.csv");
 
                 match command {
-                    PolicyCommand::Show { raw } => {
-                        handle_policy_show(&signing_key, raw).await
-                    }
+                    PolicyCommand::Show { raw } => handle_policy_show(&signing_key, raw).await,
                     PolicyCommand::History { count, oneline } => {
                         handle_policy_history(&signing_key, count, oneline).await
                     }
@@ -1126,27 +1121,14 @@ fn handle_quick_command(
                         user,
                         resource,
                         action,
-                    } => {
-                        handle_policy_check(&signing_key, &user, &resource, &action).await
-                    }
-                    PolicyCommand::Token {
-                        command: token_cmd,
-                    } => match token_cmd {
+                    } => handle_policy_check(&signing_key, &user, &resource, &action).await,
+                    PolicyCommand::Token { command: token_cmd } => match token_cmd {
                         TokenCommand::Create {
                             user,
                             name,
                             expires,
                             scope,
-                        } => {
-                            handle_token_create(
-                                &signing_key,
-                                &user,
-                                name,
-                                &expires,
-                                scope,
-                            )
-                            .await
-                        }
+                        } => handle_token_create(&signing_key, &user, name, &expires, scope).await,
                         TokenCommand::List { user: _ } => {
                             println!("JWT tokens are stateless and cannot be listed.");
                             println!();
@@ -1165,18 +1147,14 @@ fn handle_quick_command(
                             println!();
                             println!("Options for token invalidation:");
                             println!("  1. Use short expiry times (e.g., --expires 1d)");
-                            println!(
-                                "  2. Regenerate the signing key to invalidate all tokens:"
-                            );
+                            println!("  2. Regenerate the signing key to invalidate all tokens:");
                             println!(
                                 "     rm ~/.local/share/hyprstream/.registry/keys/signing.key"
                             );
                             println!("  3. Remove user permissions via policy:");
                             println!("     hyprstream quick policy edit");
                             println!();
-                            println!(
-                                "A token blocklist feature may be added in the future."
-                            );
+                            println!("A token blocklist feature may be added in the future.");
                             Ok(())
                         }
                     },
@@ -1185,14 +1163,17 @@ fn handle_quick_command(
                     }
                     PolicyCommand::ListTemplates => handle_policy_list_templates().await,
                     PolicyCommand::Role { command } => match command {
-                        RoleCommand::Add { user, role, dry_run } => {
-                            handle_policy_role_add(&signing_key, &user, &role, dry_run).await
-                        }
+                        RoleCommand::Add {
+                            user,
+                            role,
+                            dry_run,
+                        } => handle_policy_role_add(&signing_key, &user, &role, dry_run).await,
                         RoleCommand::Remove { user, role, force } => {
                             handle_policy_role_remove(&signing_key, &user, &role, force).await
                         }
                         RoleCommand::List { user, role } => {
-                            handle_policy_role_list(&signing_key, user.as_deref(), role.as_deref()).await
+                            handle_policy_role_list(&signing_key, user.as_deref(), role.as_deref())
+                                .await
                         }
                     },
                 }
@@ -1207,14 +1188,13 @@ fn handle_quick_command(
                     multi_threaded: true,
                 },
                 || async move {
-                    let worker_already_running = ctx
-                        .config()
-                        .services
-                        .startup
-                        .contains(&"worker".to_owned());
+                    let worker_already_running =
+                        ctx.config().services.startup.contains(&"worker".to_owned());
 
                     if worker_already_running {
-                        info!("WorkerService is managed by systemd, connecting to existing service");
+                        info!(
+                            "WorkerService is managed by systemd, connecting to existing service"
+                        );
                     } else {
                         info!("Starting WorkerService for CLI worker commands");
                     }
@@ -1275,24 +1255,22 @@ fn handle_quick_command(
                             .as_ref()
                             .map(|w| w.backend.clone())
                             .unwrap_or_else(|| "auto".to_owned());
-                        let ninep_decider =
-                            hyprstream_core::mac::production_ninep_decider(
-                                signing_key.clone(),
-                                &ctx.config().oauth,
-                                "ninep-worker",
-                            )
-                            .await
-                            .context("construct worker 9P MAC PEP")?;
+                        let ninep_decider = hyprstream_core::mac::production_ninep_decider(
+                            signing_key.clone(),
+                            &ctx.config().oauth,
+                            "ninep-worker",
+                        )
+                        .await
+                        .context("construct worker 9P MAC PEP")?;
                         // #1269: install the full ReferenceMonitor at every
                         // production 9P constructor. Its anonymous attach
                         // authenticator denies the uncredentialed UDS/vsock
                         // boundary locally; do not narrow process-global RPC
                         // activation and deny authenticated Worker methods.
-                        let ninep_monitor = Some(
-                            hyprstream_core::mac::enrollment_ninep_reference_monitor(Arc::clone(
-                                &ninep_decider,
-                            )),
-                        );
+                        let ninep_monitor =
+                            Some(hyprstream_core::mac::enrollment_ninep_reference_monitor(
+                                Arc::clone(&ninep_decider),
+                            ));
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
                             ninep_decider,
@@ -1305,8 +1283,7 @@ fn handle_quick_command(
                         let backend: Arc<dyn SandboxBackend> =
                             resolve_backend(&backend_name, &backend_ctx)?;
 
-                        let worker_transport =
-                            TransportConfig::inproc("hyprstream/workers");
+                        let worker_transport = TransportConfig::inproc("hyprstream/workers");
                         let mut worker_service = WorkerService::new(
                             pool_config,
                             backend,
@@ -1323,12 +1300,14 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = hyprstream_core::services::policy_client_for_process(
-                            signing_key.clone(),
-                            resolve_service_vk("policy", Some(ctx.config()))
-                                .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
-                            None,
-                        )?;
+                        let worker_policy_client =
+                            hyprstream_core::services::policy_client_for_process(
+                                signing_key.clone(),
+                                resolve_service_vk("policy", Some(ctx.config())).ok_or_else(
+                                    || anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."),
+                                )?,
+                                None,
+                            )?;
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
                         );
@@ -1354,7 +1333,11 @@ fn handle_quick_command(
 
                     use hyprstream_rpc_std::worker_client::WorkerClient;
                     let worker_client = if worker_already_running {
-                        WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?
+                        WorkerClient::from_provider(
+                            &hyprstream_discovery::ProductionRpcClientProvider,
+                            signing_key,
+                            None,
+                        )?
                     } else {
                         let destination = signing_key.verifying_key();
                         WorkerClient::for_local_bootstrap(signing_key, destination, None)?
@@ -1430,42 +1413,26 @@ fn handle_quick_command(
                             command,
                             timeout,
                         } => {
-                            handle_worker_exec(
-                                &worker_client,
-                                &container_id,
-                                command,
-                                timeout,
-                            )
-                            .await
+                            handle_worker_exec(&worker_client, &container_id, command, timeout)
+                                .await
                         }
                         WorkerAction::Terminal {
                             container_id,
                             detach_keys,
                         } => {
-                            handle_worker_terminal(
-                                &worker_client,
-                                &container_id,
-                                &detach_keys,
-                            )
-                            .await
+                            handle_worker_terminal(&worker_client, &container_id, &detach_keys)
+                                .await
                         }
                         WorkerAction::Images(img_cmd) => match img_cmd {
-                            ImageCommand::List {
-                                verbose,
-                                filter: _,
-                            } => handle_images_list(&worker_client, verbose).await,
+                            ImageCommand::List { verbose, filter: _ } => {
+                                handle_images_list(&worker_client, verbose).await
+                            }
                             ImageCommand::Pull {
                                 image,
                                 username,
                                 password,
                             } => {
-                                handle_images_pull(
-                                    &worker_client,
-                                    &image,
-                                    username,
-                                    password,
-                                )
-                                .await
+                                handle_images_pull(&worker_client, &image, username, password).await
                             }
                             ImageCommand::Rm { images, force } => {
                                 handle_images_rm(&worker_client, images, force).await
@@ -1500,10 +1467,7 @@ fn handle_quick_command(
                         model,
                         old_name,
                         new_name,
-                    } => {
-                        handle_remote_rename(ctx.registry(), &model, &old_name, &new_name)
-                            .await
-                    }
+                    } => handle_remote_rename(ctx.registry(), &model, &old_name, &new_name).await,
                 }
             },
         ),
@@ -1559,13 +1523,23 @@ fn resolve_moq_relay_reach(
 
 /// Resolve the services hosted by this foreground process independently of
 /// transport profile. Background start commands do not host their children.
-fn foreground_service_process_names(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<Vec<String>>> {
+fn foreground_service_process_names(
+    matches: &clap::ArgMatches,
+    config: &HyprConfig,
+) -> Result<Option<Vec<String>>> {
     let Some(("service", service_matches)) = matches.subcommand() else {
         return Ok(None);
     };
     let action = ServiceAction::from_arg_matches(service_matches)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let ServiceAction::Start { name, foreground, standalone, services, .. } = action else {
+    let ServiceAction::Start {
+        name,
+        foreground,
+        standalone,
+        services,
+        ..
+    } = action
+    else {
         return Ok(None);
     };
     if !foreground && !standalone {
@@ -1580,7 +1554,10 @@ fn foreground_service_process_names(matches: &clap::ArgMatches, config: &HyprCon
 }
 
 /// Process termination is safe only when this process hosts one known service.
-fn dedicated_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+fn dedicated_service_process_name(
+    matches: &clap::ArgMatches,
+    config: &HyprConfig,
+) -> Result<Option<String>> {
     let Some(names) = foreground_service_process_names(matches, config)? else {
         return Ok(None);
     };
@@ -1592,7 +1569,10 @@ fn dedicated_service_process_name(matches: &clap::ArgMatches, config: &HyprConfi
 
 /// Select the process identity before constructing any resolver/client. Transport
 /// flags do not decide whose identity a required-native split service uses.
-fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) -> Result<Option<String>> {
+fn native_service_process_name(
+    matches: &clap::ArgMatches,
+    config: &HyprConfig,
+) -> Result<Option<String>> {
     if !config.quic.iroh_required() {
         return Ok(None);
     }
@@ -1601,20 +1581,32 @@ fn native_service_process_name(matches: &clap::ArgMatches, config: &HyprConfig) 
     };
     anyhow::ensure!(names.len() == 1,
         "network-iroh-required requires exactly one service per foreground process; launch each provisioned service separately");
-    let service = names.into_iter().next().context("native service name missing")?;
-    anyhow::ensure!(hyprstream_service::get_factory(&service).is_some(), "unknown native service: {service}");
+    let service = names
+        .into_iter()
+        .next()
+        .context("native service name missing")?;
+    anyhow::ensure!(
+        hyprstream_service::get_factory(&service).is_some(),
+        "unknown native service: {service}"
+    );
     Ok(Some(service))
 }
 
 /// Required service startup consumes the provisioner's retained key. Missing or
 /// malformed material is never a reason to generate a new identity or use the
 /// CLI/root key. Compatibility commands retain their existing key behavior.
-async fn load_process_signing_key(config: &HyprConfig, native_service: Option<&str>) -> Result<SigningKey> {
+async fn load_process_signing_key(
+    config: &HyprConfig,
+    native_service: Option<&str>,
+) -> Result<SigningKey> {
     if let Some(service) = native_service {
         let secrets = HyprConfig::resolve_secrets_dir_for(Some(config))?;
         return hyprstream_core::auth::identity_store::load_existing_service_signing_key(
-            &secrets, service, hyprstream_core::auth::identity_store::SecretsProfile::from_env()?,
-        ).with_context(|| format!("load provisioned native identity for {service}"));
+            &secrets,
+            service,
+            hyprstream_core::auth::identity_store::SecretsProfile::from_env()?,
+        )
+        .with_context(|| format!("load provisioned native identity for {service}"));
     }
     let keys_dir = config.models_dir().join(".registry").join("keys");
     load_or_generate_signing_key(&keys_dir).await
@@ -1663,10 +1655,7 @@ fn select_iroh_moql_admission_proof<T>(
     }
 }
 
-fn resolve_service_vk(
-    service_name: &str,
-    config: Option<&HyprConfig>,
-) -> Option<VerifyingKey> {
+fn resolve_service_vk(service_name: &str, config: Option<&HyprConfig>) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
     if let Some(vk) = trust.resolve_one(service_name) {
@@ -1696,8 +1685,7 @@ fn resolve_service_vk(
     // classically here and then denied at envelope verification for having no
     // anchored post-quantum key, with an error that names neither the file nor
     // the fix. Refusing here reports the actual provisioning fault.
-    if let Err(e) =
-        hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)
+    if let Err(e) = hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)
     {
         tracing::error!("{e:#}");
         return None;
@@ -1769,7 +1757,10 @@ async fn install_process_production_resolver(
     let trust_source = match (&trust_source, &config.cluster_anchor_root_cert) {
         (hyprstream_discovery::DeploymentTrustSource::DidAnchored(anchors), Some(path)) => {
             let pem = std::fs::read(path).with_context(|| {
-                format!("cluster_anchor_root_cert is not readable: {}", path.display())
+                format!(
+                    "cluster_anchor_root_cert is not readable: {}",
+                    path.display()
+                )
             })?;
             hyprstream_discovery::DeploymentTrustSource::DidAnchored(
                 anchors.clone().with_root_cert_pem(pem),
@@ -1917,7 +1908,10 @@ fn install_envelope_verify_config(
         );
     }
 
-    tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
+    tracing::info!(
+        "mesh PQ trust store installed with {} peer binding(s)",
+        keyed_store.len()
+    );
 
     // Per-host mesh identity roster (#328): bind each enrolled peer's Ed25519
     // signer key to its OWN per-host subject (`service:inference:host-<label>`)
@@ -1944,7 +1938,10 @@ fn install_envelope_verify_config(
                 );
             }
         }
-        tracing::info!("mesh identity roster installed with {} per-host binding(s)", roster.len());
+        tracing::info!(
+            "mesh identity roster installed with {} per-host binding(s)",
+            roster.len()
+        );
     }
     // Shared Arc: the SAME admin-anchored store backs both the request-side and
     // response-side verify configs — built once, anchored once (#277 reuse of
@@ -2001,7 +1998,11 @@ impl PostgresProofReplayStore {
         digest.finalize().into()
     }
 
-    fn record(&self, parts: &[&[u8]], expires_at: u64) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+    fn record(
+        &self,
+        parts: &[&[u8]],
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
         match self.kv.replay_admit(Self::digest(parts), expires_at) {
             Ok(true) => hyprstream_rpc::proof::admission::ProofAdmissionResult::Admitted,
             Ok(false) => hyprstream_rpc::proof::admission::ProofAdmissionResult::Replayed,
@@ -2028,7 +2029,15 @@ impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayS
             hyprstream_rpc::proof::ProofDisposition::Authenticated => &b"authenticated"[..],
             hyprstream_rpc::proof::ProofDisposition::Unattributed => &b"unattributed"[..],
         };
-        self.record(&[b"request-proof", partition, &key.signer_thumbprint, &key.request_id], expires_at)
+        self.record(
+            &[
+                b"request-proof",
+                partition,
+                &key.signer_thumbprint,
+                &key.request_id,
+            ],
+            expires_at,
+        )
     }
 
     fn check_and_insert_mediated(
@@ -2036,10 +2045,18 @@ impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayS
         key: &hyprstream_rpc::proof::admission::MediatedQueryReplayKey,
         expires_at: u64,
     ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
-        self.record(&[
-            b"mediated-query", &key.signer_thumbprint, &key.request_id.to_be_bytes(),
-            &key.request_nonce, key.mediator.as_bytes(), key.resource.as_bytes(), key.operation.as_bytes(),
-        ], expires_at)
+        self.record(
+            &[
+                b"mediated-query",
+                &key.signer_thumbprint,
+                &key.request_id.to_be_bytes(),
+                &key.request_nonce,
+                key.mediator.as_bytes(),
+                key.resource.as_bytes(),
+                key.operation.as_bytes(),
+            ],
+            expires_at,
+        )
     }
 }
 
@@ -2125,9 +2142,9 @@ fn install_proof_admission(
     // the process policy. A failure installs nothing — proof-bearing dispatch
     // then denies at policy resolution, never serves a partial table.
     match hyprstream_rpc::proof::policy::install_generated_method_policy() {
-        Ok(rows) => tracing::info!(
-            "generated dispatch method policy installed ({rows} leaf row(s))"
-        ),
+        Ok(rows) => {
+            tracing::info!("generated dispatch method policy installed ({rows} leaf row(s))");
+        }
         Err(e) => tracing::error!(
             "generated dispatch method policy failed validation/install; \
              proof-bearing dispatch denies: {e:#}"
@@ -2151,7 +2168,9 @@ fn install_proof_admission(
             },
             Ok(_) => None,
             Err(_) => {
-                tracing::error!("records-role RDS binding could not be resolved; proof admission denies");
+                tracing::error!(
+                    "records-role RDS binding could not be resolved; proof admission denies"
+                );
                 return;
             }
         },
@@ -2169,7 +2188,9 @@ fn install_proof_admission(
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    tracing::error!("records-role RDS binding could not be resolved; proof admission denies");
+                    tracing::error!(
+                        "records-role RDS binding could not be resolved; proof admission denies"
+                    );
                     return;
                 }
             }
@@ -2190,73 +2211,77 @@ fn install_proof_admission(
     let declared_domain = std::env::var("HYPRSTREAM_REPLAY_ADMISSION_DOMAIN").ok();
     let guarantee = if shared_store.is_some() {
         Some(ReplayDomainGuarantee::LinearizableSharedStore)
-    } else { match declared_domain.as_deref() {
-        Some("single-verifier-instance") => {
-            // The single-verifier shape is only sound if this process is
-            // genuinely the sole verifier for the domain. A bare env string
-            // cannot establish that — two replicas can each set it. Require an
-            // OS-enforced exclusive lease: acquire it here and hold it for the
-            // process lifetime, so a second replica setting the same string
-            // fails to acquire and its admission stays closed (§4.6).
-            let lease_path = std::env::var("HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE").ok();
-            let Some(lease_path) = lease_path else {
-                tracing::error!(
-                    "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN=single-verifier-instance requires \
+    } else {
+        match declared_domain.as_deref() {
+            Some("single-verifier-instance") => {
+                // The single-verifier shape is only sound if this process is
+                // genuinely the sole verifier for the domain. A bare env string
+                // cannot establish that — two replicas can each set it. Require an
+                // OS-enforced exclusive lease: acquire it here and hold it for the
+                // process lifetime, so a second replica setting the same string
+                // fails to acquire and its admission stays closed (§4.6).
+                let lease_path = std::env::var("HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE").ok();
+                let Some(lease_path) = lease_path else {
+                    tracing::error!(
+                        "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN=single-verifier-instance requires \
                      HYPRSTREAM_REPLAY_SINGLE_VERIFIER_LEASE=<path> to an exclusive lease \
                      file: the env string alone cannot prove sole verification. Proof \
                      admission denies until the lease is configured."
-                );
-                return;
-            };
-            match hyprstream_rpc::proof::admission::SingleVerifierLease::acquire(
-                std::path::Path::new(&lease_path),
-            ) {
-                Ok(lease) => {
-                    tracing::info!(
-                        "acquired exclusive single-verifier lease at {} \
-                         (this process is the sole verifier for its domain)",
-                        lease.path().display()
                     );
-                    // Park the lease so its exclusive lock lives for the whole
-                    // process, not just this function.
-                    if hyprstream_rpc::proof::admission::hold_single_verifier_lease(lease).is_err() {
-                        tracing::error!(
-                            "a single-verifier lease is already held; proof admission denies"
+                    return;
+                };
+                match hyprstream_rpc::proof::admission::SingleVerifierLease::acquire(
+                    std::path::Path::new(&lease_path),
+                ) {
+                    Ok(lease) => {
+                        tracing::info!(
+                            "acquired exclusive single-verifier lease at {} \
+                         (this process is the sole verifier for its domain)",
+                            lease.path().display()
                         );
-                        return;
+                        // Park the lease so its exclusive lock lives for the whole
+                        // process, not just this function.
+                        if hyprstream_rpc::proof::admission::hold_single_verifier_lease(lease)
+                            .is_err()
+                        {
+                            tracing::error!(
+                                "a single-verifier lease is already held; proof admission denies"
+                            );
+                            return;
+                        }
+                        Some(ReplayDomainGuarantee::SingleVerifierInstance)
                     }
-                    Some(ReplayDomainGuarantee::SingleVerifierInstance)
-                }
-                Err(e) => {
-                    tracing::error!(
+                    Err(e) => {
+                        tracing::error!(
                         "cannot claim sole-verifier lease; another verifier already holds it or \
                          the path is unusable. Proof admission denies: {e:#}"
                     );
-                    return;
+                        return;
+                    }
                 }
             }
-        }
-        Some("shared-postgres") => Some(ReplayDomainGuarantee::LinearizableSharedStore),
-        Some(other) => {
-            tracing::error!(
-                "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
+            Some("shared-postgres") => Some(ReplayDomainGuarantee::LinearizableSharedStore),
+            Some(other) => {
+                tracing::error!(
+                    "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
                  cannot provide in-process: a shared linearizable backend or \
                  namespace-affine routing must be installed explicitly. Proof \
                  admission denies."
-            );
-            None
-        }
-        None => {
-            tracing::warn!(
-                "no HYPRSTREAM_REPLAY_ADMISSION_DOMAIN declared; proof replay admission \
+                );
+                None
+            }
+            None => {
+                tracing::warn!(
+                    "no HYPRSTREAM_REPLAY_ADMISSION_DOMAIN declared; proof replay admission \
                  is not installed and proof-bearing requests will deny. Declare \
                  'shared-postgres' for a configured shared replay database, or \
                  'single-verifier-instance' only when this node is the sole verifier \
                  for its service domain."
-            );
-            None
+                );
+                None
+            }
         }
-    }};
+    };
 
     let Some(guarantee) = guarantee else {
         return;
@@ -2367,7 +2392,9 @@ fn install_proof_admission(
             match hyprstream_core::auth::postgres_replay::PostgresProofReplayStore::from_env() {
                 Ok(store) => Box::new(store),
                 Err(error) => {
-                    tracing::error!("shared Postgres replay admission unavailable; admission denies: {error:#}");
+                    tracing::error!(
+                        "shared Postgres replay admission unavailable; admission denies: {error:#}"
+                    );
                     return;
                 }
             }
@@ -2512,19 +2539,23 @@ where
 }
 
 /// One-shot sender for the first native-announcement result.
-type NativeAnnouncementFirstResult =
-    std::result::Result<(), String>;
+type NativeAnnouncementFirstResult = std::result::Result<(), String>;
 
 /// Optional one-shot channel passed to the native-announcement loop body so it
 /// can report the result of the first announcement.
-type NativeAnnouncementFirstTx =
-    Option<std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>>>;
+type NativeAnnouncementFirstTx = Option<
+    std::sync::Arc<
+        parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<NativeAnnouncementFirstResult>>>,
+    >,
+>;
 
 /// Use the current authority projection's service JWT for envelope identity.
 fn native_announcement_bearer(
     announcement: &hyprstream_rpc_std::discovery_client::ServiceAnnouncement,
 ) -> anyhow::Result<String> {
-    announcement.service_jwt.as_ref()
+    announcement
+        .service_jwt
+        .as_ref()
         .filter(|token| !token.trim().is_empty())
         .cloned()
         .context("Native announcement requires a service JWT as its RPC bearer")
@@ -2547,7 +2578,10 @@ where
     };
     if let Some(tx) = announce_tx {
         if let Some(tx) = tx.lock().take() {
-            let report = result.as_ref().map(|_| ()).map_err(std::string::ToString::to_string);
+            let report = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(std::string::ToString::to_string);
             let _ = tx.send(report);
         }
     }
@@ -2672,9 +2706,9 @@ where
                     }
                     Err(_) => {
                         if let Some(tx) = initial_tx.take() {
-                            let _ = tx.send(Err(
-                                "native announcement task exited before first result".to_owned(),
-                            ));
+                            let _ = tx
+                                .send(Err("native announcement task exited before first result"
+                                    .to_owned()));
                         }
                     }
                 }
@@ -2706,7 +2740,10 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let require_initial = network_required
-        && matches!(reach, hyprstream_service::NativeAnnouncementReach::Iroh { .. });
+        && matches!(
+            reach,
+            hyprstream_service::NativeAnnouncementReach::Iroh { .. }
+        );
     if let Some(rx) = spawn_native_announcement_loop(require_initial, cancellation, loop_body) {
         match rx.recv() {
             Ok(Ok(())) => {}
@@ -2732,10 +2769,14 @@ fn main() -> Result<()> {
             }
         }
         if std::env::var("TORCH_BLAS_PREFER_HIPBLASLT").is_err() {
-            unsafe { std::env::set_var("TORCH_BLAS_PREFER_HIPBLASLT", "1"); }
+            unsafe {
+                std::env::set_var("TORCH_BLAS_PREFER_HIPBLASLT", "1");
+            }
         }
         if std::env::var("HIPBLASLT_FORCE_SPLIT_K").is_err() {
-            unsafe { std::env::set_var("HIPBLASLT_FORCE_SPLIT_K", "1"); }
+            unsafe {
+                std::env::set_var("HIPBLASLT_FORCE_SPLIT_K", "1");
+            }
         }
     }
 
@@ -2812,12 +2853,13 @@ fn main() -> Result<()> {
     // children are one and the same value — and a relative selector stays
     // meaningful regardless of a child's working directory. `None` means
     // defaults-resolution, which children reproduce on their own.
-    let explicit_config_path: Option<std::path::PathBuf> = match config_path {
-        Some(path) => Some(std::fs::canonicalize(path).with_context(|| {
-            format!("canonicalizing explicit config path {}", path.display())
-        })?),
-        None => None,
-    };
+    let explicit_config_path: Option<std::path::PathBuf> =
+        match config_path {
+            Some(path) => Some(std::fs::canonicalize(path).with_context(|| {
+                format!("canonicalizing explicit config path {}", path.display())
+            })?),
+            None => None,
+        };
     // Library-side launchers (bootstrap manager, wizard) forward the same
     // provenance their process pinned, so every launch path composes.
     if let Some(canonical) = &explicit_config_path {
@@ -2849,14 +2891,18 @@ fn main() -> Result<()> {
     if let Some(("pds", pds)) = matches.subcommand() {
         #[cfg(feature = "rocksdb")]
         if let Some(("inspect-services", inspect)) = pds.subcommand() {
-            let services = inspect.get_many::<String>("service")
-                .context("service roster is required")?.cloned().collect::<Vec<_>>();
+            let services = inspect
+                .get_many::<String>("service")
+                .context("service roster is required")?
+                .cloned()
+                .collect::<Vec<_>>();
             // Inspection errors may include trusted-artifact or configured
             // secrets paths. Keep those details out of the process error sink
             // and log collectors while preserving the public JSON success
             // document unchanged.
-            let bytes = hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)
-                .map_err(|_| anyhow::anyhow!("read-only service roster inspection failed"))?;
+            let bytes =
+                hyprstream_core::cli::deployment_bootstrap::inspect_services(&config, &services)
+                    .map_err(|_| anyhow::anyhow!("read-only service roster inspection failed"))?;
             std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?;
             return Ok(());
         }
@@ -2909,8 +2955,7 @@ fn main() -> Result<()> {
 
                 tracing_subscriber::fmt()
                     .with_env_filter(EnvFilter::builder().parse_lossy(
-                        std::env::var("RUST_LOG")
-                            .unwrap_or_else(|_| default_log_level.to_owned()),
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()),
                     ))
                     .with_target(true)
                     .with_file(true)
@@ -2923,8 +2968,7 @@ fn main() -> Result<()> {
                 _log_guard = None;
                 tracing_subscriber::fmt()
                     .with_env_filter(EnvFilter::builder().parse_lossy(
-                        std::env::var("RUST_LOG")
-                            .unwrap_or_else(|_| default_log_level.to_owned()),
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()),
                     ))
                     .with_target(true)
                     .with_file(true)
@@ -2950,8 +2994,7 @@ fn main() -> Result<()> {
 
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::builder().parse_lossy(
-                    std::env::var("RUST_LOG")
-                        .unwrap_or_else(|_| default_log_level.to_owned()),
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()),
                 ))
                 .with_target(true)
                 .with_file(true)
@@ -2964,8 +3007,7 @@ fn main() -> Result<()> {
             _log_guard = None;
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::builder().parse_lossy(
-                    std::env::var("RUST_LOG")
-                        .unwrap_or_else(|_| default_log_level.to_owned()),
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_level.to_owned()),
                 ))
                 .with_target(true)
                 .with_file(true)
@@ -3020,15 +3062,20 @@ fn main() -> Result<()> {
                     .get_one::<String>("initial_user_role")
                     .cloned()
                     .unwrap_or_else(|| "admin".to_owned());
-                let deployment_trust = hyprstream_core::cli::wizard_handlers::DeploymentTrustOptions {
-                    enabled: sub_m.get_flag("deployment_trust"),
-                    dir: sub_m.get_one::<String>("deployment_trust_dir").map(std::path::PathBuf::from),
-                    force_software: sub_m.get_flag("deployment_trust_software"),
-                    serial: sub_m.get_one::<String>("deployment_trust_serial").cloned(),
-                    piv_slot: sub_m.get_one::<String>("deployment_trust_piv_slot").cloned(),
-                    allow_plaintext_break_glass: sub_m
-                        .get_flag("deployment_trust_allow_plaintext_break_glass"),
-                };
+                let deployment_trust =
+                    hyprstream_core::cli::wizard_handlers::DeploymentTrustOptions {
+                        enabled: sub_m.get_flag("deployment_trust"),
+                        dir: sub_m
+                            .get_one::<String>("deployment_trust_dir")
+                            .map(std::path::PathBuf::from),
+                        force_software: sub_m.get_flag("deployment_trust_software"),
+                        serial: sub_m.get_one::<String>("deployment_trust_serial").cloned(),
+                        piv_slot: sub_m
+                            .get_one::<String>("deployment_trust_piv_slot")
+                            .cloned(),
+                        allow_plaintext_break_glass: sub_m
+                            .get_flag("deployment_trust_allow_plaintext_break_glass"),
+                    };
                 let wizard_options = hyprstream_core::cli::WizardOptions {
                     non_interactive,
                     start_services,
@@ -3047,18 +3094,25 @@ fn main() -> Result<()> {
                         && supports_tui());
                 let config = config.clone();
                 return with_runtime(
-                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    RuntimeConfig {
+                        device: DeviceConfig::request_cpu(),
+                        multi_threaded: true,
+                    },
                     || async move {
                         if use_tui {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                         } else {
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, wizard_options,
-                            ).await?;
+                                &models_dir,
+                                &services,
+                                wizard_options,
+                            )
+                            .await?;
                             if let Some(pds_url) = pds_url {
                                 hyprstream_core::cli::pds_handlers::handle_pds_join(
                                     &config, &pds_url, None,
-                                ).await?;
+                                )
+                                .await?;
                             }
                             Ok(())
                         }
@@ -3067,7 +3121,10 @@ fn main() -> Result<()> {
             }
             // No subcommand + first run → TUI wizard (with text fallback)
             return with_runtime(
-                RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
                 || async move {
                     if supports_tui() {
                         hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
@@ -3078,7 +3135,8 @@ fn main() -> Result<()> {
                             &models_dir,
                             &services,
                             hyprstream_core::cli::WizardOptions::first_run(),
-                        ).await
+                        )
+                        .await
                     }
                 },
             );
@@ -3174,7 +3232,8 @@ fn main() -> Result<()> {
                     multi_threaded: true,
                 },
                 || async move {
-                    hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
+                    hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose)
+                        .await
                 },
             );
         }
@@ -3207,10 +3266,13 @@ fn main() -> Result<()> {
     // ── Offline service-authority provisioning ─────────────────────────────
     if let Some(("service", sub_m)) = matches.subcommand() {
         if sub_m.subcommand_name() == Some("reconcile-enrollment") {
-            return hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(&config);
+            return hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(
+                &config,
+            );
         }
         if sub_m.subcommand_name() == Some("ensure-node-authority") {
-            let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
+            let secrets =
+                hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(&config))?;
             return hyprstream_core::auth::service_enrollment::ensure_node_authority(&secrets);
         }
     }
@@ -3251,7 +3313,8 @@ fn main() -> Result<()> {
         bool,
     ) = _registry_runtime
         .block_on(async {
-            let signing_key = load_process_signing_key(&config, native_service_name.as_deref()).await?;
+            let signing_key =
+                load_process_signing_key(&config, native_service_name.as_deref()).await?;
             let verifying_key = signing_key.verifying_key();
 
             // The process-owned Discovery client is the first native RPC
@@ -3261,19 +3324,26 @@ fn main() -> Result<()> {
             let service_token = match native_service_name.as_deref() {
                 Some(name) => {
                     let secrets = HyprConfig::resolve_secrets_dir_for(Some(&config))?;
-                    let profile = hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
-                    let token = hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
-                        &secrets, name, profile,
-                    )?
-                    .with_context(|| format!("missing enrolled service credential for {name}"))?;
+                    let profile =
+                        hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
+                    let token =
+                        hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
+                            &secrets, name, profile,
+                        )?
+                        .with_context(|| {
+                            format!("missing enrolled service credential for {name}")
+                        })?;
                     Some(token)
                 }
                 None => None,
             };
 
-            let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config, service_token.clone()).await
-                .context("Failed to install checkpoint-backed production resolver")?;
-            let client = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
+            let is_os_owned_bootstrap =
+                install_process_production_resolver(&signing_key, &config, service_token.clone())
+                    .await
+                    .context("Failed to install checkpoint-backed production resolver")?;
+            let client = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
                 signing_key.clone(),
                 service_token,
             )?;
@@ -3295,28 +3365,33 @@ fn main() -> Result<()> {
                     device: DeviceConfig::request_cpu(),
                     multi_threaded: true,
                 },
-                || async move {
-                    schema_cli::handle_tool_command(sub_m, signing_key).await
-                },
+                || async move { schema_cli::handle_tool_command(sub_m, signing_key).await },
             )?;
         }
 
         // ── Quick workflows ─────────────────────────────────────────────
         Some(("quick", sub_m)) => {
-            let cmd = QuickCommand::from_arg_matches(sub_m)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cmd =
+                QuickCommand::from_arg_matches(sub_m).map_err(|e| anyhow::anyhow!("{}", e))?;
             handle_quick_command(cmd, ctx, signing_key, verifying_key)?;
         }
 
         // ── Service management ──────────────────────────────────────────
         Some(("service", sub_m)) => {
-            let action = ServiceAction::from_arg_matches(sub_m)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let action =
+                ServiceAction::from_arg_matches(sub_m).map_err(|e| anyhow::anyhow!("{}", e))?;
 
             let services = config_for_service.services.startup.clone();
 
             match action {
-                ServiceAction::Install { services: filter, start, enable, system, systemd_session, verbose } => {
+                ServiceAction::Install {
+                    services: filter,
+                    start,
+                    enable,
+                    system,
+                    systemd_session,
+                    verbose,
+                } => {
                     let models_dir = config_for_service.models_dir().clone();
                     let target = if system {
                         hyprstream_service::ServiceTarget::System
@@ -3331,7 +3406,18 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose, explicit_config, iroh_required).await
+                            handle_service_install(
+                                &models_dir,
+                                &services,
+                                filter,
+                                start,
+                                enable,
+                                target,
+                                verbose,
+                                explicit_config,
+                                iroh_required,
+                            )
+                            .await
                         },
                     )?;
                 }
@@ -3378,9 +3464,11 @@ fn main() -> Result<()> {
                             match (name, &multi_services) {
                                 (Some(n), _) => (n, multi_services),
                                 (None, Some(_)) => (String::from("multi"), multi_services),
-                                (None, None) => return Err(anyhow::anyhow!(
-                                    "--foreground requires a service name or --services list"
-                                )),
+                                (None, None) => {
+                                    return Err(anyhow::anyhow!(
+                                        "--foreground requires a service name or --services list"
+                                    ))
+                                }
                             }
                         };
 
@@ -3478,11 +3566,12 @@ fn main() -> Result<()> {
                                     .context("invalid native network profile")?;
 
                                 // Determine which services to start
-                                let service_names: Vec<String> = if let Some(ref svc_list) = multi_services {
-                                    svc_list.clone()
-                                } else {
-                                    vec![name.clone()]
-                                };
+                                let service_names: Vec<String> =
+                                    if let Some(ref svc_list) = multi_services {
+                                        svc_list.clone()
+                                    } else {
+                                        vec![name.clone()]
+                                    };
 
                                 if ipc || native_service_name.is_some() {
                                     // Split-service identity is independent of local IPC transport.
@@ -3748,12 +3837,15 @@ fn main() -> Result<()> {
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
                                 if quic_cfg.enabled {
                                     let qc = quic_cfg;
-                                    let (cert_chain, key_der) = qc.load_tls_materials()
+                                    let (cert_chain, key_der) = qc
+                                        .load_tls_materials()
                                         .context("Failed to load QUIC TLS materials")?;
 
                                     // Print cert hash if requested (hash of leaf cert)
                                     if print_cert_hash {
-                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
+                                        let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(
+                                            &cert_chain[0],
+                                        );
                                         println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
@@ -3781,9 +3873,8 @@ fn main() -> Result<()> {
                                     // response signer. Use that existing state to prove Iroh
                                     // `moql` admission; do not fabricate credentials or fall
                                     // back to an anonymous Iroh handshake.
-                                    let moq_admission_proof = select_iroh_moql_admission_proof(
-                                        qc.iroh,
-                                        || {
+                                    let moq_admission_proof =
+                                        select_iroh_moql_admission_proof(qc.iroh, || {
                                             service_names
                                                 .iter()
                                                 .map(|service_name| {
@@ -3791,14 +3882,14 @@ fn main() -> Result<()> {
                                                         .map(|proof| (service_name.clone(), proof))
                                                 })
                                                 .collect::<Result<Vec<_>>>()
-                                        },
-                                    )?;
+                                        })?;
                                     // Event clients start before factories, so the process
                                     // proof must be installed before any pre-factory dial.
                                     if let Some(proof) = moq_admission_proof.clone() {
                                         let _ = hyprstream_rpc::moq_stream::init_global_moq_admission_proof(proof);
                                     }
-                                    let discovery_transport = ctx.transport("discovery", SocketKind::Rep);
+                                    let discovery_transport =
+                                        ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -3946,10 +4037,15 @@ fn main() -> Result<()> {
                                 // Wire JWKS-backed key resolution (kid-based, on-miss-refetch).
                                 {
                                     let issuer_url = config.oauth.issuer_url();
-                                    let jwks_url = format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
-                                    let fetcher = hyprstream_core::auth::jwks_fetcher::default_jwks_fetcher();
+                                    let jwks_url =
+                                        format!("{}/oauth/jwks", issuer_url.trim_end_matches('/'));
+                                    let fetcher =
+                                        hyprstream_core::auth::jwks_fetcher::default_jwks_fetcher();
                                     ctx.set_jwks_fetcher(fetcher);
-                                    tracing::debug!("JWKS-backed key source configured: {}", jwks_url);
+                                    tracing::debug!(
+                                        "JWKS-backed key source configured: {}",
+                                        jwks_url
+                                    );
                                 }
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
@@ -4081,17 +4177,14 @@ fn main() -> Result<()> {
                                     // track/prefix denies.
                                     let track_policy =
                                         hyprstream_rpc::auth::mac::MoqEventPolicyTable::empty();
-                                    let pep =
-                                        hyprstream_core::mac::production_moq_event_pep(
-                                            signing_key.clone(),
-                                            &config.oauth,
-                                            &audit_stream,
-                                            track_policy,
-                                        )
-                                        .await
-                                        .context(
-                                            "construct process-wide MoQ/event MAC PEP",
-                                        )?;
+                                    let pep = hyprstream_core::mac::production_moq_event_pep(
+                                        signing_key.clone(),
+                                        &config.oauth,
+                                        &audit_stream,
+                                        track_policy,
+                                    )
+                                    .await
+                                    .context("construct process-wide MoQ/event MAC PEP")?;
                                     hyprstream_rpc::events::install_event_authz(
                                         std::sync::Arc::new(
                                             hyprstream_rpc::events::MacEventAuthz::new(pep),
@@ -4126,18 +4219,23 @@ fn main() -> Result<()> {
                                             &services,
                                             true,
                                         );
-                                    let policy_position = configured_stages.iter().enumerate().find_map(
-                                        |(stage_index, stage)| {
-                                            stage.iter().position(|name| name == "policy")
+                                    let policy_position =
+                                        configured_stages.iter().enumerate().find_map(
+                                            |(stage_index, stage)| {
+                                                stage.iter().position(|name| name == "policy").map(
+                                                    |service_index| (stage_index, service_index),
+                                                )
+                                            },
+                                        );
+                                    let service_position = configured_stages
+                                        .iter()
+                                        .enumerate()
+                                        .find_map(|(stage_index, stage)| {
+                                            stage
+                                                .iter()
+                                                .position(|name| name == &service_names[0])
                                                 .map(|service_index| (stage_index, service_index))
-                                        },
-                                    );
-                                    let service_position = configured_stages.iter().enumerate().find_map(
-                                        |(stage_index, stage)| {
-                                            stage.iter().position(|name| name == &service_names[0])
-                                                .map(|service_index| (stage_index, service_index))
-                                        },
-                                    );
+                                        });
                                     match (service_position, policy_position) {
                                         (Some(service), Some(policy)) => service < policy,
                                         _ => false,
@@ -4199,10 +4297,9 @@ fn main() -> Result<()> {
                                             svc_name, ipc
                                         );
 
-                                        let spawnable = (factory.factory)(&ctx).context(format!(
-                                            "Failed to create {} service",
-                                            svc_name
-                                        ))?;
+                                        let spawnable = (factory.factory)(&ctx).context(
+                                            format!("Failed to create {} service", svc_name),
+                                        )?;
                                         let handle = manager.spawn(spawnable).await.context(
                                             format!("Failed to start {} service", svc_name),
                                         )?;
@@ -4211,9 +4308,7 @@ fn main() -> Result<()> {
 
                                     // Publish ready events for this stage before starting the next.
                                     for svc_name in stage {
-                                        if let Ok(publisher) =
-                                            EventPublisher::new("system")
-                                        {
+                                        if let Ok(publisher) = EventPublisher::new("system") {
                                             let _ = publisher
                                                 .publish_raw(
                                                     &format!("system.{}.ready", svc_name),
@@ -4228,7 +4323,8 @@ fn main() -> Result<()> {
                                     return Err(anyhow::anyhow!("No services to start"));
                                 }
 
-                                let svc_names: Vec<_> = handles.iter().map(|(n, _)| n.as_str()).collect();
+                                let svc_names: Vec<_> =
+                                    handles.iter().map(|(n, _)| n.as_str()).collect();
                                 info!(
                                     "Services ready: [{}], waiting for shutdown signal",
                                     svc_names.join(", ")
@@ -4238,9 +4334,7 @@ fn main() -> Result<()> {
 
                                 // Stop all services
                                 for (svc_name, mut handle) in handles {
-                                    if let Ok(publisher) =
-                                        EventPublisher::new("system")
-                                    {
+                                    if let Ok(publisher) = EventPublisher::new("system") {
                                         let _ = publisher
                                             .publish_raw(
                                                 &format!("system.{}.stopping", svc_name),
@@ -4262,7 +4356,14 @@ fn main() -> Result<()> {
                                 multi_threaded: false,
                             },
                             || async move {
-                                handle_service_start(&services, name, daemon, explicit_config, iroh_required).await
+                                handle_service_start(
+                                    &services,
+                                    name,
+                                    daemon,
+                                    explicit_config,
+                                    iroh_required,
+                                )
+                                .await
                             },
                         )?;
                     }
@@ -4300,7 +4401,11 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
+                            hyprstream_core::cli::service_handlers::run_repair_checks(
+                                &models_dir,
+                                verbose,
+                            )
+                            .await
                         },
                     )?;
                 }
@@ -4315,10 +4420,14 @@ fn main() -> Result<()> {
                     )?;
                 }
                 ServiceAction::ReconcileEnrollment => {
-                    hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(ctx.config())?;
+                    hyprstream_core::cli::service_handlers::handle_service_reconcile_enrollment(
+                        ctx.config(),
+                    )?;
                 }
                 ServiceAction::EnsureNodeAuthority => {
-                    let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(Some(ctx.config()))?;
+                    let secrets = hyprstream_core::config::HyprConfig::resolve_secrets_dir_for(
+                        Some(ctx.config()),
+                    )?;
                     hyprstream_core::auth::service_enrollment::ensure_node_authority(&secrets)?;
                 }
                 ServiceAction::ProvisionPolicyTemplates { template } => {
@@ -4338,14 +4447,15 @@ fn main() -> Result<()> {
 
         // ── User management ─────────────────────────────────────────────
         Some(("user", sub_m)) => {
-            let cmd = UserCommand::from_arg_matches(sub_m)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cmd = UserCommand::from_arg_matches(sub_m).map_err(|e| anyhow::anyhow!("{}", e))?;
             // Deliberately resolve from `ctx`: it honors the `--config <path>`
             // CLI override. The operator's config must win here, or `--config`
             // invocations would resolve the user store from XDG defaults and
             // split it.
             let credentials_dir =
-                hyprstream_core::auth::identity_store::credentials_dir_for_config(Some(ctx.config()))?;
+                hyprstream_core::auth::identity_store::credentials_dir_for_config(Some(
+                    ctx.config(),
+                ))?;
             // User handlers are async, run them in a minimal runtime
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4353,7 +4463,14 @@ fn main() -> Result<()> {
                 .context("Failed to create runtime for user command")?;
             rt.block_on(async {
                 match cmd {
-                    UserCommand::Create { username, role, generate, key, ssh, no_role } => {
+                    UserCommand::Create {
+                        username,
+                        role,
+                        generate,
+                        key,
+                        ssh,
+                        no_role,
+                    } => {
                         handle_user_create(
                             &credentials_dir,
                             &username,
@@ -4381,8 +4498,12 @@ fn main() -> Result<()> {
                         UserKeysCommand::Import { username, format } => {
                             handle_user_keys_import(&credentials_dir, &username, &format).await?;
                         }
-                        UserKeysCommand::Remove { username, fingerprint } => {
-                            handle_user_keys_remove(&credentials_dir, &username, &fingerprint).await?;
+                        UserKeysCommand::Remove {
+                            username,
+                            fingerprint,
+                        } => {
+                            handle_user_keys_remove(&credentials_dir, &username, &fingerprint)
+                                .await?;
                         }
                     },
                 }
@@ -4392,8 +4513,8 @@ fn main() -> Result<()> {
 
         // ── TUI display server ──────────────────────────────────────────
         Some(("tui", sub_m)) => {
-            let action = TuiAction::from_arg_matches(sub_m)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let action =
+                TuiAction::from_arg_matches(sub_m).map_err(|e| anyhow::anyhow!("{}", e))?;
 
             with_runtime(
                 RuntimeConfig {
@@ -4418,14 +4539,27 @@ fn main() -> Result<()> {
                         TuiAction::New => tui_handlers::handle_tui_new(&signing_key).await,
                         TuiAction::List => tui_handlers::handle_tui_list(&signing_key).await,
                         TuiAction::Detach => tui_handlers::handle_tui_detach().await,
-                        TuiAction::Play { cast_file, session, loop_playback } => {
-                            tui_handlers::handle_tui_play(&signing_key, &cast_file, session, loop_playback).await
+                        TuiAction::Play {
+                            cast_file,
+                            session,
+                            loop_playback,
+                        } => {
+                            tui_handlers::handle_tui_play(
+                                &signing_key,
+                                &cast_file,
+                                session,
+                                loop_playback,
+                            )
+                            .await
                         }
                         TuiAction::Shell { session } => {
                             let models_dir = config_for_service.models_dir().clone();
                             hyprstream_core::cli::shell_handlers::handle_tui_shell(
-                                &signing_key, &models_dir, session,
-                            ).await
+                                &signing_key,
+                                &models_dir,
+                                session,
+                            )
+                            .await
                         }
                     }
                 },
@@ -4437,12 +4571,14 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "metrics"))]
             {
                 let _ = sub_m;
-                return Err(anyhow::anyhow!("Flight SQL client requires the 'metrics' feature"));
+                return Err(anyhow::anyhow!(
+                    "Flight SQL client requires the 'metrics' feature"
+                ));
             }
             #[cfg(feature = "metrics")]
             {
-                let args = FlightArgs::from_arg_matches(sub_m)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let args =
+                    FlightArgs::from_arg_matches(sub_m).map_err(|e| anyhow::anyhow!("{}", e))?;
 
                 with_runtime(
                     RuntimeConfig {
@@ -4451,8 +4587,8 @@ fn main() -> Result<()> {
                     },
                     || async move {
                         use hyprstream_flight::client::{
-                            format_batches_as_csv, format_batches_as_json,
-                            format_batches_as_table, FlightClient,
+                            format_batches_as_csv, format_batches_as_json, format_batches_as_table,
+                            FlightClient,
                         };
 
                         let mut client = FlightClient::connect(&args.addr)
@@ -4473,10 +4609,7 @@ fn main() -> Result<()> {
                             };
                             print!("{}", output);
                         } else {
-                            println!(
-                                "Connected to Flight SQL server at {}",
-                                args.addr
-                            );
+                            println!("Connected to Flight SQL server at {}", args.addr);
                             println!(
                                 "Interactive mode not yet implemented. Use --query to execute SQL."
                             );
@@ -4552,7 +4685,10 @@ fn main() -> Result<()> {
             if hyprstream_core::cli::bootstrap_manager::is_first_run(&models_dir) {
                 let services = config_for_service.services.startup.clone();
                 with_runtime(
-                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    RuntimeConfig {
+                        device: DeviceConfig::request_cpu(),
+                        multi_threaded: true,
+                    },
                     || async move {
                         if supports_tui() {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
@@ -4560,15 +4696,19 @@ fn main() -> Result<()> {
                             // First-run auto-wizard defaults federation to off.
                             hyprstream_core::cli::handle_wizard(
                                 &models_dir,
-                            &services,
-                            hyprstream_core::cli::WizardOptions::first_run(),
-                            ).await
+                                &services,
+                                hyprstream_core::cli::WizardOptions::first_run(),
+                            )
+                            .await
                         }
                     },
                 )?;
             } else {
                 with_runtime(
-                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    RuntimeConfig {
+                        device: DeviceConfig::request_cpu(),
+                        multi_threaded: true,
+                    },
                     || {
                         let md = models_dir.clone();
                         async move {
@@ -4629,12 +4769,17 @@ mod resolver_startup_controls {
                     .env_remove("HYPRSTREAM__SECRETS__PATH")
                     .env_remove("HYPRSTREAM__SIGNING_KEY")
                     .status()?;
-                anyhow::ensure!(status.success(), "isolated {profile} identity regression failed");
+                anyhow::ensure!(
+                    status.success(),
+                    "isolated {profile} identity regression failed"
+                );
             }
             return Ok(());
         };
         let root = tempfile::tempdir()?;
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         for (service, seed) in [("policy", 31u8), ("model", 32u8), ("registry", 33u8)] {
             let secrets = root.path().join(format!("{service}-credentials"));
             std::fs::create_dir_all(secrets.join(service))?;
@@ -4651,31 +4796,72 @@ mod resolver_startup_controls {
             };
             std::fs::write(&key_path, [seed; 32])?;
             let mut configured = super::HyprConfig::default();
-            configured.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+            configured.quic.native_network_profile =
+                hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
             configured.secrets.path = Some(secrets.clone());
             configured.storage.models_dir = root.path().join(format!("{service}-models"));
             let config_path = root.path().join(format!("{service}.toml"));
             configured.to_file(&config_path)?;
             let matches = super::build_cli().try_get_matches_from([
-                "hyprstream", "--config", config_path.to_str().expect("temporary UTF-8 path"),
-                "service", "start", service, "--foreground",
+                "hyprstream",
+                "--config",
+                config_path.to_str().expect("temporary UTF-8 path"),
+                "service",
+                "start",
+                service,
+                "--foreground",
             ])?;
-            let config = super::load_config(matches.get_one::<std::path::PathBuf>("config").map(std::path::PathBuf::as_path))?;
+            let config = super::load_config(
+                matches
+                    .get_one::<std::path::PathBuf>("config")
+                    .map(std::path::PathBuf::as_path),
+            )?;
             let selected = super::native_service_process_name(&matches, &config)?;
             assert_eq!(selected.as_deref(), Some(service));
-            let key = runtime.block_on(super::load_process_signing_key(&config, selected.as_deref()))?;
+            let key = runtime.block_on(super::load_process_signing_key(
+                &config,
+                selected.as_deref(),
+            ))?;
             assert_eq!(key.to_bytes(), [seed; 32]);
-            let ctx = super::ServiceContext::new(key.clone(), key.verifying_key(), false, config.models_dir().clone())
-                .with_service_key(service, key.clone());
+            let ctx = super::ServiceContext::new(
+                key.clone(),
+                key.verifying_key(),
+                false,
+                config.models_dir().clone(),
+            )
+            .with_service_key(service, key.clone());
             assert_eq!(ctx.signing_key().verifying_key(), key.verifying_key());
-            assert_eq!(ctx.service_signing_key(service).verifying_key(), key.verifying_key());
-            assert!(!config.models_dir().join(".registry/keys").exists(), "native startup must not materialize a CLI/root key");
+            assert_eq!(
+                ctx.service_signing_key(service).verifying_key(),
+                key.verifying_key()
+            );
+            assert!(
+                !config.models_dir().join(".registry/keys").exists(),
+                "native startup must not materialize a CLI/root key"
+            );
             std::fs::remove_file(&key_path)?;
-            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
-            assert!(!key_path.exists(), "missing provisioned key must not be regenerated");
+            assert!(runtime
+                .block_on(super::load_process_signing_key(
+                    &config,
+                    selected.as_deref()
+                ))
+                .is_err());
+            assert!(
+                !key_path.exists(),
+                "missing provisioned key must not be regenerated"
+            );
             std::fs::write(&key_path, [seed; 31])?;
-            assert!(runtime.block_on(super::load_process_signing_key(&config, selected.as_deref())).is_err());
-            assert_eq!(std::fs::read(&key_path)?, vec![seed; 31], "malformed key must not be repaired during startup");
+            assert!(runtime
+                .block_on(super::load_process_signing_key(
+                    &config,
+                    selected.as_deref()
+                ))
+                .is_err());
+            assert_eq!(
+                std::fs::read(&key_path)?,
+                vec![seed; 31],
+                "malformed key must not be repaired during startup"
+            );
         }
         Ok(())
     }
@@ -4690,11 +4876,21 @@ mod resolver_startup_controls {
             tls_cert: "unused.pem".into(),
             tls_key: "unused.key".into(),
         });
-        for profile in [NativeNetworkProfile::Compatibility, NativeNetworkProfile::NetworkIrohRequired] {
+        for profile in [
+            NativeNetworkProfile::Compatibility,
+            NativeNetworkProfile::NetworkIrohRequired,
+        ] {
             config.quic.native_network_profile = profile;
             for argv in [
                 vec!["hyprstream", "service", "start", "oauth", "--foreground"],
-                vec!["hyprstream", "service", "start", "--foreground", "--services", "oauth"],
+                vec![
+                    "hyprstream",
+                    "service",
+                    "start",
+                    "--foreground",
+                    "--services",
+                    "oauth",
+                ],
                 vec!["hyprstream", "service", "start", "--standalone"],
             ] {
                 config.services.startup = vec!["oauth".into()];
@@ -4704,8 +4900,12 @@ mod resolver_startup_controls {
                 assert_eq!(service, "oauth");
                 let key = super::SigningKey::from_bytes(&[9; 32]);
                 let context = super::ServiceContext::new(
-                    key.clone(), key.verifying_key(), false, "/unused".into(),
-                ).with_dedicated_process_service(service);
+                    key.clone(),
+                    key.verifying_key(),
+                    false,
+                    "/unused".into(),
+                )
+                .with_dedicated_process_service(service);
                 assert!(context.is_dedicated_process_for("oauth"));
                 assert!(!context.is_dedicated_process_for("registry"));
                 assert_eq!(
@@ -4718,34 +4918,63 @@ mod resolver_startup_controls {
             for argv in [
                 vec!["hyprstream", "service", "start", "oauth"],
                 vec!["hyprstream", "service", "start", "--standalone"],
-                vec!["hyprstream", "service", "start", "--foreground", "--services", "oauth,registry"],
+                vec![
+                    "hyprstream",
+                    "service",
+                    "start",
+                    "--foreground",
+                    "--services",
+                    "oauth,registry",
+                ],
                 vec!["hyprstream", "service", "status"],
             ] {
                 let matches = super::build_cli().try_get_matches_from(argv)?;
-                assert_eq!(super::dedicated_service_process_name(&matches, &config)?, None);
+                assert_eq!(
+                    super::dedicated_service_process_name(&matches, &config)?,
+                    None
+                );
             }
         }
         Ok(())
     }
 
     #[test]
-    fn native_service_identity_rejects_multi_and_selects_single_service_list() -> anyhow::Result<()> {
+    fn native_service_identity_rejects_multi_and_selects_single_service_list() -> anyhow::Result<()>
+    {
         let mut config = super::HyprConfig::default();
-        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
+        config.quic.native_network_profile =
+            hyprstream_core::config::NativeNetworkProfile::NetworkIrohRequired;
         let single = super::build_cli().try_get_matches_from([
-            "hyprstream", "service", "start", "--foreground", "--services", "model",
+            "hyprstream",
+            "service",
+            "start",
+            "--foreground",
+            "--services",
+            "model",
         ])?;
-        assert_eq!(super::native_service_process_name(&single, &config)?.as_deref(), Some("model"));
+        assert_eq!(
+            super::native_service_process_name(&single, &config)?.as_deref(),
+            Some("model")
+        );
         let multi = super::build_cli().try_get_matches_from([
-            "hyprstream", "service", "start", "--foreground", "--services", "model,registry",
+            "hyprstream",
+            "service",
+            "start",
+            "--foreground",
+            "--services",
+            "model,registry",
         ])?;
         assert!(super::native_service_process_name(&multi, &config).is_err());
         let standalone = super::build_cli().try_get_matches_from([
-            "hyprstream", "service", "start", "--standalone",
+            "hyprstream",
+            "service",
+            "start",
+            "--standalone",
         ])?;
         config.services.startup = vec!["model".into(), "registry".into()];
         assert!(super::native_service_process_name(&standalone, &config).is_err());
-        config.quic.native_network_profile = hyprstream_core::config::NativeNetworkProfile::Compatibility;
+        config.quic.native_network_profile =
+            hyprstream_core::config::NativeNetworkProfile::Compatibility;
         assert_eq!(super::native_service_process_name(&multi, &config)?, None);
         assert_eq!(super::native_service_process_name(&single, &config)?, None);
         Ok(())
@@ -4765,7 +4994,10 @@ mod resolver_startup_controls {
                 .env_remove("HYPRSTREAM__SECRETS__PATH")
                 .env_remove("HYPRSTREAM_SECRETS_PROFILE")
                 .status()?;
-            anyhow::ensure!(status.success(), "isolated discovery seeding regression failed");
+            anyhow::ensure!(
+                status.success(),
+                "isolated discovery seeding regression failed"
+            );
             return Ok(());
         }
 
@@ -4780,9 +5012,7 @@ mod resolver_startup_controls {
         let mut default_entries = std::collections::HashMap::new();
         default_entries.insert(
             "discovery".to_owned(),
-            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(
-                &default_key,
-            )?,
+            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(&default_key)?,
         );
         hyprstream_core::auth::identity_store::write_bootstrap_pubkeys_hybrid(
             &default_secrets,
@@ -4794,9 +5024,7 @@ mod resolver_startup_controls {
         let mut custom_entries = std::collections::HashMap::new();
         custom_entries.insert(
             "discovery".to_owned(),
-            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(
-                &custom_key,
-            )?,
+            hyprstream_core::auth::identity_store::BootstrapPubkey::for_service_key(&custom_key)?,
         );
         hyprstream_core::auth::identity_store::write_bootstrap_pubkeys_hybrid(
             &custom_secrets,
@@ -4818,24 +5046,58 @@ mod resolver_startup_controls {
 
     #[test]
     fn readonly_roster_cli_requires_services_and_has_no_mutation_options() {
-        let matches = super::build_cli().try_get_matches_from([
-            "hyprstream", "pds", "inspect-services", "--service", "model,event",
-        ]).expect("read-only roster CLI");
-        let inspect = matches.subcommand_matches("pds").expect("pds")
-            .subcommand_matches("inspect-services").expect("inspect");
-        assert_eq!(inspect.get_many::<String>("service").expect("services")
-            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
+        let matches = super::build_cli()
+            .try_get_matches_from([
+                "hyprstream",
+                "pds",
+                "inspect-services",
+                "--service",
+                "model,event",
+            ])
+            .expect("read-only roster CLI");
+        let inspect = matches
+            .subcommand_matches("pds")
+            .expect("pds")
+            .subcommand_matches("inspect-services")
+            .expect("inspect");
+        assert_eq!(
+            inspect
+                .get_many::<String>("service")
+                .expect("services")
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["model", "event"]
+        );
         for args in [
             vec!["hyprstream", "pds", "inspect-services"],
-            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--valid-for-seconds", "86400"],
-            vec!["hyprstream", "pds", "inspect-services", "--service", "model", "--roster-export", "out.json"],
-        ] { assert!(super::build_cli().try_get_matches_from(args).is_err()); }
+            vec![
+                "hyprstream",
+                "pds",
+                "inspect-services",
+                "--service",
+                "model",
+                "--valid-for-seconds",
+                "86400",
+            ],
+            vec![
+                "hyprstream",
+                "pds",
+                "inspect-services",
+                "--service",
+                "model",
+                "--roster-export",
+                "out.json",
+            ],
+        ] {
+            assert!(super::build_cli().try_get_matches_from(args).is_err());
+        }
     }
 
     fn unavailable_policy_publication() -> anyhow::Error {
         hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
             hyprstream_rpc::transport::lazy_iroh::IrohPeerUnavailable::ConnectTimeout.into(),
-        ).into()
+        )
+        .into()
     }
 
     #[tokio::test(start_paused = true)]
@@ -4843,14 +5105,27 @@ mod resolver_startup_controls {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let mut projections = 0;
         let start = tokio::time::Instant::now();
-        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
-            projections += 1;
-            let generation = projections;
-            async move {
-                if generation < 3 { Err(unavailable_policy_publication()) } else { Ok(()) }
-            }
-        }).await.expect("late Discovery should allow Policy to publish");
-        assert_eq!(projections, 3, "every retry must request fresh authority material");
+        super::wait_for_policy_initial_publication(
+            &cancellation,
+            std::time::Duration::from_secs(120),
+            || {
+                projections += 1;
+                let generation = projections;
+                async move {
+                    if generation < 3 {
+                        Err(unavailable_policy_publication())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("late Discovery should allow Policy to publish");
+        assert_eq!(
+            projections, 3,
+            "every retry must request fresh authority material"
+        );
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
     }
 
@@ -4859,27 +5134,50 @@ mod resolver_startup_controls {
         let cancellation = tokio_util::sync::CancellationToken::new();
         // These are intentionally untyped security/projection errors. Even
         // availability-looking text must never select the retry path.
-        for terminal in ["expired current authority", "revoked service JWT", "iroh connect timed out"] {
+        for terminal in [
+            "expired current authority",
+            "revoked service JWT",
+            "iroh connect timed out",
+        ] {
             let mut attempts = 0;
-            let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
-                attempts += 1;
-                let first = attempts == 1;
-                async move {
-                    if first { Err(unavailable_policy_publication()) } else { anyhow::bail!(terminal) }
-                }
-            }).await.expect_err("security failures must be terminal");
+            let error = super::wait_for_policy_initial_publication(
+                &cancellation,
+                std::time::Duration::from_secs(120),
+                || {
+                    attempts += 1;
+                    let first = attempts == 1;
+                    async move {
+                        if first {
+                            Err(unavailable_policy_publication())
+                        } else {
+                            anyhow::bail!(terminal)
+                        }
+                    }
+                },
+            )
+            .await
+            .expect_err("security failures must be terminal");
             assert_eq!(error.to_string(), terminal);
             assert_eq!(attempts, 2);
         }
         let mut attempts = 0;
-        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
-            attempts += 1;
-            async {
-                Err(hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
-                    anyhow::anyhow!("missing Iroh client endpoint"),
-                ).into())
-            }
-        }).await.expect_err("pre-dispatch alone is not an availability proof");
+        let error = super::wait_for_policy_initial_publication(
+            &cancellation,
+            std::time::Duration::from_secs(120),
+            || {
+                attempts += 1;
+                async {
+                    Err(
+                        hyprstream_rpc::transport_traits::PreDispatchTransportError::new(
+                            anyhow::anyhow!("missing Iroh client endpoint"),
+                        )
+                        .into(),
+                    )
+                }
+            },
+        )
+        .await
+        .expect_err("pre-dispatch alone is not an availability proof");
         assert_eq!(attempts, 1);
         assert!(error.to_string().contains("missing Iroh client endpoint"));
     }
@@ -4888,14 +5186,23 @@ mod resolver_startup_controls {
     async fn policy_initial_publication_deadline_bounds_retries_and_inflight_call() {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let start = tokio::time::Instant::now();
-        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(2), || async {
-            Err(unavailable_policy_publication())
-        }).await.expect_err("absent Discovery cannot keep startup pending forever");
+        let error = super::wait_for_policy_initial_publication(
+            &cancellation,
+            std::time::Duration::from_secs(2),
+            || async { Err(unavailable_policy_publication()) },
+        )
+        .await
+        .expect_err("absent Discovery cannot keep startup pending forever");
         assert!(error.to_string().contains("deadline exceeded"));
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
         let start = tokio::time::Instant::now();
-        let error = super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(2), std::future::pending).await
-            .expect_err("deadline also interrupts a stalled RPC");
+        let error = super::wait_for_policy_initial_publication(
+            &cancellation,
+            std::time::Duration::from_secs(2),
+            std::future::pending,
+        )
+        .await
+        .expect_err("deadline also interrupts a stalled RPC");
         assert!(error.to_string().contains("deadline exceeded"));
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
     }
@@ -4905,10 +5212,16 @@ mod resolver_startup_controls {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
         let mut called = false;
-        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), || {
-            called = true;
-            async { Ok(()) }
-        }).await.expect_err("cancelled startup cannot publish or become ready");
+        super::wait_for_policy_initial_publication(
+            &cancellation,
+            std::time::Duration::from_secs(120),
+            || {
+                called = true;
+                async { Ok(()) }
+            },
+        )
+        .await
+        .expect_err("cancelled startup cannot publish or become ready");
         assert!(!called);
         let cancellation = tokio_util::sync::CancellationToken::new();
         let cancel = cancellation.clone();
@@ -4916,34 +5229,67 @@ mod resolver_startup_controls {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             cancel.cancel();
         });
-        super::wait_for_policy_initial_publication(&cancellation, std::time::Duration::from_secs(120), std::future::pending).await
-            .expect_err("shutdown interrupts an in-flight publication");
+        super::wait_for_policy_initial_publication(
+            &cancellation,
+            std::time::Duration::from_secs(120),
+            std::future::pending,
+        )
+        .await
+        .expect_err("shutdown interrupts an in-flight publication");
         cancel_task.await.expect("canceller");
     }
 
     #[test]
     fn deployment_bootstrap_cli_requires_roster_and_parses_lifetime() {
-        let matches = super::build_cli().try_get_matches_from([
-            "hyprstream", "pds", "provision-services", "--service", "model,event",
-            "--valid-for-seconds", "3600",
-        ]).expect("bootstrap CLI");
+        let matches = super::build_cli()
+            .try_get_matches_from([
+                "hyprstream",
+                "pds",
+                "provision-services",
+                "--service",
+                "model,event",
+                "--valid-for-seconds",
+                "3600",
+            ])
+            .expect("bootstrap CLI");
         let pds = matches.subcommand_matches("pds").expect("pds");
-        let provision = pds.subcommand_matches("provision-services").expect("provision");
-        assert_eq!(provision.get_many::<String>("service").expect("roster")
-            .map(String::as_str).collect::<Vec<_>>(), vec!["model", "event"]);
-        assert_eq!(provision.get_one::<i64>("valid-for-seconds"), Some(&3600));
-        assert!(provision.get_one::<std::path::PathBuf>("roster-export").is_none());
-        assert!(super::build_cli().try_get_matches_from([
-            "hyprstream", "pds", "provision-services",
-        ]).is_err());
-        let matches = super::build_cli().try_get_matches_from([
-            "hyprstream", "pds", "provision-services", "--service", "model",
-            "--roster-export", "/tmp/roster.json",
-        ]).expect("bootstrap CLI with roster export");
-        let provision = matches.subcommand_matches("pds").expect("pds")
-            .subcommand_matches("provision-services").expect("provision");
+        let provision = pds
+            .subcommand_matches("provision-services")
+            .expect("provision");
         assert_eq!(
-            provision.get_one::<std::path::PathBuf>("roster-export")
+            provision
+                .get_many::<String>("service")
+                .expect("roster")
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["model", "event"]
+        );
+        assert_eq!(provision.get_one::<i64>("valid-for-seconds"), Some(&3600));
+        assert!(provision
+            .get_one::<std::path::PathBuf>("roster-export")
+            .is_none());
+        assert!(super::build_cli()
+            .try_get_matches_from(["hyprstream", "pds", "provision-services",])
+            .is_err());
+        let matches = super::build_cli()
+            .try_get_matches_from([
+                "hyprstream",
+                "pds",
+                "provision-services",
+                "--service",
+                "model",
+                "--roster-export",
+                "/tmp/roster.json",
+            ])
+            .expect("bootstrap CLI with roster export");
+        let provision = matches
+            .subcommand_matches("pds")
+            .expect("pds")
+            .subcommand_matches("provision-services")
+            .expect("provision");
+        assert_eq!(
+            provision
+                .get_one::<std::path::PathBuf>("roster-export")
                 .map(std::path::PathBuf::as_path),
             Some(std::path::Path::new("/tmp/roster.json"))
         );
@@ -5024,9 +5370,10 @@ mod resolver_startup_controls {
         assert!(err.to_string().contains("service-scoped"));
 
         assert_eq!(
-            super::select_single_process_moql_admission_proof(vec![
-                ("inference".to_owned(), Some(7_u8)),
-            ])
+            super::select_single_process_moql_admission_proof(vec![(
+                "inference".to_owned(),
+                Some(7_u8)
+            ),])
             .expect("one service has one scoped proof"),
             Some(7),
         );
@@ -5055,14 +5402,18 @@ mod resolver_startup_controls {
             .find("install_process_production_resolver(&signing_key, &config, service_token.clone()).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
-            .find("RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,")
+            .find(
+                "RegistryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,",
+            )
             .expect("first generated client");
         let command_dispatch = production[startup..]
             .find("match matches.subcommand()")
             .expect("top-level command dispatch");
         assert!(install < first_generated);
         assert!(first_generated < command_dispatch);
-        assert!(production.contains("load_service_jwt_for_profile(\n                        &secrets, name, profile,"));
+        assert!(production.contains(
+            "load_service_jwt_for_profile(\n                        &secrets, name, profile,"
+        ));
         assert!(production.contains("signing_key.clone(),\n                service_token,"));
         assert_eq!(
             production
@@ -5138,11 +5489,16 @@ mod resolver_startup_controls {
             .find("let worker_client = if worker_already_running")
             .expect("worker client selection");
         let worker_selection = &source[worker..worker + 500];
-        assert!(worker_selection.contains("WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider"));
+        assert!(worker_selection.contains(
+            "WorkerClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider"
+        ));
         assert!(worker_selection.contains("WorkerClient::for_local_bootstrap"));
 
         let training = include_str!("../cli/training_handlers.rs");
-        assert_eq!(training.matches("InferenceClient::from_provider").count(), 0);
+        assert_eq!(
+            training.matches("InferenceClient::from_provider").count(),
+            0
+        );
         assert_eq!(
             training
                 .matches("InferenceClient::for_local_bootstrap")
@@ -5253,14 +5609,14 @@ mod resolver_startup_controls {
             third_wake >= second_nominal_wake && third_wake <= second_nominal_wake + timer_tick,
             "next production refresh must use the prior actual wake and stay within one Tokio timer tick"
         );
-        assert_eq!(
-            tokio::time::Instant::now(),
-            third_wake
-        );
+        assert_eq!(tokio::time::Instant::now(), third_wake);
         assert_eq!(publications.load(Ordering::SeqCst), 3);
 
         task.abort();
-        assert!(task.await.expect_err("refresh task is cancelled").is_cancelled());
+        assert!(task
+            .await
+            .expect_err("refresh task is cancelled")
+            .is_cancelled());
     }
 
     async fn expired_announcement_must_not_run() -> Result<(), std::convert::Infallible> {
@@ -5269,8 +5625,8 @@ mod resolver_startup_controls {
 
     #[tokio::test(start_paused = true)]
     async fn native_announcement_refresh_loop_shutdown_cannot_overwrite_restart() {
-        use std::sync::Arc;
         use parking_lot::Mutex;
+        use std::sync::Arc;
         let publications = Arc::new(Mutex::new(Vec::new()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let old_cancel = tokio_util::sync::CancellationToken::new();
@@ -5280,25 +5636,36 @@ mod resolver_startup_controls {
             let tx = tx.clone();
             tokio::spawn(async move {
                 super::refresh_native_announcement(
-                    "model", "quic", endpoint, i64::MAX, cancellation,
+                    "model",
+                    "quic",
+                    endpoint,
+                    i64::MAX,
+                    cancellation,
                     move || {
                         publications.lock().push(endpoint);
                         tx.send(endpoint).expect("publication receiver");
                         async { Ok::<(), std::convert::Infallible>(()) }
                     },
-                ).await
+                )
+                .await
             })
         };
         let old = spawn("quic://old:10001", old_cancel.clone());
         assert_eq!(rx.recv().await, Some("quic://old:10001"));
         old_cancel.cancel();
-        assert_eq!(old.await.expect("old task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert_eq!(
+            old.await.expect("old task"),
+            super::NativeAnnouncementRefreshCompletion::Cancelled
+        );
         let new = spawn("quic://new:10002", new_cancel.clone());
         assert_eq!(rx.recv().await, Some("quic://new:10002"));
         tokio::time::advance(std::time::Duration::from_secs(26)).await;
         assert_eq!(rx.recv().await, Some("quic://new:10002"));
         new_cancel.cancel();
-        assert_eq!(new.await.expect("new task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert_eq!(
+            new.await.expect("new task"),
+            super::NativeAnnouncementRefreshCompletion::Cancelled
+        );
         assert_eq!(
             *publications.lock(),
             vec!["quic://old:10001", "quic://new:10002", "quic://new:10002"],
@@ -5307,7 +5674,10 @@ mod resolver_startup_controls {
 
     #[tokio::test]
     async fn native_announcement_refresh_loop_cancels_in_flight_publish() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
         let cancellation = tokio_util::sync::CancellationToken::new();
         let completed = Arc::new(AtomicBool::new(false));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -5317,25 +5687,37 @@ mod resolver_startup_controls {
             let mut started_tx = Some(started_tx);
             async move {
                 super::refresh_native_announcement(
-                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    "model",
+                    "iroh",
+                    "iroh://test",
+                    i64::MAX,
+                    cancellation,
                     move || {
                         let started = started_tx.take();
                         let completed = Arc::clone(&completed);
                         async move {
-                            if let Some(started) = started { let _ = started.send(()); }
+                            if let Some(started) = started {
+                                let _ = started.send(());
+                            }
                             std::future::pending::<()>().await;
                             completed.store(true, Ordering::SeqCst);
                             Ok::<(), std::convert::Infallible>(())
                         }
                     },
-                ).await
+                )
+                .await
             }
         });
         started_rx.await.expect("publish started");
         cancellation.cancel();
         let completion = tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await.expect("cancellation must not wait for RPC completion").expect("task");
-        assert_eq!(completion, super::NativeAnnouncementRefreshCompletion::Cancelled);
+            .await
+            .expect("cancellation must not wait for RPC completion")
+            .expect("task");
+        assert_eq!(
+            completion,
+            super::NativeAnnouncementRefreshCompletion::Cancelled
+        );
         assert!(!completed.load(Ordering::SeqCst));
     }
 
@@ -5348,14 +5730,26 @@ mod resolver_startup_controls {
             let mut attempt = 0;
             async move {
                 super::refresh_native_announcement(
-                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    "model",
+                    "iroh",
+                    "iroh://test",
+                    i64::MAX,
+                    cancellation,
                     move || {
                         attempt += 1;
-                        sent.send(tokio::time::Instant::now()).expect("receiver live");
+                        sent.send(tokio::time::Instant::now())
+                            .expect("receiver live");
                         let success = attempt == 5;
-                        async move { if success { Ok(()) } else { Err("retry fixture") } }
+                        async move {
+                            if success {
+                                Ok(())
+                            } else {
+                                Err("retry fixture")
+                            }
+                        }
                     },
-                ).await
+                )
+                .await
             }
         });
         let mut previous = received.recv().await.expect("initial attempt");
@@ -5363,12 +5757,17 @@ mod resolver_startup_controls {
             let current = received.recv().await.expect("next attempt");
             let elapsed = current.duration_since(previous);
             let expected = std::time::Duration::from_secs(seconds);
-            assert!(elapsed >= expected && elapsed <= expected + std::time::Duration::from_millis(1),
-                "expected {expected:?} retry interval, got {elapsed:?}");
+            assert!(
+                elapsed >= expected && elapsed <= expected + std::time::Duration::from_millis(1),
+                "expected {expected:?} retry interval, got {elapsed:?}"
+            );
             previous = current;
         }
         cancellation.cancel();
-        assert_eq!(task.await.expect("refresh task"), super::NativeAnnouncementRefreshCompletion::Cancelled);
+        assert_eq!(
+            task.await.expect("refresh task"),
+            super::NativeAnnouncementRefreshCompletion::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -5388,7 +5787,6 @@ mod resolver_startup_controls {
             super::NativeAnnouncementRefreshCompletion::Expired
         );
     }
-
 }
 
 #[cfg(test)]
@@ -5403,7 +5801,10 @@ mod native_announcement_wiring {
         // exercising its extracted startup boundary below. A correct loop
         // test alone did not catch the old reach-only call-site decision.
         let source = include_str!("main.rs");
-        let production = source.split("mod native_announcement_wiring").next().unwrap();
+        let production = source
+            .split("mod native_announcement_wiring")
+            .next()
+            .unwrap();
         let compact: String = production.split_whitespace().collect();
         assert!(compact.contains("start_native_announcement_publisher(request.reach.clone(),hyprstream_discovery::native_network_required(),request.cancellation.clone(),"));
 
@@ -5415,21 +5816,31 @@ mod native_announcement_wiring {
                     server_name: "fixture".to_owned(),
                 },
             ] {
-                let fatal = network_required && matches!(reach, NativeAnnouncementReach::Iroh { .. });
+                let fatal =
+                    network_required && matches!(reach, NativeAnnouncementReach::Iroh { .. });
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 let loop_cancellation = cancellation.clone();
                 let (retry_tx, retry_rx) = std::sync::mpsc::sync_channel(2);
                 let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
                 struct Dropped(std::sync::mpsc::SyncSender<()>);
                 impl Drop for Dropped {
-                    fn drop(&mut self) { let _ = self.0.send(()); }
+                    fn drop(&mut self) {
+                        let _ = self.0.send(());
+                    }
                 }
                 let result = super::start_native_announcement_publisher(
-                    reach, network_required, cancellation.clone(), move |announce_tx| async move {
+                    reach,
+                    network_required,
+                    cancellation.clone(),
+                    move |announce_tx| async move {
                         let _dropped = Dropped(dropped_tx);
                         let mut attempts = 0;
                         super::refresh_native_announcement(
-                            "policy", "iroh", "iroh://fixture", i64::MAX, loop_cancellation,
+                            "policy",
+                            "iroh",
+                            "iroh://fixture",
+                            i64::MAX,
+                            loop_cancellation,
                             || {
                                 attempts += 1;
                                 let attempt = attempts;
@@ -5442,22 +5853,36 @@ mod native_announcement_wiring {
                                         retry_tx.send(attempt).unwrap();
                                         Ok(())
                                     };
-                                    send_first_result(&tx, outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
+                                    send_first_result(
+                                        &tx,
+                                        outcome.as_ref().map(|_| ()).map_err(ToString::to_string),
+                                    );
                                     outcome
                                 }
                             },
-                        ).await;
+                        )
+                        .await;
                     },
                 );
                 if fatal {
-                    assert!(result.unwrap_err().to_string().contains("local Discovery is not bound yet"));
-                    dropped_rx.recv_timeout(Duration::from_secs(2)).expect("failed required startup aborts the publisher");
-                    assert!(retry_rx.try_recv().is_err(), "required startup cannot silently retry its first failure");
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("local Discovery is not bound yet"));
+                    dropped_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("failed required startup aborts the publisher");
+                    assert!(
+                        retry_rx.try_recv().is_err(),
+                        "required startup cannot silently retry its first failure"
+                    );
                 } else {
                     result.expect("Compatibility/non-Iroh startup is nonfatal");
                     assert_eq!(retry_rx.recv_timeout(Duration::from_secs(8)).expect("publication retries at the production five-second cadence when Discovery becomes ready"), 2);
                     cancellation.cancel();
-                    dropped_rx.recv_timeout(Duration::from_secs(2)).expect("service cancellation still owns the retry task");
+                    dropped_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("service cancellation still owns the retry task");
                 }
             }
         }
@@ -5477,44 +5902,57 @@ mod native_announcement_wiring {
     #[test]
     fn required_path_handshakes_and_runs_multiple_cycles() {
         let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
-        let initial_rx = super::spawn_native_announcement_loop(true, tokio_util::sync::CancellationToken::new(), move |announce_tx| {
-            let cycle_tx = cycle_tx.clone();
-            async move {
-                for i in 0..3 {
-                    let announcement = hyprstream_rpc_std::discovery_client::ServiceAnnouncement {
-                        service_name: "model".to_owned(),
-                        socket_kind: "iroh".to_owned(),
-                        endpoint: "iroh://bound-node".to_owned(),
-                        service_jwt: Some(format!("jwt-{i}")),
-                        service_did: "did:at9p:fixture".into(),
-                        capabilities: vec!["model".to_owned()],
-                        accepted_state_digest: vec![i as u8; 64],
-                        accepted_state_epoch: i,
-                        response_key_id: "#response".to_owned(),
-                        request_kem_key_id: "#kem".to_owned(),
-                        request_kem_recipient: vec![i as u8],
-                        expires_at_unix_ms: 1000 + i as i64,
-                    };
-                    let cycle_tx = cycle_tx.clone();
-                    super::publish_native_announcement_attempt(
-                        Ok(announcement), announce_tx.as_ref().map(std::sync::Arc::clone),
-                        move |announcement| async move {
-                            assert_eq!(announcement.service_jwt, Some(format!("jwt-{i}")));
-                            assert_eq!(super::native_announcement_bearer(&announcement).unwrap(), format!("jwt-{i}"));
-                            let mut missing = announcement.clone();
-                            missing.service_jwt = None;
-                            assert!(super::native_announcement_bearer(&missing).is_err());
-                            missing.service_jwt = Some(" ".into());
-                            assert!(super::native_announcement_bearer(&missing).is_err());
-                            assert_eq!(announcement.expires_at_unix_ms, 1000 + i as i64);
-                            cycle_tx.send(announcement.accepted_state_epoch).expect("test receiver is live");
-                            Ok(())
-                        },
-                    ).await.expect("publication succeeds");
-                    tokio::task::yield_now().await;
+        let initial_rx = super::spawn_native_announcement_loop(
+            true,
+            tokio_util::sync::CancellationToken::new(),
+            move |announce_tx| {
+                let cycle_tx = cycle_tx.clone();
+                async move {
+                    for i in 0..3 {
+                        let announcement =
+                            hyprstream_rpc_std::discovery_client::ServiceAnnouncement {
+                                service_name: "model".to_owned(),
+                                socket_kind: "iroh".to_owned(),
+                                endpoint: "iroh://bound-node".to_owned(),
+                                service_jwt: Some(format!("jwt-{i}")),
+                                service_did: "did:at9p:fixture".into(),
+                                capabilities: vec!["model".to_owned()],
+                                accepted_state_digest: vec![i as u8; 64],
+                                accepted_state_epoch: i,
+                                response_key_id: "#response".to_owned(),
+                                request_kem_key_id: "#kem".to_owned(),
+                                request_kem_recipient: vec![i as u8],
+                                expires_at_unix_ms: 1000 + i as i64,
+                            };
+                        let cycle_tx = cycle_tx.clone();
+                        super::publish_native_announcement_attempt(
+                            Ok(announcement),
+                            announce_tx.as_ref().map(std::sync::Arc::clone),
+                            move |announcement| async move {
+                                assert_eq!(announcement.service_jwt, Some(format!("jwt-{i}")));
+                                assert_eq!(
+                                    super::native_announcement_bearer(&announcement).unwrap(),
+                                    format!("jwt-{i}")
+                                );
+                                let mut missing = announcement.clone();
+                                missing.service_jwt = None;
+                                assert!(super::native_announcement_bearer(&missing).is_err());
+                                missing.service_jwt = Some(" ".into());
+                                assert!(super::native_announcement_bearer(&missing).is_err());
+                                assert_eq!(announcement.expires_at_unix_ms, 1000 + i as i64);
+                                cycle_tx
+                                    .send(announcement.accepted_state_epoch)
+                                    .expect("test receiver is live");
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .expect("publication succeeds");
+                        tokio::task::yield_now().await;
+                    }
                 }
-            }
-        });
+            },
+        );
 
         let result = initial_rx
             .expect("required path has a handshake receiver")
@@ -5530,20 +5968,31 @@ mod native_announcement_wiring {
                     .expect("loop continues producing cycles"),
             );
         }
-        assert_eq!(seen, vec![0, 1, 2], "observed three full publication cycles");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2],
+            "observed three full publication cycles"
+        );
     }
 
     #[test]
     fn compat_path_publishes_without_handshake() {
         let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
-        let initial_rx = super::spawn_native_announcement_loop(false, tokio_util::sync::CancellationToken::new(), move |_announce_tx| {
-            let cycle_tx = cycle_tx.clone();
-            async move {
-                cycle_tx.send(0).expect("test receiver is live");
-            }
-        });
+        let initial_rx = super::spawn_native_announcement_loop(
+            false,
+            tokio_util::sync::CancellationToken::new(),
+            move |_announce_tx| {
+                let cycle_tx = cycle_tx.clone();
+                async move {
+                    cycle_tx.send(0).expect("test receiver is live");
+                }
+            },
+        );
 
-        assert!(initial_rx.is_none(), "compat path has no handshake receiver");
+        assert!(
+            initial_rx.is_none(),
+            "compat path has no handshake receiver"
+        );
         let got = cycle_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("compat path publishes");
@@ -5558,53 +6007,77 @@ mod native_announcement_wiring {
         let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
         struct Dropped(std::sync::mpsc::SyncSender<()>);
         impl Drop for Dropped {
-            fn drop(&mut self) { let _ = self.0.send(()); }
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
         }
         let initial = super::spawn_native_announcement_loop(
-            true, cancellation.clone(), move |announce_tx| async move {
+            true,
+            cancellation.clone(),
+            move |announce_tx| async move {
                 let _dropped = Dropped(dropped_tx);
                 super::refresh_native_announcement(
-                    "model", "iroh", "iroh://test", i64::MAX, loop_cancellation,
+                    "model",
+                    "iroh",
+                    "iroh://test",
+                    i64::MAX,
+                    loop_cancellation,
                     || {
                         started_tx.send(()).expect("publication started");
                         std::future::pending::<Result<(), std::io::Error>>()
                     },
-                ).await;
+                )
+                .await;
                 // Keep the first-result sender alive during the pending RPC.
                 drop(announce_tx);
             },
-        ).expect("required handshake");
-        started_rx.recv_timeout(Duration::from_secs(2)).expect("first publication entered");
+        )
+        .expect("required handshake");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first publication entered");
         cancellation.cancel();
-        assert!(initial.recv_timeout(Duration::from_secs(2)).expect("cancelled handshake must finish").is_err());
-        dropped_rx.recv_timeout(Duration::from_secs(2)).expect("publication task must be dropped");
+        assert!(initial
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled handshake must finish")
+            .is_err());
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publication task must be dropped");
     }
 
     #[test]
     fn required_path_rejects_success_when_already_cancelled() {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let initial = super::spawn_native_announcement_loop(
-            true, cancellation, |announce_tx| async move {
+        let initial =
+            super::spawn_native_announcement_loop(true, cancellation, |announce_tx| async move {
                 send_first_result(&announce_tx, Ok(()));
-            },
-        ).expect("required handshake");
-        assert!(initial.recv_timeout(Duration::from_secs(2)).expect("cancelled handshake must finish").is_err());
+            })
+            .expect("required handshake");
+        assert!(initial
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled handshake must finish")
+            .is_err());
     }
 
     #[test]
     fn required_path_aborts_on_first_failure() {
         let (cycle_tx, cycle_rx) = std::sync::mpsc::sync_channel(10);
-        let initial_rx = super::spawn_native_announcement_loop(true, tokio_util::sync::CancellationToken::new(), move |announce_tx| {
-            let cycle_tx = cycle_tx.clone();
-            async move {
-                send_first_result(&announce_tx, Err("injected".to_owned()));
-                loop {
-                    tokio::task::yield_now().await;
-                    cycle_tx.send(1).expect("test receiver is live");
+        let initial_rx = super::spawn_native_announcement_loop(
+            true,
+            tokio_util::sync::CancellationToken::new(),
+            move |announce_tx| {
+                let cycle_tx = cycle_tx.clone();
+                async move {
+                    send_first_result(&announce_tx, Err("injected".to_owned()));
+                    loop {
+                        tokio::task::yield_now().await;
+                        cycle_tx.send(1).expect("test receiver is live");
+                    }
                 }
-            }
-        });
+            },
+        );
 
         let result = initial_rx
             .expect("required path has a handshake receiver")
@@ -5624,28 +6097,41 @@ mod native_announcement_wiring {
         let observed = published.clone();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let initial = super::spawn_native_announcement_loop(
-            true, cancellation.clone(), move |announce_tx| async move {
+            true,
+            cancellation.clone(),
+            move |announce_tx| async move {
                 super::refresh_native_announcement(
-                    "model", "iroh", "iroh://test", i64::MAX, cancellation,
+                    "model",
+                    "iroh",
+                    "iroh://test",
+                    i64::MAX,
+                    cancellation,
                     || {
                         let tx = announce_tx.as_ref().map(std::sync::Arc::clone);
                         let published = published.clone();
                         super::publish_native_announcement_attempt(
-                            Err(anyhow::anyhow!("fresh checkpoint unavailable")), tx,
+                            Err(anyhow::anyhow!("fresh checkpoint unavailable")),
+                            tx,
                             move |_| async move {
                                 published.store(true, std::sync::atomic::Ordering::SeqCst);
                                 Ok(())
                             },
                         )
                     },
-                ).await;
+                )
+                .await;
             },
-        ).expect("required handshake");
-        let error = initial.recv_timeout(Duration::from_secs(2))
-            .expect("authority failure must complete first handshake").expect_err("startup must fail");
+        )
+        .expect("required handshake");
+        let error = initial
+            .recv_timeout(Duration::from_secs(2))
+            .expect("authority failure must complete first handshake")
+            .expect_err("startup must fail");
         assert!(error.contains("fresh checkpoint unavailable"));
-        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst),
-            "failed authority projection must never publish stale reach");
+        assert!(
+            !observed.load(std::sync::atomic::Ordering::SeqCst),
+            "failed authority projection must never publish stale reach"
+        );
     }
 }
 
@@ -5681,7 +6167,10 @@ mod native_launcher {
             .join(std::ffi::OsString::from_vec(b"parent-\xff.toml".to_vec()));
         HyprConfig::default().to_file(&config_path)?;
         let canonical = std::fs::canonicalize(&config_path)?;
-        assert!(canonical.to_str().is_none(), "fixture path must be non-UTF-8");
+        assert!(
+            canonical.to_str().is_none(),
+            "fixture path must be non-UTF-8"
+        );
 
         let matches = build_cli().try_get_matches_from([
             std::ffi::OsString::from("hyprstream"),
@@ -5729,15 +6218,16 @@ mod native_launcher {
         let mode = std::env::var(CAUSAL_MODE).unwrap_or_default();
         // The exact argv the launcher helper produced for the real binary.
         let args: Vec<String> = serde_json::from_str(&std::env::var(CAUSAL_ARGV)?)?;
-        let matches = build_cli().try_get_matches_from(
-            std::iter::once("hyprstream".to_owned()).chain(args),
-        )?;
+        let matches = build_cli()
+            .try_get_matches_from(std::iter::once("hyprstream".to_owned()).chain(args))?;
         let config = load_config(
             matches
                 .get_one::<std::path::PathBuf>("config")
                 .map(std::path::PathBuf::as_path),
         )?;
-        config.validate().context("child configuration validation")?;
+        config
+            .validate()
+            .context("child configuration validation")?;
         let _ = hyprstream_core::config::install_pinned_config(config.clone());
 
         let selected = native_service_process_name(&matches, &config)?;
@@ -5784,9 +6274,8 @@ mod native_launcher {
         stop_file: &Path,
         working_dir: &Path,
         child_instance: &str,
-    ) -> anyhow::Result<
-        Result<hyprstream_service::SpawnedProcess, hyprstream_rpc::error::RpcError>,
-    > {
+    ) -> anyhow::Result<Result<hyprstream_service::SpawnedProcess, hyprstream_rpc::error::RpcError>>
+    {
         let exe = std::env::current_exe()?;
         // Unique supervisor name: PID artifacts land under a test-owned
         // namespace, never the shared `model.pid` of a real deployment.
@@ -5832,12 +6321,8 @@ mod native_launcher {
             .to_bytes();
 
         // The exact invocation the launcher builds for the real binary.
-        let plan = direct_child_process_config(
-            SERVICE,
-            true,
-            Some(&canonical),
-            Path::new("hyprstream"),
-        )?;
+        let plan =
+            direct_child_process_config(SERVICE, true, Some(&canonical), Path::new("hyprstream"))?;
         let launch_args = plan.args.clone();
         assert!(
             !launch_args.iter().any(|arg| arg == "--ipc"),
@@ -5868,7 +6353,10 @@ mod native_launcher {
         .await?
         .expect("ready child proves config load, identity selection, and notify barrier");
         let observed = std::fs::read(&proof)?;
-        assert_eq!(observed, expected_vk, "child selected the provisioned signer");
+        assert_eq!(
+            observed, expected_vk,
+            "child selected the provisioned signer"
+        );
         // The READY child is genuinely running (its notification was not a
         // last-gasp message), with its PID file published under the unique
         // supervisor name.
@@ -5920,8 +6408,8 @@ mod native_launcher {
             missing_supervisor,
         )
         .await?;
-        let error = missing_outcome
-            .expect_err("launch must fail when the provisioned key is absent");
+        let error =
+            missing_outcome.expect_err("launch must fail when the provisioned key is absent");
         assert!(
             error.to_string().contains("exited during startup"),
             "child startup failure must propagate, got: {error}"
@@ -5933,7 +6421,6 @@ mod native_launcher {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod config_load_failure_tests {
@@ -5950,10 +6437,12 @@ mod config_load_failure_tests {
                     child.env_remove(key);
                 }
             }
-            let status = child.args([
-                "--exact", "config_load_failure_tests::invalid_config_never_defaults_account_selection",
-                "--nocapture",
-            ])
+            let status = child
+                .args([
+                    "--exact",
+                    "config_load_failure_tests::invalid_config_never_defaults_account_selection",
+                    "--nocapture",
+                ])
                 .env(CHILD, "1")
                 .env("XDG_CONFIG_HOME", root.path().join("config"))
                 .env("XDG_DATA_HOME", root.path().join("data"))
@@ -5967,7 +6456,9 @@ mod config_load_failure_tests {
             Ok(_) => anyhow::bail!("invalid port discarded PostgreSQL selection"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("Failed to load default-location configuration"));
+        assert!(error
+            .to_string()
+            .contains("Failed to load default-location configuration"));
         Ok(())
     }
 }

@@ -47,7 +47,10 @@ pub use state_store::{
 // local RocksDB store (`rocksdb` feature) or the networked RDS Postgres store
 // (`postgres` feature, selected by the resolved `[rds]` binding at bootstrap).
 // Both dependencies stay target-gated to non-wasm32.
-#[cfg(all(any(feature = "rocksdb", feature = "postgres"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    any(feature = "rocksdb", feature = "postgres"),
+    not(target_arch = "wasm32")
+))]
 mod checkpointed_pds;
 
 /// Create the empty checkpoint store for an explicitly provisioned fresh node.
@@ -131,42 +134,40 @@ pub mod scheduling;
 pub mod podspec;
 
 // Re-export key types
-pub use hyprstream_rpc::registry::SocketKind;
-pub use hyprstream_rpc::resolver::Resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub use did_anchored::{
     verify_anchor_material, DeploymentTrustSource, DidAnchors, VerifiedAnchorMaterial,
 };
+pub use hyprstream_rpc::registry::SocketKind;
+pub use hyprstream_rpc::resolver::Resolver;
 pub use plc_directory::{
     ConnectTimeDiscovery, DidOpSuccessorWitness, InMemoryPlcDirectoryStore, LivePlcDiscovery,
     PlcDirectory, PlcDirectoryRecord, PlcDirectoryStore, ResolvedPlcIdentity,
     SignedPlcDirectoryGenesis,
-};
-pub use service::{
-    authenticate_local_deployment_registry,
-    native_network_required, installed_bootstrap_discovery_client,
-    production_moq_event_target, production_moql_accepted_state_authority,
-    production_deployment_roster,
-    bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
-    AuthorizationProvider, DiscoveryService, DiscoverySelfAnnouncer, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
-    production_browser_currentness_verifier, production_browser_provisioning,
-    production_inference_rpc_client_at_transport, production_rpc_client,
-    verify_genesis_deployment_artifacts,
-    verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
-    verify_os_owned_service_key_enrollment, verify_service_key_enrollment,
-    registry_mint_capability, service_key_enrollment_capability,
-    delegation_capability_set_grants_enrollment, validate_delegation_ucan,
-    validate_registry_delegation,
-    DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
-    ServiceKeyEnrollmentArtifact, ServiceKeyEnrollmentSigningBody,
-    ValidatedDelegation, VerifiedDeploymentArtifacts, VerifiedServiceKeyEnrollment,
-    SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES,
 };
 #[cfg(feature = "test-fixtures")]
 #[doc(hidden)]
 pub use service::test_fixtures::{
     install_bootstrap_discovery_client_fixture, install_production_inference_fixture,
     ProductionInferenceFixture,
+};
+pub use service::{
+    authenticate_local_deployment_registry, bootstrap_deployment_process,
+    delegation_capability_set_grants_enrollment, deployment_registry_verifier,
+    installed_bootstrap_discovery_client, native_network_required,
+    production_browser_currentness_verifier, production_browser_provisioning,
+    production_deployment_roster, production_inference_rpc_client_at_transport,
+    production_moq_event_target, production_moql_accepted_state_authority, production_rpc_client,
+    registry_mint_capability, resolve_and_authenticate_did_anchors,
+    service_key_enrollment_capability, validate_delegation_ucan, validate_registry_delegation,
+    verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
+    verify_genesis_deployment_artifacts, verify_os_owned_service_key_enrollment,
+    verify_service_key_enrollment, AuthorizationProvider, DeploymentAuthorityCheckpoint,
+    DeploymentAuthorityLog, DiscoverySelfAnnouncer, DiscoveryService, RecordCarData,
+    RecordResolver, RegistryDelegationArtifact, RegistryDeploymentVerifier,
+    ServiceKeyEnrollmentArtifact, ServiceKeyEnrollmentSigningBody, ValidatedDelegation,
+    VerifiedDeploymentArtifacts, VerifiedServiceKeyEnrollment,
+    SERVICE_KEY_ENROLLMENT_ALLOWED_SERVICES,
 };
 
 /// Production client-construction adapter for the portable `rpc-std` clients.
@@ -191,10 +192,10 @@ impl hyprstream_rpc::RpcClientProvider for ProductionRpcClientProvider {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod did_field_domain_type_tests {
-    use hyprstream_rpc_std::discovery_capnp;
-    use hyprstream_rpc_std::discovery_client::{EnvelopeKeyset, RegisterEnvelopeKeysetRequest};
     use hyprstream_rpc::identity::Did;
     use hyprstream_rpc::{serialize_message, FromCapnp, ToCapnp};
+    use hyprstream_rpc_std::discovery_capnp;
+    use hyprstream_rpc_std::discovery_client::{EnvelopeKeyset, RegisterEnvelopeKeysetRequest};
 
     /// Field-level `$domainType("hyprstream_rpc::identity::Did")` on
     /// `EnvelopeKeyset.serviceDid` must generate a `Did` newtype field (not `String`),

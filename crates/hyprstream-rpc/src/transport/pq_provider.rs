@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use rustls::crypto::{CryptoProvider, aws_lc_rs};
+use rustls::crypto::{aws_lc_rs, CryptoProvider};
 
 const INTERNAL_MESH_GROUPS: &[rustls::NamedGroup] = &[rustls::NamedGroup::X25519MLKEM768];
 const EXTERNAL_INTEROP_GROUPS: &[rustls::NamedGroup] = &[

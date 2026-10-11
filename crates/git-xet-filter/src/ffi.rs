@@ -58,28 +58,21 @@ pub type FilterCheckFn = extern "C" fn(
     *const *const c_char,
 ) -> c_int;
 pub type FilterStreamFn = extern "C" fn(
-    *mut *mut OpaqueGitWriteStream,  // out (pointer to pointer)
-    *mut OpaqueGitFilter,             // self
-    *mut *mut c_void,                 // payload
-    *const OpaqueGitFilterSource,    // src
-    *mut OpaqueGitWriteStream,        // next
+    *mut *mut OpaqueGitWriteStream, // out (pointer to pointer)
+    *mut OpaqueGitFilter,           // self
+    *mut *mut c_void,               // payload
+    *const OpaqueGitFilterSource,   // src
+    *mut OpaqueGitWriteStream,      // next
 ) -> c_int;
 pub type FilterCleanupFn = extern "C" fn(*mut OpaqueGitFilter, *mut c_void);
 
 /// Writestream callback types
-pub type WriteStreamWriteFn = extern "C" fn(
-    stream: *mut GitWriteStreamBase,
-    buffer: *const c_char,
-    len: size_t,
-) -> c_int;
+pub type WriteStreamWriteFn =
+    extern "C" fn(stream: *mut GitWriteStreamBase, buffer: *const c_char, len: size_t) -> c_int;
 
-pub type WriteStreamCloseFn = extern "C" fn(
-    stream: *mut GitWriteStreamBase,
-) -> c_int;
+pub type WriteStreamCloseFn = extern "C" fn(stream: *mut GitWriteStreamBase) -> c_int;
 
-pub type WriteStreamFreeFn = extern "C" fn(
-    stream: *mut GitWriteStreamBase,
-);
+pub type WriteStreamFreeFn = extern "C" fn(stream: *mut GitWriteStreamBase);
 
 /// Base writestream structure (matches libgit2's git_writestream)
 /// Custom writestreams should embed this at the start of their struct

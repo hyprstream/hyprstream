@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 
-use hyprstream_rpc_std::worker_client::{KeyValue, ContainerState};
+use hyprstream_rpc_std::worker_client::{ContainerState, KeyValue};
 // Use generated ContainerMetadata (matches what's in generated ContainerConfig/ContainerStatus)
 use hyprstream_rpc_std::worker_client::ContainerMetadata;
 
@@ -49,7 +49,11 @@ pub struct Container {
 
 impl Container {
     /// Create a new container from configuration (uses generated ContainerConfig)
-    pub fn new(id: String, pod_sandbox_id: String, config: &hyprstream_rpc_std::worker_client::ContainerConfig) -> Self {
+    pub fn new(
+        id: String,
+        pod_sandbox_id: String,
+        config: &hyprstream_rpc_std::worker_client::ContainerConfig,
+    ) -> Self {
         Self {
             id,
             pod_sandbox_id,

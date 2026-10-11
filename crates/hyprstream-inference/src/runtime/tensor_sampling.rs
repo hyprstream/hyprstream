@@ -16,7 +16,7 @@ use tch::{Device, Tensor};
 /// to optimize for the target device (CPU, CUDA, ROCm, Metal, etc.).
 #[derive(Clone)]
 pub struct TensorSampler {
-    device: Device,  // Not dead code - used throughout the implementation
+    device: Device, // Not dead code - used throughout the implementation
 }
 
 impl TensorSampler {
@@ -66,7 +66,10 @@ impl TensorSampler {
     ) -> Result<usize> {
         let logits = self.squeeze_logits(logits_tensor);
         let penalized_logits = self.apply_repetition_penalty_tiered(
-            logits, repeat_penalty, previous_tokens, exempt_tokens,
+            logits,
+            repeat_penalty,
+            previous_tokens,
+            exempt_tokens,
         )?;
         self.sample_from_logits(penalized_logits, temperature, top_p, top_k)
     }
@@ -91,10 +94,7 @@ impl TensorSampler {
         .to_device(self.device);
 
         if logits.dim() != 1 {
-            tracing::warn!(
-                "Logits not 1D after squeeze: shape={:?}",
-                logits.size()
-            );
+            tracing::warn!("Logits not 1D after squeeze: shape={:?}", logits.size());
         }
         logits
     }
@@ -159,7 +159,10 @@ impl TensorSampler {
         repeat_penalty: f32,
         previous_tokens: &[i64],
     ) -> Result<Tensor> {
-        if repeat_penalty <= 0.0 || (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
+        if repeat_penalty <= 0.0
+            || (repeat_penalty - 1.0).abs() < 1e-6
+            || previous_tokens.is_empty()
+        {
             return Ok(logits);
         }
 
@@ -198,7 +201,10 @@ impl TensorSampler {
         previous_tokens: &[i64],
         exempt_tokens: &HashSet<i64>,
     ) -> Result<Tensor> {
-        if repeat_penalty <= 0.0 || (repeat_penalty - 1.0).abs() < 1e-6 || previous_tokens.is_empty() {
+        if repeat_penalty <= 0.0
+            || (repeat_penalty - 1.0).abs() < 1e-6
+            || previous_tokens.is_empty()
+        {
             return Ok(logits);
         }
 
@@ -228,7 +234,12 @@ impl TensorSampler {
         let mut result = logits.contiguous();
 
         if !full_penalty_ids.is_empty() {
-            self.apply_penalty_to_indices(&mut result, &full_penalty_ids, repeat_penalty, logits_kind)?;
+            self.apply_penalty_to_indices(
+                &mut result,
+                &full_penalty_ids,
+                repeat_penalty,
+                logits_kind,
+            )?;
         }
 
         if !reduced_penalty_ids.is_empty() {
@@ -258,8 +269,8 @@ impl TensorSampler {
         let penalty_tensor = Tensor::from_slice(&[penalty])
             .to_device(self.device)
             .to_kind(logits_kind);
-        let penalties = Tensor::ones([indices_vec.len() as i64], (logits_kind, self.device))
-            * penalty_tensor;
+        let penalties =
+            Tensor::ones([indices_vec.len() as i64], (logits_kind, self.device)) * penalty_tensor;
 
         let penalized_positive = &current_logits / &penalties;
         let penalized_negative = &current_logits * &penalties;
@@ -409,7 +420,7 @@ mod tests {
         // Very low temperature should approach greedy (highest logit wins)
         let token = sampler.sample_token(
             &logits,
-            0.01,  // Very low temp
+            0.01, // Very low temp
             1.0,
             None,
             1.0,
@@ -439,7 +450,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn test_repetition_penalty() -> Result<()> {
         let sampler = TensorSampler::new(Device::Cpu);
@@ -448,11 +458,11 @@ mod tests {
         // With high repetition penalty on token 4
         let token = sampler.sample_token(
             &logits,
-            0.01,  // Very low temp for deterministic
+            0.01, // Very low temp for deterministic
             1.0,
             None,
-            10.0,  // High penalty
-            &[4],  // Previous token was 4
+            10.0, // High penalty
+            &[4], // Previous token was 4
         )?;
 
         // Should NOT select token 4 despite it having highest logit
@@ -471,9 +481,9 @@ mod tests {
 
         // Apply penalty to token 4 (highest logit = 5.0)
         let penalized = sampler.apply_repetition_penalty(
-            logits,  // Pass ownership directly
-            2.0,  // 2x penalty
-            &[4, 4, 4],  // Token 4 appeared 3 times (but penalty is uniform, not exponential)
+            logits,     // Pass ownership directly
+            2.0,        // 2x penalty
+            &[4, 4, 4], // Token 4 appeared 3 times (but penalty is uniform, not exponential)
         )?;
 
         let penalized_vec: Vec<f32> = Vec::try_from(penalized)?;
@@ -481,16 +491,25 @@ mod tests {
         // Token 4 should be penalized with UNIFORM penalty (frequency ignored)
         // Original: 5.0, Penalized: 5.0 / 2.0 = 2.5
         // (NOT exponential: would be 5.0 / 2^3 = 0.625)
-        assert!(penalized_vec[4] < original_vec[4],
+        assert!(
+            penalized_vec[4] < original_vec[4],
             "Token 4 logit should be reduced: {} vs {}",
-            penalized_vec[4], original_vec[4]);
-        assert!((penalized_vec[4] - 2.5).abs() < 0.01,
-            "Token 4 should be ~2.5 (uniform penalty), got {}", penalized_vec[4]);
+            penalized_vec[4],
+            original_vec[4]
+        );
+        assert!(
+            (penalized_vec[4] - 2.5).abs() < 0.01,
+            "Token 4 should be ~2.5 (uniform penalty), got {}",
+            penalized_vec[4]
+        );
 
         // Other tokens should be unchanged
         for i in 0..4 {
-            assert_eq!(penalized_vec[i], original_vec[i],
-                "Token {} should be unchanged", i);
+            assert_eq!(
+                penalized_vec[i], original_vec[i],
+                "Token {} should be unchanged",
+                i
+            );
         }
         Ok(())
     }

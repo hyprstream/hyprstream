@@ -371,8 +371,7 @@ fn decode_basic_auth(header_value: &str) -> String {
 }
 
 fn base64_decode(input: &str) -> Vec<u8> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut lut = [0u8; 256];
     for (i, &c) in TABLE.iter().enumerate() {
         lut[c as usize] = i as u8;

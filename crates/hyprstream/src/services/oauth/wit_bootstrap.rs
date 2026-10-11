@@ -26,8 +26,8 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::server::middleware::AuthenticatedUser;
 use super::state::OAuthState;
+use crate::server::middleware::AuthenticatedUser;
 
 #[derive(Deserialize)]
 pub struct WitRequest {
@@ -46,7 +46,10 @@ pub async fn issue_browser_wit(
     let _ = (&state, &user, &body);
     (
         StatusCode::NOT_IMPLEMENTED,
-        [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
         Json(serde_json::json!({
             "error": "unsupported_grant_type",
             "error_description": "browser WIT bootstrap is disabled: a v16 credential cannot be \
@@ -62,12 +65,12 @@ pub async fn issue_browser_wit(
 mod tests {
     use super::*;
     use crate::config::OAuthConfig;
-    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
-    use hyprstream_rpc_std::policy_client::PolicyClient;
     use axum::extract::Extension;
     use hyprstream_rpc::rpc_client::RpcClientImpl;
     use hyprstream_rpc::signer::LocalSigner;
     use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
 
     fn test_state() -> Arc<OAuthState> {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
@@ -94,7 +97,9 @@ mod tests {
     }
 
     fn request() -> WitRequest {
-        WitRequest { pubkey: String::new() }
+        WitRequest {
+            pubkey: String::new(),
+        }
     }
 
     /// The browser WIT bootstrap route is DISABLED fail-closed for v16: it

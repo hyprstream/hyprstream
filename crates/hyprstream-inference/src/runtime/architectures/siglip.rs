@@ -80,7 +80,13 @@ impl LayerNorm {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(x.layer_norm([self.weight.size()[0]], Some(&self.weight), Some(&self.bias), self.eps, true))
+        Ok(x.layer_norm(
+            [self.weight.size()[0]],
+            Some(&self.weight),
+            Some(&self.bias),
+            self.eps,
+            true,
+        ))
     }
 }
 
@@ -150,7 +156,13 @@ impl SigLIPAttention {
         let qkv = x.matmul(&self.qkv_weight.tr()) + &self.qkv_bias;
 
         // Reshape to [B, N, 3, num_heads, head_dim]
-        let qkv = qkv.reshape([batch_size, seq_len, 3, self.num_heads as i64, self.head_dim as i64]);
+        let qkv = qkv.reshape([
+            batch_size,
+            seq_len,
+            3,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ]);
 
         // Permute to [3, B, num_heads, N, head_dim]
         let qkv = qkv.permute([2, 0, 3, 1, 4]);
@@ -168,10 +180,11 @@ impl SigLIPAttention {
         let out = attn.matmul(&v);
 
         // Reshape back: [B, N, hidden_size]
-        let out = out
-            .transpose(1, 2)
-            .contiguous()
-            .reshape([batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
+        let out = out.transpose(1, 2).contiguous().reshape([
+            batch_size,
+            seq_len,
+            (self.num_heads * self.head_dim) as i64,
+        ]);
 
         // Output projection
         let out = out.matmul(&self.proj_weight.tr()) + &self.proj_bias;
@@ -258,12 +271,7 @@ impl SigLIPBlock {
         device: Device,
         dtype: DType,
     ) -> Result<Self> {
-        let norm1 = LayerNorm::from_weights(
-            weights,
-            &format!("{prefix}.norm1"),
-            device,
-            dtype,
-        )?;
+        let norm1 = LayerNorm::from_weights(weights, &format!("{prefix}.norm1"), device, dtype)?;
 
         let attn = SigLIPAttention::from_weights(
             weights,
@@ -274,19 +282,9 @@ impl SigLIPBlock {
             dtype,
         )?;
 
-        let norm2 = LayerNorm::from_weights(
-            weights,
-            &format!("{prefix}.norm2"),
-            device,
-            dtype,
-        )?;
+        let norm2 = LayerNorm::from_weights(weights, &format!("{prefix}.norm2"), device, dtype)?;
 
-        let mlp = SigLIPMlp::from_weights(
-            weights,
-            &format!("{prefix}.mlp"),
-            device,
-            dtype,
-        )?;
+        let mlp = SigLIPMlp::from_weights(weights, &format!("{prefix}.mlp"), device, dtype)?;
 
         Ok(Self {
             norm1,
@@ -374,19 +372,9 @@ impl AttentionPool {
             .to_device(device)
             .to_kind(dtype);
 
-        let norm = LayerNorm::from_weights(
-            weights,
-            &format!("{prefix}.norm"),
-            device,
-            dtype,
-        )?;
+        let norm = LayerNorm::from_weights(weights, &format!("{prefix}.norm"), device, dtype)?;
 
-        let mlp = SigLIPMlp::from_weights(
-            weights,
-            &format!("{prefix}.mlp"),
-            device,
-            dtype,
-        )?;
+        let mlp = SigLIPMlp::from_weights(weights, &format!("{prefix}.mlp"), device, dtype)?;
 
         let head_dim = hidden_size / num_heads;
 
@@ -410,7 +398,7 @@ impl AttentionPool {
 
         // Expand latent queries: [num_queries, hidden_size] -> [B, num_queries, hidden_size]
         // The latent tensor may have extra dimensions, so squeeze first
-        let latent = self.latent.squeeze();  // Remove any singleton dimensions
+        let latent = self.latent.squeeze(); // Remove any singleton dimensions
         let latent = if latent.dim() == 1 {
             // If it's 1D [hidden_size], reshape to [1, hidden_size]
             latent.unsqueeze(0)
@@ -426,14 +414,25 @@ impl AttentionPool {
 
         // K, V from input
         let kv = x.matmul(&self.kv_weight.tr()) + &self.kv_bias;
-        let kv = kv.reshape([batch_size, seq_len, 2, self.num_heads as i64, self.head_dim as i64]);
+        let kv = kv.reshape([
+            batch_size,
+            seq_len,
+            2,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ]);
         let kv = kv.permute([2, 0, 3, 1, 4]);
         let k = kv.get(0);
         let v = kv.get(1);
 
         // Reshape Q: [B, num_queries, num_heads, head_dim]
-        let q = q.reshape([batch_size, num_queries, self.num_heads as i64, self.head_dim as i64]);
-        let q = q.transpose(1, 2);  // [B, num_heads, num_queries, head_dim]
+        let q = q.reshape([
+            batch_size,
+            num_queries,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ]);
+        let q = q.transpose(1, 2); // [B, num_heads, num_queries, head_dim]
 
         // Attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
@@ -484,7 +483,12 @@ impl SigLIPVisionTransformer {
         // Patch embedding (Conv2d projection)
         let patch_embed_weight = weights
             .get(&format!("{prefix}.patch_embed.proj.weight"))
-            .ok_or_else(|| anyhow!("Missing patch embed weight: {}.patch_embed.proj.weight", prefix))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Missing patch embed weight: {}.patch_embed.proj.weight",
+                    prefix
+                )
+            })?
             .to_device(device)
             .to_kind(dtype);
 
@@ -518,12 +522,7 @@ impl SigLIPVisionTransformer {
         debug!("Loaded {} transformer blocks", blocks.len());
 
         // Final layer norm
-        let norm = LayerNorm::from_weights(
-            weights,
-            &format!("{prefix}.norm"),
-            device,
-            dtype,
-        )?;
+        let norm = LayerNorm::from_weights(weights, &format!("{prefix}.norm"), device, dtype)?;
 
         // Optional attention pooling
         let attn_pool = if config.use_attention_pool {
@@ -563,16 +562,17 @@ impl SigLIPVisionTransformer {
         let mut x = images.conv2d(
             &self.patch_embed_weight,
             self.patch_embed_bias.as_ref(),
-            [stride, stride],  // stride
-            [0, 0],            // padding
-            [1, 1],            // dilation
-            1,                  // groups
+            [stride, stride], // stride
+            [0, 0],           // padding
+            [1, 1],           // dilation
+            1,                // groups
         );
 
         // Reshape: [B, hidden_size, H', W'] -> [B, num_patches, hidden_size]
         let (_, hidden_size, h, w) = x.size4()?;
         let num_patches = h * w;
-        x = x.permute([0, 2, 3, 1])  // [B, H', W', hidden_size]
+        x = x
+            .permute([0, 2, 3, 1]) // [B, H', W', hidden_size]
             .reshape([batch_size, num_patches, hidden_size]);
 
         debug!("After patch embed: {:?}", x.size());

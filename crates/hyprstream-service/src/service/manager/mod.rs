@@ -106,7 +106,9 @@ pub async fn detect_with_mode(target: ServiceTarget) -> Result<Box<dyn ServiceMa
         if hyprstream_rpc::has_systemd() {
             return match target {
                 ServiceTarget::System => Ok(Box::new(systemd::SystemdSystemManager::new().await?)),
-                ServiceTarget::UserSession => Ok(Box::new(systemd::SystemdManager::new_session().await?)),
+                ServiceTarget::UserSession => {
+                    Ok(Box::new(systemd::SystemdManager::new_session().await?))
+                }
                 ServiceTarget::User => Ok(Box::new(systemd::SystemdManager::new().await?)),
             };
         }
@@ -116,6 +118,6 @@ pub async fn detect_with_mode(target: ServiceTarget) -> Result<Box<dyn ServiceMa
 }
 
 // Re-exports
+pub use standalone::StandaloneManager;
 #[cfg(feature = "systemd")]
 pub use systemd::{SystemdManager, SystemdSystemManager};
-pub use standalone::StandaloneManager;

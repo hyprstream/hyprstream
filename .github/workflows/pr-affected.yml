@@ -1,10 +1,12 @@
 # Affected-set check: fast feedback for leaf-crate changes.
 #
-# Computes the workspace crates touched by a change and runs nextest + clippy
-# on just that set in the pinned builder (~2-3 min for a leaf crate instead of
-# the full gate's ~30 min). Root manifests, workspace-hack, toolchain, or
-# .github changes fall back to the full default-members set. Pure-docs PRs
-# no-op. Runs on the same self-hosted graviton pool as every other build job
+# Checks workspace Rust formatting, then computes the workspace crates touched
+# by a change and runs nextest + clippy on just that set in the pinned builder
+# (~2-3 min for a leaf crate instead of the full gate's ~30 min). Root
+# manifests, workspace-hack, toolchain, or .github changes fall back to the
+# full default-members set. The merge-group leg is required, so formatting and
+# Clippy must both pass on the exact queued candidate before it can land. Runs
+# on the same self-hosted graviton pool as every other build job
 # (hosted-runner zero scan: .github/build-matrix.json); uses its own sccache
 # + CARGO_TARGET_DIR namespace (target/hyprstream-pr) so it never contends
 # with the merge gate's target dir.
@@ -90,7 +92,7 @@ jobs:
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
 
-    - name: Affected-set nextest + clippy (in rust-builder container)
+    - name: Rust format, affected-set nextest + clippy (in rust-builder container)
       env:
         # pull_request: diff the PR head against its base. merge_group: diff
         # the synthetic merge-candidate head against its main-side base —
@@ -124,5 +126,6 @@ jobs:
           bash -euo pipefail -c '
             install -d -o ci -g ci /mnt/hypr-ci-cache/target/hyprstream-pr /build/.citmp
             chown -R ci:ci /build
+            runuser -u ci -- cargo fmt --all -- --check
             runuser -u ci -- python3 -B .github/scripts/pr_affected.py
           '

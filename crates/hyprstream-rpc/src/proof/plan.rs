@@ -126,9 +126,7 @@ impl SignerGroup {
                 1 => {
                     let gid = decode_uint(val, "group_id")?;
                     if gid > MAX_SIGNER_GROUP_ID {
-                        bail!(
-                            "signer_group: group_id {gid} exceeds ceiling {MAX_SIGNER_GROUP_ID}"
-                        );
+                        bail!("signer_group: group_id {gid} exceeds ceiling {MAX_SIGNER_GROUP_ID}");
                     }
                     group_id = Some(gid);
                 }

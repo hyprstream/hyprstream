@@ -28,7 +28,9 @@ use hyprstream_rpc_std::model_client::KVQuantType;
 ///
 /// Thin wrapper for `clap::ValueEnum` (can't derive on foreign types).
 /// Converts to the generated `KVQuantType` via `From`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum KVQuantArg {
     /// No quantization (full precision FP16/BF16)
@@ -58,7 +60,9 @@ impl From<KVQuantArg> for KVQuantType {
 /// This determines how services are spawned and managed:
 /// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport (default)
 /// - **IpcSystemd**: Multiple systemd services with socket activation, ipc:// ZMQ transport
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionMode {
     /// Standalone mode with forked processes (default for desktop/server/containers)

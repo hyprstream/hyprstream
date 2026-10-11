@@ -136,7 +136,10 @@ pub struct VerifiedClaimsMoqClearanceSource;
 
 #[async_trait::async_trait]
 impl ClearanceSource for VerifiedClaimsMoqClearanceSource {
-    async fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+    async fn clearance(
+        &self,
+        subject: &Subject,
+    ) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
         hyprstream_rpc::auth::mac::subject_context(subject, None).await
     }
 }
@@ -279,7 +282,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "5:tenantworker",
                 MoqEventAction::Publish,
-            ).await,
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )
@@ -306,7 +310,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "registry.repo789.push",
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Permit
         );
         // Only denials flow to the deny sink today (the permit-side WAL is
@@ -328,7 +333,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "registry.repo789.push",
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )

@@ -23,16 +23,16 @@ use hyprstream_rpc::browser_provisioning::{
 };
 
 use hyprstream_rpc::crypto::VerifyingKey;
-use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
-use hyprstream_rpc::rpc_client::FederateProofProvider;
+use hyprstream_rpc::envelope::RequestEnvelope;
 use hyprstream_rpc::proof::{
-    build::{AuthenticatedRequestProofInput, build_authenticated_hybrid_request_proof_with_signer},
+    build::{build_authenticated_hybrid_request_proof_with_signer, AuthenticatedRequestProofInput},
     recipient_binding::FederateRecipientBinding,
 };
-use hyprstream_rpc::envelope::RequestEnvelope;
+use hyprstream_rpc::rpc_client::FederateProofProvider;
+use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
 use hyprstream_rpc::signer::JsSigner;
-use hyprstream_rpc::transport_traits::Signer;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayload};
+use hyprstream_rpc::transport_traits::Signer;
 use hyprstream_rpc::web_transport::WtConnection;
 
 // ============================================================================
@@ -48,7 +48,10 @@ unsafe impl Sync for JsTokenProvider {}
 
 impl JsTokenProvider {
     fn call(&self) -> Option<String> {
-        self.0.call0(&wasm_bindgen::JsValue::NULL).ok().and_then(|v| v.as_string())
+        self.0
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .ok()
+            .and_then(|v| v.as_string())
     }
 }
 
@@ -74,9 +77,11 @@ impl WasmWtConnection {
     #[wasm_bindgen(constructor)]
     pub async fn connect(
         _url: &str,
-        _cert_hash: Option<String>,) -> Result<WasmWtConnection, JsError> {
-        Err( JsError::new(
-            "unprovisioned browser WebTransport dial is disabled; use RpcClient.connectResolved",))
+        _cert_hash: Option<String>,
+    ) -> Result<WasmWtConnection, JsError> {
+        Err(JsError::new(
+            "unprovisioned browser WebTransport dial is disabled; use RpcClient.connectResolved",
+        ))
     }
 }
 
@@ -113,15 +118,29 @@ struct BrowserFederateProofProvider {
 
 #[async_trait::async_trait(?Send)]
 impl FederateProofProvider for BrowserFederateProofProvider {
-    async fn proof_for(&self, envelope: &RequestEnvelope, capnp_body: &[u8]) -> anyhow::Result<Vec<u8>> {
-        anyhow::ensure!(envelope.delegation_token.is_none(), "Federate proof cannot delegate a bearer");
-        let service = envelope.service_domain.as_deref().ok_or_else(||
-            anyhow::anyhow!("Federate proof requires a canonical service domain"))?;
-        anyhow::ensure!(service == self.service_name, "Federate proof service mismatch");
-        let credential = envelope.jwt_token().ok_or_else(||
-            anyhow::anyhow!("Federate proof requires the host session credential"))?;
-        let issued_at = u64::try_from(envelope.iat).map_err(|_| anyhow::anyhow!(
-            "Federate proof requires a nonnegative request timestamp"))?;
+    async fn proof_for(
+        &self,
+        envelope: &RequestEnvelope,
+        capnp_body: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            envelope.delegation_token.is_none(),
+            "Federate proof cannot delegate a bearer"
+        );
+        let service = envelope
+            .service_domain
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Federate proof requires a canonical service domain"))?;
+        anyhow::ensure!(
+            service == self.service_name,
+            "Federate proof service mismatch"
+        );
+        let credential = envelope.jwt_token().ok_or_else(|| {
+            anyhow::anyhow!("Federate proof requires the host session credential")
+        })?;
+        let issued_at = u64::try_from(envelope.iat).map_err(|_| {
+            anyhow::anyhow!("Federate proof requires a nonnegative request timestamp")
+        })?;
         let binding = FederateRecipientBinding::from_recipients(
             envelope.response_kem_recipient.as_ref(),
             envelope.client_kem_public.as_ref(),
@@ -131,8 +150,9 @@ impl FederateProofProvider for BrowserFederateProofProvider {
             service_domain: service,
             credential: credential.as_bytes(),
             issued_at,
-            expires_at: issued_at.checked_add(30).ok_or_else(|| anyhow::anyhow!(
-                "Federate proof timestamp overflow"))?,
+            expires_at: issued_at
+                .checked_add(30)
+                .ok_or_else(|| anyhow::anyhow!("Federate proof timestamp overflow"))?,
             capnp_schema_id: self.request_schema_id,
             capnp_body,
             // v16 response-proof binding is a separate COSE response model.
@@ -143,8 +163,12 @@ impl FederateProofProvider for BrowserFederateProofProvider {
             federate_recipient_binding: Some(&binding),
         };
         build_authenticated_hybrid_request_proof_with_signer(
-            &input, &self.signer, &self.ed_kid, &self.pq_kid,
-        ).await
+            &input,
+            &self.signer,
+            &self.ed_kid,
+            &self.pq_kid,
+        )
+        .await
     }
 }
 
@@ -249,19 +273,21 @@ impl WasmRpcClient {
         sign_fn: js_sys::Function,
         server_verifying_key: Option<Vec<u8>>,
     ) -> Result<WasmRpcClient, JsError> {
-        let signer = JsSigner::new(signer_pubkey, sign_fn)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let signer =
+            JsSigner::new(signer_pubkey, sign_fn).map_err(|e| JsError::new(&e.to_string()))?;
 
-        let server_key: Option<VerifyingKey> = match server_verifying_key {
-            Some(bytes) => {
-                let arr: [u8; 32] = bytes.try_into()
-                    .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
-                Some(VerifyingKey::from_bytes(&arr)
-                    .map_err(|e| { JsError::new(&format!("invalid server verifying key: {}", e))
+        let server_key: Option<VerifyingKey> =
+            match server_verifying_key {
+                Some(bytes) => {
+                    let arr: [u8; 32] = bytes
+                        .try_into()
+                        .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
+                    Some(VerifyingKey::from_bytes(&arr).map_err(|e| {
+                        JsError::new(&format!("invalid server verifying key: {}", e))
                     })?)
-            }
-            None => None,
-        };
+                }
+                None => None,
+            };
 
         Ok(Self {
             inner: RpcClientImpl::new(signer, connection.inner, server_key),
@@ -349,19 +375,31 @@ impl WasmRpcClient {
         hyprstream_rpc::envelope::validate_service_domain(service_name)
             .map_err(|error| JsError::new(&error.to_string()))?;
         let request_schema_id = match service_name {
-            "registry" => <crate::registry_capnp::registry_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            "registry" => {
+                <crate::registry_capnp::registry_request::Reader<'static> as HasTypeId>::TYPE_ID
+            }
             "model" => <crate::model_capnp::model_request::Reader<'static> as HasTypeId>::TYPE_ID,
-            _ => return Err(JsError::new("Federate proof sender is limited to Registry and Model")),
+            _ => {
+                return Err(JsError::new(
+                    "Federate proof sender is limited to Registry and Model",
+                ))
+            }
         };
         if ed_pubkey == self.inner.signer.pubkey() {
-            return Err(JsError::new("Federate proof Ed25519 key must differ from the envelope key"));
+            return Err(JsError::new(
+                "Federate proof Ed25519 key must differ from the envelope key",
+            ));
         }
         if self.inner.signer.pq_pubkey().as_deref() == Some(pq_pubkey) {
-            return Err(JsError::new("Federate proof ML-DSA-65 key must differ from the envelope key"));
+            return Err(JsError::new(
+                "Federate proof ML-DSA-65 key must differ from the envelope key",
+            ));
         }
         for (name, kid) in [("Ed25519", ed_kid), ("ML-DSA-65", pq_kid)] {
             if kid.is_empty() || kid.len() > hyprstream_rpc::proof::MAX_KID_BYTES {
-                return Err(JsError::new(&format!("Federate proof {name} kid must be 1..64 bytes")));
+                return Err(JsError::new(&format!(
+                    "Federate proof {name} kid must be 1..64 bytes"
+                )));
             }
         }
         let signer = JsSigner::new_hybrid(ed_pubkey, ed_sign_fn, pq_pubkey, pq_sign_fn)
@@ -382,7 +420,8 @@ impl WasmRpcClient {
     ///
     /// Uses the client's default JWT (set via `withDefaultJwt()`).
     pub async fn call(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
-        self.inner.call(payload.to_vec())
+        self.inner
+            .call(payload.to_vec())
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -396,11 +435,7 @@ impl WasmRpcClient {
         payload: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         self.inner
-            .call_for_service_with_method(
-                service_name,
-                method_discriminator,
-                payload.to_vec(),
-            )
+            .call_for_service_with_method(service_name, method_discriminator, payload.to_vec())
             .await
             .map_err(|error| JsError::new(&error.to_string()))
     }
@@ -418,7 +453,8 @@ impl WasmRpcClient {
         delegated_bearer: Option<String>,
     ) -> Result<Vec<u8>, JsError> {
         let options = call_options(jwt, delegated_bearer);
-        self.inner.call_with_options(payload.to_vec(), options)
+        self.inner
+            .call_with_options(payload.to_vec(), options)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -453,7 +489,8 @@ impl WasmRpcClient {
         ephemeral_pubkey: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         let epk = fixed_ephemeral_pubkey(ephemeral_pubkey)?;
-        self.inner.call_streaming(payload.to_vec(), epk)
+        self.inner
+            .call_streaming(payload.to_vec(), epk)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -498,7 +535,8 @@ impl WasmRpcClient {
         method_discriminator: u16,
         payload: &[u8],
     ) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner
+        let handle = self
+            .inner
             .open_stream_for_service_with_method(
                 service_name,
                 method_discriminator,
@@ -519,7 +557,8 @@ impl WasmRpcClient {
         jwt: Option<String>,
         delegated_bearer: Option<String>,
     ) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner
+        let handle = self
+            .inner
             .open_stream_with_options_for_service_with_method(
                 service_name,
                 method_discriminator,
@@ -534,7 +573,9 @@ impl WasmRpcClient {
     /// Open a verified streaming subscription.
     #[wasm_bindgen(js_name = "openStream")]
     pub async fn open_stream(&self, payload: &[u8]) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner.open_stream(payload.to_vec())
+        let handle = self
+            .inner
+            .open_stream(payload.to_vec())
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(WasmStreamHandle { inner: handle })
@@ -563,13 +604,11 @@ impl WasmStreamHandle {
     #[wasm_bindgen(js_name = "nextPayload")]
     pub async fn next_payload(&mut self) -> Result<JsValue, JsError> {
         match self.inner.next_payload().await {
-            Ok(Some(StreamPayload::Data(data))) =>
-                Ok(js_sys::Uint8Array::from(&data[..]).into()),
+            Ok(Some(StreamPayload::Data(data))) => Ok(js_sys::Uint8Array::from(&data[..]).into()),
             Ok(Some(StreamPayload::Complete(meta))) => {
                 Ok(js_sys::Uint8Array::from(&meta[..]).into())
             }
-            Ok(Some(StreamPayload::Error(msg))) =>
-                Err(JsError::new(&msg)),
+            Ok(Some(StreamPayload::Error(msg))) => Err(JsError::new(&msg)),
             Ok(Some(StreamPayload::Tagged { payload, .. })) => {
                 Ok(js_sys::Uint8Array::from(&payload[..]).into())
             }
@@ -580,7 +619,9 @@ impl WasmStreamHandle {
 
     /// Cancel the stream via authenticated ctrl channel.
     pub async fn cancel(&mut self) -> Result<(), JsError> {
-        self.inner.cancel().await
+        self.inner
+            .cancel()
+            .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
 

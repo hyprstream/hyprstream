@@ -99,7 +99,10 @@ impl ParsedProof {
         Ok(proof)
     }
 
-    fn parse_with_federate_extension(cbor_bytes: &[u8], allow_federate_extension: bool) -> Result<Self> {
+    fn parse_with_federate_extension(
+        cbor_bytes: &[u8],
+        allow_federate_extension: bool,
+    ) -> Result<Self> {
         if cbor_bytes.len() > MAX_COSE_OBJECT_BYTES {
             bail!(
                 "proof: object size {} exceeds cap of {} bytes",
@@ -434,7 +437,10 @@ fn validate_signatures_against_plan(
 /// by kid, algorithm, key type, and curve/parameters, in the plan's component
 /// order. Private key material is forbidden. A malformed, unknown, duplicate,
 /// surplus, reordered, or mismatched key denies the complete proof (finding 3).
-pub(super) fn validate_unattributed_key_set(ks_val: &CborValue, plan: &SignaturePlan) -> Result<()> {
+pub(super) fn validate_unattributed_key_set(
+    ks_val: &CborValue,
+    plan: &SignaturePlan,
+) -> Result<()> {
     let arr = match ks_val {
         CborValue::Array(a) => a,
         _ => bail!("proof: hs_unattributed_key_set must be array"),

@@ -47,7 +47,10 @@ fn document(seed: u64, stratum: Stratum) -> Doc {
         _ => (clean, 0),
     };
     let valid = errors == 0;
-    debug_assert_eq!(valid, serde_json::from_str::<serde_json::Value>(&text).is_ok());
+    debug_assert_eq!(
+        valid,
+        serde_json::from_str::<serde_json::Value>(&text).is_ok()
+    );
     Doc {
         text,
         valid,

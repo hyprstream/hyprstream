@@ -67,11 +67,7 @@ fn seed_trust_store() {
 
 /// Build an OAuthService at `addr` exactly as the production factory does,
 /// with TLS OFF (plain-HTTP arm) and an IPC control transport.
-fn http_service_at(
-    oauth: &SigningKey,
-    addr: SocketAddr,
-    control: TransportConfig,
-) -> OAuthService {
+fn http_service_at(oauth: &SigningKey, addr: SocketAddr, control: TransportConfig) -> OAuthService {
     let mut tls = crate::config::TlsConfig::default();
     tls.enabled = false;
     service_at(oauth, addr, control, tls)
@@ -268,9 +264,7 @@ fn bridge_spawn_with_propagates_builder_failure() -> anyhow::Result<()> {
     let (bridge, mut ready) = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn_with(
         "readiness-fail-echo",
         || async {
-            Err::<rpc_handler::OAuthRpcHandler, _>(anyhow::anyhow!(
-                "injected bridge build failure"
-            ))
+            Err::<rpc_handler::OAuthRpcHandler, _>(anyhow::anyhow!("injected bridge build failure"))
         },
         Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
         0,
@@ -284,7 +278,9 @@ fn bridge_spawn_with_propagates_builder_failure() -> anyhow::Result<()> {
         match tokio::time::timeout(Duration::from_secs(30), &mut ready).await {
             Ok(Ok(Err(build_err))) => {
                 assert!(
-                    build_err.to_string().contains("injected bridge build failure"),
+                    build_err
+                        .to_string()
+                        .contains("injected bridge build failure"),
                     "builder error must be preserved: {build_err}"
                 );
             }
@@ -327,7 +323,10 @@ fn substrate_bind_failure_profile_mapping() -> anyhow::Result<()> {
         })
         .await
         .expect("Compatibility bind failure warns and continues");
-        assert!(compat.is_none(), "degraded Compatibility has no substrate owner");
+        assert!(
+            compat.is_none(),
+            "degraded Compatibility has no substrate owner"
+        );
     });
     Ok(())
 }
@@ -339,7 +338,8 @@ fn substrate_bind_failure_profile_mapping() -> anyhow::Result<()> {
 /// listener (RAII prebound handle closed on the failure path).
 #[test]
 fn run_occupied_http_listener_fails_before_ready() -> anyhow::Result<()> {
-    const CASE: &str = "services::oauth::readiness_tests::run_occupied_http_listener_fails_before_ready";
+    const CASE: &str =
+        "services::oauth::readiness_tests::run_occupied_http_listener_fails_before_ready";
     run_isolated(CASE, "HYPRSTREAM_OAUTH_READINESS_OCCUPIED_HTTP")?;
     if std::env::var_os("HYPRSTREAM_OAUTH_READINESS_OCCUPIED_HTTP").is_none() {
         return Ok(());
@@ -383,7 +383,8 @@ fn run_occupied_http_listener_fails_before_ready() -> anyhow::Result<()> {
 #[cfg(test)]
 #[test]
 fn run_occupied_https_listener_fails_before_ready() -> anyhow::Result<()> {
-    const CASE: &str = "services::oauth::readiness_tests::run_occupied_https_listener_fails_before_ready";
+    const CASE: &str =
+        "services::oauth::readiness_tests::run_occupied_https_listener_fails_before_ready";
     run_isolated(CASE, "HYPRSTREAM_OAUTH_READINESS_OCCUPIED_HTTPS")?;
     if std::env::var_os("HYPRSTREAM_OAUTH_READINESS_OCCUPIED_HTTPS").is_none() {
         return Ok(());
@@ -465,9 +466,8 @@ fn run_ready_then_real_http_and_bounded_shutdown() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let ready_outcome = rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(60), ready_rx).await
-    });
+    let ready_outcome =
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(60), ready_rx).await });
     let ready_fired = match ready_outcome {
         Ok(Ok(())) => true,
         // CLOSED READY: the run thread ended without ever signalling. Join it
@@ -482,13 +482,14 @@ fn run_ready_then_real_http_and_bounded_shutdown() -> anyhow::Result<()> {
                 .recv_timeout(Duration::from_secs(90))
                 .expect("run() must terminate within the shutdown budget");
             let run_result = joined.expect("run thread must not panic");
-            panic!(
-                "on_ready never fired; the actual run() result was: {run_result:?}"
-            );
+            panic!("on_ready never fired; the actual run() result was: {run_result:?}");
         }
     };
     assert!(ready_fired, "on_ready must fire on the success path");
-    assert!(control_path.exists(), "control UDS must be bound before READY");
+    assert!(
+        control_path.exists(),
+        "control UDS must be bound before READY"
+    );
 
     // Real HTTP request — proves the handler loop executes, not merely that
     // the backlog accepts.
@@ -604,7 +605,8 @@ fn run_compatibility_disabled_iroh_skips_substrate() -> anyhow::Result<()> {
 /// depth behind `validate_native_network_profile`.
 #[test]
 fn run_required_profile_disabled_iroh_fails_before_ready() -> anyhow::Result<()> {
-    const CASE: &str = "services::oauth::readiness_tests::run_required_profile_disabled_iroh_fails_before_ready";
+    const CASE: &str =
+        "services::oauth::readiness_tests::run_required_profile_disabled_iroh_fails_before_ready";
     run_isolated(CASE, "HYPRSTREAM_OAUTH_READINESS_REQUIRED_DISABLED")?;
     if std::env::var_os("HYPRSTREAM_OAUTH_READINESS_REQUIRED_DISABLED").is_none() {
         return Ok(());
@@ -612,14 +614,13 @@ fn run_required_profile_disabled_iroh_fails_before_ready() -> anyhow::Result<()>
     let env = ChildEnv::new("required-disabled");
     let oauth = SigningKey::from_bytes(&[0xA4; 32]);
     seed_trust_store();
-let addr = reserve_ephemeral_port();
+    let addr = reserve_ephemeral_port();
     let control_path = env.sock_dir.path().join("control.sock");
     let mut quic = crate::config::QuicConfig::default();
     quic.native_network_profile = crate::config::NativeNetworkProfile::NetworkIrohRequired;
     quic.enabled = false;
     quic.iroh = true;
-    let service = http_service_at(&oauth, addr, env.ipc_control())
-        .with_quic_config(quic);
+    let service = http_service_at(&oauth, addr, env.ipc_control()).with_quic_config(quic);
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let handle = std::thread::spawn(move || Box::new(service).run(shutdown, Some(ready_tx)));
@@ -662,8 +663,7 @@ fn manager_spawn_pre_ready_failure_maps_to_spawn_error() -> anyhow::Result<()> {
     };
     let manager = hyprstream_service::InprocManager::new();
     // The manager's startup handshake must not need Tokio's time driver.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()?;
+    let rt = tokio::runtime::Builder::new_current_thread().build()?;
     let spawned = rt.block_on(hyprstream_service::ServiceManager::spawn(
         &manager,
         Box::new(service),
@@ -673,7 +673,8 @@ fn manager_spawn_pre_ready_failure_maps_to_spawn_error() -> anyhow::Result<()> {
         Err(e) => e,
     };
     assert!(
-        err.to_string().contains("service thread exited before ready"),
+        err.to_string()
+            .contains("service thread exited before ready"),
         "failure must traverse the real ready-channel chain: {err}"
     );
     assert!(
@@ -687,9 +688,7 @@ fn manager_spawn_pre_ready_failure_maps_to_spawn_error() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     rt_wait
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(90), done_rx).await
-        })
+        .block_on(async { tokio::time::timeout(Duration::from_secs(90), done_rx).await })
         .expect("service teardown must finish within the budget")
         .expect("completion sender must outlive the inner run");
     Ok(())
@@ -790,7 +789,8 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
         &hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&ca.to_bytes()),
     ));
     std::fs::write(trust.join("deployment-ca.hybrid"), root)?;
-    let (log, checkpoint) = super::required_consumer_tests::did_trust::authority_log_and_checkpoint(&ca);
+    let (log, checkpoint) =
+        super::required_consumer_tests::did_trust::authority_log_and_checkpoint(&ca);
     std::fs::write(
         trust.join("deployment-authority.log.json"),
         serde_json::to_vec(&log)?,
@@ -799,7 +799,10 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
         trust.join("deployment-authority.head.json"),
         serde_json::to_vec(&checkpoint)?,
     )?;
-    std::fs::write(credentials.join("registry-service.jwt"), super::required_consumer_tests::did_trust::mint_credential(&ca, &registry))?;
+    std::fs::write(
+        credentials.join("registry-service.jwt"),
+        super::required_consumer_tests::did_trust::mint_credential(&ca, &registry),
+    )?;
     for (name, signer) in [
         ("registry", &registry),
         ("policy", &policy),
@@ -847,7 +850,11 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
     config.secrets.path = Some(secrets);
     crate::cli::deployment_bootstrap::provision_services(
         &config,
-        &["policy".to_owned(), "discovery".to_owned(), "oauth".to_owned()],
+        &[
+            "policy".to_owned(),
+            "discovery".to_owned(),
+            "oauth".to_owned(),
+        ],
         3600,
         None,
     )?;

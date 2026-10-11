@@ -97,7 +97,10 @@ impl ReleaseManifest {
 
     /// Get variant IDs that are available.
     pub fn variant_ids(&self) -> Vec<&str> {
-        self.variants.keys().map(std::string::String::as_str).collect()
+        self.variants
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 }
 

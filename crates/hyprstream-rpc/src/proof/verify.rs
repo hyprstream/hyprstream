@@ -214,9 +214,11 @@ pub fn verify_response_proof(
         }
     }
 
-    let record = resolver.resolve_service(expected_service_domain).ok_or_else(|| {
-        anyhow!("no enrolled response signer for service domain '{expected_service_domain}'")
-    })?;
+    let record = resolver
+        .resolve_service(expected_service_domain)
+        .ok_or_else(|| {
+            anyhow!("no enrolled response signer for service domain '{expected_service_domain}'")
+        })?;
     record.check_usable(now, proof.claims.exp, SignerRole::Service)?;
 
     let groups = &proof.plan.groups;
@@ -265,8 +267,9 @@ fn verify_unattributed(proof: &ParsedProof) -> Result<()> {
                 bail!("unattributed COSE_Sign1: alg {} not in profile", entry.alg);
             }
             // Match the key by its exact kid — never positionally.
-            let key = find_key_by_kid(&keys, &entry.kid)
-                .ok_or_else(|| anyhow!("unattributed proof: no key set entry for the signature kid"))?;
+            let key = find_key_by_kid(&keys, &entry.kid).ok_or_else(|| {
+                anyhow!("unattributed proof: no key set entry for the signature kid")
+            })?;
             let sign1 = coset::CoseSign1::from_slice(&cbor_bytes)
                 .map_err(|e| anyhow!("COSE_Sign1 decode: {e}"))?;
             sign1
@@ -282,21 +285,16 @@ fn verify_unattributed(proof: &ParsedProof) -> Result<()> {
                     ALG_ED25519 => {
                         let key = find_key_by_kid(&keys, &parsed_sig.kid)
                             .ok_or_else(|| anyhow!("sig {i}: no Ed25519 key for kid"))?;
-                        sign
-                            .verify_signature(i, &[], |s, d| {
-                                verify_ed25519(s, d, key)
-                            })
+                        sign.verify_signature(i, &[], |s, d| verify_ed25519(s, d, key))
                             .map_err(|e| anyhow!("sig {i} Ed25519 verification: {e}"))?;
                     }
                     ALG_ML_DSA_65 => {
                         let pq_key = extract_mldsa65_key_from_protected(
-                            &proof.protected_bytes, &parsed_sig.kid,
+                            &proof.protected_bytes,
+                            &parsed_sig.kid,
                         )?
                         .ok_or_else(|| anyhow!("sig {i}: no ML-DSA-65 key for kid"))?;
-                        sign
-                            .verify_signature(i, &[], |s, d| {
-                                verify_mldsa65(s, d, &pq_key)
-                            })
+                        sign.verify_signature(i, &[], |s, d| verify_mldsa65(s, d, &pq_key))
                             .map_err(|e| anyhow!("sig {i} ML-DSA-65 verification: {e}"))?;
                     }
                     other => bail!("unknown algorithm {other} in signature; denying"),
@@ -525,12 +523,7 @@ fn proof_to_cose_bytes(proof: &ParsedProof) -> Result<Vec<u8>> {
     let cose_value = match proof.structure {
         CoseStructure::Sign1 => {
             let sig_bstr = CborValue::Bytes(proof.signatures[0].signature.clone());
-            CborValue::Array(vec![
-                protected_bstr,
-                unprotected,
-                payload_bstr,
-                sig_bstr,
-            ])
+            CborValue::Array(vec![protected_bstr, unprotected, payload_bstr, sig_bstr])
         }
         CoseStructure::Sign => {
             let mut sig_entries = Vec::new();
@@ -559,7 +552,9 @@ fn proof_to_cose_bytes(proof: &ParsedProof) -> Result<Vec<u8>> {
 
 /// Extract Ed25519 public keys from the body-protected header's
 /// `hs_unattributed_key_set`.
-fn extract_ed25519_keys_from_protected(protected_bytes: &[u8]) -> Result<Vec<(Vec<u8>, ed25519_dalek::VerifyingKey)>> {
+fn extract_ed25519_keys_from_protected(
+    protected_bytes: &[u8],
+) -> Result<Vec<(Vec<u8>, ed25519_dalek::VerifyingKey)>> {
     let protected: ciborium::Value =
         ciborium::de::from_reader(&mut std::io::Cursor::new(protected_bytes))
             .map_err(|e| anyhow!("protected header decode: {e}"))?;
@@ -594,32 +589,37 @@ fn extract_ed25519_keys_from_protected(protected_bytes: &[u8]) -> Result<Vec<(Ve
         };
 
         // Check kty == 1 (OKP)
-        let kty = key_map.iter().find(|(k, _)| {
-            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 1)
-        }).and_then(|(_, v)| match v {
-            ciborium::Value::Integer(i) => Some(i128::from(*i)),
-            _ => None,
-        });
+        let kty = key_map
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 1))
+            .and_then(|(_, v)| match v {
+                ciborium::Value::Integer(i) => Some(i128::from(*i)),
+                _ => None,
+            });
 
         if kty != Some(1) {
             continue; // Skip non-OKP keys (ML-DSA-65 handled separately)
         }
 
         // Extract kid (label 2)
-        let kid = key_map.iter().find(|(k, _)| {
-            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 2)
-        }).and_then(|(_, v)| match v {
-            ciborium::Value::Bytes(b) => Some(b.clone()),
-            _ => None,
-        }).unwrap_or_default();
+        let kid = key_map
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 2))
+            .and_then(|(_, v)| match v {
+                ciborium::Value::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         // Extract x (label -2) — the 32-byte Ed25519 public key
-        let x = key_map.iter().find(|(k, _)| {
-            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == -2)
-        }).and_then(|(_, v)| match v {
-            ciborium::Value::Bytes(b) => Some(b.clone()),
-            _ => None,
-        }).ok_or_else(|| anyhow!("OKP key missing x coordinate"))?;
+        let x = key_map
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == -2))
+            .and_then(|(_, v)| match v {
+                ciborium::Value::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("OKP key missing x coordinate"))?;
 
         if x.len() != 32 {
             bail!("Ed25519 x coordinate must be 32 bytes, got {}", x.len());
@@ -656,7 +656,8 @@ fn verify_ed25519(
     let mut sig_bytes = [0u8; 64];
     sig_bytes.copy_from_slice(sig);
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    key.verify(data, &sig).map_err(|_| "Ed25519 verification failed")
+    key.verify(data, &sig)
+        .map_err(|_| "Ed25519 verification failed")
 }
 
 /// Extract an ML-DSA-65 public key from the body-protected header's
@@ -701,36 +702,41 @@ fn extract_mldsa65_key_from_protected(
         };
 
         // Check kty == 7 (AKP)
-        let kty = key_map.iter().find(|(k, _)| {
-            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 7)
-        }).and_then(|(_, v)| match v {
-            ciborium::Value::Integer(i) => Some(i128::from(*i)),
-            _ => None,
-        });
+        let kty = key_map
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 7))
+            .and_then(|(_, v)| match v {
+                ciborium::Value::Integer(i) => Some(i128::from(*i)),
+                _ => None,
+            });
 
         if kty != Some(7) {
             continue;
         }
 
         // Match kid
-        let key_kid = key_map.iter().find(|(k, _)| {
-            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 2)
-        }).and_then(|(_, v)| match v {
-            ciborium::Value::Bytes(b) => Some(b.clone()),
-            _ => None,
-        }).unwrap_or_default();
+        let key_kid = key_map
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 2))
+            .and_then(|(_, v)| match v {
+                ciborium::Value::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         if key_kid != kid {
             continue;
         }
 
         // Extract pub (label -1) — 1952-byte ML-DSA-65 public key
-        let pub_key = key_map.iter().find(|(k, _)| {
-            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == -1)
-        }).and_then(|(_, v)| match v {
-            ciborium::Value::Bytes(b) => Some(b.clone()),
-            _ => None,
-        }).ok_or_else(|| anyhow!("AKP key missing pub field"))?;
+        let pub_key = key_map
+            .iter()
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == -1))
+            .and_then(|(_, v)| match v {
+                ciborium::Value::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("AKP key missing pub field"))?;
 
         if pub_key.len() != 1952 {
             bail!("ML-DSA-65 pub must be 1952 bytes, got {}", pub_key.len());
@@ -757,8 +763,7 @@ fn verify_mldsa65(
 mod tests {
     use super::super::parser::ParsedProof;
     use super::super::tests::{
-        classical_enrollment, ed25519_public, hybrid_enrollment, FIXTURE_NOW,
-        FIXTURE_REQUEST_ID,
+        classical_enrollment, ed25519_public, hybrid_enrollment, FIXTURE_NOW, FIXTURE_REQUEST_ID,
     };
     use super::*;
 
@@ -822,9 +827,13 @@ mod tests {
         assert_eq!(proof.structure, CoseStructure::Sign);
         assert_eq!(proof.signatures.len(), 2);
         let resolver = hybrid_enrollment();
-        let verified =
-            verify_proof_signatures(&proof, Some(&hybrid_client_cnf()), Some(&resolver), FIXTURE_NOW)
-                .expect("P-2 must verify: both Ed25519 and ML-DSA-65 components");
+        let verified = verify_proof_signatures(
+            &proof,
+            Some(&hybrid_client_cnf()),
+            Some(&resolver),
+            FIXTURE_NOW,
+        )
+        .expect("P-2 must verify: both Ed25519 and ML-DSA-65 components");
         assert_eq!(verified.primary_principal.as_deref(), Some("client"));
     }
 
@@ -943,10 +952,13 @@ mod tests {
     fn unenrolled_credential_denies() {
         let stranger = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key();
         let resolver = classical_enrollment();
-        assert!(
-            verify_proof_signatures(&parse("P-5"), Some(&stranger), Some(&resolver), FIXTURE_NOW)
-                .is_err()
-        );
+        assert!(verify_proof_signatures(
+            &parse("P-5"),
+            Some(&stranger),
+            Some(&resolver),
+            FIXTURE_NOW
+        )
+        .is_err());
     }
 
     /// Component-key separation: a key enrolled for the WNS hybrid suite is
@@ -959,13 +971,23 @@ mod tests {
         // P-4 and P-5 are both standalone-suite (classical Sign1 and Sign
         // respectively); each must deny under the hybrid-only enrollment.
         assert!(
-            verify_proof_signatures(&parse("P-4"), Some(&client_cnf()), Some(&hybrid), FIXTURE_NOW)
-                .is_err(),
+            verify_proof_signatures(
+                &parse("P-4"),
+                Some(&client_cnf()),
+                Some(&hybrid),
+                FIXTURE_NOW
+            )
+            .is_err(),
             "P-4 (standalone suite) must deny under a hybrid enrollment"
         );
         assert!(
-            verify_proof_signatures(&parse("P-5"), Some(&client_cnf()), Some(&hybrid), FIXTURE_NOW)
-                .is_err(),
+            verify_proof_signatures(
+                &parse("P-5"),
+                Some(&client_cnf()),
+                Some(&hybrid),
+                FIXTURE_NOW
+            )
+            .is_err(),
             "P-5 (standalone suite) must deny under a hybrid enrollment"
         );
         assert!(
@@ -994,8 +1016,13 @@ mod tests {
         proof.signatures[idx].signature[0] ^= 0xFF;
         let resolver = hybrid_enrollment();
         assert!(
-            verify_proof_signatures(&proof, Some(&hybrid_client_cnf()), Some(&resolver), FIXTURE_NOW)
-                .is_err(),
+            verify_proof_signatures(
+                &proof,
+                Some(&hybrid_client_cnf()),
+                Some(&resolver),
+                FIXTURE_NOW
+            )
+            .is_err(),
             "a corrupted ML-DSA-65 component must deny"
         );
     }
@@ -1011,10 +1038,13 @@ mod tests {
             .expect("P-2 has an Ed25519 component");
         proof.signatures[idx].signature[0] ^= 0xFF;
         let resolver = hybrid_enrollment();
-        assert!(
-            verify_proof_signatures(&proof, Some(&hybrid_client_cnf()), Some(&resolver), FIXTURE_NOW)
-                .is_err()
-        );
+        assert!(verify_proof_signatures(
+            &proof,
+            Some(&hybrid_client_cnf()),
+            Some(&resolver),
+            FIXTURE_NOW
+        )
+        .is_err());
     }
 
     /// A revoked enrollment denies; so does one whose validity has passed,
@@ -1122,7 +1152,7 @@ mod tests {
                     epoch: 1,
                     role: SignerRole::Primary,
                     approver_role: None,
-            enrollment_policy_id: "test-enrollment-v1".to_owned(),
+                    enrollment_policy_id: "test-enrollment-v1".to_owned(),
                     not_after: 1_786_000_600,
                     revoked: false,
                 },
@@ -1140,7 +1170,7 @@ mod tests {
                 epoch: 1,
                 role: SignerRole::Approver,
                 approver_role: None,
-            enrollment_policy_id: "test-enrollment-v1".to_owned(),
+                enrollment_policy_id: "test-enrollment-v1".to_owned(),
                 not_after: 1_786_000_600,
                 revoked: false,
             })
@@ -1234,7 +1264,7 @@ mod tests {
                     epoch: 1,
                     role: SignerRole::Service,
                     approver_role: None,
-            enrollment_policy_id: "test-enrollment-v1".to_owned(),
+                    enrollment_policy_id: "test-enrollment-v1".to_owned(),
                     not_after: 1_786_000_600,
                     revoked: false,
                 },

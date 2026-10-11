@@ -18,7 +18,7 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::VerifyingKey;
-use hyprstream_rpc::auth::{JwkThumbprintInput, jwk_thumbprint};
+use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -34,18 +34,16 @@ pub enum DpopKey {
 impl DpopKey {
     pub fn jkt(&self) -> String {
         match self {
-            DpopKey::Ed25519 { bytes } => {
-                jwk_thumbprint(&JwkThumbprintInput::Ed25519 { x: bytes })
-            }
-            DpopKey::Es256 { x, y } => {
-                jwk_thumbprint(&JwkThumbprintInput::Es256 { x, y })
-            }
-            DpopKey::MlDsa65 { pub_bytes } => {
-                jwk_thumbprint(&JwkThumbprintInput::Akp { alg: "ML-DSA-65", pub_bytes })
-            }
-            DpopKey::MlDsa65Ed25519 { pub_bytes } => {
-                jwk_thumbprint(&JwkThumbprintInput::Akp { alg: "ML-DSA-65-Ed25519", pub_bytes })
-            }
+            DpopKey::Ed25519 { bytes } => jwk_thumbprint(&JwkThumbprintInput::Ed25519 { x: bytes }),
+            DpopKey::Es256 { x, y } => jwk_thumbprint(&JwkThumbprintInput::Es256 { x, y }),
+            DpopKey::MlDsa65 { pub_bytes } => jwk_thumbprint(&JwkThumbprintInput::Akp {
+                alg: "ML-DSA-65",
+                pub_bytes,
+            }),
+            DpopKey::MlDsa65Ed25519 { pub_bytes } => jwk_thumbprint(&JwkThumbprintInput::Akp {
+                alg: "ML-DSA-65-Ed25519",
+                pub_bytes,
+            }),
         }
     }
 
@@ -179,8 +177,9 @@ pub fn verify_dpop_proof(
             let ml_dsa_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(ml_dsa_pub)
                 .map_err(|_| DpopError::InvalidJwk)?;
             let ed25519_vk = ed25519_dalek::VerifyingKey::from_bytes(
-                ed25519_pub.try_into().map_err(|_| DpopError::InvalidJwk)?
-            ).map_err(|_| DpopError::InvalidJwk)?;
+                ed25519_pub.try_into().map_err(|_| DpopError::InvalidJwk)?,
+            )
+            .map_err(|_| DpopError::InvalidJwk)?;
             // Composite sig: ML-DSA-65 (3309) + Ed25519 (64)
             if sig_bytes.len() != 3309 + 64 {
                 return Err(DpopError::SignatureInvalid);
@@ -191,7 +190,8 @@ pub fn verify_dpop_proof(
             let mut ed_sig_arr = [0u8; 64];
             ed_sig_arr.copy_from_slice(ed_sig);
             let ed_signature = ed25519_dalek::Signature::from_bytes(&ed_sig_arr);
-            ed25519_vk.verify_strict(signing_input.as_bytes(), &ed_signature)
+            ed25519_vk
+                .verify_strict(signing_input.as_bytes(), &ed_signature)
                 .map_err(|_| DpopError::SignatureInvalid)?;
             DpopKey::MlDsa65Ed25519 { pub_bytes }
         }
@@ -207,13 +207,20 @@ pub fn verify_dpop_proof(
         .map_err(|e| DpopError::InvalidFormat(format!("payload JSON: {e}")))?;
 
     // Required claims.
-    let jti = payload["jti"].as_str()
-        .ok_or(DpopError::MissingClaim("jti"))?.to_owned();
-    let htm = payload["htm"].as_str()
-        .ok_or(DpopError::MissingClaim("htm"))?.to_owned();
-    let htu = payload["htu"].as_str()
-        .ok_or(DpopError::MissingClaim("htu"))?.to_owned();
-    let iat = payload["iat"].as_i64()
+    let jti = payload["jti"]
+        .as_str()
+        .ok_or(DpopError::MissingClaim("jti"))?
+        .to_owned();
+    let htm = payload["htm"]
+        .as_str()
+        .ok_or(DpopError::MissingClaim("htm"))?
+        .to_owned();
+    let htu = payload["htu"]
+        .as_str()
+        .ok_or(DpopError::MissingClaim("htu"))?
+        .to_owned();
+    let iat = payload["iat"]
+        .as_i64()
         .ok_or(DpopError::MissingClaim("iat"))?;
 
     // Validate htm and htu.
@@ -225,7 +232,11 @@ pub fn verify_dpop_proof(
     }
     // htu comparison: strip trailing slash, ignore query/fragment.
     let htu_normalized = htu.split('?').next().unwrap_or(&htu).trim_end_matches('/');
-    let expected_htu_norm = expected_htu.split('?').next().unwrap_or(expected_htu).trim_end_matches('/');
+    let expected_htu_norm = expected_htu
+        .split('?')
+        .next()
+        .unwrap_or(expected_htu)
+        .trim_end_matches('/');
     if htu_normalized != expected_htu_norm {
         return Err(DpopError::HtuMismatch {
             expected: expected_htu.to_owned(),
@@ -269,7 +280,9 @@ fn extract_ed25519_key(jwk: &serde_json::Value) -> Result<[u8; 32], DpopError> {
         return Err(DpopError::InvalidJwk);
     }
     let x = jwk["x"].as_str().ok_or(DpopError::InvalidJwk)?;
-    let bytes = URL_SAFE_NO_PAD.decode(x).map_err(|_| DpopError::InvalidJwk)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|_| DpopError::InvalidJwk)?;
     bytes.try_into().map_err(|_| DpopError::InvalidJwk)
 }
 
@@ -279,12 +292,16 @@ fn extract_p256_key(jwk: &serde_json::Value) -> Result<([u8; 32], [u8; 32]), Dpo
     }
     let x_str = jwk["x"].as_str().ok_or(DpopError::InvalidJwk)?;
     let y_str = jwk["y"].as_str().ok_or(DpopError::InvalidJwk)?;
-    let x_bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(x_str)
+    let x_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(x_str)
         .map_err(|_| DpopError::InvalidJwk)?
-        .try_into().map_err(|_| DpopError::InvalidJwk)?;
-    let y_bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(y_str)
+        .try_into()
+        .map_err(|_| DpopError::InvalidJwk)?;
+    let y_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(y_str)
         .map_err(|_| DpopError::InvalidJwk)?
-        .try_into().map_err(|_| DpopError::InvalidJwk)?;
+        .try_into()
+        .map_err(|_| DpopError::InvalidJwk)?;
     Ok((x_bytes, y_bytes))
 }
 
@@ -293,33 +310,36 @@ fn extract_akp_pub(jwk: &serde_json::Value) -> Result<Vec<u8>, DpopError> {
         return Err(DpopError::InvalidJwk);
     }
     let pub_str = jwk["pub"].as_str().ok_or(DpopError::InvalidJwk)?;
-    URL_SAFE_NO_PAD.decode(pub_str).map_err(|_| DpopError::InvalidJwk)
+    URL_SAFE_NO_PAD
+        .decode(pub_str)
+        .map_err(|_| DpopError::InvalidJwk)
 }
 
 fn verify_ed25519(key_bytes: &[u8; 32], msg: &[u8], sig_bytes: &[u8]) -> Result<(), DpopError> {
-    let verifying_key = VerifyingKey::from_bytes(key_bytes)
-        .map_err(|_| DpopError::InvalidJwk)?;
-    let sig_array: [u8; 64] = sig_bytes.try_into()
+    let verifying_key = VerifyingKey::from_bytes(key_bytes).map_err(|_| DpopError::InvalidJwk)?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
         .map_err(|_| DpopError::SignatureInvalid)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
     use ed25519_dalek::Verifier;
-    verifying_key.verify(msg, &signature)
+    verifying_key
+        .verify(msg, &signature)
         .map_err(|_| DpopError::SignatureInvalid)
 }
 
 fn verify_es256(x: &[u8; 32], y: &[u8; 32], msg: &[u8], sig_bytes: &[u8]) -> Result<(), DpopError> {
-    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
     use p256::EncodedPoint;
 
     let point = EncodedPoint::from_affine_coordinates(x.into(), y.into(), false);
-    let verifying_key = VerifyingKey::from_encoded_point(&point)
-        .map_err(|_| DpopError::InvalidJwk)?;
+    let verifying_key =
+        VerifyingKey::from_encoded_point(&point).map_err(|_| DpopError::InvalidJwk)?;
 
     // JWS ES256 signatures are fixed-size r||s (64 bytes), not DER.
-    let signature = Signature::from_slice(sig_bytes)
-        .map_err(|_| DpopError::SignatureInvalid)?;
+    let signature = Signature::from_slice(sig_bytes).map_err(|_| DpopError::SignatureInvalid)?;
 
-    verifying_key.verify(msg, &signature)
+    verifying_key
+        .verify(msg, &signature)
         .map_err(|_| DpopError::SignatureInvalid)
 }
 
@@ -329,8 +349,8 @@ mod dpop_nonce_tests {
     //! Building a full `OAuthState` requires a live `PolicyClient` (ZMQ),
     //! so we mirror the `HashMap<jkt, expiry>` shape used in `state.rs`
     //! and assert the invariants the verifier relies on.
-    use std::collections::HashMap;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
 
     struct NonceState {
         nonces: Mutex<HashMap<String, i64>>,
@@ -452,7 +472,10 @@ mod dpop_stripping_tests {
             URL_SAFE_NO_PAD.encode(payload.to_string()),
         );
         let signature = signing_key.sign(signing_input.as_bytes());
-        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
     }
 
     #[test]
@@ -493,10 +516,16 @@ mod dpop_stripping_tests {
 
         // Stripped: only Ed25519 half (64 bytes) — composite-alg verifier
         // requires 3309 + 64 bytes. Stripping must fail.
-        let stripped = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(ed_sig.to_bytes()));
-        let err = verify_dpop_proof(&stripped, "POST", "https://example.test/oauth/token", None).err();
-        assert!(matches!(err, Some(DpopError::SignatureInvalid)),
-            "expected SignatureInvalid, got {err:?}");
+        let stripped = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(ed_sig.to_bytes())
+        );
+        let err =
+            verify_dpop_proof(&stripped, "POST", "https://example.test/oauth/token", None).err();
+        assert!(
+            matches!(err, Some(DpopError::SignatureInvalid)),
+            "expected SignatureInvalid, got {err:?}"
+        );
     }
 
     #[test]

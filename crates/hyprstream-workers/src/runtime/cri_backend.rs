@@ -69,8 +69,8 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{NamespaceDelivery, NamespaceTransport, SandboxBackend, SandboxHandle};
-use hyprstream_rpc_std::worker_client::{KeyValue, LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+use hyprstream_rpc_std::worker_client::{KeyValue, LinuxContainerResources, PodSandboxConfig};
 
 use cri::image_service_client::ImageServiceClient;
 use cri::runtime_service_client::RuntimeServiceClient;

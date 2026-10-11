@@ -20,26 +20,27 @@ use tokio::sync::RwLock;
 use git2db::Git2DB;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
+use hyprstream_core::services::revocation::PolicyAuthorityRevocationStore;
 use hyprstream_core::services::PolicyService;
 use hyprstream_rpc_std::policy_client::PolicyClient;
-use hyprstream_core::services::revocation::PolicyAuthorityRevocationStore;
 
 use hyprstream_rpc::auth::{
-    CredentialId, CredentialRevocationStore, FileBackedCredentialRevocationStore,
-    global_credential_revocation_store, set_global_credential_revocation_store,
+    global_credential_revocation_store, set_global_credential_revocation_store, CredentialId,
+    CredentialRevocationStore, FileBackedCredentialRevocationStore,
 };
-use hyprstream_rpc::crypto::CryptoPolicy;
 use hyprstream_rpc::crypto::hybrid_kem::{KemTrustStore, KeyedKemTrustStore};
+use hyprstream_rpc::crypto::CryptoPolicy;
 use hyprstream_rpc::envelope::{
-    EnvelopeVerifyConfig, InMemoryNonceCache, KeyedPqTrustStore, PqTrustStore, install_verify_config,
+    install_verify_config, EnvelopeVerifyConfig, InMemoryNonceCache, KeyedPqTrustStore,
+    PqTrustStore,
 };
 use hyprstream_rpc::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::signer::LocalSigner;
-use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::transport::iroh_rpc::{IrohRpcProtocolHandler, LocalServiceBridge};
-use hyprstream_rpc::transport::iroh_substrate::{ALPN_HYPRSTREAM_RPC, IrohSubstrate, NoopHandler};
+use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC};
 use hyprstream_rpc::transport::iroh_transport::IrohTransport;
+use hyprstream_rpc::transport::TransportConfig;
 
 use iroh::{EndpointAddr, TransportAddr};
 
@@ -173,7 +174,10 @@ async fn revocation_store_for(
         .with_request_kem_store(request_kem_store(&server_signing_key())?)
         .with_response_pq_store(pq_trust_store());
     let client = PolicyClient::new(Arc::new(rpc));
-    Ok((client_substrate, PolicyAuthorityRevocationStore::new(client)))
+    Ok((
+        client_substrate,
+        PolicyAuthorityRevocationStore::new(client),
+    ))
 }
 
 /// Publish the authority-side durable store (tempdir-backed) as the
@@ -181,13 +185,16 @@ async fn revocation_store_for(
 /// global. Get-or-init: the OnceLock is per test-binary process. The returned
 /// bool is `true` when THIS call installed the global (its file is then the
 /// authoritative log); when `false`, an earlier test's store is the live one.
-fn install_authority_store(temp: &TempDir) -> Result<(Arc<FileBackedCredentialRevocationStore>, bool)> {
+fn install_authority_store(
+    temp: &TempDir,
+) -> Result<(Arc<FileBackedCredentialRevocationStore>, bool)> {
     let path = temp.path().join("credential-revocations.jsonl");
     let store = Arc::new(FileBackedCredentialRevocationStore::open(&path)?);
     let mut installed_here = false;
     if global_credential_revocation_store().is_none() {
-        set_global_credential_revocation_store(store.clone())
-            .map_err(|e| anyhow::anyhow!("no other test in this binary publishes the global store: {e}"))?;
+        set_global_credential_revocation_store(store.clone()).map_err(|e| {
+            anyhow::anyhow!("no other test in this binary publishes the global store: {e}")
+        })?;
         installed_here = true;
     }
     Ok((store, installed_here))
@@ -226,7 +233,7 @@ static CACHE_TEST_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// anonymous floor). One-shot; widening flushes the cache generation.
 fn ensure_identity_aware_activation() {
     use hyprstream_rpc::auth::mac::{
-        MacActivationEvidence, MacActivationMode, global_mac_activation_control,
+        global_mac_activation_control, MacActivationEvidence, MacActivationMode,
     };
 
     let control = global_mac_activation_control();
@@ -253,18 +260,16 @@ fn ensure_identity_aware_activation() {
 /// Seed a credential-bearing verified-subject cache entry for `subject_name`.
 fn remember_cached_subject(issuer: &str, jti: &str, subject_name: &str) -> CredentialId {
     use hyprstream_rpc::auth::mac::{
-        Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
-        remember_verified_claims_with_credential,
+        remember_verified_claims_with_credential, Assurance, CompartmentSet, Level, SecurityLabel,
+        VerifiedKeyMaterial,
     };
 
     let now = chrono::Utc::now().timestamp();
     let cred_id = CredentialId::jwt(issuer, jti);
-    let mut claims = hyprstream_rpc::auth::Claims::new(subject_name.to_owned(), now, now + 300)
-        .with_clearance(SecurityLabel::new(
-            Level::Secret,
-            Assurance::Classical,
-            CompartmentSet::EMPTY,
-        ));
+    let mut claims =
+        hyprstream_rpc::auth::Claims::new(subject_name.to_owned(), now, now + 300).with_clearance(
+            SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY),
+        );
     claims.iss = issuer.to_owned();
     claims.jti = Some(jti.to_owned());
     let subject = hyprstream_rpc::envelope::Subject::new(subject_name);
@@ -471,11 +476,16 @@ async fn revocation_client_consumes_renewed_service_jwt() -> Result<()> {
     let key_source = ClusterKeySource::new(ca_key.verifying_key(), issuer.to_owned())
         .with_ca_composite_key(ca_pq_vk.clone());
     let (server, address) = serve_over_iroh(
-        service.with_jwt_key_source(Arc::new(key_source)), &server_key,
-    ).await?;
+        service.with_jwt_key_source(Arc::new(key_source)),
+        &server_key,
+    )
+    .await?;
     let substrate = IrohSubstrate::new(
-        fresh_node_key(), NoopHandler::new("renew-moq"), NoopHandler::new("renew-rpc"),
-    ).await?;
+        fresh_node_key(),
+        NoopHandler::new("renew-moq"),
+        NoopHandler::new("renew-rpc"),
+    )
+    .await?;
     let connection = substrate.connect(address, ALPN_HYPRSTREAM_RPC).await?;
     let signing_key = process_a_signing_key();
     let now = chrono::Utc::now().timestamp();
@@ -484,9 +494,7 @@ async fn revocation_client_consumes_renewed_service_jwt() -> Result<()> {
             .with_issuer(issuer.to_owned())
             .with_audience(Some(issuer.to_owned()))
             .with_cnf_jwk(signing_key.verifying_key().as_bytes());
-        hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
-            &claims, &ca_key, &ca_pq, &ca_pq_vk,
-        )
+        hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(&claims, &ca_key, &ca_pq, &ca_pq_vk)
     };
     let old = token(now - 7200, now - 3600);
     let renewed = token(now, now + 3600);
@@ -496,7 +504,9 @@ async fn revocation_client_consumes_renewed_service_jwt() -> Result<()> {
     let server_vk = server_key.verifying_key();
     let kem = request_kem_store(&server_key)?;
     let store = PolicyAuthorityRevocationStore::with_client_provider(move || {
-        let jwt = current_for_client.read().clone()
+        let jwt = current_for_client
+            .read()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("current credential unavailable"))?;
         let rpc = RpcClientImpl::new(
             LocalSigner::new(client_key.clone()),
@@ -508,21 +518,51 @@ async fn revocation_client_consumes_renewed_service_jwt() -> Result<()> {
         .with_default_jwt(jwt);
         Ok(Arc::new(PolicyClient::new(Arc::new(rpc))))
     });
-    let id = CredentialId::jwt("https://renewal.example", format!("renew-{}", uuid::Uuid::new_v4()));
-    assert!(store.is_revoked(&id).await, "expired credential must fail closed");
-    assert!(store.revoke_credential(id.clone(), now + 3600).await.is_err());
+    let id = CredentialId::jwt(
+        "https://renewal.example",
+        format!("renew-{}", uuid::Uuid::new_v4()),
+    );
+    assert!(
+        store.is_revoked(&id).await,
+        "expired credential must fail closed"
+    );
+    assert!(store
+        .revoke_credential(id.clone(), now + 3600)
+        .await
+        .is_err());
     *current.write() = Some(renewed.clone());
-    assert!(!store.is_revoked(&id).await, "renewal recovers the same store without restart");
+    assert!(
+        !store.is_revoked(&id).await,
+        "renewal recovers the same store without restart"
+    );
     store.revoke_credential(id.clone(), now + 3600).await?;
-    assert!(store.is_revoked(&id).await, "renewed publication is visible at the authority");
-    let live = CredentialId::jwt("https://renewal.example", format!("live-{}", uuid::Uuid::new_v4()));
+    assert!(
+        store.is_revoked(&id).await,
+        "renewed publication is visible at the authority"
+    );
+    let live = CredentialId::jwt(
+        "https://renewal.example",
+        format!("live-{}", uuid::Uuid::new_v4()),
+    );
     *current.write() = Some(old);
-    assert!(store.is_revoked(&live).await, "expired-token causal twin denies");
+    assert!(
+        store.is_revoked(&live).await,
+        "expired-token causal twin denies"
+    );
     *current.write() = None;
-    assert!(store.is_revoked(&live).await, "missing credential cannot fall back to stale authority");
-    assert!(store.revoke_credential(live.clone(), now + 3600).await.is_err());
+    assert!(
+        store.is_revoked(&live).await,
+        "missing credential cannot fall back to stale authority"
+    );
+    assert!(store
+        .revoke_credential(live.clone(), now + 3600)
+        .await
+        .is_err());
     *current.write() = Some(renewed);
-    assert!(!store.is_revoked(&live).await, "replacement alone restores a live check");
+    assert!(
+        !store.is_revoked(&live).await,
+        "replacement alone restores a live check"
+    );
     drop(store);
     substrate.shutdown().await?;
     server.shutdown().await?;
@@ -544,13 +584,18 @@ async fn file_backed_store_is_durable() -> Result<()> {
     {
         let store = FileBackedCredentialRevocationStore::open(&path)?;
         store.revoke_credential(live.clone(), now + 3600).await?;
-        store.revoke_credential(live_cwt.clone(), now + 3600).await?;
+        store
+            .revoke_credential(live_cwt.clone(), now + 3600)
+            .await?;
         store.revoke_credential(expired.clone(), now - 10).await?;
     }
 
     // Re-open from the same path: live entries survive, expired are dropped.
     let reopened = FileBackedCredentialRevocationStore::open(&path)?;
-    assert!(reopened.is_revoked(&live).await, "JWT revocation must survive reopen");
+    assert!(
+        reopened.is_revoked(&live).await,
+        "JWT revocation must survive reopen"
+    );
     assert!(
         reopened.is_revoked(&live_cwt).await,
         "CWT revocation must survive reopen"
@@ -604,7 +649,8 @@ async fn file_backed_store_recovers_torn_tail() -> Result<()> {
     {
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
-        f.write_all(b"{\"iss\":\"https://issuer.example\",\"jwt\":\"jti-part")?; // torn
+        f.write_all(b"{\"iss\":\"https://issuer.example\",\"jwt\":\"jti-part")?;
+        // torn
     }
     let recovered = FileBackedCredentialRevocationStore::open(&path)?;
     assert!(
@@ -631,7 +677,10 @@ async fn file_backed_store_recovers_torn_tail() -> Result<()> {
         "the newline-torn record must be salvaged, not lost"
     );
     let content = std::fs::read_to_string(&path)?;
-    assert!(content.ends_with('\n'), "salvage restores the trailing newline");
+    assert!(
+        content.ends_with('\n'),
+        "salvage restores the trailing newline"
+    );
     assert_eq!(
         content.matches("jti-torn-newline").count(),
         1,
@@ -640,7 +689,10 @@ async fn file_backed_store_recovers_torn_tail() -> Result<()> {
     drop(salvaged);
 
     // A malformed MID-FILE line is corruption, not a crash artifact: fail.
-    std::fs::write(&path, b"{\"iss\":\"x\",\"jwt\":\"a\",\"exp\":9999999999}\ngarbage\n")?;
+    std::fs::write(
+        &path,
+        b"{\"iss\":\"x\",\"jwt\":\"a\",\"exp\":9999999999}\ngarbage\n",
+    )?;
     assert!(
         FileBackedCredentialRevocationStore::open(&path).is_err(),
         "mid-file corruption must fail closed"

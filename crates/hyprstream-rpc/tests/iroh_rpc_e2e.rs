@@ -385,9 +385,7 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
 /// before the echo handler runs. No attacker-triggered signed error is emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
-    use hyprstream_rpc::envelope::{
-        current_timestamp,  Authorization, RequestEnvelope,
-    };
+    use hyprstream_rpc::envelope::{current_timestamp, Authorization, RequestEnvelope};
 
     // ─── Server side ──────────────────────────────────────────────────────
     let server_signing = fresh_signing_key();
@@ -487,9 +485,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Result<()> {
     use bytes::Bytes;
-    use hyprstream_rpc::envelope::{
-        current_timestamp,  Authorization, RequestEnvelope,
-    };
+    use hyprstream_rpc::envelope::{current_timestamp, Authorization, RequestEnvelope};
 
     let invocations = Arc::new(AtomicUsize::new(0));
     let invoked = Arc::clone(&invocations);

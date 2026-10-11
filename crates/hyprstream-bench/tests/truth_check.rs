@@ -8,7 +8,12 @@
 //! suite (determinism / closure / mixing) could not see it. This suite fails
 //! on any truth-label divergence, per family, across the full frozen release.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::print_stderr)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr
+)]
 
 use std::collections::HashMap;
 
@@ -192,9 +197,7 @@ fn check_temporal(item: &Item) -> usize {
             let labels = item.question.labels();
             labels
                 .iter()
-                .position(|l| {
-                    l.strip_suffix(" days").unwrap().parse::<i64>().unwrap() == gap
-                })
+                .position(|l| l.strip_suffix(" days").unwrap().parse::<i64>().unwrap() == gap)
                 .unwrap()
         }
         QuestionKind::Score => match gap {

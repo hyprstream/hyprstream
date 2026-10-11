@@ -14,14 +14,10 @@ use tracing::info;
 
 /// Regex for extracting numeric version from model type strings
 /// SAFETY: These patterns are compile-time constants that are guaranteed valid
-static VERSION_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r"(\d+)").ok()
-});
+static VERSION_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"(\d+)").ok());
 
 /// Regex for extracting layer indices from weight key names
-static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r"layers\.(\d+)").ok()
-});
+static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"layers\.(\d+)").ok());
 
 /// Regex for extracting **decoder** layer indices from a shard manifest's
 /// `weight_map` keys (#314 follow-up to #315).
@@ -34,9 +30,8 @@ static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
 /// (`model.layers.12.` ) and not an unrelated key that merely contains the
 /// substring. Correct for llama/qwen3_5, whose decoder weights are
 /// `model.layers.<i>.…`.
-static DECODER_LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r"(?:^|\.)(?:language_model\.)?model\.layers\.(\d+)\.").ok()
-});
+static DECODER_LAYER_REGEX: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?:^|\.)(?:language_model\.)?model\.layers\.(\d+)\.").ok());
 
 /// Unified model configuration that combines all sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +162,12 @@ const ALLOW_WEIGHT_DETECT_ENV: &str = "HYPRSTREAM_ALLOW_WEIGHT_DETECT";
 /// Returns true when an env var is set to a recognized truthy value.
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -251,17 +251,24 @@ impl ModelConfig {
         let nested_json_opt = if architecture == ModelArchitecture::Janus {
             info!("Detected Janus multimodal model - loading from language_config");
 
-            let lang_config = json["language_config"].as_object()
-                .ok_or_else(|| anyhow::anyhow!("Janus config missing required 'language_config'"))?;
+            let lang_config = json["language_config"].as_object().ok_or_else(|| {
+                anyhow::anyhow!("Janus config missing required 'language_config'")
+            })?;
 
             let lang_json = serde_json::Value::Object(lang_config.clone());
-            info!("Language config hidden_size: {}", lang_json["hidden_size"].as_u64().unwrap_or(0));
+            info!(
+                "Language config hidden_size: {}",
+                lang_json["hidden_size"].as_u64().unwrap_or(0)
+            );
             Some(lang_json)
         } else if architecture == ModelArchitecture::Qwen3_5 {
             info!("Detected Qwen3.5 model - loading from text_config");
             if let Some(text_cfg) = json["text_config"].as_object() {
                 let text_json = serde_json::Value::Object(text_cfg.clone());
-                info!("text_config hidden_size: {}", text_json["hidden_size"].as_u64().unwrap_or(0));
+                info!(
+                    "text_config hidden_size: {}",
+                    text_json["hidden_size"].as_u64().unwrap_or(0)
+                );
                 Some(text_json)
             } else {
                 None // flat config (text-only checkpoint)
@@ -315,33 +322,42 @@ impl ModelConfig {
                 .map(|v| v as usize)
                 .unwrap_or(num_attention_heads),
             // head_dim is derivable from hidden_size / heads when omitted.
-            head_dim: config_source["head_dim"].as_u64()
+            head_dim: config_source["head_dim"]
+                .as_u64()
                 .map(|v| v as usize)
                 .unwrap_or(hidden_size / num_attention_heads),
-            intermediate_size: config_source["intermediate_size"].as_u64().unwrap_or(11008) as usize,
+            intermediate_size: config_source["intermediate_size"].as_u64().unwrap_or(11008)
+                as usize,
 
             vocab_size: config_source["vocab_size"].as_u64().unwrap_or(32000) as usize,
-            max_position_embeddings: config_source["max_position_embeddings"].as_u64().unwrap_or(4096)
-                as usize,
-            rope_theta: config_source["rope_parameters"]["rope_theta"].as_f64()
+            max_position_embeddings: config_source["max_position_embeddings"]
+                .as_u64()
+                .unwrap_or(4096) as usize,
+            rope_theta: config_source["rope_parameters"]["rope_theta"]
+                .as_f64()
                 .or_else(|| config_source["rope_theta"].as_f64())
                 .unwrap_or(10_000.0) as f32,
             rope_scaling: Self::parse_rope_scaling(config_source),
             // Local-RoPE / sliding-window (Gemma3); absent (None) for non-local
             // architectures — present only when config.json carries them.
             sliding_window: config_source["sliding_window"].as_u64().map(|v| v as usize),
-            rope_local_base_freq: config_source["rope_local_base_freq"].as_f64().map(|v| v as f32),
+            rope_local_base_freq: config_source["rope_local_base_freq"]
+                .as_f64()
+                .map(|v| v as f32),
 
             rms_norm_eps: config_source["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             layer_norm_eps: config_source["layer_norm_eps"].as_f64().map(|v| v as f32),
 
             hidden_activation: config_source["hidden_activation"]
                 .as_str()
-                .unwrap_or("silu").to_owned(),
+                .unwrap_or("silu")
+                .to_owned(),
 
             use_qk_norm: config_source["use_qk_norm"].as_bool().unwrap_or(false),
             scale_embeddings: config_source["scale_embeddings"].as_bool().unwrap_or(false),
-            query_pre_attn_scalar: config_source["query_pre_attn_scalar"].as_f64().map(|v| v as f32),
+            query_pre_attn_scalar: config_source["query_pre_attn_scalar"]
+                .as_f64()
+                .map(|v| v as f32),
 
             dtype: "bfloat16".to_owned(),
             use_flash_attention: true,
@@ -350,7 +366,8 @@ impl ModelConfig {
             // Qwen3.5 hybrid SSM/attention fields
             partial_rotary_factor: if architecture == ModelArchitecture::Qwen3_5 {
                 Some(
-                    config_source["rope_parameters"]["partial_rotary_factor"].as_f64()
+                    config_source["rope_parameters"]["partial_rotary_factor"]
+                        .as_f64()
                         .or_else(|| config_source["partial_rotary_factor"].as_f64())
                         .unwrap_or(0.25) as f32,
                 )
@@ -359,7 +376,8 @@ impl ModelConfig {
             },
             layer_types: if architecture == ModelArchitecture::Qwen3_5 {
                 let num_layers = num_hidden_layers;
-                config_source["layer_types"].as_array()
+                config_source["layer_types"]
+                    .as_array()
                     .map(|a| {
                         a.iter()
                             .filter_map(|v| v.as_str().map(str::to_owned))
@@ -367,35 +385,53 @@ impl ModelConfig {
                     })
                     .unwrap_or_else(|| {
                         let interval = config_source["full_attention_interval"]
-                            .as_u64().unwrap_or(4) as usize;
+                            .as_u64()
+                            .unwrap_or(4) as usize;
                         (0..num_layers)
                             .map(|i| {
-                                if (i + 1) % interval == 0 { "full_attention".to_owned() }
-                                else { "linear_attention".to_owned() }
+                                if (i + 1) % interval == 0 {
+                                    "full_attention".to_owned()
+                                } else {
+                                    "linear_attention".to_owned()
+                                }
                             })
                             .collect()
                     })
             } else {
                 vec![]
             },
-            linear_conv_kernel_dim: config_source["linear_conv_kernel_dim"].as_u64().unwrap_or(0) as usize,
-            linear_key_head_dim: config_source["linear_key_head_dim"].as_u64().unwrap_or(0) as usize,
-            linear_value_head_dim: config_source["linear_value_head_dim"].as_u64().unwrap_or(0) as usize,
-            linear_num_key_heads: config_source["linear_num_key_heads"].as_u64().unwrap_or(0) as usize,
-            linear_num_value_heads: config_source["linear_num_value_heads"].as_u64().unwrap_or(0) as usize,
+            linear_conv_kernel_dim: config_source["linear_conv_kernel_dim"]
+                .as_u64()
+                .unwrap_or(0) as usize,
+            linear_key_head_dim: config_source["linear_key_head_dim"].as_u64().unwrap_or(0)
+                as usize,
+            linear_value_head_dim: config_source["linear_value_head_dim"].as_u64().unwrap_or(0)
+                as usize,
+            linear_num_key_heads: config_source["linear_num_key_heads"].as_u64().unwrap_or(0)
+                as usize,
+            linear_num_value_heads: config_source["linear_num_value_heads"]
+                .as_u64()
+                .unwrap_or(0) as usize,
 
             // Qwen3.5 MoE fields
-            is_moe: json["model_type"].as_str().map(|s| s.contains("moe")).unwrap_or(false),
+            is_moe: json["model_type"]
+                .as_str()
+                .map(|s| s.contains("moe"))
+                .unwrap_or(false),
             num_experts: config_source["num_experts"].as_u64().unwrap_or(0) as usize,
-            num_experts_per_tok: config_source["num_experts_per_tok"].as_u64().unwrap_or(0) as usize,
-            moe_intermediate_size: config_source["moe_intermediate_size"].as_u64().unwrap_or(0) as usize,
+            num_experts_per_tok: config_source["num_experts_per_tok"].as_u64().unwrap_or(0)
+                as usize,
+            moe_intermediate_size: config_source["moe_intermediate_size"].as_u64().unwrap_or(0)
+                as usize,
             shared_expert_intermediate_size: config_source["shared_expert_intermediate_size"]
-                .as_u64().unwrap_or(0) as usize,
+                .as_u64()
+                .unwrap_or(0) as usize,
 
             // Vision fields
             has_vision: json["vision_config"].is_object(),
             vision_out_hidden_size: json["vision_config"]["out_hidden_size"]
-                .as_u64().unwrap_or(3584) as usize,
+                .as_u64()
+                .unwrap_or(3584) as usize,
         };
 
         Ok(config)
@@ -470,7 +506,9 @@ impl ModelConfig {
                     return match arch_str.to_lowercase().as_str() {
                         s if s.contains("janus") => ModelArchitecture::Janus,
                         s if s.contains("llama") => ModelArchitecture::Llama,
-                        s if s.contains("qwen3_5") || s.contains("Qwen3_5") => ModelArchitecture::Qwen3_5,
+                        s if s.contains("qwen3_5") || s.contains("Qwen3_5") => {
+                            ModelArchitecture::Qwen3_5
+                        }
                         s if s.contains("qwen") => ModelArchitecture::Qwen,
                         s if s.contains("gemma") => ModelArchitecture::Gemma,
                         s if s.contains("mistral") => ModelArchitecture::Mistral,
@@ -487,8 +525,12 @@ impl ModelConfig {
         // Check for architecture-specific weight patterns
 
         // Check for Janus multimodal components first
-        let has_vision_model = weights.keys().any(|k| k.starts_with("vision_model.") || k.starts_with("vision_encoder."));
-        let has_aligner = weights.keys().any(|k| k.starts_with("aligner.") || k.starts_with("vision_aligner."));
+        let has_vision_model = weights
+            .keys()
+            .any(|k| k.starts_with("vision_model.") || k.starts_with("vision_encoder."));
+        let has_aligner = weights
+            .keys()
+            .any(|k| k.starts_with("aligner.") || k.starts_with("vision_aligner."));
         let has_language_model = weights.keys().any(|k| k.starts_with("language_model."));
 
         if has_vision_model || has_aligner || has_language_model {
@@ -662,12 +704,10 @@ impl ModelConfig {
             return Ok(());
         }
 
-        let content = std::fs::read_to_string(&index_path).with_context(|| {
-            format!("failed to read shard manifest {}", index_path.display())
-        })?;
-        let index: serde_json::Value = serde_json::from_str(&content).with_context(|| {
-            format!("failed to parse shard manifest {}", index_path.display())
-        })?;
+        let content = std::fs::read_to_string(&index_path)
+            .with_context(|| format!("failed to read shard manifest {}", index_path.display()))?;
+        let index: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse shard manifest {}", index_path.display()))?;
         let weight_map = index["weight_map"].as_object().ok_or_else(|| {
             anyhow::anyhow!(
                 "shard manifest {} is missing required `weight_map` object",
@@ -935,7 +975,10 @@ mod tests {
         );
         let err = ModelConfig::load(dir.path(), &empty_weights())
             .expect_err("missing hidden_size must fail");
-        assert!(err.to_string().contains("hidden_size"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("hidden_size"),
+            "unexpected error: {err}"
+        );
     }
 
     /// #315: num_hidden_layers must match the shard manifest's weight_map.
@@ -1038,6 +1081,9 @@ mod tests {
         );
         let err =
             ModelConfig::load(dir.path(), &empty_weights()).expect_err("zero dimension must fail");
-        assert!(err.to_string().contains("zero dimension"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("zero dimension"),
+            "unexpected error: {err}"
+        );
     }
 }

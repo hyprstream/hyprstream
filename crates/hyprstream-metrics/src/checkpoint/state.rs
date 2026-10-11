@@ -124,8 +124,18 @@ mod tests {
     #[test]
     fn test_checkpoint_metadata_creation() {
         let tables = vec![
-            TableCheckpoint::new("metrics".to_owned(), 1000, 50000, "tables/metrics.parquet".to_owned()),
-            TableCheckpoint::new("events".to_owned(), 500, 25000, "tables/events.parquet".to_owned()),
+            TableCheckpoint::new(
+                "metrics".to_owned(),
+                1000,
+                50000,
+                "tables/metrics.parquet".to_owned(),
+            ),
+            TableCheckpoint::new(
+                "events".to_owned(),
+                500,
+                25000,
+                "tables/events.parquet".to_owned(),
+            ),
         ];
 
         let metadata = CheckpointMetadata::new(tables)

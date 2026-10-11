@@ -14,7 +14,10 @@ use tokio::sync::Mutex;
 #[derive(Debug)]
 pub enum PinnedModelArtifact {
     StagingDisk(DiskPinnedTreeProjection),
-    Sealed { projection: SealedTreeProjection, owner_pid: u32 },
+    Sealed {
+        projection: SealedTreeProjection,
+        owner_pid: u32,
+    },
 }
 
 /// Reuse one immutable staging projection across tenant-specific Inference
@@ -83,13 +86,10 @@ impl StagingPinnedArtifactCache {
         // Hold the async cache lock while acquiring to make same-commit loads
         // coalesce. The bounded acquisition itself runs on the projection I/O
         // runtime, not the Model service reactor.
-        let projection = DiskPinnedTreeProjection::acquire_bounded(
-            worktree_path,
-            commit,
-            private_disk_parent,
-        )
-        .await
-        .with_context(|| format!("capture model commit {commit}"))?;
+        let projection =
+            DiskPinnedTreeProjection::acquire_bounded(worktree_path, commit, private_disk_parent)
+                .await
+                .with_context(|| format!("capture model commit {commit}"))?;
         after_capture()?;
         // Capturing a large model can take long enough for a checkout update
         // to race the admission. Do not publish an artifact unless the exact
@@ -127,7 +127,10 @@ impl PinnedModelArtifact {
         match self {
             Self::StagingDisk(artifact) => artifact.ensure_current_process()?,
             Self::Sealed { owner_pid, .. } => {
-                ensure!(*owner_pid == std::process::id(), "sealed pinned projection cannot cross a process boundary");
+                ensure!(
+                    *owner_pid == std::process::id(),
+                    "sealed pinned projection cannot cross a process boundary"
+                );
             }
         }
         Ok(())
@@ -260,8 +263,7 @@ mod tests {
     // The bounded projection capacity is intentionally one process-global
     // slot. Serialize tests that acquire it so parallel libtest scheduling
     // cannot make the sharing assertion fail for unrelated test timing.
-    static BOUNDED_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
+    static BOUNDED_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn commit_tracked_file(root: &Path, bytes: &[u8]) -> Result<Oid> {
         let repo = git2db::Repository::init(root)?;
@@ -326,9 +328,15 @@ mod tests {
         let commit = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
         drop(tree);
         drop(repo);
-        assert!(acquire_pinned_model_in(dir.path(), Oid::zero(), parent.path()).await.is_err());
+        assert!(
+            acquire_pinned_model_in(dir.path(), Oid::zero(), parent.path())
+                .await
+                .is_err()
+        );
         std::fs::write(dir.path().join("config.json"), b"changed")?;
-        assert!(acquire_pinned_model_in(dir.path(), commit, parent.path()).await.is_err());
+        assert!(acquire_pinned_model_in(dir.path(), commit, parent.path())
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -457,10 +465,7 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("waiter observer dropped before signaling"))?;
         let key = (dir.path().to_path_buf(), commit);
         assert!(
-            entries_guard
-                .get(&key)
-                .and_then(Weak::upgrade)
-                .is_some(),
+            entries_guard.get(&key).and_then(Weak::upgrade).is_some(),
             "the live artifact must be shareable while the waiter is parked"
         );
 
@@ -501,12 +506,20 @@ mod tests {
         let config = br#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2}"#;
         std::fs::write(dir.path().join("config.json"), config)?;
         std::fs::write(dir.path().join("model.safetensors"), b"reviewed weights")?;
-        std::fs::write(dir.path().join("generation_config.json"), br#"{"temperature":0.25}"#)?;
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            br#"{"temperature":0.25}"#,
+        )?;
         Tokenizer::new(WordLevel::default())
             .save(dir.path().join("tokenizer.json"), false)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let mut index = repo.index()?;
-        for name in ["config.json", "model.safetensors", "generation_config.json", "tokenizer.json"] {
+        for name in [
+            "config.json",
+            "model.safetensors",
+            "generation_config.json",
+            "tokenizer.json",
+        ] {
             index.add_path(Path::new(name))?;
         }
         index.write()?;
@@ -520,12 +533,18 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), b"invalid replacement")?;
         std::fs::write(dir.path().join("model.safetensors"), b"replacement weights")?;
         std::fs::write(dir.path().join("tokenizer.json"), b"invalid replacement")?;
-        std::fs::write(dir.path().join("generation_config.json"), br#"{"temperature":0.9}"#)?;
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            br#"{"temperature":0.9}"#,
+        )?;
         std::fs::write(dir.path().join("untracked.safetensors"), b"unreviewed")?;
 
         let loaded_config = ModelConfig::load(artifact.root(), &std::collections::HashMap::new())?;
         assert_eq!(loaded_config.hidden_size, 8);
-        assert_eq!(std::fs::read(artifact.root().join("model.safetensors"))?, b"reviewed weights");
+        assert_eq!(
+            std::fs::read(artifact.root().join("model.safetensors"))?,
+            b"reviewed weights"
+        );
         assert!(Tokenizer::from_file(artifact.root().join("tokenizer.json")).is_ok());
         let sampling = crate::config::SamplingParams::from_model_path(artifact.root())
             .await

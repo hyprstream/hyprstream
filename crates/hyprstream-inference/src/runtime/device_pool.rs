@@ -96,8 +96,7 @@ impl DevicePool {
             let has_cuda = tch::utils::has_cuda();
             let has_hip = tch::utils::has_hip();
             let device_count = tch::Cuda::device_count();
-            let ld_path =
-                std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".to_owned());
+            let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".to_owned());
             return Err(anyhow!(
                 "DevicePool: GPU devices {indices:?} requested but no CUDA/ROCm device is \
                  available (refusing to silently fall back to CPU). \
@@ -142,12 +141,16 @@ impl DevicePool {
     /// [`Self::from_cuda_indices`] / [`Self::from_config`] for GPU resolution.
     pub fn from_devices(devices: Vec<Device>) -> Result<Self> {
         if devices.is_empty() {
-            return Err(anyhow!("DevicePool requires at least one device (got none)"));
+            return Err(anyhow!(
+                "DevicePool requires at least one device (got none)"
+            ));
         }
         let mut seen = std::collections::HashSet::with_capacity(devices.len());
         for dev in &devices {
             if !seen.insert(*dev) {
-                return Err(anyhow!("DevicePool: duplicate device {dev:?} in {devices:?}"));
+                return Err(anyhow!(
+                    "DevicePool: duplicate device {dev:?} in {devices:?}"
+                ));
             }
         }
         Ok(Self { devices })
@@ -270,7 +273,9 @@ impl LayerDeviceMap {
     /// `per_layer[g]` is the device that owns global layer `g`.
     pub fn from_per_layer(per_layer: Vec<Device>) -> Result<Self> {
         if per_layer.is_empty() {
-            return Err(anyhow!("LayerDeviceMap requires at least one layer (got none)"));
+            return Err(anyhow!(
+                "LayerDeviceMap requires at least one layer (got none)"
+            ));
         }
         Ok(Self { per_layer })
     }
@@ -383,8 +388,7 @@ mod tests {
 
     #[test]
     fn from_devices_preserves_order_and_primary() {
-        let pool =
-            DevicePool::from_devices(vec![Device::Cuda(2), Device::Cuda(0)]).unwrap();
+        let pool = DevicePool::from_devices(vec![Device::Cuda(2), Device::Cuda(0)]).unwrap();
         assert_eq!(pool.devices(), &[Device::Cuda(2), Device::Cuda(0)]);
         assert_eq!(pool.primary(), Device::Cuda(2));
         assert_eq!(pool.len(), 2);
@@ -463,8 +467,7 @@ mod tests {
     #[test]
     fn even_split_is_contiguous_and_prefix_heavy() {
         // 5 layers over 2 devices → [d0,d0,d0, d1,d1] (prefix gets the extra).
-        let pool =
-            DevicePool::from_devices(vec![Device::Cpu, Device::Cuda(0)]).unwrap();
+        let pool = DevicePool::from_devices(vec![Device::Cpu, Device::Cuda(0)]).unwrap();
         let map = LayerDeviceMap::even_split(&pool, 5).unwrap();
         assert_eq!(map.len(), 5);
         assert_eq!(map.device_for(0), Device::Cpu);
@@ -483,17 +486,16 @@ mod tests {
             }
             prev = map.device_for(g);
         }
-        assert_eq!(boundaries, 1, "contiguous 2-device split has exactly one boundary");
+        assert_eq!(
+            boundaries, 1,
+            "contiguous 2-device split has exactly one boundary"
+        );
     }
 
     #[test]
     fn even_split_balanced_when_divisible() {
-        let pool = DevicePool::from_devices(vec![
-            Device::Cpu,
-            Device::Cuda(0),
-            Device::Cuda(1),
-        ])
-        .unwrap();
+        let pool =
+            DevicePool::from_devices(vec![Device::Cpu, Device::Cuda(0), Device::Cuda(1)]).unwrap();
         let map = LayerDeviceMap::even_split(&pool, 6).unwrap();
         assert_eq!(
             (0..6).map(|g| map.device_for(g)).collect::<Vec<_>>(),
@@ -512,6 +514,10 @@ mod tests {
     fn try_device_for_is_checked() {
         let map = LayerDeviceMap::single(Device::Cpu, 2).unwrap();
         assert_eq!(map.try_device_for(1).unwrap(), Device::Cpu);
-        assert!(map.try_device_for(2).unwrap_err().to_string().contains("out of range"));
+        assert!(map
+            .try_device_for(2)
+            .unwrap_err()
+            .to_string()
+            .contains("out of range"));
     }
 }

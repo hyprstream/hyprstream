@@ -371,8 +371,8 @@ pub fn observe_spend_result(result: &SpendResult, stream_id: &str, unit: &UnitId
 pub(crate) mod tests {
     use super::*;
     use crate::services::ledger::CoseCheckpointSigner;
-    use std::sync::Arc;
     use hyprstream_ledger::{AccountSpec, IssueTransfer, LedgerBackend, MemLedger};
+    use std::sync::Arc;
 
     pub(crate) fn unit() -> UnitId {
         UnitId {
@@ -396,7 +396,9 @@ pub(crate) mod tests {
         let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let mut backend = MemLedger::new(
             cell.clone(),
-            Some(crate::services::ledger::enforcer::test_mint_authority(&ed_sk)),
+            Some(crate::services::ledger::enforcer::test_mint_authority(
+                &ed_sk,
+            )),
         );
         let issuer_liab =
             AccountId::derive(&cell, &unit().issuer, &unit(), &Purpose::IssuerLiability).unwrap();

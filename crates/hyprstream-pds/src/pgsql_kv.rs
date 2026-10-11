@@ -144,7 +144,11 @@ enum PgCmd {
     },
     /// Atomically admit an opaque replay identifier. The RPC layer computes
     /// the digest; this bridge receives no credential or request body.
-    ReplayAdmit { replay_id: [u8; 32], expires_at: u64, reply: mpsc::Sender<AnyResult<bool>> },
+    ReplayAdmit {
+        replay_id: [u8; 32],
+        expires_at: u64,
+        reply: mpsc::Sender<AnyResult<bool>>,
+    },
 }
 
 /// Result of a [`PgCmd::ReadSnapshot`]: per-range ordered pairs, then per-key
@@ -270,7 +274,8 @@ impl PgKv {
             cmd_tx,
             _thread: thread,
         };
-        kv.ping().context("RDS connection check failed at startup")?;
+        kv.ping()
+            .context("RDS connection check failed at startup")?;
         Ok(kv)
     }
 
@@ -365,7 +370,11 @@ impl PgKv {
     /// `true` means this caller won admission; `false` means it was replayed.
     /// An expiry outside PostgreSQL's signed `BIGINT` range fails closed.
     pub fn replay_admit(&self, replay_id: [u8; 32], expires_at: u64) -> AnyResult<bool> {
-        self.round_trip(|reply| PgCmd::ReplayAdmit { replay_id, expires_at, reply })
+        self.round_trip(|reply| PgCmd::ReplayAdmit {
+            replay_id,
+            expires_at,
+            reply,
+        })
     }
 
     fn round_trip<R, F>(&self, make_cmd: F) -> AnyResult<R>
@@ -624,10 +633,9 @@ fn build_rustls_config(root_cert_pem: &std::path::Path) -> AnyResult<rustls::Cli
 /// the deployment was never provisioned (or lost its history), which is
 /// fatal, not creatable.
 async fn verify_provisioned(pool: &deadpool_postgres::Pool) -> AnyResult<()> {
-    let conn = pool
-        .get()
-        .await
-        .map_err(|e| anyhow::anyhow!("RDS provisioning check: connection acquisition failed: {e}"))?;
+    let conn = pool.get().await.map_err(|e| {
+        anyhow::anyhow!("RDS provisioning check: connection acquisition failed: {e}")
+    })?;
     let row = conn
         .query_opt("SELECT to_regclass('pds_kv') IS NOT NULL", &[])
         .await
@@ -698,15 +706,21 @@ async fn migrate(pool: &deadpool_postgres::Pool, cell_id: &str) -> AnyResult<()>
 /// deliberately cannot recreate checkpointed PDS history.
 async fn migrate_replay_admission(pool: &deadpool_postgres::Pool) -> AnyResult<()> {
     const MIGRATION_LOCK_ID: i64 = 0x1257_1257_1257_1257;
-    let mut conn = pool.get().await
-        .map_err(|e| anyhow::anyhow!("RDS connection acquisition failed during replay migration: {e}"))?;
-    let tx = conn.transaction().await
+    let mut conn = pool.get().await.map_err(|e| {
+        anyhow::anyhow!("RDS connection acquisition failed during replay migration: {e}")
+    })?;
+    let tx = conn
+        .transaction()
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay migration: begin transaction failed: {e}"))?;
-    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID]).await
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay migration: advisory lock failed: {e}"))?;
-    tx.batch_execute(replay_admission_ddl()).await
+    tx.batch_execute(replay_admission_ddl())
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay schema migration failed: {e}"))?;
-    tx.commit().await
+    tx.commit()
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay migration: commit failed: {e}"))?;
     Ok(())
 }
@@ -766,7 +780,11 @@ async fn handle_cmd(pool: &deadpool_postgres::Pool, cmd: PgCmd) -> AnyResult<()>
             let r = cmd_reset_to_first_boot(pool, &marker_key).await;
             let _ = reply.send(r);
         }
-        PgCmd::ReplayAdmit { replay_id, expires_at, reply } => {
+        PgCmd::ReplayAdmit {
+            replay_id,
+            expires_at,
+            reply,
+        } => {
             let r = cmd_replay_admit(pool, &replay_id, expires_at).await;
             let _ = reply.send(r);
         }
@@ -1027,12 +1045,20 @@ async fn cmd_reset_to_first_boot(
 /// transaction, drop only this identifier if it expired and insert the new
 /// admission. A concurrent contender either sees the live row or loses
 /// `ON CONFLICT`; neither gets a second admission.
-async fn cmd_replay_admit(pool: &deadpool_postgres::Pool, replay_id: &[u8; 32], expires_at: u64) -> AnyResult<bool> {
+async fn cmd_replay_admit(
+    pool: &deadpool_postgres::Pool,
+    replay_id: &[u8; 32],
+    expires_at: u64,
+) -> AnyResult<bool> {
     let expires_at = i64::try_from(expires_at)
         .map_err(|_| anyhow::anyhow!("replay expiry exceeds PostgreSQL BIGINT range"))?;
-    let mut conn = pool.get().await
+    let mut conn = pool
+        .get()
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay admission: connection acquisition failed: {e}"))?;
-    let tx = conn.transaction().await
+    let tx = conn
+        .transaction()
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay admission: begin transaction failed: {e}"))?;
     // Use PostgreSQL's transaction clock, not the verifier host clock. All
     // competing verifiers therefore agree which durable replay rows remain
@@ -1053,15 +1079,21 @@ async fn cmd_replay_admit(pool: &deadpool_postgres::Pool, replay_id: &[u8; 32], 
          SELECT ctid FROM proof_replay_admission WHERE expires_at <= $1 \
          ORDER BY expires_at LIMIT 1024 FOR UPDATE SKIP LOCKED)",
         &[&now],
-    ).await.map_err(|e| anyhow::anyhow!("RDS replay admission: expiry collection failed: {e}"))?;
-    tx.execute("DELETE FROM proof_replay_admission WHERE replay_id = $1 AND expires_at <= $2", &[&replay_id.as_slice(), &now])
-        .await
-        .map_err(|e| anyhow::anyhow!("RDS replay admission: expiry cleanup failed: {e}"))?;
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("RDS replay admission: expiry collection failed: {e}"))?;
+    tx.execute(
+        "DELETE FROM proof_replay_admission WHERE replay_id = $1 AND expires_at <= $2",
+        &[&replay_id.as_slice(), &now],
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("RDS replay admission: expiry cleanup failed: {e}"))?;
     let inserted = tx.execute(
         "INSERT INTO proof_replay_admission (replay_id, expires_at) VALUES ($1, $2) ON CONFLICT (replay_id) DO NOTHING",
         &[&replay_id.as_slice(), &expires_at],
     ).await.map_err(|e| anyhow::anyhow!("RDS replay admission: insert-if-absent failed: {e}"))?;
-    tx.commit().await
+    tx.commit()
+        .await
         .map_err(|e| anyhow::anyhow!("RDS replay admission: commit failed: {e}"))?;
     Ok(inserted == 1)
 }
@@ -1123,7 +1155,9 @@ mod tests {
     macro_rules! require_db {
         () => {{
             let Some(url) = test_url() else {
-                eprintln!("skipping pds_record_pg DB test: HYPRSTREAM_POSTGRES_TEST_URL_FILE unset");
+                eprintln!(
+                    "skipping pds_record_pg DB test: HYPRSTREAM_POSTGRES_TEST_URL_FILE unset"
+                );
                 return;
             };
             url
@@ -1306,10 +1340,13 @@ mod tests {
     #[test]
     fn replay_admission_migration_keeps_only_digest_and_expiry() {
         let migration = include_str!("pgsql_kv.rs");
-        let table = migration.split("CREATE TABLE IF NOT EXISTS proof_replay_admission")
-            .nth(1).unwrap_or_else(|| panic!("replay table migration missing"))
+        let table = migration
+            .split("CREATE TABLE IF NOT EXISTS proof_replay_admission")
+            .nth(1)
+            .unwrap_or_else(|| panic!("replay table migration missing"))
             .split("REVOKE ALL ON TABLE proof_replay_admission FROM PUBLIC")
-            .next().unwrap_or_else(|| panic!("replay table grant boundary missing"));
+            .next()
+            .unwrap_or_else(|| panic!("replay table grant boundary missing"));
         assert!(table.contains("replay_id BYTEA PRIMARY KEY CHECK (octet_length(replay_id) = 32)"));
         assert!(table.contains("expires_at BIGINT NOT NULL CHECK (expires_at > 0)"));
         assert!(!table.contains("credential"));
@@ -1327,37 +1364,51 @@ mod tests {
     #[test]
     fn live_replay_admission_is_cross_handle_once_and_reclaims_expiry() {
         let url = require_db!();
-        let writer_a = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect A: {e}"));
-        let writer_b = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect B: {e}"));
+        let writer_a =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect A: {e}"));
+        let writer_b =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect B: {e}"));
         let mut replay_id = [0u8; 32];
         let unique = run_unique_key("replay");
         for (index, byte) in replay_id.iter_mut().enumerate() {
             *byte = unique[index % unique.len()];
         }
-        let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|e| panic!("clock: {e}")).as_secs() + 60;
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|e| panic!("clock: {e}"))
+            .as_secs()
+            + 60;
         let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
         let gate_a = std::sync::Arc::clone(&gate);
         let a = std::thread::spawn(move || {
             gate_a.wait();
-            writer_a.replay_admit(replay_id, expiry).unwrap_or_else(|e| panic!("A admission: {e}"))
+            writer_a
+                .replay_admit(replay_id, expiry)
+                .unwrap_or_else(|e| panic!("A admission: {e}"))
         });
         gate.wait();
         let won_a = a.join().unwrap_or_else(|_| panic!("A thread panicked"));
-        let won_b = writer_b.replay_admit(replay_id, expiry).unwrap_or_else(|e| panic!("B admission: {e}"));
+        let won_b = writer_b
+            .replay_admit(replay_id, expiry)
+            .unwrap_or_else(|e| panic!("B admission: {e}"));
         assert_ne!(won_a, won_b, "exactly one shared verifier may admit");
-        assert!(!writer_b.replay_admit(replay_id, expiry).unwrap_or_else(|e| panic!("replay check: {e}")));
+        assert!(!writer_b
+            .replay_admit(replay_id, expiry)
+            .unwrap_or_else(|e| panic!("replay check: {e}")));
         let mut expired = replay_id;
         expired[31] ^= 0xFF;
-        assert!(writer_b.replay_admit(expired, 1).unwrap_or_else(|e| panic!("expired seed: {e}")));
-        assert!(writer_b.replay_admit(expired, expiry).unwrap_or_else(|e| panic!("expired replacement: {e}")));
+        assert!(writer_b
+            .replay_admit(expired, 1)
+            .unwrap_or_else(|e| panic!("expired seed: {e}")));
+        assert!(writer_b
+            .replay_admit(expired, expiry)
+            .unwrap_or_else(|e| panic!("expired replacement: {e}")));
     }
 
     #[test]
     fn live_put_get_roundtrip_and_absent() {
         let url = require_db!();
-        let kv = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect: {e}"));
+        let kv = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect: {e}"));
         let key = run_unique_key("put-get");
         assert_eq!(
             kv.get(&key).unwrap_or_else(|e| panic!("get absent: {e}")),
@@ -1381,8 +1432,7 @@ mod tests {
     #[test]
     fn live_fresh_genesis_reset_clears_records_once_and_preserves_retry_writes() {
         let url = require_db!();
-        let kv = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect: {e}"));
+        let kv = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect: {e}"));
         let old_key = run_unique_key("fresh-genesis-old");
         let marker = run_unique_key("fresh-genesis-marker");
         kv.put(&old_key, b"old-state")
@@ -1395,7 +1445,8 @@ mod tests {
             None
         );
         assert_eq!(
-            kv.get(&marker).unwrap_or_else(|e| panic!("marker get: {e}")),
+            kv.get(&marker)
+                .unwrap_or_else(|e| panic!("marker get: {e}")),
             Some(Vec::new())
         );
 
@@ -1416,14 +1467,15 @@ mod tests {
     #[test]
     fn live_get_batch_is_positional_and_reports_absence() {
         let url = require_db!();
-        let kv = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect: {e}"));
+        let kv = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect: {e}"));
         let base = run_unique_key("batch");
         let key_a = [&base[..], b"a"].concat();
         let key_b = [&base[..], b"b"].concat();
         let key_absent = [&base[..], b"absent"].concat();
-        kv.put(&key_a, b"va").unwrap_or_else(|e| panic!("put a: {e}"));
-        kv.put(&key_b, b"vb").unwrap_or_else(|e| panic!("put b: {e}"));
+        kv.put(&key_a, b"va")
+            .unwrap_or_else(|e| panic!("put a: {e}"));
+        kv.put(&key_b, b"vb")
+            .unwrap_or_else(|e| panic!("put b: {e}"));
         let got = kv
             .get_batch(&[key_b.clone(), key_absent, key_a.clone()])
             .unwrap_or_else(|e| panic!("get_batch: {e}"));
@@ -1437,11 +1489,11 @@ mod tests {
     #[test]
     fn live_cas_put_first_writer_wins() {
         let url = require_db!();
-        let writer_a = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect A: {e}"));
+        let writer_a =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect A: {e}"));
         // A second pool = a second PDS process in another AZ.
-        let writer_b = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect B: {e}"));
+        let writer_b =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect B: {e}"));
         let key = run_unique_key("cas");
 
         // Genesis: both expect the key absent — exactly one wins.
@@ -1482,8 +1534,7 @@ mod tests {
     #[test]
     fn live_cas_put_atomic_side_effects() {
         let url = require_db!();
-        let kv = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect: {e}"));
+        let kv = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect: {e}"));
         let key = run_unique_key("cas-atomic");
         let side = run_unique_key("cas-atomic-side");
         let marker = run_unique_key("cas-atomic-marker");
@@ -1508,7 +1559,8 @@ mod tests {
             "the upsert landed with the CAS"
         );
         assert_eq!(
-            kv.get(&marker).unwrap_or_else(|e| panic!("get marker: {e}")),
+            kv.get(&marker)
+                .unwrap_or_else(|e| panic!("get marker: {e}")),
             None,
             "the delete landed with the CAS"
         );
@@ -1535,7 +1587,8 @@ mod tests {
             "a rejected CAS must not apply its upserts"
         );
         assert_eq!(
-            kv.get(&marker2).unwrap_or_else(|e| panic!("get marker2: {e}")),
+            kv.get(&marker2)
+                .unwrap_or_else(|e| panic!("get marker2: {e}")),
             Some(b"pending".to_vec()),
             "a rejected CAS must not apply its deletes"
         );
@@ -1546,15 +1599,16 @@ mod tests {
         let url = require_db!();
         // Two independent bridges over two pools: the in-process model of the
         // publisher (AZ-a) and resolver (AZ-b) sharing one RDS instance.
-        let az_a = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect AZ-a: {e}"));
-        let az_b = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect AZ-b: {e}"));
+        let az_a =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect AZ-a: {e}"));
+        let az_b =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect AZ-b: {e}"));
         let key = run_unique_key("two-handle");
         az_a.put(&key, b"cross-az-value")
             .unwrap_or_else(|e| panic!("write via AZ-a: {e}"));
         assert_eq!(
-            az_b.get(&key).unwrap_or_else(|e| panic!("read via AZ-b: {e}")),
+            az_b.get(&key)
+                .unwrap_or_else(|e| panic!("read via AZ-b: {e}")),
             Some(b"cross-az-value".to_vec()),
             "a write through one handle must be visible through the other"
         );
@@ -1563,8 +1617,7 @@ mod tests {
     #[test]
     fn live_read_snapshot_is_consistent() {
         let url = require_db!();
-        let kv = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect: {e}"));
+        let kv = PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect: {e}"));
         let base = run_unique_key("snap");
         let mk = |suffix: &[u8]| [&base[..], suffix].concat();
         kv.put(&mk(b"\x01"), b"v1")
@@ -1604,10 +1657,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("sub-range: {e}"));
         assert_eq!(
             snap.ranges.first().unwrap_or(&Vec::new()),
-            &vec![
-                (mk(b"\x02"), b"v2".to_vec()),
-                (mk(b"\x03"), b"v3".to_vec()),
-            ]
+            &vec![(mk(b"\x02"), b"v2".to_vec()), (mk(b"\x03"), b"v3".to_vec()),]
         );
         let snap = kv
             .read_snapshot(&[(mk(b"\x04"), upper)], &[])
@@ -1635,8 +1685,8 @@ mod tests {
     async fn live_snapshot_transaction_is_repeatable_read() {
         let url = require_db!();
         // The writer handle also guarantees the schema exists.
-        let writer = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect writer: {e}"));
+        let writer =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect writer: {e}"));
         let key = run_unique_key("rr-tx");
         writer
             .put(&key, b"v1")
@@ -1650,10 +1700,7 @@ mod tests {
             tokio_postgres::NoTls,
         ))
         .unwrap_or_else(|e| panic!("pool: {e}"));
-        let mut conn = pool
-            .get()
-            .await
-            .unwrap_or_else(|e| panic!("pool get: {e}"));
+        let mut conn = pool.get().await.unwrap_or_else(|e| panic!("pool get: {e}"));
         let tx = begin_snapshot_tx(&mut conn, "test")
             .await
             .unwrap_or_else(|e| panic!("begin snapshot tx: {e}"));
@@ -1692,10 +1739,10 @@ mod tests {
     #[test]
     fn live_get_batch_never_tears_under_a_concurrent_writer() {
         let url = require_db!();
-        let reader = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect reader: {e}"));
-        let writer = PgKv::connect_test(&url, "test-cell")
-            .unwrap_or_else(|e| panic!("connect writer: {e}"));
+        let reader =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect reader: {e}"));
+        let writer =
+            PgKv::connect_test(&url, "test-cell").unwrap_or_else(|e| panic!("connect writer: {e}"));
         let key = run_unique_key("rr-batch");
         writer
             .put(&key, b"v1")

@@ -62,9 +62,7 @@ impl ConfirmDialog {
         };
 
         let no_style = if !self.value {
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -90,14 +88,20 @@ mod tests {
     fn test_default_yes() {
         let mut dialog = ConfirmDialog::new("Continue?");
         assert!(dialog.value());
-        assert_eq!(dialog.handle_key(&KeyPress::Enter), WidgetResult::Confirmed(true));
+        assert_eq!(
+            dialog.handle_key(&KeyPress::Enter),
+            WidgetResult::Confirmed(true)
+        );
     }
 
     #[test]
     fn test_default_no() {
         let mut dialog = ConfirmDialog::new("Delete?").with_default(false);
         assert!(!dialog.value());
-        assert_eq!(dialog.handle_key(&KeyPress::Enter), WidgetResult::Confirmed(false));
+        assert_eq!(
+            dialog.handle_key(&KeyPress::Enter),
+            WidgetResult::Confirmed(false)
+        );
     }
 
     #[test]
@@ -113,15 +117,24 @@ mod tests {
     #[test]
     fn test_y_n_shortcuts() {
         let mut dialog = ConfirmDialog::new("?");
-        assert_eq!(dialog.handle_key(&KeyPress::Char(b'n')), WidgetResult::Confirmed(false));
+        assert_eq!(
+            dialog.handle_key(&KeyPress::Char(b'n')),
+            WidgetResult::Confirmed(false)
+        );
 
         let mut dialog2 = ConfirmDialog::new("?").with_default(false);
-        assert_eq!(dialog2.handle_key(&KeyPress::Char(b'y')), WidgetResult::Confirmed(true));
+        assert_eq!(
+            dialog2.handle_key(&KeyPress::Char(b'y')),
+            WidgetResult::Confirmed(true)
+        );
     }
 
     #[test]
     fn test_escape() {
         let mut dialog = ConfirmDialog::new("?");
-        assert_eq!(dialog.handle_key(&KeyPress::Escape), WidgetResult::Cancelled);
+        assert_eq!(
+            dialog.handle_key(&KeyPress::Escape),
+            WidgetResult::Cancelled
+        );
     }
 }

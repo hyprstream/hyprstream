@@ -168,16 +168,28 @@ impl ChatTemplateDataLoader {
             let mut messages = Vec::new();
 
             if let Some(ref system) = sample.system {
-                messages.push(ChatMessage { role: "system".into(), content: Some(system.clone()), ..Default::default() });
+                messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: Some(system.clone()),
+                    ..Default::default()
+                });
             }
 
-            messages.push(ChatMessage { role: "user".into(), content: Some(sample.input.clone()), ..Default::default() });
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some(sample.input.clone()),
+                ..Default::default()
+            });
 
             // Format input (without assistant response)
             let formatted_input = template.apply_chat_template(&messages, Some(true), None)?;
 
             // Add assistant response for target
-            messages.push(ChatMessage { role: "assistant".into(), content: Some(sample.output.clone()), ..Default::default() });
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: Some(sample.output.clone()),
+                ..Default::default()
+            });
 
             let full_formatted = template.apply_chat_template(&messages, Some(false), None)?;
 
@@ -222,7 +234,10 @@ mod tests {
 
         let dataset = TrainingDataset::from_jsonl(&data_path).expect("test: load dataset");
         assert_eq!(dataset.len(), 2);
-        assert_eq!(dataset.get(0).expect("test: get sample").input, "What is 2+2?");
+        assert_eq!(
+            dataset.get(0).expect("test: get sample").input,
+            "What is 2+2?"
+        );
         assert_eq!(dataset.get(0).expect("test: get sample").output, "4");
     }
 

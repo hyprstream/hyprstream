@@ -122,12 +122,20 @@ impl Mount for SyntheticMount {
     async fn open(&self, _fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
         // Read-only: reject any write/rdwr open.
         if mode & 0x03 != 0 {
-            return Err(MountError::PermissionDenied("synthetic mount is read-only".into()));
+            return Err(MountError::PermissionDenied(
+                "synthetic mount is read-only".into(),
+            ));
         }
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
         let st = fid
             .downcast_ref::<SyntheticFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -143,8 +151,16 @@ impl Mount for SyntheticMount {
         }
     }
 
-    async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        Err(MountError::PermissionDenied("synthetic mount is read-only".into()))
+    async fn write(
+        &self,
+        _fid: &Fid,
+        _offset: u64,
+        _data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
+        Err(MountError::PermissionDenied(
+            "synthetic mount is read-only".into(),
+        ))
     }
 
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
@@ -330,11 +346,19 @@ impl Mount for StreamMount {
                 if !self.registry.exists(topic) {
                     return Err(MountError::NotFound((*topic).to_string()));
                 }
-                StreamFidState::TopicDir { topic: (*topic).to_string() }
+                StreamFidState::TopicDir {
+                    topic: (*topic).to_string(),
+                }
             }
-            [topic, "data"] => StreamFidState::Data { topic: (*topic).to_string() },
-            [topic, "info"] => StreamFidState::Info { topic: (*topic).to_string() },
-            [topic, "ctl"] => StreamFidState::Ctl { topic: (*topic).to_string() },
+            [topic, "data"] => StreamFidState::Data {
+                topic: (*topic).to_string(),
+            },
+            [topic, "info"] => StreamFidState::Info {
+                topic: (*topic).to_string(),
+            },
+            [topic, "ctl"] => StreamFidState::Ctl {
+                topic: (*topic).to_string(),
+            },
             _ => return Err(MountError::NotFound(components.join("/"))),
         };
         Ok(Fid::new(state))
@@ -344,7 +368,13 @@ impl Mount for StreamMount {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -388,7 +418,13 @@ impl Mount for StreamMount {
         }
     }
 
-    async fn write(&self, fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+    async fn write(
+        &self,
+        fid: &Fid,
+        _offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
         let state = fid
             .downcast_ref::<StreamFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -404,10 +440,14 @@ impl Mount for StreamMount {
                         }
                         Ok(cmd.len() as u32)
                     }
-                    _ => Err(MountError::NotSupported(format!("unknown stream command: {cmd}"))),
+                    _ => Err(MountError::NotSupported(format!(
+                        "unknown stream command: {cmd}"
+                    ))),
                 }
             }
-            _ => Err(MountError::NotSupported("stream files are read-only".into())),
+            _ => Err(MountError::NotSupported(
+                "stream files are read-only".into(),
+            )),
         }
     }
 
@@ -420,7 +460,12 @@ impl Mount for StreamMount {
                 .registry
                 .list_topics(None)
                 .into_iter()
-                .map(|name| DirEntry { name, is_dir: true, size: 0, stat: None })
+                .map(|name| DirEntry {
+                    name,
+                    is_dir: true,
+                    size: 0,
+                    stat: None,
+                })
                 .collect()),
             StreamFidState::TopicDir { .. } => Ok(["data", "info", "ctl"]
                 .iter()
@@ -446,7 +491,14 @@ impl Mount for StreamMount {
             StreamFidState::Info { .. } => (0, "info".to_string()),
             StreamFidState::Ctl { .. } => (0, "ctl".to_string()),
         };
-        Ok(Stat { qtype, version: 0, path: 0, size: 0, name, mtime: 0 })
+        Ok(Stat {
+            qtype,
+            version: 0,
+            path: 0,
+            size: 0,
+            name,
+            mtime: 0,
+        })
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
@@ -468,7 +520,8 @@ mod tests {
             "models",
             SyntheticNode::dir().with_child(
                 "qwen3",
-                SyntheticNode::dir().with_child("info", SyntheticNode::file(b"qwen3 model\n".to_vec())),
+                SyntheticNode::dir()
+                    .with_child("info", SyntheticNode::file(b"qwen3 model\n".to_vec())),
             ),
         );
         let mount = SyntheticMount::new(root);

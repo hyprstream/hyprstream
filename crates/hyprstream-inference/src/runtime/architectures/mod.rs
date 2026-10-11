@@ -139,7 +139,11 @@ impl ModelArchitecture {
             Self::GPTOSS { total_params_b, .. } => format!("GPT-OSS-{total_params_b}B"),
             Self::GPTJ => "GPT-J".to_owned(),
             Self::Qwen3_5 => "Qwen3_5".to_owned(),
-            Self::Janus { vision_encoder, has_generation, .. } => {
+            Self::Janus {
+                vision_encoder,
+                has_generation,
+                ..
+            } => {
                 let encoder_type = match vision_encoder {
                     VisionEncoderType::SigLIP { .. } => "SigLIP",
                     VisionEncoderType::CLIP { .. } => "CLIP",
@@ -164,8 +168,8 @@ impl ModelArchitecture {
     pub fn supports_gqa(&self) -> bool {
         matches!(
             self,
-            Self::Llama { version: 3 } | 
-            Self::Mistral | 
+            Self::Llama { version: 3 } |
+            Self::Mistral |
             Self::Qwen { version: 3, .. } |  // Qwen3 uses GQA
             Self::GPTOSS { .. } // GPT-OSS uses GQA in MoE
         )
@@ -199,14 +203,20 @@ pub trait ModelOperations: Send {
     /// Returns a boxed TokenizerConfig trait object that provides
     /// model-specific tokenizer configuration logic.
     fn get_tokenizer_config(&self) -> Box<dyn crate::runtime::tokenizer_config::TokenizerConfig> {
-        use crate::runtime::tokenizer_config::{DefaultTokenizerConfig, QwenTokenizerConfig, LlamaTokenizerConfig, GemmaTokenizerConfig};
+        use crate::runtime::tokenizer_config::{
+            DefaultTokenizerConfig, GemmaTokenizerConfig, LlamaTokenizerConfig, QwenTokenizerConfig,
+        };
 
         // Return appropriate config based on architecture
         match self.architecture() {
-            ModelArchitecture::Qwen { .. } | ModelArchitecture::Qwen3_5 => Box::new(QwenTokenizerConfig),
+            ModelArchitecture::Qwen { .. } | ModelArchitecture::Qwen3_5 => {
+                Box::new(QwenTokenizerConfig)
+            }
             ModelArchitecture::Llama { .. } => Box::new(LlamaTokenizerConfig),
             ModelArchitecture::Gemma => Box::new(GemmaTokenizerConfig),
-            ModelArchitecture::Janus { base_architecture, .. } => {
+            ModelArchitecture::Janus {
+                base_architecture, ..
+            } => {
                 // Use the base architecture's tokenizer config
                 match base_architecture.as_ref() {
                     ModelArchitecture::Llama { .. } => Box::new(LlamaTokenizerConfig),
@@ -281,7 +291,9 @@ pub trait ModelOperations: Send {
 
     /// Get token embeddings for input IDs
     fn embed_tokens(&self, _input_ids: &Tensor) -> Result<Tensor> {
-        Err(anyhow!("embed_tokens not implemented for this architecture"))
+        Err(anyhow!(
+            "embed_tokens not implemented for this architecture"
+        ))
     }
 
     /// Forward pass from pre-computed embeddings (for multimodal models)
@@ -296,7 +308,9 @@ pub trait ModelOperations: Send {
     /// # Returns
     /// Logits tensor [batch_size, seq_len, vocab_size]
     fn forward_from_embeddings(&self, _embeddings: &Tensor, _start_pos: usize) -> Result<Tensor> {
-        Err(anyhow!("forward_from_embeddings not implemented for this architecture"))
+        Err(anyhow!(
+            "forward_from_embeddings not implemented for this architecture"
+        ))
     }
 
     /// Check if this model is multimodal
@@ -324,7 +338,9 @@ pub trait ModelOperations: Send {
         _images_seq_mask: Option<&Tensor>,
         _images_emb_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        Err(anyhow!("prepare_multimodal_inputs not implemented - model is not multimodal"))
+        Err(anyhow!(
+            "prepare_multimodal_inputs not implemented - model is not multimodal"
+        ))
     }
 
     /// Encode images through the vision encoder and return embeddings.
@@ -338,7 +354,9 @@ pub trait ModelOperations: Send {
     /// # Returns
     /// Embedding tensor [batch_size, embedding_dim]
     fn encode_vision(&self, _pixel_values: &Tensor) -> Result<Tensor> {
-        Err(anyhow!("encode_vision not implemented - model has no vision encoder"))
+        Err(anyhow!(
+            "encode_vision not implemented - model has no vision encoder"
+        ))
     }
 
     /// Decode a single layer (for layer-wise processing)
@@ -350,7 +368,9 @@ pub trait ModelOperations: Send {
         _position_ids: Option<&Tensor>,
         _past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
-        Err(anyhow!("decode_layer not implemented for this architecture"))
+        Err(anyhow!(
+            "decode_layer not implemented for this architecture"
+        ))
     }
 
     /// Decode a single layer with per-tenant delta injection (for TTT training path)
@@ -370,7 +390,13 @@ pub trait ModelOperations: Send {
         past_kv: Option<&crate::runtime::kv_cache::LayerKVCache>,
         _delta: &crate::training::TenantDelta,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
-        self.decode_layer(layer_idx, hidden_states, attention_mask, position_ids, past_kv)
+        self.decode_layer(
+            layer_idx,
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_kv,
+        )
     }
 
     /// Run a contiguous range of decoder layers — the 2b intra-host pipeline
@@ -469,7 +495,9 @@ pub trait ModelOperations: Send {
 
     /// Apply final layer normalization
     fn apply_final_norm(&self, _hidden_states: &Tensor) -> Result<Tensor> {
-        Err(anyhow!("apply_final_norm not implemented for this architecture"))
+        Err(anyhow!(
+            "apply_final_norm not implemented for this architecture"
+        ))
     }
 
     /// Apply language model head to get logits
@@ -480,7 +508,7 @@ pub trait ModelOperations: Send {
     /// Get the number of transformer layers
     fn num_layers(&self) -> usize {
         // Default implementation - architectures should override
-        32  // Common default
+        32 // Common default
     }
 
     /// Reshape tensor for attention computation

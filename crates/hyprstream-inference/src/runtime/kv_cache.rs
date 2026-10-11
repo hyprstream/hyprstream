@@ -31,11 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tch::Device;
 use tch::{Kind as DType, Tensor};
 
-use hyprstream_rpc_std::model_client::KVQuantType;
-use super::kv_compat::{
-    decide_cache_reuse, CacheReuseDecision, KvCompatFingerprint,
-};
+use super::kv_compat::{decide_cache_reuse, CacheReuseDecision, KvCompatFingerprint};
 use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
+use hyprstream_rpc_std::model_client::KVQuantType;
 
 // ============================================================================
 // Cache Owner and Registry Types (for multi-session support)
@@ -244,10 +242,7 @@ impl KVCacheRegistry {
         };
 
         // Insert and return (handles race condition - returns existing if another thread inserted)
-        self.caches
-            .entry(owner)
-            .or_insert(cache.clone())
-            .clone()
+        self.caches.entry(owner).or_insert(cache.clone()).clone()
     }
 
     /// Release a cache when the session is done.
@@ -321,7 +316,11 @@ impl KVCacheRegistry {
                 if guard.location() == CacheLocation::Gpu {
                     guard.offload_to_cpu();
                     freed += size;
-                    tracing::info!("Offloaded cache {:?} to CPU, freed {} GPU bytes", owner, size);
+                    tracing::info!(
+                        "Offloaded cache {:?} to CPU, freed {} GPU bytes",
+                        owner,
+                        size
+                    );
                 }
             }
         }
@@ -454,9 +453,8 @@ impl KVCacheRegistry {
         if invalidated > 0 {
             // Never log the raw tenant subject (#1253/#1261 review): emit the
             // same opaque keyed-hash id used for metric attributes.
-            let opaque = crate::runtime::token_metrics::opaque_tenant_id(&Some(
-                tenant_id.to_owned(),
-            ));
+            let opaque =
+                crate::runtime::token_metrics::opaque_tenant_id(&Some(tenant_id.to_owned()));
             tracing::info!(
                 "Invalidated {} KV caches dependent on subject delta (tenant {})",
                 invalidated,
@@ -551,8 +549,14 @@ impl BlockPool {
             "Allocating block pool: {} blocks x {:?} ({:.1} MB total)",
             num_blocks,
             block_shape,
-            (num_blocks as f64 * BLOCK_SIZE as f64 * num_kv_heads as f64 * head_dim as f64
-                * match dtype { DType::Half | DType::BFloat16 => 2.0, _ => 4.0 })
+            (num_blocks as f64
+                * BLOCK_SIZE as f64
+                * num_kv_heads as f64
+                * head_dim as f64
+                * match dtype {
+                    DType::Half | DType::BFloat16 => 2.0,
+                    _ => 4.0,
+                })
                 / (1024.0 * 1024.0),
         );
 
@@ -659,7 +663,8 @@ impl BlockPool {
             DType::Half | DType::BFloat16 => 2,
             _ => 4,
         };
-        let per_block = BLOCK_SIZE * self.block_shape[2] as usize * self.block_shape[3] as usize * elem_size;
+        let per_block =
+            BLOCK_SIZE * self.block_shape[2] as usize * self.block_shape[3] as usize * elem_size;
         self.used_blocks() * per_block
     }
 
@@ -744,7 +749,9 @@ impl QuantizedTensor {
         let device = tensor.device();
 
         if quant_type == KVQuantType::None {
-            return Err(anyhow!("Cannot create QuantizedTensor with KVQuantType::None"));
+            return Err(anyhow!(
+                "Cannot create QuantizedTensor with KVQuantType::None"
+            ));
         }
 
         // GPU-native path: BF16/FP16 on CUDA/ROCm → quantize directly on GPU
@@ -769,22 +776,36 @@ impl QuantizedTensor {
             .map_err(|e| anyhow!("Failed to copy tensor data: {:?}", e))?;
 
         let (data, state) = match quant_type {
-            KVQuantType::Int8 => bitsandbytes_sys::quantize_blockwise_fp32(&f32_data, QUANT_BLOCKSIZE)
-                .map_err(|e| anyhow!("Int8 quantization failed: {:?}", e))?,
-            KVQuantType::Nf4 => bitsandbytes_sys::quantize_4bit_nf4_fp32(&f32_data, QUANT_BLOCKSIZE)
-                .map_err(|e| anyhow!("NF4 quantization failed: {:?}", e))?,
-            KVQuantType::Fp4 => bitsandbytes_sys::quantize_4bit_fp4_fp32(&f32_data, QUANT_BLOCKSIZE)
-                .map_err(|e| anyhow!("FP4 quantization failed: {:?}", e))?,
+            KVQuantType::Int8 => {
+                bitsandbytes_sys::quantize_blockwise_fp32(&f32_data, QUANT_BLOCKSIZE)
+                    .map_err(|e| anyhow!("Int8 quantization failed: {:?}", e))?
+            }
+            KVQuantType::Nf4 => {
+                bitsandbytes_sys::quantize_4bit_nf4_fp32(&f32_data, QUANT_BLOCKSIZE)
+                    .map_err(|e| anyhow!("NF4 quantization failed: {:?}", e))?
+            }
+            KVQuantType::Fp4 => {
+                bitsandbytes_sys::quantize_4bit_fp4_fp32(&f32_data, QUANT_BLOCKSIZE)
+                    .map_err(|e| anyhow!("FP4 quantization failed: {:?}", e))?
+            }
             KVQuantType::None => unreachable!(),
         };
 
         tracing::trace!(
             "Quantized tensor (CPU path): {} elements, shape {:?} -> {} bytes ({:.1}% of f32)",
-            numel, shape, data.len(),
+            numel,
+            shape,
+            data.len(),
             (data.len() as f64 / (numel * 4) as f64) * 100.0
         );
 
-        Ok(Self { data, state, shape, dtype, device })
+        Ok(Self {
+            data,
+            state,
+            shape,
+            dtype,
+            device,
+        })
     }
 
     /// GPU-native quantization: operates directly on GPU BF16/FP16 tensors.
@@ -807,17 +828,11 @@ impl QuantizedTensor {
         let mut state = bitsandbytes_sys::QuantState::new_8bit(numel, QUANT_BLOCKSIZE);
 
         // Allocate GPU output tensor for quantized data
-        let output_tensor = Tensor::zeros(
-            [numel as i64],
-            (DType::Uint8, device),
-        );
+        let output_tensor = Tensor::zeros([numel as i64], (DType::Uint8, device));
 
         // Allocate GPU tensors for code and absmax
         let code_tensor = Tensor::from_slice(&state.code).to_device(device);
-        let absmax_tensor = Tensor::zeros(
-            [state.absmax.len() as i64],
-            (DType::Float, device),
-        );
+        let absmax_tensor = Tensor::zeros([state.absmax.len() as i64], (DType::Float, device));
 
         // Call GPU-native kernel
         unsafe {
@@ -828,12 +843,20 @@ impl QuantizedTensor {
 
             match dtype {
                 DType::BFloat16 => bitsandbytes_sys::quantize_blockwise_bf16_gpu(
-                    code_ptr, input_ptr, absmax_ptr, output_ptr,
-                    QUANT_BLOCKSIZE as i32, numel as i32,
+                    code_ptr,
+                    input_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    QUANT_BLOCKSIZE as i32,
+                    numel as i32,
                 ),
                 DType::Half => bitsandbytes_sys::quantize_blockwise_fp16_gpu(
-                    code_ptr, input_ptr, absmax_ptr, output_ptr,
-                    QUANT_BLOCKSIZE as i32, numel as i32,
+                    code_ptr,
+                    input_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    QUANT_BLOCKSIZE as i32,
+                    numel as i32,
                 ),
                 _ => unreachable!("GPU path only for BF16/FP16"),
             }
@@ -857,11 +880,19 @@ impl QuantizedTensor {
 
         tracing::trace!(
             "Quantized tensor (GPU path, {:?}): {} elements -> {} bytes ({:.1}% of original)",
-            dtype, numel, data.len(),
+            dtype,
+            numel,
+            data.len(),
             (data.len() as f64 / (numel as f64 * dtype_element_size(dtype) as f64)) * 100.0
         );
 
-        Ok(Self { data, state, shape: shape.to_vec(), dtype, device })
+        Ok(Self {
+            data,
+            state,
+            shape: shape.to_vec(),
+            dtype,
+            device,
+        })
     }
 
     /// Dequantize back to a tensor.
@@ -921,10 +952,7 @@ impl QuantizedTensor {
         let absmax_tensor = Tensor::from_slice(&self.state.absmax).to_device(self.device);
 
         // Allocate output tensor on GPU in original dtype
-        let output_tensor = Tensor::zeros(
-            [numel as i64],
-            (self.dtype, self.device),
-        );
+        let output_tensor = Tensor::zeros([numel as i64], (self.dtype, self.device));
 
         unsafe {
             let quant_ptr = quant_tensor.data_ptr() as *mut u8;
@@ -934,12 +962,20 @@ impl QuantizedTensor {
 
             match self.dtype {
                 DType::BFloat16 => bitsandbytes_sys::dequantize_blockwise_bf16_gpu(
-                    code_ptr, quant_ptr, absmax_ptr, output_ptr,
-                    self.state.blocksize as i32, numel as i32,
+                    code_ptr,
+                    quant_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    self.state.blocksize as i32,
+                    numel as i32,
                 ),
                 DType::Half => bitsandbytes_sys::dequantize_blockwise_fp16_gpu(
-                    code_ptr, quant_ptr, absmax_ptr, output_ptr,
-                    self.state.blocksize as i32, numel as i32,
+                    code_ptr,
+                    quant_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    self.state.blocksize as i32,
+                    numel as i32,
                 ),
                 _ => unreachable!("GPU dequant path only for BF16/FP16"),
             }
@@ -950,7 +986,9 @@ impl QuantizedTensor {
 
         tracing::trace!(
             "Dequantized tensor (GPU path, {:?}): {} bytes -> {} elements",
-            self.dtype, self.data.len(), numel
+            self.dtype,
+            self.data.len(),
+            numel
         );
 
         Ok(result)
@@ -1149,8 +1187,7 @@ impl LayerKVCache {
         }
 
         // Round up to chunk boundary
-        let new_capacity =
-            required_len.div_ceil(DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE;
+        let new_capacity = required_len.div_ceil(DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE;
         let new_capacity = new_capacity.min(self.max_seq_len);
 
         let shape = template.size();
@@ -1251,10 +1288,14 @@ impl LayerKVCache {
                 );
             } else {
                 // First flush - just quantize the buffer
-                *keys_quantized =
-                    Some(QuantizedTensor::from_tensor(&keys_to_quantize, *quant_type)?);
-                *values_quantized =
-                    Some(QuantizedTensor::from_tensor(&values_to_quantize, *quant_type)?);
+                *keys_quantized = Some(QuantizedTensor::from_tensor(
+                    &keys_to_quantize,
+                    *quant_type,
+                )?);
+                *values_quantized = Some(QuantizedTensor::from_tensor(
+                    &values_to_quantize,
+                    *quant_type,
+                )?);
 
                 tracing::debug!("Initial quantization: {} tokens", *buffer_len);
             }
@@ -1452,7 +1493,8 @@ impl LayerKVCache {
                 while token_offset < seq_len {
                     let block_idx = pos / BLOCK_SIZE;
                     let offset_in_block = pos % BLOCK_SIZE;
-                    let tokens_this_block = (BLOCK_SIZE - offset_in_block).min(seq_len - token_offset);
+                    let tokens_this_block =
+                        (BLOCK_SIZE - offset_in_block).min(seq_len - token_offset);
 
                     // Ensure we have enough blocks allocated. Allocation failure
                     // surfaces as the typed `BlockPoolExhausted` (fail-soft) so a
@@ -1481,7 +1523,11 @@ impl LayerKVCache {
                         .copy_(&new_keys.narrow(1, token_offset as i64, tokens_this_block as i64));
                     v_block
                         .narrow(1, offset_in_block as i64, tokens_this_block as i64)
-                        .copy_(&new_values.narrow(1, token_offset as i64, tokens_this_block as i64));
+                        .copy_(&new_values.narrow(
+                            1,
+                            token_offset as i64,
+                            tokens_this_block as i64,
+                        ));
 
                     pos += tokens_this_block;
                     token_offset += tokens_this_block;
@@ -1562,10 +1608,7 @@ impl LayerKVCache {
                 } else if key_parts.len() == 1 {
                     (key_parts.remove(0), value_parts.remove(0))
                 } else {
-                    (
-                        Tensor::cat(&key_parts, 1),
-                        Tensor::cat(&value_parts, 1),
-                    )
+                    (Tensor::cat(&key_parts, 1), Tensor::cat(&value_parts, 1))
                 };
 
                 // Cache the dequantized view
@@ -1597,7 +1640,11 @@ impl LayerKVCache {
                 let pool_guard = pool.lock();
                 let num_full_blocks = self.seq_pos / BLOCK_SIZE;
                 let remainder = self.seq_pos % BLOCK_SIZE;
-                let total_blocks_used = if remainder > 0 { num_full_blocks + 1 } else { num_full_blocks };
+                let total_blocks_used = if remainder > 0 {
+                    num_full_blocks + 1
+                } else {
+                    num_full_blocks
+                };
 
                 if total_blocks_used == 0 || key_blocks.is_empty() {
                     return Err(anyhow!("No data in paged cache"));
@@ -1728,7 +1775,11 @@ impl LayerKVCache {
                 cached_valid_len,
             } => {
                 // Free blocks beyond the last needed block
-                let blocks_needed = if pos == 0 { 0 } else { (pos - 1) / BLOCK_SIZE + 1 };
+                let blocks_needed = if pos == 0 {
+                    0
+                } else {
+                    (pos - 1) / BLOCK_SIZE + 1
+                };
                 if key_blocks.len() > blocks_needed {
                     let mut pool_guard = pool.lock();
                     for &id in &key_blocks[blocks_needed..] {
@@ -1816,7 +1867,9 @@ impl LayerKVCache {
                 // Note: dequant cache is temporary and not counted
                 total
             }
-            KVStorage::Paged { key_blocks, pool, .. } => {
+            KVStorage::Paged {
+                key_blocks, pool, ..
+            } => {
                 // Count blocks owned by this layer (K + V)
                 let pool_guard = pool.lock();
                 let elem_size = match pool_guard.dtype() {
@@ -2037,7 +2090,9 @@ impl KVCacheManager {
         if !self.enabled {
             return None;
         }
-        self.layer_caches.get_mut(&layer_idx).map(|mut cache_ref| f(&mut cache_ref))
+        self.layer_caches
+            .get_mut(&layer_idx)
+            .map(|mut cache_ref| f(&mut cache_ref))
     }
 
     /// Borrow a layer's cache directly as a `RefMut` (for the batched decode path,
@@ -2056,7 +2111,7 @@ impl KVCacheManager {
 
     /// Check if a layer cache exists (for testing)
     #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+    #[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
     fn get_layer_cache(&self, layer_idx: usize) -> Option<()> {
         if !self.enabled {
             return None;
@@ -2132,8 +2187,7 @@ impl KVCacheManager {
     ) -> CacheReuseDecision {
         let stored = self.compat_fingerprint();
         let cache_is_empty = self.cached_token_count() == 0;
-        let decision =
-            decide_cache_reuse(expected.as_ref(), stored.as_ref(), cache_is_empty);
+        let decision = decide_cache_reuse(expected.as_ref(), stored.as_ref(), cache_is_empty);
 
         match decision {
             CacheReuseDecision::Reuse => {
@@ -2204,7 +2258,11 @@ impl KVCacheManager {
             })
             .unwrap_or(0);
 
-        self.layer_caches.iter().map(|c| c.memory_usage()).sum::<usize>() + ssm_bytes
+        self.layer_caches
+            .iter()
+            .map(|c| c.memory_usage())
+            .sum::<usize>()
+            + ssm_bytes
     }
 
     /// Get the quantization type
@@ -2214,7 +2272,8 @@ impl KVCacheManager {
 
     /// Update last access timestamp (for LRU eviction)
     pub fn touch(&self) {
-        self.last_access_ms.store(current_timestamp_ms(), Ordering::Relaxed);
+        self.last_access_ms
+            .store(current_timestamp_ms(), Ordering::Relaxed);
         self.access_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2291,8 +2350,12 @@ impl KVCacheManager {
     pub fn ssm_snapshot(&self) -> Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)> {
         self.ssm_snapshot.as_ref().map(|(conv, rec)| {
             (
-                conv.iter().map(|opt| opt.as_ref().map(Tensor::copy)).collect(),
-                rec.iter().map(|opt| opt.as_ref().map(Tensor::copy)).collect(),
+                conv.iter()
+                    .map(|opt| opt.as_ref().map(Tensor::copy))
+                    .collect(),
+                rec.iter()
+                    .map(|opt| opt.as_ref().map(Tensor::copy))
+                    .collect(),
             )
         })
     }
@@ -2538,7 +2601,10 @@ mod tests {
     #[test]
     fn test_ssm_snapshot_records_owning_devices() {
         let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
-        assert!(manager.ssm_slot_devices.is_empty(), "fresh cache records nothing");
+        assert!(
+            manager.ssm_slot_devices.is_empty(),
+            "fresh cache records nothing"
+        );
 
         let opt = (DType::Float, Device::Cpu);
         let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
@@ -2605,8 +2671,14 @@ mod tests {
             }
         }
         // Values survived the offload/restore round trip.
-        assert_eq!(conv_restored[0].as_ref().unwrap().double_value(&[1, 2]), 7.0);
-        assert_eq!(conv_restored[1].as_ref().unwrap().double_value(&[1, 2]), 9.0);
+        assert_eq!(
+            conv_restored[0].as_ref().unwrap().double_value(&[1, 2]),
+            7.0
+        );
+        assert_eq!(
+            conv_restored[1].as_ref().unwrap().double_value(&[1, 2]),
+            9.0
+        );
         assert_eq!(rec_restored[0].as_ref().unwrap().double_value(&[3]), 11.0);
         assert_eq!(rec_restored[1].as_ref().unwrap().double_value(&[3]), 13.0);
     }
@@ -2629,9 +2701,19 @@ mod tests {
 
         manager.clear_all();
 
-        assert_eq!(manager.cached_token_count(), 0, "token IDs must go with the tensors");
-        assert!(manager.ssm_snapshot().is_none(), "stale snapshot must not survive a clear");
-        assert!(manager.ssm_slot_devices.is_empty(), "slot-device record must go with the snapshot");
+        assert_eq!(
+            manager.cached_token_count(),
+            0,
+            "token IDs must go with the tensors"
+        );
+        assert!(
+            manager.ssm_snapshot().is_none(),
+            "stale snapshot must not survive a clear"
+        );
+        assert!(
+            manager.ssm_slot_devices.is_empty(),
+            "slot-device record must go with the snapshot"
+        );
         assert_eq!(
             manager.prefix_match_len(&[9, 9, 9, 4]),
             0,
@@ -2753,15 +2835,25 @@ mod tests {
         let head_dim = 4;
 
         // Create pool with enough blocks for the test
-        let pool = Arc::new(Mutex::new(
-            BlockPool::new(8, num_kv_heads, head_dim, device, dtype)?
-        ));
+        let pool = Arc::new(Mutex::new(BlockPool::new(
+            8,
+            num_kv_heads,
+            head_dim,
+            device,
+            dtype,
+        )?));
 
         let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(1));
 
         // Write 10 tokens (less than one block of 256)
-        let keys = Tensor::ones([1, 10, num_kv_heads as i64, head_dim as i64], (dtype, device));
-        let values = Tensor::ones([1, 10, num_kv_heads as i64, head_dim as i64], (dtype, device)) * 2.0;
+        let keys = Tensor::ones(
+            [1, 10, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        );
+        let values = Tensor::ones(
+            [1, 10, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        ) * 2.0;
         cache.update(&keys, &values, 0)?;
         assert_eq!(cache.seq_pos, 10);
 
@@ -2771,8 +2863,14 @@ mod tests {
         assert_eq!(v.size()[1], 10);
 
         // Append 5 more tokens
-        let more_keys = Tensor::ones([1, 5, num_kv_heads as i64, head_dim as i64], (dtype, device)) * 3.0;
-        let more_values = Tensor::ones([1, 5, num_kv_heads as i64, head_dim as i64], (dtype, device)) * 4.0;
+        let more_keys = Tensor::ones(
+            [1, 5, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        ) * 3.0;
+        let more_values = Tensor::ones(
+            [1, 5, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        ) * 4.0;
         cache.update(&more_keys, &more_values, 10)?;
         assert_eq!(cache.seq_pos, 15);
 
@@ -2915,7 +3013,7 @@ mod tests {
             let values = Tensor::ones([1, 10, 2, 4], (dtype, device));
             cache.update(&keys, &values, 0)?;
             assert_eq!(pool.lock().used_blocks(), 2); // 1 K + 1 V block
-            // `cache` dropped here WITHOUT an explicit clear()
+                                                      // `cache` dropped here WITHOUT an explicit clear()
         }
 
         // Drop must have returned both blocks to the pool.
@@ -2933,7 +3031,8 @@ mod tests {
         let pool = Arc::new(Mutex::new(BlockPool::new(16, 2, 4, device, dtype)?));
 
         {
-            let manager = KVCacheManager::new_paged(3, 1024, pool.clone(), CacheOwner::Session("s".into()));
+            let manager =
+                KVCacheManager::new_paged(3, 1024, pool.clone(), CacheOwner::Session("s".into()));
             for layer in 0..3 {
                 manager.with_layer_cache(layer, |c| {
                     let k = Tensor::ones([1, 5, 2, 4], (dtype, device));
@@ -2952,13 +3051,18 @@ mod tests {
     fn mtp_auxiliary_cache_retains_paged_pool_and_owner() -> Result<()> {
         for main_layers in [0, 1] {
             let pool = Arc::new(Mutex::new(BlockPool::new(
-                2, 2, 4, Device::Cpu, DType::Float,
+                2,
+                2,
+                4,
+                Device::Cpu,
+                DType::Float,
             )?));
             let alice = CacheOwner::Session("mtp-alice".into());
             let manager = KVCacheManager::new_paged(main_layers, 64, pool.clone(), alice.clone());
             let keys = Tensor::ones([1, 1, 2, 4], (DType::Float, Device::Cpu));
             manager.ensure_layer_cache(main_layers);
-            manager.with_layer_cache(main_layers, |cache| cache.update(&keys, &keys, 0))
+            manager
+                .with_layer_cache(main_layers, |cache| cache.update(&keys, &keys, 0))
                 .expect("auxiliary slot")?;
             assert_eq!(pool.lock().used_blocks(), 2);
             for block in 0..2 {
@@ -2968,18 +3072,23 @@ mod tests {
             manager.ensure_layer_cache(main_layers);
             assert_eq!(pool.lock().used_blocks(), 2);
             manager.ensure_layer_cache(main_layers + 1);
-            let error = manager.with_layer_cache(main_layers + 1, |cache| cache.update(&keys, &keys, 0))
-                .expect("second auxiliary slot").expect_err("shared pool is full");
+            let error = manager
+                .with_layer_cache(main_layers + 1, |cache| cache.update(&keys, &keys, 0))
+                .expect("second auxiliary slot")
+                .expect_err("shared pool is full");
             assert!(error.downcast_ref::<BlockPoolExhausted>().is_some());
             assert_eq!(pool.lock().used_blocks(), 2);
             let bob = CacheOwner::Session("mtp-bob".into());
             let other = KVCacheManager::new_paged(0, 64, pool.clone(), bob.clone());
             other.ensure_layer_cache(0);
-            assert!(other.with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
-                .expect("other owner's auxiliary slot").is_err());
+            assert!(other
+                .with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
+                .expect("other owner's auxiliary slot")
+                .is_err());
             drop(manager);
             assert_eq!(pool.lock().used_blocks(), 0);
-            other.with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
+            other
+                .with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
                 .expect("other owner's auxiliary slot")?;
             for block in 0..2 {
                 assert_eq!(pool.lock().owner_of(block), Some(&bob));
@@ -3002,10 +3111,15 @@ mod tests {
 
         let keys = Tensor::ones([1, 10, 2, 4], (dtype, device));
         let values = Tensor::ones([1, 10, 2, 4], (dtype, device));
-        let err = cache.update(&keys, &values, 0).expect_err("should fail-soft on exhaustion");
+        let err = cache
+            .update(&keys, &values, 0)
+            .expect_err("should fail-soft on exhaustion");
 
         let exhausted = err.downcast_ref::<BlockPoolExhausted>();
-        assert!(exhausted.is_some(), "expected BlockPoolExhausted, got: {err:?}");
+        assert!(
+            exhausted.is_some(),
+            "expected BlockPoolExhausted, got: {err:?}"
+        );
         assert_eq!(exhausted.unwrap().total_blocks, 1);
 
         // The key block allocated before the value alloc failed must be rolled
@@ -3046,7 +3160,11 @@ mod tests {
             Some(&alice),
             "cross-owner free must not transfer or clear block ownership"
         );
-        assert_eq!(pool.used_blocks(), 1, "cross-owner free must not return block to free list");
+        assert_eq!(
+            pool.used_blocks(),
+            1,
+            "cross-owner free must not return block to free list"
+        );
 
         // Alice can free her own block.
         pool.free(&alice, block);
@@ -3076,7 +3194,9 @@ mod tests {
         let updated = manager.with_layer_cache(0, |cache| {
             let keys = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
             let values = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
-            cache.update(&keys, &values, 0).expect("populate layer cache");
+            cache
+                .update(&keys, &values, 0)
+                .expect("populate layer cache");
         });
         assert_eq!(updated, Some(()));
     }
@@ -3193,15 +3313,35 @@ mod tests {
         // Evict tenant-a's delta: only A's cache is invalidated; B is untouched.
         let invalidated = registry.invalidate_for_tenant("tenant-a");
         assert_eq!(invalidated, 1);
-        assert_eq!(registry.cache_count(), 1, "only tenant-a's cache is removed");
+        assert_eq!(
+            registry.cache_count(),
+            1,
+            "only tenant-a's cache is removed"
+        );
 
         // A's cache (Arc still held by the test) was cleared in place.
-        assert_eq!(cache_a.lock().cached_token_count(), 0, "tenant-a cache cleared");
-        assert_eq!(layer0_seq_pos(&cache_a), Some(0), "tenant-a layer KV cleared");
+        assert_eq!(
+            cache_a.lock().cached_token_count(),
+            0,
+            "tenant-a cache cleared"
+        );
+        assert_eq!(
+            layer0_seq_pos(&cache_a),
+            Some(0),
+            "tenant-a layer KV cleared"
+        );
 
         // B's cache survives with its KV intact.
-        assert_eq!(cache_b.lock().cached_token_count(), 4, "tenant-b cache intact");
-        assert_eq!(layer0_seq_pos(&cache_b), Some(4), "tenant-b layer KV intact");
+        assert_eq!(
+            cache_b.lock().cached_token_count(),
+            4,
+            "tenant-b cache intact"
+        );
+        assert_eq!(
+            layer0_seq_pos(&cache_b),
+            Some(4),
+            "tenant-b layer KV intact"
+        );
     }
 
     /// A session cache must not survive a weight-version change: no-delta↔delta
@@ -3220,14 +3360,22 @@ mod tests {
             !registry.register_delta_dependency(&owner, None, 0),
             "fresh cache is not stale"
         );
-        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved on first register");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved on first register"
+        );
 
         // 2. no-delta → tenant delta: weights changed, KV is stale and cleared.
         assert!(
             registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
             "no-delta → delta must clear stale KV"
         );
-        assert_eq!(cache.lock().cached_token_count(), 0, "KV cleared across weight version");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "KV cleared across weight version"
+        );
         assert_eq!(layer0_seq_pos(&cache), Some(0));
 
         // Repopulate to simulate a fresh compute under tenant-1.
@@ -3239,7 +3387,11 @@ mod tests {
             !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
             "same tenant at the same epoch is not stale"
         );
-        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved for same tenant");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved for same tenant"
+        );
 
         // 4. delta → no-delta: weights changed again, stale and cleared.
         assert!(
@@ -3286,7 +3438,11 @@ mod tests {
             !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
             "same tenant at the same epoch must preserve KV"
         );
-        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved within a weight epoch");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved within a weight epoch"
+        );
         assert_eq!(layer0_seq_pos(&cache), Some(4));
 
         // In-place re-adaptation: tenant id unchanged, epoch bumped 1 → 2.
@@ -3295,7 +3451,11 @@ mod tests {
             registry.register_delta_dependency(&owner, Some("tenant-1".into()), 2),
             "same tenant at an advanced epoch must clear stale KV"
         );
-        assert_eq!(cache.lock().cached_token_count(), 0, "weight-stale KV cleared");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "weight-stale KV cleared"
+        );
         assert_eq!(layer0_seq_pos(&cache), Some(0));
 
         // Repopulate under the new weights; the new epoch is now recorded.
@@ -3304,7 +3464,11 @@ mod tests {
             !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 2),
             "post-clear reuse at the recorded epoch is not stale"
         );
-        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved after recompute");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved after recompute"
+        );
 
         // A reset/rollback bumps the epoch again → stale again.
         assert!(
@@ -3328,7 +3492,10 @@ mod tests {
 
         // Releasing a stateless cache removes both the cache and its dependency.
         registry.release(&owner);
-        assert!(!registry.caches.contains_key(&owner), "stateless cache removed");
+        assert!(
+            !registry.caches.contains_key(&owner),
+            "stateless cache removed"
+        );
         assert!(
             !registry.delta_dependencies.contains_key(&owner),
             "delta dependency removed on release"
@@ -3351,6 +3518,10 @@ mod tests {
         // Invalidating any tenant leaves the no-tenant cache untouched.
         assert_eq!(registry.invalidate_for_tenant("anyone"), 0);
         assert_eq!(registry.cache_count(), 1);
-        assert_eq!(cache.lock().cached_token_count(), 4, "no-tenant cache intact");
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "no-tenant cache intact"
+        );
     }
 }

@@ -395,11 +395,16 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         method_discriminator: u16,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        self.call_bound(payload, Some(service_domain), Some(method_discriminator)).await
+        self.call_bound(payload, Some(service_domain), Some(method_discriminator))
+            .await
     }
 
-    async fn call_bound(&self, payload: Vec<u8>, service_domain: Option<&str>,
-        method_discriminator: Option<u16>,) -> Result<Vec<u8>> {
+    async fn call_bound(
+        &self,
+        payload: Vec<u8>,
+        service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
+    ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
@@ -455,8 +460,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             payload,
             ephemeral_pubkey,
             Some(service_domain),
-            Some(method_discriminator),)
-            .await
+            Some(method_discriminator),
+        )
+        .await
     }
 
     async fn call_streaming_bound(
@@ -616,7 +622,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_with_options_bound(payload, options, None, None).await
+        self.call_with_options_bound(payload, options, None, None)
+            .await
     }
 
     /// Send an option-bearing request bound to a canonical destination.
@@ -629,7 +636,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         self.call_with_options_bound(payload, options, Some(service_domain), None)
             .await
     }
-
 
     /// Send an option-bearing generated request bound to its service and method.
     pub async fn call_with_options_for_service_with_method(
@@ -817,15 +823,14 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
-        let inferred_method = if self.browser_provisioning_binding.is_some()
-            && method_discriminator.is_none()
-        {
-            Some(crate::browser_provisioning::canonical_method_discriminator(
-                &payload,
-            )?)
-        } else {
-            None
-        };
+        let inferred_method =
+            if self.browser_provisioning_binding.is_some() && method_discriminator.is_none() {
+                Some(crate::browser_provisioning::canonical_method_discriminator(
+                    &payload,
+                )?)
+            } else {
+                None
+            };
         let service_domain = service_domain.or_else(|| {
             self.browser_provisioning_binding
                 .as_ref()
@@ -852,7 +857,10 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // The browser carrier adds an authenticated provisioning transcript
         // around the application body. Dispatch removes that wrapper before
         // comparing proof claim -70003 to the decoded Cap'n Proto request.
-        let proof_body = self.federate_proof_provider.as_ref().map(|_| envelope.payload.clone());
+        let proof_body = self
+            .federate_proof_provider
+            .as_ref()
+            .map(|_| envelope.payload.clone());
         if let Some(binding) = &self.browser_provisioning_binding {
             let service_domain = service_domain.ok_or_else(|| {
                 anyhow::anyhow!("browser request extension requires a canonical service domain")
@@ -867,7 +875,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 request_id,
                 service_domain,
                 method_discriminator,
-                &envelope.payload,)?;
+                &envelope.payload,
+            )?;
         }
 
         let (pending, encrypted_envelope) = if self.transport.forbids_cleartext_envelope() {
@@ -901,21 +910,23 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             let public = keypair.public();
             envelope = envelope.with_response_kem_recipient(public.clone());
             if let Some(provider) = &self.federate_proof_provider {
-                let body = proof_body.as_deref().ok_or_else(|| anyhow::anyhow!(
-                    "Federate proof lost the original Cap'n Proto body"))?;
+                let body = proof_body.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Federate proof lost the original Cap'n Proto body")
+                })?;
                 let proof = provider.proof_for(&envelope, body).await?;
                 envelope = envelope.with_proof_cwt(proof);
             }
             // This unverified subject inspection only selects extra proof
             // emission; it grants no authority. Policy verifies the credential
             // and holder independently. User delegation remains unchanged.
-            if envelope.delegation_token.is_none() && envelope.jwt_token()
-                .and_then(|token| crate::auth::decode_unverified(token).ok())
-                .is_some_and(|claims| claims.sub.starts_with("service:"))
+            if envelope.delegation_token.is_none()
+                && envelope
+                    .jwt_token()
+                    .and_then(|token| crate::auth::decode_unverified(token).ok())
+                    .is_some_and(|claims| claims.sub.starts_with("service:"))
             {
-                envelope.authorization_witness = Some(
-                    crate::authorization_witness::sign(&envelope, &self.signer).await?,
-                );
+                envelope.authorization_witness =
+                    Some(crate::authorization_witness::sign(&envelope, &self.signer).await?);
             }
             let pending = Some(PendingResponse {
                 request_id,
@@ -936,8 +947,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             (pending, sealed)
         } else {
             if let Some(provider) = &self.federate_proof_provider {
-                let body = proof_body.as_deref().ok_or_else(|| anyhow::anyhow!(
-                    "Federate proof lost the original Cap'n Proto body"))?;
+                let body = proof_body.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Federate proof lost the original Cap'n Proto body")
+                })?;
                 let proof = provider.proof_for(&envelope, body).await?;
                 envelope = envelope.with_proof_cwt(proof);
             }
@@ -1194,8 +1206,11 @@ pub trait RpcClient: Send + Sync {
         options: CallOptions,
     ) -> Result<Vec<u8>>;
     async fn call_with_options_for_service_with_method(
-        &self, service_domain: &str, method_discriminator: u16,
-        payload: Vec<u8>, options: CallOptions,
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
             options.jwt.is_none() && options.delegated_bearer.is_none(),
@@ -1240,8 +1255,12 @@ pub trait RpcClient: Send + Sync {
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
     async fn call_streaming_with_options_for_service_with_method(
-        &self, service_domain: &str, method_discriminator: u16,
-        payload: Vec<u8>, ephemeral_pubkey: [u8; 32], options: CallOptions,
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
             options.jwt.is_none() && options.delegated_bearer.is_none(),
@@ -1328,12 +1347,20 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call_with_options_for_service(self, service_domain, payload, options).await
     }
     async fn call_with_options_for_service_with_method(
-        &self, service_domain: &str, method_discriminator: u16,
-        payload: Vec<u8>, options: CallOptions,
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_with_options_for_service_with_method(
-            self, service_domain, method_discriminator, payload, options,
-        ).await
+            self,
+            service_domain,
+            method_discriminator,
+            payload,
+            options,
+        )
+        .await
     }
 
     async fn call_streaming(
@@ -1387,12 +1414,22 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         .await
     }
     async fn call_streaming_with_options_for_service_with_method(
-        &self, service_domain: &str, method_discriminator: u16,
-        payload: Vec<u8>, ephemeral_pubkey: [u8; 32], options: CallOptions,
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_streaming_with_options_for_service_with_method(
-            self, service_domain, method_discriminator, payload, ephemeral_pubkey, options,
-        ).await
+            self,
+            service_domain,
+            method_discriminator,
+            payload,
+            ephemeral_pubkey,
+            options,
+        )
+        .await
     }
 
     #[cfg(not(feature = "fips"))]
@@ -1455,13 +1492,30 @@ mod request_kem_tests {
     use tokio::sync::{oneshot, Mutex, Notify};
 
     struct TestFederateProofProvider {
-        seen: Arc<parking_lot::Mutex<Option<(Vec<u8>, crate::proof::recipient_binding::FederateRecipientBinding)>>>,
+        seen: Arc<
+            parking_lot::Mutex<
+                Option<(
+                    Vec<u8>,
+                    crate::proof::recipient_binding::FederateRecipientBinding,
+                )>,
+            >,
+        >,
     }
 
     #[async_trait]
     impl FederateProofProvider for TestFederateProofProvider {
-        async fn proof_for(&self, envelope: &RequestEnvelope, capnp_body: &[u8]) -> Result<Vec<u8>> {
-            use crate::proof::{build::{AuthenticatedHybridProofSigner, AuthenticatedRequestProofInput, build_authenticated_hybrid_request_proof}, recipient_binding::FederateRecipientBinding};
+        async fn proof_for(
+            &self,
+            envelope: &RequestEnvelope,
+            capnp_body: &[u8],
+        ) -> Result<Vec<u8>> {
+            use crate::proof::{
+                build::{
+                    build_authenticated_hybrid_request_proof, AuthenticatedHybridProofSigner,
+                    AuthenticatedRequestProofInput,
+                },
+                recipient_binding::FederateRecipientBinding,
+            };
             let binding = FederateRecipientBinding::from_recipients(
                 envelope.response_kem_recipient.as_ref(),
                 envelope.client_kem_public.as_ref(),
@@ -1475,16 +1529,19 @@ mod request_kem_tests {
                 b"proof-fixture-pq".to_vec(),
             )?;
             let issued_at = u64::try_from(envelope.iat)?;
-            build_authenticated_hybrid_request_proof(&AuthenticatedRequestProofInput {
-                service_domain: envelope.service_domain.as_deref().unwrap(),
-                credential: envelope.jwt_token().unwrap().as_bytes(),
-                issued_at,
-                expires_at: issued_at + 30,
-                capnp_schema_id: 0xd4d0_f2a1_b3c5_8e67,
-                capnp_body,
-                response_binding: None,
-                federate_recipient_binding: Some(&binding),
-            }, &signer)
+            build_authenticated_hybrid_request_proof(
+                &AuthenticatedRequestProofInput {
+                    service_domain: envelope.service_domain.as_deref().unwrap(),
+                    credential: envelope.jwt_token().unwrap().as_bytes(),
+                    issued_at,
+                    expires_at: issued_at + 30,
+                    capnp_schema_id: 0xd4d0_f2a1_b3c5_8e67,
+                    capnp_body,
+                    response_binding: None,
+                    federate_recipient_binding: Some(&binding),
+                },
+                &signer,
+            )
         }
     }
 
@@ -1718,7 +1775,9 @@ mod request_kem_tests {
             .await
             .expect_err("ambiguous principal selection must fail");
         assert!(
-            error.to_string().contains("both a direct JWT and a delegated bearer"),
+            error
+                .to_string()
+                .contains("both a direct JWT and a delegated bearer"),
             "unexpected error: {error}"
         );
         assert!(
@@ -1921,50 +1980,76 @@ mod request_kem_tests {
         let mut kem_store = KeyedKemTrustStore::new();
         kem_store.bind(server_vk.to_bytes(), server_recipient.public());
         let seen = Arc::new(parking_lot::Mutex::new(None));
-        let client = RpcClientImpl::new(LocalSigner::new(client_sk), ForbidsCleartextMock, Some(server_vk))
-            .with_request_kem_store(Arc::new(kem_store))
-            .with_browser_provisioning_binding(browser_test_binding()).unwrap()
-            .with_federate_proof_provider(Arc::new(TestFederateProofProvider { seen: seen.clone() }))
-            .with_default_jwt("fixture.sender.constrained.jwt".into());
+        let client = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            ForbidsCleartextMock,
+            Some(server_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store))
+        .with_browser_provisioning_binding(browser_test_binding())
+        .unwrap()
+        .with_federate_proof_provider(Arc::new(TestFederateProofProvider { seen: seen.clone() }))
+        .with_default_jwt("fixture.sender.constrained.jwt".into());
         let original = browser_capnp_request(7);
-        let (wire, _) = client.sign_envelope(
-            17, original.clone(), None, None,
-            Some("fixture.sender.constrained.jwt".into()), None,
-            Some("model"), Some(7),
-        ).await.unwrap();
+        let (wire, _) = client
+            .sign_envelope(
+                17,
+                original.clone(),
+                None,
+                None,
+                Some("fixture.sender.constrained.jwt".into()),
+                None,
+                Some("model"),
+                Some(7),
+            )
+            .await
+            .unwrap();
         let mut signed = signed_envelope_from_bytes(&wire);
         signed.decrypt_in_place_mesh_kem(&server_recipient).unwrap();
         let forwarded = signed.envelope;
         let proof = crate::proof::parser::ParsedProof::parse_deferred_federate_request(
             forwarded.proof_cwt.as_deref().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let (signed_body, binding) = seen.lock().clone().unwrap();
-        assert_eq!(signed_body, original, "proof must sign the application Cap'n Proto body");
+        assert_eq!(
+            signed_body, original,
+            "proof must sign the application Cap'n Proto body"
+        );
         let (_, recovered) = crate::browser_provisioning::recover_request_payload(
             &forwarded.payload,
             crate::browser_provisioning::BrowserTranscriptPolicy::Required {
                 request_id: 17,
                 service_name: "model",
-                carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                carrier_profile:
+                    crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(proof.claims.capnp_body_bytes, recovered);
-        assert_ne!(proof.claims.capnp_body_bytes, forwarded.payload,
-            "signing the transport framing would fail dispatch's body comparison");
-        assert_eq!(proof.claims.federate_recipient_binding.as_ref(), Some(&binding));
+        assert_ne!(
+            proof.claims.capnp_body_bytes, forwarded.payload,
+            "signing the transport framing would fail dispatch's body comparison"
+        );
+        assert_eq!(
+            proof.claims.federate_recipient_binding.as_ref(),
+            Some(&binding)
+        );
         assert!(binding.matches(forwarded.response_kem_recipient.as_ref(), None, None));
         let replacement = crate::crypto::hybrid_kem::generate_recipient(
             crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
-        ).unwrap().public();
-        assert!(!binding.matches(Some(&replacement), None, None),
-            "substituting the forwarded recipient must invalidate the signed binding");
+        )
+        .unwrap()
+        .public();
+        assert!(
+            !binding.matches(Some(&replacement), None, None),
+            "substituting the forwarded recipient must invalidate the signed binding"
+        );
     }
 
     fn browser_test_binding() -> crate::browser_provisioning::BrowserRequestBinding {
         use base64::Engine as _;
-        let encode = |bytes: &[u8]| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-        };
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         crate::browser_provisioning::BrowserRequestBinding {
             version: crate::browser_provisioning::BROWSER_PROVISIONING_VERSION.to_owned(),
             service_name: "model".to_owned(),
@@ -1974,7 +2059,8 @@ mod request_kem_tests {
             certificate_hashes: vec![encode(&[0x44; 32])],
             capability: "hyprstream-rpc/1".to_owned(),
             scope: "model".to_owned(),
-            carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+            carrier_profile:
+                crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
             response_key_id: "did:at9p:test-service#response".to_owned(),
             response_key_digest: encode(&[0x11; 32]),
             request_kem_key_id: "did:at9p:test-service#mesh-kem".to_owned(),
@@ -2023,11 +2109,15 @@ mod request_kem_tests {
                 crate::browser_provisioning::BrowserTranscriptPolicy::Required {
                     request_id,
                     service_name: "model",
-                    carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                    carrier_profile:
+                        crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
                 },
             )
             .expect("legacy export returned a sealed browser transcript");
-            assert_eq!(transcript.expect("browser transcript").method_discriminator, 7);
+            assert_eq!(
+                transcript.expect("browser transcript").method_discriminator,
+                7
+            );
             assert_eq!(recovered, application);
         }
         assert_eq!(state.recipients.lock().len(), 3);
@@ -2053,12 +2143,7 @@ mod request_kem_tests {
             .await
             .expect("bound generated options call reaches transport");
         let streaming = client
-            .call_streaming_for_service_with_method(
-                "model",
-                7,
-                application.clone(),
-                [0x55; 32],
-            )
+            .call_streaming_for_service_with_method("model", 7, application.clone(), [0x55; 32])
             .await
             .expect("bound generated streaming call reaches transport");
 
@@ -2068,14 +2153,22 @@ mod request_kem_tests {
                 crate::browser_provisioning::BrowserTranscriptPolicy::Required {
                     request_id,
                     service_name: "model",
-                    carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                    carrier_profile:
+                        crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
                 },
             )
             .expect("transport returned sealed browser transcript");
-            assert_eq!(transcript.expect("browser transcript").method_discriminator, 7);
+            assert_eq!(
+                transcript.expect("browser transcript").method_discriminator,
+                7
+            );
             assert_eq!(recovered, application);
         }
-        assert_eq!(state.recipients.lock().len(), 3, "all bound calls reached transport");
+        assert_eq!(
+            state.recipients.lock().len(),
+            3,
+            "all bound calls reached transport"
+        );
     }
 
     #[tokio::test]

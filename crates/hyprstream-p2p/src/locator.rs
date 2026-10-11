@@ -652,20 +652,16 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            locator
-                .providers_at(&id, RendezvousKey::new(1, 7))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            locator
-                .providers_at(&id, RendezvousKey::new(0, 8))
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(locator
+            .providers_at(&id, RendezvousKey::new(1, 7))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(locator
+            .providers_at(&id, RendezvousKey::new(0, 8))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -939,11 +935,9 @@ mod tests {
             found.len()
         );
         // Canonical provider still present — add-only holds through bounding.
-        assert!(
-            found
-                .iter()
-                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242))
-        );
+        assert!(found
+            .iter()
+            .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)));
     }
 
     /// BEP5 fake that succeeds for the canonical bucket but returns `Err` for a

@@ -69,11 +69,7 @@ impl Remote9pMount<SocketTransport<UnixStream>> {
     /// `uname`/`aname` are the 9P attach identity and export name (the server's
     /// [`Translator`](crate::translator::Translator) ignores them and serves its
     /// single Subject-scoped root, but they are sent for protocol conformance).
-    pub async fn connect_uds(
-        path: impl AsRef<Path>,
-        uname: &str,
-        aname: &str,
-    ) -> Result<Self> {
+    pub async fn connect_uds(path: impl AsRef<Path>, uname: &str, aname: &str) -> Result<Self> {
         let transport = SocketTransport::connect_uds(path).await?;
         let client = P9Client::connect(transport, uname, aname).await?;
         Ok(Self::from_client(client))

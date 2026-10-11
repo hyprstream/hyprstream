@@ -616,29 +616,23 @@ mod tests {
         assert!(AuthStrategy::Default.is_ambient());
         assert!(AuthStrategy::SshAgent { username: None }.is_ambient());
         // Explicit strategies are never ambient.
-        assert!(
-            !AuthStrategy::Token {
-                token: "t".into(),
-                host: None
-            }
-            .is_ambient()
-        );
-        assert!(
-            !AuthStrategy::UserPass {
-                username: "u".into(),
-                password: "p".into(),
-            }
-            .is_ambient()
-        );
-        assert!(
-            !AuthStrategy::SshKey {
-                username: "u".into(),
-                public_key: None,
-                private_key: PathBuf::from("/k"),
-                passphrase: None,
-            }
-            .is_ambient()
-        );
+        assert!(!AuthStrategy::Token {
+            token: "t".into(),
+            host: None
+        }
+        .is_ambient());
+        assert!(!AuthStrategy::UserPass {
+            username: "u".into(),
+            password: "p".into(),
+        }
+        .is_ambient());
+        assert!(!AuthStrategy::SshKey {
+            username: "u".into(),
+            public_key: None,
+            private_key: PathBuf::from("/k"),
+            passphrase: None,
+        }
+        .is_ambient());
     }
 
     /// Under AllowAmbient, `AuthStrategy::Default` is honored when the server

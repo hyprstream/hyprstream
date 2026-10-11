@@ -661,7 +661,11 @@ fn batch_without_conformal_set_encodes() {
         ),
     ])];
     let batch = schema.build_batch(&version(), &rows).expect("batch builds");
-    assert_eq!(batch.num_columns(), 9, "2 columns per question + version triple");
+    assert_eq!(
+        batch.num_columns(),
+        9,
+        "2 columns per question + version triple"
+    );
     assert_eq!(batch.schema().as_ref(), &schema.arrow_schema());
     // The flip is schema evolution, so a consumer diffing the two generations fails
     // loudly rather than silently reading positional columns.
@@ -701,7 +705,10 @@ fn max_cardinality_distribution_within_producer_tolerance() {
         drift <= hyprstream_decision::confidence::PRODUCER_SUM_TOLERANCE,
         "ramp drift {drift:e} must stay within the 1e-6 producer tolerance"
     );
-    assert!(drift > 1e-7, "the ramp should exercise real headroom, got {drift:e}");
+    assert!(
+        drift > 1e-7,
+        "the ramp should exercise real headroom, got {drift:e}"
+    );
 
     let rows = vec![row(vec![(
         "wide",
@@ -719,5 +726,9 @@ fn max_cardinality_distribution_within_producer_tolerance() {
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("labels");
-    assert_eq!(labels.value(0), "opt_254", "argmax of the ramp is the last option");
+    assert_eq!(
+        labels.value(0),
+        "opt_254",
+        "argmax of the ramp is the last option"
+    );
 }

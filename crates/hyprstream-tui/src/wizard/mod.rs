@@ -44,12 +44,7 @@ const ROLE_OPTIONS: &[(&str, &str)] = &[
 const ACTION_OPTIONS: &[&str] = &["infer", "train", "query", "write", "serve", "manage"];
 
 /// Expiration options for tokens.
-const EXPIRY_OPTIONS: &[&str] = &[
-    "90 days (recommended)",
-    "30 days",
-    "1 year",
-    "never",
-];
+const EXPIRY_OPTIONS: &[&str] = &["90 days (recommended)", "30 days", "1 year", "never"];
 
 /// The wizard TUI application.
 pub struct WizardApp<B: WizardBackend> {
@@ -129,8 +124,7 @@ impl<B: WizardBackend> WizardApp<B> {
                     .with_default(false),
             ));
         } else {
-            self.phase =
-                WizardPhase::PolicyTemplate(PolicyScreen::select_from(&templates));
+            self.phase = WizardPhase::PolicyTemplate(PolicyScreen::select_from(&templates));
         }
     }
 
@@ -242,11 +236,11 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
         let chunks = Layout::vertical([
-            Constraint::Length(3),  // header
-            Constraint::Length(1),  // phase indicator
-            Constraint::Length(1),  // separator
+            Constraint::Length(3), // header
+            Constraint::Length(1), // phase indicator
+            Constraint::Length(1), // separator
             Constraint::Min(10),   // content
-            Constraint::Length(2),  // footer
+            Constraint::Length(2), // footer
         ])
         .split(area);
 
@@ -311,20 +305,21 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
                             return true;
                         }
                         InstallAction::AlreadyCurrent => {
-                            self.install_summary =
-                                Some(format!("Already running optimal variant ({})", env.current_variant));
-                            self.phase = WizardPhase::Install(InstallScreen::Done(
-                                format!("Already running {} — no changes needed", env.current_variant),
+                            self.install_summary = Some(format!(
+                                "Already running optimal variant ({})",
+                                env.current_variant
                             ));
+                            self.phase = WizardPhase::Install(InstallScreen::Done(format!(
+                                "Already running {} — no changes needed",
+                                env.current_variant
+                            )));
                             // Don't auto-advance; let user press Enter
                         }
                         InstallAction::UpgradeVariant(_) => {}
                     }
                     if !matches!(self.phase, WizardPhase::Install(InstallScreen::Done(_))) {
-                        self.phase = WizardPhase::Install(InstallScreen::ShowFindings {
-                            env,
-                            action,
-                        });
+                        self.phase =
+                            WizardPhase::Install(InstallScreen::ShowFindings { env, action });
                     }
                     true
                 }
@@ -332,37 +327,36 @@ impl<B: WizardBackend> waxterm::TerminalApp for WizardApp<B> {
                     variant,
                     progress_pct,
                     status_msg,
-                } => {
-                    match self.backend.poll_install() {
-                        InstallPoll::Downloading { item, pct } => {
-                            *progress_pct = pct;
-                            *status_msg = format!("Downloading {item}...");
-                            true
-                        }
-                        InstallPoll::Extracting { item } => {
-                            *status_msg = format!("Extracting {item}...");
-                            true
-                        }
-                        InstallPoll::Configuring { step } => {
-                            *status_msg = step;
-                            *progress_pct = 100;
-                            true
-                        }
-                        InstallPoll::Done { summary } => {
-                            self.install_summary = Some(summary.clone());
-                            let v = variant.clone();
-                            self.phase = WizardPhase::Install(InstallScreen::Done(
-                                format!("{} variant installed — {summary}", v.label()),
-                            ));
-                            true
-                        }
-                        InstallPoll::Failed(msg) => {
-                            self.phase = WizardPhase::Install(InstallScreen::Failed(msg));
-                            true
-                        }
-                        InstallPoll::Detecting => true,
+                } => match self.backend.poll_install() {
+                    InstallPoll::Downloading { item, pct } => {
+                        *progress_pct = pct;
+                        *status_msg = format!("Downloading {item}...");
+                        true
                     }
-                }
+                    InstallPoll::Extracting { item } => {
+                        *status_msg = format!("Extracting {item}...");
+                        true
+                    }
+                    InstallPoll::Configuring { step } => {
+                        *status_msg = step;
+                        *progress_pct = 100;
+                        true
+                    }
+                    InstallPoll::Done { summary } => {
+                        self.install_summary = Some(summary.clone());
+                        let v = variant.clone();
+                        self.phase = WizardPhase::Install(InstallScreen::Done(format!(
+                            "{} variant installed — {summary}",
+                            v.label()
+                        )));
+                        true
+                    }
+                    InstallPoll::Failed(msg) => {
+                        self.phase = WizardPhase::Install(InstallScreen::Failed(msg));
+                        true
+                    }
+                    InstallPoll::Detecting => true,
+                },
                 _ => false,
             },
             WizardPhase::Bootstrap(screen) => {
@@ -474,10 +468,8 @@ impl<B: WizardBackend> WizardApp<B> {
                     }
                     _ => {
                         // Put it back
-                        self.phase = WizardPhase::Install(InstallScreen::ShowFindings {
-                            env,
-                            action,
-                        });
+                        self.phase =
+                            WizardPhase::Install(InstallScreen::ShowFindings { env, action });
                         return false;
                     }
                 }
@@ -500,8 +492,7 @@ impl<B: WizardBackend> WizardApp<B> {
                         self.advance_to_bootstrap();
                     }
                     WidgetResult::Pending => {
-                        self.phase =
-                            WizardPhase::Install(InstallScreen::SelectVariant(list));
+                        self.phase = WizardPhase::Install(InstallScreen::SelectVariant(list));
                     }
                 }
                 true
@@ -577,25 +568,19 @@ impl<B: WizardBackend> WizardApp<B> {
         };
 
         match screen {
-            PolicyScreen::ConfirmReplace(mut dialog) => {
-                match dialog.handle_key(key) {
-                    WidgetResult::Confirmed(true) => {
-                        let templates = self.backend.templates();
-                        self.phase = WizardPhase::PolicyTemplate(
-                            PolicyScreen::select_from(&templates),
-                        );
-                    }
-                    WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
-                        self.phase = WizardPhase::PolicyTemplate(PolicyScreen::Skipped);
-                        self.advance_to_users();
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::PolicyTemplate(
-                            PolicyScreen::ConfirmReplace(dialog),
-                        );
-                    }
+            PolicyScreen::ConfirmReplace(mut dialog) => match dialog.handle_key(key) {
+                WidgetResult::Confirmed(true) => {
+                    let templates = self.backend.templates();
+                    self.phase = WizardPhase::PolicyTemplate(PolicyScreen::select_from(&templates));
                 }
-            }
+                WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
+                    self.phase = WizardPhase::PolicyTemplate(PolicyScreen::Skipped);
+                    self.advance_to_users();
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::PolicyTemplate(PolicyScreen::ConfirmReplace(dialog));
+                }
+            },
             PolicyScreen::SelectTemplate(mut list) => {
                 match list.handle_key(key) {
                     WidgetResult::Confirmed(selection) => {
@@ -611,9 +596,7 @@ impl<B: WizardBackend> WizardApp<B> {
                                 .to_string();
                             self.backend.apply_template(&name);
                             self.templates_applied.push(name.clone());
-                            self.phase = WizardPhase::PolicyTemplate(
-                                PolicyScreen::Applied(name),
-                            );
+                            self.phase = WizardPhase::PolicyTemplate(PolicyScreen::Applied(name));
                             // Auto-advance after applying template
                             self.advance_to_users();
                         }
@@ -622,9 +605,8 @@ impl<B: WizardBackend> WizardApp<B> {
                         self.advance_to_users();
                     }
                     WidgetResult::Pending => {
-                        self.phase = WizardPhase::PolicyTemplate(
-                            PolicyScreen::SelectTemplate(list),
-                        );
+                        self.phase =
+                            WizardPhase::PolicyTemplate(PolicyScreen::SelectTemplate(list));
                     }
                 }
             }
@@ -636,40 +618,34 @@ impl<B: WizardBackend> WizardApp<B> {
     }
 
     fn handle_users_input(&mut self, key: &KeyPress) -> bool {
-        let phase = std::mem::replace(
-            &mut self.phase,
-            WizardPhase::Users(UserScreen::Done),
-        );
+        let phase = std::mem::replace(&mut self.phase, WizardPhase::Users(UserScreen::Done));
 
         let WizardPhase::Users(screen) = phase else {
             return false;
         };
 
         match screen {
-            UserScreen::AskAdd(mut dialog) => {
-                match dialog.handle_key(key) {
-                    WidgetResult::Confirmed(true) => {
-                        self.phase = WizardPhase::Users(UserScreen::EnterName(
-                            TextInput::new("Username:"),
-                        ));
-                    }
-                    WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
-                        self.phase = WizardPhase::Users(UserScreen::Done);
-                        self.advance_to_tokens();
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Users(UserScreen::AskAdd(dialog));
-                    }
+            UserScreen::AskAdd(mut dialog) => match dialog.handle_key(key) {
+                WidgetResult::Confirmed(true) => {
+                    self.phase =
+                        WizardPhase::Users(UserScreen::EnterName(TextInput::new("Username:")));
                 }
-            }
+                WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
+                    self.phase = WizardPhase::Users(UserScreen::Done);
+                    self.advance_to_tokens();
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Users(UserScreen::AskAdd(dialog));
+                }
+            },
             UserScreen::EnterName(mut input) => {
                 match input.handle_key(key) {
                     WidgetResult::Confirmed(name) => {
                         if name.trim().is_empty() {
                             // Re-prompt
-                            self.phase = WizardPhase::Users(UserScreen::EnterName(
-                                TextInput::new("Username:"),
-                            ));
+                            self.phase = WizardPhase::Users(UserScreen::EnterName(TextInput::new(
+                                "Username:",
+                            )));
                         } else {
                             self.pending_username = name.trim().to_string();
                             self.phase = WizardPhase::Users(UserScreen::SelectRole(
@@ -686,105 +662,96 @@ impl<B: WizardBackend> WizardApp<B> {
                     }
                 }
             }
-            UserScreen::SelectRole(mut list) => {
-                match list.handle_key(key) {
-                    WidgetResult::Confirmed(selection) => {
-                        let role_name = selection
-                            .split(" —")
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
+            UserScreen::SelectRole(mut list) => match list.handle_key(key) {
+                WidgetResult::Confirmed(selection) => {
+                    let role_name = selection
+                        .split(" —")
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
 
-                        if role_name == "custom" {
-                            self.pending_role = "custom".to_string();
-                            self.phase = WizardPhase::Users(UserScreen::CustomResource(
-                                TextInput::new("Resource pattern (e.g., model:*, *):").with_default("*"),
-                            ));
-                        } else {
-                            self.backend
-                                .add_user(&self.pending_username, &role_name);
-                            self.users_created.push(UserRecord {
-                                username: self.pending_username.clone(),
-                                role: role_name,
-                            });
-                            self.phase = WizardPhase::Users(UserScreen::AskAnother(
-                                ConfirmDialog::new("Add another user?").with_default(false),
-                            ));
-                        }
-                    }
-                    WidgetResult::Cancelled => {
-                        self.phase = WizardPhase::Users(UserScreen::AskAnother(
-                            ConfirmDialog::new("Add another user?").with_default(false),
+                    if role_name == "custom" {
+                        self.pending_role = "custom".to_string();
+                        self.phase = WizardPhase::Users(UserScreen::CustomResource(
+                            TextInput::new("Resource pattern (e.g., model:*, *):")
+                                .with_default("*"),
                         ));
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Users(UserScreen::SelectRole(list));
-                    }
-                }
-            }
-            UserScreen::CustomResource(mut input) => {
-                match input.handle_key(key) {
-                    WidgetResult::Confirmed(resource) => {
-                        self.pending_resource = resource;
-                        self.phase = WizardPhase::Users(UserScreen::CustomActions(
-                            Self::make_action_multiselect(),
-                        ));
-                    }
-                    WidgetResult::Cancelled => {
-                        self.phase = WizardPhase::Users(UserScreen::AskAnother(
-                            ConfirmDialog::new("Add another user?").with_default(false),
-                        ));
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Users(UserScreen::CustomResource(input));
-                    }
-                }
-            }
-            UserScreen::CustomActions(mut list) => {
-                match list.handle_key(key) {
-                    WidgetResult::Confirmed(actions) => {
-                        self.backend.add_user_custom(
-                            &self.pending_username,
-                            &self.pending_resource,
-                            &actions,
-                        );
-                        let actions_str = actions.join(",");
+                    } else {
+                        self.backend.add_user(&self.pending_username, &role_name);
                         self.users_created.push(UserRecord {
                             username: self.pending_username.clone(),
-                            role: format!("custom({actions_str})"),
+                            role: role_name,
                         });
                         self.phase = WizardPhase::Users(UserScreen::AskAnother(
                             ConfirmDialog::new("Add another user?").with_default(false),
                         ));
                     }
-                    WidgetResult::Cancelled => {
-                        self.phase = WizardPhase::Users(UserScreen::AskAnother(
-                            ConfirmDialog::new("Add another user?").with_default(false),
-                        ));
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Users(UserScreen::CustomActions(list));
-                    }
                 }
-            }
-            UserScreen::AskAnother(mut dialog) => {
-                match dialog.handle_key(key) {
-                    WidgetResult::Confirmed(true) => {
-                        self.phase = WizardPhase::Users(UserScreen::EnterName(
-                            TextInput::new("Username:"),
-                        ));
-                    }
-                    WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
-                        self.backend.save_policies();
-                        self.phase = WizardPhase::Users(UserScreen::Done);
-                        self.advance_to_tokens();
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Users(UserScreen::AskAnother(dialog));
-                    }
+                WidgetResult::Cancelled => {
+                    self.phase = WizardPhase::Users(UserScreen::AskAnother(
+                        ConfirmDialog::new("Add another user?").with_default(false),
+                    ));
                 }
-            }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Users(UserScreen::SelectRole(list));
+                }
+            },
+            UserScreen::CustomResource(mut input) => match input.handle_key(key) {
+                WidgetResult::Confirmed(resource) => {
+                    self.pending_resource = resource;
+                    self.phase = WizardPhase::Users(UserScreen::CustomActions(
+                        Self::make_action_multiselect(),
+                    ));
+                }
+                WidgetResult::Cancelled => {
+                    self.phase = WizardPhase::Users(UserScreen::AskAnother(
+                        ConfirmDialog::new("Add another user?").with_default(false),
+                    ));
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Users(UserScreen::CustomResource(input));
+                }
+            },
+            UserScreen::CustomActions(mut list) => match list.handle_key(key) {
+                WidgetResult::Confirmed(actions) => {
+                    self.backend.add_user_custom(
+                        &self.pending_username,
+                        &self.pending_resource,
+                        &actions,
+                    );
+                    let actions_str = actions.join(",");
+                    self.users_created.push(UserRecord {
+                        username: self.pending_username.clone(),
+                        role: format!("custom({actions_str})"),
+                    });
+                    self.phase = WizardPhase::Users(UserScreen::AskAnother(
+                        ConfirmDialog::new("Add another user?").with_default(false),
+                    ));
+                }
+                WidgetResult::Cancelled => {
+                    self.phase = WizardPhase::Users(UserScreen::AskAnother(
+                        ConfirmDialog::new("Add another user?").with_default(false),
+                    ));
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Users(UserScreen::CustomActions(list));
+                }
+            },
+            UserScreen::AskAnother(mut dialog) => match dialog.handle_key(key) {
+                WidgetResult::Confirmed(true) => {
+                    self.phase =
+                        WizardPhase::Users(UserScreen::EnterName(TextInput::new("Username:")));
+                }
+                WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
+                    self.backend.save_policies();
+                    self.phase = WizardPhase::Users(UserScreen::Done);
+                    self.advance_to_tokens();
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Users(UserScreen::AskAnother(dialog));
+                }
+            },
             UserScreen::Done => {
                 self.advance_to_tokens();
             }
@@ -793,60 +760,48 @@ impl<B: WizardBackend> WizardApp<B> {
     }
 
     fn handle_tokens_input(&mut self, key: &KeyPress) -> bool {
-        let phase = std::mem::replace(
-            &mut self.phase,
-            WizardPhase::Tokens(TokenScreen::Done),
-        );
+        let phase = std::mem::replace(&mut self.phase, WizardPhase::Tokens(TokenScreen::Done));
 
         let WizardPhase::Tokens(screen) = phase else {
             return false;
         };
 
         match screen {
-            TokenScreen::AskGenerate(mut dialog, username) => {
-                match dialog.handle_key(key) {
-                    WidgetResult::Confirmed(true) => {
-                        self.phase = WizardPhase::Tokens(TokenScreen::SelectExpiry(
-                            Self::make_expiry_select(),
-                            username,
-                        ));
-                    }
-                    WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
-                        self.token_queue_idx += 1;
-                        self.advance_token_for_next_user();
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Tokens(TokenScreen::AskGenerate(
-                            dialog, username,
-                        ));
-                    }
+            TokenScreen::AskGenerate(mut dialog, username) => match dialog.handle_key(key) {
+                WidgetResult::Confirmed(true) => {
+                    self.phase = WizardPhase::Tokens(TokenScreen::SelectExpiry(
+                        Self::make_expiry_select(),
+                        username,
+                    ));
                 }
-            }
-            TokenScreen::SelectExpiry(mut list, username) => {
-                match list.handle_key(key) {
-                    WidgetResult::Confirmed(selection) => {
-                        let duration = Self::expiry_to_duration(&selection);
-                        let result =
-                            self.backend.generate_token(&username, duration);
-                        let record = TokenRecord {
-                            username: username.clone(),
-                            token: result.token,
-                            expires: result.expires,
-                        };
-                        self.tokens_generated.push(record.clone());
-                        self.phase = WizardPhase::Tokens(TokenScreen::ShowToken(record));
-                    }
-                    WidgetResult::Cancelled => {
-                        self.token_queue_idx += 1;
-                        self.advance_token_for_next_user();
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Tokens(TokenScreen::SelectExpiry(
-                            list, username,
-                        ));
-                    }
+                WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
+                    self.token_queue_idx += 1;
+                    self.advance_token_for_next_user();
                 }
-            }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Tokens(TokenScreen::AskGenerate(dialog, username));
+                }
+            },
+            TokenScreen::SelectExpiry(mut list, username) => match list.handle_key(key) {
+                WidgetResult::Confirmed(selection) => {
+                    let duration = Self::expiry_to_duration(&selection);
+                    let result = self.backend.generate_token(&username, duration);
+                    let record = TokenRecord {
+                        username: username.clone(),
+                        token: result.token,
+                        expires: result.expires,
+                    };
+                    self.tokens_generated.push(record.clone());
+                    self.phase = WizardPhase::Tokens(TokenScreen::ShowToken(record));
+                }
+                WidgetResult::Cancelled => {
+                    self.token_queue_idx += 1;
+                    self.advance_token_for_next_user();
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Tokens(TokenScreen::SelectExpiry(list, username));
+                }
+            },
             TokenScreen::ShowToken(_record) => {
                 // Any key advances
                 self.token_queue_idx += 1;
@@ -870,20 +825,18 @@ impl<B: WizardBackend> WizardApp<B> {
         };
 
         match screen {
-            ServiceScreen::AskStart(mut dialog) => {
-                match dialog.handle_key(key) {
-                    WidgetResult::Confirmed(true) => {
-                        self.backend.start_services();
-                        self.phase = WizardPhase::Services(ServiceScreen::Starting);
-                    }
-                    WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
-                        self.advance_to_summary();
-                    }
-                    WidgetResult::Pending => {
-                        self.phase = WizardPhase::Services(ServiceScreen::AskStart(dialog));
-                    }
+            ServiceScreen::AskStart(mut dialog) => match dialog.handle_key(key) {
+                WidgetResult::Confirmed(true) => {
+                    self.backend.start_services();
+                    self.phase = WizardPhase::Services(ServiceScreen::Starting);
                 }
-            }
+                WidgetResult::Confirmed(false) | WidgetResult::Cancelled => {
+                    self.advance_to_summary();
+                }
+                WidgetResult::Pending => {
+                    self.phase = WizardPhase::Services(ServiceScreen::AskStart(dialog));
+                }
+            },
             ServiceScreen::Starting => {
                 // tick-driven
                 self.phase = WizardPhase::Services(ServiceScreen::Starting);
@@ -918,7 +871,14 @@ fn render_header(frame: &mut Frame, area: Rect) {
 }
 
 fn render_phase_indicator(frame: &mut Frame, area: Rect, current: u8, name: &str) {
-    let phases = ["Install", "Bootstrap", "Policy", "Users", "Tokens", "Services"];
+    let phases = [
+        "Install",
+        "Bootstrap",
+        "Policy",
+        "Users",
+        "Tokens",
+        "Services",
+    ];
     let mut spans = vec![Span::raw("  ")];
     for (i, label) in phases.iter().enumerate() {
         let num = (i + 1) as u8;
@@ -931,7 +891,13 @@ fn render_phase_indicator(frame: &mut Frame, area: Rect, current: u8, name: &str
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let marker = if num < current { "v" } else if num == current { ">" } else { " " };
+        let marker = if num < current {
+            "v"
+        } else if num == current {
+            ">"
+        } else {
+            " "
+        };
         spans.push(Span::styled(format!("{marker}{num}.{label}"), style));
         if i < phases.len() - 1 {
             spans.push(Span::raw(" "));
@@ -1023,12 +989,13 @@ fn render_install(frame: &mut Frame, area: Rect, screen: &InstallScreen) {
 
     match screen {
         InstallScreen::Detecting => {
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled("  > ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Detecting environment...", Style::default().fg(Color::Yellow)),
-                ]),
-            ];
+            let lines = vec![Line::from(vec![
+                Span::styled("  > ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "Detecting environment...",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])];
             frame.render_widget(Paragraph::new(lines), area);
         }
         InstallScreen::ShowFindings { env, action } => {
@@ -1193,10 +1160,7 @@ fn render_bootstrap(frame: &mut Frame, area: Rect, screen: &BootstrapScreen) {
     } else if !screen.done {
         lines.push(Line::from(vec![
             Span::styled("  > ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                &screen.current_step,
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(&screen.current_step, Style::default().fg(Color::Yellow)),
         ]));
     }
 
@@ -1224,12 +1188,7 @@ fn render_policy(frame: &mut Frame, area: Rect, screen: &PolicyScreen) {
     }
 }
 
-fn render_users(
-    frame: &mut Frame,
-    area: Rect,
-    screen: &UserScreen,
-    created: &[UserRecord],
-) {
+fn render_users(frame: &mut Frame, area: Rect, screen: &UserScreen, created: &[UserRecord]) {
     let mut lines: Vec<Line> = Vec::new();
 
     // Show already-created users
@@ -1270,10 +1229,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, screen: &TokenScreen) {
         TokenScreen::AskGenerate(dialog, _) => dialog.render(frame, area),
         TokenScreen::SelectExpiry(list, username) => {
             let header = Line::from(Span::raw(format!("  Token for '{username}':")));
-            let header_area = Rect {
-                height: 1,
-                ..area
-            };
+            let header_area = Rect { height: 1, ..area };
             frame.render_widget(Paragraph::new(header), header_area);
             let list_area = Rect {
                 y: area.y + 2,
@@ -1362,10 +1318,7 @@ fn render_summary(frame: &mut Frame, area: Rect, screen: &SummaryScreen) {
     if !screen.users_created.is_empty() {
         lines.push(Line::from("Users:"));
         for user in &screen.users_created {
-            lines.push(Line::from(format!(
-                "  {} ({})",
-                user.username, user.role
-            )));
+            lines.push(Line::from(format!("  {} ({})", user.username, user.role)));
         }
     }
 
@@ -1415,7 +1368,11 @@ mod tests {
     fn skip_install(app: &mut WizardApp<MockWizardBackend>) {
         // First tick triggers detection → ShowFindings
         app.tick(33);
-        assert_eq!(app.phase_number(), 1, "Should still be at Install after detection");
+        assert_eq!(
+            app.phase_number(),
+            1,
+            "Should still be at Install after detection"
+        );
         // Press 's' to skip
         app.handle_input(WizardCommand::Key(KeyPress::Char(b's')));
         assert_eq!(app.phase_number(), 2, "Should be at Bootstrap after skip");
@@ -1429,7 +1386,10 @@ mod tests {
                 break;
             }
         }
-        assert!(app.phase_number() >= 3, "Should have advanced past bootstrap");
+        assert!(
+            app.phase_number() >= 3,
+            "Should have advanced past bootstrap"
+        );
     }
 
     // ─── Install phase tests ─────────────────────────────────────────────
@@ -1438,7 +1398,10 @@ mod tests {
     fn test_initial_phase_is_install() {
         let app = make_app();
         assert_eq!(app.phase_number(), 1);
-        assert!(matches!(app.phase, WizardPhase::Install(InstallScreen::Detecting)));
+        assert!(matches!(
+            app.phase,
+            WizardPhase::Install(InstallScreen::Detecting)
+        ));
         assert!(!app.should_quit());
     }
 
@@ -1457,7 +1420,7 @@ mod tests {
     fn test_install_skip() {
         let mut app = make_app();
         app.tick(33); // detect
-        // Press 's' to skip
+                      // Press 's' to skip
         app.handle_input(WizardCommand::Key(KeyPress::Char(b's')));
         assert_eq!(app.phase_number(), 2, "Should advance to Bootstrap");
     }
@@ -1470,7 +1433,10 @@ mod tests {
         // Press Enter to install
         app.handle_input(WizardCommand::Key(KeyPress::Enter));
         assert!(
-            matches!(app.phase, WizardPhase::Install(InstallScreen::Installing { .. })),
+            matches!(
+                app.phase,
+                WizardPhase::Install(InstallScreen::Installing { .. })
+            ),
             "Should be installing"
         );
 
@@ -1481,7 +1447,10 @@ mod tests {
                 break;
             }
         }
-        assert!(matches!(app.phase, WizardPhase::Install(InstallScreen::Done(_))));
+        assert!(matches!(
+            app.phase,
+            WizardPhase::Install(InstallScreen::Done(_))
+        ));
 
         // Press Enter to advance
         app.handle_input(WizardCommand::Key(KeyPress::Enter));
@@ -1560,7 +1529,10 @@ mod tests {
         let mut app = make_app();
         skip_install(&mut app);
         complete_bootstrap(&mut app);
-        assert!(app.phase_number() >= 3, "Should have advanced past bootstrap");
+        assert!(
+            app.phase_number() >= 3,
+            "Should have advanced past bootstrap"
+        );
     }
 
     #[test]
@@ -1589,7 +1561,11 @@ mod tests {
         // advance_to_services), so we land on Services directly, NOT
         // Tokens.
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));
-        assert_eq!(app.phase_number(), 6, "Should be at Services phase (Tokens auto-skipped)");
+        assert_eq!(
+            app.phase_number(),
+            6,
+            "Should be at Services phase (Tokens auto-skipped)"
+        );
 
         // Services: decline to start (press 'n')
         app.handle_input(WizardCommand::Key(KeyPress::Char(b'n')));

@@ -6,23 +6,22 @@
 //! envelope, or enrollment key stores.  Callers must arrange the separately
 //! enrolled proof keys and the credential's `cnf` binding before transmission.
 
+use crate::transport_traits::Signer;
 use anyhow::{bail, Result};
 use ciborium::value::Value as CborValue;
 use ed25519_dalek::Signer as _;
 use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
-use crate::transport_traits::Signer;
 
 use super::{
     recipient_binding::FederateRecipientBinding,
     response::{KemRecipient, ProtectionMode, ResponseBinding, ResponseKind},
     CredentialHash, RequestId, ALG_ED25519, ALG_ML_DSA_65, CLAIM_CAPNP_BODY_BYTES,
     CLAIM_CAPNP_SCHEMA_ID, CLAIM_CREDENTIAL_HASH, CLAIM_FEDERATE_RECIPIENT_BINDING,
-    CLAIM_RESPONSE_BINDING, COSE_HEADER_ALG,
-    COSE_HEADER_CRIT, COSE_HEADER_KID, COSE_HEADER_TYP, CWT_CLAIM_AUD, CWT_CLAIM_CTI,
-    CWT_CLAIM_EXP, CWT_CLAIM_IAT, HEADER_HS_DOMAIN, HEADER_HS_LOGICAL_SIGNER_GROUP,
-    HEADER_HS_SIGNATURE_PLAN, MAX_BODY_BYTES, MAX_KID_BYTES, PROOF_TYP, REQUEST_PROOF_DOMAIN,
-    SUITE_HYBRID,
+    CLAIM_RESPONSE_BINDING, COSE_HEADER_ALG, COSE_HEADER_CRIT, COSE_HEADER_KID, COSE_HEADER_TYP,
+    CWT_CLAIM_AUD, CWT_CLAIM_CTI, CWT_CLAIM_EXP, CWT_CLAIM_IAT, HEADER_HS_DOMAIN,
+    HEADER_HS_LOGICAL_SIGNER_GROUP, HEADER_HS_SIGNATURE_PLAN, MAX_BODY_BYTES, MAX_KID_BYTES,
+    PROOF_TYP, REQUEST_PROOF_DOMAIN, SUITE_HYBRID,
 };
 
 /// Proof-dedicated private components for the sole supported producer suite.
@@ -108,13 +107,24 @@ fn build_authenticated_hybrid_request_proof_with_id(
     signer: &AuthenticatedHybridProofSigner,
     request_id: RequestId,
 ) -> Result<Vec<u8>> {
-    let (body_protected, ed_protected, pq_protected, payload) =
-        prepare_hybrid_proof(input, &signer.ed25519_kid, &signer.ml_dsa_65_kid, request_id)?;
+    let (body_protected, ed_protected, pq_protected, payload) = prepare_hybrid_proof(
+        input,
+        &signer.ed25519_kid,
+        &signer.ml_dsa_65_kid,
+        request_id,
+    )?;
     let ed_tbs = signature_structure(&body_protected, &ed_protected, &payload)?;
     let pq_tbs = signature_structure(&body_protected, &pq_protected, &payload)?;
     let ed_signature = signer.ed25519.sign(&ed_tbs).to_bytes().to_vec();
     let pq_signature = crate::crypto::pq::ml_dsa_sign(&signer.ml_dsa_65, &pq_tbs);
-    finish_hybrid_proof(body_protected, ed_protected, pq_protected, payload, ed_signature, pq_signature)
+    finish_hybrid_proof(
+        body_protected,
+        ed_protected,
+        pq_protected,
+        payload,
+        ed_signature,
+        pq_signature,
+    )
 }
 
 /// Produce the same v16 COSE_Sign bytes with a browser-backed signer. Its
@@ -130,8 +140,13 @@ pub async fn build_authenticated_hybrid_request_proof_with_signer<S: Signer>(
     let mut request_id = [0; super::REQUEST_ID_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut request_id);
     build_authenticated_hybrid_request_proof_with_signer_and_id(
-        input, signer, ed25519_kid, ml_dsa_65_kid, request_id,
-    ).await
+        input,
+        signer,
+        ed25519_kid,
+        ml_dsa_65_kid,
+        request_id,
+    )
+    .await
 }
 
 async fn build_authenticated_hybrid_request_proof_with_signer_and_id<S: Signer>(
@@ -141,9 +156,9 @@ async fn build_authenticated_hybrid_request_proof_with_signer_and_id<S: Signer>(
     ml_dsa_65_kid: &[u8],
     request_id: RequestId,
 ) -> Result<Vec<u8>> {
-    let pq_public = signer.pq_pubkey().ok_or_else(|| anyhow::anyhow!(
-        "request proof: browser signer has no ML-DSA-65 key"
-    ))?;
+    let pq_public = signer
+        .pq_pubkey()
+        .ok_or_else(|| anyhow::anyhow!("request proof: browser signer has no ML-DSA-65 key"))?;
     let pq_key = crate::crypto::pq::ml_dsa_vk_from_bytes(&pq_public)?;
     let ed_key = ed25519_dalek::VerifyingKey::from_bytes(&signer.pubkey())?;
     let (body_protected, ed_protected, pq_protected, payload) =
@@ -151,14 +166,21 @@ async fn build_authenticated_hybrid_request_proof_with_signer_and_id<S: Signer>(
     let ed_tbs = signature_structure(&body_protected, &ed_protected, &payload)?;
     let pq_tbs = signature_structure(&body_protected, &pq_protected, &payload)?;
     let ed_signature = signer.sign(&ed_tbs).await?;
-    ed_key.verify_strict(&ed_tbs, &ed25519_dalek::Signature::from_bytes(&ed_signature))?;
-    let pq_signature = signer.pq_sign(&pq_tbs).await?.ok_or_else(|| anyhow::anyhow!(
-        "request proof: browser signer omitted ML-DSA-65 signature"
-    ))?;
+    ed_key.verify_strict(
+        &ed_tbs,
+        &ed25519_dalek::Signature::from_bytes(&ed_signature),
+    )?;
+    let pq_signature = signer.pq_sign(&pq_tbs).await?.ok_or_else(|| {
+        anyhow::anyhow!("request proof: browser signer omitted ML-DSA-65 signature")
+    })?;
     crate::crypto::pq::ml_dsa_verify(&pq_key, &pq_tbs, &pq_signature)?;
     finish_hybrid_proof(
-        body_protected, ed_protected, pq_protected, payload,
-        ed_signature.to_vec(), pq_signature,
+        body_protected,
+        ed_protected,
+        pq_protected,
+        payload,
+        ed_signature.to_vec(),
+        pq_signature,
     )
 }
 
@@ -344,8 +366,14 @@ fn federate_recipient_binding_value(binding: &FederateRecipientBinding) -> CborV
         None => CborValue::Null,
     };
     CborValue::Map(vec![
-        (CborValue::Integer(1.into()), commitment_value(&binding.response)),
-        (CborValue::Integer(2.into()), commitment_value(&binding.stream)),
+        (
+            CborValue::Integer(1.into()),
+            commitment_value(&binding.response),
+        ),
+        (
+            CborValue::Integer(2.into()),
+            commitment_value(&binding.stream),
+        ),
         (
             CborValue::Integer(3.into()),
             commitment_value(&binding.client_dh_public),
@@ -572,10 +600,8 @@ mod tests {
     fn federate_recipient_extension_is_rejected_by_generic_profile_parser() {
         let (signer, _, _) = fixture();
         let suite = crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
-        let response =
-            crate::crypto::hybrid_kem::generate_recipient(suite).unwrap();
-        let stream =
-            crate::crypto::hybrid_kem::generate_recipient(suite).unwrap();
+        let response = crate::crypto::hybrid_kem::generate_recipient(suite).unwrap();
+        let stream = crate::crypto::hybrid_kem::generate_recipient(suite).unwrap();
         let binding = FederateRecipientBinding::from_recipients(
             Some(&response.public()),
             Some(&stream.public()),
@@ -598,7 +624,7 @@ mod tests {
 
     #[test]
     fn federate_signed_proof_vector_is_stable_and_profile_isolated() {
-        use crate::crypto::hybrid_kem::{SuiteId, recipient_from_seeds};
+        use crate::crypto::hybrid_kem::{recipient_from_seeds, SuiteId};
 
         let (signer, resolver, cnf) = fixture();
         let suite = SuiteId::HyKemX25519MlKem768;
@@ -634,7 +660,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(browser_style_bytes, bytes, "external browser signer must emit the native COSE bytes");
+        assert_eq!(
+            browser_style_bytes, bytes,
+            "external browser signer must emit the native COSE bytes"
+        );
         let proof = ParsedProof::parse_deferred_federate_request(&bytes).unwrap();
         assert_eq!(proof.claims.federate_recipient_binding, Some(binding));
         assert!(ParsedProof::parse(&bytes).is_err());
@@ -654,7 +683,9 @@ mod tests {
         let substituted = mutate_payload(&bytes, |claims| {
             let (_, CborValue::Map(fields)) = claims
                 .iter_mut()
-                .find(|(key, _)| *key == CborValue::Integer(CLAIM_FEDERATE_RECIPIENT_BINDING.into()))
+                .find(|(key, _)| {
+                    *key == CborValue::Integer(CLAIM_FEDERATE_RECIPIENT_BINDING.into())
+                })
                 .unwrap()
             else {
                 panic!("Federate recipient map missing")
@@ -695,9 +726,10 @@ mod tests {
             }
         }
 
-        let signer = WrongSigner(crate::signer::LocalSigner::new(
-            ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-        ).with_pq_key(crate::crypto::pq::ml_dsa_sk_from_seed(&[10; 32])));
+        let signer = WrongSigner(
+            crate::signer::LocalSigner::new(ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+                .with_pq_key(crate::crypto::pq::ml_dsa_sk_from_seed(&[10; 32])),
+        );
         let binding = FederateRecipientBinding {
             response: None,
             stream: None,
@@ -707,11 +739,17 @@ mod tests {
         request.federate_recipient_binding = Some(&binding);
         let result = futures::executor::block_on(
             build_authenticated_hybrid_request_proof_with_signer_and_id(
-                &request, &signer, b"proof-fixture-ed", b"proof-fixture-pq",
+                &request,
+                &signer,
+                b"proof-fixture-ed",
+                b"proof-fixture-pq",
                 [0x3c; super::super::REQUEST_ID_SIZE],
             ),
         );
-        assert!(result.is_err(), "a callback that signs other bytes must fail closed");
+        assert!(
+            result.is_err(),
+            "a callback that signs other bytes must fail closed"
+        );
     }
 
     #[test]

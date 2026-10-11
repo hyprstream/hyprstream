@@ -351,11 +351,11 @@ impl Workflow {
 /// `inputs`, …) are free-form data maps, not schema levels, so they are not
 /// key-checked here.
 fn validate_known_keys(value: &serde_yaml::Value) -> Result<()> {
-    let mapping = value
-        .as_mapping()
-        .ok_or_else(|| crate::error::WorkerError::WorkflowParseError(
-            String::from("workflow root must be a mapping"),
-        ))?;
+    let mapping = value.as_mapping().ok_or_else(|| {
+        crate::error::WorkerError::WorkflowParseError(String::from(
+            "workflow root must be a mapping",
+        ))
+    })?;
 
     for (key, val) in mapping {
         let key_str = match key.as_str() {
@@ -385,11 +385,11 @@ fn validate_known_keys(value: &serde_yaml::Value) -> Result<()> {
 
 /// Validate each job mapping and its steps.
 fn validate_jobs(jobs: &serde_yaml::Value) -> Result<()> {
-    let mapping = jobs
-        .as_mapping()
-        .ok_or_else(|| crate::error::WorkerError::WorkflowParseError(
-            String::from("`jobs` must be a mapping of job-id → job"),
-        ))?;
+    let mapping = jobs.as_mapping().ok_or_else(|| {
+        crate::error::WorkerError::WorkflowParseError(String::from(
+            "`jobs` must be a mapping of job-id → job",
+        ))
+    })?;
 
     for (job_id, job) in mapping {
         let job_id_str = job_id.as_str().unwrap_or("<non-string job id>");

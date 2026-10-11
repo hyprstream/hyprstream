@@ -148,10 +148,9 @@ impl RequestService for SentinelDiscovery {
         body: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invoked.store(true, Ordering::SeqCst);
-        self.observed.lock().push((
-            body.bytes().to_vec(),
-            body.leaf_path().map(<[u16]>::to_vec),
-        ));
+        self.observed
+            .lock()
+            .push((body.bytes().to_vec(), body.leaf_path().map(<[u16]>::to_vec)));
         Ok((b"handled".to_vec(), None))
     }
 
@@ -180,8 +179,8 @@ impl RequestService for SentinelDiscovery {
 fn ping_request_bytes() -> Vec<u8> {
     let mut message = capnp::message::Builder::new_default();
     {
-        let mut req = message
-            .init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>();
+        let mut req =
+            message.init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>();
         req.set_id(7);
         req.set_ping(());
     }
@@ -222,7 +221,8 @@ fn envelope_for(payload: &[u8]) -> Vec<u8> {
     .unwrap();
     let mut message = capnp::message::Builder::new_default();
     {
-        let mut builder = message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>();
+        let mut builder =
+            message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>();
         use hyprstream_rpc::ToCapnp;
         signed.write_to(&mut builder);
     }
@@ -342,7 +342,9 @@ fn decoded_leaf_resolves_a_generated_policy_row() {
 
     let payload = ping_request_bytes();
     let body = decode_discovery_request_body(&payload).unwrap();
-    let leaf = body.leaf_path_string().expect("real request derives a leaf");
+    let leaf = body
+        .leaf_path_string()
+        .expect("real request derives a leaf");
 
     let rows = hyprstream_rpc::proof::policy::collect_generated_rows().unwrap();
     let row = rows

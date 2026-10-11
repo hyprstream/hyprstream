@@ -197,7 +197,9 @@ fn wait_for_roster_resolution(
             return Ok(());
         }
         if std::time::Instant::now() > deadline {
-            anyhow::bail!("cached roster did not converge for {did}: expected {expect:?}, got {resolved:?}");
+            anyhow::bail!(
+                "cached roster did not converge for {did}: expected {expect:?}, got {resolved:?}"
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -459,7 +461,11 @@ async fn roundtrip() -> Result<()> {
     retry.shutdown().await?;
     let rotated = client(0x36).await?;
     let rotated_connection = rotated.connect(direct(&server), ALPN_MOQ_LITE).await?;
-    let rotated_proof = proof(&advanced_client_state, &rotated_client, server_identity.clone());
+    let rotated_proof = proof(
+        &advanced_client_state,
+        &rotated_client,
+        server_identity.clone(),
+    );
     prove_moql_admission(
         &rotated_connection,
         &rotated_proof,
@@ -528,12 +534,10 @@ async fn roundtrip() -> Result<()> {
     stale_client.shutdown().await?;
 
     let successor_client = client(0x38).await?;
-    let successor_connection = successor_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
-    let successor_proof = proof(
-        &successor_state,
-        &reinit_signer,
-        server_identity.clone(),
-    );
+    let successor_connection = successor_client
+        .connect(direct(&server), ALPN_MOQ_LITE)
+        .await?;
+    let successor_proof = proof(&successor_state, &reinit_signer, server_identity.clone());
     prove_moql_admission(
         &successor_connection,
         &successor_proof,
@@ -576,7 +580,9 @@ async fn roundtrip() -> Result<()> {
     remove_test_state(&store, &squatter_state)?;
     wait_for_roster_resolution(&roster, &successor_state.did, Some("reader"))?;
     let restored_client = client(0x3B).await?;
-    let restored_connection = restored_client.connect(direct(&server), ALPN_MOQ_LITE).await?;
+    let restored_connection = restored_client
+        .connect(direct(&server), ALPN_MOQ_LITE)
+        .await?;
     prove_moql_admission(
         &restored_connection,
         &successor_proof,

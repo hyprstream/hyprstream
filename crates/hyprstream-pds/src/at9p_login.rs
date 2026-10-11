@@ -211,15 +211,15 @@ pub fn verify_login_assertion<C: Clock>(
     // Absent or wrong-length signature, signature mismatch, or a stale
     // timestamp all fail closed. The signature MUST verify against the
     // GATE-verified key — never a key supplied by the caller.
-    let sig: [u8; ED25519_LIVENESS_SIG_LEN] = assertion
-        .liveness_signature
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("liveness signature must be {ED25519_LIVENESS_SIG_LEN} bytes"))?;
+    let sig: [u8; ED25519_LIVENESS_SIG_LEN] =
+        assertion.liveness_signature.try_into().map_err(|_| {
+            anyhow::anyhow!("liveness signature must be {ED25519_LIVENESS_SIG_LEN} bytes")
+        })?;
     let sig = Signature::from_bytes(&sig);
     let binding = login_binding(&recomputed_did, assertion.challenge, assertion.issued_at);
-    ed_vk
-        .verify_strict(&binding, &sig)
-        .map_err(|_| anyhow::anyhow!("liveness signature does not verify against the GATE-verified subject key"))?;
+    ed_vk.verify_strict(&binding, &sig).map_err(|_| {
+        anyhow::anyhow!("liveness signature does not verify against the GATE-verified subject key")
+    })?;
 
     // Freshness window. `abs_diff` is symmetric so clock skew in either
     // direction is tolerated up to the bound; outside it, expired.
@@ -505,8 +505,7 @@ mod tests {
     /// verified — the reverse one-sided failure.
     #[test]
     fn classical_leg_names_wrong_capsule_fails_closed() {
-        let (_c, bytes, did, s) =
-            signed(10, vec!["did:web:node.example".to_owned()]);
+        let (_c, bytes, did, s) = signed(10, vec!["did:web:node.example".to_owned()]);
         let sig = sign_liveness(&s.ed_sk, &did, "c", NOW);
         let assertion = LoginAssertion {
             did: &did,
@@ -524,10 +523,7 @@ mod tests {
         let err = verify_login_assertion(&assertion, &FixedClock { now: NOW }, SKEW)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("does not name the verified capsule"),
-            "{err}"
-        );
+        assert!(err.contains("does not name the verified capsule"), "{err}");
     }
 
     /// Mutual alias upgrades to PqHybrid.

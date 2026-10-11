@@ -247,7 +247,10 @@ pub fn validate_service_name(name: &str) -> Result<()> {
     if name.len() > 64 {
         anyhow::bail!("service name too long (max 64 chars): '{name}'");
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         anyhow::bail!(
             "service name '{name}' contains invalid characters; \
              only lowercase ASCII, digits, and hyphens are allowed"
@@ -324,9 +327,7 @@ fn backfill_service_key_sidecars(
     service_key: &SigningKey,
 ) {
     if let Err(e) = ensure_service_key_sidecars(service_dir, service_key) {
-        tracing::warn!(
-            "could not write public key sidecars for service '{service_name}': {e:#}"
-        );
+        tracing::warn!("could not write public key sidecars for service '{service_name}': {e:#}");
     }
 }
 
@@ -339,9 +340,9 @@ pub fn load_or_generate_service_signing_key(
     const NAME: &str = "signing-key";
 
     if let Some(mut bytes) = read_secret(&service_dir, NAME)? {
-        let mut arr: [u8; 32] = bytes.as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("service '{service_name}' signing-key must be 32 bytes (Ed25519 seed)"))?;
+        let mut arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow!("service '{service_name}' signing-key must be 32 bytes (Ed25519 seed)")
+        })?;
         let sk = SigningKey::from_bytes(&arr);
         bytes.zeroize();
         arr.zeroize();
@@ -368,13 +369,12 @@ pub fn load_or_generate_service_signing_key(
         Ok(false) => {
             // Another process won the race — reload their key
             raw.zeroize();
-            tracing::info!(
-                "Key for '{service_name}' created by another process — reloading"
-            );
+            tracing::info!("Key for '{service_name}' created by another process — reloading");
             // Re-read (not recursive — file now exists)
             let mut bytes = read_secret(&service_dir, NAME)?
                 .ok_or_else(|| anyhow!("race loser: key file disappeared"))?;
-            let mut arr: [u8; 32] = bytes.as_slice()
+            let mut arr: [u8; 32] = bytes
+                .as_slice()
                 .try_into()
                 .map_err(|_| anyhow!("service '{service_name}' signing-key must be 32 bytes"))?;
             let sk = SigningKey::from_bytes(&arr);
@@ -397,7 +397,8 @@ pub fn load_or_generate_service_signing_key(
 pub fn load_ca_signing_key(credentials_dir: &std::path::Path) -> Result<SigningKey> {
     const NAME: &str = "ca-key";
     if let Some(mut bytes) = read_secret(credentials_dir, NAME)? {
-        let mut arr: [u8; 32] = bytes.as_slice()
+        let mut arr: [u8; 32] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| anyhow!("ca-key must be 32 bytes (Ed25519 seed)"))?;
         let sk = SigningKey::from_bytes(&arr);
@@ -422,11 +423,11 @@ pub fn write_ca_signing_key(credentials_dir: &std::path::Path, key: &SigningKey)
 pub fn load_ca_verifying_key(credentials_dir: &std::path::Path) -> Result<VerifyingKey> {
     const NAME: &str = "ca-pubkey";
     if let Some(bytes) = read_secret(credentials_dir, NAME)? {
-        let arr: [u8; 32] = bytes.as_slice()
+        let arr: [u8; 32] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| anyhow!("ca-pubkey must be 32 bytes (Ed25519 pubkey)"))?;
-        VerifyingKey::from_bytes(&arr)
-            .map_err(|e| anyhow!("invalid ca-pubkey: {e}"))
+        VerifyingKey::from_bytes(&arr).map_err(|e| anyhow!("invalid ca-pubkey: {e}"))
     } else {
         Err(missing_in_readonly(credentials_dir, NAME))
     }
@@ -514,8 +515,7 @@ pub fn load_service_jwt_for_profile(
     };
     match bytes {
         Some(bytes) => {
-            let jwt = String::from_utf8(bytes)
-                .context("service-jwt is not valid UTF-8")?;
+            let jwt = String::from_utf8(bytes).context("service-jwt is not valid UTF-8")?;
             Ok(Some(jwt))
         }
         None => Ok(None),
@@ -534,7 +534,8 @@ pub fn seed_service_jwt_into_trust_store(
     credentials_dir: &std::path::Path,
     profile: SecretsProfile,
 ) {
-    if let Ok(Some(jwt_str)) = load_service_jwt_for_profile(credentials_dir, service_name, profile) {
+    if let Ok(Some(jwt_str)) = load_service_jwt_for_profile(credentials_dir, service_name, profile)
+    {
         let expires_at = decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
         hyprstream_service::global_trust_store().insert(
             signing_key.verifying_key(),
@@ -657,7 +658,10 @@ pub struct BootstrapPubkey {
 impl BootstrapPubkey {
     /// A classical (Ed25519-only) entry.
     pub fn classical(ed25519: VerifyingKey) -> Self {
-        Self { ed25519, ml_dsa_65: None }
+        Self {
+            ed25519,
+            ml_dsa_65: None,
+        }
     }
 
     /// A hybrid entry binding an ML-DSA-65 key to an Ed25519 anchor.
@@ -665,7 +669,10 @@ impl BootstrapPubkey {
         ed25519: VerifyingKey,
         ml_dsa_65: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
     ) -> Self {
-        Self { ed25519, ml_dsa_65: Some(ml_dsa_65) }
+        Self {
+            ed25519,
+            ml_dsa_65: Some(ml_dsa_65),
+        }
     }
 
     /// The hybrid entry for a service that signs with `service_key`.
@@ -729,9 +736,9 @@ impl BootstrapPubkey {
             }
         };
 
-        let arr: [u8; BOOTSTRAP_ED25519_BYTES] = ed_bytes
-            .try_into()
-            .map_err(|_| anyhow!("bootstrap-pubkey for '{service}' has a malformed Ed25519 part"))?;
+        let arr: [u8; BOOTSTRAP_ED25519_BYTES] = ed_bytes.try_into().map_err(|_| {
+            anyhow!("bootstrap-pubkey for '{service}' has a malformed Ed25519 part")
+        })?;
         let ed25519 = VerifyingKey::from_bytes(&arr)
             .map_err(|e| anyhow!("invalid bootstrap-pubkey for '{service}': {e}"))?;
 
@@ -770,7 +777,9 @@ impl BootstrapPubkey {
             .map_err(|e| anyhow!("Ed25519 signature verification failed: {e}"))?;
 
         match (&self.ml_dsa_65, ml_dsa_65_sig) {
-            (Some(pq_key), Some(sig)) => hyprstream_rpc::crypto::pq::ml_dsa_verify(pq_key, message, sig),
+            (Some(pq_key), Some(sig)) => {
+                hyprstream_rpc::crypto::pq::ml_dsa_verify(pq_key, message, sig)
+            }
             (Some(_), None) => Err(anyhow!(
                 "this bootstrap key is hybrid (Ed25519 + ML-DSA-65) but no ML-DSA-65 \
                  signature was supplied; both signatures are required"
@@ -953,13 +962,17 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     const NAME: &str = "signing-key";
 
     if let Some(mut bytes) = read_secret(secrets_dir, NAME)? {
-        let mut arr: [u8; 32] = bytes.as_slice()
+        let mut arr: [u8; 32] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| anyhow!("secret '{}' must be 32 bytes (Ed25519 seed)", NAME))?;
         let sk = SigningKey::from_bytes(&arr);
         bytes.zeroize();
         arr.zeroize();
-        tracing::info!("Loaded Ed25519 signing key from '{}'", secrets_dir.display());
+        tracing::info!(
+            "Loaded Ed25519 signing key from '{}'",
+            secrets_dir.display()
+        );
         return Ok(sk);
     }
 
@@ -1075,10 +1088,14 @@ pub fn load_existing_service_signing_key(
         (_, "policy") | (SecretsProfile::PerServiceScoped, _) => secrets_dir.to_owned(),
         (SecretsProfile::SharedDirectory, _) => secrets_dir.join(service_name),
     };
-    let bytes = Zeroizing::new(read_secret(&directory, "signing-key")?
-        .ok_or_else(|| anyhow!("provisioned signing key is missing for service {service_name}"))?);
-    let seed = Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| anyhow!("service {service_name} signing-key must be 32 bytes"))?);
+    let bytes =
+        Zeroizing::new(read_secret(&directory, "signing-key")?.ok_or_else(|| {
+            anyhow!("provisioned signing key is missing for service {service_name}")
+        })?);
+    let seed = Zeroizing::new(
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow!("service {service_name} signing-key must be 32 bytes"))?,
+    );
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -1126,7 +1143,8 @@ pub fn load_or_generate_user_signing_key(
     const NAME: &str = "user-signing-key";
 
     if let Some(mut bytes) = read_secret(secrets_dir, NAME)? {
-        let mut arr: [u8; 32] = bytes.as_slice()
+        let mut arr: [u8; 32] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| anyhow!("secret '{}' must be 32 bytes (Ed25519 seed)", NAME))?;
         let sk = SigningKey::from_bytes(&arr);
@@ -1198,7 +1216,11 @@ pub fn install_user_signing_key(
     let result = write_secret(secrets_dir, NAME, &raw);
     raw.zeroize();
     result?;
-    tracing::info!("Installed adopted user signing key → '{}/{}'", secrets_dir.display(), NAME);
+    tracing::info!(
+        "Installed adopted user signing key → '{}/{}'",
+        secrets_dir.display(),
+        NAME
+    );
     Ok(backup)
 }
 
@@ -1264,15 +1286,23 @@ pub fn load_or_generate_user_identity(
 
     // Hybrid: load the PQ sibling if present, else generate (fail closed).
     if let Some(mut seed_bytes) = read_secret(secrets_dir, USER_PQ_NAME)? {
-        let mut seed: [u8; 32] = seed_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("secret '{}' must be 32 bytes (ML-DSA-65 seed)", USER_PQ_NAME))?;
+        let mut seed: [u8; 32] = seed_bytes.as_slice().try_into().map_err(|_| {
+            anyhow!(
+                "secret '{}' must be 32 bytes (ML-DSA-65 seed)",
+                USER_PQ_NAME
+            )
+        })?;
         let mldsa = pq::ml_dsa_sk_from_seed(&seed);
         seed_bytes.zeroize();
         seed.zeroize();
-        tracing::info!("Loaded hybrid PQ (ML-DSA-65) user key from '{}'", secrets_dir.display());
-        return Ok(UserIdentityKeys { ed, mldsa: Some(mldsa) });
+        tracing::info!(
+            "Loaded hybrid PQ (ML-DSA-65) user key from '{}'",
+            secrets_dir.display()
+        );
+        return Ok(UserIdentityKeys {
+            ed,
+            mldsa: Some(mldsa),
+        });
     }
 
     // Missing PQ component. Under Hybrid this must be generated; if we cannot
@@ -1304,7 +1334,10 @@ pub fn load_or_generate_user_identity(
         secrets_dir.display(),
         USER_PQ_NAME
     );
-    Ok(UserIdentityKeys { ed, mldsa: Some(mldsa) })
+    Ok(UserIdentityKeys {
+        ed,
+        mldsa: Some(mldsa),
+    })
 }
 
 /// Paths of any prior key files displaced by an adopt, so the caller can report
@@ -1364,7 +1397,10 @@ pub fn install_user_identity(
         }
     };
 
-    Ok(InstalledIdentityBackup { ed: ed_backup, pq: pq_backup })
+    Ok(InstalledIdentityBackup {
+        ed: ed_backup,
+        pq: pq_backup,
+    })
 }
 
 /// Back up `name` → `bak_name` (via [`write_secret`], mode 0600 before persist)
@@ -1408,7 +1444,15 @@ pub fn load_or_generate_rsa_key(secrets_dir: &std::path::Path) -> Result<Vec<u8>
     // Generate RSA 2048 keypair via openssl (avoids adding rsa crate dependency).
     // Output is PKCS#8 DER, compatible with jsonwebtoken::EncodingKey::from_rsa_der.
     let output = std::process::Command::new("openssl")
-        .args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-outform", "DER"])
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-outform",
+            "DER",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -1421,11 +1465,18 @@ pub fn load_or_generate_rsa_key(secrets_dir: &std::path::Path) -> Result<Vec<u8>
 
     let der_bytes = output.stdout;
     if der_bytes.len() < 100 {
-        return Err(anyhow!("openssl produced unexpectedly small RSA key ({} bytes)", der_bytes.len()));
+        return Err(anyhow!(
+            "openssl produced unexpectedly small RSA key ({} bytes)",
+            der_bytes.len()
+        ));
     }
 
     write_secret(secrets_dir, NAME, &der_bytes)?;
-    tracing::info!("Generated new RSA 2048 key → '{}/{}'", secrets_dir.display(), NAME);
+    tracing::info!(
+        "Generated new RSA 2048 key → '{}/{}'",
+        secrets_dir.display(),
+        NAME
+    );
     Ok(der_bytes)
 }
 
@@ -1437,7 +1488,13 @@ pub fn load_or_generate_tls_materials(
     server_name: &str,
     max_validity_days: u32,
 ) -> Result<TlsMaterials> {
-    load_or_generate_tls_materials_named(secrets_dir, server_name, max_validity_days, "tls-key", "tls-cert")
+    load_or_generate_tls_materials_named(
+        secrets_dir,
+        server_name,
+        max_validity_days,
+        "tls-key",
+        "tls-cert",
+    )
 }
 
 /// Load or generate TLS materials (ECDSA P-256 key + self-signed cert) using
@@ -1469,9 +1526,11 @@ pub fn load_or_generate_tls_materials_named(
 
             if needs_renewal && is_writable(secrets_dir) {
                 tracing::info!(
-                    "TLS cert '{}' approaching expiry; regenerating (reusing existing key)", cert_name
+                    "TLS cert '{}' approaching expiry; regenerating (reusing existing key)",
+                    cert_name
                 );
-                let new_cert_der = generate_cert_from_key_der(&key_der, server_name, max_validity_days)?;
+                let new_cert_der =
+                    generate_cert_from_key_der(&key_der, server_name, max_validity_days)?;
                 write_secret(secrets_dir, cert_name, &new_cert_der)?;
                 return Ok(TlsMaterials {
                     cert_der: new_cert_der,
@@ -1493,7 +1552,10 @@ pub fn load_or_generate_tls_materials_named(
                 );
             }
 
-            tracing::info!("Loaded persisted TLS materials from '{}'", secrets_dir.display());
+            tracing::info!(
+                "Loaded persisted TLS materials from '{}'",
+                secrets_dir.display()
+            );
             Ok(TlsMaterials {
                 cert_der,
                 key_der: Zeroizing::new(key_der),
@@ -1521,12 +1583,15 @@ pub fn load_or_generate_tls_materials_named(
             }
             let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
             let key_der = key_pair.serialize_der();
-            let cert_der = generate_cert_from_rcgen_keypair(&key_pair, server_name, max_validity_days)?;
+            let cert_der =
+                generate_cert_from_rcgen_keypair(&key_pair, server_name, max_validity_days)?;
             write_secret(secrets_dir, key_name, &key_der)?;
             write_secret(secrets_dir, cert_name, &cert_der)?;
             tracing::info!(
                 "Generated new TLS key '{}' + cert '{}' ({max_validity_days}d) → '{}'",
-                key_name, cert_name, secrets_dir.display()
+                key_name,
+                cert_name,
+                secrets_dir.display()
             );
             Ok(TlsMaterials {
                 cert_der,
@@ -1549,11 +1614,14 @@ pub fn load_or_generate_tls_materials_named(
 /// startup), while under-renewing could cause expired-cert errors in clients.
 /// Clock skew (mtime in the future) is handled conservatively — we trigger
 /// renewal rather than silently skipping it.
-fn cert_renewal_needed(secrets_dir: &std::path::Path, cert_name: &str, max_validity_days: u32) -> bool {
+fn cert_renewal_needed(
+    secrets_dir: &std::path::Path,
+    cert_name: &str,
+    max_validity_days: u32,
+) -> bool {
     let cert_path = secrets_dir.join(cert_name);
-    let renewal_threshold = std::time::Duration::from_secs(
-        u64::from(max_validity_days.saturating_sub(1)) * 86_400,
-    );
+    let renewal_threshold =
+        std::time::Duration::from_secs(u64::from(max_validity_days.saturating_sub(1)) * 86_400);
     match std::fs::metadata(&cert_path).and_then(|m| m.modified()) {
         Ok(mtime) => match mtime.elapsed() {
             Ok(age) => age >= renewal_threshold,
@@ -1631,12 +1699,18 @@ mod tests {
         fn set(key: &str, val: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, val);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
         fn unset(key: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
     }
     impl Drop for EnvVarGuard {
@@ -1821,7 +1895,12 @@ mod tests {
         write_secret(dir.path(), "test-key", b"secret").unwrap();
         let meta = std::fs::metadata(dir.path().join("test-key")).unwrap();
         let mode = meta.permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "expected mode 0600, got {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "expected mode 0600, got {:o}",
+            mode & 0o777
+        );
     }
 
     #[test]
@@ -1960,7 +2039,9 @@ mod tests {
         assert_eq!(sk.to_bytes().len(), 32);
         assert_eq!(vk.as_bytes().len(), 32);
         // Key file should now exist.
-        let raw = read_secret(dir.path(), "user-signing-key").unwrap().unwrap();
+        let raw = read_secret(dir.path(), "user-signing-key")
+            .unwrap()
+            .unwrap();
         assert_eq!(raw, sk.to_bytes().as_slice());
     }
 
@@ -1986,8 +2067,14 @@ mod tests {
         assert!(!m.cert_der.is_empty(), "cert_der should be non-empty");
         assert!(!m.key_der.is_empty(), "key_der should be non-empty");
         // Both files should have been written.
-        assert!(dir.path().join("tls-key").exists(), "tls-key file should exist");
-        assert!(dir.path().join("tls-cert").exists(), "tls-cert file should exist");
+        assert!(
+            dir.path().join("tls-key").exists(),
+            "tls-key file should exist"
+        );
+        assert!(
+            dir.path().join("tls-cert").exists(),
+            "tls-cert file should exist"
+        );
     }
 
     #[test]
@@ -2035,11 +2122,17 @@ mod tests {
         backdate_mtime(&dir.path().join("tls-cert"), 365);
         let m2 = load_or_generate_tls_materials(dir.path(), "localhost", 365).unwrap();
         // Key bytes must be unchanged (stable key = stable cert hash lineage).
-        assert_eq!(*m1.key_der, *m2.key_der, "key must be reused on cert renewal");
+        assert_eq!(
+            *m1.key_der, *m2.key_der,
+            "key must be reused on cert renewal"
+        );
         // Cert is a different DER (different timestamps).
         let h1 = Sha256::digest(&m1.cert_der);
         let h2 = Sha256::digest(&m2.cert_der);
-        assert_ne!(h1, h2, "renewed cert should have different DER due to new timestamps");
+        assert_ne!(
+            h1, h2,
+            "renewed cert should have different DER due to new timestamps"
+        );
     }
 
     // ── resolve_service_signing_key (#759 regression) ────────────────────────
@@ -2060,13 +2153,16 @@ mod tests {
             resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
                 .unwrap();
         assert_eq!(
-            resolved.to_bytes(), root_key.to_bytes(),
+            resolved.to_bytes(),
+            root_key.to_bytes(),
             "policy must resolve to the flat root/CA key, matching bootstrap_pubkeys[\"policy\"]"
         );
 
         // No independent `policy/signing-key` file should have been created.
         assert!(
-            read_secret(&dir.path().join("policy"), "signing-key").unwrap().is_none(),
+            read_secret(&dir.path().join("policy"), "signing-key")
+                .unwrap()
+                .is_none(),
             "resolving policy's key must not mint an independent per-service key file"
         );
     }
@@ -2107,7 +2203,9 @@ mod tests {
         );
 
         // Independent key file lives under the service subdirectory.
-        let from_disk = read_secret(&dir.path().join("model"), "signing-key").unwrap().unwrap();
+        let from_disk = read_secret(&dir.path().join("model"), "signing-key")
+            .unwrap()
+            .unwrap();
         assert_eq!(from_disk, model_key.to_bytes().to_vec());
     }
 
@@ -2153,7 +2251,9 @@ mod tests {
         assert_eq!(pub_bytes, key.verifying_key().as_bytes());
 
         let hybrid_bytes = std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap();
-        let expected = BootstrapPubkey::for_service_key(&key).unwrap().to_key_bytes();
+        let expected = BootstrapPubkey::for_service_key(&key)
+            .unwrap()
+            .to_key_bytes();
         assert_eq!(hybrid_bytes, expected);
         assert_eq!(hybrid_bytes.len(), 1984);
 
@@ -2170,7 +2270,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Simulate a pre-H1 install: only the seed exists, no sidecars.
         let seed = SigningKey::generate(&mut rand::rngs::OsRng);
-        write_secret(&dir.path().join("discovery"), "signing-key", &seed.to_bytes()).unwrap();
+        write_secret(
+            &dir.path().join("discovery"),
+            "signing-key",
+            &seed.to_bytes(),
+        )
+        .unwrap();
         let svc = dir.path().join("discovery");
         assert!(!svc.join(SIGNING_KEY_PUB_NAME).exists());
         assert!(!svc.join(SERVICE_PUBKEY_HYBRID_NAME).exists());
@@ -2187,7 +2292,9 @@ mod tests {
         let hybrid_bytes = std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap();
         assert_eq!(
             hybrid_bytes,
-            BootstrapPubkey::for_service_key(&seed).unwrap().to_key_bytes()
+            BootstrapPubkey::for_service_key(&seed)
+                .unwrap()
+                .to_key_bytes()
         );
         #[cfg(unix)]
         {
@@ -2211,7 +2318,10 @@ mod tests {
             "re-running must not rotate the key"
         );
         assert_eq!(std::fs::read(svc.join(SIGNING_KEY_PUB_NAME)).unwrap(), pub1);
-        assert_eq!(std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap(), hyb1);
+        assert_eq!(
+            std::fs::read(svc.join(SERVICE_PUBKEY_HYBRID_NAME)).unwrap(),
+            hyb1
+        );
         #[cfg(unix)]
         {
             assert_eq!(file_mode(&svc.join(SIGNING_KEY_PUB_NAME)), 0o644);
@@ -2278,7 +2388,12 @@ mod tests {
     /// (or an older release of this code) would have left it on disk.
     fn write_raw_bootstrap_pubkeys(dir: &std::path::Path, entries: &[(&str, &str)]) {
         let json: std::collections::BTreeMap<&str, &str> = entries.iter().copied().collect();
-        write_secret(dir, "bootstrap-pubkeys", &serde_json::to_vec(&json).unwrap()).unwrap();
+        write_secret(
+            dir,
+            "bootstrap-pubkeys",
+            &serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
     }
 
     // ── mandatory hybrid service entries ─────────────────────────────────────
@@ -2304,18 +2419,30 @@ mod tests {
         let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
         assert_eq!(loaded.len(), 2);
 
-        let err = format!("{:#}", ensure_bootstrap_pubkeys_hybrid(&loaded).unwrap_err());
-        assert!(err.contains("discovery"), "error names the classical service: {err}");
+        let err = format!(
+            "{:#}",
+            ensure_bootstrap_pubkeys_hybrid(&loaded).unwrap_err()
+        );
+        assert!(
+            err.contains("discovery"),
+            "error names the classical service: {err}"
+        );
         assert!(
             !err.contains("policy"),
             "error must not implicate the hybrid service: {err}"
         );
-        assert!(err.contains("wizard"), "error names the working recovery: {err}");
+        assert!(
+            err.contains("wizard"),
+            "error names the working recovery: {err}"
+        );
         assert!(
             !err.contains("service repair"),
             "error must not name the dead-end 'service repair' command: {err}"
         );
-        assert!(err.contains("ML-DSA-65"), "error names what is missing: {err}");
+        assert!(
+            err.contains("ML-DSA-65"),
+            "error names what is missing: {err}"
+        );
     }
 
     /// An all-hybrid file passes, and an unprovisioned (empty) node is not an
@@ -2420,7 +2547,10 @@ mod tests {
 
         let hybrid = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
         let entry = &hybrid["discovery"];
-        assert!(!entry.is_hybrid(), "an entry written from a bare Ed25519 key is classical");
+        assert!(
+            !entry.is_hybrid(),
+            "an entry written from a bare Ed25519 key is classical"
+        );
         assert_eq!(entry.to_key_bytes().len(), 32);
     }
 
@@ -2431,7 +2561,10 @@ mod tests {
         let (_pq_sk, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
 
         let mut map = std::collections::HashMap::new();
-        map.insert("discovery".to_owned(), BootstrapPubkey::hybrid(ed, pq_vk.clone()));
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::hybrid(ed, pq_vk.clone()),
+        );
         write_bootstrap_pubkeys_hybrid(dir.path(), &map).unwrap();
 
         let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
@@ -2446,7 +2579,10 @@ mod tests {
 
         // The Ed25519-only projection still sees the anchor, so callers that
         // predate hybrid entries keep resolving the same key.
-        assert_eq!(load_bootstrap_pubkeys(dir.path()).unwrap().get("discovery"), Some(&ed));
+        assert_eq!(
+            load_bootstrap_pubkeys(dir.path()).unwrap().get("discovery"),
+            Some(&ed)
+        );
     }
 
     #[test]
@@ -2485,8 +2621,14 @@ mod tests {
         write_raw_bootstrap_pubkeys(
             dir.path(),
             &[
-                ("policy", &URL_SAFE_NO_PAD.encode(legacy_sk.verifying_key().as_bytes())),
-                ("discovery", &URL_SAFE_NO_PAD.encode(hybrid_entry.to_key_bytes())),
+                (
+                    "policy",
+                    &URL_SAFE_NO_PAD.encode(legacy_sk.verifying_key().as_bytes()),
+                ),
+                (
+                    "discovery",
+                    &URL_SAFE_NO_PAD.encode(hybrid_entry.to_key_bytes()),
+                ),
             ],
         );
 
@@ -2529,23 +2671,44 @@ mod tests {
     fn bootstrap_pubkeys_reject_wrong_length_values() {
         let dir = TempDir::new().unwrap();
         // 33 bytes: neither the classical nor the hybrid length.
-        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", &URL_SAFE_NO_PAD.encode([0u8; 33]))]);
+        write_raw_bootstrap_pubkeys(
+            dir.path(),
+            &[("discovery", &URL_SAFE_NO_PAD.encode([0u8; 33]))],
+        );
 
         let err = load_bootstrap_pubkeys(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("'discovery'"), "error names the offending service: {err}");
-        assert!(err.contains("32 bytes"), "error states the classical shape: {err}");
-        assert!(err.contains("1984 bytes"), "error states the hybrid shape: {err}");
-        assert!(err.contains("got 33 bytes"), "error states what was found: {err}");
+        assert!(
+            err.contains("'discovery'"),
+            "error names the offending service: {err}"
+        );
+        assert!(
+            err.contains("32 bytes"),
+            "error states the classical shape: {err}"
+        );
+        assert!(
+            err.contains("1984 bytes"),
+            "error states the hybrid shape: {err}"
+        );
+        assert!(
+            err.contains("got 33 bytes"),
+            "error states what was found: {err}"
+        );
     }
 
     #[test]
     fn bootstrap_pubkeys_reject_standard_alphabet_base64() {
         let dir = TempDir::new().unwrap();
         // Standard-alphabet base64 with padding is not the documented alphabet.
-        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")]);
+        write_raw_bootstrap_pubkeys(
+            dir.path(),
+            &[("discovery", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")],
+        );
 
         let err = format!("{:#}", load_bootstrap_pubkeys(dir.path()).unwrap_err());
-        assert!(err.contains("URL-safe-no-pad"), "error states the expected alphabet: {err}");
+        assert!(
+            err.contains("URL-safe-no-pad"),
+            "error states the expected alphabet: {err}"
+        );
     }
 
     #[test]
@@ -2554,10 +2717,18 @@ mod tests {
         // Correct Ed25519 prefix, truncated ML-DSA-65 tail.
         let mut bytes = bootstrap_ed_key(0x55).verifying_key().as_bytes().to_vec();
         bytes.extend_from_slice(&[0u8; 1951]);
-        write_raw_bootstrap_pubkeys(dir.path(), &[("discovery", &URL_SAFE_NO_PAD.encode(&bytes))]);
+        write_raw_bootstrap_pubkeys(
+            dir.path(),
+            &[("discovery", &URL_SAFE_NO_PAD.encode(&bytes))],
+        );
 
-        let err = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("1984 bytes"), "error states the hybrid shape: {err}");
+        let err = load_bootstrap_pubkeys_hybrid(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("1984 bytes"),
+            "error states the hybrid shape: {err}"
+        );
     }
 
     /// The hybrid `discovery` value published as the worked example in
@@ -2572,12 +2743,14 @@ mod tests {
 
         let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
         let entry = &loaded["discovery"];
-        assert!(entry.is_hybrid(), "the documented example must be a hybrid entry");
+        assert!(
+            entry.is_hybrid(),
+            "the documented example must be a hybrid entry"
+        );
         assert_eq!(entry.to_key_bytes().len(), 1984);
         // The documented Ed25519 anchor is the leading 43 base64 characters.
         assert!(
-            DOC_EXAMPLE_HYBRID_VALUE
-                .starts_with(&URL_SAFE_NO_PAD.encode(entry.ed25519.as_bytes())),
+            DOC_EXAMPLE_HYBRID_VALUE.starts_with(&URL_SAFE_NO_PAD.encode(entry.ed25519.as_bytes())),
             "the documented anchor prefix must be the entry's Ed25519 key"
         );
     }

@@ -225,7 +225,11 @@ questions:
 
         let is_refund = &encoded.questions[2];
         assert_eq!(is_refund.kind, QuestionKind::Noul);
-        assert_eq!(is_refund.anchor_positions.len(), 1, "noul has exactly one anchor");
+        assert_eq!(
+            is_refund.anchor_positions.len(),
+            1,
+            "noul has exactly one anchor"
+        );
 
         let mut all: Vec<u32> = encoded
             .questions
@@ -236,7 +240,10 @@ questions:
         all.dedup();
         assert_eq!(all.len(), total, "anchor positions are distinct");
         for window in all.windows(2) {
-            assert!(window[0] < window[1], "anchors appear in serialization order");
+            assert!(
+                window[0] < window[1],
+                "anchors appear in serialization order"
+            );
         }
         for position in &all {
             assert_eq!(
@@ -249,7 +256,9 @@ questions:
 
     #[test]
     fn budget_is_enforced_against_token_count() {
-        let encoder = DecisionEncoder::new(fixture_tokenizer()).unwrap().with_budget(4);
+        let encoder = DecisionEncoder::new(fixture_tokenizer())
+            .unwrap()
+            .with_budget(4);
         let error = encoder.encode(&fixture_set()).unwrap_err();
         match error {
             Error::TokenBudgetExceeded { tokens, budget } => {

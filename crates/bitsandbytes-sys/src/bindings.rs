@@ -28,7 +28,7 @@ extern "C" {
 
     pub fn cquantize_blockwise_fp16(
         code: *mut f32,
-        A: *mut c_void,  // half*
+        A: *mut c_void, // half*
         absmax: *mut f32,
         out: *mut u8,
         blocksize: c_int,
@@ -37,7 +37,7 @@ extern "C" {
 
     pub fn cquantize_blockwise_bf16(
         code: *mut f32,
-        A: *mut c_void,  // bfloat16*
+        A: *mut c_void, // bfloat16*
         absmax: *mut f32,
         out: *mut u8,
         blocksize: c_int,
@@ -58,7 +58,7 @@ extern "C" {
         code: *mut f32,
         A: *mut u8,
         absmax: *mut f32,
-        out: *mut c_void,  // half*
+        out: *mut c_void, // half*
         blocksize: c_int,
         n: c_int,
         stream: bnb_stream_t,
@@ -68,7 +68,7 @@ extern "C" {
         code: *mut f32,
         A: *mut u8,
         absmax: *mut f32,
-        out: *mut c_void,  // bfloat16*
+        out: *mut c_void, // bfloat16*
         blocksize: c_int,
         n: c_int,
         stream: bnb_stream_t,
@@ -200,27 +200,16 @@ extern "C" {
     // Basic Quantization (non-blockwise)
     // ========================================================================
 
-    pub fn cquantize(
-        code: *mut f32,
-        A: *mut f32,
-        out: *mut u8,
-        n: c_int,
-    );
+    pub fn cquantize(code: *mut f32, A: *mut f32, out: *mut u8, n: c_int);
 
-    pub fn cdequantize(
-        code: *mut f32,
-        A: *mut u8,
-        out: *mut f32,
-        n: c_int,
-        stream: bnb_stream_t,
-    );
+    pub fn cdequantize(code: *mut f32, A: *mut u8, out: *mut f32, n: c_int, stream: bnb_stream_t);
 
     // ========================================================================
     // Int8 Vector Quantization (LLM.int8())
     // ========================================================================
 
     pub fn cint8_vector_quant(
-        A: *mut c_void,  // half*
+        A: *mut c_void, // half*
         out: *mut i8,
         row_stats: *mut f32,
         threshold: f32,
@@ -234,7 +223,7 @@ extern "C" {
         row_stats: *mut f32,
         col_stats: *mut f32,
         out: *mut c_void,  // half*
-        bias: *mut c_void,  // half*
+        bias: *mut c_void, // half*
         num_rows: c_int,
         num_cols: c_int,
         stream: bnb_stream_t,
@@ -245,28 +234,36 @@ extern "C" {
     // ========================================================================
 
     pub fn cgemm_4bit_inference(
-        m: c_int, n: c_int, k: c_int,
-        A: *mut c_void,  // half*
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        A: *mut c_void, // half*
         B: *mut u8,
         absmax: *mut f32,
         datatype: *mut c_void,
-        out: *mut c_void,  // half*
-        lda: c_int, ldb: c_int, ldc: c_int,
+        out: *mut c_void, // half*
+        lda: c_int,
+        ldb: c_int,
+        ldc: c_int,
         blocksize: c_int,
     );
 
     pub fn cgemm_4bit_inference_naive_fp16(
-        m: c_int, n: c_int, k: c_int,
-        A: *mut c_void,  // half*
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        A: *mut c_void, // half*
         B: *mut u8,
         absmax: *mut f32,
         code: *mut f32,
-        out: *mut c_void,  // half*
+        out: *mut c_void, // half*
         blocksize: c_int,
     );
 
     pub fn cgemm_4bit_inference_naive_fp32(
-        m: c_int, n: c_int, k: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
         A: *mut f32,
         B: *mut u8,
         absmax: *mut f32,
@@ -276,12 +273,14 @@ extern "C" {
     );
 
     pub fn cgemm_4bit_inference_naive_bf16(
-        m: c_int, n: c_int, k: c_int,
-        A: *mut c_void,  // bfloat16*
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        A: *mut c_void, // bfloat16*
         B: *mut u8,
         absmax: *mut f32,
         code: *mut f32,
-        out: *mut c_void,  // bfloat16*
+        out: *mut c_void, // bfloat16*
         blocksize: c_int,
     );
 

@@ -28,15 +28,15 @@ pub mod theme;
 
 pub use background::{BackgroundState, BackgroundStyle, ALL_STYLES, PREVIEW_H, PREVIEW_W};
 pub use chrome::{
-    ChromeOutput, ContainerEntry, ConversationKind, ConversationPickerEntry,
-    GenerationDefaults, ImageEntry, InputDialog, InputField, ModelEntry, PaneSummary,
-    PreChatSettingsState, PreChatType, RpcRequest, ServiceEntry, ServiceMode, ShellChrome,
-    ShellMode, Toast, ToastLevel, WindowSummary, WorkerEntry, WorkerTab, MENU_ITEMS,
-    keypress_to_bytes, LOCAL_ID_BIT, is_local_id,
+    is_local_id, keypress_to_bytes, ChromeOutput, ContainerEntry, ConversationKind,
+    ConversationPickerEntry, GenerationDefaults, ImageEntry, InputDialog, InputField, ModelEntry,
+    PaneSummary, PreChatSettingsState, PreChatType, RpcRequest, ServiceEntry, ServiceMode,
+    ShellChrome, ShellMode, Toast, ToastLevel, WindowSummary, WorkerEntry, WorkerTab, LOCAL_ID_BIT,
+    MENU_ITEMS,
 };
 pub use layout::{
-    CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource,
-    PaneState, PaneStorage, ScrollUpdate,
+    CellUpdate, CursorState, FrameContent, FrameUpdate, LayoutTree, PaneId, PaneSource, PaneState,
+    PaneStorage, ScrollUpdate,
 };
 
 // ============================================================================
@@ -187,16 +187,14 @@ impl Compositor {
                 self.dispatch_chrome(co)
             }
 
-            CompositorInput::MouseClick { col, row } => {
-                self.handle_mouse_click(col, row)
-            }
+            CompositorInput::MouseClick { col, row } => self.handle_mouse_click(col, row),
 
             CompositorInput::Resize(cols, rows) => {
                 self.cols = cols;
                 self.rows = rows;
                 let pane_rows = rows.saturating_sub(4);
                 let pane_cols = cols.saturating_sub(2);
-                self.chrome.cols      = pane_cols;
+                self.chrome.cols = pane_cols;
                 self.chrome.pane_rows = pane_rows;
                 self.layout.resize(pane_cols, pane_rows);
                 vec![CompositorOutput::Redraw]
@@ -210,12 +208,22 @@ impl Compositor {
                 vec![CompositorOutput::Redraw]
             }
 
-            CompositorInput::WorkerList { sandboxes, pool_summary } => {
+            CompositorInput::WorkerList {
+                sandboxes,
+                pool_summary,
+            } => {
                 self.chrome.update_worker_list(sandboxes, pool_summary);
-                if let ShellMode::WorkerManager { ref mut sandbox_sel, ref mut container_sel, .. } = self.chrome.mode {
-                    *sandbox_sel = (*sandbox_sel).min(self.chrome.worker_list.len().saturating_sub(1));
+                if let ShellMode::WorkerManager {
+                    ref mut sandbox_sel,
+                    ref mut container_sel,
+                    ..
+                } = self.chrome.mode
+                {
+                    *sandbox_sel =
+                        (*sandbox_sel).min(self.chrome.worker_list.len().saturating_sub(1));
                     if let Some(sb) = self.chrome.worker_list.get(*sandbox_sel) {
-                        *container_sel = (*container_sel).min(sb.containers.len().saturating_sub(1));
+                        *container_sel =
+                            (*container_sel).min(sb.containers.len().saturating_sub(1));
                     } else {
                         *container_sel = 0;
                     }
@@ -225,7 +233,10 @@ impl Compositor {
 
             CompositorInput::WorkerImageList { images } => {
                 self.chrome.image_list = images;
-                if let ShellMode::WorkerManager { ref mut image_sel, .. } = self.chrome.mode {
+                if let ShellMode::WorkerManager {
+                    ref mut image_sel, ..
+                } = self.chrome.mode
+                {
                     *image_sel = (*image_sel).min(self.chrome.image_list.len().saturating_sub(1));
                 }
                 vec![CompositorOutput::Redraw]
@@ -237,9 +248,12 @@ impl Compositor {
 
                 // Find and close the server-side window that contained this pane.
                 let mut out = vec![CompositorOutput::Redraw];
-                if let Some(win_idx) = self.chrome.windows.iter().position(|w| {
-                    w.panes.iter().any(|p| p.id == app_id)
-                }) {
+                if let Some(win_idx) = self
+                    .chrome
+                    .windows
+                    .iter()
+                    .position(|w| w.panes.iter().any(|p| p.id == app_id))
+                {
                     let window_id = self.chrome.windows[win_idx].id;
                     self.chrome.windows.remove(win_idx);
                     if self.chrome.windows.is_empty() {
@@ -262,13 +276,14 @@ impl Compositor {
         chrome_outputs
             .into_iter()
             .map(|co| match co {
-                ChromeOutput::Redraw    => CompositorOutput::Redraw,
-                ChromeOutput::Rpc(req)  => match req {
-                    RpcRequest::Quit    => CompositorOutput::Quit,
-                    other               => CompositorOutput::Rpc(other),
+                ChromeOutput::Redraw => CompositorOutput::Redraw,
+                ChromeOutput::Rpc(req) => match req {
+                    RpcRequest::Quit => CompositorOutput::Quit,
+                    other => CompositorOutput::Rpc(other),
                 },
-                ChromeOutput::RouteInput { app_id, data }
-                    => CompositorOutput::RouteInput { app_id, data },
+                ChromeOutput::RouteInput { app_id, data } => {
+                    CompositorOutput::RouteInput { app_id, data }
+                }
             })
             .collect()
     }
@@ -291,7 +306,8 @@ impl Compositor {
                         let sid = self.chrome.session_id;
                         let wid = win.id;
                         return vec![CompositorOutput::Rpc(RpcRequest::CloseWindow {
-                            session_id: sid, window_id: wid,
+                            session_id: sid,
+                            window_id: wid,
                         })];
                     }
                 }
@@ -365,8 +381,10 @@ impl Compositor {
                 }
 
                 // Click outside modal — dismiss.
-                if col < modal.x || col >= modal.x + modal.width
-                    || row < modal.y || row >= modal.y + modal.height
+                if col < modal.x
+                    || col >= modal.x + modal.width
+                    || row < modal.y
+                    || row >= modal.y + modal.height
                 {
                     let out = self.chrome.handle_key(waxterm::input::KeyPress::Escape);
                     return self.dispatch_chrome(out);
@@ -391,7 +409,9 @@ impl Compositor {
                             let inner_h = modal.height.saturating_sub(2);
                             let list_height = 5u16.min(inner_h / 2);
                             let max_visible = list_height.saturating_sub(1) as usize;
-                            if idx < self.chrome.settings_list.items_mut().len() && idx < max_visible {
+                            if idx < self.chrome.settings_list.items_mut().len()
+                                && idx < max_visible
+                            {
                                 self.chrome.settings_list.set_selected(idx);
                                 let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
                                 return self.dispatch_chrome(out);
@@ -411,9 +431,11 @@ impl Compositor {
                                 return vec![CompositorOutput::Redraw];
                             }
                         }
-                        ShellMode::WorkerManager { ref mut sandbox_sel, show_containers: false, .. }
-                            if idx < self.chrome.worker_list.len() =>
-                        {
+                        ShellMode::WorkerManager {
+                            ref mut sandbox_sel,
+                            show_containers: false,
+                            ..
+                        } if idx < self.chrome.worker_list.len() => {
                             *sandbox_sel = idx;
                             let out = self.chrome.handle_key(waxterm::input::KeyPress::Enter);
                             return self.dispatch_chrome(out);
@@ -447,7 +469,10 @@ mod tests {
         let popup_y = 40u16.saturating_sub(popup_h + 1);
         let first_item_row = popup_y + 1;
         // Click on item 3 (Models).
-        let out = comp.handle(CompositorInput::MouseClick { col: 5, row: first_item_row + 3 });
+        let out = comp.handle(CompositorInput::MouseClick {
+            col: 5,
+            row: first_item_row + 3,
+        });
         // Models action opens ModelList mode.
         assert!(matches!(comp.chrome.mode, ShellMode::ModelList));
         assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
@@ -477,8 +502,20 @@ mod tests {
     fn mouse_click_model_list_item() {
         use crate::render::{centered_rect, modal_percentages};
         let models = vec![
-            ModelEntry { model_ref: "a:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
-            ModelEntry { model_ref: "b:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
+            ModelEntry {
+                model_ref: "a:main".into(),
+                path: "/tmp".into(),
+                loaded: true,
+                loading: false,
+                gen_defaults: GenerationDefaults::default(),
+            },
+            ModelEntry {
+                model_ref: "b:main".into(),
+                path: "/tmp".into(),
+                loaded: true,
+                loading: false,
+                gen_defaults: GenerationDefaults::default(),
+            },
         ];
         let mut comp = Compositor::new(120, 40, 1, 1, vec![], models);
         comp.chrome.mode = ShellMode::ModelList;
@@ -488,7 +525,10 @@ mod tests {
         let first_item_row = modal.y + 2; // border + label
         let item_col = modal.x + 2;
         // Click on second item (index 1 = "b:main").
-        let out = comp.handle(CompositorInput::MouseClick { col: item_col, row: first_item_row + 1 });
+        let out = comp.handle(CompositorInput::MouseClick {
+            col: item_col,
+            row: first_item_row + 1,
+        });
         assert!(out.iter().any(|o| matches!(o,
             CompositorOutput::Rpc(RpcRequest::ListConversations { ref model_ref })
                 if model_ref == "b:main"
@@ -499,8 +539,15 @@ mod tests {
     fn mouse_click_close_button_on_pane() {
         use crate::theme::CLOSE_BUTTON_WIDTH;
         let wins = vec![WindowSummary {
-            id: 1, name: "w".into(), active_pane_id: 1,
-            panes: vec![PaneSummary { id: 1, cols: 80, rows: 24, is_private: false }],
+            id: 1,
+            name: "w".into(),
+            active_pane_id: 1,
+            panes: vec![PaneSummary {
+                id: 1,
+                cols: 80,
+                rows: 24,
+                is_private: false,
+            }],
         }];
         let mut comp = Compositor::new(120, 40, 1, 1, wins, vec![]);
         // Close button at row 1, cols [width-1-3 .. width-2] = [116, 117, 118]
@@ -508,7 +555,9 @@ mod tests {
             col: 120 - 1 - CLOSE_BUTTON_WIDTH + 1, // 117
             row: 1,
         });
-        assert!(out.iter().any(|o| matches!(o, CompositorOutput::Rpc(RpcRequest::CloseWindow { .. }))));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, CompositorOutput::Rpc(RpcRequest::CloseWindow { .. }))));
     }
 
     #[test]
@@ -535,7 +584,10 @@ mod tests {
         // Click on the window strip row directly below the popup.
         let popup_h = MENU_ITEMS.len() as u16 + 2;
         let popup_y = 40u16.saturating_sub(popup_h + 1);
-        let out = comp.handle(CompositorInput::MouseClick { col: 5, row: popup_y + popup_h });
+        let out = comp.handle(CompositorInput::MouseClick {
+            col: 5,
+            row: popup_y + popup_h,
+        });
         assert!(matches!(comp.chrome.mode, ShellMode::Normal));
         assert!(out.iter().any(|o| matches!(o, CompositorOutput::Redraw)));
     }

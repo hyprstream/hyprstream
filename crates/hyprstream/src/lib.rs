@@ -23,14 +23,14 @@ compile_error!(
 // Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
-pub use hyprstream_rpc::streaming_capnp;
-pub use hyprstream_rpc::optional_capnp;
 pub use hyprstream_rpc::nine_capnp;
+pub use hyprstream_rpc::optional_capnp;
+pub use hyprstream_rpc::streaming_capnp;
 
+pub mod account;
 pub mod api;
 pub mod archetypes;
 pub mod auth;
-pub mod account;
 pub mod cli;
 pub mod config;
 pub mod constants;
@@ -53,13 +53,7 @@ pub use hyprstream_inference::training;
 pub mod tui;
 
 // Storage exports removed
-pub use runtime::{
-    FinishReason,
-    GenerationResult,
-    RuntimeConfig,
-    RuntimeEngine,
-    TorchEngine,
-};
+pub use runtime::{FinishReason, GenerationResult, RuntimeConfig, RuntimeEngine, TorchEngine};
 
 // Export init function from runtime
 pub use runtime::create_engine as init;

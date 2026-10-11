@@ -45,15 +45,20 @@ mod types;
 
 // Re-export event types
 pub use types::{
+    // Serialization helpers
+    serialize_container_started,
+    serialize_container_stopped,
+    serialize_sandbox_started,
+    serialize_sandbox_stopped,
     // Individual event structs (with ToCapnp/FromCapnp)
-    ContainerStarted, ContainerStopped, SandboxStarted, SandboxStopped,
-    // Union enum for type-safe handling
-    WorkerEvent,
+    ContainerStarted,
+    ContainerStopped,
     // EventSubscriber integration
     ReceivedEvent,
-    // Serialization helpers
-    serialize_container_started, serialize_container_stopped,
-    serialize_sandbox_started, serialize_sandbox_stopped,
+    SandboxStarted,
+    SandboxStopped,
+    // Union enum for type-safe handling
+    WorkerEvent,
 };
 
 pub use token_manager::EventTokenManager;

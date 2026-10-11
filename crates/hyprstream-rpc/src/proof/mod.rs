@@ -32,10 +32,10 @@ pub mod enrollment;
 pub mod parser;
 pub mod plan;
 pub mod policy;
-pub mod response;
 pub mod recipient_binding;
-pub mod verify;
+pub mod response;
 mod thumbprint;
+pub mod verify;
 
 #[cfg(test)]
 mod tests;

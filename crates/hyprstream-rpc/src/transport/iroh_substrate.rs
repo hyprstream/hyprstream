@@ -61,7 +61,7 @@
 //! self-hosted `iroh-dns-server` configured through the owned endpoint builder.
 
 use anyhow::Result;
-use iroh::endpoint::{Accepting, AfterHandshakeOutcome, Connection, EndpointHooks, presets};
+use iroh::endpoint::{presets, Accepting, AfterHandshakeOutcome, Connection, EndpointHooks};
 use iroh::protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use std::{future::Future, pin::Pin};
@@ -167,9 +167,7 @@ impl IrohSubstrate {
         let endpoint = Endpoint::builder(presets::N0)
             .address_lookup(iroh::address_lookup::PkarrResolver::n0_dns())
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            .crypto_provider(
-                crate::transport::pq_provider::internal_mesh_crypto_provider(),
-            )
+            .crypto_provider(crate::transport::pq_provider::internal_mesh_crypto_provider())
             .ca_crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
             .hooks(HybridCarrierHook)
             .bind()
@@ -396,8 +394,8 @@ mod tests {
     use noq::crypto::rustls::HandshakeData;
     use rand::RngCore;
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
 
     fn fresh_key() -> [u8; 32] {

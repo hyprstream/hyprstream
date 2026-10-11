@@ -300,8 +300,11 @@ fn validate_mandatory_scope(
     // Recurse into a scoped client's leaves + nested dispatchers.
     fn check_scoped(service_name: &str, path: &str, sc: &ScopedClient) -> Result<(), String> {
         let here = format!("{path}{} ", sc.factory_name);
-        let nested_names: Vec<&str> =
-            sc.nested_clients.iter().map(|n| n.factory_name.as_str()).collect();
+        let nested_names: Vec<&str> = sc
+            .nested_clients
+            .iter()
+            .map(|n| n.factory_name.as_str())
+            .collect();
         for v in &sc.inner_request_variants {
             // A nested dispatcher inside this scope is itself exempt; recurse instead.
             if nested_names.contains(&v.name.as_str()) {
@@ -317,8 +320,10 @@ fn validate_mandatory_scope(
         Ok(())
     }
 
-    let dispatcher_names: Vec<&str> =
-        scoped_clients.iter().map(|sc| sc.factory_name.as_str()).collect();
+    let dispatcher_names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
     for v in request_variants {
         if dispatcher_names.contains(&v.name.as_str()) {
             continue; // dispatcher: leaves validated via check_scoped below
@@ -1553,8 +1558,8 @@ fn extract_union_arms(
                         }
                         Ok(capnp::schema_capnp::field::Group(_)) => {
                             return Err(format!(
-                                "union arm '{name}': nested groups inside a group arm are unsupported"
-                            ))
+                            "union arm '{name}': nested groups inside a group arm are unsupported"
+                        ))
                         }
                         Err(e) => return Err(format!("group leaf error in arm '{name}': {e}")),
                     }
@@ -2289,7 +2294,10 @@ mod mandatory_scope_tests {
 
     #[test]
     fn scoped_method_passes() {
-        let reqs = vec![variant("load", "write", false), variant("status", "query", false)];
+        let reqs = vec![
+            variant("load", "write", false),
+            variant("status", "query", false),
+        ];
         assert!(validate_mandatory_scope("model", &reqs, &[]).is_ok());
     }
 
@@ -2384,14 +2392,22 @@ mod mandatory_dispatch_tests {
         let reqs = vec![
             variant("load", "write", MAC, ""),
             variant("status", "query", MAC, ""),
-            variant("check", "", "", "the authz check itself cannot require authz"),
+            variant(
+                "check",
+                "",
+                "",
+                "the authz check itself cannot require authz",
+            ),
         ];
         assert!(validate_mandatory_dispatch("model", &reqs, &[]).is_ok());
     }
 
     #[test]
     fn an_unannotated_leaf_is_a_build_error() {
-        let reqs = vec![variant("load", "write", MAC, ""), variant("oops", "query", "", "")];
+        let reqs = vec![
+            variant("load", "write", MAC, ""),
+            variant("oops", "query", "", ""),
+        ];
         let err = validate_mandatory_dispatch("model", &reqs, &[]).unwrap_err();
         assert!(err.contains("oops"), "{err}");
         assert!(err.contains("neither"), "{err}");
@@ -2481,8 +2497,12 @@ mod mandatory_mutation_policy_tests {
             "idempotency-key-required",
             "transaction-ledger-required",
         ] {
-            validate_mandatory_mutation_policy("tui", &[variant("method", "write", semantics)], &[])
-                .unwrap_or_else(|err| panic!("{semantics}: {err}"));
+            validate_mandatory_mutation_policy(
+                "tui",
+                &[variant("method", "write", semantics)],
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("{semantics}: {err}"));
         }
     }
 
@@ -2514,16 +2534,25 @@ mod mandatory_mutation_policy_tests {
             Err(error) => error,
             Ok(()) => panic!("maxLen(0) violates the schema contract"),
         };
-        assert!(error.contains("field 'policyText'"), "field-named: {error:#}");
+        assert!(
+            error.contains("field 'policyText'"),
+            "field-named: {error:#}"
+        );
         assert!(error.contains(MAXLEN_ZERO_CONTRACT_ERROR), "{error:#}");
         assert!(error.contains("at least 1"), "{error:#}");
     }
 
     #[test]
     fn maxlen_positive_and_absent_are_valid() {
-        assert!(validate_max_len("policyText", Some(1)).is_ok(), "lower bound");
+        assert!(
+            validate_max_len("policyText", Some(1)).is_ok(),
+            "lower bound"
+        );
         assert!(validate_max_len("policyText", Some(u32::MAX)).is_ok());
-        assert!(validate_max_len("policyText", None).is_ok(), "annotation absent");
+        assert!(
+            validate_max_len("policyText", None).is_ok(),
+            "annotation absent"
+        );
     }
 
     #[test]

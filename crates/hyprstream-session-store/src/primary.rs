@@ -194,8 +194,8 @@ impl PrimaryLookup {
                 &expected.generation,
                 &self.inventory.id(),
             )
-                .await?
-                .ok_or(Error::Inactive)?;
+            .await?
+            .ok_or(Error::Inactive)?;
             let active = primary.session();
             let created_at = primary.created_at();
             if active.collision_inventory_id != self.inventory.id()
@@ -223,7 +223,10 @@ impl PrimaryLookup {
             if expected.expires_at <= now {
                 return Err(Error::Expired);
             }
-            Ok(ActiveSessionPrimary { session: active.clone(), created_at })
+            Ok(ActiveSessionPrimary {
+                session: active.clone(),
+                created_at,
+            })
         })
         .await
         .map_err(|_| Error::Unavailable)?
@@ -295,12 +298,7 @@ mod tests {
             "tenant-a",
             "https://host.test"
         ));
-        assert!(!lookup.permits(
-            "service:model",
-            &[4; 32],
-            "tenant-a",
-            "https://host.test"
-        ));
+        assert!(!lookup.permits("service:model", &[4; 32], "tenant-a", "https://host.test"));
         assert!(!lookup.permits(
             "service:registry",
             &[5; 32],

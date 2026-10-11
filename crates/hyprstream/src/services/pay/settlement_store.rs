@@ -80,7 +80,11 @@ pub trait SettlementStore: Send + Sync {
 
     /// Mark a settlement as issuance-pending (after the ledger transfer is
     /// dispatched but before the outcome is confirmed).
-    async fn mark_issuance_pending(&self, id: &str, transfer_id: TransferId) -> Result<(), PayError>;
+    async fn mark_issuance_pending(
+        &self,
+        id: &str,
+        transfer_id: TransferId,
+    ) -> Result<(), PayError>;
 
     /// Mark a settlement as issued (after the ledger outcome confirms success).
     async fn mark_issued(&self, id: &str) -> Result<(), PayError>;

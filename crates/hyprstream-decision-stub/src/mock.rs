@@ -31,7 +31,11 @@ fn draw(key: &[u8], index: u64) -> f64 {
     hasher.update(key);
     hasher.update(&index.to_le_bytes());
     let output = hasher.finalize();
-    let bits = u64::from_le_bytes(output.as_bytes()[..8].try_into().unwrap_or_else(|error| panic!("8 bytes: {error}")));
+    let bits = u64::from_le_bytes(
+        output.as_bytes()[..8]
+            .try_into()
+            .unwrap_or_else(|error| panic!("8 bytes: {error}")),
+    );
     // Map to (0, 1) exclusive: exact 0/1 components would pin confidence to 1.0 and hide
     // the derived-statistic paths the contract tests exercise.
     (bits as f64 + 0.5) / (u64::MAX as f64 + 1.0)

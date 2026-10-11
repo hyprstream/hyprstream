@@ -489,10 +489,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .and_then(|obj| obj.peel_to_commit())
                     .map(|commit| commit.id())
                     .map_err(|e| {
-                        Git2DBError::reference(
-                            &ref_str,
-                            format!("Failed to resolve revspec: {e}"),
-                        )
+                        Git2DBError::reference(&ref_str, format!("Failed to resolve revspec: {e}"))
                     })
             }
         }
@@ -516,10 +513,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .and_then(|obj| obj.peel_to_commit())
                     .map(|commit| commit.id())
                     .map_err(|e| {
-                        Git2DBError::reference(
-                            &ref_str,
-                            format!("Failed to resolve revspec: {e}"),
-                        )
+                        Git2DBError::reference(&ref_str, format!("Failed to resolve revspec: {e}"))
                     })
             }
         }
@@ -544,10 +538,7 @@ fn resolve_in_repo(repo: &Repository, git_ref: &GitRef) -> Git2DBResult<Oid> {
                     .and_then(|obj| obj.peel_to_commit())
                     .map(|commit| commit.id())
                     .map_err(|e| {
-                        Git2DBError::reference(
-                            &ref_str,
-                            format!("Failed to resolve revspec: {e}"),
-                        )
+                        Git2DBError::reference(&ref_str, format!("Failed to resolve revspec: {e}"))
                     })
             }
         }
@@ -562,10 +553,7 @@ mod tests {
     fn test_git_ref_parse() -> crate::Git2DBResult<()> {
         assert_eq!(GitRef::parse("")?, GitRef::DefaultBranch);
         assert_eq!(GitRef::parse("HEAD")?, GitRef::DefaultBranch);
-        assert_eq!(
-            GitRef::parse("main")?,
-            GitRef::Branch("main".to_owned())
-        );
+        assert_eq!(GitRef::parse("main")?, GitRef::Branch("main".to_owned()));
         assert_eq!(
             GitRef::parse("refs/heads/main")?,
             GitRef::Branch("main".to_owned())
@@ -574,10 +562,7 @@ mod tests {
             GitRef::parse("refs/tags/v1.0")?,
             GitRef::Tag("v1.0".to_owned())
         );
-        assert_eq!(
-            GitRef::parse("tags/v1.0")?,
-            GitRef::Tag("v1.0".to_owned())
-        );
+        assert_eq!(GitRef::parse("tags/v1.0")?, GitRef::Tag("v1.0".to_owned()));
 
         // Test commit hash
         let full_hash = "1234567890abcdef1234567890abcdef12345678";

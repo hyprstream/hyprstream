@@ -8,7 +8,7 @@
 //! exact 32-byte value. Absence is represented explicitly as CBOR null so a
 //! relay cannot add, remove, or replace any forwarded key.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use ciborium::value::Value as CborValue;
 use sha2::{Digest as _, Sha256};
 
@@ -130,15 +130,13 @@ fn commitment(recipient: &RecipientPublic) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
+    use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
 
     #[test]
     fn recipient_binding_rejects_omitted_and_malformed_fields() {
         let key = |value: i64| CborValue::Integer(value.into());
-        let omitted_client_dh = CborValue::Map(vec![
-            (key(1), CborValue::Null),
-            (key(2), CborValue::Null),
-        ]);
+        let omitted_client_dh =
+            CborValue::Map(vec![(key(1), CborValue::Null), (key(2), CborValue::Null)]);
         assert!(FederateRecipientBinding::decode(&omitted_client_dh).is_err());
 
         let malformed_client_dh = CborValue::Map(vec![

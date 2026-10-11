@@ -52,12 +52,12 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use crate::crypto::pq::{MlDsaVerifyingKey, ml_dsa_vk_from_bytes};
+use crate::crypto::pq::{ml_dsa_vk_from_bytes, MlDsaVerifyingKey};
 use crate::did_web::{
-    MULTICODEC_ML_DSA_65_PUB, decode_ed25519_multikey, decode_multikey, did_key_to_ed25519,
+    decode_ed25519_multikey, decode_multikey, did_key_to_ed25519, MULTICODEC_ML_DSA_65_PUB,
 };
 use crate::identity::{Did, IdentityKeyCandidate, IdentityKeys, IdentityResolver};
 
@@ -474,7 +474,7 @@ mod tests {
     use super::*;
     use crate::auth::mac::Assurance;
     use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes};
-    use crate::did_key::{MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB, ed25519_to_did_key};
+    use crate::did_key::{ed25519_to_did_key, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use serde_json::json;
@@ -803,32 +803,26 @@ mod tests {
             }],
         });
         let resolver = MethodDispatchResolver::new(FixtureDocs(doc));
-        assert!(
-            resolver
-                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .is_err());
     }
 
     #[test]
     fn did_web_empty_doc_fails_closed() {
         let doc = json!({ "id": DID_WEB, "verificationMethod": [] });
         let resolver = MethodDispatchResolver::new(FixtureDocs(doc));
-        assert!(
-            resolver
-                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .is_err());
     }
 
     #[test]
     fn did_web_fetch_failure_fails_closed() {
         let resolver = MethodDispatchResolver::new(FailingDocs);
-        assert!(
-            resolver
-                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .is_err());
     }
 
     #[test]

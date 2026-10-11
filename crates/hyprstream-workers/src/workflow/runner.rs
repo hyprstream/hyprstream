@@ -78,10 +78,13 @@ impl CandidateWorktree {
             .map_err(|e| RunnerError::VfsError(format!("canonicalize candidate worktree: {e}")))?;
         if !root.is_dir() {
             return Err(RunnerError::VfsError(format!(
-                "candidate worktree is not a directory: {}", root.display()
+                "candidate worktree is not a directory: {}",
+                root.display()
             )));
         }
-        Ok(Self { root: Arc::new(root) })
+        Ok(Self {
+            root: Arc::new(root),
+        })
     }
 
     fn mount_for_job(&self) -> RunnerResult<(MountTarget, tempfile::TempDir)> {
@@ -288,9 +291,20 @@ impl WorkflowRunner {
 
                 join_set.spawn(async move {
                     let result = run_job(
-                        ns, sem, scheduler, candidate_worktree, &job, &name, env, &inputs, &subject, cancel,
-                        job_timeout, step_timeout,
-                    ).await;
+                        ns,
+                        sem,
+                        scheduler,
+                        candidate_worktree,
+                        &job,
+                        &name,
+                        env,
+                        &inputs,
+                        &subject,
+                        cancel,
+                        job_timeout,
+                        step_timeout,
+                    )
+                    .await;
                     (name, result)
                 });
             }
@@ -385,7 +399,18 @@ async fn run_job(
     // `timeout-minutes:` already folded into `job_timeout` by the caller.
     let outcome = tokio::time::timeout(
         job_timeout,
-        run_job_steps(ns, semaphore, candidate_worktree, job, job_name, env, inputs, subject, cancel, step_timeout),
+        run_job_steps(
+            ns,
+            semaphore,
+            candidate_worktree,
+            job,
+            job_name,
+            env,
+            inputs,
+            subject,
+            cancel,
+            step_timeout,
+        ),
     )
     .await;
 
@@ -476,9 +501,9 @@ async fn run_job_steps(
         // The thread runs a current-thread tokio runtime + LocalSet so TclShell
         // (which is !Send due to Rc in molt Value) can .await VFS operations directly.
         let (script_tx, mut script_rx) = tokio::sync::mpsc::channel::<(
-            String,                                                          // script
-            HashMap<String, String>,                                         // step env
-            tokio::sync::oneshot::Sender<Result<String, String>>,            // reply
+            String,                                               // script
+            HashMap<String, String>,                              // step env
+            tokio::sync::oneshot::Sender<Result<String, String>>, // reply
         )>(1);
 
         let shell_handle = {
@@ -511,10 +536,7 @@ async fn run_job_steps(
                 return Err(RunnerError::Cancelled);
             }
 
-            let step_name = step
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("step-{}", i));
+            let step_name = step.name.clone().unwrap_or_else(|| format!("step-{}", i));
 
             if let Some(ref action) = step.uses {
                 // Action step — runs on async runtime, bounded by step_timeout (#521).
@@ -624,10 +646,7 @@ async fn run_job_steps(
                 return Err(RunnerError::Cancelled);
             }
 
-            let step_name = step
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("step-{}", i));
+            let step_name = step.name.clone().unwrap_or_else(|| format!("step-{}", i));
 
             if let Some(ref action) = step.uses {
                 // Bounded by step_timeout (#521).
@@ -922,9 +941,9 @@ impl hyprstream_vfs::Mount for EnvMount {
         _count: u32,
         _caller: &Subject,
     ) -> Result<Vec<u8>, hyprstream_vfs::MountError> {
-        let inner = fid.downcast_ref::<EnvFid>().ok_or_else(|| {
-            hyprstream_vfs::MountError::InvalidArgument("bad fid".into())
-        })?;
+        let inner = fid
+            .downcast_ref::<EnvFid>()
+            .ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("bad fid".into()))?;
         match self.vars.get(&inner.path) {
             Some(data) => {
                 let start = offset as usize;
@@ -970,10 +989,15 @@ impl hyprstream_vfs::Mount for EnvMount {
         fid: &hyprstream_vfs::Fid,
         _caller: &Subject,
     ) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
-        let inner = fid.downcast_ref::<EnvFid>().ok_or_else(|| {
-            hyprstream_vfs::MountError::InvalidArgument("bad fid".into())
-        })?;
-        Ok(hyprstream_vfs::Stat::unknown_qid(0, 0, inner.path.clone(), 0))
+        let inner = fid
+            .downcast_ref::<EnvFid>()
+            .ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("bad fid".into()))?;
+        Ok(hyprstream_vfs::Stat::unknown_qid(
+            0,
+            0,
+            inner.path.clone(),
+            0,
+        ))
     }
 
     async fn clunk(&self, _fid: hyprstream_vfs::Fid, _caller: &Subject) {}
@@ -1014,11 +1038,7 @@ mod tests {
 
     #[async_trait]
     impl Mount for MemMount {
-        async fn walk(
-            &self,
-            components: &[&str],
-            _caller: &Subject,
-        ) -> Result<Fid, MountError> {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
             Ok(Fid::new(MemFid {
                 path,
@@ -1083,11 +1103,7 @@ mod tests {
             Ok(data.len() as u32)
         }
 
-        async fn readdir(
-            &self,
-            fid: &Fid,
-            _caller: &Subject,
-        ) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
             let inner = fid
                 .downcast_ref::<MemFid>()
                 .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
@@ -1145,7 +1161,12 @@ mod tests {
         async fn walk(&self, _components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             Ok(Fid::new(SlowFid))
         }
-        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(
+            &self,
+            _fid: &mut Fid,
+            _mode: u8,
+            _caller: &Subject,
+        ) -> Result<(), MountError> {
             Ok(())
         }
         async fn write(
@@ -1171,7 +1192,11 @@ mod tests {
                 Ok(vec![])
             }
         }
-        async fn readdir(&self, _fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(
+            &self,
+            _fid: &Fid,
+            _caller: &Subject,
+        ) -> Result<Vec<DirEntry>, MountError> {
             Ok(vec![])
         }
         async fn stat(&self, _fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
@@ -1197,7 +1222,12 @@ mod tests {
         async fn walk(&self, _components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             Ok(Fid::new(TrackingFid))
         }
-        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(
+            &self,
+            _fid: &mut Fid,
+            _mode: u8,
+            _caller: &Subject,
+        ) -> Result<(), MountError> {
             Ok(())
         }
         async fn write(
@@ -1227,7 +1257,11 @@ mod tests {
                 Ok(vec![])
             }
         }
-        async fn readdir(&self, _fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+        async fn readdir(
+            &self,
+            _fid: &Fid,
+            _caller: &Subject,
+        ) -> Result<Vec<DirEntry>, MountError> {
             Ok(vec![])
         }
         async fn stat(&self, _fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
@@ -1279,9 +1313,13 @@ mod tests {
             ns.cat("/src/Cargo.toml", &subject).await.unwrap(),
             b"[package]\nname = \"candidate\"\n"
         );
-        ns.echo("/src/Cargo.toml", b"[package]\nname = \"job-local\"\n", &subject)
-            .await
-            .unwrap();
+        ns.echo(
+            "/src/Cargo.toml",
+            b"[package]\nname = \"job-local\"\n",
+            &subject,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             ns.cat("/src/Cargo.toml", &subject).await.unwrap(),
             b"[package]\nname = \"job-local\"\n"
@@ -1961,7 +1999,12 @@ mod tests {
         let workflow = make_simple_workflow(jobs);
 
         let result = runner
-            .run(&workflow, HashMap::new(), &test_subject(), CancellationToken::new())
+            .run(
+                &workflow,
+                HashMap::new(),
+                &test_subject(),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -1992,7 +2035,12 @@ mod tests {
         let workflow = make_simple_workflow(jobs);
 
         let result = runner
-            .run(&workflow, HashMap::new(), &test_subject(), CancellationToken::new())
+            .run(
+                &workflow,
+                HashMap::new(),
+                &test_subject(),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -2031,7 +2079,12 @@ mod tests {
             let wf = make_workflow();
             tokio::spawn(async move {
                 runner
-                    .run(&wf, HashMap::new(), &test_subject(), CancellationToken::new())
+                    .run(
+                        &wf,
+                        HashMap::new(),
+                        &test_subject(),
+                        CancellationToken::new(),
+                    )
                     .await
             })
         };
@@ -2042,7 +2095,12 @@ mod tests {
             let wf = make_workflow();
             tokio::spawn(async move {
                 runner
-                    .run(&wf, HashMap::new(), &test_subject(), CancellationToken::new())
+                    .run(
+                        &wf,
+                        HashMap::new(),
+                        &test_subject(),
+                        CancellationToken::new(),
+                    )
                     .await
             })
         };

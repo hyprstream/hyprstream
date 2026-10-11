@@ -47,11 +47,11 @@ use crate::crypto::derive_stream_keys;
 // DH key types - Ristretto255 (default) or P-256 (FIPS)
 #[cfg(not(feature = "fips"))]
 use crate::crypto::{
-    RistrettoPublic as DhPublic, RistrettoSecret as DhSecret, ristretto_dh as dh_compute,
+    ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret,
 };
 
 #[cfg(feature = "fips")]
-use crate::crypto::{P256PublicKey as DhPublic, P256SecretKey as DhSecret, p256_dh as dh_compute};
+use crate::crypto::{p256_dh as dh_compute, P256PublicKey as DhPublic, P256SecretKey as DhSecret};
 use crate::streaming_capnp;
 
 // ============================================================================
@@ -1370,9 +1370,9 @@ mod tests {
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         _claims: Option<Claims>,
     ) -> Vec<u8> {
-        use crate::ToCapnp;
         use crate::common_capnp;
         use crate::envelope::{RequestEnvelope, SignedEnvelope};
+        use crate::ToCapnp;
 
         let mut inner_msg = Builder::new_default();
         {
@@ -1425,11 +1425,11 @@ mod tests {
     /// which already verifies the self-asserted `cnf`'s EdDSA without a pin.
     #[test]
     fn stream_register_hybrid_verifies_only_when_pq_anchored() -> anyhow::Result<()> {
-        use crate::FromCapnp;
         use crate::common_capnp;
-        use crate::crypto::CryptoPolicy;
         use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
+        use crate::crypto::CryptoPolicy;
         use crate::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
+        use crate::FromCapnp;
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn identified_preparation_uses_hybrid_material_not_interop_dh() -> Result<()> {
-        use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
+        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
         use crate::stream_epoch::{
             IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
         };

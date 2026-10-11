@@ -4,8 +4,8 @@
 //! are owned by `hyprstream-rpc-std`; this module contains no client facade.
 
 use hyprstream_rpc::service::AuthorizeFn;
-use std::sync::Arc;
 use hyprstream_rpc_std::policy_client::PolicyCheck;
+use std::sync::Arc;
 
 // ============================================================================
 // Authorization Helper

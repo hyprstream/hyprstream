@@ -232,10 +232,7 @@ impl DmaTransport {
         }
 
         // Advance tail
-        self.atomic_store(
-            self.read_tail_idx,
-            (tail + HEADER_SIZE + msg_len) as i32,
-        );
+        self.atomic_store(self.read_tail_idx, (tail + HEADER_SIZE + msg_len) as i32);
         self.atomic_add(self.read_msg_count_idx, -1);
         // Notify the index we just advanced: a peer writer blocked waiting for
         // space watches the tail it frees (this same physical SAB slot), not

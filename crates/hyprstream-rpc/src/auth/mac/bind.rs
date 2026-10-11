@@ -205,7 +205,11 @@ mod tests {
         // SecurityLabel. The effective label is the join of exactly those two —
         // there is no third "no-label" path the caller can reach.
         let mut map = BindLabelMap::new();
-        let b = map.bind("/srv/model", label(Level::Internal), label(Level::Confidential));
+        let b = map.bind(
+            "/srv/model",
+            label(Level::Internal),
+            label(Level::Confidential),
+        );
         // effective = join(Internal, Confidential) = Confidential.
         assert_eq!(b.effective().level, Level::Confidential);
     }
@@ -217,7 +221,9 @@ mod tests {
         let mut map = BindLabelMap::new();
         // A Secret-cleared binder declares Internal; effective = Secret (floor wins).
         map.bind("/srv/policy", label(Level::Secret), label(Level::Internal));
-        let under = map.resolve(&["srv", "policy", "config", "current"]).unwrap();
+        let under = map
+            .resolve(&["srv", "policy", "config", "current"])
+            .unwrap();
         assert_eq!(
             under.level,
             Level::Secret,
@@ -267,21 +273,16 @@ mod tests {
     fn resolve_walks_to_nearest_enclosing_mount() {
         let mut map = BindLabelMap::new();
         map.bind("/srv", label(Level::Public), label(Level::Public));
-        map.bind(
-            "/srv/model",
-            label(Level::Internal),
-            label(Level::Internal),
-        );
+        map.bind("/srv/model", label(Level::Internal), label(Level::Internal));
         // /srv/model/qwen/status → nearest is /srv/model (Internal), not /srv.
         assert_eq!(
-            map.resolve(&["srv", "model", "qwen", "status"]).unwrap().level,
+            map.resolve(&["srv", "model", "qwen", "status"])
+                .unwrap()
+                .level,
             Level::Internal
         );
         // /srv/other → nearest is /srv (Public).
-        assert_eq!(
-            map.resolve(&["srv", "other"]).unwrap().level,
-            Level::Public
-        );
+        assert_eq!(map.resolve(&["srv", "other"]).unwrap().level, Level::Public);
     }
 
     #[test]

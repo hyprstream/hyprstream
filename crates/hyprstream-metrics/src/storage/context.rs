@@ -16,8 +16,8 @@
 
 use super::StorageBackend;
 use duckdb::arrow::array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray,
-    FixedSizeListArray, FixedSizeListBuilder, Float32Builder,
+    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, Float32Array, Float32Builder,
+    Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
@@ -102,7 +102,9 @@ impl ContextRecord {
     /// Create multiple records as a single batch (more efficient for bulk inserts)
     pub fn batch_to_record_batch(records: &[ContextRecord]) -> Result<RecordBatch, Status> {
         if records.is_empty() {
-            return Err(Status::invalid_argument("Cannot create batch from empty records"));
+            return Err(Status::invalid_argument(
+                "Cannot create batch from empty records",
+            ));
         }
 
         // Embedding dimension is typically small (< 10000), safe conversion
@@ -112,8 +114,10 @@ impl ContextRecord {
 
         // Build arrays
         let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
-        let conversation_ids: Vec<&str> = records.iter().map(|r| r.conversation_id.as_str()).collect();
-        let session_ids: Vec<Option<&str>> = records.iter().map(|r| r.session_id.as_deref()).collect();
+        let conversation_ids: Vec<&str> =
+            records.iter().map(|r| r.conversation_id.as_str()).collect();
+        let session_ids: Vec<Option<&str>> =
+            records.iter().map(|r| r.session_id.as_deref()).collect();
         let model_ids: Vec<&str> = records.iter().map(|r| r.model_id.as_str()).collect();
         let timestamps: Vec<i64> = records.iter().map(|r| r.timestamp).collect();
         let quality_scores: Vec<Option<f64>> = records.iter().map(|r| r.quality_score).collect();
@@ -189,7 +193,9 @@ impl<B: StorageBackend> ContextStore<B> {
     /// Store a single context record
     pub async fn store(&self, record: ContextRecord) -> Result<(), Status> {
         let batch = record.to_record_batch()?;
-        self.backend.insert_into_table(&self.table_name, batch).await
+        self.backend
+            .insert_into_table(&self.table_name, batch)
+            .await
     }
 
     /// Store multiple context records in a batch
@@ -198,7 +204,9 @@ impl<B: StorageBackend> ContextStore<B> {
             return Ok(());
         }
         let batch = ContextRecord::batch_to_record_batch(records)?;
-        self.backend.insert_into_table(&self.table_name, batch).await
+        self.backend
+            .insert_into_table(&self.table_name, batch)
+            .await
     }
 
     /// Get recent context by session (CAG - no semantic search)
@@ -359,7 +367,11 @@ impl<B: StorageBackend> ContextStore<B> {
         }
 
         // Sort by score descending and take top-k
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         Ok(results)

@@ -26,7 +26,6 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ed25519_dalek::Signer;
 
-
 /// Handle `hyprstream sign-challenge [USER_CODE] [--nonce N] [--code-challenge CC]`
 ///
 /// `config` is the already-loaded `HyprConfig` (honoring `--config`/env) so the
@@ -96,10 +95,7 @@ async fn handle_device_flow(
     // secrets directory, not a re-derived default location.
     let client = build_oauth_http_client(insecure, config)?;
 
-    let nonce_url = format!(
-        "{}/oauth/device/nonce?user_code={}",
-        base_url, normalized
-    );
+    let nonce_url = format!("{}/oauth/device/nonce?user_code={}", base_url, normalized);
     let resp = client
         .get(&nonce_url)
         .send()
@@ -112,7 +108,10 @@ async fn handle_device_flow(
         anyhow::bail!("Server returned {}: {}", status, body);
     }
 
-    let json: serde_json::Value = resp.json().await.context("Invalid JSON from nonce endpoint")?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("Invalid JSON from nonce endpoint")?;
     let nonce = json["nonce"]
         .as_str()
         .context("Missing 'nonce' in server response")?;
@@ -146,7 +145,11 @@ async fn handle_device_flow(
         // Parse JSON error_description returned by verify_post when Accept: application/json
         let error_msg = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
-            .and_then(|v| v["error_description"].as_str().map(std::borrow::ToOwned::to_owned))
+            .and_then(|v| {
+                v["error_description"]
+                    .as_str()
+                    .map(std::borrow::ToOwned::to_owned)
+            })
             .unwrap_or_else(|| format!("Server returned {}", status));
         anyhow::bail!("Authorization failed: {}", error_msg);
     }
@@ -197,10 +200,12 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
 
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let (sk, _vk) = crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
-        .map_err(|e| anyhow::anyhow!(
-            "Could not load user signing key: {e}\n\
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Could not load user signing key: {e}\n\
              Run 'hyprstream wizard' to set up your identity first."
-        ))?;
+            )
+        })?;
 
     Ok((sk, username))
 }
@@ -213,7 +218,10 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
 /// issuer URL (and, downstream, the secrets dir for the local dev cert)
 /// would be read from the wrong place (#450). When `config` is `None` we
 /// fall back to a fresh default load for backward compatibility.
-fn resolve_server_url(server: Option<String>, config: Option<&crate::config::HyprConfig>) -> String {
+fn resolve_server_url(
+    server: Option<String>,
+    config: Option<&crate::config::HyprConfig>,
+) -> String {
     if let Some(s) = server {
         return s;
     }
@@ -333,8 +341,7 @@ mod tests {
     fn der_to_pem_roundtrips_through_reqwest() {
         // Generate a throwaway self-signed cert and confirm reqwest accepts
         // the PEM we produce from its DER encoding.
-        let kp =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("gen key");
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("gen key");
         let mut params =
             rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
         params.not_before = time::OffsetDateTime::now_utc();

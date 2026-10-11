@@ -277,7 +277,10 @@ impl std::fmt::Debug for Claims {
             .field("iat", &self.iat)
             .field("jti", &self.jti)
             .field("sid", &self.sid)
-            .field("hs_session_authority_generation", &self.hs_session_authority_generation)
+            .field(
+                "hs_session_authority_generation",
+                &self.hs_session_authority_generation,
+            )
             .field("hs_profile", &self.hs_profile)
             .field("hs_signer_suite_v1", &self.hs_signer_suite_v1)
             .field("workload_session_id", &self.workload_session_id)
@@ -434,7 +437,6 @@ impl std::fmt::Display for SessionClaimError {
 
 impl std::error::Error for SessionClaimError {}
 
-
 impl Claims {
     /// Create new claims.
     pub fn new(sub: String, iat: i64, exp: i64) -> Self {
@@ -496,7 +498,7 @@ impl Claims {
     /// This does not make a token eligible for dispatch; current profile,
     /// session, proof, replay and Policy checks remain mandatory.
     pub fn with_session_authority_generation(mut self, generation: [u8; 32]) -> Self {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         self.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode(generation));
         self
     }
@@ -504,7 +506,7 @@ impl Claims {
     /// Parse the signed generation without accepting padding, alternate
     /// alphabets, truncation, or a wire-provided database locator.
     pub fn session_authority_generation(&self) -> anyhow::Result<Option<[u8; 32]>> {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let Some(encoded) = self.hs_session_authority_generation.as_deref() else {
             return Ok(None);
         };
@@ -513,7 +515,10 @@ impl Claims {
         let generation: [u8; 32] = raw
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid session generation length"))?;
-        anyhow::ensure!(URL_SAFE_NO_PAD.encode(generation) == encoded, "noncanonical session generation");
+        anyhow::ensure!(
+            URL_SAFE_NO_PAD.encode(generation) == encoded,
+            "noncanonical session generation"
+        );
         Ok(Some(generation))
     }
 
@@ -557,18 +562,15 @@ impl Claims {
     /// Every authorization and cache-insertion path MUST use this parser —
     /// never an `sid.or_else(workload_session_id)` chain, which would let an
     /// active OIDC session mask a revoked or unknown workload session.
-    pub fn session_key(&self) -> std::result::Result<
-        Option<super::credential::SessionKey>,
-        SessionClaimError,
-    > {
+    pub fn session_key(
+        &self,
+    ) -> std::result::Result<Option<super::credential::SessionKey>, SessionClaimError> {
         let sid = self.sid.as_deref();
         let wsid = self.workload_session_id.as_deref();
         if sid.is_some() && wsid.is_some() {
             return Err(SessionClaimError::AmbiguousSessionClaims);
         }
-        if sid.is_some_and(|v| v.trim().is_empty())
-            || wsid.is_some_and(|v| v.trim().is_empty())
-        {
+        if sid.is_some_and(|v| v.trim().is_empty()) || wsid.is_some_and(|v| v.trim().is_empty()) {
             return Err(SessionClaimError::EmptySessionIdentifier);
         }
         Ok(match (sid, wsid) {
@@ -618,7 +620,10 @@ impl Claims {
     /// An absent claim yields an empty iterator, keeping scope-based consumers
     /// fail closed for legacy and non-OAuth tokens.
     pub fn granted_scopes(&self) -> impl Iterator<Item = &str> {
-        self.scope.as_deref().into_iter().flat_map(str::split_whitespace)
+        self.scope
+            .as_deref()
+            .into_iter()
+            .flat_map(str::split_whitespace)
     }
 
     /// Return whether this token's signed grant contains `required` exactly.
@@ -883,9 +888,7 @@ mod tests {
         let ed = [0x01; 32];
         let claims = Claims::new("alice".to_owned(), 1000, 1300)
             .with_cnf_jwk(&ed)
-            .with_federate_signer_suite(
-                "n47qkIMqPn-EuRo0YmrWkGFyyCY0UmVhKE19Bxbtt0U".to_owned(),
-            );
+            .with_federate_signer_suite("n47qkIMqPn-EuRo0YmrWkGFyyCY0UmVhKE19Bxbtt0U".to_owned());
         let json = serde_json::to_value(&claims).unwrap();
         assert_eq!(json["hs_profile"], "federate-session-v1");
         assert_eq!(
@@ -895,7 +898,10 @@ mod tests {
         assert_eq!(json["cnf"].as_object().unwrap().len(), 1);
         assert_eq!(json["cnf"]["jwk"]["kty"], "OKP");
         assert_eq!(json["cnf"]["jwk"]["crv"], "Ed25519");
-        assert_eq!(json["cnf"]["jwk"]["x"], "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE");
+        assert_eq!(
+            json["cnf"]["jwk"]["x"],
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+        );
         assert!(json["cnf"].get("hs_signer_suite").is_none());
         assert!(json["cnf"].get("jkt").is_none());
         let decoded: Claims = serde_json::from_value(json).unwrap();
@@ -909,7 +915,10 @@ mod tests {
         let plain = Claims::new("alice".to_owned(), 1000, 2000);
         assert!(plain.act.is_none());
         let json = serde_json::to_string(&plain).unwrap();
-        assert!(!json.contains("\"act\""), "plain token must not carry act: {json}");
+        assert!(
+            !json.contains("\"act\""),
+            "plain token must not carry act: {json}"
+        );
 
         // Delegated token: sub = delegator (user), act = actor (service:mcp),
         // with a nested hop to exercise RFC 8693 §4.1 multi-hop.
@@ -928,7 +937,11 @@ mod tests {
         let json = serde_json::to_string(&delegated).unwrap();
         let back: Claims = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sub, "alice", "sub stays the delegator");
-        assert_eq!(back.act, Some(actor), "act round-trips including the nested hop");
+        assert_eq!(
+            back.act,
+            Some(actor),
+            "act round-trips including the nested hop"
+        );
         assert_eq!(
             back.cap.as_deref(),
             Some("infer@mac://model/qwen-7b"),
@@ -949,7 +962,10 @@ mod tests {
             act: None,
         });
         let dbg = format!("{claims:?}");
-        assert!(dbg.contains("service:mcp"), "act is not secret, must be visible");
+        assert!(
+            dbg.contains("service:mcp"),
+            "act is not secret, must be visible"
+        );
         assert!(dbg.contains("act:"));
     }
 
@@ -987,11 +1003,7 @@ mod tests {
     };
 
     fn fu5_clearance() -> SecurityLabel {
-        SecurityLabel::new(
-            Level::Secret,
-            Assurance::PqHybrid,
-            CompartmentSet::EMPTY,
-        )
+        SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY)
     }
 
     /// A federated token (issuer not in `local_issuers`) carrying a `clearance`
@@ -1085,7 +1097,10 @@ mod tests {
 
         // Both present → ambiguous, rejected (no masking).
         assert_eq!(
-            base().with_sid("s1").with_workload_session_id("w1").session_key(),
+            base()
+                .with_sid("s1")
+                .with_workload_session_id("w1")
+                .session_key(),
             Err(SessionClaimError::AmbiguousSessionClaims)
         );
 
@@ -1514,18 +1529,33 @@ mod id_token_tests {
     #[test]
     fn federate_generation_is_signed_jwt_only_and_canonical() {
         let original = [0x42; 32];
-        let claims = Claims::new("alice".into(), 1, 2)
-            .with_session_authority_generation(original);
-        assert_eq!(claims.session_authority_generation().unwrap(), Some(original));
+        let claims = Claims::new("alice".into(), 1, 2).with_session_authority_generation(original);
+        assert_eq!(
+            claims.session_authority_generation().unwrap(),
+            Some(original)
+        );
         let json = serde_json::to_vec(&claims).unwrap();
         let decoded: Claims = serde_json::from_slice(&json).unwrap();
-        assert_eq!(decoded.session_authority_generation().unwrap(), Some(original));
+        assert_eq!(
+            decoded.session_authority_generation().unwrap(),
+            Some(original)
+        );
         let mut malformed = decoded.clone();
-        for bad in ["", "A", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"] {
+        for bad in [
+            "",
+            "A",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+        ] {
             malformed.hs_session_authority_generation = Some(bad.into());
-            assert!(malformed.session_authority_generation().is_err(), "accepted {bad:?}");
+            assert!(
+                malformed.session_authority_generation().is_err(),
+                "accepted {bad:?}"
+            );
         }
         assert!(Claims::new("alice".into(), 1, 2)
-            .session_authority_generation().unwrap().is_none());
+            .session_authority_generation()
+            .unwrap()
+            .is_none());
     }
 }

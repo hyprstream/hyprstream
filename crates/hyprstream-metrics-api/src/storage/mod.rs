@@ -48,10 +48,11 @@ impl StorageUtils {
                     DataType::Float64 => "DOUBLE PRECISION",
                     DataType::Utf8 => "VARCHAR",
                     DataType::Binary => "BLOB",
-                    _ => return Err(Status::invalid_argument(format!(
-                        "Unsupported data type: {:?}",
-                        field.data_type()
-                    ))),
+                    _ =>
+                        return Err(Status::invalid_argument(format!(
+                            "Unsupported data type: {:?}",
+                            field.data_type()
+                        ))),
                 }
             ));
         }
@@ -68,7 +69,9 @@ impl StorageUtils {
 
     /// Generate SQL for selecting data from a table
     pub fn generate_select_sql(table_name: &str, projection: Option<Vec<String>>) -> String {
-        let columns = projection.map(|cols| cols.join(", ")).unwrap_or_else(|| "*".to_owned());
+        let columns = projection
+            .map(|cols| cols.join(", "))
+            .unwrap_or_else(|| "*".to_owned());
         format!("SELECT {columns} FROM {table_name}")
     }
 

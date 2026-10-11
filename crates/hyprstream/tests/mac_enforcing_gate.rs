@@ -565,12 +565,12 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         AtprotoDidDocumentResolver, OAuthState, RegisteredClient,
     };
     use hyprstream_core::services::PolicyService;
-    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
-    use hyprstream_rpc_std::policy_client::PolicyClient;
     use hyprstream_rpc::auth::ClusterKeySource;
     use hyprstream_rpc::crypto::CryptoPolicy;
     use hyprstream_rpc::rpc_client::RpcClientImpl;
     use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+    use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     use hyprstream_service::{InprocManager, ServiceManager as _};
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
     use sha2::{Digest as _, Sha256};

@@ -297,7 +297,8 @@ impl BrowserRequestBinding {
             self.service_did.starts_with("did:at9p:"),
             "browser binding requires did:at9p"
         );
-        let service_origin = parse_https_url(&self.service_origin, "browser binding service origin")?;
+        let service_origin =
+            parse_https_url(&self.service_origin, "browser binding service origin")?;
         let webtransport_url =
             parse_https_url(&self.webtransport_url, "browser binding WebTransport route")?;
         anyhow::ensure!(
@@ -1048,13 +1049,15 @@ pub async fn fetch_browser_provisioning(
     let reader: web_sys::ReadableStreamDefaultReader = body.get_reader().unchecked_into();
     let mut bytes = Vec::with_capacity(content_length);
     loop {
-        let result = JsFuture::from(reader.read())
-            .await
-            .map_err(|error| anyhow::anyhow!("browser provisioning response read failed: {error:?}"))?;
+        let result = JsFuture::from(reader.read()).await.map_err(|error| {
+            anyhow::anyhow!("browser provisioning response read failed: {error:?}")
+        })?;
         let done = js_sys::Reflect::get(&result, &wasm_bindgen::JsValue::from_str("done"))
             .map_err(|_| anyhow::anyhow!("browser provisioning response chunk omitted done"))?
             .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("browser provisioning response chunk had invalid done"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("browser provisioning response chunk had invalid done")
+            })?;
         if done {
             break;
         }

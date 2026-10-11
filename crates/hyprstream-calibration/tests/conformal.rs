@@ -141,8 +141,16 @@ fn ordinal_conformal_marginal_coverage_on_synthetic() {
     }
     let denom = n_eval as f64;
     // Finite-sample slack: 1 - alpha - 0.04 with n=2000 is >30 standard errors safe.
-    assert!(cov_rps as f64 / denom >= 0.86, "RPS-CP coverage {}", cov_rps);
-    assert!(cov_cps as f64 / denom >= 0.86, "min-CPS coverage {}", cov_cps);
+    assert!(
+        cov_rps as f64 / denom >= 0.86,
+        "RPS-CP coverage {}",
+        cov_rps
+    );
+    assert!(
+        cov_cps as f64 / denom >= 0.86,
+        "min-CPS coverage {}",
+        cov_cps
+    );
     assert!(cov_aps as f64 / denom >= 0.86, "APS coverage {}", cov_aps);
     // min-CPS should not blow up: mean width below full range.
     assert!(

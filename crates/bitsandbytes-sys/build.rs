@@ -95,7 +95,10 @@ fn find_bitsandbytes_library(backend: Backend) -> Option<(PathBuf, String)> {
                 let name = name.to_string_lossy();
                 // Remove 'lib' prefix if present
                 let lib_name = name.strip_prefix("lib").unwrap_or(&name);
-                return Some((lib_path.parent().unwrap().to_path_buf(), lib_name.to_string()));
+                return Some((
+                    lib_path.parent().unwrap().to_path_buf(),
+                    lib_name.to_string(),
+                ));
             }
         }
     }
@@ -223,7 +226,10 @@ fn ensure_bitsandbytes_source() -> Option<PathBuf> {
 
     // Create deps directory
     if let Err(e) = std::fs::create_dir_all(&deps_dir) {
-        println!("cargo:warning=bitsandbytes-sys: Failed to create deps dir: {}", e);
+        println!(
+            "cargo:warning=bitsandbytes-sys: Failed to create deps dir: {}",
+            e
+        );
         return None;
     }
 
@@ -296,7 +302,10 @@ fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)>
 
     // Create build directory
     if let Err(e) = std::fs::create_dir_all(&build_dir) {
-        println!("cargo:warning=bitsandbytes-sys: Failed to create build dir: {}", e);
+        println!(
+            "cargo:warning=bitsandbytes-sys: Failed to create build dir: {}",
+            e
+        );
         return None;
     }
 
@@ -320,11 +329,17 @@ fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)>
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            println!("cargo:warning=bitsandbytes-sys: cmake configure failed with {}", s);
+            println!(
+                "cargo:warning=bitsandbytes-sys: cmake configure failed with {}",
+                s
+            );
             return None;
         }
         Err(e) => {
-            println!("cargo:warning=bitsandbytes-sys: cmake configure error: {}", e);
+            println!(
+                "cargo:warning=bitsandbytes-sys: cmake configure error: {}",
+                e
+            );
             return None;
         }
     }
@@ -338,7 +353,10 @@ fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)>
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            println!("cargo:warning=bitsandbytes-sys: cmake build failed with {}", s);
+            println!(
+                "cargo:warning=bitsandbytes-sys: cmake build failed with {}",
+                s
+            );
             return None;
         }
         Err(e) => {
@@ -376,7 +394,10 @@ fn find_built_library(lib_dir: &Path, backend: Backend) -> Option<String> {
         }
     }
 
-    println!("cargo:warning=bitsandbytes-sys: Built library not found in {:?}", lib_dir);
+    println!(
+        "cargo:warning=bitsandbytes-sys: Built library not found in {:?}",
+        lib_dir
+    );
     None
 }
 
@@ -422,7 +443,10 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
     let backend = Backend::from_features();
-    println!("cargo:warning=bitsandbytes-sys: Using {:?} backend", backend);
+    println!(
+        "cargo:warning=bitsandbytes-sys: Using {:?} backend",
+        backend
+    );
 
     // Emit backend configuration
     match backend {

@@ -153,7 +153,11 @@ pub fn build_greeting() -> [u8; GREETING_SIZE] {
 
 /// Validate a peer's ZMTP greeting.
 pub fn validate_greeting(greeting: &[u8]) -> Result<()> {
-    ensure!(greeting.len() >= GREETING_SIZE, "Greeting too short: {} bytes", greeting.len());
+    ensure!(
+        greeting.len() >= GREETING_SIZE,
+        "Greeting too short: {} bytes",
+        greeting.len()
+    );
 
     ensure!(
         greeting[0] == 0xFF,
@@ -304,7 +308,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<(ZmtpFrame, usize)> {
     let long = (flags & 0x02) != 0;
     let command = (flags & 0x04) != 0;
 
-    ensure!(flags & 0xF8 == 0, "ZMTP frame has reserved bits set: 0x{:02X}", flags);
+    ensure!(
+        flags & 0xF8 == 0,
+        "ZMTP frame has reserved bits set: 0x{:02X}",
+        flags
+    );
 
     let (size, header_len): (usize, usize) = if long {
         ensure!(buf.len() >= 9, "buffer too short for long frame header");
@@ -323,9 +331,13 @@ pub fn decode_frame(buf: &[u8]) -> Result<(ZmtpFrame, usize)> {
         (buf[1] as usize, 2)
     };
 
-    let total = header_len
-        .checked_add(size)
-        .ok_or_else(|| anyhow!("frame size overflow: header_len={} + size={}", header_len, size))?;
+    let total = header_len.checked_add(size).ok_or_else(|| {
+        anyhow!(
+            "frame size overflow: header_len={} + size={}",
+            header_len,
+            size
+        )
+    })?;
     ensure!(
         buf.len() >= total,
         "buffer too short for frame body: need {}, have {}",
@@ -334,7 +346,14 @@ pub fn decode_frame(buf: &[u8]) -> Result<(ZmtpFrame, usize)> {
     );
 
     let data = buf[header_len..header_len + size].to_vec();
-    Ok((ZmtpFrame { more, command, data }, header_len + size))
+    Ok((
+        ZmtpFrame {
+            more,
+            command,
+            data,
+        },
+        header_len + size,
+    ))
 }
 
 /// Encode a ZMTP command frame.
@@ -372,7 +391,10 @@ pub fn decode_multipart(buf: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
         ensure!(offset < buf.len(), "unexpected end of multipart message");
         let (frame, consumed) = decode_frame(&buf[offset..])?;
 
-        ensure!(!frame.command, "unexpected command frame in multipart message");
+        ensure!(
+            !frame.command,
+            "unexpected command frame in multipart message"
+        );
 
         let more = frame.more;
         parts.push(frame.data);
@@ -435,9 +457,12 @@ pub fn decode_flat_parts(flat: &[u8]) -> Result<Vec<Vec<u8>>> {
             offset + 4 <= flat.len(),
             "flat encoding truncated at length field"
         );
-        let len =
-            u32::from_be_bytes([flat[offset], flat[offset + 1], flat[offset + 2], flat[offset + 3]])
-                as usize;
+        let len = u32::from_be_bytes([
+            flat[offset],
+            flat[offset + 1],
+            flat[offset + 2],
+            flat[offset + 3],
+        ]) as usize;
         offset += 4;
 
         ensure!(

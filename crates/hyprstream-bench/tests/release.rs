@@ -70,7 +70,12 @@ fn permutation_stratum_is_closed_and_score_is_never_permuted() {
             // Every rotation carries the same correct label text.
             let label = item.truth_label();
             for rotated in group {
-                assert_eq!(rotated.truth_label(), label, "{}: truth rotates", rotated.id);
+                assert_eq!(
+                    rotated.truth_label(),
+                    label,
+                    "{}: truth rotates",
+                    rotated.id
+                );
                 let mut a = item.question.labels();
                 let mut b = rotated.question.labels();
                 a.sort();
@@ -123,10 +128,8 @@ fn committed_manifest_matches_regeneration() {
     manifest.verify(&BenchConfig::default()).unwrap();
 
     // The disclosure text is pinned by digest inside the manifest.
-    let disclosure = std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("DISCLOSURE.md"),
-    )
-    .unwrap();
+    let disclosure =
+        std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("DISCLOSURE.md")).unwrap();
     assert_eq!(blake3_hex(&disclosure), manifest.disclosure.blake3);
 }
 

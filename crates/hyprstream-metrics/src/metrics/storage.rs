@@ -1,5 +1,5 @@
 use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
-use crate::metrics::{MetricRecord, create_record_batch, encode_record_batch};
+use crate::metrics::{create_record_batch, encode_record_batch, MetricRecord};
 use crate::storage::StorageBackend;
 use duckdb::arrow::array::{Float64Array, Int64Array, StringArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
@@ -144,12 +144,13 @@ pub trait MetricsStorage: Send + Sync + 'static {
         from_timestamp: i64,
         to_timestamp: Option<i64>,
     ) -> Result<Vec<AggregateResult>, Status> {
-        let sql = Self::generate_metric_aggregation_sql(function, group_by, from_timestamp, to_timestamp);
+        let sql =
+            Self::generate_metric_aggregation_sql(function, group_by, from_timestamp, to_timestamp);
         let handle = self.backend().prepare_sql(&sql).await?;
         let batch = self.backend().query_sql(&handle).await?;
 
         let mut results = Vec::with_capacity(batch.num_rows());
-        
+
         // Extract column arrays
         let value_col = batch
             .column_by_name("value")
@@ -176,7 +177,9 @@ pub trait MetricsStorage: Send + Sync + 'static {
                 } else if let Some(float_col) = col.as_any().downcast_ref::<Float64Array>() {
                     float_col.value(row).to_string()
                 } else {
-                    return Err(Status::internal(format!("Unsupported group by column type: {col_name}")));
+                    return Err(Status::internal(format!(
+                        "Unsupported group by column type: {col_name}"
+                    )));
                 };
                 group_values.insert(col_name.clone(), value);
             }
@@ -184,7 +187,9 @@ pub trait MetricsStorage: Send + Sync + 'static {
             // Extract timestamp if it's part of the group by
             let timestamp = if let Some(time_col) = &group_by.time_column {
                 if let Some(col) = batch.column_by_name(time_col) {
-                    col.as_any().downcast_ref::<Int64Array>().map(|int_col| int_col.value(row))
+                    col.as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map(|int_col| int_col.value(row))
                 } else {
                     None
                 }
@@ -214,9 +219,7 @@ pub trait MetricsStorage: Send + Sync + 'static {
 
     /// Generate SQL for querying metrics
     fn generate_metric_query_sql(from_timestamp: i64) -> String {
-        format!(
-            "SELECT * FROM metrics WHERE timestamp >= {from_timestamp} ORDER BY timestamp ASC"
-        )
+        format!("SELECT * FROM metrics WHERE timestamp >= {from_timestamp} ORDER BY timestamp ASC")
     }
 
     /// Generate SQL for aggregating metrics

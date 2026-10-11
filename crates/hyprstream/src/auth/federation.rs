@@ -12,11 +12,11 @@
 //! positional singleton — that anti-pattern forecloses both overlap rotation
 //! and PQ-hybrid publication (#1183).
 
-use anyhow::{Result, anyhow};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
-use hyprstream_rpc_std::discovery_client::DiscoveryClient;
 use hyprstream_rpc::auth::{FederationKey, FederationKeySource};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -144,7 +144,10 @@ impl FederationKeyResolver {
     /// set, calls to `get_keys` for issuers that aren't currently
     /// permitted by PolicyService policy return Err — fail-closed,
     /// matching the CIMD client path.
-    pub fn with_policy_client(mut self, client: Arc<hyprstream_rpc_std::policy_client::PolicyClient>) -> Self {
+    pub fn with_policy_client(
+        mut self,
+        client: Arc<hyprstream_rpc_std::policy_client::PolicyClient>,
+    ) -> Self {
         self.policy_client = Some(client);
         self
     }
@@ -802,7 +805,7 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
 
     use ed25519_dalek::{Signer, SigningKey};
-    use hyprstream_rpc::auth::{Claims, jwt};
+    use hyprstream_rpc::auth::{jwt, Claims};
     use rand::rngs::OsRng;
 
     fn b64u(bytes: &[u8]) -> String {
@@ -1214,12 +1217,10 @@ mod tests {
             .with_jwks_fetcher(fetcher);
 
         for _ in 0..3 {
-            assert!(
-                resolver
-                    .get_keys("https://fed.example", Some("kid-ghost"))
-                    .await
-                    .is_err()
-            );
+            assert!(resolver
+                .get_keys("https://fed.example", Some("kid-ghost"))
+                .await
+                .is_err());
         }
         assert_eq!(
             fetch_count.load(Ordering::SeqCst),
@@ -1261,7 +1262,11 @@ mod tests {
             let rotated = rotated.clone();
             Box::pin(async move {
                 let n = cc.fetch_add(1, Ordering::SeqCst);
-                if n == 0 { Ok(overlap) } else { Ok(rotated) }
+                if n == 0 {
+                    Ok(overlap)
+                } else {
+                    Ok(rotated)
+                }
             })
         });
 

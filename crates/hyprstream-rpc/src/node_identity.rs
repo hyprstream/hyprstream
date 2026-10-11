@@ -13,9 +13,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
+use parking_lot::RwLock;
 use sha2::Sha256;
 use std::collections::HashMap;
-use parking_lot::RwLock;
 use zeroize::Zeroize;
 
 use crate::identity::{IdentityProvider, SigningIdentity};
@@ -218,7 +218,9 @@ impl NodeIdentityProvider {
     pub fn register_purpose(&self, purpose: &str) -> Result<[u8; 32]> {
         let key = self.derive(purpose)?;
         let pubkey = key.verifying_key().to_bytes();
-        self.known_pubkeys.write().insert(pubkey, Subject::new("system"));
+        self.known_pubkeys
+            .write()
+            .insert(pubkey, Subject::new("system"));
         Ok(pubkey)
     }
 
@@ -269,8 +271,13 @@ impl IdentityProvider for NodeIdentityProvider {
         let signing_key = self.derive(purpose)?;
         let pubkey = signing_key.verifying_key().to_bytes();
         // Track this derived pubkey so resolve() recognizes it as in-process "system".
-        self.known_pubkeys.write().insert(pubkey, Subject::new("system"));
-        Ok(Box::new(DerivedIdentity { signing_key, pubkey }))
+        self.known_pubkeys
+            .write()
+            .insert(pubkey, Subject::new("system"));
+        Ok(Box::new(DerivedIdentity {
+            signing_key,
+            pubkey,
+        }))
     }
 
     fn resolve(&self, pubkey: &[u8; 32]) -> Subject {
@@ -459,7 +466,10 @@ mod tests {
         let root_b = SigningKey::generate(&mut rand::rngs::OsRng);
         let vk_a = crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&root_a));
         let vk_b = crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&root_b));
-        assert_ne!(vk_a, vk_b, "different node seeds must derive different mesh keys");
+        assert_ne!(
+            vk_a, vk_b,
+            "different node seeds must derive different mesh keys"
+        );
     }
 
     #[allow(clippy::unwrap_used)]
@@ -477,7 +487,10 @@ mod tests {
         );
         // And it equals the explicit two-step derivation (purpose key -> seed).
         let expected_seed = derive_purpose_key(&root, MESH_MLDSA_PURPOSE).to_bytes();
-        assert_eq!(mesh_seed, expected_seed, "derivation must match the purpose-key path");
+        assert_eq!(
+            mesh_seed, expected_seed,
+            "derivation must match the purpose-key path"
+        );
     }
 
     #[allow(clippy::unwrap_used)]

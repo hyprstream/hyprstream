@@ -642,8 +642,8 @@ pub fn self_asserted_outer_pq_key(
     let Some(ob) = outer_bytes else {
         return Ok(None);
     };
-    let outer =
-        CoseSign1::from_slice(&ob).map_err(|e| anyhow!("malformed outer ML-DSA COSE_Sign1: {e}"))?;
+    let outer = CoseSign1::from_slice(&ob)
+        .map_err(|e| anyhow!("malformed outer ML-DSA COSE_Sign1: {e}"))?;
     let outer_alg = header_alg(&outer)?;
     if outer_alg != ALG_ML_DSA_65 {
         bail!("outer COSE_Sign1 must be ML-DSA-65, got alg={outer_alg}");
@@ -747,7 +747,9 @@ pub fn verify_composite(
     let mut pq_bound = false;
     if let Some(declared) = &declared_pq {
         let Some(ob) = outer_bytes.as_ref() else {
-            bail!("inner EdDSA COSE_Sign1 commits to an ML-DSA-65 key but the outer layer is absent");
+            bail!(
+                "inner EdDSA COSE_Sign1 commits to an ML-DSA-65 key but the outer layer is absent"
+            );
         };
         let outer = CoseSign1::from_slice(ob)
             .map_err(|e| anyhow!("malformed outer ML-DSA COSE_Sign1: {e}"))?;
@@ -932,11 +934,9 @@ mod tests {
         let (victim_inner_bytes, _) = decode_composite_for_test(&cose).unwrap();
         let mut attacker_outer = unsigned_outer(attacker_kid.clone());
         attacker_outer.signature = attacker_sig.clone();
-        let swapped = encode_composite_for_test(
-            victim_inner_bytes,
-            Some(attacker_outer.to_vec().unwrap()),
-        )
-        .unwrap();
+        let swapped =
+            encode_composite_for_test(victim_inner_bytes, Some(attacker_outer.to_vec().unwrap()))
+                .unwrap();
         let err = verify_composite(
             &swapped,
             &ed.verifying_key(),
@@ -1056,8 +1056,7 @@ mod tests {
             .to_bytes()
             .to_vec();
         let pq_sig = ml_dsa_sign(&pq_sk, &outer_tbs(pq_kid.clone(), payload, &ed_sig, &aad()));
-        let cose =
-            assemble_composite_nested_pq_bound((ed_kid, ed_sig), (pq_kid, pq_sig)).unwrap();
+        let cose = assemble_composite_nested_pq_bound((ed_kid, ed_sig), (pq_kid, pq_sig)).unwrap();
 
         let res = verify_composite(
             &cose,

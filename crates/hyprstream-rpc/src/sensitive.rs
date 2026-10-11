@@ -16,7 +16,6 @@ impl SensitiveBytes {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
-
 }
 
 impl BoundedWireBytes for SensitiveBytes {
@@ -68,8 +67,8 @@ mod tests {
 
     #[test]
     fn wire_decode_rejects_oversized_before_copy() {
-        use crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
         use super::BoundedWireBytes;
+        use crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
         let oversized = vec![0u8; MAX_MEDIATED_EVIDENCE_BYTES + 1];
         assert!(SensitiveBytes::from_wire_bytes(&oversized).is_err());
         let exact = vec![0u8; MAX_MEDIATED_EVIDENCE_BYTES];

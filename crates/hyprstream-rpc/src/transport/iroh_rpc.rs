@@ -208,20 +208,16 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
         // even if cancel() lands between iterations, the next time the
         // loop hits `cancelled().await` it returns immediately.
         self.inner.shutdown.cancel();
-        let deadline = self.inner.processor.begin_shutdown(
-            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT,
-        );
+        let deadline = self
+            .inner
+            .processor
+            .begin_shutdown(tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT);
         // Wait for all in-flight streams to release their permits.
         // `acquire_many` succeeds only once every permit is returned. Bounded
         // (#159) so a wedged processor/transport can't hang shutdown forever;
         // on timeout we close() and proceed (remaining tasks die with the conn).
         let cap = self.inner.stream_limit_capacity;
-        match tokio::time::timeout_at(
-            deadline,
-            self.inner.stream_limit.acquire_many(cap),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(deadline, self.inner.stream_limit.acquire_many(cap)).await {
             Ok(Ok(permits)) => {
                 // Keep permits drained so any post-shutdown accept also
                 // sees a closed semaphore.
@@ -326,7 +322,9 @@ where
         });
     }
     while let Some(joined) = requests.join_next().await {
-        if joined.is_err() { result = Err(BridgeShutdownError::ThreadPanicked); }
+        if joined.is_err() {
+            result = Err(BridgeShutdownError::ThreadPanicked);
+        }
     }
     result
 }
@@ -391,7 +389,9 @@ impl BridgeThread {
         let handle = self.handle.lock().take();
         if let Some(handle) = handle {
             // No lock needed by any caller or service destructor is held here.
-            let result = handle.join().unwrap_or(Err(BridgeShutdownError::ThreadPanicked));
+            let result = handle
+                .join()
+                .unwrap_or(Err(BridgeShutdownError::ThreadPanicked));
             *self.completed.lock() = Some(result.clone());
             self.completion.notify_all();
             result
@@ -418,7 +418,9 @@ async fn finish_bridge_local_set(
         // Await the dispatch task (which owns every accepted RPC), not the
         // whole LocalSet: streaming continuations are residual background work.
         let run = local.run_until(async move {
-            dispatch.await.unwrap_or(Err(BridgeShutdownError::ThreadPanicked))
+            dispatch
+                .await
+                .unwrap_or(Err(BridgeShutdownError::ThreadPanicked))
         });
         tokio::pin!(run);
         tokio::select! {
@@ -488,14 +490,23 @@ impl LocalServiceBridge {
                     stopped.clone(),
                 ));
                 let result = rt.block_on(finish_bridge_local_set(
-                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT, thread_admission,
+                    local,
+                    dispatch,
+                    stopped,
+                    super::rpc_session::DRAIN_TIMEOUT,
+                    thread_admission,
                 ));
                 drop(rt);
                 result
             })
             .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
 
-        Ok(Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission })
+        Ok(Self {
+            tx,
+            shutdown,
+            thread: Arc::new(BridgeThread::new(thread)),
+            admission,
+        })
     }
 
     /// Like [`LocalServiceBridge::spawn`], but constructs the service ON the
@@ -566,14 +577,26 @@ impl LocalServiceBridge {
                     run_bridge_dispatch_loop(service, rx, nonce_cache, dispatch_shutdown).await
                 });
                 let result = rt.block_on(finish_bridge_local_set(
-                    local, dispatch, stopped, super::rpc_session::DRAIN_TIMEOUT, thread_admission,
+                    local,
+                    dispatch,
+                    stopped,
+                    super::rpc_session::DRAIN_TIMEOUT,
+                    thread_admission,
                 ));
                 drop(rt);
                 result
             })
             .map_err(|e| anyhow::anyhow!("spawn rpc bridge thread: {e}"))?;
 
-        Ok((Self { tx, shutdown, thread: Arc::new(BridgeThread::new(thread)), admission }, ready_rx))
+        Ok((
+            Self {
+                tx,
+                shutdown,
+                thread: Arc::new(BridgeThread::new(thread)),
+                admission,
+            },
+            ready_rx,
+        ))
     }
 }
 
@@ -599,7 +622,8 @@ impl LocalServiceBridge {
             return Err(BridgeShutdownError::SelfJoin);
         }
         let thread = Arc::clone(&self.thread);
-        tokio::task::spawn_blocking(move || thread.join()).await
+        tokio::task::spawn_blocking(move || thread.join())
+            .await
             .map_err(|error| BridgeShutdownError::JoinTask(error.to_string()))?
     }
 }
@@ -616,7 +640,9 @@ impl Drop for LocalServiceBridge {
 }
 
 impl IrohRequestProcessor for LocalServiceBridge {
-    fn close_admission(&self) { LocalServiceBridge::close_admission(self); }
+    fn close_admission(&self) {
+        LocalServiceBridge::close_admission(self);
+    }
 
     fn begin_shutdown(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
         LocalServiceBridge::begin_shutdown(self, deadline)
@@ -641,8 +667,15 @@ impl IrohRequestProcessor for LocalServiceBridge {
                 // Linearize successful enqueue against shutdown, without holding
                 // any lock across queue backpressure, dispatch, or thread join.
                 let _admission = self.admission.lock();
-                anyhow::ensure!(!self.shutdown.is_cancelled(), "iroh-rpc bridge: admission closed");
-                permit.send(BridgeMessage { request, carrier, respond: respond_tx });
+                anyhow::ensure!(
+                    !self.shutdown.is_cancelled(),
+                    "iroh-rpc bridge: admission closed"
+                );
+                permit.send(BridgeMessage {
+                    request,
+                    carrier,
+                    respond: respond_tx,
+                });
             }
             respond_rx
                 .await
@@ -701,7 +734,8 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.entered.send(());
             let _ = self.release.recv_timeout(Duration::from_secs(5));
-            self.completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -741,8 +775,9 @@ mod tests {
             &self,
             signed_body: &[u8],
         ) -> Result<crate::service::DecodedRequestBody> {
-            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
-
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
         }
         fn name(&self) -> &str {
             &self.name
@@ -778,7 +813,10 @@ mod tests {
         let nonce = Arc::new(crate::envelope::InMemoryNonceCache::new());
         let bridge = Arc::new(if build_on_thread {
             let (bridge, ready) = LocalServiceBridge::spawn_with(
-                "destructor-gate", move || async move { Ok(service) }, nonce, 0,
+                "destructor-gate",
+                move || async move { Ok(service) },
+                nonce,
+                0,
             )?;
             ready.blocking_recv()??;
             bridge
@@ -798,8 +836,13 @@ mod tests {
         // Teardown must not return while that gate is held.
         let premature = returned_rx.recv_timeout(Duration::from_millis(100)).ok();
         release_tx.send(())?;
-        owner.join().map_err(|_| anyhow::anyhow!("bridge owner panicked"))?;
-        assert!(premature.is_none(), "bridge drop returned before service destruction");
+        owner
+            .join()
+            .map_err(|_| anyhow::anyhow!("bridge owner panicked"))?;
+        assert!(
+            premature.is_none(),
+            "bridge drop returned before service destruction"
+        );
         assert!(returned_rx.recv_timeout(Duration::from_secs(5))?);
         Ok(())
     }
@@ -830,20 +873,30 @@ mod tests {
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut service = BridgeEcho::new(fresh_signing_key());
         service.drop_probe = Some(BridgeDropProbe {
-            entered: entered_tx, release: release_rx, completed: Arc::clone(&completed),
+            entered: entered_tx,
+            release: release_rx,
+            completed: Arc::clone(&completed),
         });
         let bridge = Arc::new(LocalServiceBridge::spawn(
-            service, Arc::new(crate::envelope::InMemoryNonceCache::new()), 0,
+            service,
+            Arc::new(crate::envelope::InMemoryNonceCache::new()),
+            0,
         )?);
         let owner = Arc::clone(&bridge);
         let first = tokio::spawn(async move { owner.shutdown().await });
-        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5))).await??;
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+            .await??;
         first.abort();
         let _ = first.await;
-        let premature = tokio::time::timeout(Duration::from_millis(100), bridge.shutdown()).await.is_ok();
+        let premature = tokio::time::timeout(Duration::from_millis(100), bridge.shutdown())
+            .await
+            .is_ok();
         release_tx.send(())?;
         tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await??;
-        assert!(!premature, "cancelled waiter lost the in-progress thread join");
+        assert!(
+            !premature,
+            "cancelled waiter lost the in-progress thread join"
+        );
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
@@ -866,7 +919,8 @@ mod tests {
                 let _ = entered_tx.send(());
                 std::future::pending().await
             },
-            Arc::new(crate::envelope::InMemoryNonceCache::new()), 0,
+            Arc::new(crate::envelope::InMemoryNonceCache::new()),
+            0,
         )?;
         let bridge = Arc::new(bridge);
         let retained = Arc::clone(&bridge);
@@ -874,8 +928,13 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await??;
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(ready.await.is_err());
-        assert!(retained.process(Bytes::new(),
-            crate::transport::carrier::CarrierContext::iroh()).await.is_err());
+        assert!(retained
+            .process(
+                Bytes::new(),
+                crate::transport::carrier::CarrierContext::iroh()
+            )
+            .await
+            .is_err());
         // Completion is idempotent while another owner still retains the bridge.
         bridge.shutdown().await?;
         Ok(())
@@ -887,13 +946,18 @@ mod tests {
         let key = fresh_signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&key);
         let mut store = crate::envelope::KeyedPqTrustStore::new();
-        store.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        store.bind(
+            key.verifying_key().to_bytes(),
+            &crate::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
         let store = Arc::new(store);
         crate::envelope::install_verify_config(crate::envelope::EnvelopeVerifyConfig {
-            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(store.clone()),
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store.clone()),
         })?;
         crate::envelope::install_response_verify_config(crate::envelope::ResponseVerifyConfig {
-            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(store),
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(store),
         })?;
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -903,16 +967,23 @@ mod tests {
         let mut responses = Vec::new();
         for payload in [b"one", b"two"] {
             let envelope = crate::envelope::SignedEnvelope::new_signed_hybrid(
-                crate::envelope::RequestEnvelope::new(payload.to_vec()), &key, &pq,
+                crate::envelope::RequestEnvelope::new(payload.to_vec()),
+                &key,
+                &pq,
             );
             let mut message = capnp::message::Builder::new_default();
-            envelope.write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder>());
+            envelope.write_to(
+                &mut message.init_root::<crate::common_capnp::signed_envelope::Builder>(),
+            );
             let mut wire = Vec::new();
             capnp::serialize::write_message(&mut wire, &message)?;
             let (respond, response) = tokio::sync::oneshot::channel();
             tx.try_send(BridgeMessage {
-                request: Bytes::from(wire), carrier: crate::transport::carrier::CarrierContext::inproc(), respond,
-            }).map_err(|_| anyhow::anyhow!("queue admission failed"))?;
+                request: Bytes::from(wire),
+                carrier: crate::transport::carrier::CarrierContext::inproc(),
+                respond,
+            })
+            .map_err(|_| anyhow::anyhow!("queue admission failed"))?;
             responses.push(response);
         }
         // Both requests are queued BEFORE shutdown, before dispatch is polled.
@@ -920,17 +991,32 @@ mod tests {
         stopped.cancel();
         let local = tokio::task::LocalSet::new();
         let dispatch = local.spawn_local(run_bridge_dispatch_loop(
-            std::rc::Rc::new(service), rx, Arc::new(crate::envelope::InMemoryNonceCache::new()), stopped.clone(),
+            std::rc::Rc::new(service),
+            rx,
+            Arc::new(crate::envelope::InMemoryNonceCache::new()),
+            stopped.clone(),
         ));
-        let drain = finish_bridge_local_set(local, dispatch, stopped, super::super::rpc_session::DRAIN_TIMEOUT, Arc::new(parking_lot::Mutex::new(None)));
+        let drain = finish_bridge_local_set(
+            local,
+            dispatch,
+            stopped,
+            super::super::rpc_session::DRAIN_TIMEOUT,
+            Arc::new(parking_lot::Mutex::new(None)),
+        );
         let coordinate = async {
-            tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(2)).await??.forget();
+            tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(2))
+                .await??
+                .forget();
             assert!(tx.is_closed(), "new admissions remained open during grace");
             release.add_permits(2);
             for response in responses {
                 let wire = response.await??;
-                let (_, payload) = crate::envelope::unwrap_response(&wire, Some(&key.verifying_key()))?;
-                assert_eq!(payload, crate::service::dispatch::DISPATCH_DENIED.as_bytes());
+                let (_, payload) =
+                    crate::envelope::unwrap_response(&wire, Some(&key.verifying_key()))?;
+                assert_eq!(
+                    payload,
+                    crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                );
             }
             anyhow::Ok(())
         };
@@ -965,15 +1051,22 @@ mod tests {
         let key = fresh_signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&key);
         let mut store = crate::envelope::KeyedPqTrustStore::new();
-        store.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        store.bind(
+            key.verifying_key().to_bytes(),
+            &crate::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
         crate::envelope::install_verify_config(crate::envelope::EnvelopeVerifyConfig {
-            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(store)),
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(Arc::new(store)),
         })?;
         let envelope = crate::envelope::SignedEnvelope::new_signed_hybrid(
-            crate::envelope::RequestEnvelope::new(b"held".to_vec()), &key, &pq,
+            crate::envelope::RequestEnvelope::new(b"held".to_vec()),
+            &key,
+            &pq,
         );
         let mut message = capnp::message::Builder::new_default();
-        envelope.write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder>());
+        envelope
+            .write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder>());
         let mut wire = Vec::new();
         capnp::serialize::write_message(&mut wire, &message)?;
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -984,35 +1077,60 @@ mod tests {
         release.send(())?;
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         service.drop_probe = Some(BridgeDropProbe {
-            entered: drop_entered, release: released, completed: dropped.clone(),
+            entered: drop_entered,
+            release: released,
+            completed: dropped.clone(),
         });
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let (respond, response) = tokio::sync::oneshot::channel();
         tx.try_send(BridgeMessage {
-            request: Bytes::from(wire), carrier: crate::transport::carrier::CarrierContext::inproc(), respond,
-        }).map_err(|_| anyhow::anyhow!("queue admission failed"))?;
+            request: Bytes::from(wire),
+            carrier: crate::transport::carrier::CarrierContext::inproc(),
+            respond,
+        })
+        .map_err(|_| anyhow::anyhow!("queue admission failed"))?;
         let stopped = CancellationToken::new();
         let thread_stopped = stopped.clone();
         let thread = std::thread::spawn(move || {
             // Real dispatch/queue/destructor, with only the runtime clock made
             // virtual: exercise the unchanged production 40-second bound.
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all()
-                .start_paused(true).build().map_err(|e| BridgeShutdownError::Runtime(e.to_string()))?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .map_err(|e| BridgeShutdownError::Runtime(e.to_string()))?;
             let local = tokio::task::LocalSet::new();
             let dispatch = local.spawn_local(run_bridge_dispatch_loop(
-                std::rc::Rc::new(service), rx, Arc::new(crate::envelope::InMemoryNonceCache::new()), thread_stopped.clone(),
+                std::rc::Rc::new(service),
+                rx,
+                Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                thread_stopped.clone(),
             ));
-            rt.block_on(finish_bridge_local_set(local, dispatch, thread_stopped, super::super::rpc_session::DRAIN_TIMEOUT, Arc::new(parking_lot::Mutex::new(None))))
+            rt.block_on(finish_bridge_local_set(
+                local,
+                dispatch,
+                thread_stopped,
+                super::super::rpc_session::DRAIN_TIMEOUT,
+                Arc::new(parking_lot::Mutex::new(None)),
+            ))
         });
         let bridge = LocalServiceBridge {
-            tx, shutdown: stopped, thread: Arc::new(BridgeThread::new(thread)), admission: Arc::new(parking_lot::Mutex::new(None)),
+            tx,
+            shutdown: stopped,
+            thread: Arc::new(BridgeThread::new(thread)),
+            admission: Arc::new(parking_lot::Mutex::new(None)),
         };
-        tokio::time::timeout(Duration::from_secs(5), entered.acquire()).await??.forget();
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await??
+            .forget();
         let (first, second) = tokio::join!(bridge.shutdown(), bridge.shutdown());
         assert_eq!(first, Err(BridgeShutdownError::DrainTimedOut));
         assert_eq!(second, first);
         assert_eq!(bridge.shutdown().await, first);
-        assert!(response.await.is_err(), "forced deadline retained the accepted response sender");
+        assert!(
+            response.await.is_err(),
+            "forced deadline retained the accepted response sender"
+        );
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
@@ -1021,15 +1139,23 @@ mod tests {
         let key = fresh_signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&key);
         let mut store = crate::envelope::KeyedPqTrustStore::new();
-        store.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
+        store.bind(
+            key.verifying_key().to_bytes(),
+            &crate::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
         crate::envelope::install_verify_config(crate::envelope::EnvelopeVerifyConfig {
-            policy: crate::crypto::CryptoPolicy::Hybrid, pq_store: Some(Arc::new(store)),
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(Arc::new(store)),
         })?;
         Ok(key)
     }
 
-    fn deadline_test_bridge(key: &SigningKey) -> Result<(
-        Arc<LocalServiceBridge>, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>,
+    fn deadline_test_bridge(
+        key: &SigningKey,
+    ) -> Result<(
+        Arc<LocalServiceBridge>,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Semaphore>,
         Arc<std::sync::atomic::AtomicBool>,
     )> {
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1041,18 +1167,27 @@ mod tests {
         let (drop_release, released) = std::sync::mpsc::channel();
         drop_release.send(())?;
         service.drop_probe = Some(BridgeDropProbe {
-            entered: drop_entered, release: released, completed: dropped.clone(),
+            entered: drop_entered,
+            release: released,
+            completed: dropped.clone(),
         });
         let bridge = Arc::new(LocalServiceBridge::spawn(
-            service, Arc::new(crate::envelope::InMemoryNonceCache::new()), 0,
+            service,
+            Arc::new(crate::envelope::InMemoryNonceCache::new()),
+            0,
         )?);
         Ok((bridge, entered, release, dropped))
     }
 
     async fn exercise_transport_bridge_deadline<T, F, D>(
-        transport: T, key: &SigningKey, bridge: Arc<LocalServiceBridge>,
-        entered: Arc<tokio::sync::Semaphore>, release: Arc<tokio::sync::Semaphore>,
-        dropped: Arc<std::sync::atomic::AtomicBool>, forced: bool, drain: D,
+        transport: T,
+        key: &SigningKey,
+        bridge: Arc<LocalServiceBridge>,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        forced: bool,
+        drain: D,
     ) -> Result<()>
     where
         T: crate::transport::Transport + 'static,
@@ -1060,39 +1195,76 @@ mod tests {
         D: FnOnce(tokio::time::Instant) -> F,
     {
         let mut kem = crate::crypto::hybrid_kem::KeyedKemTrustStore::new();
-        kem.bind(key.verifying_key().to_bytes(), crate::node_identity::derive_mesh_kem_recipient(key)?.public());
+        kem.bind(
+            key.verifying_key().to_bytes(),
+            crate::node_identity::derive_mesh_kem_recipient(key)?.public(),
+        );
         let pq = crate::node_identity::derive_mesh_mldsa_key(key);
         let mut response_trust = crate::envelope::KeyedPqTrustStore::new();
-        response_trust.bind(key.verifying_key().to_bytes(), &crate::crypto::pq::ml_dsa_sk_to_vk(&pq));
-        let client = Arc::new(crate::rpc_client::RpcClientImpl::new(
-            crate::signer::LocalSigner::new(key.clone()), transport, Some(key.verifying_key()),
-        ).with_request_kem_store(Arc::new(kem)).with_response_pq_store(Arc::new(response_trust)));
+        response_trust.bind(
+            key.verifying_key().to_bytes(),
+            &crate::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        );
+        let client = Arc::new(
+            crate::rpc_client::RpcClientImpl::new(
+                crate::signer::LocalSigner::new(key.clone()),
+                transport,
+                Some(key.verifying_key()),
+            )
+            .with_request_kem_store(Arc::new(kem))
+            .with_response_pq_store(Arc::new(response_trust)),
+        );
         // Release on assertion/error too: a regression must fail, not strand
         // the real worker behind its fixture gate during test unwinding.
         struct ReleaseOnDrop(Arc<tokio::sync::Semaphore>);
-        impl Drop for ReleaseOnDrop { fn drop(&mut self) { self.0.add_permits(1); } }
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.add_permits(1);
+            }
+        }
         let _cleanup = ReleaseOnDrop(release.clone());
         let caller = client.clone();
         let response = tokio::spawn(async move {
-            caller.call_for_service("bridge-echo", b"held".to_vec()).await
+            caller
+                .call_for_service("bridge-echo", b"held".to_vec())
+                .await
         });
-        tokio::time::timeout(Duration::from_secs(5), entered.acquire()).await??.forget();
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await??
+            .forget();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         assert_eq!(bridge.begin_shutdown(deadline), deadline);
-        assert_eq!(bridge.begin_shutdown(deadline + Duration::from_secs(40)), deadline,
-            "later carrier shutdown must not extend the first grace");
-        assert!(bridge.process(Bytes::new(), crate::transport::carrier::CarrierContext::inproc()).await.is_err());
+        assert_eq!(
+            bridge.begin_shutdown(deadline + Duration::from_secs(40)),
+            deadline,
+            "later carrier shutdown must not extend the first grace"
+        );
+        assert!(bridge
+            .process(
+                Bytes::new(),
+                crate::transport::carrier::CarrierContext::inproc()
+            )
+            .await
+            .is_err());
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         let carrier = tokio::spawn(drain(deadline));
         if !forced {
             release.add_permits(1);
             let payload = tokio::time::timeout(Duration::from_secs(2), response).await???;
-            assert_eq!(payload, crate::service::dispatch::DISPATCH_DENIED.as_bytes());
+            assert_eq!(
+                payload,
+                crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+            );
         } else {
             // The accepted RPC is still held: neither a caller cancellation
             // nor an already-finished request can make the deadline test pass.
             assert!(!response.is_finished());
-            assert!(tokio::time::timeout(Duration::from_secs(3), response).await??.is_err(), "held request must be cancelled at deadline");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), response)
+                    .await??
+                    .is_err(),
+                "held request must be cancelled at deadline"
+            );
         }
         tokio::time::timeout(Duration::from_secs(3), carrier).await???;
         // Deliberately join AFTER the transport drain too: this must reuse the
@@ -1102,10 +1274,19 @@ mod tests {
             assert_eq!(result, Err(BridgeShutdownError::DrainTimedOut));
         } else {
             result?;
-            assert!(tokio::time::Instant::now() < deadline, "released request did not drain during grace");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "released request did not drain during grace"
+            );
         }
-        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "join returned before destructor despite retained client");
-        assert_eq!(bridge.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(40)), deadline);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "join returned before destructor despite retained client"
+        );
+        assert_eq!(
+            bridge.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(40)),
+            deadline
+        );
         // Keep the actual network client alive through the completed join.
         drop(client);
         Ok(())
@@ -1116,14 +1297,36 @@ mod tests {
         let key = deadline_test_identity()?;
         for forced in [false, true] {
             let (bridge, entered, release, dropped) = deadline_test_bridge(&key)?;
-            let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"),
-                IrohRpcProtocolHandler::with_stream_limit(bridge.clone(), key.clone(), DEFAULT_STREAM_LIMIT)).await?;
-            let client = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("client moq"), NoopHandler::new("client rpc")).await?;
-            let connection = client.connect(direct_addr(&server), ALPN_HYPRSTREAM_RPC).await?;
+            let server = IrohSubstrate::new_test(
+                fresh_key(),
+                NoopHandler::new("moq"),
+                IrohRpcProtocolHandler::with_stream_limit(
+                    bridge.clone(),
+                    key.clone(),
+                    DEFAULT_STREAM_LIMIT,
+                ),
+            )
+            .await?;
+            let client = IrohSubstrate::new_test(
+                fresh_key(),
+                NoopHandler::new("client moq"),
+                NoopHandler::new("client rpc"),
+            )
+            .await?;
+            let connection = client
+                .connect(direct_addr(&server), ALPN_HYPRSTREAM_RPC)
+                .await?;
             exercise_transport_bridge_deadline(
-                crate::transport::iroh_transport::IrohTransport::new(connection), &key,
-                bridge, entered, release, dropped, forced, move |_| async move { server.shutdown().await },
-            ).await?;
+                crate::transport::iroh_transport::IrohTransport::new(connection),
+                &key,
+                bridge,
+                entered,
+                release,
+                dropped,
+                forced,
+                move |_| async move { server.shutdown().await },
+            )
+            .await?;
             client.shutdown().await?;
         }
         Ok(())
@@ -1131,7 +1334,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinnrpc_bridge_shared_deadline_replies_or_forces_join() -> Result<()> {
-        use crate::transport::quinn_transport::{QuinnRpcServer, QuinnTransport, connect_pinned};
+        use crate::transport::quinn_transport::{connect_pinned, QuinnRpcServer, QuinnTransport};
         crate::transport::pq_provider::install_pq_crypto_provider()?;
         let key = deadline_test_identity()?;
         for forced in [false, true] {
@@ -1143,21 +1346,37 @@ mod tests {
             );
             let server = web_transport_quinn::ServerBuilder::new()
                 .with_addr("127.0.0.1:0".parse()?)
-                .with_certificate(vec![rustls::pki_types::CertificateDer::from(cert_der.clone())], private)?;
+                .with_certificate(
+                    vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
+                    private,
+                )?;
             let address = server.local_addr()?;
-            let rpc = QuinnRpcServer::with_capacity(server, bridge.clone(), key.clone(), DEFAULT_STREAM_LIMIT);
+            let rpc = QuinnRpcServer::with_capacity(
+                server,
+                bridge.clone(),
+                key.clone(),
+                DEFAULT_STREAM_LIMIT,
+            );
             let limit = rpc.stream_limit();
             let capacity = rpc.capacity();
             let token = rpc.shutdown_token();
             let task = tokio::spawn(rpc.run());
             let session = connect_pinned(address, &cert_der).await?;
-            exercise_transport_bridge_deadline(QuinnTransport::new(session), &key,
-                bridge, entered, release, dropped, forced, move |deadline| async move {
+            exercise_transport_bridge_deadline(
+                QuinnTransport::new(session),
+                &key,
+                bridge,
+                entered,
+                release,
+                dropped,
+                forced,
+                move |deadline| async move {
                     QuinnRpcServer::shutdown_until(&limit, capacity, &token, deadline).await;
                     task.await??;
                     Ok(())
                 },
-            ).await?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1167,30 +1386,49 @@ mod tests {
         let key = deadline_test_identity()?;
         for forced in [false, true] {
             let (bridge, entered, release, dropped) = deadline_test_bridge(&key)?;
-            let directory = std::env::temp_dir().join(format!("hyprstream-r3-{}", hex::encode(&fresh_key()[..8])));
+            let directory = std::env::temp_dir()
+                .join(format!("hyprstream-r3-{}", hex::encode(&fresh_key()[..8])));
             std::fs::create_dir(&directory)?;
             let path = directory.join("rpc.sock");
             let config = crate::transport::TransportConfig::ipc(path.clone());
             let shutdown = Arc::new(tokio::sync::Notify::new());
             struct StopOnDrop(Arc<tokio::sync::Notify>);
-            impl Drop for StopOnDrop { fn drop(&mut self) { self.0.notify_one(); } }
+            impl Drop for StopOnDrop {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
             let _stop = StopOnDrop(shutdown.clone());
             let (ready, readiness) = tokio::sync::oneshot::channel();
             let processor = bridge.clone();
             let signing_key = key.clone();
             let stopped = shutdown.clone();
             let task = tokio::spawn(async move {
-                crate::service::serve::serve_bridged(&config, processor, signing_key, stopped, Some(ready)).await
+                crate::service::serve::serve_bridged(
+                    &config,
+                    processor,
+                    signing_key,
+                    stopped,
+                    Some(ready),
+                )
+                .await
             });
             tokio::time::timeout(Duration::from_secs(5), readiness).await??;
             exercise_transport_bridge_deadline(
-                crate::transport::lazy_uds::LazyUdsTransport::new(path), &key,
-                bridge, entered, release, dropped, forced, move |_| async move {
+                crate::transport::lazy_uds::LazyUdsTransport::new(path),
+                &key,
+                bridge,
+                entered,
+                release,
+                dropped,
+                forced,
+                move |_| async move {
                     shutdown.notify_one();
                     task.await??;
                     Ok(())
                 },
-            ).await?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1211,18 +1449,34 @@ mod tests {
         let uds_stopped = uds_token.clone();
         let task = tokio::spawn(async move {
             tokio::join!(
-                crate::transport::quinn_transport::QuinnRpcServer::shutdown_until(&quinn_limit, 1, &quinn_stopped, deadline),
-                crate::transport::uds_server::UdsRpcServer::shutdown_until(&uds_limit, 1, &uds_stopped, deadline),
+                crate::transport::quinn_transport::QuinnRpcServer::shutdown_until(
+                    &quinn_limit,
+                    1,
+                    &quinn_stopped,
+                    deadline
+                ),
+                crate::transport::uds_server::UdsRpcServer::shutdown_until(
+                    &uds_limit,
+                    1,
+                    &uds_stopped,
+                    deadline
+                ),
             );
             assert!(quinn_limit.is_closed() && uds_limit.is_closed());
         });
         quinn_token.cancelled().await;
         uds_token.cancelled().await;
         tokio::time::advance(Duration::from_secs(9)).await;
-        assert!(!task.is_finished(), "drain expired before the shared deadline");
+        assert!(
+            !task.is_finished(),
+            "drain expired before the shared deadline"
+        );
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        assert!(task.is_finished(), "carrier started a fresh grace instead of using the owner's remaining budget");
+        assert!(
+            task.is_finished(),
+            "carrier started a fresh grace instead of using the owner's remaining budget"
+        );
         task.await?;
         Ok(())
     }

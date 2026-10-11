@@ -76,7 +76,10 @@ fn parse_ssh_ed25519(line: &str) -> Result<VerifyingKey> {
 /// Handle `user register <username>`
 pub async fn handle_user_register(credentials_dir: &Path, username: &str) -> Result<()> {
     let store = open_store(credentials_dir).await?;
-    store.register(username).await.context("Failed to register user")?;
+    store
+        .register(username)
+        .await
+        .context("Failed to register user")?;
     println!("Registered user '{username}'");
     Ok(())
 }
@@ -97,11 +100,7 @@ pub async fn handle_user_list(credentials_dir: &Path) -> Result<()> {
 }
 
 /// Handle `user remove <username> [--force]`
-pub async fn handle_user_remove(
-    credentials_dir: &Path,
-    username: &str,
-    force: bool,
-) -> Result<()> {
+pub async fn handle_user_remove(credentials_dir: &Path, username: &str, force: bool) -> Result<()> {
     if !force {
         print!("Remove user '{username}'? [y/N] ");
         std::io::stdout().flush()?;
@@ -132,7 +131,13 @@ pub async fn handle_user_keys_list(credentials_dir: &Path, username: &str) -> Re
         for pk in &pubkeys {
             let label = pk.label.as_deref().unwrap_or("(no label)");
             let ts = pk.created_at;
-            println!("{}  {}  algorithm={}  (added {})", pk.fingerprint, label, pk.algorithm.as_str(), ts);
+            println!(
+                "{}  {}  algorithm={}  (added {})",
+                pk.fingerprint,
+                label,
+                pk.algorithm.as_str(),
+                ts
+            );
         }
     }
     Ok(())
@@ -274,10 +279,12 @@ fn read_seed_file(path: &str) -> Result<[u8; 32]> {
             .map_err(|_| anyhow::anyhow!("Seed file is not 32 bytes (Ed25519)"))?
     } else {
         // Try base64 of 32 bytes.
-        let s = std::str::from_utf8(&raw)
-            .map_err(|_| anyhow::anyhow!("Seed file is neither 32 raw bytes nor base64 of 32 bytes"))?;
-        let decoded = STANDARD.decode(s.trim())
-            .map_err(|_| anyhow::anyhow!("Seed file is neither 32 raw bytes nor base64 of 32 bytes"))?;
+        let s = std::str::from_utf8(&raw).map_err(|_| {
+            anyhow::anyhow!("Seed file is neither 32 raw bytes nor base64 of 32 bytes")
+        })?;
+        let decoded = STANDARD.decode(s.trim()).map_err(|_| {
+            anyhow::anyhow!("Seed file is neither 32 raw bytes nor base64 of 32 bytes")
+        })?;
         decoded
             .try_into()
             .map_err(|_| anyhow::anyhow!("Decoded seed is not 32 bytes (Ed25519)"))?
@@ -300,9 +307,7 @@ fn parse_openssh_ed25519(path: &str) -> Result<SigningKey> {
         key
     };
     match key.key_data() {
-        ssh_key::private::KeypairData::Ed25519(ed) => {
-            Ok(SigningKey::from(&ed.private))
-        }
+        ssh_key::private::KeypairData::Ed25519(ed) => Ok(SigningKey::from(&ed.private)),
         _ => anyhow::bail!(
             "{path} is not an Ed25519 key ({}); only ssh-ed25519 is supported. \
              Generate one with: ssh-keygen -t ed25519",

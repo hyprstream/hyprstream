@@ -51,7 +51,7 @@ use std::sync::{
     Arc, OnceLock, Weak,
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context, Result};
 use bytes::Bytes;
 use moq_net::{
     Broadcast, BroadcastConsumer, BroadcastProducer, Group, OriginConsumer, OriginProducer, Track,
@@ -87,8 +87,8 @@ pub fn init_global_moq_admission_proof(
 }
 
 /// Borrow the process proof for other authenticated native MoQ planes.
-pub fn global_moq_admission_proof()
--> Option<&'static crate::transport::moql_admission::MoqlAdmissionProof> {
+pub fn global_moq_admission_proof(
+) -> Option<&'static crate::transport::moql_admission::MoqlAdmissionProof> {
     GLOBAL_MOQ_ADMISSION_PROOF.get()
 }
 
@@ -300,7 +300,10 @@ impl RelayTarget {
         transport: crate::stream_info::TransportConfig,
         server_identity: crate::stream_info::MoqlServerIdentity,
     ) -> Self {
-        Self { transport, server_identity }
+        Self {
+            transport,
+            server_identity,
+        }
     }
 }
 
@@ -361,7 +364,7 @@ pub fn relay_reach_from_decoded(
 ///
 /// Idempotent: a second call is a no-op (the first path wins).
 pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
-    use crate::transport::uds_session::{PLANE_MOQ, accept_uds};
+    use crate::transport::uds_session::{accept_uds, PLANE_MOQ};
     use moq_net::Server as MoqServer;
 
     if native_iroh_required() {
@@ -1335,11 +1338,15 @@ async fn moq_stream_handle_task(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use crate::streaming::StreamVerifier;
-    use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
+    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
     use moq_net::{Client as MoqClient, Origin, Track};
 
     if native_iroh_required() {
-        let _ = tx.send(Err(anyhow!("network-iroh-required refuses a local MoQ socket client"))).await;
+        let _ = tx
+            .send(Err(anyhow!(
+                "network-iroh-required refuses a local MoQ socket client"
+            )))
+            .await;
         return;
     }
     let session = match connect_uds(&uds_path, PLANE_MOQ).await {
@@ -1590,7 +1597,8 @@ pub struct MoqReachConnection {
 }
 
 /// Monotonic process transport policy installed by native deployment bootstrap.
-static NATIVE_IROH_REQUIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NATIVE_IROH_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Require native Iroh; later compatibility callers cannot reopen fallbacks.
 pub fn require_native_iroh() {
@@ -1650,7 +1658,7 @@ pub async fn connect_moq_reach_for_profile(
     server_identity: &crate::stream_info::MoqlServerIdentity,
     iroh_required: bool,
 ) -> Result<MoqReachConnection> {
-    use crate::transport::uds_session::{PLANE_MOQ, connect_uds};
+    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
     use moq_net::{Client as MoqClient, Origin};
 
     let iroh_required = iroh_required || native_iroh_required();
@@ -1688,13 +1696,13 @@ pub async fn connect_moq_reach_for_profile(
                         "iroh moql reach lacks a live resolver-verified server witness"
                     )),
                     Some(expected_server) => {
-                    // The process-global proof is this client's local accepted
-                    // identity. The signed StreamInfo supplies the *remote*
-                    // server witness for this particular dial; never reuse the
-                    // local announcement's witness as the expected server.
-                    let mut proof = proof.clone();
-                    proof.expected_server = expected_server.clone();
-                    crate::dial::dial_stream_authenticated(&cfg, &proof).await
+                        // The process-global proof is this client's local accepted
+                        // identity. The signed StreamInfo supplies the *remote*
+                        // server witness for this particular dial; never reuse the
+                        // local announcement's witness as the expected server.
+                        let mut proof = proof.clone();
+                        proof.expected_server = expected_server.clone();
+                        crate::dial::dial_stream_authenticated(&cfg, &proof).await
                     }
                 }
             }
@@ -1721,7 +1729,9 @@ pub async fn connect_moq_reach_for_profile(
     // an authenticated Iroh rejection must not silently cross into this
     // process's local plane: that could subscribe to an unrelated producer.
     if iroh_required && !had_dialable_network_reach {
-        return Err(anyhow!("network-iroh-required: no dialable Iroh stream reach; refusing QUIC/local fallback"));
+        return Err(anyhow!(
+            "network-iroh-required: no dialable Iroh stream reach; refusing QUIC/local fallback"
+        ));
     }
     if had_dialable_network_reach {
         return Err(anyhow!(
@@ -2017,8 +2027,12 @@ pub async fn run_relay_announce_link(
     let cfg = reach_to_transport_config(&dest)
         .ok_or_else(|| anyhow!("relay reach is not a dialable network transport"))?;
 
-    if native_iroh_required() && !matches!(cfg.endpoint, crate::transport::EndpointType::Iroh { .. }) {
-        return Err(anyhow!("network-iroh-required rejects non-Iroh stream relay"));
+    if native_iroh_required()
+        && !matches!(cfg.endpoint, crate::transport::EndpointType::Iroh { .. })
+    {
+        return Err(anyhow!(
+            "network-iroh-required rejects non-Iroh stream relay"
+        ));
     }
 
     // #504 item 3 — relay-capability gate (fail-closed): do NOT announce this
@@ -2044,15 +2058,15 @@ pub async fn run_relay_announce_link(
             proof.expected_server = expected_server.clone();
             crate::dial::dial_stream_authenticated(&cfg, &proof).await?
         }
-        (crate::transport::EndpointType::Iroh { .. }, Some(_), Some(_)) => anyhow::bail!(
-            "iroh moql relay lacks a live resolver-verified relay witness"
-        ),
-        (crate::transport::EndpointType::Iroh { .. }, Some(_), None) => anyhow::bail!(
-            "iroh moql relay requires a resolver-verified relay witness"
-        ),
-        (crate::transport::EndpointType::Iroh { .. }, None, _) => anyhow::bail!(
-            "iroh moql relay requires an accepted-state admission proof"
-        ),
+        (crate::transport::EndpointType::Iroh { .. }, Some(_), Some(_)) => {
+            anyhow::bail!("iroh moql relay lacks a live resolver-verified relay witness")
+        }
+        (crate::transport::EndpointType::Iroh { .. }, Some(_), None) => {
+            anyhow::bail!("iroh moql relay requires a resolver-verified relay witness")
+        }
+        (crate::transport::EndpointType::Iroh { .. }, None, _) => {
+            anyhow::bail!("iroh moql relay requires an accepted-state admission proof")
+        }
         _ => crate::dial::dial_stream(&cfg).await?,
     };
     // `with_origin` makes the link bidirectional: this node's broadcasts are
@@ -2289,10 +2303,10 @@ fn seal_payload(
     nonce: Option<[u8; 12]>,
     payload: &StreamPayloadData,
 ) -> Result<StreamPayloadData> {
-    use crate::crypto::event_crypto::{EventPrivacy, encrypt_event, encrypt_event_with_nonce};
+    use crate::crypto::event_crypto::{encrypt_event, encrypt_event_with_nonce, EventPrivacy};
     use crate::stream_consumer::{
-        SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT, SEALED_KIND_ERROR,
-        stream_aead_aad,
+        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT,
+        SEALED_KIND_ERROR,
     };
 
     let control_bytes = match payload {
@@ -2471,7 +2485,10 @@ mod tests {
         }
         assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"late-data"));
         assert!(matches!(&got[1], StreamPayload::Complete(_)));
-        assert!(track.next_group().await?.is_none(), "completed track must EOF cleanly");
+        assert!(
+            track.next_group().await?.is_none(),
+            "completed track must EOF cleanly"
+        );
         Ok(())
     }
 
@@ -2512,7 +2529,10 @@ mod tests {
         }
         assert!(matches!(&got[0], StreamPayload::Data(data) if data == b"partial"));
         assert!(matches!(&got[1], StreamPayload::Error(message) if message == "expected failure"));
-        assert!(track.next_group().await?.is_none(), "errored track must EOF cleanly");
+        assert!(
+            track.next_group().await?.is_none(),
+            "errored track must EOF cleanly"
+        );
         Ok(())
     }
 
@@ -2521,8 +2541,8 @@ mod tests {
     /// already attached consumer keeps its track long enough to drain the
     /// authenticated terminal group.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn moq_stream_finished_broadcast_cleanup_is_exact_and_retains_attached_track()
-    -> Result<()> {
+    async fn moq_stream_finished_broadcast_cleanup_is_exact_and_retains_attached_track(
+    ) -> Result<()> {
         let origin = origin();
 
         let (_complete_secret, complete_pub) = crate::crypto::generate_ephemeral_keypair();
@@ -2808,7 +2828,7 @@ mod tests {
     /// and traffic keys, and the relay-visible Group identity remains monotonic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn identified_epoch_rekey_keeps_stock_moq_objects_opaque_and_immutable() -> Result<()> {
-        use crate::crypto::hybrid_kem::{SuiteId, generate_recipient};
+        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
         use crate::crypto::key_exchange::client_identified_stream_epoch;
         use crate::stream_epoch::{
             IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
@@ -3352,7 +3372,8 @@ mod tests {
         };
         let message = err.to_string();
         assert!(
-            message.contains("all dialable network reaches failed; refusing local moq UDS fallback"),
+            message
+                .contains("all dialable network reaches failed; refusing local moq UDS fallback"),
             "dialable Iroh rejection must not fall back to local UDS: {message}"
         );
         assert!(
@@ -3476,15 +3497,31 @@ mod tests {
     #[tokio::test]
     async fn required_stream_reach_rejects_empty_and_browser_only_without_dial() {
         let identity = crate::stream_info::MoqlServerIdentity::default();
-        for reach in [vec![], vec![crate::stream_info::Destination {
-            role: crate::stream_info::Role::Direct,
-            transport: crate::stream_info::TransportConfig::Quic(crate::stream_info::QuicReach {
-                addr: "127.0.0.1:9".into(), server_name: "localhost".into(), cert_hashes: vec![],
-            }), moql_server_identity: Default::default(),
-        }]] {
-            let result = tokio::time::timeout(std::time::Duration::from_millis(200),
-                connect_moq_reach_for_profile(&reach, &identity, true)).await.unwrap();
-            assert!(result.err().unwrap().to_string().contains("no dialable Iroh stream reach"));
+        for reach in [
+            vec![],
+            vec![crate::stream_info::Destination {
+                role: crate::stream_info::Role::Direct,
+                transport: crate::stream_info::TransportConfig::Quic(
+                    crate::stream_info::QuicReach {
+                        addr: "127.0.0.1:9".into(),
+                        server_name: "localhost".into(),
+                        cert_hashes: vec![],
+                    },
+                ),
+                moql_server_identity: Default::default(),
+            }],
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                connect_moq_reach_for_profile(&reach, &identity, true),
+            )
+            .await
+            .unwrap();
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("no dialable Iroh stream reach"));
         }
     }
 
@@ -3927,56 +3964,50 @@ mod tests {
 
         // Wrong key.
         let wrong = [0x99u8; 32];
-        assert!(
-            crate::stream_consumer::open_sealed_payload(
-                &wrong,
-                topic,
-                epoch,
-                0,
-                0,
-                tag,
-                ct,
-                nonce,
-                key_commitment
-            )
-            .is_err()
-        );
+        assert!(crate::stream_consumer::open_sealed_payload(
+            &wrong,
+            topic,
+            epoch,
+            0,
+            0,
+            tag,
+            ct,
+            nonce,
+            key_commitment
+        )
+        .is_err());
 
         // Wrong epoch (AAD mismatch) — anti-replay across epochs.
-        assert!(
-            crate::stream_consumer::open_sealed_payload(
-                &enc_key,
-                topic,
-                2,
-                0,
-                0,
-                tag,
-                ct,
-                nonce,
-                key_commitment
-            )
-            .is_err()
-        );
+        assert!(crate::stream_consumer::open_sealed_payload(
+            &enc_key,
+            topic,
+            2,
+            0,
+            0,
+            tag,
+            ct,
+            nonce,
+            key_commitment
+        )
+        .is_err());
 
         // Tampered ciphertext.
         let mut bad_ct = ct.clone();
         if let Some(b) = bad_ct.first_mut() {
             *b ^= 0xFF;
         }
-        assert!(
-            crate::stream_consumer::open_sealed_payload(
-                &enc_key,
-                topic,
-                epoch,
-                0,
-                0,
-                tag,
-                &bad_ct,
-                nonce,
-                key_commitment
-            )
-            .is_err()
-        );
+        assert!(crate::stream_consumer::open_sealed_payload(
+            &enc_key,
+            topic,
+            epoch,
+            0,
+            0,
+            tag,
+            &bad_ct,
+            nonce,
+            key_commitment
+        )
+        .is_err());
     }
 
     // ── #321 provenance over a published block ─────────────────────────────
@@ -4044,10 +4075,14 @@ mod tests {
         let empty = KeyedPqTrustStore::new();
         let none_enrolled = |_: &[u8; 32]| false;
         let mut v2 = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
-        assert!(
-            verify_moq_frame_with_provenance(&mut v2, &topic, &frames[0], &empty, &none_enrolled)
-                .is_err()
-        );
+        assert!(verify_moq_frame_with_provenance(
+            &mut v2,
+            &topic,
+            &frames[0],
+            &empty,
+            &none_enrolled
+        )
+        .is_err());
         Ok(())
     }
 }

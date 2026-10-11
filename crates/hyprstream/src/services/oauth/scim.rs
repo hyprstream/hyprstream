@@ -7,17 +7,17 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
+use hex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use hex;
 
 use super::state::OAuthState;
 use super::user_service;
-use crate::auth::{UserFilter, decode_pubkey_base64};
+use crate::auth::{decode_pubkey_base64, UserFilter};
 
 use super::scim_types::*;
 
@@ -68,7 +68,9 @@ fn scim_error_simple(status: u16, detail: &str) -> axum::response::Response {
         .into_response()
 }
 
-fn user_service(state: &Arc<OAuthState>) -> Result<&Arc<user_service::UserService>, Box<axum::response::Response>> {
+fn user_service(
+    state: &Arc<OAuthState>,
+) -> Result<&Arc<user_service::UserService>, Box<axum::response::Response>> {
     state
         .user_service
         .as_ref()
@@ -87,33 +89,24 @@ fn hosted_account_did_from_body(
         .filter(|did| !did.is_empty())
         .map(str::to_owned);
     if let Some(did) = did.as_deref() {
-        super::token::hosted_account_tenant_from_did(
-            did,
-            state.hosted_account_zone.as_ref(),
-        )
-        .map_err(|error| {
-            Box::new(scim_error(
-                400,
-                "invalidValue",
-                &format!("invalid hosted_account_did: {error}"),
-            ))
-        })?;
+        super::token::hosted_account_tenant_from_did(did, state.hosted_account_zone.as_ref())
+            .map_err(|error| {
+                Box::new(scim_error(
+                    400,
+                    "invalidValue",
+                    &format!("invalid hosted_account_did: {error}"),
+                ))
+            })?;
     }
     Ok(did)
 }
 
-fn user_to_scim(
-    info: &user_service::UserInfo,
-    base_url: &str,
-    include_pubkey: bool,
-) -> ScimUser {
+fn user_to_scim(info: &user_service::UserInfo, base_url: &str, include_pubkey: bool) -> ScimUser {
     let etag = compute_etag(&info.sub, info.active);
     ScimUser {
         schemas: {
             let mut s = vec![SCIM_SCHEMA_USER.to_owned()];
-            if include_pubkey
-                && (!info.pubkey_base64.is_empty() || info.atproto_did.is_some())
-            {
+            if include_pubkey && (!info.pubkey_base64.is_empty() || info.atproto_did.is_some()) {
                 s.push(SCIM_SCHEMA_EXT_HYPRSTREAM.to_owned());
             }
             s
@@ -159,14 +152,21 @@ fn compute_etag(sub: &str, active: bool) -> String {
 }
 
 /// Check If-Match header against current ETag. Returns `true` if OK to proceed.
-fn check_if_match(headers: &HeaderMap, current_etag: &str) -> Result<(), Box<axum::response::Response>> {
+fn check_if_match(
+    headers: &HeaderMap,
+    current_etag: &str,
+) -> Result<(), Box<axum::response::Response>> {
     if let Some(if_match) = headers.get(header::IF_MATCH) {
-        let if_match_str = if_match.to_str().map_err(|_| {
-            Box::new(scim_error_simple(400, "Invalid If-Match header"))
-        })?;
+        let if_match_str = if_match
+            .to_str()
+            .map_err(|_| Box::new(scim_error_simple(400, "Invalid If-Match header")))?;
         // Support both "W/\"hash\"" and bare etag
         if if_match_str != current_etag && if_match_str != "*" {
-            return Err(Box::new(scim_error(412, "invalidValue", "Resource version mismatch (ETag)")));
+            return Err(Box::new(scim_error(
+                412,
+                "invalidValue",
+                "Resource version mismatch (ETag)",
+            )));
         }
     }
     Ok(())
@@ -178,7 +178,10 @@ fn apply_attributes(user: &mut ScimUser, attributes: Option<&str>, excluded: Opt
     if let Some(attrs) = attributes {
         let requested: Vec<&str> = attrs.split(',').map(str::trim).collect();
         // Clear fields not in the requested set
-        if !requested.iter().any(|a| *a == "displayName" || *a == "name") {
+        if !requested
+            .iter()
+            .any(|a| *a == "displayName" || *a == "name")
+        {
             user.display_name = None;
         }
         if !requested.contains(&"emails") {
@@ -193,7 +196,10 @@ fn apply_attributes(user: &mut ScimUser, attributes: Option<&str>, excluded: Opt
     }
     if let Some(excluded) = excluded {
         let excluded_set: Vec<&str> = excluded.split(',').map(str::trim).collect();
-        if excluded_set.iter().any(|a| *a == "displayName" || *a == "name") {
+        if excluded_set
+            .iter()
+            .any(|a| *a == "displayName" || *a == "name")
+        {
             user.display_name = None;
         }
         if excluded_set.contains(&"emails") {
@@ -211,7 +217,10 @@ fn apply_attributes(user: &mut ScimUser, attributes: Option<&str>, excluded: Opt
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 fn base_url() -> String {
-    crate::config::HyprConfig::load().unwrap_or_default().oauth.issuer_url()
+    crate::config::HyprConfig::load()
+        .unwrap_or_default()
+        .oauth
+        .issuer_url()
 }
 
 /// Find a user by id (sub) or userName.
@@ -232,12 +241,14 @@ async fn find_user(
 
 /// Build a SCIM JSON response with standard headers.
 fn scim_response(status: StatusCode, body: &ScimUser, etag: &str) -> axum::response::Response {
-    let mut resp = axum::response::Response::new(
-        serde_json::to_string(body).unwrap_or_default().into(),
-    );
+    let mut resp =
+        axum::response::Response::new(serde_json::to_string(body).unwrap_or_default().into());
     *resp.status_mut() = status;
     let headers = resp.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/scim+json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/scim+json"),
+    );
     if let Ok(val) = HeaderValue::from_str(etag) {
         headers.insert(header::ETAG, val);
     }
@@ -339,7 +350,10 @@ pub async fn create_user(
         .unwrap_or("")
         .to_owned();
 
-    let display_name = body.get("displayName").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
+    let display_name = body
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(std::borrow::ToOwned::to_owned);
     let email = body
         .get("emails")
         .and_then(|v| v.as_array())
@@ -347,7 +361,10 @@ pub async fn create_user(
         .and_then(|e| e.get("value"))
         .and_then(|v| v.as_str())
         .map(std::borrow::ToOwned::to_owned);
-    let external_id = body.get("externalId").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
+    let external_id = body
+        .get("externalId")
+        .and_then(|v| v.as_str())
+        .map(std::borrow::ToOwned::to_owned);
     let hosted_account_did = match hosted_account_did_from_body(&state, &body) {
         Ok(did) => did,
         Err(response) => return *response,
@@ -389,12 +406,14 @@ pub async fn create_user(
     let scim = user_to_scim(&info, &base_url, true);
     let etag = scim.meta.version.clone().unwrap_or_default();
 
-    let mut resp = axum::response::Response::new(
-        serde_json::to_string(&scim).unwrap_or_default().into(),
-    );
+    let mut resp =
+        axum::response::Response::new(serde_json::to_string(&scim).unwrap_or_default().into());
     *resp.status_mut() = StatusCode::CREATED;
     let headers = resp.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/scim+json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/scim+json"),
+    );
     if let Ok(val) = HeaderValue::from_str(&format!("{base_url}/scim/v2/Users/{}", info.sub)) {
         headers.insert(header::LOCATION, val);
     }
@@ -450,7 +469,10 @@ pub async fn replace_user(
         return *e;
     }
 
-    let display_name = body.get("displayName").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
+    let display_name = body
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(std::borrow::ToOwned::to_owned);
     let email = body
         .get("emails")
         .and_then(|v| v.as_array())
@@ -458,7 +480,10 @@ pub async fn replace_user(
         .and_then(|e| e.get("value"))
         .and_then(|v| v.as_str())
         .map(std::borrow::ToOwned::to_owned);
-    let external_id = body.get("externalId").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
+    let external_id = body
+        .get("externalId")
+        .and_then(|v| v.as_str())
+        .map(std::borrow::ToOwned::to_owned);
     let active = body.get("active").and_then(serde_json::Value::as_bool);
     let hosted_account_did = match hosted_account_did_from_body(&state, &body) {
         Ok(did) => did,
@@ -548,15 +573,19 @@ pub async fn list_user_keys(
         Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
-    let resources: Vec<serde_json::Value> = info.pubkeys.iter().map(|pk| {
-        serde_json::json!({
-            "fingerprint": pk.fingerprint,
-            "pubkeyBase64": pk.pubkey_base64,
-            "label": pk.label,
-            "createdAt": pk.created_at,
-            "lastUsedAt": pk.last_used_at,
+    let resources: Vec<serde_json::Value> = info
+        .pubkeys
+        .iter()
+        .map(|pk| {
+            serde_json::json!({
+                "fingerprint": pk.fingerprint,
+                "pubkeyBase64": pk.pubkey_base64,
+                "label": pk.label,
+                "createdAt": pk.created_at,
+                "lastUsedAt": pk.last_used_at,
+            })
         })
-    }).collect();
+        .collect();
     let total = resources.len();
 
     (
@@ -592,7 +621,10 @@ pub async fn add_user_key(
         Some(s) => s,
         None => return scim_error(400, "invalidValue", "pubkeyBase64 is required"),
     };
-    let label = body.get("label").and_then(|v| v.as_str()).map(str::to_owned);
+    let label = body
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
 
     let pubkey = match decode_pubkey_base64(pubkey_b64) {
         Ok(k) => k,
@@ -651,9 +683,7 @@ pub async fn remove_user_key(
 /// GET /scim/v2/ServiceProviderConfig (RFC 7644 §4).
 pub async fn service_provider_config() -> axum::response::Response {
     let config = ScimServiceProviderConfig {
-        schemas: vec![
-            "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig".to_owned(),
-        ],
+        schemas: vec!["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig".to_owned()],
         patch: ScimFeature { supported: false },
         bulk: ScimFeatureWithMax {
             supported: false,

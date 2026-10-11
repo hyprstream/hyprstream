@@ -25,10 +25,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use hyprstream_rpc_std::registry_capnp;
 use hyprstream_core::services::generated::registry_client::decode_registry_request_body;
 use hyprstream_rpc::auth::mac::{Assurance, Level};
 use hyprstream_rpc::proof::policy;
+use hyprstream_rpc_std::registry_capnp;
 
 fn to_bytes(message: &capnp::message::Builder<capnp::message::HeapAllocator>) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -111,7 +111,9 @@ fn malformed_bodies_do_not_decode() {
 #[test]
 fn mediated_operation_is_bound_to_the_generated_signed_leaf() {
     let mut request = capnp::message::Builder::new_default();
-    request.init_root::<registry_capnp::registry_request::Builder>().set_list(());
+    request
+        .init_root::<registry_capnp::registry_request::Builder>()
+        .set_list(());
     let body = to_bytes(&request);
     policy::verify_mediated_operation("registry", &body, "query").unwrap();
     assert!(policy::verify_mediated_operation("registry", &body, "manage").is_err());
@@ -120,17 +122,23 @@ fn mediated_operation_is_bound_to_the_generated_signed_leaf() {
     assert!(policy::verify_mediated_operation("registry", b"invalid", "query").is_err());
 
     let mut scoped = capnp::message::Builder::new_default();
-    scoped.init_root::<registry_capnp::registry_request::Builder>()
-        .init_repo().set_list_worktrees(());
+    scoped
+        .init_root::<registry_capnp::registry_request::Builder>()
+        .init_repo()
+        .set_list_worktrees(());
     policy::verify_mediated_operation("registry", &to_bytes(&scoped), "query").unwrap();
     assert!(policy::verify_mediated_operation("registry", &to_bytes(&scoped), "manage").is_err());
 
     // Public queries and nested mediation are not scoped caller operations.
     let mut public = capnp::message::Builder::new_default();
-    public.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>().init_check();
+    public
+        .init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>()
+        .init_check();
     assert!(policy::verify_mediated_operation("policy", &to_bytes(&public), "query").is_err());
     let mut nested = capnp::message::Builder::new_default();
-    nested.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>().init_check_mediated();
+    nested
+        .init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>()
+        .init_check_mediated();
     assert!(policy::verify_mediated_operation("policy", &to_bytes(&nested), "query").is_err());
 }
 
@@ -143,8 +151,17 @@ fn generated_inventory_is_complete_valid_and_lists_derived_leaves() {
 
     // Every server-linked schema contributed rows.
     for service in [
-        "registry", "model", "policy", "inference", "mcp", "tui", "metrics", "oauth",
-        "discovery", "worker", "workflow",
+        "registry",
+        "model",
+        "policy",
+        "inference",
+        "mcp",
+        "tui",
+        "metrics",
+        "oauth",
+        "discovery",
+        "worker",
+        "workflow",
     ] {
         assert!(
             rows.iter().any(|row| row.service == service),
@@ -304,8 +321,7 @@ fn mutation_semantics_follow_the_scope_action_blocks() {
             assert!(
                 row.scope_exempt,
                 "{}:{} has no scope action without its recorded exemption",
-                row.service,
-                row.symbolic_path
+                row.service, row.symbolic_path
             );
             continue;
         }
@@ -338,9 +354,18 @@ fn tui_mutation_policies_are_explicit_and_handler_accurate() {
             .unwrap_or_else(|| panic!("missing tui:{leaf}"))
             .mutation_semantics
     };
-    assert_eq!(semantics("focusWindow"), Some(MutationSemantics::NaturallyIdempotent));
-    assert_eq!(semantics("focusPane"), Some(MutationSemantics::NaturallyIdempotent));
-    assert_eq!(semantics("resize"), Some(MutationSemantics::NaturallyIdempotent));
+    assert_eq!(
+        semantics("focusWindow"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
+    assert_eq!(
+        semantics("focusPane"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
+    assert_eq!(
+        semantics("resize"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
     assert_eq!(
         semantics("sendInput"),
         Some(MutationSemantics::IdempotencyKeyRequired),
@@ -385,7 +410,11 @@ fn metrics_query_leaves_declare_only_real_effect_semantics() {
         "a replayed queryStream duplicates the interop-stream preparation and \
          scheduled continuation"
     );
-    assert_eq!(semantics("query"), None, "structured query is a genuine read");
+    assert_eq!(
+        semantics("query"),
+        None,
+        "structured query is a genuine read"
+    );
     // Genuine reads stay policy-free.
     assert_eq!(semantics("listViews"), None);
 }
@@ -442,7 +471,13 @@ fn inference_lora_and_stream_effects_declare_required_semantics() {
         Some(MutationSemantics::IdempotencyKeyRequired),
         "a replayed trainStep advances the TTT delta twice"
     );
-    for leaf in ["saveLora", "unloadLora", "tttWriteback", "snapshotDelta", "embed"] {
+    for leaf in [
+        "saveLora",
+        "unloadLora",
+        "tttWriteback",
+        "snapshotDelta",
+        "embed",
+    ] {
         assert_eq!(
             semantics(leaf),
             Some(MutationSemantics::NaturallyIdempotent),
@@ -575,8 +610,14 @@ fn model_stateful_query_leaves_declare_their_effects() {
         semantics("fs.walk"),
         Some(MutationSemantics::IdempotencyKeyRequired)
     );
-    assert_eq!(semantics("fs.open"), Some(MutationSemantics::NaturallyIdempotent));
-    assert_eq!(semantics("fs.clunk"), Some(MutationSemantics::NaturallyIdempotent));
+    assert_eq!(
+        semantics("fs.open"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
+    assert_eq!(
+        semantics("fs.clunk"),
+        Some(MutationSemantics::NaturallyIdempotent)
+    );
 }
 
 /// Scope exemption records an authorization exception, not an implicit
@@ -604,7 +645,6 @@ fn scope_exempt_mutator_is_explicitly_classified() {
         assert_eq!(lookup(public).mutation_semantics, None, "{public}");
     }
 }
-
 
 /// Sol finding 2: the generated required-Data reader must reject evidence
 /// above the mediated-evidence cap at the field boundary — BEFORE any owned
@@ -641,7 +681,8 @@ fn mediated_check_evidence_reader_enforces_cap_before_copy() {
     };
     let v = v.expect("typed variant reader");
     assert!(
-        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v).is_err(),
+        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
+            .is_err(),
         "oversized evidence must be rejected before the owned copy"
     );
 
@@ -682,22 +723,32 @@ fn mediated_check_text_fields_enforce_maxlen_before_copy() {
         to_bytes(&message)
     };
 
-    let read = |bytes: &[u8]| -> anyhow::Result<hyprstream_rpc_std::policy_client::MediatedPolicyCheck> {
-        let message = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(bytes),
-            capnp::message::ReaderOptions::new(),
-        )?;
-        let req = message.get_root::<policy_request::Reader>()?;
-        let Which::CheckMediated(v) = req.which()? else {
-            panic!("expected checkMediated variant");
+    let read =
+        |bytes: &[u8]| -> anyhow::Result<hyprstream_rpc_std::policy_client::MediatedPolicyCheck> {
+            let message = capnp::serialize::read_message(
+                &mut std::io::Cursor::new(bytes),
+                capnp::message::ReaderOptions::new(),
+            )?;
+            let req = message.get_root::<policy_request::Reader>()?;
+            let Which::CheckMediated(v) = req.which()? else {
+                panic!("expected checkMediated variant");
+            };
+            let v = v?;
+            <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
         };
-        let v = v?;
-        <hyprstream_rpc_std::policy_client::MediatedPolicyCheck as FromCapnp>::read_from(v)
-    };
 
     // resource over 4096 / operation over 128: rejected at the reader.
-    assert!(read(&build(4097, 1)).is_err(), "oversized resource must reject");
-    assert!(read(&build(1, 129)).is_err(), "oversized operation must reject");
+    assert!(
+        read(&build(4097, 1)).is_err(),
+        "oversized resource must reject"
+    );
+    assert!(
+        read(&build(1, 129)).is_err(),
+        "oversized operation must reject"
+    );
     // Each exact boundary decodes.
-    assert!(read(&build(4096, 128)).is_ok(), "at-boundary resource+operation must decode");
+    assert!(
+        read(&build(4096, 128)).is_ok(),
+        "at-boundary resource+operation must decode"
+    );
 }

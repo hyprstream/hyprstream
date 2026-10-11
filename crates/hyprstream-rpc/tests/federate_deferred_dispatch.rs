@@ -20,7 +20,6 @@ use anyhow::{ensure, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer as _, SigningKey};
-use parking_lot::Mutex;
 use hyprstream_rpc::{
     auth::{Claims, ClusterKeySource, InMemoryCredentialRevocationStore, JwtKeySource},
     crypto::{
@@ -34,9 +33,9 @@ use hyprstream_rpc::{
             build_authenticated_hybrid_request_proof, AuthenticatedHybridProofSigner,
             AuthenticatedRequestProofInput,
         },
-        recipient_binding::FederateRecipientBinding,
         parser::ParsedProof,
         policy::{set_global_method_policy, CryptoSuite, InMemoryMethodPolicy, SignaturePolicy},
+        recipient_binding::FederateRecipientBinding,
         verify::VerifiedProof,
     },
     service::{
@@ -46,6 +45,7 @@ use hyprstream_rpc::{
     transport::{carrier::CarrierContext, TransportConfig},
     ToCapnp,
 };
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
@@ -163,13 +163,7 @@ fn proof(
     stream: &Recipient,
     client_dh_public: [u8; 32],
 ) -> Vec<u8> {
-    proof_with_recipients(
-        token,
-        body,
-        Some(response),
-        Some(stream),
-        client_dh_public,
-    )
+    proof_with_recipients(token, body, Some(response), Some(stream), client_dh_public)
 }
 
 fn proof_with_recipients(
@@ -323,10 +317,7 @@ impl RequestService for Service {
             "proof does not bind exact credential/schema"
         );
         ensure!(!self.revoked.load(Ordering::SeqCst), "authority revoked");
-        ensure!(
-            self.seen.lock().insert(proof.claims.request_id),
-            "replay"
-        );
+        ensure!(self.seen.lock().insert(proof.claims.request_id), "replay");
         Ok((
             VerifiedProof {
                 replay_thumbprint: [9; 32],
@@ -450,14 +441,24 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
     let same_proof = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
     send(
         &service,
-        &wire(&bearer, same_proof.clone(), &f.body, &response, &stream, CLIENT_DH),
+        &wire(
+            &bearer,
+            same_proof.clone(),
+            &f.body,
+            &response,
+            &stream,
+            CLIENT_DH,
+        ),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    send(&service, &wire(&bearer, same_proof, &f.body, &response, &stream, CLIENT_DH))
-        .await
-        .unwrap();
+    send(
+        &service,
+        &wire(&bearer, same_proof, &f.body, &response, &stream, CLIENT_DH),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         service.calls.load(Ordering::SeqCst),
         1,
@@ -468,10 +469,17 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
     let (response, stream) = recipients();
     send(
         &service,
-        &wire(&bearer, proof(&bearer, &f.body, &response, &stream, CLIENT_DH), &f.body, &response, &stream, CLIENT_DH),
+        &wire(
+            &bearer,
+            proof(&bearer, &f.body, &response, &stream, CLIENT_DH),
+            &f.body,
+            &response,
+            &stream,
+            CLIENT_DH,
+        ),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     assert_eq!(
         service.calls.load(Ordering::SeqCst),
         1,
@@ -533,7 +541,13 @@ async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
     let service = Service::new();
     let bearer = token("alice");
     let (holder_response, holder_stream) = recipients();
-    let holder_proof = proof(&bearer, &f.body, &holder_response, &holder_stream, CLIENT_DH);
+    let holder_proof = proof(
+        &bearer,
+        &f.body,
+        &holder_response,
+        &holder_stream,
+        CLIENT_DH,
+    );
 
     let (relay_response, _) = recipients();
     let response_substitution = send(
@@ -588,13 +602,8 @@ async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
 
     // A signed null is meaningful: if the holder chose the legacy DH-only
     // stream path, the relay cannot add its own stream KEM recipient.
-    let null_stream_proof = proof_with_recipients(
-        &bearer,
-        &f.body,
-        Some(&holder_response),
-        None,
-        CLIENT_DH,
-    );
+    let null_stream_proof =
+        proof_with_recipients(&bearer, &f.body, Some(&holder_response), None, CLIENT_DH);
     let (_, relay_added_stream) = recipients();
     let stream_added_to_signed_null = send(
         &service,
@@ -630,7 +639,14 @@ async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
 
     send(
         &service,
-        &wire(&bearer, holder_proof, &f.body, &holder_response, &holder_stream, CLIENT_DH),
+        &wire(
+            &bearer,
+            holder_proof,
+            &f.body,
+            &holder_response,
+            &holder_stream,
+            CLIENT_DH,
+        ),
     )
     .await
     .unwrap();

@@ -4,12 +4,12 @@
 //! TuiLoggerWidget. Lives in shell_handlers.rs, NOT in the compositor (which
 //! must remain WASM-safe).
 
-use ratatui::Frame;
+use hyprstream_compositor::theme;
 use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
 use ratatui::style::{Color, Style};
+use ratatui::Frame;
 use tui_logger::{TuiLoggerWidget, TuiWidgetState};
-use hyprstream_compositor::theme;
 
 pub struct ConsoleApp {
     pub state: TuiWidgetState,

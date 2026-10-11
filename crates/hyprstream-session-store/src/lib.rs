@@ -6,7 +6,7 @@
 //! The caller supplies a dedicated, TLS-verified PostgreSQL connection under the
 //! narrow runtime role. No DSN or token bodies are accepted or logged here.
 
-use tokio_postgres::{Client, IsolationLevel, Row, error::SqlState};
+use tokio_postgres::{error::SqlState, Client, IsolationLevel, Row};
 pub mod primary;
 
 pub const PROFILE: &str = "federate-session-v1";

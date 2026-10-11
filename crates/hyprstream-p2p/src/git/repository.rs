@@ -3,7 +3,10 @@
 //! This module provides the core Git operations using libgit2 instead of shell commands.
 //! Uses the Repository pattern to encapsulate Git operations with clean separation.
 
-use crate::{types::{GitHash, Sha256Hash}, Result};
+use crate::{
+    types::{GitHash, Sha256Hash},
+    Result,
+};
 use git2::{Oid, Repository as Git2Repository};
 use std::path::Path;
 
@@ -127,7 +130,8 @@ impl Repository {
         Ok(CommitInfo {
             sha256: sha256.clone(),
             tree_sha256: Sha256Hash::new(commit.tree_id().to_string())?,
-            parent_sha256s: commit.parent_ids()
+            parent_sha256s: commit
+                .parent_ids()
                 .map(|oid| Sha256Hash::new(oid.to_string()))
                 .collect::<Result<Vec<_>>>()?,
             message: commit.message().unwrap_or("").to_owned(),
@@ -165,14 +169,7 @@ mod tests {
         };
         let tree = git_repo.find_tree(tree_id)?;
 
-        let commit_id = git_repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Initial commit",
-            &tree,
-            &[],
-        )?;
+        let commit_id = git_repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?;
 
         // Test our Repository wrapper
         let repo = Repository::open(repo_path)?;

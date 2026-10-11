@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use hyprstream_rpc_std::registry_client::WorktreeClient;
 use crate::services::WorktreeClientExt;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
 
 /// Information about a discovered adapter
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,7 +312,12 @@ impl AdapterManager {
         let mut adapters = Vec::new();
 
         // Check if adapters dir exists
-        if !fs.stat_path("adapters").await.map(|s| s.exists).unwrap_or(false) {
+        if !fs
+            .stat_path("adapters")
+            .await
+            .map(|s| s.exists)
+            .unwrap_or(false)
+        {
             return Ok(adapters);
         }
 
@@ -342,7 +347,11 @@ impl AdapterManager {
             };
 
             let rel_config = format!("adapters/{base_name}.config.json");
-            let config_exists = fs.stat_path(&rel_config).await.map(|s| s.exists).unwrap_or(false);
+            let config_exists = fs
+                .stat_path(&rel_config)
+                .await
+                .map(|s| s.exists)
+                .unwrap_or(false);
 
             adapters.push(AdapterInfo {
                 filename: name_str.clone(),
@@ -374,7 +383,11 @@ impl AdapterManager {
     }
 
     /// Create an indexed adapter filename (async, via FsOps)
-    pub async fn create_indexed_name_async(&self, name: &str, index: Option<u32>) -> Result<String> {
+    pub async fn create_indexed_name_async(
+        &self,
+        name: &str,
+        index: Option<u32>,
+    ) -> Result<String> {
         let idx = if let Some(i) = index {
             i
         } else {
@@ -414,7 +427,8 @@ impl AdapterManager {
         let rel_config = format!("adapters/{adapter_name}.config.json");
         let config_json = serde_json::to_string_pretty(&config)
             .with_context(|| "Failed to serialize adapter config")?;
-        fs.write_file_chunked(&rel_config, config_json.as_bytes()).await?;
+        fs.write_file_chunked(&rel_config, config_json.as_bytes())
+            .await?;
 
         // Create empty adapter file
         let rel_adapter = format!("adapters/{adapter_name}.safetensors");
@@ -443,7 +457,12 @@ impl AdapterManager {
             None => return Ok(self.has_adapters()),
         };
 
-        if !fs.stat_path("adapters").await.map(|s| s.exists).unwrap_or(false) {
+        if !fs
+            .stat_path("adapters")
+            .await
+            .map(|s| s.exists)
+            .unwrap_or(false)
+        {
             return Ok(false);
         }
 
@@ -476,7 +495,12 @@ impl AdapterManager {
             // Remove config if exists
             if let Some(config_path) = &adapter.config_path {
                 let rel_config = config_path.to_string_lossy();
-                if fs.stat_path(&rel_config).await.map(|s| s.exists).unwrap_or(false) {
+                if fs
+                    .stat_path(&rel_config)
+                    .await
+                    .map(|s| s.exists)
+                    .unwrap_or(false)
+                {
                     fs.remove_path(&rel_config).await?;
                 }
             }
@@ -488,7 +512,11 @@ impl AdapterManager {
     }
 
     /// Write adapter config file (async, via FsOps)
-    pub async fn write_config_async(&self, adapter_name: &str, config: &AdapterConfig) -> Result<()> {
+    pub async fn write_config_async(
+        &self,
+        adapter_name: &str,
+        config: &AdapterConfig,
+    ) -> Result<()> {
         let fs = match &self.fs {
             Some(fs) => fs,
             None => {
@@ -503,7 +531,8 @@ impl AdapterManager {
 
         let rel_config = format!("adapters/{adapter_name}.config.json");
         let config_json = serde_json::to_string_pretty(config)?;
-        fs.write_file_chunked(&rel_config, config_json.as_bytes()).await?;
+        fs.write_file_chunked(&rel_config, config_json.as_bytes())
+            .await?;
         Ok(())
     }
 
@@ -589,17 +618,19 @@ mod tests {
         config.model_ref = "test_model".to_owned();
 
         // Initialize adapter with auto-index
-        let adapter_path = manager
-            .initialize_adapter("test", None, config.clone())?;
+        let adapter_path = manager.initialize_adapter("test", None, config.clone())?;
         assert!(adapter_path.exists());
-        let path_str = adapter_path.to_str().ok_or_else(|| anyhow::anyhow!("path not valid utf-8"))?;
+        let path_str = adapter_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("path not valid utf-8"))?;
         assert!(path_str.contains("00_test"));
 
         // Initialize adapter with specific index
-        let adapter_path = manager
-            .initialize_adapter("custom", Some(5), config)?;
+        let adapter_path = manager.initialize_adapter("custom", Some(5), config)?;
         assert!(adapter_path.exists());
-        let path_str = adapter_path.to_str().ok_or_else(|| anyhow::anyhow!("path not valid utf-8"))?;
+        let path_str = adapter_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("path not valid utf-8"))?;
         assert!(path_str.contains("05_custom"));
 
         // Check that configs were created

@@ -874,7 +874,10 @@ mod tests {
         let ssh_upper = extract_git_authority("ssh://git@MÜNCHEN.example/repo.git");
         assert!(ssh_lower.is_some());
         assert_eq!(ssh_lower, ssh_upper);
-        assert_eq!(lower, ssh_lower, "https and ssh must canonicalize identically");
+        assert_eq!(
+            lower, ssh_lower,
+            "https and ssh must canonicalize identically"
+        );
     }
 
     /// Malformed authorities are rejected outright (`None`) rather than
@@ -984,8 +987,14 @@ mod tests {
     #[test]
     fn extract_git_authority_rejects_backslash_anywhere() {
         assert_eq!(extract_git_authority("ssh://git@github.com\\evil/x"), None);
-        assert_eq!(extract_git_authority("https://evil.example/\\@github.com"), None);
-        assert_eq!(extract_git_authority("http://github.com\\.evil.example/x"), None);
+        assert_eq!(
+            extract_git_authority("https://evil.example/\\@github.com"),
+            None
+        );
+        assert_eq!(
+            extract_git_authority("http://github.com\\.evil.example/x"),
+            None
+        );
     }
 
     /// scp-like syntax is covered by the same top-level guard: a backslash

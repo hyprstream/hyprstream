@@ -23,10 +23,12 @@ use crate::error::{Result, WorkerError};
 use crate::image::RafsStore;
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use hyprstream_rpc_std::worker_client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
 use super::kata_agent::{AgentAddress, ContainerRootfs, KataAgentClient};
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
+use hyprstream_rpc_std::worker_client::{
+    CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig,
+};
 use hyprstream_vfs::{Mount, Subject, SyntheticNode};
 
 /// virtio-fs mount tag under which `start()` attaches the composed per-sandbox
@@ -1454,7 +1456,8 @@ mod tests {
             sandbox_path,
             image_id: None,
             console_socket: None,
-            applied_resources: hyprstream_rpc_std::worker_client::LinuxContainerResources::default(),
+            applied_resources: hyprstream_rpc_std::worker_client::LinuxContainerResources::default(
+            ),
             reservation: None,
         }
     }

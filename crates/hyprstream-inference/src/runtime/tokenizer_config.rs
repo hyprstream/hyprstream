@@ -25,7 +25,8 @@ pub trait TokenizerConfig: Send + Sync {
     ///
     /// # Returns
     /// * `Result<()>` - Success or error during configuration
-    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, model_vocab_size: usize) -> Result<()>;
+    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, model_vocab_size: usize)
+        -> Result<()>;
 
     /// Get special tokens that should be added for this model
     ///
@@ -38,7 +39,11 @@ pub trait TokenizerConfig: Send + Sync {
     ///
     /// # Returns
     /// * Vector of `AddedToken` objects to add to the tokenizer
-    fn get_special_tokens(&self, _model_vocab_size: usize, _tokenizer_vocab_size: usize) -> Vec<AddedToken> {
+    fn get_special_tokens(
+        &self,
+        _model_vocab_size: usize,
+        _tokenizer_vocab_size: usize,
+    ) -> Vec<AddedToken> {
         Vec::new() // Default: no special tokens
     }
 
@@ -111,7 +116,11 @@ pub trait TokenizerConfig: Send + Sync {
 pub struct QwenTokenizerConfig;
 
 impl TokenizerConfig for QwenTokenizerConfig {
-    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, model_vocab_size: usize) -> Result<()> {
+    fn configure_tokenizer(
+        &self,
+        tokenizer: &mut Tokenizer,
+        model_vocab_size: usize,
+    ) -> Result<()> {
         let current_vocab_size = tokenizer.get_vocab_size(true);
 
         // Qwen models have special tokens beyond the base vocabulary
@@ -130,7 +139,7 @@ impl TokenizerConfig for QwenTokenizerConfig {
                 // Create as special tokens (special=true)
                 // They ARE special tokens in the model's vocabulary
                 let token = AddedToken::from(format!("<|extra_{i}|>"), true)
-                    .single_word(true)  // Treat as single word
+                    .single_word(true) // Treat as single word
                     .lstrip(false)
                     .rstrip(false)
                     .normalized(false);
@@ -143,7 +152,8 @@ impl TokenizerConfig for QwenTokenizerConfig {
 
             tracing::info!(
                 "Added {} special tokens (<|extra_0|> through <|extra_{}|>) to Qwen tokenizer",
-                added, missing_count - 1
+                added,
+                missing_count - 1
             );
 
             // Verify they were actually added. A tokenizer/embedding vocab
@@ -155,11 +165,17 @@ impl TokenizerConfig for QwenTokenizerConfig {
             // short-fall here is a hard error, not a warning.
             let new_size = tokenizer.get_vocab_size(true);
             if new_size == model_vocab_size {
-                tracing::info!("✅ Vocabulary successfully expanded from {} to {}", current_vocab_size, new_size);
+                tracing::info!(
+                    "✅ Vocabulary successfully expanded from {} to {}",
+                    current_vocab_size,
+                    new_size
+                );
             } else if new_size > current_vocab_size {
                 tracing::info!(
                     "✅ Vocabulary expanded from {} to {} (added {} tokens)",
-                    current_vocab_size, new_size, new_size - current_vocab_size
+                    current_vocab_size,
+                    new_size,
+                    new_size - current_vocab_size
                 );
             }
             // new_size < current_vocab_size only happens if add_special_tokens
@@ -182,7 +198,11 @@ impl TokenizerConfig for QwenTokenizerConfig {
         Ok(())
     }
 
-    fn get_special_tokens(&self, model_vocab_size: usize, tokenizer_vocab_size: usize) -> Vec<AddedToken> {
+    fn get_special_tokens(
+        &self,
+        model_vocab_size: usize,
+        tokenizer_vocab_size: usize,
+    ) -> Vec<AddedToken> {
         if model_vocab_size <= tokenizer_vocab_size {
             return Vec::new();
         }
@@ -231,7 +251,8 @@ impl TokenizerConfig for QwenTokenizerConfig {
                     // This shouldn't happen if we configured the tokenizer correctly
                     tracing::warn!(
                         "Token {} is beyond expanded vocabulary size {}, formatting as <|extra_N|>",
-                        token_id, vocab_size
+                        token_id,
+                        vocab_size
                     );
                     let extra_idx = (token_id as usize) - vocab_size;
                     Ok(Some(format!("<|extra_{extra_idx}|>")))
@@ -251,7 +272,11 @@ impl TokenizerConfig for QwenTokenizerConfig {
 pub struct LlamaTokenizerConfig;
 
 impl TokenizerConfig for LlamaTokenizerConfig {
-    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, model_vocab_size: usize) -> Result<()> {
+    fn configure_tokenizer(
+        &self,
+        tokenizer: &mut Tokenizer,
+        model_vocab_size: usize,
+    ) -> Result<()> {
         let current_vocab_size = tokenizer.get_vocab_size(true);
 
         if model_vocab_size != current_vocab_size {
@@ -271,13 +296,18 @@ impl TokenizerConfig for LlamaTokenizerConfig {
 pub struct GemmaTokenizerConfig;
 
 impl TokenizerConfig for GemmaTokenizerConfig {
-    fn configure_tokenizer(&self, tokenizer: &mut Tokenizer, model_vocab_size: usize) -> Result<()> {
+    fn configure_tokenizer(
+        &self,
+        tokenizer: &mut Tokenizer,
+        model_vocab_size: usize,
+    ) -> Result<()> {
         let current_vocab_size = tokenizer.get_vocab_size(true);
 
         if model_vocab_size != current_vocab_size {
             tracing::debug!(
                 "Gemma model vocab size ({}) differs from tokenizer vocab size ({})",
-                model_vocab_size, current_vocab_size
+                model_vocab_size,
+                current_vocab_size
             );
         }
 
@@ -294,7 +324,11 @@ impl TokenizerConfig for GemmaTokenizerConfig {
 pub struct DefaultTokenizerConfig;
 
 impl TokenizerConfig for DefaultTokenizerConfig {
-    fn configure_tokenizer(&self, _tokenizer: &mut Tokenizer, _model_vocab_size: usize) -> Result<()> {
+    fn configure_tokenizer(
+        &self,
+        _tokenizer: &mut Tokenizer,
+        _model_vocab_size: usize,
+    ) -> Result<()> {
         // No special configuration for unknown models
         tracing::debug!("Using default tokenizer configuration (no modifications)");
         Ok(())

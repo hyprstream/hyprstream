@@ -1,8 +1,6 @@
 //! Native Event transport bootstrap. Identity admission and MAC are independent.
 use anyhow::{Context, Result};
-use hyprstream_discovery::admission_roster::{
-    self, DeploymentRosterSource,
-};
+use hyprstream_discovery::admission_roster::{self, DeploymentRosterSource};
 use hyprstream_rpc::moq_authz::PeerIdentity;
 use hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer;
 use hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof;
@@ -171,9 +169,14 @@ impl EventNetworkService {
         tokio::pin!(stopped);
         stopped.as_mut().enable();
         let substrate = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
-            self.secret, self.handler,
-            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new("Event provides only authenticated moql"),
-        ).await.map_err(|e| RpcError::SpawnFailed(format!("native Event bind: {e}")))?;
+            self.secret,
+            self.handler,
+            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new(
+                "Event provides only authenticated moql",
+            ),
+        )
+        .await
+        .map_err(|e| RpcError::SpawnFailed(format!("native Event bind: {e}")))?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let _cancel_on_exit = cancellation.clone().drop_guard();
         let announce_cancel = cancellation.clone();
@@ -203,7 +206,10 @@ impl EventNetworkService {
             } => {},
         }
         cancellation.cancel();
-        substrate.shutdown().await.map_err(|e| RpcError::SpawnFailed(format!("Event shutdown: {e}")))
+        substrate
+            .shutdown()
+            .await
+            .map_err(|e| RpcError::SpawnFailed(format!("Event shutdown: {e}")))
     }
 }
 
@@ -230,7 +236,9 @@ impl hyprstream_rpc::service::Spawnable for EventNetworkService {
             .build()
             .map_err(|e| RpcError::SpawnFailed(e.to_string()))?;
         runtime.block_on((*self).run_until_shutdown(shutdown, move || {
-            if let Some(ready) = on_ready { let _ = ready.send(()); }
+            if let Some(ready) = on_ready {
+                let _ = ready.send(());
+            }
             let _ = hyprstream_rpc::notify::ready();
         }))
     }
@@ -312,7 +320,10 @@ mod tests {
         .await
         .context("Event lost shutdown at readiness")??;
         anyhow::ensure!(ready.get(), "Event never reached readiness");
-        anyhow::ensure!(announced.lock().is_cancelled(), "announcement was not cancelled");
+        anyhow::ensure!(
+            announced.lock().is_cancelled(),
+            "announcement was not cancelled"
+        );
         Ok(())
     }
 
@@ -369,8 +380,12 @@ mod tests {
         Ok(())
     }
 
-    fn state_with_services(service_ids: &[&str]) -> hyprstream_rpc::transport::moql_admission::AcceptedIdentityState {
-        use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey};
+    fn state_with_services(
+        service_ids: &[&str],
+    ) -> hyprstream_rpc::transport::moql_admission::AcceptedIdentityState {
+        use hyprstream_rpc::transport::moql_admission::{
+            AcceptedIdentityState, AcceptedSubjectKey,
+        };
         AcceptedIdentityState {
             epoch: 1,
             head_digest: [1; 64],
@@ -425,7 +440,9 @@ mod tests {
 
         // Identity churn: the same service name now lives at a new DID.
         states.write().remove(original);
-        states.write().insert(successor.to_owned(), state_with_services(&["#event"]));
+        states
+            .write()
+            .insert(successor.to_owned(), state_with_services(&["#event"]));
         assert!(
             !authorizer.authorize_ingress(&peer_of(original), "local"),
             "superseded DID must lose the grant"
@@ -439,7 +456,9 @@ mod tests {
         // genuine identity makes the name ambiguous — deny both, escalate to
         // neither (the store cannot distinguish provenance; uniqueness is the
         // discriminator).
-        states.write().insert(squatter.to_owned(), state_with_services(&["#event"]));
+        states
+            .write()
+            .insert(squatter.to_owned(), state_with_services(&["#event"]));
         assert!(!authorizer.authorize_ingress(&peer_of(successor), "local"));
         assert!(!authorizer.authorize_ingress(&peer_of(squatter), "local"));
 

@@ -27,10 +27,12 @@ impl VtPane {
         stdout_rx: Receiver<Vec<u8>>,
         stdin_tx: Option<SyncSender<Vec<u8>>>,
     ) -> Self {
-        let vt = Vt::builder()
-            .size(cols as usize, rows as usize)
-            .build();
-        Self { vt, stdout_rx, stdin_tx }
+        let vt = Vt::builder().size(cols as usize, rows as usize).build();
+        Self {
+            vt,
+            stdout_rx,
+            stdin_tx,
+        }
     }
 
     /// Drain stdout_rx into the VTE parser.
@@ -62,8 +64,6 @@ impl VtPane {
 
     /// Resize the VT to new dimensions (protocol-agnostic, no escape sequences).
     pub fn resize_vt(&mut self, cols: u16, rows: u16) {
-        self.vt = Vt::builder()
-            .size(cols as usize, rows as usize)
-            .build();
+        self.vt = Vt::builder().size(cols as usize, rows as usize).build();
     }
 }

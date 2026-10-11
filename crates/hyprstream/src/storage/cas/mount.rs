@@ -897,7 +897,8 @@ impl CasMount {
         match tokens.next() {
             None => Ok(()), // blank line
             Some("commit") => {
-                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:commit").await?;
+                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:commit")
+                    .await?;
                 self.seal_slot(slot).await.map(|_| ())
             }
             Some("abort") => {
@@ -933,7 +934,10 @@ impl CasMount {
                     },
                 }
             }
-            Some("label") => self.declare_label_cmd(id, slot, tokens.collect(), caller).await,
+            Some("label") => {
+                self.declare_label_cmd(id, slot, tokens.collect(), caller)
+                    .await
+            }
             Some(cmd) => Err(MountError::InvalidArgument(format!(
                 "unknown ctl command: {cmd}"
             ))),
@@ -1213,7 +1217,8 @@ impl Mount for CasMount {
             CasFid::StageData { id, mode } => {
                 check_writable(*mode)?;
                 let slot = self.slot_for(id, caller)?;
-                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:write").await?;
+                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:write")
+                    .await?;
 
                 let off = usize::try_from(offset)
                     .map_err(|_| MountError::InvalidArgument("write offset overflow".into()))?;
@@ -1308,7 +1313,8 @@ impl Mount for CasMount {
             ));
         }
 
-        self.authorize(caller, CasMountObjectKind::Stage, "new", "stage:create").await?;
+        self.authorize(caller, CasMountObjectKind::Stage, "new", "stage:create")
+            .await?;
 
         let id = self.staging.mint(caller, self.staging_cfg.slot_quota_bytes);
         *inner = CasFid::StageRoot {

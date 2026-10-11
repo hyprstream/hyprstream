@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use arrow_array::Array as _;
 use arrow_array::{ArrayRef, StringArray};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
@@ -41,7 +42,6 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrow_array::Array as _;
 use futures::{StreamExt, TryStreamExt};
 use hyprstream_decision::answer::VersionTriple;
 use hyprstream_decision::arrow::DecisionSchema;
@@ -73,9 +73,7 @@ pub struct DecideFlightSqlService {
 
 impl DecideFlightSqlService {
     /// A tonic service wrapping this stub, for `Server::builder().add_service(…)`.
-    pub fn into_server(
-        self,
-    ) -> arrow_flight::flight_service_server::FlightServiceServer<Self> {
+    pub fn into_server(self) -> arrow_flight::flight_service_server::FlightServiceServer<Self> {
         arrow_flight::flight_service_server::FlightServiceServer::new(self)
     }
 
@@ -83,8 +81,9 @@ impl DecideFlightSqlService {
     // tonic::Status is the trait-mandated Err; boxing it would fight the Flight SQL API.
     #[allow(clippy::result_large_err)]
     fn prepare(query: &str) -> Result<(QuestionSet, DecisionSchema, VersionTriple), Status> {
-        let entry: Entry = serde_json::from_str(query)
-            .map_err(|error| Status::invalid_argument(format!("decide document is not valid JSON: {error}")))?;
+        let entry: Entry = serde_json::from_str(query).map_err(|error| {
+            Status::invalid_argument(format!("decide document is not valid JSON: {error}"))
+        })?;
         let Entry::Map(fields) = &entry else {
             return Err(Status::invalid_argument(
                 "decide document must be a JSON object: {questions, schema_version, calib_version?, model?}",
@@ -99,12 +98,20 @@ impl DecideFlightSqlService {
                 "questions" => questions = Some(value.clone()),
                 "schema_version" => match value {
                     Entry::Str(version) => schema_version = Some(version.clone()),
-                    _ => return Err(Status::invalid_argument("`schema_version` must be a string")),
+                    _ => {
+                        return Err(Status::invalid_argument(
+                            "`schema_version` must be a string",
+                        ))
+                    }
                 },
                 "calib_version" => match value {
                     Entry::Null => calib_version = Some(None),
                     Entry::Str(version) => calib_version = Some(Some(version.clone())),
-                    _ => return Err(Status::invalid_argument("`calib_version` must be a string or null")),
+                    _ => {
+                        return Err(Status::invalid_argument(
+                            "`calib_version` must be a string or null",
+                        ))
+                    }
                 },
                 "model" => match value {
                     Entry::Str(name) => model = Some(name.clone()),
@@ -165,7 +172,9 @@ impl DecideFlightSqlService {
 fn schema_ipc(schema: &Schema) -> bytes::Bytes {
     let IpcMessage(bytes) = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
         .try_into()
-        .unwrap_or_else(|error| panic!("schema IPC encoding is infallible for in-memory schemas: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("schema IPC encoding is infallible for in-memory schemas: {error}")
+        });
     bytes
 }
 
@@ -190,9 +199,7 @@ impl FlightSqlService for DecideFlightSqlService {
             triple,
             states: Vec::new(),
         };
-        self.statements
-            .lock()
-            .insert(handle.clone(), prepared);
+        self.statements.lock().insert(handle.clone(), prepared);
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into(),
             dataset_schema: schema_ipc(&dataset_schema),
@@ -221,7 +228,9 @@ impl FlightSqlService for DecideFlightSqlService {
         let prepared = statements
             .get(&query.prepared_statement_handle[..])
             .ok_or_else(|| {
-                Status::not_found("unknown prepared statement handle (stale or drifted; re-prepare)")
+                Status::not_found(
+                    "unknown prepared statement handle (stale or drifted; re-prepare)",
+                )
             })?;
         let schema = prepared.decision_schema.arrow_schema();
         // The Flight SQL do_get dispatcher routes on the ticket's Any-encoded command,
@@ -267,7 +276,9 @@ impl FlightSqlService for DecideFlightSqlService {
                 .column_by_name(STATE_PARAMETER)
                 .and_then(|column| column.as_any().downcast_ref::<StringArray>())
                 .ok_or_else(|| {
-                    Status::invalid_argument("parameter batch must carry a non-null utf8 `state` column")
+                    Status::invalid_argument(
+                        "parameter batch must carry a non-null utf8 `state` column",
+                    )
                 })?;
             for row in 0..column.len() {
                 if column.is_null(row) {
@@ -292,13 +303,18 @@ impl FlightSqlService for DecideFlightSqlService {
         &self,
         query: CommandPreparedStatementQuery,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as arrow_flight::flight_service_server::FlightService>::DoGetStream>, Status> {
+    ) -> Result<
+        Response<<Self as arrow_flight::flight_service_server::FlightService>::DoGetStream>,
+        Status,
+    > {
         let (set, schema, triple, states) = {
             let statements = self.statements.lock();
             let prepared = statements
                 .get(&query.prepared_statement_handle[..])
                 .ok_or_else(|| {
-                    Status::not_found("unknown prepared statement handle (stale or drifted; re-prepare)")
+                    Status::not_found(
+                        "unknown prepared statement handle (stale or drifted; re-prepare)",
+                    )
                 })?;
             (
                 prepared.set.clone(),
@@ -333,7 +349,8 @@ pub async fn serve(
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::from_std(listener).unwrap_or_else(|error| panic!("tokio listener: {error}"));
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .unwrap_or_else(|error| panic!("tokio listener: {error}"));
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         tonic::transport::Server::builder()
             .add_service(DecideFlightSqlService::default().into_server())

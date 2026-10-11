@@ -5,5 +5,5 @@
 //! `hyprstream_service::*`.
 
 pub use hyprstream_rpc::service::metadata::{
-    MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode,
+    MethodMeta, ParamMeta, SchemaMetadataFn, ScopedClientTreeNode, ScopedSchemaMetadataFn,
 };

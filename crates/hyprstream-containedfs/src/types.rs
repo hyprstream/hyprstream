@@ -143,9 +143,7 @@ impl FsHandle {
                     .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
                 file.metadata().map_err(FsError::Io)
             }
-            FsHandleInner::Path(path) => {
-                fs::metadata(path).map_err(FsError::Io)
-            }
+            FsHandleInner::Path(path) => fs::metadata(path).map_err(FsError::Io),
         }
     }
 
@@ -161,7 +159,8 @@ impl FsHandle {
                 } else {
                     flags |= OpenFlags::O_RDONLY;
                 }
-                handle.reopen(flags)
+                handle
+                    .reopen(flags)
                     .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))
             }
             FsHandleInner::Path(path) => {

@@ -211,7 +211,9 @@ impl<B: StorageBackend> DecisionBatchStore<B> {
         batch: &RecordBatch,
     ) -> Result<String, Status> {
         if schema_fingerprint.is_empty() {
-            return Err(Status::invalid_argument("schema_fingerprint must not be empty"));
+            return Err(Status::invalid_argument(
+                "schema_fingerprint must not be empty",
+            ));
         }
         if model_id.is_empty() {
             return Err(Status::invalid_argument("model_id must not be empty"));
@@ -227,7 +229,9 @@ impl<B: StorageBackend> DecisionBatchStore<B> {
         };
         let payload = encode_batch_ipc(batch)?;
         let row = meta_to_record_batch(&meta, PAYLOAD_FORMAT_IPC_STREAM, &payload)?;
-        self.backend.insert_into_table(DECISION_BATCH_TABLE, row).await?;
+        self.backend
+            .insert_into_table(DECISION_BATCH_TABLE, row)
+            .await?;
         Ok(meta.batch_id)
     }
 

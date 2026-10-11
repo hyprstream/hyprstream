@@ -126,8 +126,8 @@ pub use activation::{
     anonymous_floor, block_identity_widening_for_unverified_attach_transport,
     flush_verified_subject_cache_generation, global_mac_activation_control,
     remember_verified_claims, remember_verified_claims_with_credential, remember_verified_subject,
-    revoke_verified_subject_credential, subject_context, subject_context_with, MacActivationControl,
-    MacActivationError, MacActivationEvidence, MacActivationMode,
+    revoke_verified_subject_credential, subject_context, subject_context_with,
+    MacActivationControl, MacActivationError, MacActivationEvidence, MacActivationMode,
 };
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
 pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
@@ -153,9 +153,9 @@ pub use moq_resolve::{
     MAX_TRACK_SEGMENT_BYTES, SUPPORTED_TRACK_POLICY_REVISION,
 };
 pub use pep::{
-    bounded_audit_coordinate, BOUNDED_AUDIT_COORDINATE_MAX_BYTES, ClearanceSource,
-    DenyAllClearanceSource, MAX_AUDIT_COORDINATE_PREFIX_BYTES, MoqEventAction, MoqEventPep,
-    MoqMacAuditReason, MoqMacAuditRecord, MoqMacAuditSink,
+    bounded_audit_coordinate, ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep,
+    MoqMacAuditReason, MoqMacAuditRecord, MoqMacAuditSink, BOUNDED_AUDIT_COORDINATE_MAX_BYTES,
+    MAX_AUDIT_COORDINATE_PREFIX_BYTES,
 };
 // `RpcObjectLabelResolver` stays exported for the RPC/VFS/9P planes. The
 // MoQ/event plane deliberately consumes only `MoqEventLabelResolver`

@@ -103,7 +103,9 @@ async fn tcp_full_session() {
 
     // Stat (getattr).
     match rpc(&mut client, msg::tgetattr(6, 1, 0x7ff)).await {
-        Response::Getattr { size, .. } => assert_eq!(size, b"hello from kata-translator".len() as u64),
+        Response::Getattr { size, .. } => {
+            assert_eq!(size, b"hello from kata-translator".len() as u64)
+        }
         other => panic!("expected Rgetattr, got {other:?}"),
     }
 

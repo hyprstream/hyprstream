@@ -54,7 +54,12 @@ impl UdsRpcServer {
         processor: P,
         signing_key: SigningKey,
     ) -> Self {
-        Self::with_capacity(listener, Arc::new(processor), signing_key, DEFAULT_STREAM_LIMIT)
+        Self::with_capacity(
+            listener,
+            Arc::new(processor),
+            signing_key,
+            DEFAULT_STREAM_LIMIT,
+        )
     }
 
     /// Build a server with an explicit server-wide concurrent-stream cap.
@@ -124,13 +129,20 @@ impl UdsRpcServer {
     /// [`DRAIN_TIMEOUT`]) for every in-flight stream to release its permit, then
     /// close the semaphore. Mirrors [`QuinnRpcServer::shutdown`](super::quinn_transport::QuinnRpcServer::shutdown).
     pub async fn shutdown(stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken) {
-        Self::shutdown_until(stream_limit, capacity, token,
-            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT).await;
+        Self::shutdown_until(
+            stream_limit,
+            capacity,
+            token,
+            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT,
+        )
+        .await;
     }
 
     /// Drain against the owner's shared deadline, without starting a new grace.
     pub async fn shutdown_until(
-        stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken,
+        stream_limit: &Arc<Semaphore>,
+        capacity: u32,
+        token: &CancellationToken,
         deadline: tokio::time::Instant,
     ) {
         token.cancel();

@@ -4,11 +4,11 @@
 //! pattern over the 9P protocol. These replace the old `read_file`/`write_file`/`mkdir`
 //! convenience methods that sent entire files in a single message.
 
+use anyhow::Result;
 use hyprstream_rpc_std::registry_client::WorktreeClient;
 use hyprstream_rpc_std::registry_client::{
-    NpWalk, NpOpen, NpCreate, NpRead, NpWrite, NpClunk, NpRemove, NpStatReq,
+    NpClunk, NpCreate, NpOpen, NpRead, NpRemove, NpStatReq, NpWalk, NpWrite,
 };
-use anyhow::Result;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -71,9 +71,7 @@ pub struct DirEntryInfo {
 // auto-trait-bounds caveat is accepted because every caller drives this over
 // a known-Send client within one runtime.
 #[allow(async_fn_in_trait)]
-pub trait WorktreeClientExt:
-    hyprstream_rpc_std::registry_client::WorktreeRpc
-{
+pub trait WorktreeClientExt: hyprstream_rpc_std::registry_client::WorktreeRpc {
     /// Read at most `limit` bytes without transferring the rest of a file.
     /// Used for checkpoint metadata preflight before tensor allocation.
     async fn read_file_prefix(&self, path: &str, limit: usize) -> Result<Vec<u8>> {
@@ -126,7 +124,13 @@ pub trait WorktreeClientExt:
         let wnames = split_path(path);
 
         // Walk to the file
-        let _walk_resp = self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await?;
+        let _walk_resp = self
+            .walk(&NpWalk {
+                fid: 0,
+                newfid: fid,
+                wnames: wnames.clone(),
+            })
+            .await?;
 
         // Stat to get file size (for pre-allocation)
         let stat_resp = self.np_stat(&NpStatReq { fid }).await?;
@@ -140,7 +144,13 @@ pub trait WorktreeClientExt:
         let mut buf = Vec::with_capacity(file_size as usize);
         let mut offset = 0u64;
         loop {
-            let resp = self.read(&NpRead { fid, offset, count: iounit }).await?;
+            let resp = self
+                .read(&NpRead {
+                    fid,
+                    offset,
+                    count: iounit,
+                })
+                .await?;
             if resp.data.is_empty() {
                 break; // EOF
             }
@@ -160,7 +170,10 @@ pub trait WorktreeClientExt:
     async fn write_file_chunked(&self, path: &str, data: &[u8]) -> Result<()> {
         let components = split_path(path);
         let (parent_components, file_name) = if components.len() > 1 {
-            (&components[..components.len() - 1], &components[components.len() - 1])
+            (
+                &components[..components.len() - 1],
+                &components[components.len() - 1],
+            )
         } else if components.len() == 1 {
             // File is in the root directory
             (&components[..0], &components[0])
@@ -174,13 +187,30 @@ pub trait WorktreeClientExt:
         let parent_wnames: Vec<String> = parent_components.to_vec();
         if parent_wnames.is_empty() {
             // Root directory — walk with empty wnames
-            self.walk(&NpWalk { fid: 0, newfid: fid, wnames: vec![] }).await?;
+            self.walk(&NpWalk {
+                fid: 0,
+                newfid: fid,
+                wnames: vec![],
+            })
+            .await?;
         } else {
-            self.walk(&NpWalk { fid: 0, newfid: fid, wnames: parent_wnames.clone() }).await?;
+            self.walk(&NpWalk {
+                fid: 0,
+                newfid: fid,
+                wnames: parent_wnames.clone(),
+            })
+            .await?;
         }
 
         // Create the file (opens it for writing)
-        let create_resp = self.create(&NpCreate { fid, name: file_name.clone(), perm: 0o644, mode: OWRITE }).await?;
+        let create_resp = self
+            .create(&NpCreate {
+                fid,
+                name: file_name.clone(),
+                perm: 0o644,
+                mode: OWRITE,
+            })
+            .await?;
         let iounit = create_resp.iounit;
 
         // Write in iounit-sized chunks
@@ -188,7 +218,13 @@ pub trait WorktreeClientExt:
         while offset < data.len() as u64 {
             let end = std::cmp::min(offset + iounit as u64, data.len() as u64);
             let chunk = &data[offset as usize..end as usize];
-            let write_resp = self.write(&NpWrite { fid, offset, data: chunk.to_vec() }).await?;
+            let write_resp = self
+                .write(&NpWrite {
+                    fid,
+                    offset,
+                    data: chunk.to_vec(),
+                })
+                .await?;
             offset += write_resp.count as u64;
         }
 
@@ -210,12 +246,24 @@ pub trait WorktreeClientExt:
         // Walk + create each component
         let mut current_fid = next_fid();
         // Start at root
-        self.walk(&NpWalk { fid: 0, newfid: current_fid, wnames: vec![] }).await?;
+        self.walk(&NpWalk {
+            fid: 0,
+            newfid: current_fid,
+            wnames: vec![],
+        })
+        .await?;
 
         for component in &components {
             let child_fid = next_fid();
             // Try to walk to the component first (it may already exist)
-            match self.walk(&NpWalk { fid: current_fid, newfid: child_fid, wnames: vec![component.clone()] }).await {
+            match self
+                .walk(&NpWalk {
+                    fid: current_fid,
+                    newfid: child_fid,
+                    wnames: vec![component.clone()],
+                })
+                .await
+            {
                 Ok(_) => {
                     // Directory exists, clunk the old fid and continue
                     self.clunk(&NpClunk { fid: current_fid }).await?;
@@ -223,7 +271,13 @@ pub trait WorktreeClientExt:
                 }
                 Err(_) => {
                     // Directory doesn't exist — create it
-                    self.create(&NpCreate { fid: current_fid, name: component.clone(), perm: DMDIR | 0o755, mode: OREAD }).await?;
+                    self.create(&NpCreate {
+                        fid: current_fid,
+                        name: component.clone(),
+                        perm: DMDIR | 0o755,
+                        mode: OREAD,
+                    })
+                    .await?;
                     // After create, the fid now points to the new directory
                     // current_fid is mutated by the server (fid now = new dir)
                 }
@@ -242,7 +296,14 @@ pub trait WorktreeClientExt:
         let wnames = split_path(path);
 
         // Try to walk to the path
-        match self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await {
+        match self
+            .walk(&NpWalk {
+                fid: 0,
+                newfid: fid,
+                wnames: wnames.clone(),
+            })
+            .await
+        {
             Ok(_) => {
                 let stat_resp = self.np_stat(&NpStatReq { fid }).await?;
                 self.clunk(&NpClunk { fid }).await?;
@@ -275,7 +336,12 @@ pub trait WorktreeClientExt:
         let fid = next_fid();
         let wnames = split_path(path);
 
-        self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await?;
+        self.walk(&NpWalk {
+            fid: 0,
+            newfid: fid,
+            wnames: wnames.clone(),
+        })
+        .await?;
         self.remove(&NpRemove { fid }).await?;
 
         Ok(())
@@ -300,7 +366,12 @@ pub trait WorktreeClientExt:
         let fid = next_fid();
         let wnames = split_path(path);
 
-        self.walk(&NpWalk { fid: 0, newfid: fid, wnames: wnames.clone() }).await?;
+        self.walk(&NpWalk {
+            fid: 0,
+            newfid: fid,
+            wnames: wnames.clone(),
+        })
+        .await?;
         let open_resp = self.open(&NpOpen { fid, mode: OREAD }).await?;
         let iounit = open_resp.iounit;
 
@@ -310,7 +381,13 @@ pub trait WorktreeClientExt:
         let mut entries = Vec::new();
         let mut offset = 0u64;
         loop {
-            let resp = self.read(&NpRead { fid, offset, count: iounit }).await?;
+            let resp = self
+                .read(&NpRead {
+                    fid,
+                    offset,
+                    count: iounit,
+                })
+                .await?;
             if resp.data.is_empty() {
                 break;
             }
@@ -318,19 +395,23 @@ pub trait WorktreeClientExt:
             // Each entry is: name_len(u32) + name(utf8) + is_dir(u8) + size(u64)
             let mut cursor = 0;
             while cursor + 4 <= resp.data.len() {
-                let name_len = u32::from_le_bytes(
-                    resp.data[cursor..cursor + 4].try_into().unwrap_or([0; 4])
-                ) as usize;
+                let name_len =
+                    u32::from_le_bytes(resp.data[cursor..cursor + 4].try_into().unwrap_or([0; 4]))
+                        as usize;
                 cursor += 4;
-                if cursor + name_len > resp.data.len() { break; }
-                let name = String::from_utf8_lossy(&resp.data[cursor..cursor + name_len]).to_string();
+                if cursor + name_len > resp.data.len() {
+                    break;
+                }
+                let name =
+                    String::from_utf8_lossy(&resp.data[cursor..cursor + name_len]).to_string();
                 cursor += name_len;
-                if cursor + 9 > resp.data.len() { break; }
+                if cursor + 9 > resp.data.len() {
+                    break;
+                }
                 let is_dir = resp.data[cursor] != 0;
                 cursor += 1;
-                let size = u64::from_le_bytes(
-                    resp.data[cursor..cursor + 8].try_into().unwrap_or([0; 8])
-                );
+                let size =
+                    u64::from_le_bytes(resp.data[cursor..cursor + 8].try_into().unwrap_or([0; 8]));
                 cursor += 8;
                 entries.push(DirEntryInfo { name, is_dir, size });
             }

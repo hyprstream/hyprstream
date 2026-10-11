@@ -11,7 +11,7 @@
 
 use super::calibration::CalibrationStore;
 use super::decision_batch::DecisionBatchStore;
-use super::{METRICS_TABLE, MetricRecord, create_record_batch};
+use super::{create_record_batch, MetricRecord, METRICS_TABLE};
 use crate::storage::StorageBackend;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -82,7 +82,10 @@ impl<B: StorageBackend> MetricsProducer<B> {
     /// does not set itself.
     pub async fn emit(&self, mut record: MetricRecord) -> Result<(), Status> {
         for (key, value) in &self.default_labels {
-            record.labels.entry(key.clone()).or_insert_with(|| value.clone());
+            record
+                .labels
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
         if record.tenant_id.is_none() {
             record.tenant_id.clone_from(&self.default_tenant);
@@ -103,7 +106,10 @@ impl<B: StorageBackend> MetricsProducer<B> {
         let mut merged = Vec::new();
         for mut record in records {
             for (key, value) in &self.default_labels {
-                record.labels.entry(key.clone()).or_insert_with(|| value.clone());
+                record
+                    .labels
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
             }
             if record.tenant_id.is_none() {
                 record.tenant_id.clone_from(&self.default_tenant);

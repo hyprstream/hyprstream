@@ -20,7 +20,7 @@ use std::fs;
 use std::path::Path;
 
 use hyprstream_vfs::overlay::passthrough_rootfs_overlay;
-use hyprstream_vfs::{FsMount, Mount, MountError, SetAttr, Subject, OREAD, ORDWR, OWRITE};
+use hyprstream_vfs::{FsMount, Mount, MountError, SetAttr, Subject, ORDWR, OREAD, OWRITE};
 
 fn subject() -> Subject {
     Subject::new("tenant-a")
@@ -32,7 +32,8 @@ fn subject() -> Subject {
 #[test]
 fn adapter_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<hyprstream_vfs::FuseFileSystemMount<fuse_backend_rs::overlayfs::OverlayFs>>();
+    assert_send_sync::<hyprstream_vfs::FuseFileSystemMount<fuse_backend_rs::overlayfs::OverlayFs>>(
+    );
     // And usable as the trait object a Namespace stores.
     fn _coerce(m: std::sync::Arc<dyn FsMount>) -> std::sync::Arc<dyn Mount> {
         m
@@ -102,7 +103,9 @@ fn whiteouts_available() -> bool {
 #[tokio::test]
 async fn lower_file_is_visible_through_overlay() {
     let h = harness(&[("greeting.txt", b"hello from lower\n")]);
-    let data = read_file(&h.overlay, &["greeting.txt"], &subject()).await.unwrap();
+    let data = read_file(&h.overlay, &["greeting.txt"], &subject())
+        .await
+        .unwrap();
     assert_eq!(data, b"hello from lower\n");
 }
 
@@ -114,8 +117,15 @@ async fn write_triggers_copy_up_lower_untouched() {
     // Open the lower file RDWR and overwrite — OverlayFs copies it up to the
     // writable upper layer.
     let mut fid = h.overlay.walk(&["doc.txt"], &caller).await.unwrap();
-    h.overlay.open(&mut fid, ORDWR | hyprstream_vfs::OTRUNC, &caller).await.unwrap();
-    let n = h.overlay.write(&fid, 0, b"modified\n", &caller).await.unwrap();
+    h.overlay
+        .open(&mut fid, ORDWR | hyprstream_vfs::OTRUNC, &caller)
+        .await
+        .unwrap();
+    let n = h
+        .overlay
+        .write(&fid, 0, b"modified\n", &caller)
+        .await
+        .unwrap();
     assert_eq!(n, b"modified\n".len() as u32);
     h.overlay.clunk(fid, &caller).await;
 
@@ -133,19 +143,28 @@ async fn create_new_file_in_upper() {
     let h = harness(&[]);
     let caller = subject();
 
-    FsMount::create(&h.overlay, &["fresh.txt"], 0o644, &caller).await.unwrap();
+    FsMount::create(&h.overlay, &["fresh.txt"], 0o644, &caller)
+        .await
+        .unwrap();
 
     // Re-open for write and put content in.
     let mut fid = h.overlay.walk(&["fresh.txt"], &caller).await.unwrap();
     h.overlay.open(&mut fid, OWRITE, &caller).await.unwrap();
-    h.overlay.write(&fid, 0, b"brand new\n", &caller).await.unwrap();
+    h.overlay
+        .write(&fid, 0, b"brand new\n", &caller)
+        .await
+        .unwrap();
     h.overlay.clunk(fid, &caller).await;
 
-    let data = read_file(&h.overlay, &["fresh.txt"], &caller).await.unwrap();
+    let data = read_file(&h.overlay, &["fresh.txt"], &caller)
+        .await
+        .unwrap();
     assert_eq!(data, b"brand new\n");
 
     // create on an existing name fails closed.
-    let err = FsMount::create(&h.overlay, &["fresh.txt"], 0o644, &caller).await.unwrap_err();
+    let err = FsMount::create(&h.overlay, &["fresh.txt"], 0o644, &caller)
+        .await
+        .unwrap_err();
     assert!(matches!(err, MountError::AlreadyExists(_)), "got {err:?}");
 }
 
@@ -155,7 +174,9 @@ async fn mkdir_and_readdir() {
     let caller = subject();
 
     h.overlay.mkdir(&["sub"], 0o755, &caller).await.unwrap();
-    FsMount::create(&h.overlay, &["sub", "nested.txt"], 0o644, &caller).await.unwrap();
+    FsMount::create(&h.overlay, &["sub", "nested.txt"], 0o644, &caller)
+        .await
+        .unwrap();
 
     // readdir of root: lower files + new dir all merged by OverlayFs.
     let mut fid = h.overlay.walk(&[], &caller).await.unwrap();
@@ -175,12 +196,22 @@ async fn setattr_truncate() {
     let caller = subject();
 
     h.overlay
-        .setattr(&["big.txt"], &SetAttr { size: Some(4), ..Default::default() }, &caller)
+        .setattr(
+            &["big.txt"],
+            &SetAttr {
+                size: Some(4),
+                ..Default::default()
+            },
+            &caller,
+        )
         .await
         .unwrap();
 
     let data = read_file(&h.overlay, &["big.txt"], &caller).await.unwrap();
-    assert_eq!(data, b"0123", "truncate via setattr (copy-up) should shorten");
+    assert_eq!(
+        data, b"0123",
+        "truncate via setattr (copy-up) should shorten"
+    );
 
     // stat_path reflects the new size.
     let st = h.overlay.stat_path(&["big.txt"], &caller).await.unwrap();
@@ -194,7 +225,9 @@ async fn subject_threaded_anonymous_vs_named() {
     let h = harness(&[("shared.txt", b"data\n")]);
 
     let named = Subject::new("alice");
-    let data = read_file(&h.overlay, &["shared.txt"], &named).await.unwrap();
+    let data = read_file(&h.overlay, &["shared.txt"], &named)
+        .await
+        .unwrap();
     assert_eq!(data, b"data\n");
 
     let anon = Subject::anonymous();
@@ -212,13 +245,17 @@ async fn unlink_lower_file_whiteout() {
     let caller = subject();
 
     // Sanity: visible before delete.
-    assert!(read_file(&h.overlay, &["doomed.txt"], &caller).await.is_ok());
+    assert!(read_file(&h.overlay, &["doomed.txt"], &caller)
+        .await
+        .is_ok());
 
     // Delete a file that exists only in the RO lower → OverlayFs lays a whiteout
     // in the upper layer; the lower file is masked, not mutated.
     h.overlay.unlink(&["doomed.txt"], &caller).await.unwrap();
 
-    let err = read_file(&h.overlay, &["doomed.txt"], &caller).await.unwrap_err();
+    let err = read_file(&h.overlay, &["doomed.txt"], &caller)
+        .await
+        .unwrap_err();
     assert!(matches!(err, MountError::NotFound(_)), "got {err:?}");
 
     // The lower host file still exists (whiteout, not deletion).
@@ -239,7 +276,10 @@ async fn rename_across_layers() {
 
     // Rename a lower-only file to a new name: OverlayFs copies the source up and
     // whiteouts the old location.
-    h.overlay.rename(&["src.txt"], &["dst.txt"], &caller).await.unwrap();
+    h.overlay
+        .rename(&["src.txt"], &["dst.txt"], &caller)
+        .await
+        .unwrap();
 
     let data = read_file(&h.overlay, &["dst.txt"], &caller).await.unwrap();
     assert_eq!(data, b"payload\n");

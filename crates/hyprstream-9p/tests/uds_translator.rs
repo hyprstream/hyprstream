@@ -68,10 +68,21 @@ impl Mount for TestMount {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-        let state = fid.downcast_ref::<TestFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
+        let state = fid
+            .downcast_ref::<TestFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let joined = state.path.join("/");
-        let data = self.files.get(&joined).ok_or_else(|| MountError::NotFound(joined))?;
+        let data = self
+            .files
+            .get(&joined)
+            .ok_or_else(|| MountError::NotFound(joined))?;
         let off = offset as usize;
         if off >= data.len() {
             return Ok(vec![]);
@@ -80,7 +91,13 @@ impl Mount for TestMount {
         Ok(data[off..end].to_vec())
     }
 
-    async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+    async fn write(
+        &self,
+        _fid: &Fid,
+        _offset: u64,
+        _data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
         Err(MountError::NotSupported("read-only test mount".into()))
     }
 
@@ -88,18 +105,39 @@ impl Mount for TestMount {
         Ok(self
             .files
             .keys()
-            .map(|k| DirEntry { name: k.clone(), is_dir: false, size: 0, stat: None })
+            .map(|k| DirEntry {
+                name: k.clone(),
+                is_dir: false,
+                size: 0,
+                stat: None,
+            })
             .collect())
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let state = fid.downcast_ref::<TestFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        let state = fid
+            .downcast_ref::<TestFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         if state.path.is_empty() {
-            return Ok(Stat { qtype: 0x80, version: 1, path: 0, size: 0, name: String::new(), mtime: 0 });
+            return Ok(Stat {
+                qtype: 0x80,
+                version: 1,
+                path: 0,
+                size: 0,
+                name: String::new(),
+                mtime: 0,
+            });
         }
         let joined = state.path.join("/");
         let size = self.files.get(&joined).map(|d| d.len() as u64).unwrap_or(0);
-        Ok(Stat { qtype: 0, version: 1, path: 1, size, name: joined, mtime: 0 })
+        Ok(Stat {
+            qtype: 0,
+            version: 1,
+            path: 1,
+            size,
+            name: joined,
+            mtime: 0,
+        })
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
@@ -133,7 +171,10 @@ async fn uds_full_session() {
     let sock = std::env::temp_dir().join(format!(
         "hyprstream-9p-uds-{}-{}.sock",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();

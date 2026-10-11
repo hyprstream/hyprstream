@@ -42,12 +42,17 @@ impl MediatedEvidence {
         }
         if !crate::envelope::mediated_request_fits(&envelope.envelope)
             || envelope.cose.len() > MAX_MEDIATED_EVIDENCE_BYTES
-            || envelope.pq_kem_ciphertext.as_ref().is_some_and(|bytes| bytes.len() > MAX_MEDIATED_EVIDENCE_BYTES)
+            || envelope
+                .pq_kem_ciphertext
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > MAX_MEDIATED_EVIDENCE_BYTES)
         {
             return None;
         }
         let mut message = capnp::message::Builder::new_default();
-        envelope.write_to(&mut message.init_root::<crate::common_capnp::signed_envelope::Builder<'_>>());
+        envelope.write_to(
+            &mut message.init_root::<crate::common_capnp::signed_envelope::Builder<'_>>(),
+        );
         let bytes = capnp::serialize::write_message_to_words(&message);
         (bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES).then(|| Self(bytes.into()))
     }
@@ -237,7 +242,11 @@ impl EnvelopeContext {
     /// Verify the original holder's hybrid transcript without granting local
     /// transport provenance. Credential verification is still mandatory.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn from_mediated_evidence(evidence: &[u8], mediator_service: &str, operation: &str) -> Result<Self> {
+    pub fn from_mediated_evidence(
+        evidence: &[u8],
+        mediator_service: &str,
+        operation: &str,
+    ) -> Result<Self> {
         if crate::authorization_witness::is_witness_evidence(evidence) {
             let verified = crate::authorization_witness::verify(evidence, mediator_service)?;
             if let Some(signed_operation) = verified.operation.as_deref() {
@@ -258,8 +267,13 @@ impl EnvelopeContext {
                 Some(MediatedEvidence(evidence.to_vec().into())),
             ));
         }
-        let signed = crate::envelope::verify_mediated_envelope_evidence(evidence, mediator_service)?;
-        crate::proof::policy::verify_mediated_operation(mediator_service, &signed.envelope.payload, operation)?;
+        let signed =
+            crate::envelope::verify_mediated_envelope_evidence(evidence, mediator_service)?;
+        crate::proof::policy::verify_mediated_operation(
+            mediator_service,
+            &signed.envelope.payload,
+            operation,
+        )?;
         Ok(Self::from_verified(&signed))
     }
 
@@ -267,36 +281,64 @@ impl EnvelopeContext {
     /// Possession of these bytes is not an identity grant; the receiver must
     /// independently verify holder, credential, target, method and freshness.
     pub fn original_holder_evidence(&self) -> Option<&[u8]> {
-        self.original_holder_evidence.as_ref().map(|evidence| evidence.0.as_ref())
+        self.original_holder_evidence
+            .as_ref()
+            .map(|evidence| evidence.0.as_ref())
     }
 
     /// Record a verified holder's derived authorization query, independently
     /// of the request's original dispatch admission. No default local store:
     /// startup must install the topology-qualified replay backend.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn admit_mediated_query(&self, mediator: &str, resource: &str, operation: &str) -> Result<()> {
-        use crate::proof::admission::{global_proof_replay_store, admit_mediated_query, validate_mediated_query_dimensions, MediatedQueryReplayKey, ProofAdmissionResult};
+    pub fn admit_mediated_query(
+        &self,
+        mediator: &str,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
+        use crate::proof::admission::{
+            admit_mediated_query, global_proof_replay_store, validate_mediated_query_dimensions,
+            MediatedQueryReplayKey, ProofAdmissionResult,
+        };
         use sha2::{Digest, Sha256};
-        anyhow::ensure!(self.claims().is_some() && self.original_holder_evidence.is_some(), "verified holder evidence required");
+        anyhow::ensure!(
+            self.claims().is_some() && self.original_holder_evidence.is_some(),
+            "verified holder evidence required"
+        );
         // Validate mediated-query dimensions on the borrowed values before the
         // owned replay key is built (bounded preallocation, Sol MED-2).
         validate_mediated_query_dimensions(mediator, resource, operation)?;
-        anyhow::ensure!(self.service_domain.as_deref() == Some(mediator), "mediator target mismatch");
+        anyhow::ensure!(
+            self.service_domain.as_deref() == Some(mediator),
+            "mediator target mismatch"
+        );
         // Envelope iat is milliseconds and its age boundary is inclusive.
         // Retain through that last accepted millisecond, rounding up to the
         // replay store's exclusive seconds boundary, never down.
-        let last_valid_ms = self.request_iat.checked_add(crate::envelope::MAX_TIMESTAMP_AGE_MS)
+        let last_valid_ms = self
+            .request_iat
+            .checked_add(crate::envelope::MAX_TIMESTAMP_AGE_MS)
             .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?;
-        let expires_at = u64::try_from(last_valid_ms.div_euclid(1000).checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?)?;
+        let expires_at = u64::try_from(
+            last_valid_ms
+                .div_euclid(1000)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?,
+        )?;
         let key = MediatedQueryReplayKey {
             signer_thumbprint: Sha256::digest(self.cnf).into(),
             request_id: self.request_id,
             request_nonce: self.request_nonce,
-            mediator: mediator.to_owned(), resource: resource.to_owned(), operation: operation.to_owned(),
+            mediator: mediator.to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
         };
-        let store = global_proof_replay_store().ok_or_else(|| anyhow::anyhow!("no mediated replay backend installed"))?;
-        anyhow::ensure!(admit_mediated_query(store, &key, expires_at) == ProofAdmissionResult::Admitted, "mediated query replay admission denied");
+        let store = global_proof_replay_store()
+            .ok_or_else(|| anyhow::anyhow!("no mediated replay backend installed"))?;
+        anyhow::ensure!(
+            admit_mediated_query(store, &key, expires_at) == ProofAdmissionResult::Admitted,
+            "mediated query replay admission denied"
+        );
         Ok(())
     }
 
@@ -308,12 +350,20 @@ impl EnvelopeContext {
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
-        Self::from_authenticated_request(&envelope.envelope, envelope.cnf, MediatedEvidence::from_envelope(envelope))
+        Self::from_authenticated_request(
+            &envelope.envelope,
+            envelope.cnf,
+            MediatedEvidence::from_envelope(envelope),
+        )
     }
 
     // Only callers that verified either the envelope or the purpose-bound
     // witness may use this. Credential verification is still mandatory.
-    fn from_authenticated_request(envelope: &crate::envelope::RequestEnvelope, cnf: [u8; 32], evidence: Option<MediatedEvidence>) -> Self {
+    fn from_authenticated_request(
+        envelope: &crate::envelope::RequestEnvelope,
+        cnf: [u8; 32],
+        evidence: Option<MediatedEvidence>,
+    ) -> Self {
         Self {
             request_id: envelope.request_id,
             claims: None,
@@ -806,7 +856,9 @@ impl EnvelopeContext {
         resource: String,
         operation: String,
     ) -> anyhow::Result<()> {
-        let (claims, subject) = self.deferred_federate.take()
+        let (claims, subject) = self
+            .deferred_federate
+            .take()
             .ok_or_else(|| anyhow::anyhow!("no deferred Federate credential"))?;
         anyhow::ensure!(
             holder_ed != [0; 32]
@@ -814,7 +866,10 @@ impl EnvelopeContext {
                 && verified.primary_principal.as_deref() == Some(claims.sub.as_str())
                 && verified.primary_suite == "hs-cose-sign-ed25519-mldsa65-wns-v1"
                 && subject.name() == Some(claims.sub.as_str())
-                && claims.tenant.as_deref().is_some_and(|tenant| !tenant.is_empty() && tenant != "*")
+                && claims
+                    .tenant
+                    .as_deref()
+                    .is_some_and(|tenant| !tenant.is_empty() && tenant != "*")
                 && !resource.is_empty()
                 && !operation.is_empty(),
             "Federate holder/subject/profile mismatch"
@@ -833,7 +888,9 @@ impl EnvelopeContext {
     /// A serving handler must compare every generated authorization call with
     /// this tuple and perform its ordinary fresh Policy check as well.
     pub fn admitted_federate_operation(&self, resource: &str, operation: &str) -> bool {
-        self.federate_request_use.as_ref().is_some_and(|(r, a)| r == resource && a == operation)
+        self.federate_request_use
+            .as_ref()
+            .is_some_and(|(r, a)| r == resource && a == operation)
     }
 
     pub fn is_federate_admitted(&self) -> bool {
@@ -1018,10 +1075,8 @@ pub trait RequestService: 'static {
     /// An unknown discriminant, a malformed body, or a body exceeding the
     /// reviewed decode caps is an error — the same denial as an unlisted
     /// leaf, never a coarser fallback.
-    fn decode_request_body(
-        &self,
-        signed_body: &[u8],
-    ) -> Result<crate::service::DecodedRequestBody>;
+    fn decode_request_body(&self, signed_body: &[u8])
+        -> Result<crate::service::DecodedRequestBody>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -1199,7 +1254,12 @@ pub trait RequestService: 'static {
         _ctx: &EnvelopeContext,
         _body: &crate::service::DecodedRequestBody,
         _proof: &crate::proof::parser::ParsedProof,
-    ) -> anyhow::Result<(crate::proof::verify::VerifiedProof, [u8; 32], String, String)> {
+    ) -> anyhow::Result<(
+        crate::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+    )> {
         anyhow::bail!("Federate request admission is disabled")
     }
 
@@ -1534,23 +1594,20 @@ pub trait RequestService: 'static {
                             );
                             anyhow::anyhow!("JWT key resolution failed")
                         })?;
-                    crate::auth::decode_with_key(
-                        &token,
-                        &verifying_key,
-                        self.expected_audience(),
-                    )
+                    crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
                 } else {
-                    let candidates = key_source
-                        .get_keys(&unverified.iss, None)
-                        .await
-                        .map_err(|e| {
-                            tracing::warn!(
-                                "JWT key resolution failed for kid-less iss={}: {}",
-                                unverified.iss,
-                                e
-                            );
-                            anyhow::anyhow!("JWT key resolution failed")
-                        })?;
+                    let candidates =
+                        key_source
+                            .get_keys(&unverified.iss, None)
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(
+                                    "JWT key resolution failed for kid-less iss={}: {}",
+                                    unverified.iss,
+                                    e
+                                );
+                                anyhow::anyhow!("JWT key resolution failed")
+                            })?;
                     crate::auth::decode_with_any_key_lenient(
                         &token,
                         &candidates,
@@ -1574,7 +1631,8 @@ pub trait RequestService: 'static {
         // static credential. A future adapter must replace this denial only
         // after complete request-local proof and authority admission exists.
         if verified.has_federate_profile_marker()
-            || verified.is_reserved_federate_staging_credential() {
+            || verified.is_reserved_federate_staging_credential()
+        {
             let generation = verified.session_authority_generation()?;
             anyhow::ensure!(
                 self.accept_deferred_federate_credential()
@@ -1595,11 +1653,17 @@ pub trait RequestService: 'static {
                 crate::auth::is_local_iss(&verified.iss, &local_refs),
                 "Federate host issuer is not local"
             );
-            let jti = verified.jti.as_deref().ok_or_else(|| anyhow::anyhow!("missing Federate jti"))?;
-            let revocations = self.credential_revocation_store()
+            let jti = verified
+                .jti
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing Federate jti"))?;
+            let revocations = self
+                .credential_revocation_store()
                 .ok_or_else(|| anyhow::anyhow!("Federate revocation authority unavailable"))?;
             anyhow::ensure!(
-                !revocations.is_revoked(&crate::auth::CredentialId::jwt(&verified.iss, jti)).await,
+                !revocations
+                    .is_revoked(&crate::auth::CredentialId::jwt(&verified.iss, jti))
+                    .await,
                 "Federate credential revoked"
             );
             if let Some(expected) = ctx.envelope_wit_hash {
@@ -1735,15 +1799,18 @@ pub trait RequestService: 'static {
             let holder_matches = if let Some(expected) = verified.cnf_key_bytes() {
                 bool::from(expected.ct_eq(&ctx.cnf))
             } else if let Some(jkt) = verified.cnf_jkt() {
-                let signer_jkt = crate::auth::jwk_thumbprint(
-                    &crate::auth::JwkThumbprintInput::Ed25519 { x: &ctx.cnf },
-                );
+                let signer_jkt =
+                    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
+                        x: &ctx.cnf,
+                    });
                 bool::from(signer_jkt.as_bytes().ct_eq(jkt.as_bytes()))
             } else {
                 false
             };
-            anyhow::ensure!(holder_matches,
-                "delegated service credential requires its bound holder signer");
+            anyhow::ensure!(
+                holder_matches,
+                "delegated service credential requires its bound holder signer"
+            );
         }
 
         // Store verified claims on context for downstream use
@@ -1917,8 +1984,7 @@ pub struct QuicLoopConfig {
     /// public carrier address. Used to advertise only an `IrohTransport` service
     /// entry when bound; it must never become a verification method.
     #[cfg(not(target_arch = "wasm32"))]
-    pub on_iroh_bound:
-        Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
+    pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
     /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
     /// spawner places it in the service's `ProducerReachConfig` (so published
@@ -1944,13 +2010,11 @@ pub struct QuicLoopConfig {
     /// `None`, the pre-#1027 posture stands: anonymous carriers are refused.
     /// Native-only.
     #[cfg(not(target_arch = "wasm32"))]
-    pub moq_admission:
-        Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    pub moq_admission: Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
     /// Optional service-owned ingress authorization. The spawner forwards it
     /// unchanged to the Iroh MoQL handler; absence is deliberately read-only.
     #[cfg(not(target_arch = "wasm32"))]
-    pub moq_ingress_authorizer:
-        Option<crate::transport::iroh_moq::SharedIngressAuthorizer>,
+    pub moq_ingress_authorizer: Option<crate::transport::iroh_moq::SharedIngressAuthorizer>,
     /// Native client proof for authenticated Iroh `moql` dials in this process.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
@@ -2102,10 +2166,16 @@ mod empty_iss_gate_tests {
             signed_body: &[u8],
         ) -> Result<crate::service::DecodedRequestBody> {
             // Byte-oriented mock: no Cap'n Proto schema, no derivable leaf.
-            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
         }
         fn name(&self) -> &str {
-            if self.federate_opt_in { "model" } else { "mock" }
+            if self.federate_opt_in {
+                "model"
+            } else {
+                "mock"
+            }
         }
         fn accept_deferred_federate_credential(&self) -> bool {
             self.federate_opt_in
@@ -2119,7 +2189,9 @@ mod empty_iss_gate_tests {
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
         }
-        fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+        fn credential_revocation_store(
+            &self,
+        ) -> Option<&dyn crate::auth::CredentialRevocationStore> {
             // Test-local revocation store: these tests verify local
             // jti-bearing tokens, and every production process publishes a
             // store at startup (the policy-authority bootstrap). Without
@@ -2151,10 +2223,9 @@ mod empty_iss_gate_tests {
             token: &str,
             _protected: &crate::auth::ProtectedHeader,
         ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
-            let controller = self
-                .internal_controller
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("internal work bearer is not accepted by this service"))?;
+            let controller = self.internal_controller.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("internal work bearer is not accepted by this service")
+            })?;
             anyhow::ensure!(
                 ctx.cnf == controller.to_bytes(),
                 "internal work bearer envelope was not signed by the pinned controller"
@@ -2168,7 +2239,9 @@ mod empty_iss_gate_tests {
             )?;
             anyhow::ensure!(
                 crate::auth::internal_work::admit_internal_work_jti_once(
-                    &claims.jti, claims.exp, now,
+                    &claims.jti,
+                    claims.exp,
+                    now,
                 ),
                 "internal work token jti was already admitted (replay)"
             );
@@ -2222,7 +2295,9 @@ mod empty_iss_gate_tests {
         let relay = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
         let claims = Claims::new("alice".into(), 1, 100)
             .with_tenant("tenant-a".into())
-            .with_scope(Some("query:model:qwen2.5-0.5b-instruct query:registry:List".into()))
+            .with_scope(Some(
+                "query:model:qwen2.5-0.5b-instruct query:registry:List".into(),
+            ))
             .with_cnf_jwk(&holder);
         let mut ctx = ctx_with_token("signature-verified-token".into(), false);
         ctx.cnf = relay;
@@ -2239,15 +2314,20 @@ mod empty_iss_gate_tests {
             approvers: vec![],
         };
         let mut wrong = ctx.clone();
-        assert!(wrong.commit_deferred_federate(&proof, relay,
-            "registry:List".into(), "query".into()).is_err());
+        assert!(wrong
+            .commit_deferred_federate(&proof, relay, "registry:List".into(), "query".into())
+            .is_err());
         assert!(wrong.subject().is_anonymous());
-        assert!(ctx.commit_deferred_federate(&proof, holder,
-            "registry:List".into(), "query".into()).is_ok());
+        assert!(ctx
+            .commit_deferred_federate(&proof, holder, "registry:List".into(), "query".into())
+            .is_ok());
         assert_eq!(ctx.subject().name(), Some("alice"));
         assert_eq!(ctx.domain().unwrap(), "tenant-a");
         assert_eq!(ctx.authenticated_signer_key().unwrap().to_bytes(), holder);
-        assert_eq!(ctx.verified_key_material(), crate::auth::mac::VerifiedKeyMaterial::PqHybrid);
+        assert_eq!(
+            ctx.verified_key_material(),
+            crate::auth::mac::VerifiedKeyMaterial::PqHybrid
+        );
         assert!(ctx.admitted_federate_operation("registry:List", "query"));
         assert!(!ctx.admitted_federate_operation("registry:Get", "query"));
         assert!(ctx.verified_direct_jwt().is_none());
@@ -2363,7 +2443,9 @@ mod empty_iss_gate_tests {
         let token = crate::auth::jwt::encode(&claims, &ca);
         let mut ctx = ctx_with_token(token.clone(), false);
         assert!(ctx.verified_direct_jwt().is_none());
-        svc.verify_claims(&mut ctx).await.expect("direct credential");
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("direct credential");
         let (verified, exact_token) = ctx.verified_direct_jwt().expect("verified direct token");
         assert_eq!(verified.sub, "alice");
         assert_eq!(exact_token, token);
@@ -2449,7 +2531,9 @@ mod empty_iss_gate_tests {
             .with_session_authority_generation([7; 32]);
         let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
         ctx.cnf = relay;
-        svc.verify_claims(&mut ctx).await.expect("reserved JWT snapshot may defer");
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("reserved JWT snapshot may defer");
         assert!(ctx.deferred_federate_credential().is_some());
         assert!(ctx.subject().is_anonymous());
         assert!(ctx.claims().is_none());
@@ -2677,7 +2761,9 @@ mod empty_iss_gate_tests {
         // The credential itself is valid when presented by its holder.
         let mut direct = ctx_with_token(token.clone(), true);
         direct.cnf = holder.verifying_key().to_bytes();
-        svc.verify_claims(&mut direct).await.expect("valid holder credential");
+        svc.verify_claims(&mut direct)
+            .await
+            .expect("valid holder credential");
         assert_eq!(direct.subject().name(), Some("service:policy"));
 
         // Service WITs are distributed as key attestations. Relay admission
@@ -2687,16 +2773,26 @@ mod empty_iss_gate_tests {
         replay.delegation_token = Some(token);
         replay.cnf = relay.verifying_key().to_bytes();
         let error = svc.verify_claims(&mut replay).await.expect_err(
-            "an admitted relay must not impersonate a published service credential's holder");
-        assert!(error.to_string().contains("requires its bound holder signer"));
-        assert!(replay.claims().is_none(), "rejected relay must not acquire verified claims");
+            "an admitted relay must not impersonate a published service credential's holder",
+        );
+        assert!(error
+            .to_string()
+            .contains("requires its bound holder signer"));
+        assert!(
+            replay.claims().is_none(),
+            "rejected relay must not acquire verified claims"
+        );
     }
 
     #[tokio::test]
     async fn delegated_service_thumbprint_requires_holder_and_missing_binding_denies() {
         let (mut svc, ca) = mock_service();
-        let holder = SigningKey::from_bytes(&[23u8; 32]).verifying_key().to_bytes();
-        let foreign = SigningKey::from_bytes(&[24u8; 32]).verifying_key().to_bytes();
+        let holder = SigningKey::from_bytes(&[23u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let foreign = SigningKey::from_bytes(&[24u8; 32])
+            .verifying_key()
+            .to_bytes();
         let now = chrono::Utc::now().timestamp();
         let base = Claims::new("service:policy".to_owned(), now, now + 300);
         for (claims, signer, allowed) in [
@@ -2716,8 +2812,16 @@ mod empty_iss_gate_tests {
                 assert_eq!(ctx.subject().name(), Some("service:policy"));
             } else {
                 let error = result.expect_err("foreign or unbound service delegation must deny");
-                assert!(error.to_string().contains("requires its bound holder signer"), "{error:#}");
-                assert!(ctx.claims().is_none(), "rejected delegation must publish no claims");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires its bound holder signer"),
+                    "{error:#}"
+                );
+                assert!(
+                    ctx.claims().is_none(),
+                    "rejected delegation must publish no claims"
+                );
             }
         }
     }
@@ -3062,7 +3166,9 @@ mod empty_iss_gate_tests {
             .await
             .expect_err("a credential carrying both sid and workload_session_id must be rejected");
         assert!(
-            ambiguous_err.to_string().contains("malformed session claims"),
+            ambiguous_err
+                .to_string()
+                .contains("malformed session claims"),
             "unexpected error for ambiguous session claims: {ambiguous_err}"
         );
 
@@ -3245,7 +3351,9 @@ mod ipc_key_identity_tests {
             &self,
             signed_body: &[u8],
         ) -> Result<crate::service::DecodedRequestBody> {
-            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
         }
         fn name(&self) -> &str {
             "discovery"
@@ -3940,7 +4048,6 @@ mod browser_method_commitment_tests {
     }
 }
 
-
 /// Internal execution work order (`iw+jwt`) routing tests — the
 /// single-service Model→Inference boundary's GENERIC pipeline half.
 ///
@@ -4005,7 +4112,9 @@ mod internal_work_routing_tests {
             &self,
             signed_body: &[u8],
         ) -> Result<crate::service::DecodedRequestBody> {
-            Ok(crate::service::DecodedRequestBody::opaque(signed_body.to_vec()))
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
         }
         fn name(&self) -> &str {
             "boundary-mock"
@@ -4047,7 +4156,9 @@ mod internal_work_routing_tests {
             )?;
             anyhow::ensure!(
                 crate::auth::internal_work::admit_internal_work_jti_once(
-                    &claims.jti, claims.exp, now,
+                    &claims.jti,
+                    claims.exp,
+                    now,
                 ),
                 "internal work token jti was already admitted (replay)"
             );
@@ -4143,7 +4254,11 @@ mod internal_work_routing_tests {
         svc.verify_claims(&mut ctx)
             .await
             .expect("the pinned controller's work order must be admitted");
-        assert_eq!(ctx.subject().name(), Some("alice"), "original caller identity");
+        assert_eq!(
+            ctx.subject().name(),
+            Some("alice"),
+            "original caller identity"
+        );
         assert_eq!(ctx.verified_tenant(), Some("tenant-a"));
         assert_eq!(
             ctx.claims().map(|c| c.sub.as_str()),
@@ -4208,7 +4323,10 @@ mod internal_work_routing_tests {
         // The EXACT resolved identity — no legacy prefix normalization.
         assert_eq!(ctx.subject(), crate::envelope::Subject::new("user:alice"));
         assert_eq!(ctx.subject().name(), Some("user:alice"));
-        assert_eq!(ctx.internal_work().expect("work order").subject, ctx.subject());
+        assert_eq!(
+            ctx.internal_work().expect("work order").subject,
+            ctx.subject()
+        );
         assert_eq!(ctx.claims().map(|c| c.sub.as_str()), Some("user:alice"));
         assert_eq!(ctx.verified_tenant(), Some("tenant-a"));
     }
@@ -4323,9 +4441,8 @@ mod internal_work_routing_tests {
             &controller,
         );
         let svc = BoundaryMockService::with_controller(&controller);
-        let admit = |token: String| {
-            ctx_with_internal_token(token, controller.verifying_key().to_bytes())
-        };
+        let admit =
+            |token: String| ctx_with_internal_token(token, controller.verifying_key().to_bytes());
         let mut first = admit(token.clone());
         svc.verify_claims(&mut first)
             .await
