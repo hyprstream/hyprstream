@@ -29,7 +29,11 @@ fn host_claims() -> Claims {
         .verifying_key()
         .to_bytes();
     let pq = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[42; 32]));
-    let mut claims = Claims::new("local-account".into(), NOW as i64, NOW as i64 + 60)
+    let mut claims = Claims::new(
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        NOW as i64,
+        NOW as i64 + 60,
+    )
         .with_issuer(HOST.into())
         .with_audience(Some(HOST.into()))
         .with_client_id(CLIENT)
@@ -147,7 +151,7 @@ fn fixture() -> (CredentialHandle, SessionPrimary, CollisionInventory) {
         issuer: HOST.into(),
         profile: PROFILE.into(),
         sid: "sid-a".into(),
-        subject: "local-account".into(),
+        subject: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
         tenant: "tenant-a".into(),
         client: CLIENT.into(),
         audience: HOST.into(),
@@ -743,6 +747,7 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
         .to_bytes();
     record_b.ed_public = b.expected.ed_public.to_vec();
     record_b.pq_public = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[52; 32]));
+    b.pq_public = record_b.pq_public.clone();
     b.expected.suite_thumbprint =
         signer_suite_thumbprint(SUITE, &[&record_b.ed_public, &record_b.pq_public]);
     record_b.sid = b.expected.sid.clone();
