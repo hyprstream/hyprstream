@@ -279,6 +279,42 @@ async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<
     assert_eq!(committed.subject, ATPROTO_DID);
     assert!(client.commit_federate_session(&commit).await.is_err());
 
+    // The SAME long-lived local client must read its current exact-key
+    // credential on every request, never falling back to its initial JWT.
+    let trust = hyprstream_service::global_trust_store();
+    let install = |claims: &Claims, expires_at| {
+        trust.insert(oauth_key.verifying_key(), hyprstream_service::Attestation {
+            scopes: ["oauth".to_owned()].into_iter().collect(), subject: None,
+            jwt: Some(jwt::encode_service_jwt(claims, &authority_key)), expires_at,
+            attested_by: Some(authority_key.verifying_key().to_bytes()),
+        });
+    };
+    let mut fresh_request = request.clone();
+    fresh_request.challenge_id = vec![12; 32];
+    fresh_request.source.jti = "renewed-source".to_owned();
+    fresh_request.source.token_hash = vec![44; 32];
+    install(&Claims { sub: "service:model".into(), ..claims.clone() }, now + 121);
+    assert!(client.prepare_federate_session(&fresh_request).await.is_err(),
+        "a replaced invalid credential must not reuse the initial valid token");
+    let renewed = claims.clone().with_jti();
+    install(&renewed, now + 122);
+    assert_eq!(client.prepare_federate_session(&fresh_request).await?.subject, ATPROTO_DID);
+    // Generic trust insertion is monotonic in expiry. Remove before seeding
+    // an already-expired entry to test expiry without sleeping or clock tricks.
+    trust.remove(&oauth_key.verifying_key());
+    install(&renewed, now - 1);
+    assert!(client.prepare_federate_session(&fresh_request).await.is_err(),
+        "expired trust-store enrollment must not reuse an earlier token");
+    trust.remove(&oauth_key.verifying_key());
+    assert!(client.prepare_federate_session(&fresh_request).await.is_err(),
+        "removed enrollment must not reuse an earlier token");
+    let expired = Claims { iat: now - 300, exp: now - 120, ..renewed.clone() };
+    install(&expired, now + 120);
+    assert!(client.prepare_federate_session(&fresh_request).await.is_err(),
+        "an expired current JWT must be rejected even with an unexpired attestation");
+    install(&renewed, now + 121);
+    assert_eq!(client.prepare_federate_session(&fresh_request).await?.subject, ATPROTO_DID);
+
     let missing = PolicyClient::for_local_transport_bootstrap(
         &transport, oauth_key.clone(), authority_key.verifying_key(), None,
     )?;

@@ -123,12 +123,28 @@ pub(crate) fn runtime_policy_client(
             Some(token),
         )
     } else {
-        PolicyClient::for_local_transport_bootstrap(
+        anyhow::ensure!(
+            matches!(
+                &transport.endpoint,
+                hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                    | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                    | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+            ),
+            "local bootstrap refuses network transport; use the identity-bound provider",
+        );
+        let key = signing_key.verifying_key();
+        let provider = Arc::new(move || {
+            hyprstream_service::global_trust_store()
+                .get(&key)
+                .and_then(|attestation| attestation.jwt)
+        });
+        let rpc = hyprstream_rpc::dial::dial_with_token_provider(
             transport,
-            signing_key,
-            policy_vk,
-            Some(token),
-        )
+            hyprstream_rpc::signer::LocalSigner::new(signing_key),
+            Some(policy_vk),
+            Some(provider),
+        )?;
+        Ok(PolicyClient::new(rpc))
     }
 }
 
@@ -1862,7 +1878,8 @@ mod tests {
             .and_then(|tail| tail.split("/// Create the OAuth Axum router.").next())
             .expect("production Policy constructor must exist");
         assert!(policy_constructor.contains("factories::service_token(&signing_key)"));
-        assert!(policy_constructor.contains("PolicyClient::for_local_transport_bootstrap("));
+        assert!(policy_constructor.contains("dial::dial_with_token_provider("));
+        assert!(policy_constructor.contains("local bootstrap refuses network transport"));
         assert!(policy_constructor.contains("Some(token)"));
         assert!(run.contains(
             "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
