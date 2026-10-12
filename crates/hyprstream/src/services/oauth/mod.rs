@@ -107,6 +107,47 @@ use state::OAuthState;
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "oauth";
 
+/// Use only this OAuth instance's enrolled credential. Native clients retain
+/// their existing renewing provider; the initial token enables that provider.
+pub(crate) fn runtime_policy_client(
+    transport: &TransportConfig,
+    signing_key: hyprstream_rpc::crypto::SigningKey,
+    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
+) -> Result<PolicyClient> {
+    let token = crate::services::factories::service_token(&signing_key)
+        .ok_or_else(|| anyhow::anyhow!("OAuth has no enrolled service credential"))?;
+    if hyprstream_discovery::native_network_required() {
+        PolicyClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key,
+            Some(token),
+        )
+    } else {
+        anyhow::ensure!(
+            matches!(
+                &transport.endpoint,
+                hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                    | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                    | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+            ),
+            "local bootstrap refuses network transport; use the identity-bound provider",
+        );
+        let key = signing_key.verifying_key();
+        let provider = Arc::new(move || {
+            hyprstream_service::global_trust_store()
+                .get(&key)
+                .and_then(|attestation| attestation.jwt)
+        });
+        let rpc = hyprstream_rpc::dial::dial_with_token_provider(
+            transport,
+            hyprstream_rpc::signer::LocalSigner::new(signing_key),
+            Some(policy_vk),
+            Some(provider),
+        )?;
+        Ok(PolicyClient::new(rpc))
+    }
+}
+
 /// Create the OAuth Axum router.
 ///
 /// CORS is outermost (applied last) so OPTIONS preflights are handled before
@@ -853,19 +894,13 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let policy_client = if hyprstream_discovery::native_network_required() {
-                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)
-                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
-            } else {
-                PolicyClient::for_local_transport_bootstrap(
-                    &self.policy_transport,
-                    self.signing_key.clone(),
-                    policy_vk,
-                    None,
-                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                    format!("failed to create PolicyClient: {e}"),
-                ))?
-            };
+            let policy_client = runtime_policy_client(
+                &self.policy_transport,
+                self.signing_key.clone(),
+                policy_vk,
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                format!("failed to create PolicyClient: {e}"),
+            ))?;
 
             let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
                 Some(vk) => vk,
@@ -1849,14 +1884,21 @@ mod tests {
         // checkpoint-backed discovery resolver; compat dials the
         // factory-resolved IPC transports (20-space continuation inside the
         // profile branch).
-        assert!(run.contains(
-            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
-        ));
+        assert!(run.contains("runtime_policy_client(\n                &self.policy_transport,"));
+        let policy_constructor = production
+            .split("pub(crate) fn runtime_policy_client(")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Create the OAuth Axum router.").next())
+            .expect("production Policy constructor must exist");
+        assert!(policy_constructor.contains("factories::service_token(&signing_key)"));
+        assert!(policy_constructor.contains("dial::dial_with_token_provider("));
+        assert!(policy_constructor.contains("local bootstrap refuses network transport"));
+        assert!(policy_constructor.contains("Some(token)"));
         assert!(run.contains(
             "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
+            policy_constructor.contains("if hyprstream_discovery::native_network_required() {\n        PolicyClient::from_provider("),
             "Required profile must resolve Policy through the checkpoint resolver"
         );
         assert!(

@@ -5,10 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod support;
-
 use std::{
-    collections::HashSet,
     io::Cursor,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,6 +17,7 @@ use anyhow::{ensure, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer as _, SigningKey};
+use hyprstream_rpc::auth::mac::{install_mac_dispatch_pep, MacDecision, MacDispatchPep};
 use hyprstream_rpc::{
     auth::{Claims, ClusterKeySource, InMemoryCredentialRevocationStore, JwtKeySource},
     crypto::{
@@ -29,6 +27,7 @@ use hyprstream_rpc::{
     envelope::{self, EnvelopeVerification, RequestEnvelope, SignedEnvelope},
     node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key},
     proof::{
+        admission::{set_global_proof_replay_store, InMemoryProofReplayStore},
         build::{
             build_authenticated_hybrid_request_proof, AuthenticatedHybridProofSigner,
             AuthenticatedRequestProofInput,
@@ -45,13 +44,29 @@ use hyprstream_rpc::{
     transport::{carrier::CarrierContext, TransportConfig},
     ToCapnp,
 };
-use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
 const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
+const TEST_DID: &str = "did:plc:3f7ldey5bivhfjapwqi2sljy";
+const SOURCE_ISSUER: &str = "https://login.federate.to";
 const SCHEMA: u64 = 0xe7339d5d26ab3076;
 const CLIENT_DH: [u8; 32] = [0x61; 32];
+
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static MAC_ALLOW: AtomicBool = AtomicBool::new(true);
+
+struct TestPep;
+
+impl MacDispatchPep for TestPep {
+    fn check(&self, _: &EnvelopeContext, _: &str, _: Option<&[u16]>) -> MacDecision {
+        if MAC_ALLOW.load(Ordering::SeqCst) {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(hyprstream_rpc::auth::mac::MacDenyReason::NoPepInstalled)
+        }
+    }
+}
 
 struct Fixture {
     ca: SigningKey,
@@ -94,7 +109,10 @@ fn fixture() -> &'static Fixture {
             set_global_method_policy(Box::new(table)).is_ok(),
             "isolated method policy"
         );
-        support::install_explicit_dispatch_pep();
+        install_mac_dispatch_pep(Arc::new(TestPep));
+        let _ = set_global_proof_replay_store(Box::new(
+            InMemoryProofReplayStore::single_verifier_instance(128),
+        ));
         let body = hyprstream_rpc::serialize_message(|message| {
             message
                 .init_root::<hyprstream_rpc::common_capnp::error_info::Builder>()
@@ -122,7 +140,7 @@ fn token(subject: &str) -> String {
         "hs-cose-sign-ed25519-mldsa65-wns-v1",
         &[&holder_ed, &holder_pq],
     );
-    let claims = Claims::new(subject.into(), now, now + 120)
+    let mut claims = Claims::new(subject.into(), now, now + 120)
         .with_issuer(HOST.into())
         .with_audience(Some(HOST.into()))
         .with_client_id(CLIENT)
@@ -130,9 +148,12 @@ fn token(subject: &str) -> String {
         .with_sid("sid-a")
         .with_scope(Some("infer:model:qwen2.5-0.5b-instruct:main".into()))
         .with_cnf_jwk(&holder_ed)
-        .with_cnf_hs_signer_suite(URL_SAFE_NO_PAD.encode(suite))
-        .with_session_authority_generation([7; 32])
+        .with_federate_signer_suite(URL_SAFE_NO_PAD.encode(suite))
+        .with_federate_signer_inventory([7; 32])
         .with_jti();
+    claims.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode(holder_pq));
+    claims.hs_source_issuer_v1 = Some(SOURCE_ISSUER.into());
+    claims.hs_source_subject_v1 = Some("opaque-atproto-connector-subject".into());
     let vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&f.ca_pq)).unwrap();
     let kid = hyprstream_rpc::auth::jwt::composite_kid(&vk, &f.ca.verifying_key());
     let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid}"}}"#);
@@ -236,9 +257,9 @@ struct Service {
     key_source: Arc<dyn JwtKeySource>,
     revocations: InMemoryCredentialRevocationStore,
     expected_body: Vec<u8>,
-    seen: Mutex<HashSet<[u8; 16]>>,
     revoked: AtomicBool,
     calls: AtomicUsize,
+    policy_admissions: AtomicUsize,
 }
 
 impl Service {
@@ -253,9 +274,9 @@ impl Service {
             ),
             revocations: InMemoryCredentialRevocationStore::new(),
             expected_body: f.body.clone(),
-            seen: Mutex::new(HashSet::new()),
             revoked: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            policy_admissions: AtomicUsize::new(0),
         }
     }
 }
@@ -297,12 +318,19 @@ impl RequestService for Service {
         ctx: &EnvelopeContext,
         body: &DecodedRequestBody,
         proof: &ParsedProof,
-    ) -> Result<(VerifiedProof, [u8; 32], String, String)> {
+    ) -> Result<(
+        VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         let (claims, exact_token) = ctx
             .deferred_federate_credential()
             .ok_or_else(|| anyhow::anyhow!("not deferred"))?;
         ensure!(
-            claims.sub == "alice" && ctx.subject().is_anonymous(),
+            claims.sub == TEST_DID && ctx.subject().is_anonymous(),
             "wrong subject or early identity"
         );
         ensure!(
@@ -317,18 +345,37 @@ impl RequestService for Service {
             "proof does not bind exact credential/schema"
         );
         ensure!(!self.revoked.load(Ordering::SeqCst), "authority revoked");
-        ensure!(self.seen.lock().insert(proof.claims.request_id), "replay");
+        let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
+            signer_thumbprint: [9; 32],
+            request_id: proof.claims.request_id,
+        };
         Ok((
             VerifiedProof {
                 replay_thumbprint: [9; 32],
-                primary_principal: Some("alice".into()),
+                primary_principal: Some(TEST_DID.into()),
                 primary_suite: "hs-cose-sign-ed25519-mldsa65-wns-v1".into(),
                 approvers: vec![],
             },
             fixture().holder.verifying_key().to_bytes(),
             "model:qwen2.5-0.5b-instruct:main".into(),
             "infer".into(),
+            replay_key,
+            proof.claims.exp,
         ))
+    }
+    async fn commit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> Result<()> {
+        ensure!(ctx.admitted_federate_operation(resource, operation));
+        ensure!(replay_expiry > 0);
+        ensure!(replay_key.signer_thumbprint == [9; 32]);
+        self.policy_admissions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
     async fn handle_request(
         &self,
@@ -336,7 +383,7 @@ impl RequestService for Service {
         _: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         ensure!(
-            ctx.subject().name() == Some("alice")
+            ctx.subject().name() == Some(TEST_DID)
                 && ctx.domain()? == "tenant-a"
                 && ctx.authenticated_signer_key().unwrap().to_bytes()
                     == fixture().holder.verifying_key().to_bytes()
@@ -434,9 +481,11 @@ async fn send(service: &Service, bytes: &[u8]) -> Result<Vec<u8>> {
 
 #[tokio::test]
 async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
+    let _guard = TEST_LOCK.lock().await;
+    MAC_ALLOW.store(true, Ordering::SeqCst);
     let f = fixture();
     let service = Service::new();
-    let bearer = token("alice");
+    let bearer = token(TEST_DID);
     let (response, stream) = recipients();
     let same_proof = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
     send(
@@ -537,9 +586,11 @@ async fn deferred_dispatch_wiring_commits_only_valid_original_holder_request() {
 
 #[tokio::test]
 async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
+    let _guard = TEST_LOCK.lock().await;
+    MAC_ALLOW.store(true, Ordering::SeqCst);
     let f = fixture();
     let service = Service::new();
-    let bearer = token("alice");
+    let bearer = token(TEST_DID);
     let (holder_response, holder_stream) = recipients();
     let holder_proof = proof(
         &bearer,
@@ -651,4 +702,40 @@ async fn blind_relay_cannot_substitute_any_holder_bound_recipient() {
     .await
     .unwrap();
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn federate_replay_waits_for_mac_and_remains_atomic_for_duplicates() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let f = fixture();
+    let service = Service::new();
+    let bearer = token(TEST_DID);
+    let (response, stream) = recipients();
+    let proof_bytes = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
+    let request = wire(&bearer, proof_bytes, &f.body, &response, &stream, CLIENT_DH);
+
+    // A mandatory-MAC denial happens before the service's final fresh Policy
+    // admission. It must not consume replay state; correcting authorization
+    // lets the identical signed request retry successfully.
+    MAC_ALLOW.store(false, Ordering::SeqCst);
+    let denied = send(&service, &request).await?;
+    assert_denial_has_no_success_payload(&denied);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(service.policy_admissions.load(Ordering::SeqCst), 0);
+
+    MAC_ALLOW.store(true, Ordering::SeqCst);
+    send(&service, &request).await?;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(service.policy_admissions.load(Ordering::SeqCst), 1);
+
+    // Two dispatches racing with the same fresh proof share the atomic replay
+    // admission store. At most one reaches the handler.
+    let (response, stream) = recipients();
+    let proof_bytes = proof(&bearer, &f.body, &response, &stream, CLIENT_DH);
+    let concurrent = wire(&bearer, proof_bytes, &f.body, &response, &stream, CLIENT_DH);
+    let (first, second) = tokio::join!(send(&service, &concurrent), send(&service, &concurrent));
+    first?;
+    second?;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 2);
+    Ok(())
 }

@@ -45,7 +45,7 @@ fn occupy_port(addr: SocketAddr) -> std::net::TcpListener {
 
 /// Insert the policy/discovery verifying keys `run()` requires from the
 /// global trust store, as the launcher's depends_on population would.
-fn seed_trust_store() {
+fn seed_trust_store(oauth: &SigningKey) {
     use hyprstream_service::Attestation;
     let store = hyprstream_service::global_trust_store();
     for (name, key) in [
@@ -63,6 +63,30 @@ fn seed_trust_store() {
             },
         );
     }
+    seed_oauth_credential(oauth, &SigningKey::from_bytes(&[0xB1; 32]));
+}
+
+/// The production Policy client requires the launcher's signer-bound service
+/// credential even when this readiness fixture never sends a Policy request.
+fn seed_oauth_credential(oauth: &SigningKey, policy: &SigningKey) {
+    let now = chrono::Utc::now().timestamp();
+    let claims = hyprstream_rpc::auth::Claims::new("service:oauth".to_owned(), now, now + 3600)
+        .with_cnf_jwk(oauth.verifying_key().as_bytes());
+    let jwt = crate::auth::jwt::encode_composite_service_jwt(
+        &claims,
+        &derive_mesh_mldsa_key(policy),
+        policy,
+    );
+    hyprstream_service::global_trust_store().insert(
+        oauth.verifying_key(),
+        hyprstream_service::Attestation {
+            scopes: ["oauth".to_owned()].into_iter().collect(),
+            subject: Some("service:oauth".to_owned()),
+            jwt: Some(jwt),
+            expires_at: now + 3600,
+            attested_by: None,
+        },
+    );
 }
 
 /// Build an OAuthService at `addr` exactly as the production factory does,
@@ -163,6 +187,13 @@ impl ChildEnv {
             .expect("short child socket dir");
         let credentials = dir.path().join("credentials");
         std::fs::create_dir_all(&credentials).expect("credentials dir");
+        // Exercise the real startup composite-store initialization instead of
+        // failing before the listener/carrier boundary under test.
+        crate::auth::identity_store::write_ca_signing_key(
+            &credentials,
+            &SigningKey::from_bytes(&[0xB0; 32]),
+        )
+        .expect("write isolated readiness CA fixture");
         std::env::set_var("CREDENTIALS_DIRECTORY", &credentials);
         std::env::set_var("HYPRSTREAM__SECRETS__PATH", &credentials);
         // The mandatory encrypted production profile requires the PGlite
@@ -346,7 +377,7 @@ fn run_occupied_http_listener_fails_before_ready() -> anyhow::Result<()> {
     }
     let env = ChildEnv::new("occupied-http");
     let oauth = SigningKey::from_bytes(&[0xA1; 32]);
-    seed_trust_store();
+    seed_trust_store(&oauth);
     let addr = reserve_ephemeral_port();
     let _holder = occupy_port(addr);
     let control_path = env.sock_dir.path().join("control.sock");
@@ -391,7 +422,7 @@ fn run_occupied_https_listener_fails_before_ready() -> anyhow::Result<()> {
     }
     let env = ChildEnv::new("occupied-https");
     let oauth = SigningKey::from_bytes(&[0xA2; 32]);
-    seed_trust_store();
+    seed_trust_store(&oauth);
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_path = env.dir.path().join("cert.pem");
     let key_path = env.dir.path().join("key.pem");
@@ -452,7 +483,7 @@ fn run_ready_then_real_http_and_bounded_shutdown() -> anyhow::Result<()> {
     }
     let env = ChildEnv::new("positive");
     let oauth = SigningKey::from_bytes(&[0xA3; 32]);
-    seed_trust_store();
+    seed_trust_store(&oauth);
     let addr = reserve_ephemeral_port();
     let control_path = env.sock_dir.path().join("control.sock");
     let service = http_service_at(&oauth, addr, env.ipc_control());
@@ -539,7 +570,7 @@ fn run_compatibility_disabled_iroh_skips_substrate() -> anyhow::Result<()> {
     }
     let env = ChildEnv::new("compat-disabled");
     let oauth = SigningKey::from_bytes(&[0xA9; 32]);
-    seed_trust_store();
+    seed_trust_store(&oauth);
     let addr = reserve_ephemeral_port();
     let service = http_service_at(&oauth, addr, env.ipc_control());
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
@@ -613,7 +644,7 @@ fn run_required_profile_disabled_iroh_fails_before_ready() -> anyhow::Result<()>
     }
     let env = ChildEnv::new("required-disabled");
     let oauth = SigningKey::from_bytes(&[0xA4; 32]);
-    seed_trust_store();
+    seed_trust_store(&oauth);
     let addr = reserve_ephemeral_port();
     let control_path = env.sock_dir.path().join("control.sock");
     let mut quic = crate::config::QuicConfig::default();
@@ -651,7 +682,7 @@ fn manager_spawn_pre_ready_failure_maps_to_spawn_error() -> anyhow::Result<()> {
     }
     let env = ChildEnv::new("manager-chain");
     let oauth = SigningKey::from_bytes(&[0xA5; 32]);
-    seed_trust_store();
+    seed_trust_store(&oauth);
     let addr = reserve_ephemeral_port();
     let _holder = occupy_port(addr);
     // Completion wrapper: done_rx fires only AFTER the inner OAuthService
@@ -784,6 +815,9 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
     let registry = SigningKey::from_bytes(&[0x72; 32]);
     let policy = SigningKey::from_bytes(&[0x73; 32]);
     let discovery = SigningKey::from_bytes(&[0x74; 32]);
+    // This case overrides HYPRSTREAM__SECRETS__PATH, so its OAuth
+    // composite-store fixture must live in that effective directory too.
+    crate::auth::identity_store::write_ca_signing_key(&secrets, &policy)?;
     let mut root = ca.verifying_key().to_bytes().to_vec();
     root.extend(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
         &hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&ca.to_bytes()),
@@ -875,6 +909,7 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
         true,
         &hyprstream_pds::rds::RdsConfig::default(),
     ))?;
+    seed_oauth_credential(&oauth, &policy);
     assert!(
         hyprstream_discovery::native_network_required(),
         "the Os-owned bootstrap must have activated the Required profile"
@@ -904,12 +939,21 @@ fn run_required_bootstrap_first_ready_then_http() -> anyhow::Result<()> {
     let rt_wait = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt_wait.block_on(async {
+    let ready = rt_wait.block_on(async {
         tokio::time::timeout(Duration::from_secs(90), ready_rx)
             .await
             .expect("READY must arrive within the test budget")
-            .expect("on_ready must fire on the Required success path");
     });
+    if ready.is_err() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(90))
+            .expect("failed Required startup must finish within budget");
+        panic!("Required startup closed READY; actual service result: {result:?}");
+    }
     // Real HTTP request through the actually serving handler. (This proves
     // READY ordering and HTTP serving only — it makes no claim about
     // protected-API authorization, and real outbound Policy/Discovery RPC

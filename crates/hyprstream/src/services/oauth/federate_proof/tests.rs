@@ -29,18 +29,25 @@ fn host_claims() -> Claims {
         .verifying_key()
         .to_bytes();
     let pq = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[42; 32]));
-    let mut claims = Claims::new("local-account".into(), NOW as i64, NOW as i64 + 60)
-        .with_issuer(HOST.into())
-        .with_audience(Some(HOST.into()))
-        .with_client_id(CLIENT)
-        .with_tenant("tenant-a".into())
-        .with_sid("sid-a")
-        .with_scope(Some("query:registry:List".into()))
-        .with_cnf_jwk(&ed)
-        .with_federate_signer_suite(
-            URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(SUITE, &[&ed, &pq])),
-        )
-        .with_session_authority_generation([7; 32]);
+    let mut claims = Claims::new(
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        NOW as i64,
+        NOW as i64 + 60,
+    )
+    .with_issuer(HOST.into())
+    .with_audience(Some(HOST.into()))
+    .with_client_id(CLIENT)
+    .with_tenant("tenant-a".into())
+    .with_sid("sid-a")
+    .with_scope(Some("query:registry:List".into()))
+    .with_cnf_jwk(&ed)
+    .with_federate_signer_suite(
+        URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(SUITE, &[&ed, &pq])),
+    );
+    claims.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode(&pq));
+    claims.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode([7; 32]));
+    claims.hs_source_issuer_v1 = Some(super::super::federate_source::ISSUER.into());
+    claims.hs_source_subject_v1 = Some("opaque-oidc-subject".into());
     claims.jti = Some("jti-a".into());
     claims
 }
@@ -52,11 +59,12 @@ fn h3b_verified_host_snapshot_requires_complete_exact_signed_facts() {
     assert_eq!(handle.expected.sid, "sid-a");
     assert_eq!(handle.expected.generation, [7; 32]);
     assert_eq!(handle.expected.scopes, ["query:registry:List"]);
+    assert_eq!(handle.pq_public.len(), 1952);
     let token_hash: [u8; 32] = Sha256::digest(b"fixture-token").into();
     assert_eq!(handle.credential_hash, token_hash);
 
     let mut bad = valid.clone();
-    bad.hs_session_authority_generation = None;
+    bad.hs_signer_inventory_v1 = None;
     assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
     let mut bad = valid.clone();
     bad.iss = "https://other.example".into();
@@ -81,6 +89,15 @@ fn h3b_verified_host_snapshot_requires_complete_exact_signed_facts() {
     assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
     let mut bad = valid.clone();
     bad.hs_signer_suite_v1 = None;
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.hs_signer_pq_key_v1 = None;
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.hs_source_issuer_v1 = Some("https://attacker.invalid".into());
+    assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
+    let mut bad = valid.clone();
+    bad.hs_source_subject_v1 = Some(String::new());
     assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
     let mut bad = valid.clone();
     bad.cnf.as_mut().unwrap().hs_signer_suite = bad.hs_signer_suite_v1.take();
@@ -134,7 +151,7 @@ fn fixture() -> (CredentialHandle, SessionPrimary, CollisionInventory) {
         issuer: HOST.into(),
         profile: PROFILE.into(),
         sid: "sid-a".into(),
-        subject: "local-account".into(),
+        subject: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
         tenant: "tenant-a".into(),
         client: CLIENT.into(),
         audience: HOST.into(),
@@ -157,7 +174,7 @@ fn fixture() -> (CredentialHandle, SessionPrimary, CollisionInventory) {
         scopes: expected.scopes.clone(),
         grant_revision: "revision-a".into(),
         ed_public: ed.to_vec(),
-        pq_public: pq,
+        pq_public: pq.clone(),
         generation: expected.generation.to_vec(),
         created_at: NOW as i64 - 1,
         expires_at: expected.expires_at,
@@ -169,29 +186,35 @@ fn fixture() -> (CredentialHandle, SessionPrimary, CollisionInventory) {
             expected,
             credential_id: "jti-a".into(),
             credential_hash: Sha256::digest(TOKEN).into(),
+            pq_public: pq.clone(),
+            issued_at: NOW as i64 - 1,
         },
         record,
         inventory,
     )
 }
 
-#[test]
-fn h3b_policy_lookup_request_is_exact_credential_tuple() {
+#[tokio::test]
+async fn h3b_signed_credential_supplies_the_proof_key_without_policy_lookup() {
     let (handle, _, _) = fixture();
-    let request = PolicyPrimaryProvider::request(&handle);
+    let primary = SignedCredentialPrimaryProvider
+        .resolve_current(&handle)
+        .await
+        .unwrap();
     let e = &handle.expected;
-    assert_eq!(request.issuer, e.issuer);
-    assert_eq!(request.profile, e.profile);
-    assert_eq!(request.sid, e.sid);
-    assert_eq!(request.subject, e.subject);
-    assert_eq!(request.tenant, e.tenant);
-    assert_eq!(request.client, e.client);
-    assert_eq!(request.audience, e.audience);
-    assert_eq!(request.scopes, e.scopes);
-    assert_eq!(request.ed_public, e.ed_public);
-    assert_eq!(request.suite_thumbprint, e.suite_thumbprint);
-    assert_eq!(request.generation, e.generation);
-    assert_eq!(request.expires_at, e.expires_at);
+    assert_eq!(primary.host, e.issuer);
+    assert_eq!(primary.profile, e.profile);
+    assert_eq!(primary.sid, e.sid);
+    assert_eq!(primary.subject, e.subject);
+    assert_eq!(primary.tenant, e.tenant);
+    assert_eq!(primary.client, e.client);
+    assert_eq!(primary.resource, e.audience);
+    assert_eq!(primary.scopes, e.scopes);
+    assert_eq!(primary.ed_public, e.ed_public);
+    assert_eq!(primary.pq_public, handle.pq_public);
+    assert_eq!(primary.generation, e.generation);
+    assert_eq!(primary.expires_at, e.expires_at);
+    assert_eq!(primary.proof_epoch, 1);
 }
 
 fn provider(record: SessionPrimary) -> Arc<Provider> {
@@ -676,7 +699,7 @@ fn h3b_request_local_resolver_never_falls_back_to_static_primary() {
         static_enrollments: &statics,
         in_flight: &permits,
     };
-    let mut static_record = local_resolver(&handle.expected, &record, &policy)
+    let mut static_record = local_resolver(&handle.expected, &record, &handle.pq_public, &policy)
         .unwrap()
         .primary;
     static_record.components[0] =
@@ -692,14 +715,14 @@ fn h3b_request_local_resolver_never_falls_back_to_static_primary() {
         static_enrollments: &statics,
         in_flight: &permits,
     };
-    let resolver = local_resolver(&handle.expected, &record, &policy).unwrap();
+    let resolver = local_resolver(&handle.expected, &record, &handle.pq_public, &policy).unwrap();
     assert!(resolver.resolve_primary(&static_key).is_none());
     assert!(statics.resolve_primary(&static_key).is_some());
     assert!(resolver.resolve_approver(b"static-kid").is_some());
     assert!(resolver.resolve_service("registry").is_some());
     let mut next_epoch = record.clone();
     next_epoch.proof_epoch += 1;
-    let next = local_resolver(&handle.expected, &next_epoch, &policy).unwrap();
+    let next = local_resolver(&handle.expected, &next_epoch, &handle.pq_public, &policy).unwrap();
     assert_ne!(
         resolver.primary.replay_thumbprint(),
         next.primary.replay_thumbprint()
@@ -712,7 +735,7 @@ fn h3b_request_local_resolver_never_falls_back_to_static_primary() {
         static_enrollments: &statics,
         in_flight: &permits,
     };
-    assert!(local_resolver(&handle.expected, &record, &policy).is_err());
+    assert!(local_resolver(&handle.expected, &record, &handle.pq_public, &policy).is_err());
 }
 
 #[tokio::test]
@@ -726,6 +749,7 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
         .to_bytes();
     record_b.ed_public = b.expected.ed_public.to_vec();
     record_b.pq_public = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[52; 32]));
+    b.pq_public = record_b.pq_public.clone();
     b.expected.suite_thumbprint =
         signer_suite_thumbprint(SUITE, &[&record_b.ed_public, &record_b.pq_public]);
     record_b.sid = b.expected.sid.clone();

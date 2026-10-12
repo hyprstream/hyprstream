@@ -14,8 +14,8 @@ use anyhow::{bail, ensure, Context, Result};
 use deadpool_postgres::Pool;
 use hyprstream_rpc::proof::{
     admission::{
-        MediatedQueryReplayKey, ProofAdmissionResult, ProofReplayKey, ProofReplayStore,
-        ReplayDomainGuarantee,
+        CredentialReplayKey, MediatedQueryReplayKey, ProofAdmissionResult, ProofReplayKey,
+        ProofReplayStore, ReplayDomainGuarantee,
     },
     ProofDisposition,
 };
@@ -199,6 +199,21 @@ impl ProofReplayStore for PostgresProofReplayStore {
             digest.update((field.len() as u32).to_be_bytes());
             digest.update(field.as_bytes());
         }
+        self.admit(3, digest.finalize().into(), expires_at)
+    }
+
+    fn check_and_insert_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        let mut digest = Sha256::new();
+        digest.update(b"hyprstream-source-credential-replay-v1\0");
+        digest.update(key.issuer_client_namespace);
+        digest.update(key.credential_identity);
+        // Partition 3 is the existing non-request-proof partition. The
+        // domain-separated digest keeps credential identities disjoint from
+        // mediated-query keys without a schema migration.
         self.admit(3, digest.finalize().into(), expires_at)
     }
 }
@@ -510,6 +525,52 @@ mod tests {
         assert_eq!(
             restarted.check_and_insert_mediated(&mediated_key(2), future(60)),
             ProofAdmissionResult::Admitted
+        );
+        let credential_key = CredentialReplayKey {
+            issuer_client_namespace: [5; 32],
+            credential_identity: [6; 32],
+        };
+        let c = Arc::new(restarted);
+        let d = Arc::new(
+            PostgresProofReplayStore::start(domain.clone(), pool(limited_url.as_str())).unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [c.clone(), d.clone()]
+            .into_iter()
+            .map(|store| {
+                let key = credential_key.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.check_and_insert_credential(&key, future(60))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| **r == ProofAdmissionResult::Admitted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| **r == ProofAdmissionResult::Replayed)
+                .count(),
+            1
+        );
+        drop(c);
+        drop(d);
+        let restarted =
+            PostgresProofReplayStore::start(domain.clone(), pool(limited_url.as_str())).unwrap();
+        assert_eq!(
+            restarted.check_and_insert_credential(&credential_key, future(60)),
+            ProofAdmissionResult::Replayed
         );
         let other =
             PostgresProofReplayStore::start(format!("{domain}.other"), pool(limited_url.as_str()))

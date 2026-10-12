@@ -563,6 +563,7 @@ where
         }
     };
 
+    let mut deferred_federate_replay = None;
     if deferred_federate {
         let Some(proof) = parsed_proof.as_ref() else {
             return dispatch_denied("Federate holder proof missing");
@@ -581,7 +582,7 @@ where
         if !recipients_match {
             return dispatch_denied("Federate recipient binding denied");
         }
-        let (verified, holder_ed, resource, operation) = match service
+        let (verified, holder_ed, resource, operation, replay_key, replay_expiry) = match service
             .admit_deferred_federate_request(&ctx, &decoded_body, proof)
             .await
         {
@@ -589,11 +590,12 @@ where
             Err(_) => return dispatch_denied("Federate request admission denied"),
         };
         if ctx
-            .commit_deferred_federate(&verified, holder_ed, resource, operation)
+            .commit_deferred_federate(&verified, holder_ed, resource.clone(), operation.clone())
             .is_err()
         {
             return dispatch_denied("Federate holder/subject mismatch");
         }
+        deferred_federate_replay = Some((replay_key, replay_expiry, resource, operation));
         verified_proof = Some(verified);
     }
 
@@ -714,8 +716,9 @@ where
     // 2e. Replay admission (§5.2 step 7). Deliberately last: the pipeline
     // admits the replay key only after policy evaluation, so rejected and
     // denied requests never consume store capacity.
-    // Federate's H1 replay key was consumed in the request-local Policy RPC;
-    // its session-bound namespace is not eligible for this generic store.
+    // Federate's original-holder proof is admitted by the request-local
+    // serving adapter after its fresh Policy check; it uses this same shared
+    // replay store with the signed hybrid-key namespace.
     if !deferred_federate {
         if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
             let proof_admission = (|| -> Result<()> {
@@ -814,6 +817,51 @@ where
                     "{} proof admission denied (id={}): {e:#}",
                     service.name(),
                     request_id
+                );
+                return dispatch_denied("dispatch denied");
+            }
+        }
+    }
+
+    // Fresh Policy authorization and the durable session-bound replay consume
+    // are one transaction in Policy. Defer that call until every local method
+    // and MAC gate has passed, so an otherwise valid proof denied here remains
+    // retryable. It is the final authorization gate before handler dispatch.
+    if deferred_federate {
+        let Some((replay_key, replay_expiry, resource, operation)) =
+            deferred_federate_replay.as_ref()
+        else {
+            return dispatch_denied("Federate replay admission unavailable");
+        };
+        if service
+            .commit_deferred_federate_request(&ctx, resource, operation, replay_key, *replay_expiry)
+            .await
+            .is_err()
+        {
+            warn!("{} Federate Policy/replay admission denied", service.name());
+            return dispatch_denied("dispatch denied");
+        }
+        let Some(replay_store) = crate::proof::admission::global_proof_replay_store() else {
+            return dispatch_denied("Federate replay admission unavailable");
+        };
+        let Some(proof) = parsed_proof.as_ref() else {
+            return dispatch_denied("Federate holder proof missing");
+        };
+        match crate::proof::admission::admit_request_proof(
+            replay_store,
+            proof.disposition,
+            replay_key,
+            *replay_expiry,
+        ) {
+            crate::proof::admission::ProofAdmissionResult::Admitted => {}
+            crate::proof::admission::ProofAdmissionResult::Replayed => {
+                warn!("{} Federate proof replay detected", service.name());
+                return dispatch_denied("dispatch denied");
+            }
+            crate::proof::admission::ProofAdmissionResult::Failed => {
+                warn!(
+                    "{} Federate proof replay admission failed closed",
+                    service.name()
                 );
                 return dispatch_denied("dispatch denied");
             }

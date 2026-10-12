@@ -261,6 +261,10 @@ pub struct AuthorizeBinding {
     pub request: super::authorize::AuthorizeParams,
 }
 
+#[cfg(all(test, feature = "postgres"))]
+#[path = "federate_model_tests.rs"]
+mod federate_model_tests;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -277,7 +281,7 @@ mod tests {
     }
 
     #[cfg(feature = "postgres")]
-    fn composite_signer_fixture(
+    pub(super) fn composite_signer_fixture(
         version: u64,
         pairs: Vec<hyprstream_rpc::auth::CompositeKeyPair>,
     ) -> (
@@ -311,7 +315,7 @@ mod tests {
     }
 
     #[cfg(feature = "postgres")]
-    fn oauth_signing_pair(seed: u8) -> hyprstream_rpc::auth::CompositeKeyPair {
+    pub(super) fn oauth_signing_pair(seed: u8) -> hyprstream_rpc::auth::CompositeKeyPair {
         use std::sync::Arc;
         let ed = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]));
         let (pq, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();

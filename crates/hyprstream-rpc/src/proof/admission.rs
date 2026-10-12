@@ -131,6 +131,15 @@ pub struct MediatedQueryReplayKey {
     pub operation: String,
 }
 
+/// Opaque namespace and identity digests for a one-use source credential.
+/// This is separate from holder-proof request IDs, so consuming a login token
+/// cannot collide with a later Registry/Model proof admission.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialReplayKey {
+    pub issuer_client_namespace: [u8; 32],
+    pub credential_identity: [u8; 32],
+}
+
 /// The outcome of a replay admission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofAdmissionResult {
@@ -199,6 +208,17 @@ pub trait ProofReplayStore: Send + Sync {
     ) -> ProofAdmissionResult {
         ProofAdmissionResult::Failed
     }
+
+    /// Atomically consume one verified source credential through its expiry.
+    /// Backends that do not provide a separate shared credential partition
+    /// deny rather than alias it into proof-request replay state.
+    fn check_and_insert_credential(
+        &self,
+        _key: &CredentialReplayKey,
+        _expires_at: u64,
+    ) -> ProofAdmissionResult {
+        ProofAdmissionResult::Failed
+    }
 }
 
 /// In-memory replay store for a deployment with exactly one verifier instance.
@@ -216,6 +236,7 @@ pub struct InMemoryProofReplayStore {
     authenticated: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
     unattributed: parking_lot::Mutex<ExpiryMap<ProofReplayKey>>,
     mediated: parking_lot::Mutex<ExpiryMap<MediatedQueryReplayKey>>,
+    credentials: parking_lot::Mutex<ExpiryMap<CredentialReplayKey>>,
     max_per_partition: usize,
 }
 
@@ -228,6 +249,7 @@ impl InMemoryProofReplayStore {
             authenticated: Default::default(),
             unattributed: Default::default(),
             mediated: Default::default(),
+            credentials: Default::default(),
             max_per_partition,
         }
     }
@@ -271,6 +293,19 @@ impl ProofReplayStore for InMemoryProofReplayStore {
         self.mediated
             .lock()
             .admit(key, expires_at, self.max_per_partition, now)
+    }
+
+    fn check_and_insert_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        self.credentials.lock().admit(
+            key,
+            expires_at,
+            self.max_per_partition,
+            current_unix_seconds(),
+        )
     }
 }
 
@@ -557,6 +592,38 @@ mod tests {
         assert_eq!(
             admit_mediated_query(&empty, &oversized, far_future()),
             ProofAdmissionResult::Failed
+        );
+    }
+
+    #[test]
+    fn source_credentials_are_consumed_once_in_a_separate_partition() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(2);
+        let credential = CredentialReplayKey {
+            issuer_client_namespace: [7; 32],
+            credential_identity: [8; 32],
+        };
+        assert_eq!(
+            store.check_and_insert_credential(&credential, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            store.check_and_insert_credential(&credential, far_future()),
+            ProofAdmissionResult::Replayed
+        );
+        assert_eq!(
+            store.check_and_insert(ProofDisposition::Authenticated, &key(7, 8), far_future()),
+            ProofAdmissionResult::Admitted,
+            "source-token admission must not consume the RPC request-proof key"
+        );
+        assert_eq!(
+            store.check_and_insert_credential(
+                &CredentialReplayKey {
+                    credential_identity: [9; 32],
+                    ..credential
+                },
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
         );
     }
 

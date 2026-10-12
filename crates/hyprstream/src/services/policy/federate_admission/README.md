@@ -1,71 +1,45 @@
-# Federate authority-at-use core (not installed by production factories)
+# Federate production identity and request authorization
 
-The admission core authenticates an enrolled local `service:oauth` caller and
-uses the host-verified Dex `federated_claims` ATProto DID as the Policy
-principal. The signed Dex `(issuer, opaque sub)` is retained only as source
-provenance and durably bound to that DID; admission does not create or read a
-local username/profile row. A deterministic host-scoped UUID is an internal
-session-store key, not a second user identity. The separate hosted-account
-`did:web` is not used as the person's identity or to discover a tenant.
-Concrete requested scopes are intersected with fixed client/resource ceilings
-and current `PolicyManager` checks under `(DID, tenant, resource, action)`. The
-staging tenant is accepted only when exactly one existing tenant has a grant
-for the requested staging scope; zero or multiple tenant matches deny. No
-separate tenant-membership store is added. Prepare computes an
-observed-decision digest; redemption recomputes the decision and compares
-equality. The digest is not a global mutation epoch, and a later cross-store
-mutation may still leave a stale short-lived session. No atomic
-PostgreSQL/Casbin snapshot is claimed.
+The ATProto DID from Dex's signature-verified `federated_claims` connector
+assertion is the Hyprstream principal and Policy subject. The issuer-signed
+host credential keeps the opaque Dex `(issuer, sub)` as provenance; neither a
+handle, email, browser-supplied DID, local username, nor hosted `did:web` is
+used to establish the principal. Login alone grants no access.
 
-Admission still commits session and source replay atomically before a receipt;
-there is no token signer. Its OAuth-only lookup/revoke boundary and 2-second
-aggregate deadline remain unchanged. Tenant resolution examines current
-tenant-scoped Policy grants and rejects missing or ambiguous matches; it does
-not read or scan signed hosted-account records.
+Policy prepares a short-lived challenge from the DID's current tenant grants,
+then repeats the Policy decision when the one-use challenge is redeemed. The
+OAuth service signs a credential with DID `sub`, audience, expiry, correlation
+`sid`, exact scope ceiling, Ed25519 `cnf.jwk`, ML-DSA-65 public key, ordered
+hybrid-key thumbprint, signer-inventory digest, and verified OIDC provenance.
+The complete challenge/signature binding proves possession of both proof
+keys. Credential lifetime is capped at five minutes. `sid` is correlation only:
+there is no session-row lookup or immediate per-session logout contract.
 
-This source slice adds a fresh scope-ceiling and DID-scoped Policy check for one
-exact Registry/Model operation, plus a PostgreSQL primary-record lookup that
-binds the active session to its durable verified source DID. Each call first
-performs a fresh, server-timed PostgreSQL lookup of session/source state, then
-rechecks current DID grants (including explicit deny rules used for
-suspension). The lookup fails closed unless schema v5 stores the source DID and
-the durable one-to-one issuer/subject↔DID binding, and the replay
-`(host,sid,client_id)` index is present. The per-use decision returns no bearer,
-delegated service credential, or reusable permit. Once dispatch wiring exists,
-each subsequent request or distinct tool call must invoke it again. This helper
-adds no per-token, per-chunk, or timer polling; the request/tool handler wiring
-and stream behavior remain unimplemented in this source slice.
+Registry and Model independently verify the host credential, the original
+holder's COSE request proof, and its binding to the exact service, schema,
+method/body, credential, and expiry. Before dispatch they ask authenticated
+Policy to recheck the DID's current tenant/resource/action grant and signed
+scope ceiling. A revoke or suspension therefore denies the next protected
+request/tool call. Model-to-Inference remains inside the same logical Model
+request and retains the original caller; no delegated bearer is created.
 
-The code remains private, uninstalled and default-deny: no RPC route, service
-factory, proof/session constructor, client/host configuration, or runtime switch
-is added. An ordinary deserialized `Session`, subject string, or browser field
-cannot construct the store's `PrimaryRecord`; only the exact active lookup does.
-The caller must still bind the full record to the verified host JWT and original
-holder proof, then consume v16 request replay before protected dispatch.
+After Policy allows the action, the serving adapter admits the request ID into
+the existing shared PostgreSQL replay store. It stores only a
+domain-separated replay digest and expiry; the request body, bearer, and
+credential are not stored. Database failure or replay denies dispatch. This
+is the only PostgreSQL state required by the Federate Registry/Model path;
+the v5 session/provenance schema, session URL, and profile bootstrap are not
+runtime prerequisites.
 
-## Remaining staged integration
+The Policy factory installs the runtime from the trusted service enrollment
+and a complete local signer inventory. It derives the signed inventory digest
+from that inventory, so a credential from an old inventory fails the next
+Policy action check. Missing enrollment/inventory or replay authority remains
+fail-closed. Historical session-store migration code is not used by this
+runtime path.
 
-1. Add and independently review the verified request-local session context:
-   strict host-token binding, original-holder proof verification, full-record
-   lookup/capability, and durable v16 request replay. Current production has no
-   constructor for the evidence accepted by this core.
-2. Add the authenticated Policy RPC operation and install its single
-   authoritative decision owner only after the session store and current
-   DID-scoped grant reads are qualified.
-3. Wire the returned one-request decision through authenticated RPC Registry and
-   Model dispatch, then require a fresh check immediately before each distinct
-   tool call. Deny this profile on unclassified 9P, in-process, HTTP, CLI and
-   background paths. Model→Inference stays inside the same logical Model request
-   and carries the original caller/session context; it does not become a new
-   authority or reusable delegated credential.
-4. Add dispatch-isolation, tool-pre-effect, stream-continuation, cross-replica,
-   and real post-ack revocation tests before any enablement. A prior authorized
-   stream may finish; a new request/tool call after the mutation acknowledgement
-   must deny. No token/chunk/timer polling is permitted.
-
-The `postgres` feature is only a compile/test boundary here. Source includes
-version-3 bounded replay lookup, version-4 verified-source-DID, and version-5
-one-to-one identity-binding migrations;
-they are not run by the crate or applied to any database. No route or DB
-connection is installed, and no DB role, AWS/GitLab setting, live DB, or runtime
-state is changed.
+This source change still requires local focused tests, exact-head CI/review,
+and live acceptance. None of those alone proves the full delivery objective:
+the receipt must show Federate browser login from the staging website, an
+authenticated Registry RPC, a pinned Model-to-Inference request, and denial
+after a Policy grant is revoked. Worker validation is out of scope.

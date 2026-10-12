@@ -874,11 +874,19 @@ async fn publish_composite_key_set(
                 })),
             "committed active composite signing authority is incomplete"
         );
+        let digest = persisted_digest.ok_or_else(|| {
+            anyhow::anyhow!("committed composite digest disappeared during restore")
+        })?;
         if persisted_version > current.version() {
-            let digest = persisted_digest.ok_or_else(|| {
-                anyhow::anyhow!("committed composite digest disappeared during restore")
-            })?;
             key_set.publish(persisted_version, digest, pairs)?;
+        } else {
+            // Standalone OAuth first installs this generation as a verifier in
+            // main. Restoring its local signer must attach the exact private
+            // handles without inventing a new ledger generation. Release our
+            // exclusive ledger lock before the attachment rechecks the commit
+            // under its own shared lock; the writer lock remains held.
+            drop(ledger_lock);
+            key_set.attach_committed_signing_keys(persisted_version, &digest, pairs)?;
         }
         #[cfg(not(test))]
         start_composite_authority_subscription(secrets_dir.to_path_buf(), ca_key.verifying_key())?;
@@ -7745,6 +7753,75 @@ mod tests {
                 "failure materialized staged C as committed authority"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn committed_verifier_generation_restores_local_signer_without_rotation() {
+        const PHASE: &str = "HYPRSTREAM_COMPOSITE_SIGNER_ATTACH_TEST";
+        const DIRECTORY: &str = "HYPRSTREAM_COMPOSITE_SIGNER_ATTACH_DIR";
+        let phase = std::env::var(PHASE).unwrap_or_default();
+        if phase.is_empty() {
+            let dir = TempDir::new().unwrap();
+            for phase in ["bootstrap", "restore"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "auth::key_rotation::tests::committed_verifier_generation_restores_local_signer_without_rotation", "--nocapture"])
+                    .env(PHASE, phase).env(DIRECTORY, dir.path()).status().unwrap();
+                assert!(status.success(), "{phase} subprocess failed");
+            }
+            return;
+        }
+        let dir = std::path::PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        let config = test_config();
+        let ca = Arc::new(SigningKey::from_bytes(&[0x69; 32]));
+        let ed = load_or_init_key_store(&dir, &config);
+        let pq = load_or_init_ml_dsa_key_store(&dir, &config);
+        if phase == "bootstrap" {
+            initialize_composite_key_set(&dir, &ed, &pq, ca, 300)
+                .await
+                .unwrap();
+            return;
+        }
+        let marker = std::fs::read(composite_committed_path(&dir)).unwrap();
+        let (commit, _) = read_committed_composite_ledger(&dir).unwrap();
+        let immutable_path = composite_committed_ledger_path(&dir, &commit);
+        let immutable = std::fs::read(&immutable_path).unwrap();
+        // Exact production order: main restores verifier-only N, then the
+        // OAuth factory restores the local signing authority at that same N.
+        restore_composite_verifying_key_set(&dir, &ed, &pq, ca.verifying_key())
+            .await
+            .unwrap();
+        let keys = hyprstream_rpc::auth::global_composite_key_set();
+        use hyprstream_rpc::auth::CompositePairRole;
+        let before = keys.mint_snapshot().unwrap();
+        assert!(before
+            .active_signing_pair(CompositePairRole::OAuth)
+            .is_none());
+        for _ in 0..2 {
+            initialize_composite_key_set(&dir, &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .unwrap();
+            let after = keys.mint_snapshot().unwrap();
+            assert_eq!(after.version(), before.version());
+            assert_eq!(after.component_digest(), before.component_digest());
+            for role in [CompositePairRole::OAuth, CompositePairRole::Policy] {
+                assert!(after.active_signing_pair(role).is_some());
+            }
+        }
+        // Matching file metadata is insufficient: missing local components
+        // must still fail closed instead of manufacturing a signing identity.
+        let absent = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: None,
+            lead: None,
+        });
+        assert!(initialize_composite_key_set(&dir, &absent, &pq, ca, 300)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(composite_committed_path(&dir)).unwrap(),
+            marker
+        );
+        assert_eq!(std::fs::read(immutable_path).unwrap(), immutable);
     }
 
     #[tokio::test]

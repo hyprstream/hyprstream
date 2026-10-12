@@ -84,6 +84,40 @@ fn source() -> Source {
         expires_at: now + 120,
     }
 }
+
+struct TestSharedReplayStore(hyprstream_rpc::proof::admission::InMemoryProofReplayStore);
+
+impl hyprstream_rpc::proof::admission::ProofReplayStore for TestSharedReplayStore {
+    fn domain_guarantee(&self) -> hyprstream_rpc::proof::admission::ReplayDomainGuarantee {
+        hyprstream_rpc::proof::admission::ReplayDomainGuarantee::LinearizableSharedStore
+    }
+
+    fn check_and_insert(
+        &self,
+        partition: hyprstream_rpc::proof::ProofDisposition,
+        key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.0.check_and_insert(partition, key, expires_at)
+    }
+
+    fn check_and_insert_mediated(
+        &self,
+        key: &hyprstream_rpc::proof::admission::MediatedQueryReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.0.check_and_insert_mediated(key, expires_at)
+    }
+
+    fn check_and_insert_credential(
+        &self,
+        key: &hyprstream_rpc::proof::admission::CredentialReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.0.check_and_insert_credential(key, expires_at)
+    }
+}
+
 async fn fixture() -> (AdmissionService, EnvelopeContext) {
     let signer = SigningKey::from_bytes(&[24; 32]).verifying_key();
     use crate::auth::service_enrollment::ServiceEnrollment;
@@ -109,6 +143,34 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
             ),
         ]),
     });
+    let collision_inventory = CollisionInventory::from_sources(
+        &["model".into(), "oauth".into(), "registry".into()],
+        vec![
+            hyprstream_session_store::primary::InventorySource {
+                id: "model".into(),
+                keys: vec![
+                    SigningKey::from_bytes(&[25; 32])
+                        .verifying_key()
+                        .to_bytes()
+                        .to_vec(),
+                    vec![27; 1952],
+                ],
+            },
+            hyprstream_session_store::primary::InventorySource {
+                id: "oauth".into(),
+                keys: vec![signer.to_bytes().to_vec()],
+            },
+            hyprstream_session_store::primary::InventorySource {
+                id: "registry".into(),
+                keys: vec![SigningKey::from_bytes(&[26; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec()],
+            },
+        ],
+    )
+    .unwrap();
+    let inventory_id = collision_inventory.id();
     let scopes = BTreeSet::from([STAGING_SCOPE.into()]);
     let policy = Arc::new(PolicyManager::new_in_memory().await.unwrap());
     policy
@@ -132,13 +194,17 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
             client_scopes: scopes.clone(),
             resource_scopes: scopes,
         },
-        serving_generation: [3; 32],
-        local_collision_inventory_id: [7; 32],
+        serving_generation: inventory_id,
+        local_collision_inventory_id: inventory_id,
+        collision_inventory,
     };
     (
         AdmissionService {
             authority: Some(a),
             capacity: Some(Semaphore::new(1)),
+            source_replay: Some(Arc::new(
+                hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(128),
+            )),
             ..Default::default()
         },
         EnvelopeContext::for_test_authenticated_subject_with_claims(
@@ -150,39 +216,360 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
     )
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<()> {
+    // Crypto configuration and the trust store are process-lifetime globals.
+    // Keep this full wire fixture independent of parallel unit tests.
+    const CHILD: &str = "HYPRSTREAM_OAUTH_POLICY_CLIENT_FIXTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "services::policy::federate_admission::tests::oauth_runtime_client_authenticates_real_prepare_and_commit", "--nocapture"])
+            .env(CHILD, "1").status()?;
+        anyhow::ensure!(
+            status.success(),
+            "isolated OAuth Policy client regression failed"
+        );
+        return Ok(());
+    }
+    hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+        TestSharedReplayStore(
+            hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(
+                128,
+            ),
+        ),
+    ))
+    .map_err(|_| anyhow::anyhow!("isolated replay fixture already installed"))?;
+    use hyprstream_rpc::auth::{jwt, Claims, ClusterKeySource};
+    use hyprstream_rpc::transport::TransportConfig;
+    use hyprstream_rpc_std::policy_client::{
+        CommitFederateSession, FederateVerifiedSource, PolicyClient, PrepareFederateSession,
+    };
+    use hyprstream_service::{InprocManager, ServiceManager};
+
+    // Exercise the real client, signed envelope verification and Policy
+    // handlers. The dispatch PEP is an explicit test fixture; this test's
+    // boundary is the OAuth service credential and holder binding.
+    crate::mac::install_explicit_test_dispatch_pep();
+    let _ = hyprstream_rpc::envelope::install_verify_config(
+        hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+            pq_store: None,
+        },
+    );
+    let _ = hyprstream_rpc::envelope::install_response_verify_config(
+        hyprstream_rpc::envelope::ResponseVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+            pq_store: None,
+        },
+    );
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
+    let (admission, _) = fixture().await;
+    let policy = admission.authority.as_ref().unwrap().policy.clone();
+    for rule in crate::auth::policy_templates::SERVICE_BASE_POLICIES {
+        policy
+            .add_policy_with_domain(
+                rule.subject,
+                rule.domain,
+                rule.resource,
+                rule.action,
+                rule.effect,
+            )
+            .await?;
+    }
+    let authority_key = SigningKey::from_bytes(&[94; 32]);
+    let oauth_key = SigningKey::from_bytes(&[24; 32]);
+    let issuer = "https://federate-policy-client.test";
+    let transport = TransportConfig::inproc(format!("oauth-policy-{}", uuid::Uuid::new_v4()));
+    let root = tempfile::tempdir()?;
+    let git = Arc::new(tokio::sync::RwLock::new(
+        git2db::Git2DB::open(root.path()).await?,
+    ));
+    let mut service = super::super::PolicyService::new(
+        policy,
+        Arc::new(authority_key.clone()),
+        crate::config::TokenConfig::default(),
+        git,
+        transport.clone(),
+    )
+    .with_jwt_key_source(Arc::new(ClusterKeySource::new(
+        authority_key.verifying_key(),
+        issuer.to_owned(),
+    )));
+    service.federate_admission = Some(Arc::new(admission));
+    let manager = InprocManager::new();
+    manager.spawn(Box::new(service)).await?;
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims::new("service:oauth".into(), now, now + 120)
+        .with_issuer(issuer.to_owned())
+        .with_cnf_jwk(oauth_key.verifying_key().as_bytes());
+    let token = jwt::encode_service_jwt(&claims, &authority_key);
+    hyprstream_service::global_trust_store().insert(
+        oauth_key.verifying_key(),
+        hyprstream_service::Attestation {
+            scopes: ["oauth".to_owned()].into_iter().collect(),
+            subject: None,
+            jwt: Some(token),
+            expires_at: now + 120,
+            attested_by: Some(authority_key.verifying_key().to_bytes()),
+        },
+    );
+    let client = crate::services::oauth::runtime_policy_client(
+        &transport,
+        oauth_key.clone(),
+        authority_key.verifying_key(),
+    )?;
+    let source = source();
+    let verified = FederateVerifiedSource {
+        issuer: source.issuer,
+        subject: source.subject,
+        atproto_did: source.atproto_did,
+        jti: source.jti,
+        nonce: source.nonce,
+        token_hash: source.token_hash.to_vec(),
+        issued_at: source.issued_at,
+        expires_at: source.expires_at,
+    };
+    let request = PrepareFederateSession {
+        source: verified.clone(),
+        requested: vec![STAGING_SCOPE.into()],
+        challenge_id: vec![11; 32],
+        challenge_created_at: now,
+        ed_public: SigningKey::from_bytes(&[31; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec(),
+        pq_public: vec![31; 1952],
+    };
+    let prepared = client.prepare_federate_session(&request).await?;
+    assert_eq!(prepared.subject, ATPROTO_DID);
+    let commit = CommitFederateSession {
+        source: verified,
+        policy_handle: prepared.policy_handle,
+        challenge_id: request.challenge_id.clone(),
+        challenge_created_at: now,
+        challenge_expires_at: now + 60,
+        ed_public: request.ed_public.clone(),
+        pq_public: request.pq_public.clone(),
+    };
+    let committed = client.commit_federate_session(&commit).await?;
+    assert_eq!(committed.subject, ATPROTO_DID);
+    assert!(client.commit_federate_session(&commit).await.is_err());
+
+    // The SAME long-lived local client must read its current exact-key
+    // credential on every request, never falling back to its initial JWT.
+    let trust = hyprstream_service::global_trust_store();
+    let install = |claims: &Claims, expires_at| {
+        trust.insert(
+            oauth_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: ["oauth".to_owned()].into_iter().collect(),
+                subject: None,
+                jwt: Some(jwt::encode_service_jwt(claims, &authority_key)),
+                expires_at,
+                attested_by: Some(authority_key.verifying_key().to_bytes()),
+            },
+        );
+    };
+    let mut fresh_request = request.clone();
+    fresh_request.challenge_id = vec![12; 32];
+    fresh_request.source.jti = "renewed-source".to_owned();
+    fresh_request.source.token_hash = vec![44; 32];
+    install(
+        &Claims {
+            sub: "service:model".into(),
+            ..claims.clone()
+        },
+        now + 121,
+    );
+    assert!(
+        client
+            .prepare_federate_session(&fresh_request)
+            .await
+            .is_err(),
+        "a replaced invalid credential must not reuse the initial valid token"
+    );
+    let renewed = claims.clone().with_jti();
+    install(&renewed, now + 122);
+    assert_eq!(
+        client
+            .prepare_federate_session(&fresh_request)
+            .await?
+            .subject,
+        ATPROTO_DID
+    );
+    // Generic trust insertion is monotonic in expiry. Remove before seeding
+    // an already-expired entry to test expiry without sleeping or clock tricks.
+    trust.remove(&oauth_key.verifying_key());
+    install(&renewed, now - 1);
+    assert!(
+        client
+            .prepare_federate_session(&fresh_request)
+            .await
+            .is_err(),
+        "expired trust-store enrollment must not reuse an earlier token"
+    );
+    trust.remove(&oauth_key.verifying_key());
+    assert!(
+        client
+            .prepare_federate_session(&fresh_request)
+            .await
+            .is_err(),
+        "removed enrollment must not reuse an earlier token"
+    );
+    let expired = Claims {
+        iat: now - 300,
+        exp: now - 120,
+        ..renewed.clone()
+    };
+    install(&expired, now + 120);
+    assert!(
+        client
+            .prepare_federate_session(&fresh_request)
+            .await
+            .is_err(),
+        "an expired current JWT must be rejected even with an unexpired attestation"
+    );
+    install(&renewed, now + 121);
+    assert_eq!(
+        client
+            .prepare_federate_session(&fresh_request)
+            .await?
+            .subject,
+        ATPROTO_DID
+    );
+
+    let missing = PolicyClient::for_local_transport_bootstrap(
+        &transport,
+        oauth_key.clone(),
+        authority_key.verifying_key(),
+        None,
+    )?;
+    assert!(missing.prepare_federate_session(&request).await.is_err());
+    for bad_claims in [
+        Claims {
+            sub: "service:model".into(),
+            ..claims.clone()
+        },
+        claims
+            .clone()
+            .with_cnf_jwk(SigningKey::from_bytes(&[32; 32]).verifying_key().as_bytes()),
+    ] {
+        let bad = PolicyClient::for_local_transport_bootstrap(
+            &transport,
+            oauth_key.clone(),
+            authority_key.verifying_key(),
+            Some(jwt::encode_service_jwt(&bad_claims, &authority_key)),
+        )?;
+        assert!(bad.prepare_federate_session(&request).await.is_err());
+    }
+    assert!(
+        crate::services::oauth::runtime_policy_client(
+            &transport,
+            SigningKey::from_bytes(&[93; 32]),
+            authority_key.verifying_key(),
+        )
+        .is_err(),
+        "a different key cannot borrow OAuth's credential"
+    );
+    manager.stop("policy").await?;
+    Ok(())
+}
+
 #[tokio::test]
-async fn rpc_prepare_requires_writer_and_consumes_mismatched_handle_once() {
-    let (mut service, ctx) = fixture().await;
+async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_inventory() {
+    let (service, ctx) = fixture().await;
+    let source = source();
+    let requested = vec![STAGING_SCOPE.to_owned()];
+    let now = chrono::Utc::now().timestamp();
+    let model_ed = SigningKey::from_bytes(&[25; 32]).verifying_key().to_bytes();
+
+    assert!(
+        service
+            .prepare_rpc(
+                &ctx,
+                source.clone(),
+                requested.clone(),
+                [11; 32],
+                now,
+                model_ed,
+                vec![31; 1952],
+            )
+            .await
+            .is_err(),
+        "foreign Ed25519 key was admitted as a Federate proof key"
+    );
+    assert!(
+        service
+            .prepare_rpc(
+                &ctx,
+                source.clone(),
+                requested.clone(),
+                [12; 32],
+                now,
+                [31; 32],
+                vec![27; 1952],
+            )
+            .await
+            .is_err(),
+        "foreign ML-DSA key was admitted as a Federate proof key"
+    );
+
+    let challenge_id = [13; 32];
+    let ed_public = [31; 32];
+    let pq_public = vec![32; 1952];
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            source.clone(),
+            requested,
+            challenge_id,
+            now,
+            ed_public,
+            pq_public.clone(),
+        )
+        .await
+        .expect("fresh proof-key pair should prepare");
+    let expires_at = (now + 60)
+        .min(source.expires_at)
+        .min(source.issued_at + 120);
+    // Simulate a corrupted/legacy pending handle so commit independently
+    // rechecks the current trusted inventory instead of trusting prepare.
+    service
+        .pending
+        .lock()
+        .await
+        .get_mut(&prepared.handle)
+        .unwrap()
+        .ed_public = model_ed;
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                prepared.handle,
+                source,
+                challenge_id,
+                now,
+                expires_at,
+                model_ed,
+                pq_public,
+            )
+            .await
+            .is_err(),
+        "commit failed to recheck the key collision policy"
+    );
+}
+
+#[tokio::test]
+async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
+    let (service, ctx) = fixture().await;
     let now = chrono::Utc::now().timestamp();
     let verified_source = source();
     let requested = vec![STAGING_SCOPE.to_owned()];
-    assert!(service
-        .prepare_rpc(
-            &ctx,
-            verified_source.clone(),
-            requested.clone(),
-            [9; 32],
-            now,
-            [1; 32],
-            vec![2; 1952]
-        )
-        .await
-        .is_err());
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host_path("/var/tmp/hyprstream-b1b-no-postgres")
-        .user("nobody")
-        .dbname("unused");
-    service.session_pool = Some(
-        deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
-            config,
-            tokio_postgres::NoTls,
-        ))
-        .runtime(deadpool_postgres::Runtime::Tokio1)
-        .max_size(1)
-        .build()
-        .unwrap(),
-    );
     let prepared = service
         .prepare_rpc(
             &ctx,
@@ -196,7 +583,7 @@ async fn rpc_prepare_requires_writer_and_consumes_mismatched_handle_once() {
         .await
         .unwrap();
     assert_eq!(service.pending.lock().await.len(), 1);
-    // A wrong key consumes the one-use handle before any database contact.
+    // A wrong key consumes the one-use handle before any token can be minted.
     assert!(service
         .commit_rpc(
             &ctx,
@@ -280,6 +667,65 @@ async fn rpc_prepare_requires_writer_and_consumes_mismatched_handle_once() {
         .await
         .is_err());
     assert!(service.pending.lock().await.is_empty());
+
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            source(),
+            vec![STAGING_SCOPE.into()],
+            [13; 32],
+            now,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    let session = service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            source(),
+            [13; 32],
+            now,
+            now + 60,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.subject, ATPROTO_DID);
+    assert_eq!(session.proof_epoch, 1);
+    assert_eq!(session.scopes, [STAGING_SCOPE.to_owned()]);
+
+    let replayed = source();
+    let prepared_again = service
+        .prepare_rpc(
+            &ctx,
+            replayed.clone(),
+            vec![STAGING_SCOPE.into()],
+            [14; 32],
+            now,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                prepared_again.handle,
+                replayed,
+                [14; 32],
+                now,
+                now + 60,
+                [1; 32],
+                vec![2; 1952],
+            )
+            .await
+            .is_err(),
+        "a fresh challenge must not redeem the same source credential twice"
+    );
 }
 
 #[tokio::test]
@@ -319,6 +765,57 @@ async fn h2_request_use_requires_exact_enrolled_serving_holder() {
         hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX),
     );
     assert!(serving_caller(&oauth, manifest).is_err());
+}
+
+#[tokio::test]
+async fn stateless_request_use_rechecks_the_live_did_grant_each_call() {
+    let (service, _) = fixture().await;
+    let authority = service.authority.as_ref().unwrap();
+    let generation = authority.serving_generation.to_vec();
+    let collision_inventory_id = authority.local_collision_inventory_id.to_vec();
+    let reader = RequestUseReader::new(Arc::new(service), None);
+    let model_ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+        Subject::new("service:model"),
+        "*",
+        SigningKey::from_bytes(&[25; 32]).verifying_key(),
+        hyprstream_rpc::auth::Claims::new("service:model".into(), 0, i64::MAX),
+    );
+    let mut request = AdmitFederateRequest {
+        issuer: "https://host.test".into(),
+        profile: hyprstream_session_store::PROFILE.into(),
+        sid: "correlation-only-sid".into(),
+        subject: ATPROTO_DID.into(),
+        tenant: "tenant".into(),
+        client: "client".into(),
+        audience: "https://host.test".into(),
+        scopes: vec![STAGING_SCOPE.into()],
+        ed_public: vec![1; 32],
+        suite_thumbprint: vec![2; 32],
+        generation,
+        collision_inventory_id,
+        expires_at: chrono::Utc::now().timestamp() + 60,
+        proof_epoch: 1,
+        verified_namespace: vec![4; 32],
+        request_id: vec![5; 16],
+        resource: format!("model:{STAGING_MODEL_REF}"),
+        operation: "infer".into(),
+    };
+    reader.admit(&model_ctx, &request).await.unwrap();
+    request.sid = "different-correlation-only-sid".into();
+    reader.admit(&model_ctx, &request).await.unwrap();
+
+    let policy = Arc::clone(&reader.admission.authority.as_ref().unwrap().policy);
+    assert!(policy
+        .remove_policy_with_domain(
+            ATPROTO_DID,
+            "tenant",
+            &format!("model:{STAGING_MODEL_REF}"),
+            "infer",
+            "allow",
+        )
+        .await
+        .unwrap());
+    assert!(reader.admit(&model_ctx, &request).await.is_err());
 }
 
 #[tokio::test]
@@ -769,10 +1266,13 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .batch_execute(hyprstream_session_store::MIGRATION_V5)
         .await
         .unwrap();
-    control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
-        &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8;32][..], &&[7u8;32][..]]).await.unwrap();
     let mut client = connect(&socket, &db).await;
     let (mut service, ctx) = fixture().await;
+    let authority = service.authority.as_ref().unwrap();
+    let serving_generation = authority.serving_generation;
+    let collision_inventory_id = authority.local_collision_inventory_id;
+    control.execute("INSERT INTO federate_session.profile_state(host,profile,enabled,authority_generation,collision_inventory_id) VALUES ($1,$2,true,$3,$4)",
+        &[&"https://host.test", &hyprstream_session_store::PROFILE, &&serving_generation[..], &&collision_inventory_id[..]]).await.unwrap();
     let mut session_config = tokio_postgres::Config::new();
     session_config
         .host_path(&socket)
@@ -836,8 +1336,8 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &mut client,
         "https://host.test",
         &committed.sid,
-        &[3; 32],
-        &[7; 32]
+        &serving_generation,
+        &collision_inventory_id
     )
     .await
     .unwrap()
@@ -976,7 +1476,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     );
     let receipt = receipt.expect("accepted read-to-commit race must not be rejected");
     assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+        .lookup(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .unwrap()
         .is_some());
@@ -996,8 +1496,8 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &mut client,
         "https://host.test",
         &receipt.sid,
-        &[3; 32],
-        &[7; 32],
+        &serving_generation,
+        &collision_inventory_id,
     )
     .await
     .unwrap()
@@ -1049,7 +1549,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     .unwrap();
     let reader = RequestUseReader {
         admission: Arc::clone(&service),
-        pool,
+        pool: Some(pool),
         capacity: Semaphore::new(2),
         clock_skew_secs: 30,
     };
@@ -1175,7 +1675,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     control
         .execute(
             "UPDATE federate_session.profile_state SET authority_generation=$3 WHERE host=$1 AND profile=$2",
-            &[&"https://host.test", &hyprstream_session_store::PROFILE, &&[3u8; 32][..]],
+            &[&"https://host.test", &hyprstream_session_store::PROFILE, &&serving_generation[..]],
         )
         .await
         .unwrap();
@@ -1203,7 +1703,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     );
     assert!(a.is_err() && b.is_err());
     assert!(service
-        .revoke(&ctx, &client, &receipt.sid, &[3; 32])
+        .revoke(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .unwrap());
     request_use.request_id = vec![14; 16];
@@ -1221,7 +1721,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .await
         .is_err());
     assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+        .lookup(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .unwrap()
         .is_none());
@@ -1229,8 +1729,8 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         &mut client,
         "https://host.test",
         &receipt.sid,
-        &[3; 32],
-        &[7; 32]
+        &serving_generation,
+        &collision_inventory_id
     )
     .await
     .unwrap()
@@ -1245,7 +1745,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .await
         .unwrap();
     assert!(service
-        .lookup(&ctx, &client, &receipt.sid, &[3; 32])
+        .lookup(&ctx, &client, &receipt.sid, &serving_generation)
         .await
         .is_err());
     drop(client);

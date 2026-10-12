@@ -504,6 +504,13 @@ pub(crate) struct Source {
     commitment: Commitment,
 }
 impl Source {
+    /// OIDC provenance paired with the independently verified ATProto DID.
+    /// The upstream `sub` is deliberately opaque and never becomes the
+    /// Hyprstream principal.
+    pub(crate) fn provenance(&self) -> (&str, &str) {
+        (ISSUER, &self.subject)
+    }
+
     /// The nonce-committed proof keys must be pinned by Policy at prepare time.
     /// Only a verified `Source` exposes this pair to the authenticated adapter.
     #[allow(dead_code)] // Consumed by the B1b Policy adapter, not the disabled issuer.

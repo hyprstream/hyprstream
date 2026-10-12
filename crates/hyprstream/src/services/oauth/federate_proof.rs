@@ -1,12 +1,12 @@
 //! Request-local Federate proof verification and Policy admission.
 //!
-//! The serving factory installs this adapter only when session-store TLS config,
-//! authenticated Policy transport, and static proof enrollment are available.
-//! Policy remains the authority for the complete signing-key inventory. The
-//! adapter accepts only a host JWT already signature-verified by the RPC layer;
-//! each request resolves current session primary and fresh Policy authority,
-//! then consumes shared replay state before dispatch. No subject-keyed positive
-//! cache or browser-selected DB locator is used.
+//! The serving factory installs this adapter with authenticated Policy transport
+//! and static proof enrollment; no session-store URL is required. The adapter
+//! accepts only a host JWT already signature-verified by the RPC layer, gets
+//! the hybrid proof key from that signed credential, asks Policy for a fresh
+//! grant decision, then returns replay admission data for dispatch to consume
+//! only after the generated method-policy and mandatory MAC checks. No
+//! subject-keyed positive cache or browser-selected DB locator is used.
 
 use std::{sync::Arc, time::Duration};
 
@@ -25,9 +25,7 @@ use hyprstream_rpc::{
     },
     service::EnvelopeContext,
 };
-use hyprstream_rpc_std::policy_client::{
-    AdmitFederateRequest, PolicyClient, ResolveSessionPrimary, SessionPrimary,
-};
+use hyprstream_rpc_std::policy_client::{AdmitFederateRequest, PolicyClient, SessionPrimary};
 use hyprstream_session_store::{primary::ExpectedPrimary, PROFILE, SUITE};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -45,21 +43,79 @@ pub(crate) enum Error {
 }
 type Result<T> = std::result::Result<T, Error>;
 
+/// Exercise the real signed-credential/holder verifier at the dispatch boundary.
+/// The caller's fixture supplies action admission/replay separately; this does
+/// not stand in for the production Policy decision.
+#[cfg(test)]
+pub(crate) async fn verify_dispatch_fixture(
+    ctx: &EnvelopeContext,
+    service: &str,
+    schema_id: u64,
+    body: &[u8],
+) -> Result<(VerifiedProof, [u8; 32])> {
+    let handle = CredentialHandle::from_verified_context(ctx)?;
+    let enrollments = hyprstream_rpc::proof::enrollment::InMemoryEnrollmentResolver::new();
+    let semaphore = Semaphore::new(1);
+    let local = LocalPolicy {
+        static_enrollments: &enrollments,
+        in_flight: &semaphore,
+    };
+    let consumer = Consumer {
+        provider: Some(Arc::new(SignedCredentialPrimaryProvider)),
+    };
+    let request = Request {
+        proof: ctx.request_proof_cwt().ok_or(Error::Denied)?,
+        credential: ctx
+            .deferred_federate_credential()
+            .ok_or(Error::Denied)?
+            .1
+            .as_bytes(),
+        service,
+        schema_id,
+        body,
+    };
+    let (verified, _) = consumer
+        .verify_with_primary(&handle, &request, &local, || {
+            chrono::Utc::now().timestamp().max(0) as u64
+        })
+        .await?;
+    Ok((verified, handle.expected.ed_public))
+}
+
 /// Immutable verified credential facts, never a positive authority snapshot.
 /// No Deserialize, subject-keyed registry, Clone or production constructor.
 struct CredentialHandle {
     expected: ExpectedPrimary,
     credential_id: String,
     credential_hash: [u8; 32],
+    pq_public: Vec<u8>,
+    issued_at: i64,
 }
 
 impl CredentialHandle {
     /// The RPC verifier must have signature-verified the direct reserved host
     /// JWT and deferred identity publication. This creates only a credential
-    /// snapshot; current primary, original-holder proof, durable replay and
-    /// fresh action authority must all succeed before dispatch.
+    /// snapshot; original-holder proof, shared replay and fresh Policy action
+    /// authority must all succeed before dispatch.
     fn from_verified_context(ctx: &EnvelopeContext) -> Result<Self> {
         let (claims, token) = ctx.deferred_federate_credential().ok_or(Error::Denied)?;
+        let header = parse_protected_header(token).map_err(|_| Error::Denied)?;
+        if header.typ != "at+jwt" {
+            return Err(Error::Denied);
+        }
+        Self::from_claims_snapshot(claims, token)
+    }
+
+    /// The dispatcher calls this only after the holder proof has been
+    /// committed to the request context. The claims and token remain the
+    /// exact facts verified by the envelope verifier; no caller-supplied
+    /// identity is accepted here.
+    fn from_committed_context(ctx: &EnvelopeContext) -> Result<Self> {
+        if !ctx.is_federate_admitted() {
+            return Err(Error::Denied);
+        }
+        let claims = ctx.claims().ok_or(Error::Denied)?;
+        let token = ctx.jwt_token().ok_or(Error::Denied)?;
         let header = parse_protected_header(token).map_err(|_| Error::Denied)?;
         if header.typ != "at+jwt" {
             return Err(Error::Denied);
@@ -76,8 +132,17 @@ impl CredentialHandle {
         let suite = claims.hs_signer_suite_v1.as_deref().ok_or(Error::Denied)?;
         let suite_bytes = URL_SAFE_NO_PAD.decode(suite).map_err(|_| Error::Denied)?;
         let suite_thumbprint: [u8; 32] = suite_bytes.try_into().map_err(|_| Error::Denied)?;
+        let pq_encoded = claims.hs_signer_pq_key_v1.as_deref().ok_or(Error::Denied)?;
+        let pq_public = URL_SAFE_NO_PAD
+            .decode(pq_encoded)
+            .map_err(|_| Error::Denied)?;
+        let source_issuer = claims.hs_source_issuer_v1.as_deref().ok_or(Error::Denied)?;
+        let source_subject = claims
+            .hs_source_subject_v1
+            .as_deref()
+            .ok_or(Error::Denied)?;
         let generation = claims
-            .session_authority_generation()
+            .federate_signer_inventory()
             .map_err(|_| Error::Denied)?
             .ok_or(Error::Denied)?;
         let sid = claims.sid.as_deref().ok_or(Error::Denied)?;
@@ -99,6 +164,16 @@ impl CredentialHandle {
             || jwk.crv != "Ed25519"
             || URL_SAFE_NO_PAD.encode(ed) != jwk.x
             || URL_SAFE_NO_PAD.encode(suite_thumbprint) != suite
+            || claims
+                .session_authority_generation()
+                .map_err(|_| Error::Denied)?
+                .is_some()
+            || pq_public.len() != 1952
+            || URL_SAFE_NO_PAD.encode(&pq_public) != pq_encoded
+            || ml_dsa_vk_from_bytes(&pq_public).is_err()
+            || signer_suite_thumbprint(SUITE, &[&ed, &pq_public]) != suite_thumbprint
+            || source_issuer != super::federate_source::ISSUER
+            || !bounded(source_subject, 256)
             || !bounded(sid, 128)
             || !bounded(subject, 256)
             || subject == "anonymous"
@@ -146,51 +221,51 @@ impl CredentialHandle {
             },
             credential_id: jti.into(),
             credential_hash: Sha256::digest(token.as_bytes()).into(),
+            pq_public,
+            issued_at: claims.iat,
         })
     }
 }
 
-/// Resolve current Policy-owned session state for every request. Never cache
-/// successful authority; no browser-selected DB locator is accepted.
+/// Resolve proof keys from the already verified, host-signed credential. This
+/// is proof material only; Policy still authorizes every protected operation.
 #[async_trait::async_trait]
 trait CurrentPrimary: Send + Sync {
     async fn resolve_current(&self, credential: &CredentialHandle) -> Result<SessionPrimary>;
 }
 
-/// An authenticated service client, never the browser bearer. The serving
-/// factory supplies its own enrolled signer and capability; no fallback exists.
-struct PolicyPrimaryProvider {
-    client: PolicyClient,
-}
+struct SignedCredentialPrimaryProvider;
 
-impl PolicyPrimaryProvider {
-    fn request(credential: &CredentialHandle) -> ResolveSessionPrimary {
+#[async_trait::async_trait]
+impl CurrentPrimary for SignedCredentialPrimaryProvider {
+    async fn resolve_current(&self, credential: &CredentialHandle) -> Result<SessionPrimary> {
         let e = &credential.expected;
-        ResolveSessionPrimary {
-            issuer: e.issuer.clone(),
+        Ok(SessionPrimary {
+            host: e.issuer.clone(),
             profile: e.profile.clone(),
+            suite: SUITE.into(),
             sid: e.sid.clone(),
+            account_id: federate_account_id(&e.issuer, &e.subject),
             subject: e.subject.clone(),
             tenant: e.tenant.clone(),
             client: e.client.clone(),
-            audience: e.audience.clone(),
+            resource: e.audience.clone(),
             scopes: e.scopes.clone(),
+            grant_revision: credential.credential_id.clone(),
             ed_public: e.ed_public.to_vec(),
-            suite_thumbprint: e.suite_thumbprint.to_vec(),
+            pq_public: credential.pq_public.clone(),
             generation: e.generation.to_vec(),
+            created_at: credential.issued_at,
             expires_at: e.expires_at,
-        }
+            proof_epoch: 1,
+            collision_inventory_id: e.generation.to_vec(),
+        })
     }
 }
 
-#[async_trait::async_trait]
-impl CurrentPrimary for PolicyPrimaryProvider {
-    async fn resolve_current(&self, credential: &CredentialHandle) -> Result<SessionPrimary> {
-        self.client
-            .resolve_session_primary(&Self::request(credential))
-            .await
-            .map_err(|_| Error::Unavailable)
-    }
+fn federate_account_id(host: &str, did: &str) -> String {
+    let name = format!("hyprstream-federate-account-v1\0{host}\0{did}");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
 /// Input bytes are the original holder's proof/credential, not the relay's.
@@ -213,8 +288,9 @@ struct LocalPolicy<'a> {
 }
 
 /// Serving adapter installed only when the authenticated Policy client and
-/// static proof enrollment are available. The Policy service owns and checks
-/// the complete key inventory; serving services do not need the node root key.
+/// static proof enrollment are available. Policy validates the complete signer
+/// inventory at login and checks its signed digest at every action; serving
+/// services do not need the node root key or a session database.
 pub(crate) struct DispatchAdapter {
     client: PolicyClient,
     static_enrollments: Arc<dyn EnrollmentResolver>,
@@ -255,15 +331,16 @@ impl DispatchAdapter {
         service: &str,
         schema_id: u64,
         body: &[u8],
-        resource: &str,
-        operation: &str,
-    ) -> Result<(VerifiedProof, [u8; 32])> {
+    ) -> Result<(
+        VerifiedProof,
+        [u8; 32],
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
         let handle = CredentialHandle::from_verified_context(ctx)?;
         let raw = ctx.request_proof_cwt().ok_or(Error::Denied)?;
         let consumer = Consumer {
-            provider: Some(Arc::new(PolicyPrimaryProvider {
-                client: self.client.clone(),
-            })),
+            provider: Some(Arc::new(SignedCredentialPrimaryProvider)),
         };
         let local = LocalPolicy {
             static_enrollments: self.static_enrollments.as_ref(),
@@ -280,8 +357,8 @@ impl DispatchAdapter {
             schema_id,
             body,
         };
-        let (verified, active) = consumer
-            .verify_with_primary(&handle, &request, &local, || {
+        let verified = consumer
+            .verify(&handle, &request, &local, || {
                 chrono::Utc::now().timestamp().max(0) as u64
             })
             .await?;
@@ -290,6 +367,33 @@ impl DispatchAdapter {
         {
             return Err(Error::Denied);
         }
+        let e = &handle.expected;
+        let replay_key = hyprstream_rpc::proof::admission::ProofReplayKey {
+            signer_thumbprint: verified.replay_thumbprint,
+            request_id: proof.claims.request_id,
+        };
+        let replay_expiry = proof.claims.exp.min(e.expires_at as u64);
+        Ok((verified, e.ed_public, replay_key, replay_expiry))
+    }
+
+    /// Run the fresh Policy check and its durable replay consume only after
+    /// the dispatcher has passed generated method-policy and MAC checks.
+    pub(crate) async fn commit_request_use(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        if replay_expiry <= now || !ctx.admitted_federate_operation(resource, operation) {
+            return Err(Error::Denied);
+        }
+        let handle = CredentialHandle::from_committed_context(ctx)?;
+        let active = SignedCredentialPrimaryProvider
+            .resolve_current(&handle)
+            .await?;
         let e = &handle.expected;
         let data = AdmitFederateRequest {
             issuer: e.issuer.clone(),
@@ -306,8 +410,8 @@ impl DispatchAdapter {
             collision_inventory_id: active.collision_inventory_id,
             expires_at: e.expires_at,
             proof_epoch: active.proof_epoch,
-            verified_namespace: verified.replay_thumbprint.to_vec(),
-            request_id: proof.claims.request_id.to_vec(),
+            verified_namespace: replay_key.signer_thumbprint.to_vec(),
+            request_id: replay_key.request_id.to_vec(),
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
@@ -316,10 +420,11 @@ impl DispatchAdapter {
             .admit_federate_request(&data)
             .await
             .map_err(|_| Error::Unavailable)?;
-        if !admitted {
-            return Err(Error::Denied);
+        if admitted {
+            Ok(())
+        } else {
+            Err(Error::Denied)
         }
-        Ok((verified, e.ed_public))
     }
 }
 
@@ -395,7 +500,7 @@ impl Consumer {
         if e.expires_at as u64 <= now || active.created_at > now as i64 {
             return Err(Error::Denied);
         }
-        let resolver = local_resolver(e, &active, policy)?;
+        let resolver = local_resolver(e, &active, &handle.pq_public, policy)?;
         let holder = VerifyingKey::from_bytes(&e.ed_public).map_err(|_| Error::Denied)?;
         let verified = verify_proof_signatures(&proof, Some(&holder), Some(&resolver), now)
             .map_err(|_| Error::Denied)?;
@@ -428,6 +533,7 @@ impl EnrollmentResolver for RequestResolver<'_> {
 fn local_resolver<'a>(
     e: &ExpectedPrimary,
     a: &SessionPrimary,
+    credential_pq_public: &[u8],
     policy: &LocalPolicy<'a>,
 ) -> Result<RequestResolver<'a>> {
     if a.host != e.issuer
@@ -440,6 +546,7 @@ fn local_resolver<'a>(
         || a.resource != e.audience
         || a.scopes != e.scopes
         || a.ed_public != e.ed_public
+        || a.pq_public != credential_pq_public
         || a.generation != e.generation
         || a.expires_at < e.expires_at
         || a.created_at < 0

@@ -12,11 +12,20 @@ use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{
     auth::{signer_suite::signer_suite_thumbprint, Scope},
-    proof::enrollment::authenticated_replay_namespace,
+    proof::{
+        admission::{
+            global_proof_replay_store, CredentialReplayKey, ProofAdmissionResult, ProofReplayStore,
+            ReplayDomainGuarantee,
+        },
+        enrollment::authenticated_replay_namespace,
+    },
 };
 use hyprstream_rpc_std::policy_client::AdmitFederateRequest;
-use hyprstream_session_store::{Admission, PendingSession, PrimaryRecord, Session, Source, Store};
+use hyprstream_session_store::{
+    primary::CollisionInventory, Admission, PendingSession, PrimaryRecord, Session, Source, Store,
+};
 use rand::RngCore as _;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -74,6 +83,45 @@ struct PendingDecision {
     expires_at: i64,
 }
 
+trait CredentialReplayAdmission: Send + Sync {
+    fn admit_source_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult;
+}
+
+impl<T: ProofReplayStore> CredentialReplayAdmission for T {
+    fn admit_source_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        self.check_and_insert_credential(key, expires_at)
+    }
+}
+
+/// Production Policy uses the same shared admission backend as RPC request
+/// proofs. It refuses single-process memory because credential consumption
+/// must survive verifier restarts and coordinate concurrent instances.
+struct GlobalCredentialReplay;
+
+impl CredentialReplayAdmission for GlobalCredentialReplay {
+    fn admit_source_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        let Some(store) = global_proof_replay_store() else {
+            return ProofAdmissionResult::Failed;
+        };
+        if store.domain_guarantee() != ReplayDomainGuarantee::LinearizableSharedStore {
+            return ProofAdmissionResult::Failed;
+        }
+        store.check_and_insert_credential(key, expires_at)
+    }
+}
+
 /// Internal upstream evidence, not a browser DTO or verification boolean.
 /// OAuth's FederateIssuer constructs it only after strict source-token
 /// validation and both signatures over the exact challenge have verified.
@@ -97,15 +145,20 @@ struct Authorities {
     /// loader.
     serving_generation: [u8; 32],
     local_collision_inventory_id: [u8; 32],
+    /// Public keys remain in Policy so issuance can reject cross-protocol
+    /// proof-key reuse without persisting session rows or sharing root keys.
+    collision_inventory: CollisionInventory,
 }
 
 /// Default denies before any authority or DB access. The verified ATProto DID
-/// is the human principal; admission does not require a local UserStore row.
+/// is the human principal. OIDC `(issuer, sub)` remains login provenance; no
+/// local UserStore row is required to establish the Hyprstream identity.
 #[derive(Default)]
 pub(super) struct AdmissionService {
     authority: Option<Authorities>,
     capacity: Option<Semaphore>,
     session_pool: Option<deadpool_postgres::Pool>,
+    source_replay: Option<Arc<dyn CredentialReplayAdmission>>,
     pending: Mutex<BTreeMap<[u8; 32], PendingDecision>>,
 }
 
@@ -116,13 +169,16 @@ pub(super) struct AdmissionService {
 #[allow(dead_code)]
 pub(super) struct RequestUseReader {
     admission: Arc<AdmissionService>,
-    pool: deadpool_postgres::Pool,
+    pool: Option<deadpool_postgres::Pool>,
     capacity: Semaphore,
     clock_skew_secs: i64,
 }
 
 impl RequestUseReader {
-    pub(super) fn new(admission: Arc<AdmissionService>, pool: deadpool_postgres::Pool) -> Self {
+    pub(super) fn new(
+        admission: Arc<AdmissionService>,
+        pool: Option<deadpool_postgres::Pool>,
+    ) -> Self {
         Self {
             admission,
             pool,
@@ -180,9 +236,48 @@ impl RequestUseReader {
                 && data.proof_epoch <= i64::MAX as u64,
             "serving profile mismatch"
         );
+        if self.pool.is_none() {
+            let did = data.subject.as_str();
+            let now = chrono::Utc::now().timestamp();
+            ensure!(
+                (did.starts_with("did:plc:") || did.starts_with("did:web:"))
+                    && did.len() <= 255
+                    && data.expires_at <= now.saturating_add(300)
+                    && data.proof_epoch == 1,
+                "invalid stateless Federate credential"
+            );
+            ensure!(
+                data.scopes.iter().all(|scope| {
+                    authority.profile.client_scopes.contains(scope)
+                        && authority.profile.resource_scopes.contains(scope)
+                }),
+                "credential exceeds the Federate scope ceiling"
+            );
+            ensure!(
+                data.scopes.iter().any(|text| {
+                    Scope::parse(text).is_ok_and(|scope| {
+                        scope.action == data.operation && scope.policy_resource() == data.resource
+                    })
+                }),
+                "operation is outside the signed scope"
+            );
+            let _permit = self.capacity.try_acquire()?;
+            ensure!(
+                authority
+                    .policy
+                    .check_with_domain(did, &data.tenant, &data.resource, &data.operation)
+                    .await,
+                "current DID tenant grant denied"
+            );
+            return Ok(());
+        }
         let _permit = self.capacity.try_acquire()?;
         tokio::time::timeout(Duration::from_secs(2), async {
-            let mut client = self.pool.get().await?;
+            let pool = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Federate session pool unavailable"))?;
+            let mut client = pool.get().await?;
             let primary = Store::lookup_primary(
                 &mut client,
                 &authority.profile.host,
@@ -260,10 +355,10 @@ impl AdmissionService {
     pub(super) fn configured(
         policy: Arc<PolicyManager>,
         enrollment: Arc<ServiceEnrollmentManifest>,
-        serving_generation: [u8; 32],
-        local_collision_inventory_id: [u8; 32],
-        session_pool: deadpool_postgres::Pool,
+        collision_inventory: CollisionInventory,
+        session_pool: Option<deadpool_postgres::Pool>,
     ) -> Self {
+        let inventory_id = collision_inventory.id();
         let scopes = BTreeSet::from([
             "infer:model:qwen2.5-0.5b-instruct:main".to_owned(),
             "query:model:Status".to_owned(),
@@ -282,13 +377,42 @@ impl AdmissionService {
                     client_scopes: scopes.clone(),
                     resource_scopes: scopes,
                 },
-                serving_generation,
-                local_collision_inventory_id,
+                serving_generation: inventory_id,
+                local_collision_inventory_id: inventory_id,
+                collision_inventory,
             }),
             capacity: Some(Semaphore::new(32)),
-            session_pool: Some(session_pool),
+            session_pool,
+            source_replay: Some(Arc::new(GlobalCredentialReplay)),
             pending: Mutex::default(),
         }
+    }
+}
+
+fn source_credential_replay_key(source: &Source, client_id: &str) -> CredentialReplayKey {
+    fn digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        for field in fields {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        digest.finalize().into()
+    }
+
+    CredentialReplayKey {
+        issuer_client_namespace: digest(
+            b"hyprstream-source-credential-namespace-v1\0",
+            &[source.issuer.as_bytes(), client_id.as_bytes()],
+        ),
+        credential_identity: digest(
+            b"hyprstream-source-credential-identity-v1\0",
+            &[
+                source.jti.as_bytes(),
+                source.nonce.as_bytes(),
+                &source.token_hash,
+            ],
+        ),
     }
 }
 
@@ -589,14 +713,15 @@ impl AdmissionService {
         ed_public: [u8; 32],
         pq_public: Vec<u8>,
     ) -> Result<PreparedDecision> {
-        self.authority(ctx)?;
-        ensure!(
-            self.session_pool.is_some(),
-            "Federate session writer disabled"
-        );
+        let authority = self.authority(ctx)?;
         let now = chrono::Utc::now().timestamp();
         ensure!(challenge_id != [0; 32], "invalid challenge ID");
-        ensure!(pq_public.len() == 1952, "invalid PQ public key");
+        ensure!(
+            authority
+                .collision_inventory
+                .permits(&ed_public, &pq_public),
+            "Federate proof key collides with a trusted protocol key or has an invalid PQ length"
+        );
         ensure!(
             created_at >= now - 30 && created_at <= now + 5,
             "stale challenge"
@@ -663,11 +788,7 @@ impl AdmissionService {
         ed_public: [u8; 32],
         pq_public: Vec<u8>,
     ) -> Result<Session> {
-        self.authority(ctx)?;
-        let pool = self
-            .session_pool
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Federate session writer disabled"))?;
+        let authority = self.authority(ctx)?;
         let pending = self
             .pending
             .lock()
@@ -686,23 +807,58 @@ impl AdmissionService {
             "challenge/source binding changed"
         );
         ensure!(pq_public.len() == 1952, "invalid PQ public key");
-        let mut client = tokio::time::timeout(Duration::from_secs(2), pool.get()).await??;
-        self.redeem(
-            ctx,
-            &mut client,
-            PossessionEvidence {
-                source,
-                ed_public,
-                pq_public,
-                sid: uuid::Uuid::new_v4().to_string(),
-                requested: pending.requested,
-                challenge: pending.decision,
-                created_at,
-                expires_at,
-                session_expires_at: pending.source.expires_at.min(now + 300),
-            },
+        ensure!(
+            authority
+                .collision_inventory
+                .permits(&ed_public, &pq_public),
+            "Federate proof key collides with a trusted protocol key"
+        );
+        if let Some(pool) = &self.session_pool {
+            let mut client = tokio::time::timeout(Duration::from_secs(2), pool.get()).await??;
+            return self
+                .redeem(
+                    ctx,
+                    &mut client,
+                    PossessionEvidence {
+                        source,
+                        ed_public,
+                        pq_public,
+                        sid: uuid::Uuid::new_v4().to_string(),
+                        requested: pending.requested,
+                        challenge: pending.decision,
+                        created_at,
+                        expires_at,
+                        session_expires_at: pending.source.expires_at.min(now + 300),
+                    },
+                )
+                .await;
+        }
+        let current = tokio::time::timeout(
+            Duration::from_secs(2),
+            authority.decision(&source, &pending.requested),
         )
-        .await
+        .await??;
+        ensure!(current == pending.decision, "challenge decision changed");
+        let session_expires_at = pending.source.expires_at.min(now + 300);
+        ensure!(session_expires_at > now, "source credential expired");
+        self.consume_source_credential(&source, &authority.profile.client)?;
+        Ok(Session {
+            host: authority.profile.host.clone(),
+            sid: uuid::Uuid::new_v4().to_string(),
+            account_id: current.account_id,
+            subject: current.subject,
+            tenant: current.tenant,
+            client_id: authority.profile.client.clone(),
+            resource: authority.profile.resource.clone(),
+            scopes: current.scopes,
+            grant_revision: current.revision,
+            ed_public,
+            pq_public,
+            generation: current.generation,
+            collision_inventory_id: current.collision_inventory_id,
+            proof_epoch: 1,
+            expires_at: session_expires_at,
+        })
     }
 
     fn authority(&self, ctx: &EnvelopeContext) -> Result<&Authorities> {
@@ -712,6 +868,26 @@ impl AdmissionService {
             .ok_or_else(|| anyhow::anyhow!("Federate admission disabled"))?;
         oauth_caller(ctx, &authority.enrollment)?;
         Ok(authority)
+    }
+
+    fn consume_source_credential(&self, source: &Source, client_id: &str) -> Result<()> {
+        let expires_at = u64::try_from(source.expires_at)?;
+        let now = u64::try_from(chrono::Utc::now().timestamp())?;
+        ensure!(expires_at > now, "source credential expired");
+        let replay = self
+            .source_replay
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("source credential replay admission disabled"))?;
+        let key = source_credential_replay_key(source, client_id);
+        match replay.admit_source_credential(&key, expires_at) {
+            ProofAdmissionResult::Admitted => Ok(()),
+            ProofAdmissionResult::Replayed => {
+                Err(anyhow::anyhow!("source credential already consumed"))
+            }
+            ProofAdmissionResult::Failed => Err(anyhow::anyhow!(
+                "source credential replay admission unavailable"
+            )),
+        }
     }
 
     async fn prepare(
@@ -744,6 +920,7 @@ impl AdmissionService {
         tokio::time::timeout(Duration::from_secs(2), async {
             let current = a.decision(&evidence.source, &evidence.requested).await?;
             ensure!(current == evidence.challenge, "challenge decision changed");
+            self.consume_source_credential(&evidence.source, &a.profile.client)?;
             let session = PendingSession {
                 host: a.profile.host.clone(),
                 sid: evidence.sid,

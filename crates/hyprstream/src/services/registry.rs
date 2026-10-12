@@ -4051,6 +4051,8 @@ impl RequestService for RegistryService {
         [u8; 32],
         String,
         String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
     )> {
         #[cfg(feature = "postgres")]
         {
@@ -4061,22 +4063,53 @@ impl RequestService for RegistryService {
             let pin = crate::services::model::StagingModelPin::from_env()?
                 .ok_or_else(|| anyhow::anyhow!("Federate Registry requires a staging model pin"))?;
             let (resource, operation) = federate_registry_operation(body, &pin)?;
-            let (verified, holder) = adapter
+            let (verified, holder, replay_key, replay_expiry) = adapter
                 .admit(
                     ctx,
                     proof,
                     "registry",
                     FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID,
                     body.bytes(),
-                    &resource,
-                    &operation,
                 )
                 .await?;
-            Ok((verified, holder, resource, operation))
+            Ok((
+                verified,
+                holder,
+                resource,
+                operation,
+                replay_key,
+                replay_expiry,
+            ))
         }
         #[cfg(not(feature = "postgres"))]
         {
             let _ = (ctx, body, proof);
+            anyhow::bail!("Federate dispatch is disabled")
+        }
+    }
+
+    async fn commit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "postgres")]
+        {
+            let adapter = self
+                .federate_dispatch
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Federate dispatch is disabled"))?;
+            adapter
+                .commit_request_use(ctx, resource, operation, replay_key, replay_expiry)
+                .await
+                .map_err(anyhow::Error::new)
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let _ = (ctx, resource, operation, replay_key, replay_expiry);
             anyhow::bail!("Federate dispatch is disabled")
         }
     }

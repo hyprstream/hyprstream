@@ -159,8 +159,9 @@ pub struct Claims {
     /// standalone service credentials (no session lifecycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    /// Federate's signed, canonical 32-byte authority generation. This is
-    /// JWT-only: an envelope claims field cannot assert session authority.
+    /// Signed generation for profiles that use server-side session authority.
+    /// Stateless Federate proof credentials use `hs_signer_inventory_v1`
+    /// instead. This is JWT-only; envelope claims cannot assert this state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hs_session_authority_generation: Option<String>,
     /// Exact opt-in Federate PoP/COSE subprofile. This is not authority on its
@@ -172,6 +173,21 @@ pub struct Claims {
     /// confirmation method: `cnf.jwk` remains the sole confirmation key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hs_signer_suite_v1: Option<String>,
+    /// The public ML-DSA-65 half of the COSE proof key pair. It is safe to
+    /// carry in the issuer-signed credential and lets a verifier validate the
+    /// holder proof without resolving a session row just to recover a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_pq_key_v1: Option<String>,
+    /// Digest of the issuer's trusted signer inventory at login. This expires
+    /// stale proof credentials after an inventory change without a session DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_inventory_v1: Option<String>,
+    /// Signed login provenance. `sub` remains the canonical ATProto DID;
+    /// these claims retain the upstream OIDC identity used to establish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_source_issuer_v1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_source_subject_v1: Option<String>,
     /// Workload credential family session ID (`workload_session_id`) — a
     /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
     /// credentials of an enrolled workload family (e.g. a service-JWT
@@ -283,6 +299,10 @@ impl std::fmt::Debug for Claims {
             )
             .field("hs_profile", &self.hs_profile)
             .field("hs_signer_suite_v1", &self.hs_signer_suite_v1)
+            .field("hs_signer_pq_key_v1", &self.hs_signer_pq_key_v1)
+            .field("hs_signer_inventory_v1", &self.hs_signer_inventory_v1)
+            .field("hs_source_issuer_v1", &self.hs_source_issuer_v1)
+            .field("hs_source_subject_v1", &self.hs_source_subject_v1)
             .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
             .field("client_id", &self.client_id)
@@ -388,6 +408,10 @@ impl FromCapnp for Claims {
             hs_session_authority_generation: None,
             hs_profile: None,
             hs_signer_suite_v1: None,
+            hs_signer_pq_key_v1: None,
+            hs_signer_inventory_v1: None,
+            hs_source_issuer_v1: None,
+            hs_source_subject_v1: None,
             workload_session_id: None,
             aud,
             client_id: None,
@@ -451,6 +475,10 @@ impl Claims {
             hs_session_authority_generation: None,
             hs_profile: None,
             hs_signer_suite_v1: None,
+            hs_signer_pq_key_v1: None,
+            hs_signer_inventory_v1: None,
+            hs_source_issuer_v1: None,
+            hs_source_subject_v1: None,
             workload_session_id: None,
             aud: None,
             client_id: None,
@@ -494,9 +522,9 @@ impl Claims {
         self
     }
 
-    /// Set the signed Federate generation in its one canonical encoding.
-    /// This does not make a token eligible for dispatch; current profile,
-    /// session, proof, replay and Policy checks remain mandatory.
+    /// Set a session-authority generation in its one canonical encoding.
+    /// This does not make a token eligible for dispatch; profile, proof,
+    /// replay and Policy checks remain mandatory.
     pub fn with_session_authority_generation(mut self, generation: [u8; 32]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         self.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode(generation));
@@ -504,7 +532,7 @@ impl Claims {
     }
 
     /// Parse the signed generation without accepting padding, alternate
-    /// alphabets, truncation, or a wire-provided database locator.
+    /// alphabets, truncation, or a wire-provided state locator.
     pub fn session_authority_generation(&self) -> anyhow::Result<Option<[u8; 32]>> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let Some(encoded) = self.hs_session_authority_generation.as_deref() else {
@@ -522,7 +550,39 @@ impl Claims {
         Ok(Some(generation))
     }
 
-    /// Recognize the fixed host/client even when the generation claim was
+    /// Set the trusted signer-inventory digest for the stateless Federate
+    /// proof profile. This binds a short-lived credential to the host's current
+    /// verifier inventory without naming a database or session row.
+    pub fn with_federate_signer_inventory(mut self, inventory: [u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        self.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode(inventory));
+        self
+    }
+
+    /// Parse the signed Federate signer-inventory digest in its sole canonical
+    /// base64url encoding. Callers decide whether the all-zero value is valid
+    /// for their configured inventory.
+    pub fn federate_signer_inventory(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let Some(encoded) = self.hs_signer_inventory_v1.as_deref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            encoded.len() == 43,
+            "invalid signer inventory digest length"
+        );
+        let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+        let inventory: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signer inventory digest length"))?;
+        anyhow::ensure!(
+            URL_SAFE_NO_PAD.encode(inventory) == encoded,
+            "noncanonical signer inventory digest"
+        );
+        Ok(Some(inventory))
+    }
+
+    /// Recognize the fixed host/client even when one profile marker was
     /// removed by a faulty issuer or token transformation.
     pub fn is_reserved_federate_staging_credential(&self) -> bool {
         self.iss == FEDERATE_STAGING_HOST
@@ -535,10 +595,15 @@ impl Claims {
         self.hs_session_authority_generation.is_some()
             || self.hs_profile.is_some()
             || self.hs_signer_suite_v1.is_some()
+            || self.hs_signer_pq_key_v1.is_some()
+            || self.hs_signer_inventory_v1.is_some()
+            || self.hs_source_issuer_v1.is_some()
+            || self.hs_source_subject_v1.is_some()
     }
 
     /// Stamp the exact Federate profile and its ordered hybrid-suite digest.
-    /// Issuers must still commit session admission before signing the JWT.
+    /// This marker alone is never authority; the reserved path also verifies
+    /// the signed source binding, holder proof, replay admission and live Policy.
     pub fn with_federate_signer_suite(mut self, thumbprint_b64url: String) -> Self {
         self.hs_profile = Some("federate-session-v1".to_owned());
         self.hs_signer_suite_v1 = Some(thumbprint_b64url);
@@ -1555,6 +1620,33 @@ mod id_token_tests {
         }
         assert!(Claims::new("alice".into(), 1, 2)
             .session_authority_generation()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn federate_signer_inventory_is_signed_jwt_only_and_canonical() {
+        let original = [0x24; 32];
+        let claims = Claims::new("alice".into(), 1, 2).with_federate_signer_inventory(original);
+        assert_eq!(claims.federate_signer_inventory().unwrap(), Some(original));
+        let json = serde_json::to_vec(&claims).unwrap();
+        let decoded: Claims = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.federate_signer_inventory().unwrap(), Some(original));
+        let mut malformed = decoded.clone();
+        for bad in [
+            "",
+            "A",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+        ] {
+            malformed.hs_signer_inventory_v1 = Some(bad.into());
+            assert!(
+                malformed.federate_signer_inventory().is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(Claims::new("alice".into(), 1, 2)
+            .federate_signer_inventory()
             .unwrap()
             .is_none());
     }
