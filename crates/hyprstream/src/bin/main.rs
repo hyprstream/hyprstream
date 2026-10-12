@@ -2058,6 +2058,21 @@ impl hyprstream_rpc::proof::admission::ProofReplayStore for PostgresProofReplayS
             expires_at,
         )
     }
+
+    fn check_and_insert_credential(
+        &self,
+        key: &hyprstream_rpc::proof::admission::CredentialReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.record(
+            &[
+                b"source-credential",
+                &key.issuer_client_namespace,
+                &key.credential_identity,
+            ],
+            expires_at,
+        )
+    }
 }
 
 /// Install the v16 proof admission substrate: the rotating server challenge

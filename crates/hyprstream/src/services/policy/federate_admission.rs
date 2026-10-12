@@ -12,13 +12,20 @@ use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::{
     auth::{signer_suite::signer_suite_thumbprint, Scope},
-    proof::enrollment::authenticated_replay_namespace,
+    proof::{
+        admission::{
+            global_proof_replay_store, CredentialReplayKey, ProofAdmissionResult, ProofReplayStore,
+            ReplayDomainGuarantee,
+        },
+        enrollment::authenticated_replay_namespace,
+    },
 };
 use hyprstream_rpc_std::policy_client::AdmitFederateRequest;
 use hyprstream_session_store::{
     primary::CollisionInventory, Admission, PendingSession, PrimaryRecord, Session, Source, Store,
 };
 use rand::RngCore as _;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -76,6 +83,45 @@ struct PendingDecision {
     expires_at: i64,
 }
 
+trait CredentialReplayAdmission: Send + Sync {
+    fn admit_source_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult;
+}
+
+impl<T: ProofReplayStore> CredentialReplayAdmission for T {
+    fn admit_source_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        self.check_and_insert_credential(key, expires_at)
+    }
+}
+
+/// Production Policy uses the same shared admission backend as RPC request
+/// proofs. It refuses single-process memory because credential consumption
+/// must survive verifier restarts and coordinate concurrent instances.
+struct GlobalCredentialReplay;
+
+impl CredentialReplayAdmission for GlobalCredentialReplay {
+    fn admit_source_credential(
+        &self,
+        key: &CredentialReplayKey,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        let Some(store) = global_proof_replay_store() else {
+            return ProofAdmissionResult::Failed;
+        };
+        if store.domain_guarantee() != ReplayDomainGuarantee::LinearizableSharedStore {
+            return ProofAdmissionResult::Failed;
+        }
+        store.check_and_insert_credential(key, expires_at)
+    }
+}
+
 /// Internal upstream evidence, not a browser DTO or verification boolean.
 /// OAuth's FederateIssuer constructs it only after strict source-token
 /// validation and both signatures over the exact challenge have verified.
@@ -112,6 +158,7 @@ pub(super) struct AdmissionService {
     authority: Option<Authorities>,
     capacity: Option<Semaphore>,
     session_pool: Option<deadpool_postgres::Pool>,
+    source_replay: Option<Arc<dyn CredentialReplayAdmission>>,
     pending: Mutex<BTreeMap<[u8; 32], PendingDecision>>,
 }
 
@@ -336,8 +383,36 @@ impl AdmissionService {
             }),
             capacity: Some(Semaphore::new(32)),
             session_pool,
+            source_replay: Some(Arc::new(GlobalCredentialReplay)),
             pending: Mutex::default(),
         }
+    }
+}
+
+fn source_credential_replay_key(source: &Source, client_id: &str) -> CredentialReplayKey {
+    fn digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        for field in fields {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        digest.finalize().into()
+    }
+
+    CredentialReplayKey {
+        issuer_client_namespace: digest(
+            b"hyprstream-source-credential-namespace-v1\0",
+            &[source.issuer.as_bytes(), client_id.as_bytes()],
+        ),
+        credential_identity: digest(
+            b"hyprstream-source-credential-identity-v1\0",
+            &[
+                source.jti.as_bytes(),
+                source.nonce.as_bytes(),
+                &source.token_hash,
+            ],
+        ),
     }
 }
 
@@ -766,6 +841,7 @@ impl AdmissionService {
         ensure!(current == pending.decision, "challenge decision changed");
         let session_expires_at = pending.source.expires_at.min(now + 300);
         ensure!(session_expires_at > now, "source credential expired");
+        self.consume_source_credential(&source, &authority.profile.client)?;
         Ok(Session {
             host: authority.profile.host.clone(),
             sid: uuid::Uuid::new_v4().to_string(),
@@ -792,6 +868,26 @@ impl AdmissionService {
             .ok_or_else(|| anyhow::anyhow!("Federate admission disabled"))?;
         oauth_caller(ctx, &authority.enrollment)?;
         Ok(authority)
+    }
+
+    fn consume_source_credential(&self, source: &Source, client_id: &str) -> Result<()> {
+        let expires_at = u64::try_from(source.expires_at)?;
+        let now = u64::try_from(chrono::Utc::now().timestamp())?;
+        ensure!(expires_at > now, "source credential expired");
+        let replay = self
+            .source_replay
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("source credential replay admission disabled"))?;
+        let key = source_credential_replay_key(source, client_id);
+        match replay.admit_source_credential(&key, expires_at) {
+            ProofAdmissionResult::Admitted => Ok(()),
+            ProofAdmissionResult::Replayed => {
+                Err(anyhow::anyhow!("source credential already consumed"))
+            }
+            ProofAdmissionResult::Failed => Err(anyhow::anyhow!(
+                "source credential replay admission unavailable"
+            )),
+        }
     }
 
     async fn prepare(
@@ -824,6 +920,7 @@ impl AdmissionService {
         tokio::time::timeout(Duration::from_secs(2), async {
             let current = a.decision(&evidence.source, &evidence.requested).await?;
             ensure!(current == evidence.challenge, "challenge decision changed");
+            self.consume_source_credential(&evidence.source, &a.profile.client)?;
             let session = PendingSession {
                 host: a.profile.host.clone(),
                 sid: evidence.sid,

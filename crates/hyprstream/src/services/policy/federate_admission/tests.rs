@@ -84,6 +84,40 @@ fn source() -> Source {
         expires_at: now + 120,
     }
 }
+
+struct TestSharedReplayStore(hyprstream_rpc::proof::admission::InMemoryProofReplayStore);
+
+impl hyprstream_rpc::proof::admission::ProofReplayStore for TestSharedReplayStore {
+    fn domain_guarantee(&self) -> hyprstream_rpc::proof::admission::ReplayDomainGuarantee {
+        hyprstream_rpc::proof::admission::ReplayDomainGuarantee::LinearizableSharedStore
+    }
+
+    fn check_and_insert(
+        &self,
+        partition: hyprstream_rpc::proof::ProofDisposition,
+        key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.0.check_and_insert(partition, key, expires_at)
+    }
+
+    fn check_and_insert_mediated(
+        &self,
+        key: &hyprstream_rpc::proof::admission::MediatedQueryReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.0.check_and_insert_mediated(key, expires_at)
+    }
+
+    fn check_and_insert_credential(
+        &self,
+        key: &hyprstream_rpc::proof::admission::CredentialReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.0.check_and_insert_credential(key, expires_at)
+    }
+}
+
 async fn fixture() -> (AdmissionService, EnvelopeContext) {
     let signer = SigningKey::from_bytes(&[24; 32]).verifying_key();
     use crate::auth::service_enrollment::ServiceEnrollment;
@@ -168,6 +202,9 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
         AdmissionService {
             authority: Some(a),
             capacity: Some(Semaphore::new(1)),
+            source_replay: Some(Arc::new(
+                hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(128),
+            )),
             ..Default::default()
         },
         EnvelopeContext::for_test_authenticated_subject_with_claims(
@@ -194,6 +231,14 @@ async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<
         );
         return Ok(());
     }
+    hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+        TestSharedReplayStore(
+            hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(
+                128,
+            ),
+        ),
+    ))
+    .map_err(|_| anyhow::anyhow!("isolated replay fixture already installed"))?;
     use hyprstream_rpc::auth::{jwt, Claims, ClusterKeySource};
     use hyprstream_rpc::transport::TransportConfig;
     use hyprstream_rpc_std::policy_client::{
@@ -651,6 +696,36 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     assert_eq!(session.subject, ATPROTO_DID);
     assert_eq!(session.proof_epoch, 1);
     assert_eq!(session.scopes, [STAGING_SCOPE.to_owned()]);
+
+    let replayed = source();
+    let prepared_again = service
+        .prepare_rpc(
+            &ctx,
+            replayed.clone(),
+            vec![STAGING_SCOPE.into()],
+            [14; 32],
+            now,
+            [1; 32],
+            vec![2; 1952],
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                prepared_again.handle,
+                replayed,
+                [14; 32],
+                now,
+                now + 60,
+                [1; 32],
+                vec![2; 1952],
+            )
+            .await
+            .is_err(),
+        "a fresh challenge must not redeem the same source credential twice"
+    );
 }
 
 #[tokio::test]
