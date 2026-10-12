@@ -93,7 +93,8 @@ impl Binning {
     pub fn assign(&self, confidence: f64) -> usize {
         let n_bins = self.n_bins();
         for (i, w) in self.edges.windows(2).enumerate() {
-            if confidence >= w[0] && (confidence < w[1] || (i == n_bins - 1 && confidence <= w[1])) {
+            if confidence >= w[0] && (confidence < w[1] || (i == n_bins - 1 && confidence <= w[1]))
+            {
                 return i;
             }
         }

@@ -7,7 +7,7 @@
 //! unblocks #699 carrier-(b).
 
 use hyprstream_rpc::auth::mac::{ContentBoundLabel, LabeledObject, SecurityLabel};
-use hyprstream_rpc::cid::{Codec, HashAlgo, decode_cid, encode_cid};
+use hyprstream_rpc::cid::{decode_cid, encode_cid, Codec, HashAlgo};
 use serde::{Deserialize, Serialize};
 
 use super::CasError;

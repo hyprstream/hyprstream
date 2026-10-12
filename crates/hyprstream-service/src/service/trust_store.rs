@@ -86,7 +86,11 @@ impl TrustStore {
             );
             return;
         }
-        let subject_debug = attestation.subject.as_deref().unwrap_or("<scope-derived>").to_owned();
+        let subject_debug = attestation
+            .subject
+            .as_deref()
+            .unwrap_or("<scope-derived>")
+            .to_owned();
         let scopes_debug: Vec<String> = attestation.scopes.iter().cloned().collect();
         let expires_debug = attestation.expires_at;
         self.inner
@@ -136,7 +140,8 @@ impl TrustStore {
         use dashmap::mapref::entry::Entry;
         anyhow::ensure!(!service.is_empty(), "empty registered service name");
         anyhow::ensure!(
-            attestation.scopes.len() == 1 && attestation.scopes.contains(service)
+            attestation.scopes.len() == 1
+                && attestation.scopes.contains(service)
                 && attestation.subject.is_none()
                 && attestation.jwt.as_ref().is_some_and(|jwt| !jwt.is_empty())
                 && attestation.attested_by.is_some()
@@ -144,18 +149,28 @@ impl TrustStore {
             "invalid service registration attestation"
         );
         match self.inner.entry(key) {
-            Entry::Vacant(entry) => { entry.insert(attestation); }
+            Entry::Vacant(entry) => {
+                entry.insert(attestation);
+            }
             Entry::Occupied(mut entry) => {
                 let existing = entry.get();
                 let subject = format!("service:{service}");
                 anyhow::ensure!(
-                    existing.subject.as_deref().is_none_or(|value| value == subject)
+                    existing
+                        .subject
+                        .as_deref()
+                        .is_none_or(|value| value == subject)
                         && existing.scopes.is_subset(&attestation.scopes),
                     "service registration conflicts with retained key identity"
                 );
-                anyhow::ensure!(attestation.expires_at >= existing.expires_at, "stale service registration");
                 anyhow::ensure!(
-                    existing.attested_by.is_none_or(|authority| Some(authority) == attestation.attested_by),
+                    attestation.expires_at >= existing.expires_at,
+                    "stale service registration"
+                );
+                anyhow::ensure!(
+                    existing
+                        .attested_by
+                        .is_none_or(|authority| Some(authority) == attestation.attested_by),
                     "service registration conflicts with retained authority"
                 );
                 if attestation.expires_at == existing.expires_at {
@@ -180,8 +195,7 @@ impl TrustStore {
         match self.inner.get(key) {
             Some(att) => {
                 let now = chrono::Utc::now().timestamp();
-                (att.expires_at == 0 || att.expires_at > now)
-                    && att.scopes.contains(scope)
+                (att.expires_at == 0 || att.expires_at > now) && att.scopes.contains(scope)
             }
             None => false,
         }
@@ -260,7 +274,10 @@ impl TrustStore {
     /// For user keys: returns `attestation.subject` (e.g., "alice").
     /// For service keys: returns `"service:{first_scope}"` (e.g., "service:model").
     /// Returns `None` if the key is not in the trust store or is expired.
-    pub fn resolve_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+    pub fn resolve_subject(
+        &self,
+        signer_pubkey: &[u8; 32],
+    ) -> Option<hyprstream_rpc::envelope::Subject> {
         let vk = VerifyingKey::from_bytes(signer_pubkey).ok()?;
         let att = self.get(&vk)?;
         // User keys: explicit subject
@@ -275,9 +292,10 @@ impl TrustStore {
             return Some(hyprstream_rpc::envelope::Subject::new(subject.clone()));
         }
         // Service keys: derive from scope
-        att.scopes.iter().next().map(|scope| {
-            hyprstream_rpc::envelope::Subject::new(format!("service:{scope}"))
-        })
+        att.scopes
+            .iter()
+            .next()
+            .map(|scope| hyprstream_rpc::envelope::Subject::new(format!("service:{scope}")))
     }
 
     /// Remove all entries whose attestation was issued by the given root key.
@@ -286,9 +304,8 @@ impl TrustStore {
     pub fn invalidate_by_root(&self, root_key: &VerifyingKey) -> usize {
         let root_bytes = root_key.to_bytes();
         let before = self.inner.len();
-        self.inner.retain(|_, att| {
-            att.attested_by.as_ref() != Some(&root_bytes)
-        });
+        self.inner
+            .retain(|_, att| att.attested_by.as_ref() != Some(&root_bytes));
         let removed = before - self.inner.len();
         if removed > 0 {
             tracing::info!(
@@ -381,7 +398,10 @@ mod tests {
 
     fn make_attestation(scopes: &[&str], expires_at: i64) -> Attestation {
         Attestation {
-            scopes: scopes.iter().map(std::string::ToString::to_string).collect(),
+            scopes: scopes
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             subject: None,
             jwt: None,
             expires_at,
@@ -417,7 +437,9 @@ mod tests {
         registered.subject = None;
         registered.scopes.insert("model".to_owned());
         for _ in 0..2 {
-            assert!(store.publish_service_registration(key, "model", registered.clone()).is_ok());
+            assert!(store
+                .publish_service_registration(key, "model", registered.clone())
+                .is_ok());
             let published = store.published_keys_for_scope("model");
             assert_eq!(published.len(), 1);
             assert_eq!(published[0].verifying_key, key);
@@ -438,7 +460,9 @@ mod tests {
         certified.attested_by = Some([7; 32]);
         for _ in 0..2 {
             store.publish_service_registration(key, "model", certified.clone())?;
-            let retained = store.get(&key).ok_or_else(|| anyhow::anyhow!("registration missing"))?;
+            let retained = store
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("registration missing"))?;
             assert_eq!(retained.attested_by, certified.attested_by);
             assert_eq!(retained.jwt, certified.jwt);
             assert_eq!(retained.scopes, certified.scopes);
@@ -448,7 +472,8 @@ mod tests {
     }
 
     #[test]
-    fn service_registration_rejects_conflicts_without_changing_cached_authority() -> anyhow::Result<()> {
+    fn service_registration_rejects_conflicts_without_changing_cached_authority(
+    ) -> anyhow::Result<()> {
         let (_, key) = random_key();
         let expires = chrono::Utc::now().timestamp() + 3600;
         let mut registered = make_attestation(&["model"], expires);
@@ -473,8 +498,12 @@ mod tests {
         for existing in conflicting {
             let store = TrustStore::new();
             store.insert(key, existing.clone());
-            assert!(store.publish_service_registration(key, "model", registered.clone()).is_err());
-            let retained = store.get(&key).ok_or_else(|| anyhow::anyhow!("existing authority was lost"))?;
+            assert!(store
+                .publish_service_registration(key, "model", registered.clone())
+                .is_err());
+            let retained = store
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("existing authority was lost"))?;
             assert_eq!(retained.subject, existing.subject);
             assert_eq!(retained.scopes, existing.scopes);
             assert_eq!(retained.jwt, existing.jwt);
@@ -484,7 +513,9 @@ mod tests {
         let store = TrustStore::new();
         let mut invalid = registered;
         invalid.jwt = None;
-        assert!(store.publish_service_registration(key, "model", invalid).is_err());
+        assert!(store
+            .publish_service_registration(key, "model", invalid)
+            .is_err());
         assert!(store.get(&key).is_none());
         Ok(())
     }
@@ -504,10 +535,16 @@ mod tests {
             renewed.expires_at = expires + 3600;
             renewed.jwt = Some("renewed-credential".to_owned());
             renewed.attested_by = Some([8; 32]);
-            assert!(store.publish_service_registration(key, "model", renewed.clone()).is_err());
+            assert!(store
+                .publish_service_registration(key, "model", renewed.clone())
+                .is_err());
             // Public get intentionally hides expired entries; inspect retained
             // storage here to prove the rejected replacement did not mutate it.
-            let unchanged = store.inner.get(&key).ok_or_else(|| anyhow::anyhow!("retained authority lost"))?.clone();
+            let unchanged = store
+                .inner
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("retained authority lost"))?
+                .clone();
             assert_eq!(unchanged.attested_by, retained.attested_by);
             assert_eq!(unchanged.jwt, retained.jwt);
             assert_eq!(unchanged.expires_at, retained.expires_at);
@@ -516,7 +553,9 @@ mod tests {
             // Renewal may change the credential/expiry, but not its root.
             renewed.attested_by = retained.attested_by;
             store.publish_service_registration(key, "model", renewed.clone())?;
-            let updated = store.get(&key).ok_or_else(|| anyhow::anyhow!("renewal missing"))?;
+            let updated = store
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("renewal missing"))?;
             assert_eq!(updated.attested_by, retained.attested_by);
             assert_eq!(updated.jwt, renewed.jwt);
             assert_eq!(updated.expires_at, renewed.expires_at);
@@ -709,9 +748,8 @@ mod tests {
         store.insert(service_key, make_attestation(&["discovery"], 0));
 
         // The rpc-layer global resolver routes through this same trust store.
-        let registered = hyprstream_rpc::auth::key_subject_resolver::resolve_subject(
-            &service_key.to_bytes(),
-        );
+        let registered =
+            hyprstream_rpc::auth::key_subject_resolver::resolve_subject(&service_key.to_bytes());
         assert_eq!(
             registered.map(|s| s.to_string()),
             Some("service:discovery".to_owned()),

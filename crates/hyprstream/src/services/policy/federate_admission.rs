@@ -209,8 +209,7 @@ impl RequestUseReader {
             ensure!(
                 data.scopes.iter().any(|text| {
                     Scope::parse(text).is_ok_and(|scope| {
-                        scope.action == data.operation
-                            && scope.policy_resource() == data.resource
+                        scope.action == data.operation && scope.policy_resource() == data.resource
                     })
                 }),
                 "operation is outside the signed scope"
@@ -597,7 +596,10 @@ impl Authorities {
             (did.starts_with("did:plc:") || did.starts_with("did:web:")) && did.len() <= 255,
             "session subject is not an ATProto DID"
         );
-        ensure!(source_atproto_did == did, "source DID does not match session principal");
+        ensure!(
+            source_atproto_did == did,
+            "source DID does not match session principal"
+        );
         ensure!(
             session.account_id == federate_account_id(&self.profile.host, did),
             "session account binding changed"
@@ -640,7 +642,9 @@ impl AdmissionService {
         let now = chrono::Utc::now().timestamp();
         ensure!(challenge_id != [0; 32], "invalid challenge ID");
         ensure!(
-            authority.collision_inventory.permits(&ed_public, &pq_public),
+            authority
+                .collision_inventory
+                .permits(&ed_public, &pq_public),
             "Federate proof key collides with a trusted protocol key or has an invalid PQ length"
         );
         ensure!(
@@ -729,7 +733,9 @@ impl AdmissionService {
         );
         ensure!(pq_public.len() == 1952, "invalid PQ public key");
         ensure!(
-            authority.collision_inventory.permits(&ed_public, &pq_public),
+            authority
+                .collision_inventory
+                .permits(&ed_public, &pq_public),
             "Federate proof key collides with a trusted protocol key"
         );
         if let Some(pool) = &self.session_pool {

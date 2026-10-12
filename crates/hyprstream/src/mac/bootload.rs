@@ -100,12 +100,8 @@ fn load_boot_policy_files(
         .context("expected MAC boot-policy hash must be hexadecimal")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("expected MAC boot-policy hash must be exactly 32 bytes"))?;
-    check_reviewed_policy(
-        &policy,
-        artifacts.expected_generation,
-        &expected_hash,
-    )
-    .context("configured MAC boot-policy rollback pin rejected")?;
+    check_reviewed_policy(&policy, artifacts.expected_generation, &expected_hash)
+        .context("configured MAC boot-policy rollback pin rejected")?;
     Ok(policy)
 }
 
@@ -484,7 +480,9 @@ mod tests {
         boot_artifacts_at_generation(7)
     }
 
-    fn boot_artifacts_at_generation(generation: u32) -> (
+    fn boot_artifacts_at_generation(
+        generation: u32,
+    ) -> (
         SignedPolicy,
         SignedApproval,
         crate::auth::identity_store::BootstrapPubkey,
@@ -513,13 +511,12 @@ mod tests {
             },
         )
         .unwrap();
-        let binding =
-            ApprovalBinding::new(
-                &grant_with(vec![]),
-                policy.generation,
-                policy.policy_hash().unwrap(),
-            )
-            .unwrap();
+        let binding = ApprovalBinding::new(
+            &grant_with(vec![]),
+            policy.generation,
+            policy.policy_hash().unwrap(),
+        )
+        .unwrap();
         let approval = SignedApproval::sign(binding, &ed, &pq).unwrap();
         let authority =
             crate::auth::identity_store::BootstrapPubkey::hybrid(ed.verifying_key(), pq_vk);
@@ -567,8 +564,7 @@ mod tests {
 
     #[test]
     fn configured_boot_pin_rejects_older_valid_pair_after_restart_reload() {
-        let (current_signed, current_approval, authority, ed, pq) =
-            boot_artifacts_at_generation(7);
+        let (current_signed, current_approval, authority, ed, pq) = boot_artifacts_at_generation(7);
         let current = verify_boot_policy(&current_signed, &current_approval, &authority).unwrap();
         let older = CompiledPolicy::new(
             crate::mac::te::TeMatrix::default(),

@@ -46,8 +46,9 @@ impl CacheManager {
                 let now_secs = i64::try_from(
                     now.duration_since(UNIX_EPOCH)
                         .map_err(|e| Status::internal(e.to_string()))?
-                        .as_secs()
-                ).unwrap_or(i64::MAX);
+                        .as_secs(),
+                )
+                .unwrap_or(i64::MAX);
                 let ttl_secs = i64::try_from(ttl).unwrap_or(i64::MAX);
                 let cutoff = now_secs.saturating_sub(ttl_secs);
 

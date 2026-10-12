@@ -112,8 +112,7 @@ impl ProductionUserStore {
             CredentialsBackend::Postgres => {
                 #[cfg(feature = "postgres")]
                 {
-                    let store =
-                        super::PostgresUserStore::open_admitted(&Self::permit()).await?;
+                    let store = super::PostgresUserStore::open_admitted(&Self::permit()).await?;
                     Ok(Self::from_encrypted_backend(store))
                 }
                 #[cfg(not(feature = "postgres"))]
@@ -131,10 +130,7 @@ impl ProductionUserStore {
                         inner: Arc::new(store),
                     })
                 }
-                #[cfg(all(
-                    not(feature = "encrypted-account-admission"),
-                    not(feature = "rocksdb")
-                ))]
+                #[cfg(all(not(feature = "encrypted-account-admission"), not(feature = "rocksdb")))]
                 {
                     anyhow::bail!(
                         "credentials.backend = \"rocksdb\" but this binary lacks the rocksdb feature"
@@ -279,7 +275,10 @@ mod tests {
                 .env("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres")
                 .env("HYPRSTREAM__OAUTH__PORT", "invalid-port")
                 .status()?;
-            anyhow::ensure!(status.success(), "invalid credential configuration child failed");
+            anyhow::ensure!(
+                status.success(),
+                "invalid credential configuration child failed"
+            );
             return Ok(());
         }
         let credentials = tempfile::tempdir()?;
@@ -287,7 +286,9 @@ mod tests {
             Ok(_) => anyhow::bail!("invalid configuration opened an account store"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("failed to load production credential configuration"));
+        assert!(error
+            .to_string()
+            .contains("failed to load production credential configuration"));
         assert_eq!(std::fs::read_dir(credentials.path())?.count(), 0);
         Ok(())
     }

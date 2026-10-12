@@ -10,9 +10,10 @@
 
 use std::{sync::Arc, time::Duration};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::VerifyingKey;
 use hyprstream_rpc::{
-    auth::{Claims, Scope, parse_protected_header, signer_suite::signer_suite_thumbprint},
+    auth::{parse_protected_header, signer_suite::signer_suite_thumbprint, Claims, Scope},
     crypto::pq::ml_dsa_vk_from_bytes,
     proof::{
         enrollment::{
@@ -26,7 +27,6 @@ use hyprstream_rpc::{
 };
 use hyprstream_rpc_std::policy_client::{AdmitFederateRequest, PolicyClient, SessionPrimary};
 use hyprstream_session_store::{primary::ExpectedPrimary, PROFILE, SUITE};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -65,7 +65,11 @@ pub(crate) async fn verify_dispatch_fixture(
     };
     let request = Request {
         proof: ctx.request_proof_cwt().ok_or(Error::Denied)?,
-        credential: ctx.deferred_federate_credential().ok_or(Error::Denied)?.1.as_bytes(),
+        credential: ctx
+            .deferred_federate_credential()
+            .ok_or(Error::Denied)?
+            .1
+            .as_bytes(),
         service,
         schema_id,
         body,
@@ -129,9 +133,14 @@ impl CredentialHandle {
         let suite_bytes = URL_SAFE_NO_PAD.decode(suite).map_err(|_| Error::Denied)?;
         let suite_thumbprint: [u8; 32] = suite_bytes.try_into().map_err(|_| Error::Denied)?;
         let pq_encoded = claims.hs_signer_pq_key_v1.as_deref().ok_or(Error::Denied)?;
-        let pq_public = URL_SAFE_NO_PAD.decode(pq_encoded).map_err(|_| Error::Denied)?;
+        let pq_public = URL_SAFE_NO_PAD
+            .decode(pq_encoded)
+            .map_err(|_| Error::Denied)?;
         let source_issuer = claims.hs_source_issuer_v1.as_deref().ok_or(Error::Denied)?;
-        let source_subject = claims.hs_source_subject_v1.as_deref().ok_or(Error::Denied)?;
+        let source_subject = claims
+            .hs_source_subject_v1
+            .as_deref()
+            .ok_or(Error::Denied)?;
         let generation = claims
             .federate_signer_inventory()
             .map_err(|_| Error::Denied)?
@@ -155,7 +164,10 @@ impl CredentialHandle {
             || jwk.crv != "Ed25519"
             || URL_SAFE_NO_PAD.encode(ed) != jwk.x
             || URL_SAFE_NO_PAD.encode(suite_thumbprint) != suite
-            || claims.session_authority_generation().map_err(|_| Error::Denied)?.is_some()
+            || claims
+                .session_authority_generation()
+                .map_err(|_| Error::Denied)?
+                .is_some()
             || pq_public.len() != 1952
             || URL_SAFE_NO_PAD.encode(&pq_public) != pq_encoded
             || ml_dsa_vk_from_bytes(&pq_public).is_err()
@@ -334,11 +346,22 @@ impl DispatchAdapter {
             static_enrollments: self.static_enrollments.as_ref(),
             in_flight: &self.in_flight,
         };
-        let request = Request { proof: raw, credential: ctx.deferred_federate_credential().ok_or(Error::Denied)?.1.as_bytes(), service, schema_id, body };
-        let verified = consumer.verify(
-            &handle, &request, &local,
-            || chrono::Utc::now().timestamp().max(0) as u64,
-        ).await?;
+        let request = Request {
+            proof: raw,
+            credential: ctx
+                .deferred_federate_credential()
+                .ok_or(Error::Denied)?
+                .1
+                .as_bytes(),
+            service,
+            schema_id,
+            body,
+        };
+        let verified = consumer
+            .verify(&handle, &request, &local, || {
+                chrono::Utc::now().timestamp().max(0) as u64
+            })
+            .await?;
         if verified.primary_principal.as_deref() != Some(handle.expected.subject.as_str())
             || verified.primary_suite != SUITE
         {

@@ -1,6 +1,6 @@
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::time::Instant;
-use anyhow::{anyhow, Result};
 use tch::Tensor;
 
 /// Outcome of resolving an adaptation through the state machine.
@@ -15,7 +15,9 @@ pub enum ResolveOutcome {
         eff_ranks: HashMap<String, usize>,
     },
     StoredPending,
-    Skipped { reason: String },
+    Skipped {
+        reason: String,
+    },
 }
 
 /// Strategy for handling a completed adaptation.
@@ -89,9 +91,11 @@ impl DeltaAdaptationState {
 
     pub fn is_expired(&self) -> bool {
         match self {
-            Self::Pending { created_at, timeout_ms, .. } => {
-                created_at.elapsed().as_millis() as u64 > *timeout_ms
-            }
+            Self::Pending {
+                created_at,
+                timeout_ms,
+                ..
+            } => created_at.elapsed().as_millis() as u64 > *timeout_ms,
             Self::Idle => false,
         }
     }
@@ -147,7 +151,8 @@ impl DeltaAdaptationState {
             pre_muon: old_muon,
             pre_eff_ranks: old_ranks,
             ..
-        } = std::mem::replace(self, Self::Idle) {
+        } = std::mem::replace(self, Self::Idle)
+        {
             // Old pending exists: promote its baseline (pre-first-adaptation state)
             (old_snap, old_muon, old_ranks)
         } else {
@@ -198,15 +203,11 @@ impl DeltaAdaptationState {
     /// to apply to the delta's counters.
     pub fn writeback_stats(&mut self) -> Result<WritebackInfo> {
         match std::mem::replace(self, Self::Idle) {
-            Self::Pending { ttt_result, .. } => {
-                Ok(WritebackInfo {
-                    steps_performed: ttt_result.steps_performed,
-                    loss_improvement: ttt_result.loss_improvement,
-                })
-            }
-            Self::Idle => {
-                Err(anyhow!("No pending adaptation to write back"))
-            }
+            Self::Pending { ttt_result, .. } => Ok(WritebackInfo {
+                steps_performed: ttt_result.steps_performed,
+                loss_improvement: ttt_result.loss_improvement,
+            }),
+            Self::Idle => Err(anyhow!("No pending adaptation to write back")),
         }
     }
 
@@ -214,12 +215,17 @@ impl DeltaAdaptationState {
     /// to restore onto the delta.
     pub fn evict(&mut self) -> Result<EvictedSnapshot> {
         match std::mem::replace(self, Self::Idle) {
-            Self::Pending { pre_snapshot, pre_muon, pre_eff_ranks, .. } => {
-                Ok(EvictedSnapshot { pre_snapshot, pre_muon, pre_eff_ranks })
-            }
-            Self::Idle => {
-                Err(anyhow!("No pending adaptation to evict"))
-            }
+            Self::Pending {
+                pre_snapshot,
+                pre_muon,
+                pre_eff_ranks,
+                ..
+            } => Ok(EvictedSnapshot {
+                pre_snapshot,
+                pre_muon,
+                pre_eff_ranks,
+            }),
+            Self::Idle => Err(anyhow!("No pending adaptation to evict")),
         }
     }
 }
@@ -236,16 +242,27 @@ mod tests {
     use super::*;
 
     fn make_guard(expired: bool, at_capacity: bool) -> GuardStatus {
-        GuardStatus { expired, at_capacity, lora_generation: 0 }
+        GuardStatus {
+            expired,
+            at_capacity,
+            lora_generation: 0,
+        }
     }
 
     fn make_fake_snapshot() -> HashMap<String, Tensor> {
         let mut m = HashMap::new();
-        m.insert("test".into(), Tensor::zeros([2, 2], (tch::Kind::Float, tch::Device::Cpu)));
+        m.insert(
+            "test".into(),
+            Tensor::zeros([2, 2], (tch::Kind::Float, tch::Device::Cpu)),
+        );
         m
     }
 
-    fn make_fake_result(recommendation: bool, loss_improvement: f32, steps: usize) -> super::super::ttt::TTTResult {
+    fn make_fake_result(
+        recommendation: bool,
+        loss_improvement: f32,
+        steps: usize,
+    ) -> super::super::ttt::TTTResult {
         let mut r = super::super::ttt::TTTResult::skipped("test");
         r.recommendation = recommendation;
         r.loss_improvement = loss_improvement;
@@ -271,7 +288,9 @@ mod tests {
             AdaptationStrategy::AutoWriteback,
             &guard,
             &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::WrittenBack));
         assert!(!state.is_pending());
@@ -286,7 +305,9 @@ mod tests {
             AdaptationStrategy::AutoWriteback,
             &guard,
             &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::Evicted { .. }));
         assert!(!state.is_pending());
@@ -301,7 +322,9 @@ mod tests {
             AdaptationStrategy::Speculative,
             &guard,
             &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::StoredPending));
         assert!(state.is_pending());
@@ -316,7 +339,9 @@ mod tests {
             AdaptationStrategy::AutoWriteback,
             &guard,
             &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::Skipped { .. }));
     }
@@ -328,16 +353,24 @@ mod tests {
         let result = make_fake_result(true, 0.05, 3);
         let snap1 = make_fake_snapshot();
         state.resolve(
-            AdaptationStrategy::Speculative, &guard, &result,
-            snap1, HashMap::new(), HashMap::new(),
+            AdaptationStrategy::Speculative,
+            &guard,
+            &result,
+            snap1,
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(state.is_pending());
 
         let guard_expired = make_guard(true, false);
         let result2 = make_fake_result(true, 0.03, 2);
         let outcome = state.resolve(
-            AdaptationStrategy::AutoWriteback, &guard_expired, &result2,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            AdaptationStrategy::AutoWriteback,
+            &guard_expired,
+            &result2,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::WrittenBack));
     }
@@ -351,24 +384,40 @@ mod tests {
         let snap1 = make_fake_snapshot();
         let snap1_keys: Vec<String> = snap1.keys().cloned().collect();
         state.resolve(
-            AdaptationStrategy::Speculative, &guard, &result,
-            snap1, HashMap::new(), HashMap::new(),
+            AdaptationStrategy::Speculative,
+            &guard,
+            &result,
+            snap1,
+            HashMap::new(),
+            HashMap::new(),
         );
 
         let snap2 = {
             let mut m = HashMap::new();
-            m.insert("different_key".into(), Tensor::ones([2, 2], (tch::Kind::Float, tch::Device::Cpu)));
+            m.insert(
+                "different_key".into(),
+                Tensor::ones([2, 2], (tch::Kind::Float, tch::Device::Cpu)),
+            );
             m
         };
         let result2 = make_fake_result(true, 0.03, 2);
         state.resolve(
-            AdaptationStrategy::Speculative, &guard, &result2,
-            snap2, HashMap::new(), HashMap::new(),
+            AdaptationStrategy::Speculative,
+            &guard,
+            &result2,
+            snap2,
+            HashMap::new(),
+            HashMap::new(),
         );
 
-        if let DeltaAdaptationState::Pending { ref pre_snapshot, .. } = state {
-            assert!(pre_snapshot.contains_key(&snap1_keys[0]),
-                "Stacked pending should promote the FIRST snapshot as baseline");
+        if let DeltaAdaptationState::Pending {
+            ref pre_snapshot, ..
+        } = state
+        {
+            assert!(
+                pre_snapshot.contains_key(&snap1_keys[0]),
+                "Stacked pending should promote the FIRST snapshot as baseline"
+            );
         } else {
             panic!("Expected Pending state");
         }
@@ -386,8 +435,12 @@ mod tests {
         let guard = make_guard(false, false);
         let result = make_fake_result(true, 0.05, 3);
         state.resolve(
-            AdaptationStrategy::Speculative, &guard, &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            AdaptationStrategy::Speculative,
+            &guard,
+            &result,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         let info = state.writeback_stats().unwrap();
         assert_eq!(info.steps_performed, 3);
@@ -407,8 +460,12 @@ mod tests {
         let guard = make_guard(false, false);
         let result = make_fake_result(true, 0.05, 3);
         state.resolve(
-            AdaptationStrategy::Speculative, &guard, &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            AdaptationStrategy::Speculative,
+            &guard,
+            &result,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         let evicted = state.evict().unwrap();
         assert!(!evicted.pre_snapshot.is_empty());
@@ -421,8 +478,12 @@ mod tests {
         let guard = make_guard(false, false);
         let result = make_fake_result(true, 0.05, 3);
         let outcome = state.resolve(
-            AdaptationStrategy::AutoEvict, &guard, &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            AdaptationStrategy::AutoEvict,
+            &guard,
+            &result,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::Evicted { .. }));
     }
@@ -435,16 +496,22 @@ mod tests {
         let result = make_fake_result(true, 0.01, 3);
         let outcome = state.resolve(
             AdaptationStrategy::WritebackIfAbove { threshold: 0.02 },
-            &guard, &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            &guard,
+            &result,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::Evicted { .. }));
 
         let result2 = make_fake_result(true, 0.05, 3);
         let outcome2 = state.resolve(
             AdaptationStrategy::WritebackIfAbove { threshold: 0.02 },
-            &guard, &result2,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            &guard,
+            &result2,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome2, ResolveOutcome::WrittenBack));
     }
@@ -455,8 +522,12 @@ mod tests {
         let guard = make_guard(false, false);
         let result = crate::training::ttt::TTTResult::skipped("too short");
         let outcome = state.resolve(
-            AdaptationStrategy::AutoWriteback, &guard, &result,
-            make_fake_snapshot(), HashMap::new(), HashMap::new(),
+            AdaptationStrategy::AutoWriteback,
+            &guard,
+            &result,
+            make_fake_snapshot(),
+            HashMap::new(),
+            HashMap::new(),
         );
         assert!(matches!(outcome, ResolveOutcome::Skipped { .. }));
         assert!(!state.is_pending());

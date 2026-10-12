@@ -108,7 +108,10 @@ fn default_http_host() -> String {
 impl AccountZoneConfig {
     /// Whether the deployment has configured an account zone at all.
     pub fn is_configured(&self) -> bool {
-        self.zone.as_deref().filter(|s| !s.trim().is_empty()).is_some()
+        self.zone
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
     }
 
     /// Resolve the configured zone, or return [`AccountZoneError::Unset`].
@@ -195,7 +198,10 @@ mod tests {
                 dns01_credential: Some(blank.to_owned()),
                 ..Default::default()
             };
-            assert!(!cfg.dns01_ready(), "blank credential {blank:?} must not be ready");
+            assert!(
+                !cfg.dns01_ready(),
+                "blank credential {blank:?} must not be ready"
+            );
         }
     }
 

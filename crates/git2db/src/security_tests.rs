@@ -50,7 +50,6 @@ mod path_validation_tests {
         assert!(safe_path.ends_with("other"));
     }
 
-
     #[test]
     fn test_path_normalization() {
         use hyprstream_containedfs::contained_join;
@@ -101,9 +100,7 @@ mod transport_registry_tests {
                 let registry = Arc::clone(&registry);
                 let factory = Arc::clone(&factory);
                 let scheme = scheme.clone();
-                std::thread::spawn(move || {
-                    registry.register_transport(scheme, factory.clone())
-                })
+                std::thread::spawn(move || registry.register_transport(scheme, factory.clone()))
             })
             .collect();
 
@@ -128,16 +125,32 @@ mod transport_registry_tests {
         let factory = Arc::new(crate::transport::MockTransportFactory);
 
         // Valid schemes
-        assert!(registry.register_transport(format!("sec-valid1-{}", test_id), factory.clone()).is_ok());
-        assert!(registry.register_transport(format!("sec-valid2-{}", test_id), factory.clone()).is_ok());
-        assert!(registry.register_transport(format!("sec-my-transport-{}", test_id), factory.clone()).is_ok());
-        assert!(registry.register_transport(format!("sec_my_transport_{}", test_id), factory.clone()).is_ok());
+        assert!(registry
+            .register_transport(format!("sec-valid1-{}", test_id), factory.clone())
+            .is_ok());
+        assert!(registry
+            .register_transport(format!("sec-valid2-{}", test_id), factory.clone())
+            .is_ok());
+        assert!(registry
+            .register_transport(format!("sec-my-transport-{}", test_id), factory.clone())
+            .is_ok());
+        assert!(registry
+            .register_transport(format!("sec_my_transport_{}", test_id), factory.clone())
+            .is_ok());
 
         // Invalid schemes
-        assert!(registry.register_transport("".to_owned(), factory.clone()).is_err());
-        assert!(registry.register_transport("http://".to_owned(), factory.clone()).is_err());
-        assert!(registry.register_transport("http://invalid".to_owned(), factory.clone()).is_err());
-        assert!(registry.register_transport("transport with spaces".to_owned(), factory.clone()).is_err());
+        assert!(registry
+            .register_transport("".to_owned(), factory.clone())
+            .is_err());
+        assert!(registry
+            .register_transport("http://".to_owned(), factory.clone())
+            .is_err());
+        assert!(registry
+            .register_transport("http://invalid".to_owned(), factory.clone())
+            .is_err());
+        assert!(registry
+            .register_transport("transport with spaces".to_owned(), factory.clone())
+            .is_err());
     }
 
     #[test]
@@ -151,7 +164,9 @@ mod transport_registry_tests {
         let factory = Arc::new(crate::transport::MockTransportFactory);
 
         // Register transport
-        assert!(registry.register_transport(scheme.clone(), factory.clone()).is_ok());
+        assert!(registry
+            .register_transport(scheme.clone(), factory.clone())
+            .is_ok());
         assert_eq!(registry.stats().registered_factories, 1);
 
         // Unregister transport
@@ -183,7 +198,8 @@ mod integration_tests {
         let temp_dir = tempdir().unwrap();
 
         // Test that path validation works with real file operations using safe_path
-        let safe_path = hyprstream_containedfs::contained_join(temp_dir.path(), "test-repo").unwrap();
+        let safe_path =
+            hyprstream_containedfs::contained_join(temp_dir.path(), "test-repo").unwrap();
 
         // Create test directory
         std::fs::create_dir_all(&safe_path).unwrap();
@@ -191,7 +207,8 @@ mod integration_tests {
         assert!(safe_path.starts_with(temp_dir.path()));
 
         // Test path safety with safe_path
-        let safe_join = hyprstream_containedfs::contained_join(temp_dir.path(), "safe-model").unwrap();
+        let safe_join =
+            hyprstream_containedfs::contained_join(temp_dir.path(), "safe-model").unwrap();
         assert!(safe_join.starts_with(temp_dir.path()));
     }
 
@@ -256,7 +273,11 @@ mod performance_tests {
         }
 
         let duration = start.elapsed();
-        assert!(duration.as_millis() < 100, "Path validation should be fast: {:?}", duration);
+        assert!(
+            duration.as_millis() < 100,
+            "Path validation should be fast: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -279,7 +300,10 @@ mod performance_tests {
             .collect();
 
         for handle in handles {
-            assert!(handle.join().is_ok(), "Concurrent path validation should be thread-safe");
+            assert!(
+                handle.join().is_ok(),
+                "Concurrent path validation should be thread-safe"
+            );
         }
     }
 }
@@ -336,9 +360,13 @@ mod regression_tests {
             // Should either succeed (constrained by scoped_join) or fail gracefully
             // But should never allow actual path traversal
             if let Ok(validated_path) = result {
-                assert!(validated_path.starts_with(temp_dir.path()),
+                assert!(
+                    validated_path.starts_with(temp_dir.path()),
                     "Path {} was validated to {:?} which escapes base directory {:?}",
-                    attempt, validated_path, temp_dir.path());
+                    attempt,
+                    validated_path,
+                    temp_dir.path()
+                );
             }
         }
     }
@@ -373,7 +401,10 @@ mod regression_tests {
 
         // Should have successful registrations
         let success_count = results.iter().filter(|r| r.is_ok()).count();
-        assert!(success_count > 0, "At least some registrations should succeed");
+        assert!(
+            success_count > 0,
+            "At least some registrations should succeed"
+        );
     }
 }
 
@@ -427,10 +458,7 @@ mod untrusted_repo_guards {
     fn init_target_repo(path: &Path, filename: &str, content: &str) {
         let repo = Repository::init(path).unwrap();
         std::fs::write(path.join(filename), content).unwrap();
-        repo.index()
-            .unwrap()
-            .add_path(Path::new(filename))
-            .unwrap();
+        repo.index().unwrap().add_path(Path::new(filename)).unwrap();
         repo.index().unwrap().write().unwrap();
         commit_index(&repo, "initial");
     }
@@ -493,7 +521,11 @@ mod untrusted_repo_guards {
         let manager = test_manager();
 
         let target_dir = tempdir().unwrap();
-        init_target_repo(target_dir.path(), "secret.txt", "attacker-controlled payload\n");
+        init_target_repo(
+            target_dir.path(),
+            "secret.txt",
+            "attacker-controlled payload\n",
+        );
 
         let outer_dir = tempdir().unwrap();
         init_outer_repo_with_submodule(
@@ -540,7 +572,11 @@ mod untrusted_repo_guards {
         let manager = test_manager();
 
         let target_dir = tempdir().unwrap();
-        init_target_repo(target_dir.path(), "secret.txt", "attacker-controlled payload\n");
+        init_target_repo(
+            target_dir.path(),
+            "secret.txt",
+            "attacker-controlled payload\n",
+        );
 
         let outer_dir = tempdir().unwrap();
         init_outer_repo_with_submodule(
@@ -601,7 +637,11 @@ mod untrusted_repo_guards {
             .await
             .unwrap();
 
-        assert!(repo.find_submodule("vendor/target").unwrap().open().is_err());
+        assert!(repo
+            .find_submodule("vendor/target")
+            .unwrap()
+            .open()
+            .is_err());
     }
 
     // ---- Guard 2: FilterMode ----
@@ -783,7 +823,11 @@ mod untrusted_repo_guards {
 
         let dest_dir = tempdir().unwrap();
         let result = manager
-            .clone_repository(&file_url(src_dir.path()), &dest_dir.path().join("clone"), Some(options))
+            .clone_repository(
+                &file_url(src_dir.path()),
+                &dest_dir.path().join("clone"),
+                Some(options),
+            )
             .await
             .map(|_repo| ());
 

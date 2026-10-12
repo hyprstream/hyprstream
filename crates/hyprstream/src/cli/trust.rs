@@ -254,7 +254,9 @@ impl LoadedAuthority {
 /// Dispatch one early-startup trust command.
 pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
     match command {
-        TrustCommand::SignMacBootPolicy(args) => crate::mac::bootload::sign_reviewed_boot_policy(&args),
+        TrustCommand::SignMacBootPolicy(args) => {
+            crate::mac::bootload::sign_reviewed_boot_policy(&args)
+        }
         TrustCommand::MintDeploymentCa(args) => mint_deployment_ca(&args),
         TrustCommand::DelegateRegistrySigner(args) => delegate_registry_signer(&args),
         TrustCommand::MintRegistryJwt(args) => mint_registry_jwt(&args),
@@ -481,7 +483,13 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
         delegated_public_key_b64: delegated_public_b64,
         ucan_b64: STANDARD.encode(ucan.to_cbor()?),
     };
-    hyprstream_discovery::validate_registry_delegation(&public_ca, &log, &checkpoint, &artifact, now)?;
+    hyprstream_discovery::validate_registry_delegation(
+        &public_ca,
+        &log,
+        &checkpoint,
+        &artifact,
+        now,
+    )?;
     commit_outputs(vec![
         PendingOutput::new(&args.delegated_key, encrypted, 0o600),
         PendingOutput::new(&args.delegation, pretty_json_bytes(&artifact)?, 0o644),
@@ -3567,9 +3575,14 @@ mod tests {
             "legacy delegation must not grant enrollment"
         );
         let artifact = delegation_artifact(&root, &log, &delegated, legacy, now);
-        let validated =
-            hyprstream_discovery::validate_registry_delegation(&public_ca, &log, &checkpoint, &artifact, now)
-                .unwrap();
+        let validated = hyprstream_discovery::validate_registry_delegation(
+            &public_ca,
+            &log,
+            &checkpoint,
+            &artifact,
+            now,
+        )
+        .unwrap();
         assert!(!validated.grants_service_key_enrollment);
     }
 
@@ -3592,9 +3605,14 @@ mod tests {
             "two-capability delegation must grant enrollment"
         );
         let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
-        let validated =
-            hyprstream_discovery::validate_registry_delegation(&public_ca, &log, &checkpoint, &artifact, now)
-                .unwrap();
+        let validated = hyprstream_discovery::validate_registry_delegation(
+            &public_ca,
+            &log,
+            &checkpoint,
+            &artifact,
+            now,
+        )
+        .unwrap();
         assert!(validated.grants_service_key_enrollment);
         // A delegated registry JWT carrying the two-capability artifact still
         // passes the production verifier.
@@ -3875,8 +3893,14 @@ mod tests {
         verify_deployment(&args).unwrap();
         // Both allowlisted services attest against the same chain.
         for service in ["discovery", "policy"] {
-            let attestation =
-                mint_test_attestation(&delegated, artifact.clone(), service, &service_public, now, 3_600);
+            let attestation = mint_test_attestation(
+                &delegated,
+                artifact.clone(),
+                service,
+                &service_public,
+                now,
+                3_600,
+            );
             args.service_key_attestations
                 .push(write_attestation(dir.path(), &attestation));
         }
@@ -3910,7 +3934,9 @@ mod tests {
             now,
             3_600,
         );
-        assert!(verify_deployment(&args(vec![write_attestation(dir.path(), &legacy_scope)])).is_err());
+        assert!(
+            verify_deployment(&args(vec![write_attestation(dir.path(), &legacy_scope)])).is_err()
+        );
         // An attestation whose lifetime exceeds the one-hour capability ceiling
         // is rejected by the production verifier.
         let over_ttl = mint_test_attestation(
@@ -3963,8 +3989,7 @@ mod tests {
         let artifact = delegation_artifact(&root, &log, &delegated, dual, now);
         let service_ed = SigningKey::generate(&mut rand::rngs::OsRng);
         let (service_pq, _) = ml_dsa_generate_keypair();
-        let service_pq_vk =
-            ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&service_pq)).unwrap();
+        let service_pq_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&service_pq)).unwrap();
         let service_public = public_pair_bytes(&service_ed.verifying_key(), &service_pq);
         let attestation = mint_test_attestation(
             &delegated,
@@ -4618,7 +4643,7 @@ mod tests {
         );
     }
 
-   fn multibase(codec: [u8; 2], key: &[u8]) -> String {
+    fn multibase(codec: [u8; 2], key: &[u8]) -> String {
         let mut payload = Vec::with_capacity(2 + key.len());
         payload.extend_from_slice(&codec);
         payload.extend_from_slice(key);
@@ -4906,7 +4931,6 @@ mod tests {
         assert!(
             uri.contains("staging.example.com"),
             "uri must use the SNI hostname, not the IP: {uri}"
-
         );
     }
 

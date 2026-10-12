@@ -36,7 +36,7 @@ pub enum TrustCommand {
     /// optionally enable the unattended registry-credential refresher.
     Install(InstallDeploymentTrustArgs),
 
-/// Mint the deployment anchor capsule and its did:web document.
+    /// Mint the deployment anchor capsule and its did:web document.
     MintAnchorCapsule(MintAnchorCapsuleArgs),
 }
 
@@ -147,7 +147,6 @@ pub struct MintAnchorCapsuleArgs {
     /// Replace existing output files.
     #[arg(long)]
     pub force: bool,
-
 }
 
 #[derive(Debug, Args)]

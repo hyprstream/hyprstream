@@ -74,7 +74,6 @@ impl BrowserIrohPeer {
     pub fn node_id_z32(&self) -> String {
         self.endpoint_id().to_z32()
     }
-
 }
 
 impl Default for BrowserIrohPeer {
@@ -162,10 +161,7 @@ pub async fn resolve_pkarr_relay_url(node_id_bytes: &[u8; 32]) -> Result<Option<
     let endpoint_info = iroh::endpoint_info::EndpointInfo::from_pkarr_signed_packet(&signed_packet)
         .map_err(|e| anyhow!("EndpointInfo parse failed: {e:?}"))?;
 
-    let relay_url = endpoint_info
-        .relay_urls()
-        .next()
-        .map(|url| url.to_string());
+    let relay_url = endpoint_info.relay_urls().next().map(|url| url.to_string());
 
     // Wrap as an unverified reach hint so the D3 contract (pkarr derives zero
     // authority) is enforced at the type — callers get a PkarrReachHint, never a

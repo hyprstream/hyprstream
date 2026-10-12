@@ -328,8 +328,9 @@ impl CompositeKeySet {
             if let Some((pq, ed)) = pair.signing_keys() {
                 anyhow::ensure!(
                     ed.verifying_key() == current.ed25519
-                        && crate::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(&*pq))
-                            == crate::crypto::pq::ml_dsa_vk_bytes(&current.ml_dsa),
+                        && crate::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(
+                            &*pq
+                        )) == crate::crypto::pq::ml_dsa_vk_bytes(&current.ml_dsa),
                     "private signer does not match committed public pair"
                 );
                 attached.push(pair);

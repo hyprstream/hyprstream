@@ -1887,7 +1887,10 @@ mod tests {
 
     #[test]
     fn base_weight_digest_is_stable() {
-        let s = digested(&[("model-00001-of-00002.safetensors", b"AAA"), ("model-00002-of-00002.safetensors", b"BBB")]);
+        let s = digested(&[
+            ("model-00001-of-00002.safetensors", b"AAA"),
+            ("model-00002-of-00002.safetensors", b"BBB"),
+        ]);
         // Same sorted input → identical digest.
         assert_eq!(
             base_weight_digest_from_shards(&s),
@@ -1900,7 +1903,10 @@ mod tests {
     /// differing in bytes must diverge).
     #[test]
     fn base_weight_digest_same_basename_different_bytes_diverge() {
-        let names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"];
+        let names = [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ];
         let a = digested(&[(names[0], b"content-A"), (names[1], b"content-B")]);
         let b = digested(&[(names[0], b"content-A!"), (names[1], b"content-B")]);
         assert_ne!(
@@ -1932,10 +1938,7 @@ mod tests {
     #[test]
     fn base_weight_digest_shard_count_participates() {
         // Two shards each carrying the same bytes vs one shard carrying them.
-        let two = digested(&[
-            ("a-00001.safetensors", b"X"),
-            ("a-00002.safetensors", b"X"),
-        ]);
+        let two = digested(&[("a-00001.safetensors", b"X"), ("a-00002.safetensors", b"X")]);
         let one = digested(&[("a.safetensors", b"X")]);
         assert_ne!(
             base_weight_digest_from_shards(&two),
@@ -2008,6 +2011,9 @@ mod tests {
             decide_cache_reuse(None, Some(&exp), false),
             DiscardAndRecompute
         );
-        assert_eq!(decide_cache_reuse(None, Some(&exp), true), DiscardAndRecompute);
+        assert_eq!(
+            decide_cache_reuse(None, Some(&exp), true),
+            DiscardAndRecompute
+        );
     }
 }

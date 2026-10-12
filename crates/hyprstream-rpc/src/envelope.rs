@@ -208,9 +208,7 @@ impl FromCapnp for Authorization {
                 // here, before any issuer key is resolved, on every transport
                 // that carries this envelope.
                 if crate::proof::is_proof_typed_credential(token.as_bytes()) {
-                    anyhow::bail!(
-                        "authorization slot carries a proof CWT, not a credential"
-                    );
+                    anyhow::bail!("authorization slot carries a proof CWT, not a credential");
                 }
                 Ok(Self::IdJag(token.to_str()?.to_owned()))
             }
@@ -2279,9 +2277,14 @@ impl FromCapnp for RequestEnvelope {
             service_domain,
             authorization_witness: if reader.has_authorization_witness() {
                 let value = reader.get_authorization_witness()?;
-                anyhow::ensure!(value.len() <= crate::authorization_witness::MAX_WITNESS_BYTES, "authorization witness too large");
+                anyhow::ensure!(
+                    value.len() <= crate::authorization_witness::MAX_WITNESS_BYTES,
+                    "authorization witness too large"
+                );
                 Some(value.to_vec().into())
-            } else { None },
+            } else {
+                None
+            },
             proof_cwt: {
                 let has = reader.reborrow().has_proof_cwt();
                 if !has {
@@ -2340,7 +2343,9 @@ pub(crate) fn mediated_request_fits(request: &RequestEnvelope) -> bool {
     // Only the holder's own IdJag binds a mediated query. Relayed
     // (delegated) service credentials carry no holder consent here and are
     // denied (3c72353b6 relay-vouching exception removed per scoped repair).
-    let Some(credential) = request.jwt_token() else { return false; };
+    let Some(credential) = request.jwt_token() else {
+        return false;
+    };
     if request.delegation_token.is_some() {
         return false;
     }
@@ -2350,14 +2355,20 @@ pub(crate) fn mediated_request_fits(request: &RequestEnvelope) -> bool {
         credential.len(),
         request.service_domain.as_ref().map_or(0, String::len),
         request.proof_cwt.as_ref().map_or(0, Vec::len),
-        request.authorization_witness.as_ref().map_or(0, |bytes| bytes.len()),
+        request
+            .authorization_witness
+            .as_ref()
+            .map_or(0, |bytes| bytes.len()),
     ];
     for length in lengths {
-        let Some(next) = remaining.checked_sub(length) else { return false; };
+        let Some(next) = remaining.checked_sub(length) else {
+            return false;
+        };
         remaining = next;
     }
     for recipient in [&request.client_kem_public, &request.response_kem_recipient]
-        .into_iter().flatten()
+        .into_iter()
+        .flatten()
     {
         // Validation bounds the component count and each key length before
         // encode() allocates its wire representation.
@@ -2365,7 +2376,9 @@ pub(crate) fn mediated_request_fits(request: &RequestEnvelope) -> bool {
             return false;
         }
         for key in &recipient.eks {
-            let Some(next) = remaining.checked_sub(key.len()) else { return false; };
+            let Some(next) = remaining.checked_sub(key.len()) else {
+                return false;
+            };
             remaining = next;
         }
     }
@@ -2383,7 +2396,9 @@ fn mediated_capture_bounds_all_variable_fields_before_serializing() {
     oversized = request.clone();
     oversized.authorization_witness = Some(vec![0; MAX_MEDIATED_EVIDENCE_BYTES].into());
     assert!(!mediated_request_fits(&oversized));
-    oversized = request.clone().with_jwt_token("x".repeat(MAX_MEDIATED_EVIDENCE_BYTES));
+    oversized = request
+        .clone()
+        .with_jwt_token("x".repeat(MAX_MEDIATED_EVIDENCE_BYTES));
     assert!(!mediated_request_fits(&oversized));
     oversized = request.clone();
     oversized.service_domain = Some("x".repeat(MAX_MEDIATED_EVIDENCE_BYTES));
@@ -2416,11 +2431,25 @@ pub fn verify_mediated_envelope_evidence(
     let mut remaining = evidence;
     let message = capnp::serialize::read_message_from_flat_slice(&mut remaining, options)?;
     anyhow::ensure!(remaining.is_empty(), "trailing mediated evidence bytes");
-    let signed = SignedEnvelope::read_from(message.get_root::<common_capnp::signed_envelope::Reader<'_>>()?)?;
-    anyhow::ensure!(signed.encrypted_envelope.is_none(), "encrypted outer evidence requires the proof path");
-    anyhow::ensure!(signed.envelope.service_domain.as_deref() == Some(mediator_service), "mediated evidence target mismatch");
-    anyhow::ensure!(signed.envelope.delegation_token.is_none(), "nested delegated evidence denied");
-    anyhow::ensure!(signed.envelope.jwt_token().is_some(), "mediated evidence requires a holder credential");
+    let signed = SignedEnvelope::read_from(
+        message.get_root::<common_capnp::signed_envelope::Reader<'_>>()?,
+    )?;
+    anyhow::ensure!(
+        signed.encrypted_envelope.is_none(),
+        "encrypted outer evidence requires the proof path"
+    );
+    anyhow::ensure!(
+        signed.envelope.service_domain.as_deref() == Some(mediator_service),
+        "mediated evidence target mismatch"
+    );
+    anyhow::ensure!(
+        signed.envelope.delegation_token.is_none(),
+        "nested delegated evidence denied"
+    );
+    anyhow::ensure!(
+        signed.envelope.jwt_token().is_some(),
+        "mediated evidence requires a holder credential"
+    );
     signed.validate_timestamp()?;
     let holder = VerifyingKey::from_bytes(&signed.cnf)?;
     let trust = global_pq_store();
@@ -2669,7 +2698,14 @@ impl ResponseEnvelope {
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
     ) -> Result<Self> {
-        Self::new_signed_with_challenge(request_id, payload, None, signing_key, pq_signing_key, policy)
+        Self::new_signed_with_challenge(
+            request_id,
+            payload,
+            None,
+            signing_key,
+            pq_signing_key,
+            policy,
+        )
     }
 
     /// Create and sign a response that also advertises the server's current
@@ -4960,7 +4996,10 @@ mod tests {
         let plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
         let none = classical_denial(None, &sk);
         assert!(none.server_challenge.is_none());
-        assert_eq!(plain.sig, none.sig, "no challenge must not alter the transcript");
+        assert_eq!(
+            plain.sig, none.sig,
+            "no challenge must not alter the transcript"
+        );
         assert!(none.verify(Some(&vk)).is_ok());
     }
 

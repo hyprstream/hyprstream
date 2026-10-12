@@ -47,7 +47,10 @@ fn run_shell(mut args: impl Iterator<Item = String>) {
     let registry_dir = models_dir.join(".registry").join("models");
     let models = hyprstream_tui::shell_app::discover_models(&registry_dir);
     let (models, registry_dir) = if models.is_empty() {
-        (hyprstream_tui::shell_app::discover_models(&models_dir), models_dir.clone())
+        (
+            hyprstream_tui::shell_app::discover_models(&models_dir),
+            models_dir.clone(),
+        )
     } else {
         (models, registry_dir)
     };
@@ -55,10 +58,10 @@ fn run_shell(mut args: impl Iterator<Item = String>) {
         models,
         cols,
         rows,
-        Box::new(|_, _| {}),  // no model service in standalone mode
+        Box::new(|_, _| {}), // no model service in standalone mode
         Box::new(|_| false),
-        None,                  // no git ops in standalone mode
-        Some(registry_dir),    // re-scanned when the ModelList view opens
+        None,               // no git ops in standalone mode
+        Some(registry_dir), // re-scanned when the ModelList view opens
     );
     let config = waxterm::TerminalConfig::new().cols(cols).rows(rows);
 
@@ -106,7 +109,9 @@ fn run_compositor_wasi() {
         rows,
         true, // heartbeat keeps Wanix pipe flushed during idle frames
     );
-    let Ok(mut terminal) = ratatui::Terminal::new(backend) else { return };
+    let Ok(mut terminal) = ratatui::Terminal::new(backend) else {
+        return;
+    };
 
     let mut compositor = Compositor::new(cols, rows, 0, 0, vec![], vec![]);
     terminal.draw(|f| compositor.render(f)).ok();
@@ -130,7 +135,9 @@ fn run_compositor_wasi() {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let Ok(msg) = reader.get_root::<compositor_ipc_in::Reader<'_>>() else { continue };
+        let Ok(msg) = reader.get_root::<compositor_ipc_in::Reader<'_>>() else {
+            continue;
+        };
         let Ok(which) = msg.which() else { continue };
 
         let mut needs_redraw = false;
@@ -140,15 +147,31 @@ fn run_compositor_wasi() {
                 let pane_id = frame.get_id();
                 let ansi = frame.get_data().unwrap_or_default().to_vec();
                 let outs = compositor.handle(CompositorInput::ServerFrame { pane_id, ansi });
-                let quit = dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
-                if quit { return }
+                let quit = dispatch_compositor_outputs(
+                    outs,
+                    &mut compositor,
+                    &mut terminal,
+                    &mut needs_redraw,
+                    &mut ipc_out,
+                );
+                if quit {
+                    return;
+                }
             }
             compositor_ipc_in::Keyboard(Ok(data_bytes)) => {
                 let parser: InputParser<KeyPress> = InputParser::new(vec![]);
                 for key in parser.parse(data_bytes) {
                     let outs = compositor.handle(CompositorInput::KeyPress(key));
-                    let quit = dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
-                    if quit { return }
+                    let quit = dispatch_compositor_outputs(
+                        outs,
+                        &mut compositor,
+                        &mut terminal,
+                        &mut needs_redraw,
+                        &mut ipc_out,
+                    );
+                    if quit {
+                        return;
+                    }
                 }
             }
             compositor_ipc_in::Resize(Ok(resize)) => {
@@ -156,23 +179,47 @@ fn run_compositor_wasi() {
                 rows = resize.get_rows();
                 terminal.backend_mut().resize(cols, rows);
                 let outs = compositor.handle(CompositorInput::Resize(cols, rows));
-                dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
+                dispatch_compositor_outputs(
+                    outs,
+                    &mut compositor,
+                    &mut terminal,
+                    &mut needs_redraw,
+                    &mut ipc_out,
+                );
             }
             compositor_ipc_in::AppFrame(Ok(frame)) => {
                 let app_id = frame.get_id();
                 let ansi = frame.get_data().unwrap_or_default().to_vec();
                 let outs = compositor.handle(CompositorInput::AppFrame { app_id, ansi });
-                dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
+                dispatch_compositor_outputs(
+                    outs,
+                    &mut compositor,
+                    &mut terminal,
+                    &mut needs_redraw,
+                    &mut ipc_out,
+                );
             }
             compositor_ipc_in::WindowList(Ok(data_bytes)) => {
                 if let Ok(wins) = serde_json::from_slice::<Vec<WindowSummary>>(data_bytes) {
                     let outs = compositor.handle(CompositorInput::WindowList(wins));
-                    dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
+                    dispatch_compositor_outputs(
+                        outs,
+                        &mut compositor,
+                        &mut terminal,
+                        &mut needs_redraw,
+                        &mut ipc_out,
+                    );
                 }
             }
             compositor_ipc_in::PaneClosed(pane_id) => {
                 let outs = compositor.handle(CompositorInput::PaneClosed { pane_id });
-                dispatch_compositor_outputs(outs, &mut compositor, &mut terminal, &mut needs_redraw, &mut ipc_out);
+                dispatch_compositor_outputs(
+                    outs,
+                    &mut compositor,
+                    &mut terminal,
+                    &mut needs_redraw,
+                    &mut ipc_out,
+                );
             }
             compositor_ipc_in::SessionReset(()) => {
                 compositor = Compositor::new(cols, rows, 0, 0, vec![], vec![]);
@@ -193,7 +240,9 @@ fn run_compositor_wasi() {
 fn dispatch_compositor_outputs(
     outs: Vec<hyprstream_compositor::CompositorOutput>,
     _compositor: &mut hyprstream_compositor::Compositor,
-    terminal: &mut ratatui::Terminal<waxterm::backend::AnsiBackend<std::io::BufWriter<std::io::Stdout>>>,
+    terminal: &mut ratatui::Terminal<
+        waxterm::backend::AnsiBackend<std::io::BufWriter<std::io::Stdout>>,
+    >,
     needs_redraw: &mut bool,
     ipc_out: &mut Option<std::fs::File>,
 ) -> bool {
@@ -206,7 +255,8 @@ fn dispatch_compositor_outputs(
             CompositorOutput::Rpc(req) => {
                 let json = serde_json::to_vec(&req).unwrap_or_default();
                 let mut builder = capnp::message::Builder::new_default();
-                builder.init_root::<compositor_ipc_out::Builder<'_>>()
+                builder
+                    .init_root::<compositor_ipc_out::Builder<'_>>()
                     .set_rpc_request(&json);
                 if write_capnp_message(ipc_out, &builder).is_err() {
                     *ipc_out = None; // EPIPE — stop writing
@@ -248,16 +298,21 @@ fn run_chat_wasi_v2() {
     use waxterm::backend::AnsiBackend;
     use waxterm::input::{InputParser, KeyPress};
 
-    let model_name = std::env::args().nth(2).unwrap_or_else(|| "unknown".to_owned());
+    let model_name = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "unknown".to_owned());
     let (mut cols, mut rows) = (80u16, 24u16);
 
     let stdout = std::io::stdout();
     let backend = AnsiBackend::new(
         std::io::BufWriter::with_capacity(32 * 1024, stdout),
-        cols, rows,
+        cols,
+        rows,
         true,
     );
-    let Ok(mut terminal) = ratatui::Terminal::new(backend) else { return };
+    let Ok(mut terminal) = ratatui::Terminal::new(backend) else {
+        return;
+    };
 
     let mut app = ChatApp::new_wasm(model_name, cols, rows);
     terminal.draw(|f| chat_draw(f, &app)).ok();
@@ -281,7 +336,9 @@ fn run_chat_wasi_v2() {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let Ok(msg) = reader.get_root::<chat_app_ipc_in::Reader<'_>>() else { continue };
+        let Ok(msg) = reader.get_root::<chat_app_ipc_in::Reader<'_>>() else {
+            continue;
+        };
         let Ok(which) = msg.which() else { continue };
 
         let mut needs_redraw = false;
@@ -293,16 +350,21 @@ fn run_chat_wasi_v2() {
                     if let Some(req_json) = app.handle_key(key) {
                         // Write inference request via capnp IPC pipe
                         let mut builder = capnp::message::Builder::new_default();
-                        builder.init_root::<chat_app_ipc_out::Builder<'_>>()
+                        builder
+                            .init_root::<chat_app_ipc_out::Builder<'_>>()
                             .set_inference_request(req_json.as_bytes());
                         if write_capnp_message(&mut ipc_out, &builder).is_err() {
                             ipc_out = None;
                         }
                     }
                     needs_redraw = true;
-                    if app.quit { break }
+                    if app.quit {
+                        break;
+                    }
                 }
-                if app.quit { break }
+                if app.quit {
+                    break;
+                }
             }
             chat_app_ipc_in::Resize(Ok(resize)) => {
                 cols = resize.get_cols();

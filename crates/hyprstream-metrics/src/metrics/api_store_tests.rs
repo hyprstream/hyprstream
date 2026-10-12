@@ -8,15 +8,15 @@
 
 use crate::aggregation::{AggregateFunction, GroupBy};
 use crate::metrics::calibration::{
-    CalibrationParams, CalibrationStore, ConformalParams, ConformalQuantile, DecisionPrimitive,
-    DirichletParams, OrdinalInterval, VersionTriple, mint_calib_version,
+    mint_calib_version, CalibrationParams, CalibrationStore, ConformalParams, ConformalQuantile,
+    DecisionPrimitive, DirichletParams, OrdinalInterval, VersionTriple,
 };
 use crate::metrics::decision_batch::DecisionBatchStore;
 use crate::metrics::producer::MetricsProducer;
 use crate::metrics::storage::{MetricsStorage, MetricsStorageImpl};
-use crate::metrics::{METRICS_TABLE, MetricRecord};
-use crate::storage::StorageBackend;
+use crate::metrics::{MetricRecord, METRICS_TABLE};
 use crate::storage::duckdb::DuckDbBackend;
+use crate::storage::StorageBackend;
 use duckdb::arrow::array::{
     ArrayRef, BooleanArray, Float32Builder, Float64Array, Int64Array, ListBuilder, RecordBatch,
     StringArray, UInt32Array,
@@ -54,13 +54,23 @@ async fn test_insert_and_latest_round_trip() -> Result<(), Status> {
 
     let mut older = params(DecisionPrimitive::Choice, "cal-v1", 1_000);
     older.dirichlet = Some(DirichletParams {
-        weights: vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]],
+        weights: vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ],
         bias: vec![0.1, 0.0, -0.1],
     });
     older.conformal = Some(ConformalParams::Quantiles {
         quantiles: vec![
-            ConformalQuantile { level: 0.8, quantile: 0.31 },
-            ConformalQuantile { level: 0.9, quantile: 0.47 },
+            ConformalQuantile {
+                level: 0.8,
+                quantile: 0.31,
+            },
+            ConformalQuantile {
+                level: 0.9,
+                quantile: 0.47,
+            },
         ],
     });
     store.insert(&older).await?;
@@ -134,7 +144,10 @@ async fn test_none_numeric_params_round_trip_as_null() -> Result<(), Status> {
         .latest("jev1:q1", "qwen3.5-0.8b@main", DecisionPrimitive::Choice)
         .await?
         .ok_or_else(|| Status::internal("row missing"))?;
-    assert_eq!(back.temperature, None, "identity temperature must stay NULL");
+    assert_eq!(
+        back.temperature, None,
+        "identity temperature must stay NULL"
+    );
     assert_eq!(back.cardinality, None);
     assert_eq!(back.calib_size, None);
     assert_eq!(back.null_bias, row.null_bias, "set fields still round-trip");
@@ -153,7 +166,9 @@ async fn test_insert_rejects_duplicate_version_triple() -> Result<(), Status> {
     let err = match store.insert(&row).await {
         Err(err) => err,
         Ok(()) => {
-            return Err(Status::internal("duplicate version triple must be rejected"));
+            return Err(Status::internal(
+                "duplicate version triple must be rejected",
+            ));
         }
     };
     assert_eq!(err.code(), tonic::Code::AlreadyExists);
@@ -225,7 +240,12 @@ async fn test_put_get_round_trip_preserves_batch() -> Result<(), Status> {
 
     let batch = model_emitted_batch()?;
     let batch_id = store
-        .put("jev1:routing:v3", "qwen3.5-0.8b@main", Some("cal-v2"), &batch)
+        .put(
+            "jev1:routing:v3",
+            "qwen3.5-0.8b@main",
+            Some("cal-v2"),
+            &batch,
+        )
         .await?;
     assert!(batch_id.starts_with("batch-"));
 
@@ -237,7 +257,10 @@ async fn test_put_get_round_trip_preserves_batch() -> Result<(), Status> {
     assert_eq!(meta.model_id, "qwen3.5-0.8b@main");
     assert_eq!(meta.calib_version.as_deref(), Some("cal-v2"));
     assert_eq!(meta.row_count, 2);
-    assert_eq!(decoded, batch, "payload must round-trip byte-for-byte typed");
+    assert_eq!(
+        decoded, batch,
+        "payload must round-trip byte-for-byte typed"
+    );
     Ok(())
 }
 
@@ -249,7 +272,9 @@ async fn test_fetch_by_schema_and_list() -> Result<(), Status> {
 
     let batch = model_emitted_batch()?;
     store.put("jev1:routing:v3", "m1", None, &batch).await?;
-    store.put("jev1:routing:v3", "m1", Some("cal-v1"), &batch).await?;
+    store
+        .put("jev1:routing:v3", "m1", Some("cal-v1"), &batch)
+        .await?;
     store.put("jev1:eta:v1", "m1", None, &batch).await?;
 
     let routing = store.fetch_by_schema("jev1:routing:v3").await?;
@@ -287,10 +312,14 @@ async fn test_producer_emit_with_default_labels_and_tenant() -> Result<(), Statu
     producer.init().await?;
 
     // Defaults apply.
-    producer.emit(producer.point("decision.latency_ms", 6.5)).await?;
+    producer
+        .emit(producer.point("decision.latency_ms", 6.5))
+        .await?;
     // Per-record values win over defaults.
     let mut record = producer.point("decision.latency_ms", 7.0);
-    record.labels.insert("primitive".to_owned(), "score".to_owned());
+    record
+        .labels
+        .insert("primitive".to_owned(), "score".to_owned());
     record.tenant_id = Some("tenant-b".to_owned());
     producer.emit(record).await?;
     // A bare producer emits NULL labels/tenant.
@@ -314,7 +343,10 @@ async fn test_producer_emit_with_default_labels_and_tenant() -> Result<(), Statu
     );
 
     assert_eq!(rows[1].tenant_id.as_deref(), Some("tenant-b"));
-    assert_eq!(rows[1].labels.get("primitive").map(String::as_str), Some("score"));
+    assert_eq!(
+        rows[1].labels.get("primitive").map(String::as_str),
+        Some("score")
+    );
     assert_eq!(
         rows[1].labels.get("service").map(String::as_str),
         Some("inference"),
@@ -351,10 +383,19 @@ async fn test_group_by_tenant_id() -> Result<(), Status> {
             None,
         )
         .await?;
-    assert_eq!(results.len(), 3, "one group per tenant incl. the NULL group");
+    assert_eq!(
+        results.len(),
+        3,
+        "one group per tenant incl. the NULL group"
+    );
     let by_tenant: BTreeMap<String, f64> = results
         .into_iter()
-        .map(|r| (r.group_values.get("tenant_id").cloned().unwrap_or_default(), r.value))
+        .map(|r| {
+            (
+                r.group_values.get("tenant_id").cloned().unwrap_or_default(),
+                r.value,
+            )
+        })
         .collect();
     assert_eq!(by_tenant.get("tenant-a"), Some(&1.0));
     assert_eq!(by_tenant.get("tenant-b"), Some(&1.0));

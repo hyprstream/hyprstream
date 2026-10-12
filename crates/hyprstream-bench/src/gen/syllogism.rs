@@ -17,8 +17,8 @@ use crate::item::Item;
 const FAMILY: Family = Family::Syllogism;
 
 const NAMES: [&str; 12] = [
-    "glorps", "wibbles", "snarfs", "krendels", "plughs", "zorbs", "mippels", "tarns",
-    "quells", "droves", "fims", "jastrels",
+    "glorps", "wibbles", "snarfs", "krendels", "plughs", "zorbs", "mippels", "tarns", "quells",
+    "droves", "fims", "jastrels",
 ];
 
 struct Chain {

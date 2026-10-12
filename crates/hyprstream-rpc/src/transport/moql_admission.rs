@@ -772,8 +772,11 @@ impl MoqlAdmissionAuthenticator {
 
     /// Share live authority, isolating each service's carrier identity and replay cache.
     pub fn for_server(&self) -> Self {
-        Self::new(Arc::clone(&self.authority), Arc::clone(&self.tenant_resolver))
-            .with_timeout(self.timeout)
+        Self::new(
+            Arc::clone(&self.authority),
+            Arc::clone(&self.tenant_resolver),
+        )
+        .with_timeout(self.timeout)
     }
 
     /// Install the local accepted-state identity that signs server confirmation
@@ -989,9 +992,7 @@ impl MoqlAdmissionAuthenticator {
             head_digest: current.head_digest.to_vec(),
             // Genesis never lapses; successors always carry a bounded expiry
             // that both sides project from the same accepted state.
-            expires_at_unix_ms: current
-                .expires_at_unix_ms
-                .unwrap_or(i64::MAX),
+            expires_at_unix_ms: current.expires_at_unix_ms.unwrap_or(i64::MAX),
             ed25519: server.identity.ed25519,
             ml_dsa65: server.identity.ml_dsa65.clone(),
         })
@@ -1630,18 +1631,29 @@ mod tests {
             move |_peer| tenant.lock().clone()
         });
         let identity = crate::stream_info::MoqlServerIdentity {
-            did: DID.to_owned(), epoch: state.epoch, head_digest: state.head_digest.to_vec(),
+            did: DID.to_owned(),
+            epoch: state.epoch,
+            head_digest: state.head_digest.to_vec(),
             expires_at_unix_ms: crate::envelope::current_timestamp() + 60_000,
-            ed25519: ed.verifying_key().to_bytes(), ml_dsa65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+            ed25519: ed.verifying_key().to_bytes(),
+            ml_dsa65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
         };
-        let auth = MoqlAdmissionAuthenticator::new(authority, resolver).with_server_identity_and_carrier(
-            MoqlServerIdentityProof { identity, ed25519: ed.clone(), ml_dsa_65: pq },
-            [1; 32],
-        );
+        let auth = MoqlAdmissionAuthenticator::new(authority, resolver)
+            .with_server_identity_and_carrier(
+                MoqlServerIdentityProof {
+                    identity,
+                    ed25519: ed.clone(),
+                    ml_dsa_65: pq,
+                },
+                [1; 32],
+            );
         let admitted = AdmittedMoqPeer {
-            peer: PeerIdentity::authenticated(DID.to_owned()), tenant: "alice".to_owned(),
-            epoch: state.epoch, head_digest: state.head_digest,
-            subject_ed25519: ed.verifying_key().to_bytes(), carrier_node_id: [0; 32],
+            peer: PeerIdentity::authenticated(DID.to_owned()),
+            tenant: "alice".to_owned(),
+            epoch: state.epoch,
+            head_digest: state.head_digest,
+            subject_ed25519: ed.verifying_key().to_bytes(),
+            carrier_node_id: [0; 32],
         };
         assert!(auth.is_still_current(&admitted));
         *tenant.lock() = None;
@@ -1702,9 +1714,8 @@ mod tests {
                 }
             })
         };
-        let resolver: PeerTenantResolver = Arc::new(|peer: &PeerIdentity| {
-            peer.subject.as_deref().map(|_| "alice".to_owned())
-        });
+        let resolver: PeerTenantResolver =
+            Arc::new(|peer: &PeerIdentity| peer.subject.as_deref().map(|_| "alice".to_owned()));
         let pinned_identity = crate::stream_info::MoqlServerIdentity {
             did: SERVER_DID.to_owned(),
             epoch: 3,
@@ -1730,7 +1741,10 @@ mod tests {
             carrier_node_id: [0; 32],
         };
         assert!(auth.is_still_current(&admitted));
-        assert_eq!(auth.project_server_identity(&pinned_proof).unwrap().epoch, 3);
+        assert_eq!(
+            auth.project_server_identity(&pinned_proof).unwrap().epoch,
+            3
+        );
 
         // ── Renewal: SERVER epoch 4, new head digest, SAME subject keys. ──
         *server_state.lock() = state_with(&server_ed, &server_pq, 4, 0x44);

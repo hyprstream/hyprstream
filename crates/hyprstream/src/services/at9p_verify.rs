@@ -57,18 +57,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
-    Router,
+    Json, Router,
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use hyprstream_pds::at9p_login::{
-    ClassicalClaim, Clock, LoginAssertion, verify_login_assertion,
-};
+use hyprstream_pds::at9p_login::{verify_login_assertion, ClassicalClaim, Clock, LoginAssertion};
 use hyprstream_rpc::auth::mac::Assurance;
 use hyprstream_rpc::error::RpcError;
 use hyprstream_rpc::registry::SocketKind;
@@ -253,20 +250,26 @@ async fn verify_handler(
     let capsule_bytes = match STANDARD.decode(&req.capsule_b64) {
         Ok(b) => b,
         Err(_) => {
-            return (err_status("bad_capsule"), Json(VerifyErr::new(
-                "bad_capsule",
-                "capsule_b64 is not valid base64",
-            )))
+            return (
+                err_status("bad_capsule"),
+                Json(VerifyErr::new(
+                    "bad_capsule",
+                    "capsule_b64 is not valid base64",
+                )),
+            )
                 .into_response();
         }
     };
     let signature = match STANDARD.decode(&req.signature_b64) {
         Ok(b) => b,
         Err(_) => {
-            return (err_status("bad_signature"), Json(VerifyErr::new(
-                "bad_signature",
-                "signature_b64 is not valid base64",
-            )))
+            return (
+                err_status("bad_signature"),
+                Json(VerifyErr::new(
+                    "bad_signature",
+                    "signature_b64 is not valid base64",
+                )),
+            )
                 .into_response();
         }
     };
@@ -312,8 +315,7 @@ async fn verify_handler(
             // string is safe to surface: it names the gate that rejected, not
             // attacker-supplied capsule contents.
             let msg = format!("{e:#}");
-            let code: &'static str = if msg.contains("hash-gate") || msg.contains("GATE rejected")
-            {
+            let code: &'static str = if msg.contains("hash-gate") || msg.contains("GATE rejected") {
                 "hash_mismatch"
             } else if msg.contains("liveness signature must be")
                 || msg.contains("does not verify against the GATE-verified subject key")
@@ -398,7 +400,11 @@ impl Spawnable for At9pVerifyService {
             .await
             .map_err(|e| RpcError::SpawnFailed(format!("{SERVICE_NAME} TLS config: {e}")))?;
 
-            let scheme = if rustls_config.is_some() { "https" } else { "http" };
+            let scheme = if rustls_config.is_some() {
+                "https"
+            } else {
+                "http"
+            };
             let state = VerifyFaceState {
                 max_skew_seconds: self.config.max_skew_seconds,
                 max_challenge_bytes: self.config.max_challenge_bytes,
@@ -421,10 +427,11 @@ impl Spawnable for At9pVerifyService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use axum::body::{Body, to_bytes};
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
-    use hyprstream_pds::at9p::{CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry,
-                              ServiceType, Transport};
+    use hyprstream_pds::at9p::{
+        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+    };
     use hyprstream_pds::at9p_gate::DID_AT9P_PREFIX;
     use hyprstream_pds::at9p_login::login_binding;
     use hyprstream_pds::at9p_sign::sign_capsule;
@@ -439,8 +446,11 @@ mod tests {
         seed[31] = tag.wrapping_add(7);
         let ed = SigningKey::from_bytes(&seed);
         let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
-        let kp = HybridKeyPair::new(ed.verifying_key().to_bytes().to_vec(), ml_dsa_vk_bytes(&pq_vk))
-            .unwrap();
+        let kp = HybridKeyPair::new(
+            ed.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_vk),
+        )
+        .unwrap();
         (ed, pq_sk, kp)
     }
 
@@ -469,11 +479,9 @@ mod tests {
     #[test]
     fn service_name_is_dns_safe_and_stable() {
         assert_eq!(SERVICE_NAME, "at9p-verify");
-        assert!(
-            SERVICE_NAME
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-        );
+        assert!(SERVICE_NAME
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),);
     }
 
     /// POST a JSON body to the credential-free router and return (status, body).
@@ -491,7 +499,10 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
         (status, body)
     }
 
@@ -514,7 +525,10 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
         (status, body)
     }
 
@@ -522,7 +536,9 @@ mod tests {
     async fn valid_assertion_returns_200_classical() {
         let (bytes, did, ed) = signed_capsule(1, Vec::new());
         let issued = SystemClock.now_unix_seconds();
-        let sig = ed.sign(&login_binding(&did, "challenge-1", issued)).to_bytes();
+        let sig = ed
+            .sign(&login_binding(&did, "challenge-1", issued))
+            .to_bytes();
         let req = LoginAssertionRequest {
             did: did.clone(),
             capsule_b64: STANDARD.encode(&bytes),

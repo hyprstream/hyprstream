@@ -14,8 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use hyprstream_vfs::Subject;
 use hyprstream_rpc::events::EventSubscriber;
+use hyprstream_vfs::Subject;
 
 use crate::error::Result;
 use crate::events::ReceivedEvent;
@@ -63,12 +63,9 @@ impl GitHubActionsAdapter {
     /// Generic (non-gate) loader: parses in [`Legacy`](super::parser::ParseMode)
     /// mode via [`WorkflowService::scan_repo`]. The merge gate opts into
     /// strict mode via [`Self::load_repo_with`] (#1432).
-    pub async fn load_repo(
-        &mut self,
-        repo_id: &str,
-        service: &WorkflowService,
-    ) -> Result<()> {
-        self.load_repo_with(repo_id, service, super::parser::ParseMode::Legacy).await
+    pub async fn load_repo(&mut self, repo_id: &str, service: &WorkflowService) -> Result<()> {
+        self.load_repo_with(repo_id, service, super::parser::ParseMode::Legacy)
+            .await
     }
 
     /// Load a repository's workflows with an explicit [`ParseMode`] (#1432).
@@ -189,11 +186,7 @@ impl SubscriberAdapter for GitHubActionsAdapter {
         "github-actions"
     }
 
-    async fn run(
-        &self,
-        service: Arc<WorkflowService>,
-        cancel: CancellationToken,
-    ) -> Result<()> {
+    async fn run(&self, service: Arc<WorkflowService>, cancel: CancellationToken) -> Result<()> {
         tracing::info!(
             adapter = self.name(),
             prefixes = ?self.subscribed_prefixes,
@@ -313,7 +306,10 @@ jobs:
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
     fn adapter() -> std::result::Result<GitHubActionsAdapter, Box<dyn std::error::Error>> {
-        Ok(GitHubActionsAdapter::new(EventSubscriber::new()?, Subject::new("gate-test")))
+        Ok(GitHubActionsAdapter::new(
+            EventSubscriber::new()?,
+            Subject::new("gate-test"),
+        ))
     }
 
     fn service() -> super::super::service::WorkflowService {
@@ -335,7 +331,8 @@ jobs:
         write_workflow(tmp.path(), KNOWN_YAML).await?;
 
         let svc = service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         let mut adp = adapter()?;
         adp.load_repo_with("acme", &svc, super::super::parser::ParseMode::Strict)
@@ -346,8 +343,10 @@ jobs:
             "known workflow should register at least one handler"
         );
         assert!(
-            svc.list_workflows().await?.iter().any(|i| i.id
-                == "acme:.github/workflows/gate.yml"),
+            svc.list_workflows()
+                .await?
+                .iter()
+                .any(|i| i.id == "acme:.github/workflows/gate.yml"),
             "workflow should be registered after first strict load"
         );
 
@@ -369,8 +368,10 @@ jobs:
         );
         // And the registration must be evicted from the service.
         assert!(
-            !svc.list_workflows().await?.iter().any(|i| i.id
-                == "acme:.github/workflows/gate.yml"),
+            !svc.list_workflows()
+                .await?
+                .iter()
+                .any(|i| i.id == "acme:.github/workflows/gate.yml"),
             "strict-rejected workflow's registration must be evicted on reconcile"
         );
         Ok(())
@@ -384,7 +385,8 @@ jobs:
         write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
 
         let svc = service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         let mut adp = adapter()?;
         adp.load_repo("acme", &svc).await?; // legacy
@@ -393,8 +395,10 @@ jobs:
             "legacy load keeps the unknown-key workflow's handlers"
         );
         assert!(
-            svc.list_workflows().await?.iter().any(|i| i.id
-                == "acme:.github/workflows/gate.yml"),
+            svc.list_workflows()
+                .await?
+                .iter()
+                .any(|i| i.id == "acme:.github/workflows/gate.yml"),
             "legacy load keeps the unknown-key workflow registered"
         );
         Ok(())

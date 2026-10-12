@@ -29,21 +29,21 @@ use hyprstream_rpc::stream_consumer::StreamHandle;
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
-use crate::generated::discovery_client::{dispatch_discovery, serialize_response, DiscoveryHandler};
-use hyprstream_rpc_std::discovery_client::{
-    AuthMetadata, AuthMetadataList, DiscoveryResponseVariant, EndpointInfo, EntityStatement,
-    EnvelopeKeyset, ErrorInfo,
-    GetRecordRequest, IssuerList, NodeLiveness, PingInfo, PlacementCandidate,
-    PlacementCandidateSet, QueryCandidatesRequest, RecordCar, RegisterEntityStatementRequest,
-    RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement, ServiceEndpoints, ServiceList,
-    ServiceSummary,
+use crate::generated::discovery_client::{
+    dispatch_discovery, serialize_response, DiscoveryHandler,
 };
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 use crate::state_store::{
     unix_millis_now, AnnouncedEndpoint, CachedEntityStatement, CachedEnvelopeKeyset,
-    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore,
-    ANNOUNCED_ENDPOINT_TTL,
+    DiscoveryState, DiscoveryStateStore, LiveAllocatable, MemoryStateStore, ANNOUNCED_ENDPOINT_TTL,
+};
+use hyprstream_rpc_std::discovery_client::{
+    AuthMetadata, AuthMetadataList, DiscoveryResponseVariant, EndpointInfo, EntityStatement,
+    EnvelopeKeyset, ErrorInfo, GetRecordRequest, IssuerList, NodeLiveness, PingInfo,
+    PlacementCandidate, PlacementCandidateSet, QueryCandidatesRequest, RecordCar,
+    RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement,
+    ServiceEndpoints, ServiceList, ServiceSummary,
 };
 
 use anyhow::{Context, Result};
@@ -505,7 +505,9 @@ fn select_service_candidates(
 /// shared scheduling-substrate `SelectorOp` (`crate::scheduling`, #628).
 /// Deliberately exhaustive (no catch-all) so a future wire variant fails to
 /// compile here instead of silently matching nothing.
-fn to_scheduling_op(op: hyprstream_rpc_std::discovery_client::SelectorOp) -> scheduling::SelectorOp {
+fn to_scheduling_op(
+    op: hyprstream_rpc_std::discovery_client::SelectorOp,
+) -> scheduling::SelectorOp {
     use hyprstream_rpc_std::discovery_client::SelectorOp as Wire;
     match op {
         Wire::In => scheduling::SelectorOp::In,
@@ -529,24 +531,56 @@ fn to_scheduling_op(op: hyprstream_rpc_std::discovery_client::SelectorOp) -> sch
 pub trait AuthorizationProvider: Send + Sync {
     /// Verified ingress context, including original holder evidence for
     /// service-mediated checks. Policy-backed providers override this seam.
-    async fn check_context(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<bool> {
-        self.check(&ctx.subject().to_string(), "*", resource, operation, ctx.jwt_token()).await
+    async fn check_context(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<bool> {
+        self.check(
+            &ctx.subject().to_string(),
+            "*",
+            resource,
+            operation,
+            ctx.jwt_token(),
+        )
+        .await
     }
 
-    async fn check_batch_context(&self, ctx: &EnvelopeContext, resources: &[String], operation: &str) -> Result<Vec<bool>> {
-        self.check_batch(&ctx.subject().to_string(), "*", resources, operation, ctx.jwt_token()).await
+    async fn check_batch_context(
+        &self,
+        ctx: &EnvelopeContext,
+        resources: &[String],
+        operation: &str,
+    ) -> Result<Vec<bool>> {
+        self.check_batch(
+            &ctx.subject().to_string(),
+            "*",
+            resources,
+            operation,
+            ctx.jwt_token(),
+        )
+        .await
     }
 
     /// One bounded authorization vector; implementations may amortize RPC
     /// overhead but must retain one decision per resource in input order.
     async fn check_batch(
-        &self, subject: &str, domain: &str, resources: &[String],
-        operation: &str, bearer: Option<&str>,
+        &self,
+        subject: &str,
+        domain: &str,
+        resources: &[String],
+        operation: &str,
+        bearer: Option<&str>,
     ) -> Result<Vec<bool>> {
         anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
         let mut allowed = Vec::with_capacity(resources.len());
         for resource in resources {
-            allowed.push(self.check(subject, domain, resource, operation, bearer).await.unwrap_or(false));
+            allowed.push(
+                self.check(subject, domain, resource, operation, bearer)
+                    .await
+                    .unwrap_or(false),
+            );
         }
         Ok(allowed)
     }
@@ -834,20 +868,34 @@ pub struct DiscoverySelfAnnouncer {
 
 impl DiscoverySelfAnnouncer {
     pub async fn publish(&self, announcement: &ServiceAnnouncement) -> Result<()> {
-        anyhow::ensure!(announcement.service_name == "discovery", "self publication is only for Discovery");
-        anyhow::ensure!(announcement.service_did.is_did_at9p(), "self publication requires an accepted identity");
+        anyhow::ensure!(
+            announcement.service_name == "discovery",
+            "self publication is only for Discovery"
+        );
+        anyhow::ensure!(
+            announcement.service_did.is_did_at9p(),
+            "self publication requires an accepted identity"
+        );
         let mut ctx = EnvelopeContext::from_callback_service(0, "discovery");
         ctx.cnf = self.validator.signing_key.verifying_key().to_bytes();
-        self.validator.store_announcement(&ctx, announcement).await?;
+        self.validator
+            .store_announcement(&ctx, announcement)
+            .await?;
         Ok(())
     }
 }
 
 impl DiscoveryService {
     pub fn self_announcer(&self) -> Result<DiscoverySelfAnnouncer> {
-        let source = self.accepted_state_source.clone()
+        let source = self
+            .accepted_state_source
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("self publication requires accepted-state authority"))?;
-        let mut validator = Self::new(self.signing_key.clone(), self.jwt_verifying_key, self.transport.clone());
+        let mut validator = Self::new(
+            self.signing_key.clone(),
+            self.jwt_verifying_key,
+            self.transport.clone(),
+        );
         validator.state_store = self.state_store.clone();
         validator.accepted_state_source = Some(source);
         validator.jwt_key_source = self.jwt_key_source.clone();
@@ -855,7 +903,11 @@ impl DiscoveryService {
         Ok(DiscoverySelfAnnouncer { validator })
     }
 
-    async fn store_announcement(&self, ctx: &EnvelopeContext, data: &ServiceAnnouncement) -> Result<DiscoveryResponseVariant> {
+    async fn store_announcement(
+        &self,
+        ctx: &EnvelopeContext,
+        data: &ServiceAnnouncement,
+    ) -> Result<DiscoveryResponseVariant> {
         info!(
             "Discovery: service '{}' announced {} endpoint: {} (from {})",
             data.service_name,
@@ -893,7 +945,8 @@ impl DiscoveryService {
                 &data.request_kem_recipient,
             )?;
             anyhow::ensure!(
-                recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                recipient.suite_id
+                    == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
                     && recipient.eks.len() == recipient.suite_id.components().len(),
                 "identity-bound announcement requires suite-complete hybrid KEM material"
             );
@@ -984,7 +1037,8 @@ impl DiscoveryService {
         }
 
         let now_unix_ms = unix_millis_now();
-        let heartbeat_expiry = now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
+        let heartbeat_expiry =
+            now_unix_ms.saturating_add(ANNOUNCED_ENDPOINT_TTL.as_millis() as i64);
         // Legacy clients omit identity expiry (Cap'n Proto defaults it to 0).
         // Only identity-bound announcements carry a signed expiry constraint.
         let expires_at_unix_ms = if identity_bound {
@@ -997,10 +1051,22 @@ impl DiscoveryService {
             if let Some(source) = &self.accepted_state_source {
                 let state = source
                     .accepted_state(data.service_did.as_str())?
-                    .ok_or_else(|| anyhow::anyhow!("announcement DID has no accepted-current state"))?;
-                anyhow::ensure!(state.current.subject_keys.iter().any(|key| key.ed25519_pub == ctx.cnf),
-                    "announcement signer is not an accepted current subject key");
-                let service = state.current.services.iter().find(|entry| entry.id == format!("#{svc_name}"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("announcement DID has no accepted-current state")
+                    })?;
+                anyhow::ensure!(
+                    state
+                        .current
+                        .subject_keys
+                        .iter()
+                        .any(|key| key.ed25519_pub == ctx.cnf),
+                    "announcement signer is not an accepted current subject key"
+                );
+                let service = state
+                    .current
+                    .services
+                    .iter()
+                    .find(|entry| entry.id == format!("#{svc_name}"))
                     .ok_or_else(|| anyhow::anyhow!("announcement service is not accepted"))?;
                 // Checkpoint discipline (the same rule as the fixed bootstrap
                 // roles): only capsule-signed material binds request
@@ -1337,7 +1403,10 @@ impl DiscoveryService {
     #[cfg(not(target_arch = "wasm32"))]
     // Without `rocksdb` every authority arm fails closed before any use, so
     // the remainder of this body is intentionally unreachable there.
-    #[cfg_attr(not(any(feature = "rocksdb", feature = "postgres")), allow(unreachable_code, unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "rocksdb", feature = "postgres")),
+        allow(unreachable_code, unused_variables)
+    )]
     fn bootstrap_authenticated_process(
         authority: ProcessBootstrapAuthority,
         discovery_client: hyprstream_rpc_std::discovery_client::DiscoveryClient,
@@ -1388,7 +1457,8 @@ impl DiscoveryService {
         PROCESS_ACCEPTED_STATE_SOURCE
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
-        PROCESS_NATIVE_NETWORK_REQUIRED.set(authority.network_required)
+        PROCESS_NATIVE_NETWORK_REQUIRED
+            .set(authority.network_required)
             .map_err(|_| anyhow::anyhow!("process native profile is already installed"))?;
         if let Some(identity) = deployment_identity {
             PROCESS_REGISTRY_VERIFIER.set(identity).map_err(|_| {
@@ -1477,38 +1547,75 @@ pub(super) fn project_bootstrap_endpoint(
     service_name: &str,
     key: &VerifyingKey,
 ) -> Result<AnnouncedEndpoint> {
-    anyhow::ensure!(matches!(service_name, "discovery" | "policy"), "not a fixed bootstrap role");
+    anyhow::ensure!(
+        matches!(service_name, "discovery" | "policy"),
+        "not a fixed bootstrap role"
+    );
     let service_id = format!("#{service_name}");
     let mut matching = states.iter().filter(|state| {
-        state.current.services.iter().any(|entry| entry.id == service_id)
-            && state.current.subject_keys.iter().any(|subject| subject.ed25519_pub == key.as_bytes())
+        state
+            .current
+            .services
+            .iter()
+            .any(|entry| entry.id == service_id)
+            && state
+                .current
+                .subject_keys
+                .iter()
+                .any(|subject| subject.ed25519_pub == key.as_bytes())
     });
-    let state = matching.next().ok_or_else(|| anyhow::anyhow!("no accepted bootstrap identity for {service_name}"))?;
-    anyhow::ensure!(matching.next().is_none(), "ambiguous accepted bootstrap identity for {service_name}");
+    let state = matching
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no accepted bootstrap identity for {service_name}"))?;
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "ambiguous accepted bootstrap identity for {service_name}"
+    );
     let expiry = accepted_expiry_unix_ms(state)?;
-    anyhow::ensure!(state.epoch > 0 && expiry > unix_millis_now(), "bootstrap identity is unbounded or expired");
-    let entry = state.current.services.iter().find(|entry| entry.id == service_id)
+    anyhow::ensure!(
+        state.epoch > 0 && expiry > unix_millis_now(),
+        "bootstrap identity is unbounded or expired"
+    );
+    let entry = state
+        .current
+        .services
+        .iter()
+        .find(|entry| entry.id == service_id)
         .ok_or_else(|| anyhow::anyhow!("bootstrap service disappeared"))?;
-    anyhow::ensure!(entry.endpoint.transport == hyprstream_pds::at9p::Transport::Iroh,
-        "bootstrap service requires signed Iroh reach");
+    anyhow::ensure!(
+        entry.endpoint.transport == hyprstream_pds::at9p::Transport::Iroh,
+        "bootstrap service requires signed Iroh reach"
+    );
     parse_announced_iroh(&entry.endpoint.address)?;
-    let kem = entry.endpoint.request_kem.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("bootstrap service lacks signed request KEM; reprovision service identity"))?;
+    let kem = entry.endpoint.request_kem.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("bootstrap service lacks signed request KEM; reprovision service identity")
+    })?;
     let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(kem)?;
     recipient.validate()?;
-    anyhow::ensure!(recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
-        "bootstrap requires hybrid KEM");
-    let subject_key = state.current.subject_keys.iter().find(|subject| subject.ed25519_pub == key.as_bytes())
+    anyhow::ensure!(
+        recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        "bootstrap requires hybrid KEM"
+    );
+    let subject_key = state
+        .current
+        .subject_keys
+        .iter()
+        .find(|subject| subject.ed25519_pub == key.as_bytes())
         .ok_or_else(|| anyhow::anyhow!("bootstrap response key disappeared"))?;
     hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&subject_key.mldsa65_pub)?;
     Ok(AnnouncedEndpoint {
-        socket_kind: "iroh".to_owned(), endpoint: entry.endpoint.address.clone(),
+        socket_kind: "iroh".to_owned(),
+        endpoint: entry.endpoint.address.clone(),
         service_did: Did::from(state.did.clone()),
         capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
-        accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+        accepted_state_digest: state.head_digest.to_vec(),
+        accepted_state_epoch: state.epoch,
         response_key_id: format!("{}#response", state.did),
-        request_kem_key_id: format!("{}#mesh-kem", state.did), request_kem_recipient: kem.clone(),
-        expires_at_unix_ms: expiry, source_signer: key.to_bytes(), live_until_unix_ms: expiry,
+        request_kem_key_id: format!("{}#mesh-kem", state.did),
+        request_kem_recipient: kem.clone(),
+        expires_at_unix_ms: expiry,
+        source_signer: key.to_bytes(),
+        live_until_unix_ms: expiry,
     })
 }
 
@@ -1529,8 +1636,11 @@ impl DiscoveryServiceResolver {
 
     async fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
         let bootstrap = if query.profile == ResolverProfile::NativeIrohRequired {
-            self.accepted_state_source.bootstrap_endpoints(&query.service_name)?
-        } else { None };
+            self.accepted_state_source
+                .bootstrap_endpoints(&query.service_name)?
+        } else {
+            None
+        };
         let entries = if let Some(entries) = bootstrap {
             entries
         } else if let Some(client) = &self.discovery_client {
@@ -1569,9 +1679,7 @@ impl DiscoveryServiceResolver {
         for entry in entries {
             // The backend/remote Discovery already checked the volatile lease
             // on its receipt clock. Signed/current authority is checked below.
-            if entry.service_did.as_str().is_empty()
-                || entry.accepted_state_digest.len() != 64
-            {
+            if entry.service_did.as_str().is_empty() || entry.accepted_state_digest.len() != 64 {
                 continue;
             }
             let Some(state) = self
@@ -1872,27 +1980,44 @@ static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier
     std::sync::OnceLock::new();
 static PROCESS_NATIVE_NETWORK_REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[cfg(not(target_arch = "wasm32"))]
-static PROCESS_BOOTSTRAP_CARRIER: std::sync::OnceLock<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> = std::sync::OnceLock::new();
+static PROCESS_BOOTSTRAP_CARRIER: std::sync::OnceLock<
+    hyprstream_rpc::transport::iroh_substrate::IrohSubstrate,
+> = std::sync::OnceLock::new();
 
 /// Transport profile selected by authenticated process bootstrap.
 pub fn native_network_required() -> bool {
-    PROCESS_NATIVE_NETWORK_REQUIRED.get().copied().unwrap_or(false)
+    PROCESS_NATIVE_NETWORK_REQUIRED
+        .get()
+        .copied()
+        .unwrap_or(false)
 }
 
 /// Resolve native Event reach and its accepted-current server witness together.
-pub async fn production_moq_event_target() -> Result<(TransportConfig, hyprstream_rpc::stream_info::MoqlServerIdentity)> {
-    let resolver = PRODUCTION_RESOLVER.get().ok_or_else(|| anyhow::anyhow!("production resolver is not installed"))?;
-    let resolved = resolver.resolve_service_candidates(ServiceQuery::network_moq("event")?).await?
-        .into_iter().next().ok_or_else(|| anyhow::anyhow!("no native Event reach"))?;
+pub async fn production_moq_event_target() -> Result<(
+    TransportConfig,
+    hyprstream_rpc::stream_info::MoqlServerIdentity,
+)> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("production resolver is not installed"))?;
+    let resolved = resolver
+        .resolve_service_candidates(ServiceQuery::network_moq("event")?)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no native Event reach"))?;
     resolver.ensure_current(&resolved).await?;
-    Ok((resolved.transport().clone(), hyprstream_rpc::stream_info::MoqlServerIdentity {
-        did: resolved.service_did().as_str().to_owned(),
-        epoch: resolved.evidence().accepted_state_epoch,
-        head_digest: resolved.evidence().accepted_state_digest.to_vec(),
-        expires_at_unix_ms: resolved.expires_at_unix_ms(),
-        ed25519: resolved.response_verifying_key().to_bytes(),
-        ml_dsa65: resolved.response_ml_dsa65().to_vec(),
-    }))
+    Ok((
+        resolved.transport().clone(),
+        hyprstream_rpc::stream_info::MoqlServerIdentity {
+            did: resolved.service_did().as_str().to_owned(),
+            epoch: resolved.evidence().accepted_state_epoch,
+            head_digest: resolved.evidence().accepted_state_digest.to_vec(),
+            expires_at_unix_ms: resolved.expires_at_unix_ms(),
+            ed25519: resolved.response_verifying_key().to_bytes(),
+            ml_dsa65: resolved.response_ml_dsa65().to_vec(),
+        },
+    ))
 }
 
 /// Project one checkpoint-verified accepted state into the admission-facing
@@ -1906,18 +2031,30 @@ pub(crate) fn project_accepted_identity_state(
     let expires = chrono::DateTime::parse_from_rfc3339(state.expires_at.as_deref()?)
         .ok()?
         .timestamp_millis();
-    let subject_keys = state.current.subject_keys.iter().map(|key| {
-        Some(AcceptedSubjectKey {
-            ed25519: key.ed25519_pub.as_slice().try_into().ok()?,
-            ml_dsa_65: (!key.mldsa65_pub.is_empty()).then(|| key.mldsa65_pub.clone())?,
+    let subject_keys = state
+        .current
+        .subject_keys
+        .iter()
+        .map(|key| {
+            Some(AcceptedSubjectKey {
+                ed25519: key.ed25519_pub.as_slice().try_into().ok()?,
+                ml_dsa_65: (!key.mldsa65_pub.is_empty()).then(|| key.mldsa65_pub.clone())?,
+            })
         })
-    }).collect::<Option<Vec<_>>>()?;
+        .collect::<Option<Vec<_>>>()?;
     // Project the capsule's `#<name>` service ids verbatim (#1652): the
     // state is already in hand, so DID→service-name derivation at the
     // admission sites costs zero extra store reads.
-    let service_ids = state.current.services.iter().map(|service| service.id.clone()).collect::<Vec<_>>();
+    let service_ids = state
+        .current
+        .services
+        .iter()
+        .map(|service| service.id.clone())
+        .collect::<Vec<_>>();
     (!subject_keys.is_empty()).then_some(AcceptedIdentityState {
-        epoch: state.epoch, head_digest: state.head_digest, subject_keys,
+        epoch: state.epoch,
+        head_digest: state.head_digest,
+        subject_keys,
         service_ids,
         expires_at_unix_ms: Some(expires),
     })
@@ -1925,8 +2062,11 @@ pub(crate) fn project_accepted_identity_state(
 
 /// Project only bounded, valid checkpoint state into the MoQL authority.
 /// Every admission and live-session recheck rereads the pinned source.
-pub fn production_moql_accepted_state_authority() -> Result<Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority>> {
-    let source = PROCESS_ACCEPTED_STATE_SOURCE.get().cloned()
+pub fn production_moql_accepted_state_authority(
+) -> Result<Arc<dyn hyprstream_rpc::transport::moql_admission::AcceptedStateAuthority>> {
+    let source = PROCESS_ACCEPTED_STATE_SOURCE
+        .get()
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("production accepted-state authority is not installed"))?;
     Ok(Arc::new(move |did: &str| {
         let state = source.accepted_state(did).ok().flatten()?;
@@ -1941,10 +2081,11 @@ pub fn production_moql_accepted_state_authority() -> Result<Arc<dyn hyprstream_r
 /// per-DID authority; a read failure yields an empty roster, which denies.
 /// Served through a TTL cache: the live-session recheck runs every 100 ms
 /// per session and must not re-verify the whole store each time.
-pub fn production_deployment_roster() -> Result<
-    Arc<dyn crate::admission_roster::DeploymentRosterSource>,
-> {
-    let source = PROCESS_ACCEPTED_STATE_SOURCE.get().cloned()
+pub fn production_deployment_roster(
+) -> Result<Arc<dyn crate::admission_roster::DeploymentRosterSource>> {
+    let source = PROCESS_ACCEPTED_STATE_SOURCE
+        .get()
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("production accepted-state authority is not installed"))?;
     let load: std::sync::Arc<dyn Fn() -> Vec<crate::admission_roster::RosterEntry> + Send + Sync> =
         Arc::new(move || {
@@ -1955,9 +2096,8 @@ pub fn production_deployment_roster() -> Result<
                     states
                         .iter()
                         .filter_map(|state| {
-                            project_accepted_identity_state(state).map(|projected| {
-                                (state.did.clone(), projected)
-                            })
+                            project_accepted_identity_state(state)
+                                .map(|projected| (state.did.clone(), projected))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2234,10 +2374,8 @@ pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
 /// loader as startup. Returns verification-only evidence, not a raw-key
 /// authority constructor, and does not install a process resolver.
 pub fn authenticate_local_deployment_registry() -> Result<RegistryDeploymentVerifier> {
-    authenticate_registry_deployment_credentials(
-        load_trusted_registry_deployment_credentials()?,
-    )
-    .map(|identity| identity.verifier)
+    authenticate_registry_deployment_credentials(load_trusted_registry_deployment_credentials()?)
+        .map(|identity| identity.verifier)
 }
 
 /// Non-cloneable proof privately minted from the fixed CA/JWT pair.
@@ -3303,9 +3441,16 @@ pub fn verify_os_owned_service_key_enrollment(
     let paths = resolve_deployment_trust_paths()?;
     let public_ca = read_trusted_artifact(&paths.public_ca, "deployment CA root")?;
     let authority_log = read_trusted_artifact(&paths.authority_log, "deployment authority log")?;
-    let authority_checkpoint =
-        read_trusted_artifact(&paths.authority_checkpoint, "deployment authority checkpoint")?;
-    verify_service_key_enrollment(&public_ca, &authority_log, &authority_checkpoint, attestation_json)
+    let authority_checkpoint = read_trusted_artifact(
+        &paths.authority_checkpoint,
+        "deployment authority checkpoint",
+    )?;
+    verify_service_key_enrollment(
+        &public_ca,
+        &authority_log,
+        &authority_checkpoint,
+        attestation_json,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3591,13 +3736,11 @@ static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthority
 /// Trust is not weakened: the checkpoint was already verified by
 /// `authenticate_deployment_bootstrap`, and the caller still authenticates
 /// every lazy response with the pinned `discovery_vk`.
-fn resolve_local_discovery_transport(
-) -> anyhow::Result<hyprstream_rpc::transport::TransportConfig> {
+fn resolve_local_discovery_transport() -> anyhow::Result<hyprstream_rpc::transport::TransportConfig>
+{
     hyprstream_rpc::registry::try_global()
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "EndpointRegistry not initialized — local discovery fabric unavailable"
-            )
+            anyhow::anyhow!("EndpointRegistry not initialized — local discovery fabric unavailable")
         })?
         .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)
 }
@@ -3622,9 +3765,14 @@ fn install_local_discovery_client(
     let token_provider = renewing_service_token_provider(&signing_key, token);
     let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
     let rpc = hyprstream_rpc::dial::dial_with_token_provider(
-        &transport, signer, Some(discovery_vk), token_provider,
+        &transport,
+        signer,
+        Some(discovery_vk),
+        token_provider,
     )?;
-    Ok(hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
+    Ok(hyprstream_rpc_std::discovery_client::DiscoveryClient::new(
+        rpc,
+    ))
 }
 
 /// Only a caller that supplied its own enrolled credential can obtain a
@@ -3668,7 +3816,10 @@ fn renewing_service_token_provider(
 #[cfg(not(target_arch = "wasm32"))]
 // Without `rocksdb` the accepted-state authority construction fails closed,
 // leaving the verifier binding unused in that configuration.
-#[cfg_attr(not(any(feature = "rocksdb", feature = "postgres")), allow(unused_variables))]
+#[cfg_attr(
+    not(any(feature = "rocksdb", feature = "postgres")),
+    allow(unused_variables)
+)]
 pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     service_token: Option<String>,
@@ -3693,16 +3844,22 @@ pub async fn bootstrap_deployment_process(
             // `discovery_vk` authenticates every lazy response.
             let discovery_client = if network_required {
                 #[cfg(not(test))]
-                let ProcessAcceptanceIdentity::Deployment(verifier) = &authority.acceptance_identity;
+                let ProcessAcceptanceIdentity::Deployment(verifier) =
+                    &authority.acceptance_identity;
                 #[cfg(test)]
                 let verifier = match &authority.acceptance_identity {
                     ProcessAcceptanceIdentity::Deployment(verifier) => verifier,
                     #[cfg(test)]
-                    ProcessAcceptanceIdentity::Test(_) => anyhow::bail!("native bootstrap requires deployment authority"),
+                    ProcessAcceptanceIdentity::Test(_) => {
+                        anyhow::bail!("native bootstrap requires deployment authority")
+                    }
                 };
                 #[cfg(any(feature = "rocksdb", feature = "postgres"))]
                 let source = crate::checkpointed_pds::open_deployment_accepted_state_source(
-                    &authority.store_path, verifier.clone(), records, true,
+                    &authority.store_path,
+                    verifier.clone(),
+                    records,
+                    true,
                 )?;
                 // Fail closed: without a concrete store backend there is no
                 // accepted-state authority to bootstrap against.
@@ -3719,34 +3876,50 @@ pub async fn bootstrap_deployment_process(
                 // binds. Keep this distinct from the service's inbound address.
                 use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, RefuseHandler};
                 let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
-                    &signing_key, "hyprstream-bootstrap-client-transport-v1",
+                    &signing_key,
+                    "hyprstream-bootstrap-client-transport-v1",
                 );
-                let carrier = IrohSubstrate::new(transport_key.to_bytes(),
+                let carrier = IrohSubstrate::new(
+                    transport_key.to_bytes(),
                     RefuseHandler::new("outbound bootstrap only"),
                     RefuseHandler::new("outbound bootstrap only"),
-                ).await?;
-                let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(carrier.owned_client_endpoint());
-                PROCESS_BOOTSTRAP_CARRIER.set(carrier)
+                )
+                .await?;
+                let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
+                    carrier.owned_client_endpoint(),
+                );
+                PROCESS_BOOTSTRAP_CARRIER
+                    .set(carrier)
                     .map_err(|_| anyhow::anyhow!("bootstrap carrier already installed"))?;
                 let resolver = Arc::new(DiscoveryServiceResolver {
                     state_store: MemoryStateStore::production_default(),
                     accepted_state_source: source,
                     discovery_client: None,
                 });
-                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(ProductionRpcClient::new(
-                    "discovery", "discovery", None, signing_key, service_token, resolver,
-                )?))
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(
+                    ProductionRpcClient::new(
+                        "discovery",
+                        "discovery",
+                        None,
+                        signing_key,
+                        service_token,
+                        resolver,
+                    )?,
+                ))
             } else {
                 install_local_discovery_client(signing_key, discovery_vk, service_token)?
             };
             (authority, discovery_client)
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
-            anyhow::ensure!(!network_required, "required native bootstrap needs provisioned OS-owned accepted service state");
+            anyhow::ensure!(
+                !network_required,
+                "required native bootstrap needs provisioned OS-owned accepted service state"
+            );
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
                 authenticate_did_anchored_bootstrap(&anchors).await?;
-                let token_provider = renewing_service_token_provider(&signing_key, service_token);
-                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+            let token_provider = renewing_service_token_provider(&signing_key, service_token);
+            let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
             if remote_node {
                 // Remote worker: the DID-advertised transport is the only
                 // reach. QUIC forbids cleartext envelopes, so the document's
@@ -3808,9 +3981,15 @@ pub async fn bootstrap_deployment_process(
                     })?
                     .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)?;
                 let rpc = hyprstream_rpc::dial::dial_with_token_provider(
-                    &transport, signer, Some(discovery_vk), token_provider,
+                    &transport,
+                    signer,
+                    Some(discovery_vk),
+                    token_provider,
                 )?;
-                (authority, hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc))
+                (
+                    authority,
+                    hyprstream_rpc_std::discovery_client::DiscoveryClient::new(rpc),
+                )
             }
         }
     };
@@ -3972,12 +4151,9 @@ pub fn production_rpc_client(
 /// Discovery reach a remote node has. The client is authenticated per its
 /// installing arm (pinned discovery key; remote-node additionally KEM/PQ-bound
 /// and liveness-verified before install).
-pub fn installed_bootstrap_discovery_client() -> Option<hyprstream_rpc_std::discovery_client::DiscoveryClient> {
-    PRODUCTION_RESOLVER
-        .get()
-        .cloned()?
-        .discovery_client
-        .clone()
+pub fn installed_bootstrap_discovery_client(
+) -> Option<hyprstream_rpc_std::discovery_client::DiscoveryClient> {
+    PRODUCTION_RESOLVER.get().cloned()?.discovery_client.clone()
 }
 
 /// Construct a production RPC client pinned to one router-selected advertised
@@ -4045,8 +4221,16 @@ struct ProductionRpcClient {
 }
 
 fn production_service_query(service_name: &str, required: bool) -> Result<ServiceQuery> {
-    ServiceQuery::new(service_name, ["hyprstream-rpc/1".to_owned()],
-        if required { ResolverProfile::NativeIrohRequired } else { ResolverProfile::NetworkDiscovery }, 3)
+    ServiceQuery::new(
+        service_name,
+        ["hyprstream-rpc/1".to_owned()],
+        if required {
+            ResolverProfile::NativeIrohRequired
+        } else {
+            ResolverProfile::NetworkDiscovery
+        },
+        3,
+    )
 }
 
 impl ProductionRpcClient {
@@ -4081,7 +4265,8 @@ impl ProductionRpcClient {
         })
     }
     async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
-        let query = production_service_query(&self.resolution_service_name, native_network_required())?;
+        let query =
+            production_service_query(&self.resolution_service_name, native_network_required())?;
         let max_attempts = query.max_attempts;
         let mut snapshots = self.resolver.resolve_service_candidates(query).await?;
         let authority = snapshots
@@ -4225,7 +4410,11 @@ pub mod test_fixtures {
             endpoints.push(endpoint);
         }
 
-        fn announcements_for_sync(&self, service_name: &str, now_unix_ms: i64) -> Vec<AnnouncedEndpoint> {
+        fn announcements_for_sync(
+            &self,
+            service_name: &str,
+            now_unix_ms: i64,
+        ) -> Vec<AnnouncedEndpoint> {
             self.services
                 .lock()
                 .get(service_name)
@@ -4290,7 +4479,11 @@ pub mod test_fixtures {
         }
 
         #[cfg(test)]
-        async fn liveness(&self, _node: &Did, _now_unix_ms: i64) -> Result<Option<LiveAllocatable>> {
+        async fn liveness(
+            &self,
+            _node: &Did,
+            _now_unix_ms: i64,
+        ) -> Result<Option<LiveAllocatable>> {
             anyhow::bail!("fixture announcement store does not track liveness")
         }
 
@@ -4326,7 +4519,10 @@ pub mod test_fixtures {
             anyhow::bail!("fixture announcement store does not track envelope keysets")
         }
 
-        async fn envelope_keyset(&self, _service_did: &str) -> Result<Option<CachedEnvelopeKeyset>> {
+        async fn envelope_keyset(
+            &self,
+            _service_did: &str,
+        ) -> Result<Option<CachedEnvelopeKeyset>> {
             anyhow::bail!("fixture announcement store does not track envelope keysets")
         }
     }
@@ -4518,9 +4714,9 @@ pub mod test_fixtures {
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
                 state_store: MemoryStateStore::production_default(),
-                accepted_state_source: Arc::new(FixtureAcceptedStates(
-                    parking_lot::Mutex::new(HashMap::new()),
-                )),
+                accepted_state_source: Arc::new(FixtureAcceptedStates(parking_lot::Mutex::new(
+                    HashMap::new(),
+                ))),
                 discovery_client: Some(discovery_client),
             }))
             .map_err(|_| anyhow::anyhow!("production resolver is already installed"))
@@ -4787,10 +4983,7 @@ impl DiscoveryService {
             .state_store
             .announcements_for(name, unix_millis_now())
             .await?;
-        let Some(endpoint) = endpoints
-            .iter()
-            .find(|ep| ep.socket_kind == wanted)
-        else {
+        let Some(endpoint) = endpoints.iter().find(|ep| ep.socket_kind == wanted) else {
             return Ok(None);
         };
 
@@ -5582,7 +5775,8 @@ mod resolver_tests {
         .unwrap_or_else(|e| panic!("test hybrid keys invalid: {e}"));
         let mut endpoint = ServiceEndpoint::new(At9pTransport::Iroh, address)
             .unwrap_or_else(|e| panic!("test endpoint invalid: {e}"));
-        endpoint.request_kem = request_kem.map(hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::encode);
+        endpoint.request_kem =
+            request_kem.map(hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::encode);
         let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint)
             .unwrap_or_else(|e| panic!("test service invalid: {e}"));
         let body = CapsuleBody::new(vec![keys], vec![service])
@@ -5654,29 +5848,29 @@ mod resolver_tests {
             .put_announcement_sync(
                 "model",
                 AnnouncedEndpoint {
-                socket_kind: if local_reach {
-                    "rep"
-                } else if native_iroh {
-                    "iroh"
-                } else {
-                    "quic"
-                }
-                .to_owned(),
-                endpoint,
-                service_did: Did::from(state.did.clone()),
-                capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
-                    .into_iter()
-                    .collect(),
-                accepted_state_digest: state.head_digest.to_vec(),
-                accepted_state_epoch: state.epoch,
-                response_key_id: format!("{}#response-current", state.did),
-                request_kem_key_id: format!("{}#kem-current", state.did),
-                request_kem_recipient: kem.public().encode(),
-                expires_at_unix_ms: 4_070_908_800_000,
-                source_signer: signing.verifying_key().to_bytes(),
-                live_until_unix_ms: unix_millis_now()
-                    + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64,
-            },
+                    socket_kind: if local_reach {
+                        "rep"
+                    } else if native_iroh {
+                        "iroh"
+                    } else {
+                        "quic"
+                    }
+                    .to_owned(),
+                    endpoint,
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
+                        .into_iter()
+                        .collect(),
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                    source_signer: signing.verifying_key().to_bytes(),
+                    live_until_unix_ms: unix_millis_now()
+                        + ANNOUNCED_ENDPOINT_TTL.as_millis() as i64,
+                },
             )
             .expect("seed announcement");
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state))));
@@ -5732,15 +5926,27 @@ mod resolver_tests {
     #[tokio::test]
     async fn production_profile_preserves_compatibility_quic_without_local_fallback() {
         let (resolver, _) = production_fixture(false);
-        assert!(resolver.resolve_service(production_service_query("model", false).expect("query")).await.is_ok());
-        assert!(resolver.resolve_service(production_service_query("model", true).expect("query")).await.is_err());
+        assert!(resolver
+            .resolve_service(production_service_query("model", false).expect("query"))
+            .await
+            .is_ok());
+        assert!(resolver
+            .resolve_service(production_service_query("model", true).expect("query"))
+            .await
+            .is_err());
         let (resolver, _) = native_production_fixture(false);
         for required in [false, true] {
-            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_ok());
+            assert!(resolver
+                .resolve_service(production_service_query("model", required).expect("query"))
+                .await
+                .is_ok());
         }
         let (resolver, _) = production_fixture(true);
         for required in [false, true] {
-            assert!(resolver.resolve_service(production_service_query("model", required).expect("query")).await.is_err());
+            assert!(resolver
+                .resolve_service(production_service_query("model", required).expect("query"))
+                .await
+                .is_err());
         }
     }
 
@@ -5949,17 +6155,13 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn ordinary_iroh_announcement_handler_redacts_bearer_before_storage_and_discovery() {
-        hyprstream_rpc::registry::init(
-            hyprstream_rpc::registry::EndpointMode::Inproc,
-            None,
-        );
+        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
         let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
         )
         .expect("test KEM");
         let reach = format!("iroh://{}", hex::encode([0x7a; 32]));
-        let (state, service_signing) =
-            accepted_service_state(12, &reach, Some(&kem.public()));
+        let (state, service_signing) = accepted_service_state(12, &reach, Some(&kem.public()));
         let root = SigningKey::from_bytes(&[0x61; 32]);
         let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
             state.clone(),
@@ -6106,7 +6308,9 @@ mod resolver_tests {
                 },
             )
             .await
-            .expect_err("identity-bound announcement over a KEM-less legacy identity must be refused");
+            .expect_err(
+                "identity-bound announcement over a KEM-less legacy identity must be refused",
+            );
         assert!(error.to_string().contains("signed request KEM"));
     }
 
@@ -6237,10 +6441,7 @@ mod resolver_tests {
 
     #[tokio::test]
     async fn remote_get_endpoints_omits_stale_and_fetch_cannot_refresh_it() {
-        hyprstream_rpc::registry::init(
-            hyprstream_rpc::registry::EndpointMode::Inproc,
-            None,
-        );
+        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
         let service = service();
         let name = "stale-remote-reach";
         service
@@ -6290,56 +6491,112 @@ mod resolver_tests {
     #[tokio::test]
     async fn valkey_announcement_handler_lease_and_result_follow_shared_time() {
         use crate::state_store::tests::ReplicaClock;
-        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
-        for backend in [crate::DiscoveryStateBackend::Valkey, crate::DiscoveryStateBackend::Tiered] {
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        for backend in [
+            crate::DiscoveryStateBackend::Valkey,
+            crate::DiscoveryStateBackend::Tiered,
+        ] {
             let config = crate::DiscoveryStateConfig {
-                backend, active_active: true,
+                backend,
+                active_active: true,
                 valkey: crate::ValkeyStateConfig {
                     url: url.clone(),
-                    key_prefix: format!("hs-handler-lease-{}-{}-{backend:?}", std::process::id(), unix_millis_now()),
+                    key_prefix: format!(
+                        "hs-handler-lease-{}-{}-{backend:?}",
+                        std::process::id(),
+                        unix_millis_now()
+                    ),
                     ..Default::default()
                 },
                 ..Default::default()
             };
             let (state, signing) = accepted_state(12);
-            let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state.clone()))));
+            let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+                state.clone(),
+            ))));
             let root = SigningKey::from_bytes(&[0x61; 32]);
-            let service = DiscoveryService::new(Arc::new(root.clone()), root.verifying_key(), TransportConfig::inproc("lease-handler-test"))
-                .with_accepted_state_source(source.clone())
-                .with_state(DiscoveryState::connect(&config).await.unwrap());
-            let claims = hyprstream_rpc::auth::Claims::new("service:model".to_owned(),
-                chrono::Utc::now().timestamp(), chrono::Utc::now().timestamp() + 7_200)
-                .with_cnf_jwk(signing.verifying_key().as_bytes());
+            let service = DiscoveryService::new(
+                Arc::new(root.clone()),
+                root.verifying_key(),
+                TransportConfig::inproc("lease-handler-test"),
+            )
+            .with_accepted_state_source(source.clone())
+            .with_state(DiscoveryState::connect(&config).await.unwrap());
+            let claims = hyprstream_rpc::auth::Claims::new(
+                "service:model".to_owned(),
+                chrono::Utc::now().timestamp(),
+                chrono::Utc::now().timestamp() + 7_200,
+            )
+            .with_cnf_jwk(signing.verifying_key().as_bytes());
             let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
             let envelope = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
-                hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()), &signing, &pq);
+                hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+                &signing,
+                &pq,
+            );
             let ctx = EnvelopeContext::from_verified_as_system(&envelope);
             let kem = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&signing).unwrap();
             let now = unix_millis_now();
             let mut request = ServiceAnnouncement {
-                service_name: "model".to_owned(), socket_kind: "quic".to_owned(),
+                service_name: "model".to_owned(),
+                socket_kind: "quic".to_owned(),
                 endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
-                service_jwt: Some(hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root)),
-                service_did: Did::from(state.did.clone()), capabilities: vec!["hyprstream-rpc/1".to_owned()],
-                accepted_state_digest: state.head_digest.to_vec(), accepted_state_epoch: state.epoch,
+                service_jwt: Some(hyprstream_rpc::auth::jwt::encode_service_jwt(
+                    &claims, &root,
+                )),
+                service_did: Did::from(state.did.clone()),
+                capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                accepted_state_digest: state.head_digest.to_vec(),
+                accepted_state_epoch: state.epoch,
                 response_key_id: format!("{}#response-current", state.did),
                 request_kem_key_id: format!("{}#kem-current", state.did),
-                request_kem_recipient: kem.public().encode(), expires_at_unix_ms: now + 7_200_000,
+                request_kem_recipient: kem.public().encode(),
+                expires_at_unix_ms: now + 7_200_000,
             };
             for skew in [3_600_000, -3_600_000] {
                 let _clock = ReplicaClock::at(now + skew);
-                assert!(matches!(service.handle_announce(&ctx, 1, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
-                let rows = service.state_store.announcements_for("model", now + skew).await.unwrap();
-                assert_eq!(rows.len(), 1, "successful response requires a stored publication");
+                assert!(matches!(
+                    service.handle_announce(&ctx, 1, &request).await.unwrap(),
+                    DiscoveryResponseVariant::AnnounceResult
+                ));
+                let rows = service
+                    .state_store
+                    .announcements_for("model", now + skew)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "successful response requires a stored publication"
+                );
                 assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
                 assert_eq!(rows[0].expires_at_unix_ms, request.expires_at_unix_ms);
                 assert_eq!(rows[0].request_kem_recipient, request.request_kem_recipient);
                 let stored_json = serde_json::to_string(&rows[0]).unwrap();
                 assert!(!stored_json.contains(request.service_jwt.as_deref().unwrap()));
                 // Repeated reads exercise populated L1, not only its first fill.
-                assert!(service.resolve_announced_endpoint("model", SocketKind::Quic).await.unwrap().is_some());
-                assert_eq!(service.state_store.all_announcements(now + skew).await.unwrap().len(), 1);
-                service.production_resolver().unwrap().resolve_service(ServiceQuery::network("model").unwrap()).await.unwrap();
+                assert!(service
+                    .resolve_announced_endpoint("model", SocketKind::Quic)
+                    .await
+                    .unwrap()
+                    .is_some());
+                assert_eq!(
+                    service
+                        .state_store
+                        .all_announcements(now + skew)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                service
+                    .production_resolver()
+                    .unwrap()
+                    .resolve_service(ServiceQuery::network("model").unwrap())
+                    .await
+                    .unwrap();
             }
             // Legacy publication has no signed expiry, but receives the same
             // bounded backend lease on both initial publication and refresh.
@@ -6356,8 +6613,15 @@ mod resolver_tests {
             legacy.expires_at_unix_ms = 0;
             for skew in [3_600_000, -3_600_000] {
                 let _clock = ReplicaClock::at(now + skew);
-                assert!(matches!(service.handle_announce(&ctx, 1, &legacy).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
-                let rows = service.state_store.announcements_for("legacy", now + skew).await.unwrap();
+                assert!(matches!(
+                    service.handle_announce(&ctx, 1, &legacy).await.unwrap(),
+                    DiscoveryResponseVariant::AnnounceResult
+                ));
+                let rows = service
+                    .state_store
+                    .announcements_for("legacy", now + skew)
+                    .await
+                    .unwrap();
                 assert_eq!(rows.len(), 1);
                 assert!((now + 89_000..=now + 91_000).contains(&rows[0].live_until_unix_ms));
                 assert_eq!(rows[0].expires_at_unix_ms, rows[0].live_until_unix_ms);
@@ -6367,33 +6631,57 @@ mod resolver_tests {
             // signed deadline with the same epoch is an ignored older write;
             // the handler must not claim it was published.
             request.expires_at_unix_ms = now + 20_000;
-            assert!(service.handle_announce(&ctx, 2, &request).await.unwrap_err().to_string().contains("not stored"));
+            assert!(service
+                .handle_announce(&ctx, 2, &request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not stored"));
 
             // Updated signed accepted-state evidence supplies a shorter current-state
             // ceiling; the backend must not extend it to the receipt TTL.
             let accepted_limit = (now / 1_000) * 1_000 + 20_000;
-            let accepted_expiry = chrono::DateTime::from_timestamp_millis(accepted_limit).unwrap()
+            let accepted_expiry = chrono::DateTime::from_timestamp_millis(accepted_limit)
+                .unwrap()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             let (bounded, _) = accepted_state_with_expiry(12, &accepted_expiry);
             *source.0.lock() = Some(bounded.clone());
             request.expires_at_unix_ms = now + 7_200_000;
             request.accepted_state_digest = bounded.head_digest.to_vec();
-            assert!(matches!(service.handle_announce(&ctx, 3, &request).await.unwrap(), DiscoveryResponseVariant::AnnounceResult));
-            let values = service.state_store.announcements_for("model", now).await.unwrap();
+            assert!(matches!(
+                service.handle_announce(&ctx, 3, &request).await.unwrap(),
+                DiscoveryResponseVariant::AnnounceResult
+            ));
+            let values = service
+                .state_store
+                .announcements_for("model", now)
+                .await
+                .unwrap();
             assert_eq!(values[0].live_until_unix_ms, accepted_limit);
 
             // Both signed and accepted expiry reject under a behind clock, and
             // neither rejection is reported as AnnounceResult.
             let _clock = ReplicaClock::at(now - 3_600_000);
             request.expires_at_unix_ms = now - 1;
-            assert!(service.handle_announce(&ctx, 4, &request).await.unwrap_err().to_string().contains("not stored"));
-            let expired_text = chrono::DateTime::from_timestamp_millis(now - 1).unwrap()
+            assert!(service
+                .handle_announce(&ctx, 4, &request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not stored"));
+            let expired_text = chrono::DateTime::from_timestamp_millis(now - 1)
+                .unwrap()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             let (expired, _) = accepted_state_with_expiry(12, &expired_text);
             *source.0.lock() = Some(expired.clone());
             request.expires_at_unix_ms = now + 7_200_000;
             request.accepted_state_digest = expired.head_digest.to_vec();
-            assert!(service.handle_announce(&ctx, 5, &request).await.unwrap_err().to_string().contains("not stored"));
+            assert!(service
+                .handle_announce(&ctx, 5, &request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not stored"));
         }
     }
 
@@ -6498,7 +6786,10 @@ mod resolver_tests {
             Arc::new(resolver),
         )
         .expect("selected client");
-        assert_eq!(client.snapshots().await.expect("selected snapshot").len(), 1);
+        assert_eq!(
+            client.snapshots().await.expect("selected snapshot").len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6517,7 +6808,9 @@ mod resolver_tests {
             Ok(_) => panic!("unadvertised transport was authorized"),
             Err(error) => error,
         };
-        assert!(reach_error.to_string().contains("not a current authorized candidate"));
+        assert!(reach_error
+            .to_string()
+            .contains("not a current authorized candidate"));
         let domain_error = client
             .call_for_service("model", Vec::new())
             .await
@@ -6543,8 +6836,12 @@ mod resolver_tests {
         let resolver = Arc::new(resolver);
         let _ = PRODUCTION_RESOLVER.set(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
-        let _client = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(&crate::ProductionRpcClientProvider, client_signing, None)
-            .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
+        let _client = hyprstream_rpc_std::discovery_client::DiscoveryClient::from_provider(
+            &crate::ProductionRpcClientProvider,
+            client_signing,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
     }
 
     #[test]
@@ -7060,7 +7357,9 @@ mod resolver_tests {
                     .expect("authenticate process resolver");
             DiscoveryService::bootstrap_authenticated_process(
                 authority,
-                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(
+                    NoopBootstrapClient,
+                )),
                 &hyprstream_pds::rds::RdsConfig::default(),
             )
             .expect("install process resolver");
@@ -7121,7 +7420,9 @@ mod resolver_tests {
                         .and_then(|authority| {
                             DiscoveryService::bootstrap_authenticated_process(
                                 authority,
-                                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(
+                                    Arc::new(NoopBootstrapClient),
+                                ),
                                 &hyprstream_pds::rds::RdsConfig::default(),
                             )
                         })
@@ -7163,7 +7464,9 @@ mod resolver_tests {
                     .unwrap();
             let first = DiscoveryService::bootstrap_authenticated_process(
                 authority,
-                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                hyprstream_rpc_std::discovery_client::DiscoveryClient::new(Arc::new(
+                    NoopBootstrapClient,
+                )),
                 &hyprstream_pds::rds::RdsConfig::default(),
             )
             .expect_err("missing checkpoint store unexpectedly installed");
@@ -7195,8 +7498,12 @@ mod resolver_tests {
     #[tokio::test]
     async fn stale_or_expired_production_evidence_is_rejected() {
         let (resolver, _) = native_production_fixture(false);
-        let expiry = resolver.state_store.announcements_for("model", unix_millis_now())
-            .await.unwrap()[0].live_until_unix_ms;
+        let expiry = resolver
+            .state_store
+            .announcements_for("model", unix_millis_now())
+            .await
+            .unwrap()[0]
+            .live_until_unix_ms;
         {
             // Expired writes now correctly leave a prior valid value intact.
             // Advance this memory backend's clock to expire the real lease
@@ -7271,9 +7578,9 @@ mod resolver_tests {
             .put_announcement(
                 "model",
                 legacy_endpoint(
-                "quic",
-                "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
-                Instant::now(),
+                    "quic",
+                    "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
+                    Instant::now(),
                 ),
             )
             .await
@@ -7314,9 +7621,9 @@ mod resolver_tests {
             .put_announcement(
                 "model",
                 legacy_endpoint(
-                "quic",
-                "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
-                Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
+                    "quic",
+                    "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
+                    Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
                 ),
             )
             .await
@@ -7433,7 +7740,10 @@ impl DiscoveryHandler for DiscoveryService {
         drop(reg);
 
         // Merge live announcements from the configured state backend.
-        let announced = self.state_store.all_announcements(unix_millis_now()).await?;
+        let announced = self
+            .state_store
+            .all_announcements(unix_millis_now())
+            .await?;
         let local_names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
         for (name, endpoints) in &announced {
             if local_names.iter().any(|n| n == name) {
@@ -8040,67 +8350,115 @@ impl DiscoveryHandler for DiscoveryService {
             // not one or two Policy RPCs and a point GET per node. Read bounded
             // shared snapshots and authorize in bounded vectors instead.
             let live_nodes = self.state_store.all_liveness(unix_millis_now()).await?;
-            let eligible: Vec<_> = live_nodes.into_iter().filter(|(node, live)| {
-                resources.iter().all(|req| live.allocatable.iter()
-                    .find(|(name, _)| name == &req.name)
-                    .is_some_and(|(_, quantity)| req.satisfied_by(quantity)))
-                    && (self.placement_index.record_uri(node.as_str()).is_none()
-                        || selectors.iter().all(|selector| selector.matches(
-                            &self.placement_index.effective_labels(node.as_str()))))
-            }).map(|(node, _)| node).collect();
+            let eligible: Vec<_> = live_nodes
+                .into_iter()
+                .filter(|(node, live)| {
+                    resources.iter().all(|req| {
+                        live.allocatable
+                            .iter()
+                            .find(|(name, _)| name == &req.name)
+                            .is_some_and(|(_, quantity)| req.satisfied_by(quantity))
+                    }) && (self.placement_index.record_uri(node.as_str()).is_none()
+                        || selectors.iter().all(|selector| {
+                            selector.matches(&self.placement_index.effective_labels(node.as_str()))
+                        }))
+                })
+                .map(|(node, _)| node)
+                .collect();
             let authorized = stream::iter(eligible.chunks(256))
                 .map(|nodes| async move {
-                    anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
-                        "candidate query deadline exceeded; retry");
-                    let resources: Vec<_> = nodes.iter()
-                        .map(|node| format!("placement:candidate:{node}")).collect();
+                    anyhow::ensure!(
+                        started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                        "candidate query deadline exceeded; retry"
+                    );
+                    let resources: Vec<_> = nodes
+                        .iter()
+                        .map(|node| format!("placement:candidate:{node}"))
+                        .collect();
                     let decisions = match &self.auth_provider {
                         Some(auth) => auth.check_batch_context(ctx, &resources, "query").await?,
                         None => vec![true; resources.len()],
                     };
-                    anyhow::ensure!(decisions.len() == nodes.len(), "invalid authorization decision count");
-                    Ok::<_, anyhow::Error>(nodes.iter().zip(decisions)
-                        .filter(|(_, allowed)| *allowed).map(|(node, _)| node.clone()).collect::<Vec<_>>())
+                    anyhow::ensure!(
+                        decisions.len() == nodes.len(),
+                        "invalid authorization decision count"
+                    );
+                    Ok::<_, anyhow::Error>(
+                        nodes
+                            .iter()
+                            .zip(decisions)
+                            .filter(|(_, allowed)| *allowed)
+                            .map(|(node, _)| node.clone())
+                            .collect::<Vec<_>>(),
+                    )
                 })
                 .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
-                .try_collect::<Vec<_>>().await?
-                .into_iter().flatten().collect::<Vec<_>>();
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
 
             // No denied node can trigger repository hydration. Completed
             // verified ingests survive a cold-query timeout, so retries progress.
-            stream::iter(&authorized).map(|node| async move {
-                anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
-                    "candidate query deadline exceeded; retry");
-                anyhow::ensure!(self.ensure_placement_ingested(node).await,
-                    "candidate projection ingestion is pending; retry");
-                Ok::<_, anyhow::Error>(())
-            }).buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
-                .try_collect::<Vec<_>>().await?;
+            stream::iter(&authorized)
+                .map(|node| async move {
+                    anyhow::ensure!(
+                        started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                        "candidate query deadline exceeded; retry"
+                    );
+                    anyhow::ensure!(
+                        self.ensure_placement_ingested(node).await,
+                        "candidate projection ingestion is pending; retry"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                })
+                .buffer_unordered(CANDIDATE_QUERY_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
 
             // Recheck expiry in one shared-clock snapshot after possibly slow
             // hydration/authz, rather than issuing an awaited GET for each DID.
-            let mut live: std::collections::HashMap<_, _> = self.state_store.all_liveness(unix_millis_now())
-                .await?.into_iter().collect();
+            let mut live: std::collections::HashMap<_, _> = self
+                .state_store
+                .all_liveness(unix_millis_now())
+                .await?
+                .into_iter()
+                .collect();
             let mut candidates = Vec::new();
             for node in authorized {
                 let did = node.as_str().to_owned();
-                let Some(record_uri) = self.placement_index.record_uri(&did) else { continue };
-                let Some(value) = live.remove(&node) else { continue };
+                let Some(record_uri) = self.placement_index.record_uri(&did) else {
+                    continue;
+                };
+                let Some(value) = live.remove(&node) else {
+                    continue;
+                };
                 let labels = self.placement_index.effective_labels(&did);
-                if !selectors.iter().all(|selector| selector.matches(&labels)) ||
-                    !resources.iter().all(|req| value.allocatable.iter()
-                        .find(|(name, _)| name == &req.name)
-                        .is_some_and(|(_, quantity)| req.satisfied_by(quantity))) {
+                if !selectors.iter().all(|selector| selector.matches(&labels))
+                    || !resources.iter().all(|req| {
+                        value
+                            .allocatable
+                            .iter()
+                            .find(|(name, _)| name == &req.name)
+                            .is_some_and(|(_, quantity)| req.satisfied_by(quantity))
+                    })
+                {
                     continue;
                 }
                 candidates.push(Candidate {
-                    did, record_uri, load_fraction: value.load_fraction,
-                    allocatable: value.allocatable, last_seen: value.last_seen,
+                    did,
+                    record_uri,
+                    load_fraction: value.load_fraction,
+                    allocatable: value.allocatable,
+                    last_seen: value.last_seen,
                 });
             }
             let authorized: Vec<_> = candidates.iter().collect();
-            anyhow::ensure!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
-                "candidate query deadline exceeded; retry");
+            anyhow::ensure!(
+                started.elapsed() < CANDIDATE_QUERY_TIMEOUT,
+                "candidate query deadline exceeded; retry"
+            );
 
             // Post-filter, post-authz, pre-bound — so callers can tell truncation
             // apart from "that's really all of them".
@@ -8608,13 +8966,13 @@ mod query_candidates_tests {
 
     use std::collections::BTreeMap;
 
-    use hyprstream_rpc_std::discovery_client::{LabelSelector, ResourceRequest, SelectorOp};
     use hyprstream_pds::car::build_car_v1;
     use hyprstream_pds::cid::Cid;
     use hyprstream_pds::commit::{Commit, UnsignedCommit};
     use hyprstream_pds::mst::Node;
     use hyprstream_pds::placement::node::{self, NodeRecord};
     use hyprstream_pds::tid::Tid;
+    use hyprstream_rpc_std::discovery_client::{LabelSelector, ResourceRequest, SelectorOp};
     use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 
     /// Allows every (resource, operation) pair.
@@ -8888,60 +9246,125 @@ mod query_candidates_tests {
         struct BatchPolicy(Arc<AtomicUsize>);
         #[async_trait(?Send)]
         impl AuthorizationProvider for BatchPolicy {
-            async fn check(&self, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<bool> {
+            async fn check(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<bool> {
                 panic!("capacity query regressed to per-node Policy RPC");
             }
-            async fn check_batch(&self, _: &str, _: &str, resources: &[String], _: &str, _: Option<&str>) -> Result<Vec<bool>> {
+            async fn check_batch(
+                &self,
+                _: &str,
+                _: &str,
+                resources: &[String],
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<Vec<bool>> {
                 assert!(resources.len() <= 256);
                 self.0.fetch_add(1, SeqCst);
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                Ok(resources.iter().map(|r| !r.ends_with("capacity-00001.example")).collect())
+                Ok(resources
+                    .iter()
+                    .map(|r| !r.ends_with("capacity-00001.example"))
+                    .collect())
             }
         }
-        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return };
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
         let config = crate::DiscoveryStateConfig {
-            backend: crate::DiscoveryStateBackend::Tiered, active_active: true,
+            backend: crate::DiscoveryStateBackend::Tiered,
+            active_active: true,
             valkey: crate::ValkeyStateConfig {
-                url, key_prefix: format!("capacity-query-{}-{}", std::process::id(), unix_millis_now()),
+                url,
+                key_prefix: format!(
+                    "capacity-query-{}-{}",
+                    std::process::id(),
+                    unix_millis_now()
+                ),
                 ..crate::ValkeyStateConfig::default()
-            }, ..crate::DiscoveryStateConfig::default()
+            },
+            ..crate::DiscoveryStateConfig::default()
         };
         let capacity = config.valkey.liveness_capacity;
-        assert_eq!(capacity, 65_536, "exercise advertised capacity without lowering it");
+        assert_eq!(
+            capacity, 65_536,
+            "exercise advertised capacity without lowering it"
+        );
         let state = DiscoveryState::connect(&config).await.unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let svc = service_with(Box::new(BatchPolicy(calls.clone())), HashMap::new()).with_state(state);
+        let svc =
+            service_with(Box::new(BatchPolicy(calls.clone())), HashMap::new()).with_state(state);
         // Warm verified placement projection: signature/admission behavior has
         // separate real-CAR tests; this fixture isolates full-capacity querying.
         for i in 0..capacity {
             let did = format!("did:web:capacity-{i:05}.example");
-            svc.placement_index.seed_warm_node_for_test(did.clone(), crate::placement_index::NodeFacts {
-                record_uri: format!("at://{did}/ai.hyprstream.placement.node/3a"),
-                labels: vec![("zone".to_owned(), if i % 2 == 1 { "west" } else { "east" }.to_owned())],
-                ..Default::default()
-            });
+            svc.placement_index.seed_warm_node_for_test(
+                did.clone(),
+                crate::placement_index::NodeFacts {
+                    record_uri: format!("at://{did}/ai.hyprstream.placement.node/3a"),
+                    labels: vec![(
+                        "zone".to_owned(),
+                        if i % 2 == 1 { "west" } else { "east" }.to_owned(),
+                    )],
+                    ..Default::default()
+                },
+            );
         }
-        stream::iter(0..capacity).map(|i| {
-            let store = &svc.state_store;
-            async move {
-                let now = unix_millis_now();
-                store.put_liveness(&Did::new(format!("did:web:capacity-{i:05}.example")), LiveAllocatable {
-                    allocatable: vec![("cpu".to_owned(), "8".to_owned())],
-                    load_fraction: 1.0 - i as f32 / capacity as f32,
-                    last_seen: now, live_until_unix_ms: now + 45_000,
-                }).await.unwrap();
-            }
-        }).buffer_unordered(256).collect::<Vec<_>>().await;
+        stream::iter(0..capacity)
+            .map(|i| {
+                let store = &svc.state_store;
+                async move {
+                    let now = unix_millis_now();
+                    store
+                        .put_liveness(
+                            &Did::new(format!("did:web:capacity-{i:05}.example")),
+                            LiveAllocatable {
+                                allocatable: vec![("cpu".to_owned(), "8".to_owned())],
+                                load_fraction: 1.0 - i as f32 / capacity as f32,
+                                last_seen: now,
+                                live_until_unix_ms: now + 45_000,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            })
+            .buffer_unordered(256)
+            .collect::<Vec<_>>()
+            .await;
         let mut request = empty_query(1);
-        request.selectors = vec![LabelSelector { key: "zone".to_owned(), op: SelectorOp::In, values: vec!["west".to_owned()] }];
-        request.resources = vec![ResourceRequest { name: "cpu".to_owned(), min_quantity: "4".to_owned() }];
+        request.selectors = vec![LabelSelector {
+            key: "zone".to_owned(),
+            op: SelectorOp::In,
+            values: vec!["west".to_owned()],
+        }];
+        request.resources = vec![ResourceRequest {
+            name: "cpu".to_owned(),
+            min_quantity: "4".to_owned(),
+        }];
         let started = Instant::now();
-        let result = as_set(svc.handle_query_candidates(&test_ctx(), 1, &request).await.unwrap());
+        let result = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &request)
+                .await
+                .unwrap(),
+        );
         assert!(started.elapsed() < CANDIDATE_QUERY_TIMEOUT);
         assert_eq!(result.total_matching, (capacity / 2 - 1) as u32);
         assert_eq!(result.candidates.len(), 1);
-        assert_eq!(result.candidates[0].node, format!("did:web:capacity-{:05}.example", capacity - 1));
-        assert_eq!(calls.load(SeqCst), capacity / 2 / 256, "warm selector filtering precedes Policy RPC");
+        assert_eq!(
+            result.candidates[0].node,
+            format!("did:web:capacity-{:05}.example", capacity - 1)
+        );
+        assert_eq!(
+            calls.load(SeqCst),
+            capacity / 2 / 256,
+            "warm selector filtering precedes Policy RPC"
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -9153,10 +9576,19 @@ mod query_candidates_tests {
         );
         // Expiring the shared record excludes it even from populated indexes.
         let now = unix_millis_now();
-        replica_a.state_store.put_liveness(&Did::new(did.to_owned()), LiveAllocatable {
-            allocatable: vec![], load_fraction: 0.1,
-            last_seen: now, live_until_unix_ms: now + 20,
-        }).await.unwrap();
+        replica_a
+            .state_store
+            .put_liveness(
+                &Did::new(did.to_owned()),
+                LiveAllocatable {
+                    allocatable: vec![],
+                    load_fraction: 0.1,
+                    last_seen: now,
+                    live_until_unix_ms: now + 20,
+                },
+            )
+            .await
+            .unwrap();
         // The shared clock cannot be advanced by passing a replica timestamp.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -9610,8 +10042,8 @@ mod eager_resolver_regression {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         hyprstream_rpc::registry::init(EndpointMode::Ipc, Some(runtime_dir.clone()));
 
-        let registry = hyprstream_rpc::registry::try_global()
-            .expect("EndpointRegistry must be initialized");
+        let registry =
+            hyprstream_rpc::registry::try_global().expect("EndpointRegistry must be initialized");
 
         // First-boot posture: discovery has NOT registered an endpoint.
         let registered = registry.registered_endpoint("discovery", SocketKind::Rep);
@@ -9625,11 +10057,10 @@ mod eager_resolver_regression {
         // The resolver-install path: dial + DiscoveryClient::new.
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let discovery_vk = signing_key.verifying_key();
-        let _client = install_local_discovery_client(signing_key, discovery_vk, None)
-            .expect(
-                "install_local_discovery_client must succeed at first boot with \
+        let _client = install_local_discovery_client(signing_key, discovery_vk, None).expect(
+            "install_local_discovery_client must succeed at first boot with \
                  no registered discovery endpoint",
-            );
+        );
 
         // Confirm the resolved transport is the default UDS path (IPC variant).
         let transport = resolve_local_discovery_transport()
@@ -9655,7 +10086,8 @@ mod eager_resolver_regression {
             .next()
             .expect("production source");
         assert!(production.contains("None, signing_key, service_token, resolver,"));
-        assert!(production.contains("install_local_discovery_client(signing_key, discovery_vk, service_token)"));
+        assert!(production
+            .contains("install_local_discovery_client(signing_key, discovery_vk, service_token)"));
         assert!(production.contains("Some(discovery_vk), token_provider,"));
         assert!(production.contains("current_service_token(&self.signing_key, &self.token)"));
     }
@@ -9726,7 +10158,6 @@ mod eager_resolver_regression {
         );
     }
 }
-
 
 // ============================================================================
 // Regression: PostgreSQL accepted-state authority selection (#staging-resolver)

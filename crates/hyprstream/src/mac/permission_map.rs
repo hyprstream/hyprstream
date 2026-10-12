@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyprstream_rpc::auth::ucan::capability::{Ability, Capability, Caveats, Resource};
 
-use crate::auth::{SCHEMA_SCOPE_ACTIONS, scope_action_from_name, scope_action_name};
+use crate::auth::{scope_action_from_name, scope_action_name, SCHEMA_SCOPE_ACTIONS};
 use crate::mac::compiler::{AccessRequest, PermissionMap};
 use crate::mac::te::{Action, ObjectType, SubjectType, TeRule};
 
@@ -117,10 +117,7 @@ impl ScopePermissionMap {
     }
 
     /// The registered objects of `class`, in id order.
-    fn objects_of_class<'a>(
-        &'a self,
-        class: &'a str,
-    ) -> impl Iterator<Item = ObjectType> + 'a {
+    fn objects_of_class<'a>(&'a self, class: &'a str) -> impl Iterator<Item = ObjectType> + 'a {
         self.by_name
             .range((class.to_owned(), String::new())..)
             .take_while(move |((c, _), _)| c == class)
@@ -324,7 +321,10 @@ mod tests {
         ];
         for g in &grants {
             let rules = m.permissions_for(g);
-            assert!(!rules.is_empty(), "grant {g} must lower to at least one rule");
+            assert!(
+                !rules.is_empty(),
+                "grant {g} must lower to at least one rule"
+            );
             for rule in rules {
                 let access = m
                     .granted_access(&rule)

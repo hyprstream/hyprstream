@@ -12,7 +12,7 @@
 /// Returns (DER certificate, DER private key, SHA-256 hash).
 pub fn generate_wt_cert(validity_days: u32) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     let validity_days = validity_days.min(14); // WebTransport max
 

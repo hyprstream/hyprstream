@@ -172,7 +172,10 @@ impl ServiceEndpoint {
         validate_optional_no_ws(self.relay.as_deref(), "service endpoint relay")?;
         validate_optional_no_ws(self.export.as_deref(), "service endpoint export")?;
         if let Some(key) = &self.request_kem {
-            ensure!(!key.is_empty() && key.len() <= 4096, "invalid endpoint request KEM length");
+            ensure!(
+                !key.is_empty() && key.len() <= 4096,
+                "invalid endpoint request KEM length"
+            );
         }
         Ok(())
     }
@@ -203,7 +206,14 @@ impl ServiceEndpoint {
     fn from_value(value: &DagCbor) -> Result<Self> {
         reject_unknown(
             value,
-            &["address", "transport", "nodeId", "relay", "export", "requestKem"],
+            &[
+                "address",
+                "transport",
+                "nodeId",
+                "relay",
+                "export",
+                "requestKem",
+            ],
             "at9p service endpoint",
         )?;
         let endpoint = Self {

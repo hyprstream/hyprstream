@@ -98,7 +98,9 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &ChatApp) {
     let skip = if total <= visible {
         0
     } else {
-        total.saturating_sub(visible).saturating_sub(app.scroll_offset)
+        total
+            .saturating_sub(visible)
+            .saturating_sub(app.scroll_offset)
     };
 
     let lines: Vec<Line<'static>> = all_lines.into_iter().skip(skip).take(visible).collect();
@@ -120,8 +122,8 @@ fn draw_input_line(frame: &mut Frame, area: Rect, app: &ChatApp) {
         area,
     );
     if show_cursor {
-        let cx = (area.x + 2 + app.input_buf.len() as u16)
-            .min(area.x + area.width.saturating_sub(1));
+        let cx =
+            (area.x + 2 + app.input_buf.len() as u16).min(area.x + area.width.saturating_sub(1));
         frame.set_cursor_position((cx, area.y));
     }
 }
@@ -130,7 +132,11 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
     let keys: &[(&str, &str)] = if matches!(app.mode, ChatMode::Streaming) {
         &[("Esc", "Abort")]
     } else {
-        &[("Enter", "Send"), ("\u{2191}\u{2193}", "Scroll"), ("Esc", "Close")]
+        &[
+            ("Enter", "Send"),
+            ("\u{2191}\u{2193}", "Scroll"),
+            ("Esc", "Close"),
+        ]
     };
     let mut spans = Vec::new();
     for (key, label) in keys {

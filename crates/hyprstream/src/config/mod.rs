@@ -19,9 +19,9 @@ pub use hyprstream_pds::rds::RdsConfig;
 // Inference-facing config types moved to `hyprstream-inference` (Wave B decomposition);
 // re-exported here so every existing `crate::config::...` path keeps resolving.
 pub use hyprstream_inference::config::{
-    FinishReason, GenerationConfig, GenerationResult, HyprstreamTrainingConfig, ModelConfig,
-    RuntimeConfig, TTTMetrics, TTTTrainingConfig, TrainingMode, default_lora_rank,
-    default_target_modules,
+    default_lora_rank, default_target_modules, FinishReason, GenerationConfig, GenerationResult,
+    HyprstreamTrainingConfig, ModelConfig, RuntimeConfig, TTTMetrics, TTTTrainingConfig,
+    TrainingMode,
 };
 
 // Export root configuration and builder (defined below in this module)
@@ -304,7 +304,6 @@ pub struct HyprConfig {
     #[serde(default)]
     pub ledger_postgres_pool_size: Option<usize>,
 }
-
 
 /// Persistent secrets storage configuration.
 ///
@@ -2116,9 +2115,7 @@ impl At9pRenewalConfig {
     /// Defaults to 24 h (see the field docs for the defensive rationale).
     pub fn valid_for_seconds(&self) -> anyhow::Result<i64> {
         const DEFAULT_RENEWAL_TTL_SECS: i64 = 86_400;
-        let ttl = self
-            .valid_for_secs
-            .unwrap_or(DEFAULT_RENEWAL_TTL_SECS);
+        let ttl = self.valid_for_secs.unwrap_or(DEFAULT_RENEWAL_TTL_SECS);
         anyhow::ensure!(
             (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS).contains(&ttl),
             "[registry.at9p_renewal] valid_for_secs must be {}..{} seconds",
@@ -2307,14 +2304,14 @@ impl Default for ServicesConfig {
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
     let mut services = vec![
-        "event".to_owned(),     // Must start first (message bus)
-        "registry".to_owned(),  // Model registry
-        "policy".to_owned(),    // Authorization
-        "streams".to_owned(),   // Streaming proxy with JWT validation
-        "worker".to_owned(),    // Container workloads
-        "model".to_owned(),     // Model management
-        "oauth".to_owned(),     // OAuth 2.1 authorization server
-        "oai".to_owned(),       // OpenAI-compatible HTTP API
+        "event".to_owned(),    // Must start first (message bus)
+        "registry".to_owned(), // Model registry
+        "policy".to_owned(),   // Authorization
+        "streams".to_owned(),  // Streaming proxy with JWT validation
+        "worker".to_owned(),   // Container workloads
+        "model".to_owned(),    // Model management
+        "oauth".to_owned(),    // OAuth 2.1 authorization server
+        "oai".to_owned(),      // OpenAI-compatible HTTP API
     ];
     #[cfg(feature = "metrics")]
     {
@@ -2500,7 +2497,6 @@ impl InferenceServerConfig {
         format!("inference-cpu-{}", self.replica)
     }
 }
-
 
 /// Application-level LoRA settings (TOML config: enabled, max_adapters, etc.)
 ///
@@ -3221,7 +3217,10 @@ impl SamplingParams {
     ///
     /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
     /// letting the engine use its defaults.
-    pub fn into_generation_request(self, prompt: String) -> hyprstream_rpc_std::inference_client::GenerationRequest {
+    pub fn into_generation_request(
+        self,
+        prompt: String,
+    ) -> hyprstream_rpc_std::inference_client::GenerationRequest {
         hyprstream_rpc_std::inference_client::GenerationRequest {
             prompt,
             max_tokens: self.max_tokens.map(|v| v as u32),
@@ -3326,7 +3325,10 @@ mod tests {
             Ok(_) => panic!("6h check vs 10m TTL must be refused"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("half of valid_for_secs"), "{error}");
+        assert!(
+            error.to_string().contains("half of valid_for_secs"),
+            "{error}"
+        );
         // Interval at exactly half the TTL still leaves a schedule where the
         // head expires on the tick boundary: refuse strictly below only.
         let boundary = At9pRenewalConfig {
@@ -3409,7 +3411,12 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
-        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+        use axum::{
+            body::Body,
+            http::{header, Request},
+            routing::get,
+            Router,
+        };
         use tower::ServiceExt;
 
         for origins in [
@@ -3423,37 +3430,74 @@ mod tests {
                 ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
                 ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
                 ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
-                ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+                (
+                    "HYPRSTREAM__OAUTH__EXTERNAL_URL",
+                    "https://discovery.staging.lab.hyprstream.com",
+                ),
                 ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
-            ].into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
             let cfg: HyprConfig = config::Config::builder()
                 .add_source(config::Config::try_from(&HyprConfig::default())?)
                 .add_source(HyprConfig::environment_source().source(Some(source)))
                 .build()?
                 .try_deserialize()?;
-            assert_eq!(cfg.oauth.cors.allowed_origins, origins.split(',').map(str::trim).collect::<Vec<_>>());
+            assert_eq!(
+                cfg.oauth.cors.allowed_origins,
+                origins.split(',').map(str::trim).collect::<Vec<_>>()
+            );
             assert!(cfg.oauth.cors.enabled);
             assert!(cfg.oauth.cors.allow_credentials);
             assert!(!cfg.oauth.cors.permissive_headers);
-            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(
+                cfg.oauth.external_url.as_deref(),
+                Some("https://discovery.staging.lab.hyprstream.com")
+            );
             assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
 
             let app = Router::new()
                 .route("/probe", get(|| async { "ok" }))
                 .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
-            for origin in cfg.oauth.cors.allowed_origins.iter().map(String::as_str)
+            for origin in cfg
+                .oauth
+                .cors
+                .allowed_origins
+                .iter()
+                .map(String::as_str)
                 .chain(["https://not-allowed.example"])
             {
-                let response = app.clone().oneshot(Request::builder()
-                    .uri("/probe")
-                    .header(header::ORIGIN, origin)
-                    .body(Body::empty())?).await?;
-                let allowed = cfg.oauth.cors.allowed_origins.iter().any(|value| value == origin);
-                assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                    .and_then(|value| value.to_str().ok()), allowed.then_some(origin));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/probe")
+                            .header(header::ORIGIN, origin)
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                let allowed = cfg
+                    .oauth
+                    .cors
+                    .allowed_origins
+                    .iter()
+                    .any(|value| value == origin);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .and_then(|value| value.to_str().ok()),
+                    allowed.then_some(origin)
+                );
                 if allowed {
-                    assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
-                        .and_then(|value| value.to_str().ok()), Some("true"));
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("true")
+                    );
                 }
             }
         }
@@ -3468,7 +3512,10 @@ mod tests {
             ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
             ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
             ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
-            ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+            (
+                "HYPRSTREAM__OAUTH__EXTERNAL_URL",
+                "https://discovery.staging.lab.hyprstream.com",
+            ),
             ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
         ]
         .into_iter()
@@ -3484,20 +3531,34 @@ mod tests {
     /// Drive the real `cors_layer` middleware with an `Origin` request and
     /// return the `(access-control-allow-origin, access-control-allow-credentials)`
     /// header values it emits.
-    async fn cors_probe(cfg: &HyprConfig, origin: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
-        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+    async fn cors_probe(
+        cfg: &HyprConfig,
+        origin: &str,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        use axum::{
+            body::Body,
+            http::{header, Request},
+            routing::get,
+            Router,
+        };
         use tower::ServiceExt;
         let app = Router::new()
             .route("/probe", get(|| async { "ok" }))
             .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
         let response = app
-            .oneshot(Request::builder()
-                .uri("/probe")
-                .header(header::ORIGIN, origin)
-                .body(Body::empty())?)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())?,
+            )
             .await?;
         let header_str = |name: header::HeaderName| {
-            response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned)
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
         };
         Ok((
             header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
@@ -3506,7 +3567,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost() -> anyhow::Result<()> {
+    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost(
+    ) -> anyhow::Result<()> {
         // An empty, whitespace-only, or separators-only value must trim+filter
         // to an empty vector so the middleware's localhost fallback applies —
         // the same posture as the legacy `HYPRSTREAM_CORS_ORIGINS` parser.
@@ -3515,7 +3577,10 @@ mod tests {
             assert!(cfg.oauth.cors.allowed_origins.is_empty(), "{origins:?}");
             assert!(cfg.oauth.cors.enabled);
             assert!(cfg.oauth.cors.allow_credentials);
-            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(
+                cfg.oauth.external_url.as_deref(),
+                Some("https://discovery.staging.lab.hyprstream.com")
+            );
             assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
 
             // The exact four-origin localhost fallback set is allowed and echoes
@@ -3544,13 +3609,21 @@ mod tests {
     async fn oauth_cors_env_mixed_valid_and_empty_entries_drops_empties() -> anyhow::Result<()> {
         // Empty entries interleaved with real origins are dropped after trimming;
         // the surviving exact list both serves itself and disables the fallback.
-        let cfg = cors_cfg_from_env(" , https://staging-amp.hyprstream.com ,, https://second.example\t,")?;
+        let cfg = cors_cfg_from_env(
+            " , https://staging-amp.hyprstream.com ,, https://second.example\t,",
+        )?;
         assert_eq!(
             cfg.oauth.cors.allowed_origins,
-            vec!["https://staging-amp.hyprstream.com".to_owned(), "https://second.example".to_owned()]
+            vec![
+                "https://staging-amp.hyprstream.com".to_owned(),
+                "https://second.example".to_owned()
+            ]
         );
         assert!(cfg.oauth.cors.allow_credentials);
-        for origin in ["https://staging-amp.hyprstream.com", "https://second.example"] {
+        for origin in [
+            "https://staging-amp.hyprstream.com",
+            "https://second.example",
+        ] {
             let (acao, credentials) = cors_probe(&cfg, origin).await?;
             assert_eq!(acao, Some(origin.to_owned()));
             assert_eq!(credentials, Some("true".to_owned()));
@@ -3566,7 +3639,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off() -> anyhow::Result<()> {
+    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off(
+    ) -> anyhow::Result<()> {
         // Trimming a whitespace-padded star intentionally selects the explicit
         // wildcard operator, which always disables ambient credentials.
         let cfg = cors_cfg_from_env(" * ")?;
@@ -3622,9 +3696,7 @@ mod tests {
         // A pre-#1652 DID-valued list is exactly this failure: DIDs are not
         // factory service names.
         config.event_publishers.clear();
-        config
-            .event_publishers
-            .insert("did:at9p:9f7abc".to_owned());
+        config.event_publishers.insert("did:at9p:9f7abc".to_owned());
         assert!(
             config.validate_admission_policy().is_err(),
             "DID-valued event_publishers must fail loudly, not become silent read-only"
@@ -3690,16 +3762,24 @@ mod tests {
 
     #[test]
     fn credential_pds_rejects_plaintext_capable_backends() {
-        assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
-        assert!(CredentialsBackend::Postgres.ensure_allowed_for_build().is_ok());
-        assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
-        assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
+        assert!(CredentialsBackend::Pglite
+            .ensure_allowed_for_build()
+            .is_ok());
+        assert!(CredentialsBackend::Postgres
+            .ensure_allowed_for_build()
+            .is_ok());
+        assert!(CredentialsBackend::Rocksdb
+            .ensure_allowed_for_build()
+            .is_err());
+        assert!(CredentialsBackend::Valkey
+            .ensure_allowed_for_build()
+            .is_err());
     }
 
     #[test]
     fn credentials_backend_deserializes_postgres() {
-        let config: CredentialsConfig = toml::from_str("backend = \"postgres\"")
-            .unwrap_or_else(|error| panic!("{error}"));
+        let config: CredentialsConfig =
+            toml::from_str("backend = \"postgres\"").unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(config.backend, CredentialsBackend::Postgres);
     }
 
@@ -4157,7 +4237,6 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         );
         assert_eq!(cfg.oauth.active_secs(), 30);
     }
-
 
     /// RAII guard to set/unset a process env var for the duration of a test and
     /// restore the previous value, keeping env-mutating tests from leaking state.

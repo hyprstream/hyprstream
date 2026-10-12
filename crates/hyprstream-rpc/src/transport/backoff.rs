@@ -93,9 +93,15 @@ mod tests {
     #[test]
     fn first_failure_sets_cooldown() {
         let mut b = ReconnectBackoff::default();
-        assert!(b.cooldown_remaining().is_none(), "no cooldown before first failure");
+        assert!(
+            b.cooldown_remaining().is_none(),
+            "no cooldown before first failure"
+        );
         b.record_failure();
-        assert!(b.cooldown_remaining().is_some(), "cooldown after first failure");
+        assert!(
+            b.cooldown_remaining().is_some(),
+            "cooldown after first failure"
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@
 #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 mod metered {
     use once_cell::sync::Lazy;
-    use opentelemetry::{KeyValue, metrics::Meter};
+    use opentelemetry::{metrics::Meter, KeyValue};
 
     /// OTel meter scope name for inference token-burn instruments.
     const METER_NAME: &str = "hyprstream.inference";
@@ -72,7 +72,10 @@ mod metered {
 
     /// (model, opaque-tenant) attribute set for the per-request histogram.
     fn request_attrs(model: &str, tenant: Option<u64>) -> [KeyValue; 2] {
-        [KeyValue::new("model", model.to_owned()), tenant_attr(tenant)]
+        [
+            KeyValue::new("model", model.to_owned()),
+            tenant_attr(tenant),
+        ]
     }
 
     /// Token-burn instruments built from an OTel [`Meter`].
@@ -142,7 +145,8 @@ mod metered {
         pub fn record_request_total(&self, model: &str, tenant: Option<u64>, total: u64) {
             // Record even when total == 0 so an empty-generation request is still
             // observable as a sample; the counter carries the non-zero breakdown.
-            self.request_tokens.record(total, &request_attrs(model, tenant));
+            self.request_tokens
+                .record(total, &request_attrs(model, tenant));
         }
 
         /// Record MTP self-speculative draft outcomes for a completed request.
@@ -182,7 +186,7 @@ mod metered {
 }
 
 #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
-pub use metered::{TokenBurnMeter, global_meter};
+pub use metered::{global_meter, TokenBurnMeter};
 
 /// No-op instruments when the `otel` feature is disabled or the target is wasm32
 /// (the opentelemetry crates are not wasm-compatible and are target-gated out).
@@ -239,7 +243,11 @@ pub fn opaque_tenant_id(tenant: &Option<String>) -> Option<u64> {
     static TENANT_HASH_KEY: OnceLock<RandomState> = OnceLock::new();
 
     let subject = tenant.as_ref()?;
-    Some(TENANT_HASH_KEY.get_or_init(RandomState::new).hash_one(subject))
+    Some(
+        TENANT_HASH_KEY
+            .get_or_init(RandomState::new)
+            .hash_one(subject),
+    )
 }
 
 #[cfg(all(test, feature = "otel", not(target_arch = "wasm32")))]
@@ -332,10 +340,7 @@ mod tests {
         ];
         assert_eq!(
             counter_points,
-            vec![
-                (expected_generated_attrs, 7),
-                (expected_prompt_attrs, 10),
-            ],
+            vec![(expected_generated_attrs, 7), (expected_prompt_attrs, 10),],
             "counter points must be exactly prompt=10 and generated=7 with exact attrs"
         );
 
@@ -397,7 +402,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(any_counter, 0, "zero-count records must not land on the counter");
+        assert_eq!(
+            any_counter, 0,
+            "zero-count records must not land on the counter"
+        );
         Ok(())
     }
 }

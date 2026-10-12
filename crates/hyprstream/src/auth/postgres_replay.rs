@@ -91,8 +91,8 @@ impl PostgresProofReplayStore {
         let url = url.trim();
         ensure!(!url.is_empty(), "replay Postgres URL file is empty");
         // The shared pool builder enforces remote DNS, verify-full, CA-pinned TLS.
-        let pool =
-            build_verified_postgres_pool(url, &ca_path, 2).context("building replay Postgres TLS pool")?;
+        let pool = build_verified_postgres_pool(url, &ca_path, 2)
+            .context("building replay Postgres TLS pool")?;
         Self::start(domain, pool)
     }
 
@@ -295,6 +295,7 @@ fn worker(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
@@ -651,8 +652,7 @@ mod tests {
         let migration = include_str!("../../sql/replay_admission_v1.sql");
         let role_guard = migration
             .find("IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hyprstream_replay_runtime')");
-        let create_schema = migration
-            .find("CREATE SCHEMA IF NOT EXISTS replay_admission");
+        let create_schema = migration.find("CREATE SCHEMA IF NOT EXISTS replay_admission");
         assert!(
             matches!(
                 (role_guard, create_schema),

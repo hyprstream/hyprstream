@@ -146,8 +146,9 @@ impl AccountId {
             canonical_purpose(purpose),
         ]);
         let mut h = blake3::Hasher::new();
-        ciborium::into_writer(&value, &mut h)
-            .map_err(|e| LedgerError::Internal(format!("account-id DAG-CBOR encode failed: {e}")))?;
+        ciborium::into_writer(&value, &mut h).map_err(|e| {
+            LedgerError::Internal(format!("account-id DAG-CBOR encode failed: {e}"))
+        })?;
         let mut out = [0u8; 16];
         h.finalize_xof().fill(&mut out);
         Ok(AccountId(u128::from_be_bytes(out)))

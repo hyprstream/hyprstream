@@ -37,7 +37,11 @@ fn transpose_slip(value: i64) -> i64 {
         let mut chars: Vec<char> = text.chars().collect();
         let n = chars.len();
         chars.swap(n - 2, n - 1);
-        chars.into_iter().collect::<String>().parse().unwrap_or(value)
+        chars
+            .into_iter()
+            .collect::<String>()
+            .parse()
+            .unwrap_or(value)
     } else {
         value + 10
     }
@@ -51,8 +55,11 @@ pub fn noul(seed: u64, stratum: Stratum) -> Item {
             // Near-miss arithmetic: the claim is one slip away from correct
             // half the time, so the stratum mixes true and false at the
             // hardest margin.
-            let slip = [problem.answer + 1, problem.answer - 1, transpose_slip(problem.answer)]
-                [rng.below(3) as usize];
+            let slip = [
+                problem.answer + 1,
+                problem.answer - 1,
+                transpose_slip(problem.answer),
+            ][rng.below(3) as usize];
             if rng.below(2) == 0 {
                 (slip, slip == problem.answer)
             } else {

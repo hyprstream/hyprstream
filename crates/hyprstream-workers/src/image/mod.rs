@@ -48,9 +48,9 @@ mod image_fs;
 // The image-store trait + inventory registration seam — ALWAYS compiled
 // (feature-invariant). Concrete backends (RafsStore under `oci-image`) impl
 // `ImageStore` and `inventory::submit!` an `ImageBackendRegistration`.
-pub mod store_trait;
 #[cfg(feature = "oci-image")]
 mod store;
+pub mod store_trait;
 // #652 (follow-on to #633/#641): projects `RafsStore`'s on-disk CAS as a
 // 9P/VFS `Mount` — the storage-layer namespace surface, distinct from
 // `ImageFs` (the composed filesystem a guest mounts). Only needs `RafsStore`
@@ -59,9 +59,9 @@ mod store;
 #[cfg(feature = "oci-image")]
 mod store_mount;
 
-pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
 #[cfg(all(feature = "oci-image", not(target_arch = "wasm32")))]
 pub use image_fs::{image_fs_for, image_fs_from_rafs, ImageFs};
+pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
 #[cfg(feature = "oci-image")]
 pub use store::{GcStats, ImageMetadata, RafsStore};
 #[cfg(feature = "oci-image")]

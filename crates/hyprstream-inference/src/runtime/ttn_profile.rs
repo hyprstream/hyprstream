@@ -70,14 +70,13 @@ pub fn qwen3_5_0_8b_profile() -> LayerProfile {
     // no per-projection spectral data is carried.
     let attn_layers = [
         (23usize, Some(8.40f64), 32usize),
-        (3usize,  Some(5.62f64), 24usize),
+        (3usize, Some(5.62f64), 24usize),
         (19usize, Some(4.39f64), 16usize),
         (15usize, Some(3.22f64), 16usize),
-        (7usize,  Some(2.16f64), 8usize),
+        (7usize, Some(2.16f64), 8usize),
         (11usize, Some(1.13f64), 8usize),
     ];
-    let attn_set: std::collections::HashSet<usize> =
-        attn_layers.iter().map(|(i, ..)| *i).collect();
+    let attn_set: std::collections::HashSet<usize> = attn_layers.iter().map(|(i, ..)| *i).collect();
 
     let mut layers: Vec<LayerAnalysis> = Vec::with_capacity(24);
 
@@ -193,7 +192,9 @@ fn entropy_of_nonneg(s: &Tensor) -> f64 {
     let p = s / total;
     let mask = p.gt(1e-30);
     let p_valid = p.masked_select(&mask);
-    -(&p_valid * p_valid.log()).sum(Kind::Double).double_value(&[])
+    -(&p_valid * p_valid.log())
+        .sum(Kind::Double)
+        .double_value(&[])
 }
 
 /// Rank ceiling for any profile derived without ablation ground truth
@@ -262,7 +263,10 @@ pub fn compute_layer_profile(
 
     // Detect key prefix: base models use "model.layers.*",
     // Instruct models may use "model.language_model.layers.*"
-    let prefix_base = if weights.keys().any(|k| k.starts_with("model.language_model.")) {
+    let prefix_base = if weights
+        .keys()
+        .any(|k| k.starts_with("model.language_model."))
+    {
         "model.language_model.layers"
     } else {
         "model.layers"
@@ -293,7 +297,11 @@ pub fn compute_layer_profile(
         // Target modules: default ["q_proj", "v_proj"] for standard attention
         let target_modules = match layer_type {
             LayerType::FullAttention => {
-                vec!["q_proj".to_owned(), "v_proj".to_owned(), "o_proj".to_owned()]
+                vec![
+                    "q_proj".to_owned(),
+                    "v_proj".to_owned(),
+                    "o_proj".to_owned(),
+                ]
             }
             LayerType::GatedDeltaNet => vec!["o_proj".to_owned()],
             LayerType::StandardAttention => {
@@ -375,9 +383,11 @@ pub fn get_layer_profile(
     weights: Option<&HashMap<String, Tensor>>,
 ) -> Result<LayerProfile> {
     // Tier 1: Embedded profile for known models (zero-cost)
-    if let Some(profile) =
-        find_embedded_profile(&config.model_type, config.num_hidden_layers, config.hidden_size)
-    {
+    if let Some(profile) = find_embedded_profile(
+        &config.model_type,
+        config.num_hidden_layers,
+        config.hidden_size,
+    ) {
         info!(
             "Using embedded TTN profile for {} ({} layers)",
             config.model_type, config.num_hidden_layers
@@ -387,10 +397,7 @@ pub fn get_layer_profile(
 
     // Tier 2: Cached profile from disk (~1ms)
     if let Some(mut profile) = load_cached_profile(model_path) {
-        info!(
-            "Loaded cached TTN profile from {}",
-            model_path.display()
-        );
+        info!("Loaded cached TTN profile from {}", model_path.display());
         // A cached profile for a model with no embedded ablation data is a
         // persisted Tier-3 computation and gets the same cap. Older caches
         // predate the cap; hand-edited ones must not bypass it either.
@@ -445,8 +452,8 @@ pub fn get_layer_profile(
 pub fn delta_rank_utilization(lora_a: &Tensor, lora_b: &Tensor) -> f64 {
     let _guard = tch::no_grad_guard();
     let _ = lora_a; // A is kaiming-initialized and not informative for rank utilization
-    // Gram trick: B^T @ B = [rank, rank]; eigenvalues = σᵢ² of B.
-    // O(rank³) — much cheaper than SVD of [out, rank] directly (O(out·rank²)).
+                    // Gram trick: B^T @ B = [rank, rank]; eigenvalues = σᵢ² of B.
+                    // O(rank³) — much cheaper than SVD of [out, rank] directly (O(out·rank²)).
     let gram = lora_b.tr().matmul(lora_b);
     let (_, s, _) = gram.svd(true, false); // s = σᵢ² of B (eigenvalues of PSD gram)
     let max_entropy = (s.size()[0] as f64).ln();
@@ -524,10 +531,7 @@ impl RankUtilizationTracker {
     }
 
     pub fn record(&mut self, key: &str, utilization: f64) {
-        let entry = self
-            .history
-            .entry(key.to_owned())
-            .or_default();
+        let entry = self.history.entry(key.to_owned()).or_default();
         entry.push_back(utilization);
         while entry.len() > self.window_size {
             entry.pop_front();
@@ -585,12 +589,20 @@ mod tests {
         assert_eq!(profile.layers.len(), 24);
 
         // Check full-attention layers have correct ranks
-        let attn_23 = profile.layers.iter().find(|l| l.layer_idx == 23).expect("layer 23 should exist");
+        let attn_23 = profile
+            .layers
+            .iter()
+            .find(|l| l.layer_idx == 23)
+            .expect("layer 23 should exist");
         assert_eq!(attn_23.recommended_rank, 32);
         assert_eq!(attn_23.layer_type, LayerType::FullAttention);
         assert_eq!(attn_23.perplexity_delta, Some(8.40));
 
-        let gdn_0 = profile.layers.iter().find(|l| l.layer_idx == 0).expect("layer 0 should exist");
+        let gdn_0 = profile
+            .layers
+            .iter()
+            .find(|l| l.layer_idx == 0)
+            .expect("layer 0 should exist");
         assert_eq!(gdn_0.recommended_rank, GDN_LORA_RANK);
         assert_eq!(gdn_0.layer_type, LayerType::GatedDeltaNet);
     }
@@ -629,8 +641,7 @@ mod tests {
             );
         }
 
-        let profile =
-            compute_layer_profile(&weights, &config, dir.path()).expect("profile");
+        let profile = compute_layer_profile(&weights, &config, dir.path()).expect("profile");
         assert_eq!(profile.layers.len(), 2);
 
         let gdn = &profile.layers[0];
@@ -733,5 +744,4 @@ mod tests {
         let tracker = RankUtilizationTracker::new(5);
         assert!(tracker.summary("nonexistent").is_none());
     }
-
 }

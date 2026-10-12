@@ -149,7 +149,6 @@ fn ts_cli_rejects_invalid_cgr_without_partial_generation() {
     let _ = std::fs::remove_dir_all(tmp);
 }
 
-
 const VALID_PUBLIC_SCHEMA: &str = r#"
 @0xd15ea5ed15ea5ed1;
 
@@ -213,7 +212,10 @@ fn ts_cli_accepts_valid_public_cgr_and_writes_output() {
         output_dir.join("valid.ts").is_file(),
         "successful CLI run must write valid.ts; entries: {:?}",
         std::fs::read_dir(&output_dir)
-            .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect::<Vec<_>>())
+            .map(|entries| entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .collect::<Vec<_>>())
             .unwrap_or_default()
     );
     let _ = std::fs::remove_dir_all(tmp);
@@ -242,7 +244,8 @@ struct ConflictResponse {
 
 #[test]
 fn ts_cli_rejects_local_mac_public_conflict_without_output() {
-    let tmp = std::env::temp_dir().join(format!("hyprstream_ts_cli_conflict_{}", std::process::id()));
+    let tmp =
+        std::env::temp_dir().join(format!("hyprstream_ts_cli_conflict_{}", std::process::id()));
     let input_dir = tmp.join("input");
     std::fs::create_dir_all(&input_dir).expect("create input");
     let capnp_path = input_dir.join("conflict.capnp");
@@ -275,9 +278,18 @@ fn ts_cli_rejects_local_mac_public_conflict_without_output() {
         ])
         .output()
         .expect("run TypeScript codegen CLI");
-    assert!(!output.status.success(), "local MAC/Public conflict must fail: {output:?}");
+    assert!(
+        !output.status.success(),
+        "local MAC/Public conflict must fail: {output:?}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("BOTH") && stderr.contains("dispatchPublic"), "{stderr}");
-    assert!(!output_dir.exists(), "conflict must not produce partial output");
+    assert!(
+        stderr.contains("BOTH") && stderr.contains("dispatchPublic"),
+        "{stderr}"
+    );
+    assert!(
+        !output_dir.exists(),
+        "conflict must not produce partial output"
+    );
     let _ = std::fs::remove_dir_all(tmp);
 }

@@ -24,9 +24,9 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, DpopJtiAdmission, OAuthState, RefreshTokenEntry};
-use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 // #1425: the public browser client_id routes the sender-bound exchange.
 use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
 
@@ -1352,8 +1352,11 @@ async fn issue_token_with_refresh(
     // regardless of whether the client requested the atproto profile. Its
     // account-zone suffix is the PDS/Casbin tenant; the full DID is an account
     // identity and is not a valid `/pds/{tenant}` path component.
-    let (hosted_account_did, hosted_account_tenant) =
-        match resolve_hosted_account_binding(state, sub).await {
+    let (hosted_account_did, hosted_account_tenant) = match resolve_hosted_account_binding(
+        state, sub,
+    )
+    .await
+    {
         Ok(binding) => binding,
         Err(e) => {
             tracing::warn!(local_subject = %sub, error = %e, "rejecting token issuance: account has no hosted DID tenant binding");
@@ -1713,15 +1716,23 @@ mod tests {
         assert!(super::reserved_federate_form(
             b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&hs_profile=federate-session-v1"
         ));
-        assert!(super::reserved_federate_form(format!(
+        assert!(super::reserved_federate_form(
+            format!(
             "client_id={}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token",
             super::super::federate_source::CLIENT
-        ).as_bytes()));
-        assert!(super::reserved_federate_form(format!(
-            "client_id=ordinary&client_id={}",
-            super::super::federate_source::CLIENT
-        ).as_bytes()));
-        assert!(!super::reserved_federate_form(b"client_id=ordinary&grant_type=refresh_token"));
+        )
+            .as_bytes()
+        ));
+        assert!(super::reserved_federate_form(
+            format!(
+                "client_id=ordinary&client_id={}",
+                super::super::federate_source::CLIENT
+            )
+            .as_bytes()
+        ));
+        assert!(!super::reserved_federate_form(
+            b"client_id=ordinary&grant_type=refresh_token"
+        ));
     }
 
     #[test]
@@ -1752,8 +1763,7 @@ mod tests {
             assert!(hosted_account_tenant_from_did(unbound, Some(&zone)).is_err());
         }
         assert!(
-            hosted_account_tenant_from_did("did:web:alice.other.example.com", Some(&zone))
-                .is_err()
+            hosted_account_tenant_from_did("did:web:alice.other.example.com", Some(&zone)).is_err()
         );
         assert!(hosted_account_tenant_from_did("did:web:alice.acct.example.com", None).is_err());
     }
@@ -2017,11 +2027,11 @@ mod tests {
     /// /dev/null — never opened) and a recording refresh-token store.
     async fn freeze_test_state(store: Arc<RecordingTokenStore>) -> Arc<OAuthState> {
         use crate::config::OAuthConfig;
-        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
-        use hyprstream_rpc_std::policy_client::PolicyClient;
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
         let vk = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key();
@@ -2207,8 +2217,7 @@ mod tests {
             tenant: None,
             resource: None,
         };
-        let response =
-            exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
+        let response = exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(

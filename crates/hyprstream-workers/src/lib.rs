@@ -56,9 +56,9 @@ pub mod runtime;
 // `WorkerService` can hold `Option<Arc<dyn ImageStore>>` without any cfg
 // mirror (#646). The concrete `RafsStore` impl + its `submit!` are
 // `oci-image`-gated (they pull the nydus deps); the trait surface is not.
+pub mod events;
 pub mod image;
 pub mod workflow;
-pub mod events;
 
 #[cfg(feature = "dbus")]
 pub mod dbus;
@@ -68,29 +68,35 @@ pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, Workflow
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, SandboxBackend, SandboxHandle};
 #[cfg(feature = "nspawn")]
 pub use runtime::{NspawnBackend, NspawnConfig};
+pub use runtime::{SandboxBackend, SandboxHandle, WorkerService};
 // Inventory-based backend registry + fail-closed selection spine (#507)
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 // Scheduling-substrate explain (#628): the shared SelectionReport<C> trace.
-pub use runtime::{explain_selection, BackendCandidate};
 #[cfg(feature = "kata")]
 pub use runtime::KataBackend;
+pub use runtime::{explain_selection, BackendCandidate};
 // The image-store trait seam is always available; only the concrete RAFS impl
 // (`RafsStore`) requires `oci-image`.
-pub use image::{ImageBackendRegistration, ImageStore};
 #[cfg(feature = "oci-image")]
 pub use image::RafsStore;
+pub use image::{ImageBackendRegistration, ImageStore};
 
-pub use workflow::WorkflowService;
 pub use events::{
+    serialize_container_started,
+    serialize_container_stopped,
+    serialize_sandbox_started,
+    serialize_sandbox_stopped,
+    ContainerStarted,
+    ContainerStopped,
+    ReceivedEvent,
+    SandboxStarted,
+    SandboxStopped,
     // Event types
-    WorkerEvent, ReceivedEvent,
-    SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,
-    serialize_sandbox_started, serialize_sandbox_stopped,
-    serialize_container_started, serialize_container_stopped,
+    WorkerEvent,
 };
+pub use workflow::WorkflowService;
 // Re-export the moq event origin init function for the factory
 pub use hyprstream_rpc::moq_event::{init_global_moq_event_origin, MoqEventOrigin};
 

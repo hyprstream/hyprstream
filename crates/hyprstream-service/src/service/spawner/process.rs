@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use super::{
-    ProcessBackend, ProcessConfig, SpawnedProcess, SpawnerBackend, StandaloneBackend, SystemdBackend,
+    ProcessBackend, ProcessConfig, SpawnedProcess, SpawnerBackend, StandaloneBackend,
+    SystemdBackend,
 };
 use hyprstream_rpc::error::Result;
 
@@ -75,7 +76,9 @@ impl ProcessSpawner {
                         backend_type: ProcessBackend::Systemd { user_mode },
                     }
                 } else {
-                    tracing::warn!("Systemd requested but not available, falling back to standalone");
+                    tracing::warn!(
+                        "Systemd requested but not available, falling back to standalone"
+                    );
                     Self {
                         backend: Arc::new(StandaloneBackend::new()),
                         backend_type: ProcessBackend::Standalone,

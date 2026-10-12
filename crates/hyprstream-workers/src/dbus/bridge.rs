@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use super::policy::{container_subject, DbusOperation, DbusResource};
 use super::protocol::{
-    BusType, DbusCallRequest, DbusCallResponse, DbusGetPropertyRequest,
-    DbusRequest, DbusResponse, DbusSetPropertyRequest, DbusSubscribeRequest, DbusValue,
+    BusType, DbusCallRequest, DbusCallResponse, DbusGetPropertyRequest, DbusRequest, DbusResponse,
+    DbusSetPropertyRequest, DbusSubscribeRequest, DbusValue,
 };
 use crate::error::{Result, WorkerError};
 
@@ -146,9 +146,9 @@ impl DbusBridgeService {
                     ));
                 }
 
-                let conn = zbus::Connection::system()
-                    .await
-                    .map_err(|e| WorkerError::Internal(format!("Failed to connect to system bus: {e}")))?;
+                let conn = zbus::Connection::system().await.map_err(|e| {
+                    WorkerError::Internal(format!("Failed to connect to system bus: {e}"))
+                })?;
 
                 *guard = Some(conn.clone());
                 Ok(conn)
@@ -165,9 +165,9 @@ impl DbusBridgeService {
                     ));
                 }
 
-                let conn = zbus::Connection::session()
-                    .await
-                    .map_err(|e| WorkerError::Internal(format!("Failed to connect to session bus: {e}")))?;
+                let conn = zbus::Connection::session().await.map_err(|e| {
+                    WorkerError::Internal(format!("Failed to connect to session bus: {e}"))
+                })?;
 
                 *guard = Some(conn.clone());
                 Ok(conn)
@@ -176,11 +176,7 @@ impl DbusBridgeService {
     }
 
     /// Handle a D-Bus request from a container
-    pub async fn handle_request(
-        &self,
-        container_id: &str,
-        request: DbusRequest,
-    ) -> DbusResponse {
+    pub async fn handle_request(&self, container_id: &str, request: DbusRequest) -> DbusResponse {
         let subject = container_subject(container_id, None);
 
         match request {
@@ -189,7 +185,8 @@ impl DbusBridgeService {
             DbusRequest::SetProperty(set) => self.handle_set_property(&subject, set).await,
             DbusRequest::Subscribe(sub) => self.handle_subscribe(&subject, container_id, sub).await,
             DbusRequest::Unsubscribe { subscription_id } => {
-                self.handle_unsubscribe(&subject, container_id, &subscription_id).await
+                self.handle_unsubscribe(&subject, container_id, &subscription_id)
+                    .await
             }
         }
     }
@@ -197,14 +194,14 @@ impl DbusBridgeService {
     /// Handle a method call request
     async fn handle_call(&self, subject: &str, call: DbusCallRequest) -> DbusResponse {
         // Build resource and check policy
-        let resource = DbusResource::method_call(
-            call.bus,
-            &call.destination,
-            &call.interface,
-            &call.method,
-        );
+        let resource =
+            DbusResource::method_call(call.bus, &call.destination, &call.interface, &call.method);
 
-        if !self.policy_check.check(subject, &resource.to_resource_string(), DbusOperation::Call.as_str()) {
+        if !self.policy_check.check(
+            subject,
+            &resource.to_resource_string(),
+            DbusOperation::Call.as_str(),
+        ) {
             tracing::warn!(
                 subject = %subject,
                 resource = %resource,
@@ -217,10 +214,7 @@ impl DbusBridgeService {
         let conn = match self.ensure_connected(call.bus).await {
             Ok(c) => c,
             Err(e) => {
-                return DbusResponse::error(
-                    "org.freedesktop.DBus.Error.Failed",
-                    e.to_string(),
-                );
+                return DbusResponse::error("org.freedesktop.DBus.Error.Failed", e.to_string());
             }
         };
 
@@ -236,10 +230,7 @@ impl DbusBridgeService {
         // proper type conversion between DbusValue and zbus::Value
         match self.forward_call(&conn, &call, timeout).await {
             Ok(values) => DbusResponse::Return(DbusCallResponse::new(values)),
-            Err(e) => DbusResponse::error(
-                "org.freedesktop.DBus.Error.Failed",
-                e.to_string(),
-            ),
+            Err(e) => DbusResponse::error("org.freedesktop.DBus.Error.Failed", e.to_string()),
         }
     }
 
@@ -287,9 +278,9 @@ impl DbusBridgeService {
 
         let reply = tokio::time::timeout(timeout, call_future)
             .await
-            .map_err(|_| WorkerError::Internal(format!(
-                "D-Bus call timed out after {timeout:?}"
-            )))?;
+            .map_err(|_| {
+                WorkerError::Internal(format!("D-Bus call timed out after {timeout:?}"))
+            })?;
 
         match reply {
             Ok(_msg) => {
@@ -301,15 +292,19 @@ impl DbusBridgeService {
     }
 
     /// Handle a property get request
-    async fn handle_get_property(&self, subject: &str, get: DbusGetPropertyRequest) -> DbusResponse {
-        let resource = DbusResource::property_read(
-            get.bus,
-            &get.destination,
-            &get.interface,
-            &get.property,
-        );
+    async fn handle_get_property(
+        &self,
+        subject: &str,
+        get: DbusGetPropertyRequest,
+    ) -> DbusResponse {
+        let resource =
+            DbusResource::property_read(get.bus, &get.destination, &get.interface, &get.property);
 
-        if !self.policy_check.check(subject, &resource.to_resource_string(), DbusOperation::Read.as_str()) {
+        if !self.policy_check.check(
+            subject,
+            &resource.to_resource_string(),
+            DbusOperation::Read.as_str(),
+        ) {
             return DbusResponse::access_denied(&resource.to_resource_string());
         }
 
@@ -317,20 +312,14 @@ impl DbusBridgeService {
         let conn = match self.ensure_connected(get.bus).await {
             Ok(c) => c,
             Err(e) => {
-                return DbusResponse::error(
-                    "org.freedesktop.DBus.Error.Failed",
-                    e.to_string(),
-                );
+                return DbusResponse::error("org.freedesktop.DBus.Error.Failed", e.to_string());
             }
         };
 
         // Forward the property get request
         match self.forward_get_property(&conn, &get).await {
             Ok(value) => DbusResponse::Property { value },
-            Err(e) => DbusResponse::error(
-                "org.freedesktop.DBus.Error.Failed",
-                e.to_string(),
-            ),
+            Err(e) => DbusResponse::error("org.freedesktop.DBus.Error.Failed", e.to_string()),
         }
     }
 
@@ -398,15 +387,19 @@ impl DbusBridgeService {
     }
 
     /// Handle a property set request
-    async fn handle_set_property(&self, subject: &str, set: DbusSetPropertyRequest) -> DbusResponse {
-        let resource = DbusResource::property_write(
-            set.bus,
-            &set.destination,
-            &set.interface,
-            &set.property,
-        );
+    async fn handle_set_property(
+        &self,
+        subject: &str,
+        set: DbusSetPropertyRequest,
+    ) -> DbusResponse {
+        let resource =
+            DbusResource::property_write(set.bus, &set.destination, &set.interface, &set.property);
 
-        if !self.policy_check.check(subject, &resource.to_resource_string(), DbusOperation::Write.as_str()) {
+        if !self.policy_check.check(
+            subject,
+            &resource.to_resource_string(),
+            DbusOperation::Write.as_str(),
+        ) {
             return DbusResponse::access_denied(&resource.to_resource_string());
         }
 
@@ -414,20 +407,14 @@ impl DbusBridgeService {
         let conn = match self.ensure_connected(set.bus).await {
             Ok(c) => c,
             Err(e) => {
-                return DbusResponse::error(
-                    "org.freedesktop.DBus.Error.Failed",
-                    e.to_string(),
-                );
+                return DbusResponse::error("org.freedesktop.DBus.Error.Failed", e.to_string());
             }
         };
 
         // Forward the property set request
         match self.forward_set_property(&conn, &set).await {
             Ok(()) => DbusResponse::Return(DbusCallResponse::empty()),
-            Err(e) => DbusResponse::error(
-                "org.freedesktop.DBus.Error.Failed",
-                e.to_string(),
-            ),
+            Err(e) => DbusResponse::error("org.freedesktop.DBus.Error.Failed", e.to_string()),
         }
     }
 
@@ -506,7 +493,11 @@ impl DbusBridgeService {
             &sub.signal,
         );
 
-        if !self.policy_check.check(subject, &resource.to_resource_string(), DbusOperation::Subscribe.as_str()) {
+        if !self.policy_check.check(
+            subject,
+            &resource.to_resource_string(),
+            DbusOperation::Subscribe.as_str(),
+        ) {
             return DbusResponse::access_denied(&resource.to_resource_string());
         }
 
@@ -576,7 +567,8 @@ impl DbusBridgeService {
 
     /// Clean up subscriptions for a container
     pub fn cleanup_container(&self, container_id: &str) {
-        self.subscriptions.retain(|_, sub| sub.container_id != container_id);
+        self.subscriptions
+            .retain(|_, sub| sub.container_id != container_id);
     }
 }
 
@@ -614,7 +606,8 @@ fn dbus_value_to_zvariant(value: &DbusValue) -> Result<String> {
         DbusValue::Variant(inner) => dbus_value_to_zvariant(inner),
         DbusValue::Array(_) | DbusValue::Dict(_) | DbusValue::Bytes(_) => {
             Err(WorkerError::Internal(
-                "Complex D-Bus types (Array, Dict, Bytes) not yet supported for property set".to_owned(),
+                "Complex D-Bus types (Array, Dict, Bytes) not yet supported for property set"
+                    .to_owned(),
             ))
         }
     }
@@ -627,11 +620,7 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_creation() -> Result<()> {
         let config = DbusBridgeConfig::default();
-        let bridge = DbusBridgeService::with_policy(
-            config,
-            Arc::new(AllowAllPolicy),
-        )
-        .await?;
+        let bridge = DbusBridgeService::with_policy(config, Arc::new(AllowAllPolicy)).await?;
 
         assert_eq!(bridge.subscription_count(), 0);
         Ok(())
@@ -640,11 +629,7 @@ mod tests {
     #[tokio::test]
     async fn test_policy_denied() -> Result<()> {
         let config = DbusBridgeConfig::default();
-        let bridge = DbusBridgeService::with_policy(
-            config,
-            Arc::new(DenyAllPolicy),
-        )
-        .await?;
+        let bridge = DbusBridgeService::with_policy(config, Arc::new(DenyAllPolicy)).await?;
 
         let request = DbusRequest::Call(DbusCallRequest::new(
             "org.freedesktop.Notifications",
@@ -667,11 +652,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_unsubscribe() -> Result<()> {
         let config = DbusBridgeConfig::default();
-        let bridge = DbusBridgeService::with_policy(
-            config,
-            Arc::new(AllowAllPolicy),
-        )
-        .await?;
+        let bridge = DbusBridgeService::with_policy(config, Arc::new(AllowAllPolicy)).await?;
 
         // Subscribe
         let request = DbusRequest::Subscribe(DbusSubscribeRequest {
@@ -707,11 +688,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_container() -> Result<()> {
         let config = DbusBridgeConfig::default();
-        let bridge = DbusBridgeService::with_policy(
-            config,
-            Arc::new(AllowAllPolicy),
-        )
-        .await?;
+        let bridge = DbusBridgeService::with_policy(config, Arc::new(AllowAllPolicy)).await?;
 
         // Create subscriptions for two containers
         for container in ["container-1", "container-2"] {

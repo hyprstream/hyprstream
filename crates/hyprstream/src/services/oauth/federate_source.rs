@@ -415,30 +415,38 @@ fn atproto_account_did(v: &Value) -> Result<String> {
     let (method, specific) = method_specific.split_once(':').ok_or(Error::Invalid)?;
     match method {
         "plc" => {
-            require(specific.len() == 24
-                && specific
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)))?;
+            require(
+                specific.len() == 24
+                    && specific
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
+            )?;
         }
         "web" => {
             // ATProto repo/account identifiers use host-form did:web only;
             // a literal colon introduces a path-form DID that the ATProto
             // identity profile does not accept. Keep this aligned with the
             // repo-authority validator while allowing encoded host ports.
-            require(!hyprstream_pds::repo_authority::is_path_form_did_web(
-                did,
-            ))?;
-            require(!specific.is_empty()
-                && specific.split(':').all(|part| !part.is_empty())
-                && specific.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'%' || b == b':'
-                }))?;
+            require(!hyprstream_pds::repo_authority::is_path_form_did_web(did))?;
+            require(
+                !specific.is_empty()
+                    && specific.split(':').all(|part| !part.is_empty())
+                    && specific.bytes().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || b == b'.'
+                            || b == b'-'
+                            || b == b'%'
+                            || b == b':'
+                    }),
+            )?;
             let bytes = specific.as_bytes();
             for (i, byte) in bytes.iter().enumerate() {
                 if *byte == b'%' {
-                    require(i + 2 < bytes.len()
-                        && bytes[i + 1].is_ascii_hexdigit()
-                        && bytes[i + 2].is_ascii_hexdigit())?;
+                    require(
+                        i + 2 < bytes.len()
+                            && bytes[i + 1].is_ascii_hexdigit()
+                            && bytes[i + 2].is_ascii_hexdigit(),
+                    )?;
                 }
             }
         }

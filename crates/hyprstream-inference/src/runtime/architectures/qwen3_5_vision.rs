@@ -1,12 +1,18 @@
 //! Qwen3.5 vision encoder
-#![allow(dead_code, unused_variables, clippy::redundant_closure, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_for_method_calls)]
+#![allow(
+    dead_code,
+    unused_variables,
+    clippy::redundant_closure,
+    clippy::needless_borrows_for_generic_args,
+    clippy::redundant_closure_for_method_calls
+)]
 //!
 //! Architecture: Conv3d patch embedding → 27 transformer blocks (2D RoPE on Q/K) →
 //! VisionPatchMerger (2×2 spatial merge) → out_hidden_size projection.
 //!
 //! Output: [total_image_patches, out_hidden_size]
 
-use super::llama::{LlamaMLP, LinearProjection, RMSNorm};
+use super::llama::{LinearProjection, LlamaMLP, RMSNorm};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tch::{Kind, Tensor};
@@ -16,16 +22,16 @@ use tch::{Kind, Tensor};
 // ============================================================================
 
 pub struct Qwen3_5VisionConfig {
-    pub depth: usize,              // 27
-    pub hidden_size: usize,        // 1152
-    pub intermediate_size: usize,  // 4304
-    pub num_heads: usize,          // 16
-    pub head_dim: usize,           // hidden_size / num_heads = 72
-    pub patch_size: usize,         // 16
-    pub temporal_patch_size: usize,// 2 (image-only: use 1)
-    pub spatial_merge_size: usize, // 2
-    pub out_hidden_size: usize,    // 3584 (9B) or 2048 (35B)
-    pub rms_norm_eps: f32,         // 1e-6
+    pub depth: usize,               // 27
+    pub hidden_size: usize,         // 1152
+    pub intermediate_size: usize,   // 4304
+    pub num_heads: usize,           // 16
+    pub head_dim: usize,            // hidden_size / num_heads = 72
+    pub patch_size: usize,          // 16
+    pub temporal_patch_size: usize, // 2 (image-only: use 1)
+    pub spatial_merge_size: usize,  // 2
+    pub out_hidden_size: usize,     // 3584 (9B) or 2048 (35B)
+    pub rms_norm_eps: f32,          // 1e-6
 }
 
 impl Qwen3_5VisionConfig {
@@ -59,8 +65,13 @@ struct VisionPatchEmbed {
 }
 
 impl VisionPatchEmbed {
-    fn load(weights: &mut HashMap<String, Tensor>, prefix: &str, cfg: &Qwen3_5VisionConfig) -> Result<Self> {
-        let pw = weights.remove(&format!("{prefix}.patch_embed.proj.weight"))
+    fn load(
+        weights: &mut HashMap<String, Tensor>,
+        prefix: &str,
+        cfg: &Qwen3_5VisionConfig,
+    ) -> Result<Self> {
+        let pw = weights
+            .remove(&format!("{prefix}.patch_embed.proj.weight"))
             .ok_or_else(|| anyhow!("Missing {prefix}.patch_embed.proj.weight"))?;
         let pb = weights.remove(&format!("{prefix}.patch_embed.proj.bias"));
         Ok(Self {
@@ -88,10 +99,10 @@ impl VisionPatchEmbed {
         let out = x5d.conv3d(
             &self.proj_weight,
             self.proj_bias.as_ref(),
-            &[tp, ps, ps],   // stride
-            &[0i64, 0, 0],   // padding
-            &[1i64, 1, 1],   // dilation
-            1,               // groups
+            &[tp, ps, ps], // stride
+            &[0i64, 0, 0], // padding
+            &[1i64, 1, 1], // dilation
+            1,             // groups
         );
 
         // out: [B, hidden, T_out, H_out, W_out]
@@ -100,7 +111,9 @@ impl VisionPatchEmbed {
         let total_patches = out_shape[2] * out_shape[3] * out_shape[4];
 
         // Flatten to [B, num_patches, hidden]
-        let out = out.permute([0, 2, 3, 4, 1]).reshape([batch, total_patches, hidden]);
+        let out = out
+            .permute([0, 2, 3, 4, 1])
+            .reshape([batch, total_patches, hidden]);
         Ok(out)
     }
 }
@@ -138,14 +151,21 @@ fn vision_rope_2d(
 
     // For each patch (r, c), angle = cat(row_angle, col_angle) of total dim head_dim/2
     // Expand: [grid_h, grid_w, half/2] for each
-    let row_exp = row_angles.unsqueeze(1).expand([grid_h, grid_w, half / 2], false);
-    let col_exp = col_angles.unsqueeze(0).expand([grid_h, grid_w, half / 2], false);
+    let row_exp = row_angles
+        .unsqueeze(1)
+        .expand([grid_h, grid_w, half / 2], false);
+    let col_exp = col_angles
+        .unsqueeze(0)
+        .expand([grid_h, grid_w, half / 2], false);
 
     // Full angle for each patch: [grid_h*grid_w, half]
-    let angles = Tensor::cat(&[
-        row_exp.reshape([grid_h * grid_w, half / 2]),
-        col_exp.reshape([grid_h * grid_w, half / 2]),
-    ], 1);
+    let angles = Tensor::cat(
+        &[
+            row_exp.reshape([grid_h * grid_w, half / 2]),
+            col_exp.reshape([grid_h * grid_w, half / 2]),
+        ],
+        1,
+    );
 
     // Duplicate for cos/sin halves: [num_patches, head_dim]
     let angles_full = Tensor::cat(&[&angles, &angles], 1);
@@ -237,24 +257,38 @@ impl VisionBlock {
         cfg: &Qwen3_5VisionConfig,
         block_idx: usize,
     ) -> Result<Self> {
-        let norm1_w = weights.remove(&format!("{prefix}.norm1.weight"))
+        let norm1_w = weights
+            .remove(&format!("{prefix}.norm1.weight"))
             .ok_or_else(|| anyhow!("Missing {prefix}.norm1.weight"))?;
-        let norm2_w = weights.remove(&format!("{prefix}.norm2.weight"))
+        let norm2_w = weights
+            .remove(&format!("{prefix}.norm2.weight"))
             .ok_or_else(|| anyhow!("Missing {prefix}.norm2.weight"))?;
 
         Ok(Self {
-            norm1: RMSNorm { weight: norm1_w, eps: cfg.rms_norm_eps },
+            norm1: RMSNorm {
+                weight: norm1_w,
+                eps: cfg.rms_norm_eps,
+            },
             attn: VisionAttention {
                 qkv: LinearProjection::take(weights, &format!("{prefix}.attn.qkv.weight"))?,
                 proj: LinearProjection::take(weights, &format!("{prefix}.attn.proj.weight"))?,
                 num_heads: cfg.num_heads,
                 head_dim: cfg.head_dim,
             },
-            norm2: RMSNorm { weight: norm2_w, eps: cfg.rms_norm_eps },
+            norm2: RMSNorm {
+                weight: norm2_w,
+                eps: cfg.rms_norm_eps,
+            },
             mlp: LlamaMLP {
-                gate_proj: LinearProjection::take(weights, &format!("{prefix}.mlp.gate_proj.weight"))?,
+                gate_proj: LinearProjection::take(
+                    weights,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                )?,
                 up_proj: LinearProjection::take(weights, &format!("{prefix}.mlp.up_proj.weight"))?,
-                down_proj: LinearProjection::take(weights, &format!("{prefix}.mlp.down_proj.weight"))?,
+                down_proj: LinearProjection::take(
+                    weights,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                )?,
                 activation: "gelu_pytorch_tanh".to_owned(),
                 layer_idx: block_idx,
             },
@@ -278,8 +312,8 @@ unsafe impl Sync for VisionBlock {}
 
 struct VisionPatchMerger {
     ln_q: RMSNorm,
-    mlp0: LinearProjection,  // visual.merger.mlp.0  [(hidden*merge^2), out_hidden_size]
-    mlp2: LinearProjection,  // visual.merger.mlp.2  [out_hidden_size, out_hidden_size]
+    mlp0: LinearProjection, // visual.merger.mlp.0  [(hidden*merge^2), out_hidden_size]
+    mlp2: LinearProjection, // visual.merger.mlp.2  [out_hidden_size, out_hidden_size]
     spatial_merge_size: usize,
     hidden_size: usize,
     out_hidden_size: usize,
@@ -291,11 +325,15 @@ impl VisionPatchMerger {
         prefix: &str,
         cfg: &Qwen3_5VisionConfig,
     ) -> Result<Self> {
-        let ln_q_w = weights.remove(&format!("{prefix}.ln_q.weight"))
+        let ln_q_w = weights
+            .remove(&format!("{prefix}.ln_q.weight"))
             .ok_or_else(|| anyhow!("Missing {prefix}.ln_q.weight"))?;
 
         Ok(Self {
-            ln_q: RMSNorm { weight: ln_q_w, eps: cfg.rms_norm_eps },
+            ln_q: RMSNorm {
+                weight: ln_q_w,
+                eps: cfg.rms_norm_eps,
+            },
             mlp0: LinearProjection::take(weights, &format!("{prefix}.mlp.0.weight"))?,
             mlp2: LinearProjection::take(weights, &format!("{prefix}.mlp.2.weight"))?,
             spatial_merge_size: cfg.spatial_merge_size,
@@ -319,7 +357,8 @@ impl VisionPatchMerger {
         let out_w = grid_w / s;
 
         // Reshape: [out_h, s, out_w, s, h] → [out_h*out_w, s*s*h]
-        let merged = x.reshape([out_h, s, out_w, s, h])
+        let merged = x
+            .reshape([out_h, s, out_w, s, h])
             .permute([0, 2, 1, 3, 4])
             .reshape([out_h * out_w, s * s * h]);
 
@@ -363,7 +402,12 @@ impl Qwen3_5VisionEncoder {
         let merger_prefix = format!("{prefix}.merger");
         let merger = VisionPatchMerger::load(weights, &merger_prefix, &cfg)?;
 
-        Ok(Self { config: cfg, patch_embed, blocks, merger })
+        Ok(Self {
+            config: cfg,
+            patch_embed,
+            blocks,
+            merger,
+        })
     }
 
     /// Encode pixel values to vision features.

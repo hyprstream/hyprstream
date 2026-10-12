@@ -127,8 +127,14 @@ mod tests {
     #[test]
     fn test_type_and_confirm() {
         let mut input = TextInput::new("Name:");
-        assert_eq!(input.handle_key(&KeyPress::Char(b'h')), WidgetResult::Pending);
-        assert_eq!(input.handle_key(&KeyPress::Char(b'i')), WidgetResult::Pending);
+        assert_eq!(
+            input.handle_key(&KeyPress::Char(b'h')),
+            WidgetResult::Pending
+        );
+        assert_eq!(
+            input.handle_key(&KeyPress::Char(b'i')),
+            WidgetResult::Pending
+        );
         assert_eq!(
             input.handle_key(&KeyPress::Enter),
             WidgetResult::Confirmed("hi".to_string())

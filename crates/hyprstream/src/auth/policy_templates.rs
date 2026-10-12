@@ -73,36 +73,138 @@ impl ServiceGrouping {
 /// validated. No CSV parsing needed.
 pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // PolicyService: CA — issues tokens, manages policy rules, assigns roles
-    ServicePolicyRule { subject: "service:policy", domain: "*", resource: "*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:policy",
+        domain: "*",
+        resource: "*",
+        action: "*",
+        effect: "allow",
+    },
     // User-token issuance belongs to OAuth, not every enrolled workload.
     // Service credential renewal uses its separately verified renewal path.
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:IssueToken", action: "manage", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "policy:IssueToken",
+        action: "manage",
+        effect: "allow",
+    },
     // Credential revocation publication: only the OAuth revocation authority
     // (the RFC 7009 endpoint) may publish to the canonical store.
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RevokeCredential", action: "manage", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "policy:RevokeCredential",
+        action: "manage",
+        effect: "allow",
+    },
     // Revocation checks: every enrolled service verifies credentials (and
     // probes the authority at startup); anonymous/end-user callers may not.
-    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:CheckCredentialRevocation", action: "query", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:*",
+        domain: "*",
+        resource: "policy:CheckCredentialRevocation",
+        action: "query",
+        effect: "allow",
+    },
     // Session lifecycle: only the OAuth authority (which owns user-session
     // issuance) may register or revoke sessions.
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RegisterSession", action: "manage", effect: "allow" },
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:RevokeSession", action: "manage", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "policy:RegisterSession",
+        action: "manage",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "policy:RevokeSession",
+        action: "manage",
+        effect: "allow",
+    },
     // Session checks: every enrolled service verifies session-bearing
     // credentials; anonymous/end-user callers may not.
-    ServicePolicyRule { subject: "service:*", domain: "*", resource: "policy:CheckSession", action: "query", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:*",
+        domain: "*",
+        resource: "policy:CheckSession",
+        action: "query",
+        effect: "allow",
+    },
     // Services that perform policy authorization checks
     // OAuth account-management RPC relays the verified upstream caller to
     // Policy; this admits the relay, not the caller's requested operation.
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:PolicyCheck", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:model", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:worker", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:oai", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:tui", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:discovery", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:notification", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
-    ServicePolicyRule { subject: "service:mcp", domain: "*", resource: "policy:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "policy:PolicyCheck",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:registry",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:model",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:worker",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oai",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:tui",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:discovery",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:notification",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:metrics",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:mcp",
+        domain: "*",
+        resource: "policy:*",
+        action: "*",
+        effect: "allow",
+    },
     ServicePolicyRule {
         subject: "service:flight",
         domain: "*",
@@ -111,27 +213,135 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
         effect: "allow",
     },
     // Service key resolution: any service can resolve other service keys via policy
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:model", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:worker", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:oai", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:tui", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:discovery", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:notification", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
-    ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:registry",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:model",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:worker",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oai",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:tui",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:discovery",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:notification",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:metrics",
+        domain: "*",
+        resource: "policy:*",
+        action: "query",
+        effect: "allow",
+    },
     // Registry access (services that create RegistryClient)
-    ServicePolicyRule { subject: "service:model", domain: "*", resource: "registry:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:oai", domain: "*", resource: "registry:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:flight", domain: "*", resource: "registry:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:model",
+        domain: "*",
+        resource: "registry:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oai",
+        domain: "*",
+        resource: "registry:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:flight",
+        domain: "*",
+        resource: "registry:*",
+        action: "*",
+        effect: "allow",
+    },
     // Model/inference access (services that create ModelClient)
-    ServicePolicyRule { subject: "service:model", domain: "*", resource: "model:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:oai", domain: "*", resource: "model:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:model",
+        domain: "*",
+        resource: "model:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oai",
+        domain: "*",
+        resource: "model:*",
+        action: "*",
+        effect: "allow",
+    },
     // Discovery: services announce and query endpoints
-    ServicePolicyRule { subject: "service:discovery", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:discovery",
+        domain: "*",
+        resource: "discovery:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:model",
+        domain: "*",
+        resource: "discovery:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oai",
+        domain: "*",
+        resource: "discovery:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:worker",
+        domain: "*",
+        resource: "discovery:*",
+        action: "*",
+        effect: "allow",
+    },
     // #446: EVERY socket-served service announces its own QUIC endpoint to
     // DiscoveryService on startup (the generic `factory.rs` announce hook). Now
     // that those IPC callers resolve as their authoritative `service:<name>`
@@ -140,16 +350,76 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // (NOT `discovery:*`), so these services can register their endpoint but not
     // mutate the rest of the discovery namespace. The services already granted
     // broad `discovery:*` above (discovery/model/oai/worker) are unaffected.
-    ServicePolicyRule { subject: "service:mcp", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:notification", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:registry", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:tui", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:event", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:streams", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:flight", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
-    ServicePolicyRule { subject: "service:policy", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:mcp",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:metrics",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:notification",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:registry",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:tui",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:event",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:streams",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:flight",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:policy",
+        domain: "*",
+        resource: "discovery:Announce",
+        action: "write",
+        effect: "allow",
+    },
     // NOTE: Federation (`federation:register` resource) is deny-by-default.
     // This is the single, atproto-style trust gate that governs both:
     //   - third-party clients registering via CIMD (Client ID Metadata
@@ -169,14 +439,35 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     // to join the broader MCP/atproto network.
     //
     // Infra services — scoped to their own domain
-    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "oauth:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:streams", domain: "*", resource: "streams:*", action: "*", effect: "allow" },
-    ServicePolicyRule { subject: "service:event", domain: "*", resource: "event:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "oauth:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:streams",
+        domain: "*",
+        resource: "streams:*",
+        action: "*",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:event",
+        domain: "*",
+        resource: "event:*",
+        action: "*",
+        effect: "allow",
+    },
 ];
 
 /// Convert structured base policies to the Vec<Vec<String>> Casbin expects.
 pub fn base_policies_to_vec() -> Vec<Vec<String>> {
-    SERVICE_BASE_POLICIES.iter().map(ServicePolicyRule::to_vec).collect()
+    SERVICE_BASE_POLICIES
+        .iter()
+        .map(ServicePolicyRule::to_vec)
+        .collect()
 }
 
 /// Convert structured base policies to a CSV string (for default_policy_csv only).

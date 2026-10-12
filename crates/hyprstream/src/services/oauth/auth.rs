@@ -9,13 +9,13 @@
 
 use std::sync::Arc;
 
-use subtle::ConstantTimeEq;
 use axum::{
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use subtle::ConstantTimeEq;
 
 use super::state::OAuthState;
 pub use crate::server::middleware::AuthenticatedUser;
@@ -40,9 +40,13 @@ pub async fn require_bearer_token(
         .map(str::to_owned);
 
     let (scheme, token) = match auth_header.as_deref().and_then(|h| {
-        if let Some(t) = h.strip_prefix("Bearer ") { Some(("Bearer", t.to_owned())) }
-        else if let Some(t) = h.strip_prefix("DPoP ") { Some(("DPoP", t.to_owned())) }
-        else { None }
+        if let Some(t) = h.strip_prefix("Bearer ") {
+            Some(("Bearer", t.to_owned()))
+        } else if let Some(t) = h.strip_prefix("DPoP ") {
+            Some(("DPoP", t.to_owned()))
+        } else {
+            None
+        }
     }) {
         Some(pair) => pair,
         None => {
@@ -311,15 +315,15 @@ pub(super) async fn verify_access_token(
     token: &str,
     audience_policy: AudiencePolicy,
 ) -> Result<hyprstream_rpc::auth::Claims, &'static str> {
-    let header = hyprstream_rpc::auth::parse_protected_header(token)
-        .map_err(|_| "JWT header invalid")?;
+    let header =
+        hyprstream_rpc::auth::parse_protected_header(token).map_err(|_| "JWT header invalid")?;
     if !hyprstream_rpc::auth::is_rfc9068_access_token_type(&header.typ) {
         return Err("JWT type invalid");
     }
 
     let canonical_audience = state.atproto_issuer_url();
-    let unverified = hyprstream_rpc::auth::decode_unverified(token)
-        .map_err(|_| "JWT claims invalid")?;
+    let unverified =
+        hyprstream_rpc::auth::decode_unverified(token).map_err(|_| "JWT claims invalid")?;
 
     // Audience policy dispatch. Both paths enforce a non-empty audience.
     let expected_audience = match (&audience_policy, unverified.aud.as_deref()) {

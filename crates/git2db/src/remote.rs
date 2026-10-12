@@ -144,9 +144,7 @@ impl<'a> RemoteManager<'a> {
 
             // Update URL
             repo.remote_set_url(&name, &url).map_err(|e| {
-                Git2DBError::configuration(format!(
-                    "Failed to set URL for remote '{name}': {e}"
-                ))
+                Git2DBError::configuration(format!("Failed to set URL for remote '{name}': {e}"))
             })?;
 
             Ok(())

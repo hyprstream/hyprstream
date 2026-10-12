@@ -34,16 +34,16 @@ fn host_claims() -> Claims {
         NOW as i64,
         NOW as i64 + 60,
     )
-        .with_issuer(HOST.into())
-        .with_audience(Some(HOST.into()))
-        .with_client_id(CLIENT)
-        .with_tenant("tenant-a".into())
-        .with_sid("sid-a")
-        .with_scope(Some("query:registry:List".into()))
-        .with_cnf_jwk(&ed)
-        .with_federate_signer_suite(
-            URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(SUITE, &[&ed, &pq])),
-        );
+    .with_issuer(HOST.into())
+    .with_audience(Some(HOST.into()))
+    .with_client_id(CLIENT)
+    .with_tenant("tenant-a".into())
+    .with_sid("sid-a")
+    .with_scope(Some("query:registry:List".into()))
+    .with_cnf_jwk(&ed)
+    .with_federate_signer_suite(
+        URL_SAFE_NO_PAD.encode(signer_suite_thumbprint(SUITE, &[&ed, &pq])),
+    );
     claims.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode(&pq));
     claims.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode([7; 32]));
     claims.hs_source_issuer_v1 = Some(super::super::federate_source::ISSUER.into());
@@ -429,7 +429,9 @@ async fn h3b_each_authority_binding_and_epoch_is_checked() {
         |r| r.created_at = NOW as i64 + 1,
         |r| r.proof_epoch = 0,
         |r| r.proof_epoch = u64::MAX,
-        |r| { r.collision_inventory_id.pop(); },
+        |r| {
+            r.collision_inventory_id.pop();
+        },
         |r| r.account_id.clear(),
         |r| r.grant_revision.clear(),
     ];

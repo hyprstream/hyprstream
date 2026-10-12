@@ -122,7 +122,8 @@ impl WorkerEvent {
         use capnp::serialize;
         use worker_capnp::worker_event;
 
-        let reader = serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
+        let reader =
+            serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
         let event = reader.get_root::<worker_event::Reader>()?;
 
         match event.which()? {

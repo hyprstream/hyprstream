@@ -974,10 +974,7 @@ mod tests {
 
     #[test]
     fn public_mst_preserves_canonical_bytes_on_decode() {
-        let value = DagCbor::str_map([
-            ("l", DagCbor::Null),
-            ("e", DagCbor::List(Vec::new())),
-        ]);
+        let value = DagCbor::str_map([("l", DagCbor::Null), ("e", DagCbor::List(Vec::new()))]);
         let bytes = crate::atproto_cbor::encode(&value).expect("encode public node");
         let node = NodeData::from_atproto_dag_cbor(&bytes).expect("decode public node");
         assert_eq!(

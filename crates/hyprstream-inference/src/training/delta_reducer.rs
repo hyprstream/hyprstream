@@ -104,7 +104,10 @@ pub struct Provenance {
 impl Provenance {
     /// Construct a fully-trusted contributor identity.
     pub fn trusted(host_id: impl Into<String>) -> Self {
-        Self { host_id: host_id.into(), trust: 1.0 }
+        Self {
+            host_id: host_id.into(),
+            trust: 1.0,
+        }
     }
 }
 
@@ -148,7 +151,10 @@ impl Default for ContributionGate {
         // a single contributor; well above legitimate TTT drift, well below a
         // runaway. min_trust=0 admits any positively-trusted host; raise to
         // exclude provisional peers.
-        Self { max_norm_ratio: 2.0, min_trust: 0.0 }
+        Self {
+            max_norm_ratio: 2.0,
+            min_trust: 0.0,
+        }
     }
 }
 
@@ -244,7 +250,11 @@ pub struct StackSvdReducer {
 impl StackSvdReducer {
     /// Construct with a fixed output rank and the default gate / no-op hook.
     pub fn new(rank: usize) -> Self {
-        Self { rank, gate: ContributionGate::default(), validation: Box::new(NoopValidation) }
+        Self {
+            rank,
+            gate: ContributionGate::default(),
+            validation: Box::new(NoopValidation),
+        }
     }
 
     /// Override the contributor gate.
@@ -309,7 +319,10 @@ impl DeltaReducer for StackSvdReducer {
             if ri != ri_b {
                 return Err(anyhow!(
                     "reduce_key('{}'): contributor '{}' rank mismatch A[0]={} vs B[1]={}",
-                    key, c.provenance.host_id, ri, ri_b
+                    key,
+                    c.provenance.host_id,
+                    ri,
+                    ri_b
                 ));
             }
 
@@ -347,15 +360,15 @@ impl DeltaReducer for StackSvdReducer {
         //
         // 1) A_stack = Ua · diag(Sa) · Vha   (economy: some=true, compute_uv=true)
         let (ua, sa, va) = a_stack.svd(true, true); // Ua [Σr,k], Sa [k], Va [in,k]
-        // tch's `svd` returns V (not Vh); Vha = Va^T.
+                                                    // tch's `svd` returns V (not Vh); Vha = Va^T.
         let k = sa.size()[0]; // = min(Σr, in) = Σr
         let _ = k;
         // 2) C = B_stack · Ua · diag(Sa)  →  [out, Σr]
         let c = b_stack.matmul(&ua) * sa.unsqueeze(0); // broadcast diag(Sa) over rows
-        // 3) C = Uc · diag(Sc) · Vhc
+                                                       // 3) C = Uc · diag(Sc) · Vhc
         let (uc, sc, vc) = c.svd(true, true); // Uc [out,m], Sc [m], Vc [Σr,m]
-        // 4) Vh_final = Vhc · Vha = Vc^T · Va^T = (Va · Vc)^T  →  [m, in]
-        //    ΔW = Uc · diag(Sc) · Vh_final
+                                              // 4) Vh_final = Vhc · Vha = Vc^T · Va^T = (Va · Vc)^T  →  [m, in]
+                                              //    ΔW = Uc · diag(Sc) · Vh_final
         let vh_final = va.matmul(&vc).tr(); // [m, in]
 
         // 5) Truncate to fixed R (pad with zeros if Σr < R so shapes are stable).
@@ -466,7 +479,9 @@ pub fn reduce_state_dicts(
     }
 
     if result.is_empty() {
-        return Err(anyhow!("reduce_state_dicts: no aggregatable layer keys across contributors"));
+        return Err(anyhow!(
+            "reduce_state_dicts: no aggregatable layer keys across contributors"
+        ));
     }
 
     Ok(result)
@@ -532,7 +547,10 @@ mod tests {
             lora_b: b,
             scaling: 1.0,
             delta_norm_ratio: norm_ratio,
-            provenance: Provenance { host_id: host.to_owned(), trust },
+            provenance: Provenance {
+                host_id: host.to_owned(),
+                trust,
+            },
         }
     }
 
@@ -595,7 +613,11 @@ mod tests {
         let w1 = reconstruct(&a1, &b1);
         let w2 = reconstruct(&a2, &b2);
         let diff: f64 = (&w1 - &w2).abs().max().double_value(&[]);
-        assert!(diff < 1e-3, "permuting contributors must not change ΔW, max diff = {}", diff);
+        assert!(
+            diff < 1e-3,
+            "permuting contributors must not change ΔW, max diff = {}",
+            diff
+        );
     }
 
     #[test]
@@ -621,7 +643,10 @@ mod tests {
 
     #[test]
     fn test_norm_bound_gate_rejects_over_norm() {
-        let gate = ContributionGate { max_norm_ratio: 1.0, min_trust: 0.0 };
+        let gate = ContributionGate {
+            max_norm_ratio: 1.0,
+            min_trust: 0.0,
+        };
         let reducer = StackSvdReducer::new(8).with_gate(gate);
         let contribs = vec![
             make_contrib(4, 16, 16, 1.0, 0.2, "good", 1),
@@ -629,13 +654,24 @@ mod tests {
         ];
         let err = reducer.reduce_key("k", &contribs).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("evil"), "error should name the rejected host: {}", msg);
-        assert!(msg.contains("exceeds bound"), "error should explain the norm bound: {}", msg);
+        assert!(
+            msg.contains("evil"),
+            "error should name the rejected host: {}",
+            msg
+        );
+        assert!(
+            msg.contains("exceeds bound"),
+            "error should explain the norm bound: {}",
+            msg
+        );
     }
 
     #[test]
     fn test_min_trust_gate_rejects_untrusted() {
-        let gate = ContributionGate { max_norm_ratio: 10.0, min_trust: 0.5 };
+        let gate = ContributionGate {
+            max_norm_ratio: 10.0,
+            min_trust: 0.5,
+        };
         let reducer = StackSvdReducer::new(8).with_gate(gate);
         let contribs = vec![make_contrib(4, 16, 16, 0.2, 0.1, "provisional", 1)];
         let err = reducer.reduce_key("k", &contribs).unwrap_err();
@@ -655,7 +691,10 @@ mod tests {
             lora_b: x_full.lora_b.copy(),
             scaling: 1.0,
             delta_norm_ratio: 0.1,
-            provenance: Provenance { host_id: "x".to_owned(), trust: 0.05 },
+            provenance: Provenance {
+                host_id: "x".to_owned(),
+                trust: 0.05,
+            },
         };
         let base_clone = |seed_marker: &Contribution| Contribution {
             lora_a: seed_marker.lora_a.copy(),
@@ -673,7 +712,9 @@ mod tests {
             .unwrap();
         let w_full = reconstruct(&fa, &fb);
 
-        let (la, lb) = reducer.reduce_key("k", &[base_clone(&base), x_low]).unwrap();
+        let (la, lb) = reducer
+            .reduce_key("k", &[base_clone(&base), x_low])
+            .unwrap();
         let w_low = reconstruct(&la, &lb);
 
         let move_full: f64 = (&w_full - &w_base).abs().sum(Kind::Float).double_value(&[]);
@@ -692,8 +733,14 @@ mod tests {
         let mk_state = |rank: i64, keys: &[&str]| -> HashMap<String, Tensor> {
             let mut s = HashMap::new();
             for k in keys {
-                s.insert(format!("{}.lora_a", k), Tensor::randn([rank, 32], (Kind::Float, Device::Cpu)));
-                s.insert(format!("{}.lora_b", k), Tensor::randn([16, rank], (Kind::Float, Device::Cpu)));
+                s.insert(
+                    format!("{}.lora_a", k),
+                    Tensor::randn([rank, 32], (Kind::Float, Device::Cpu)),
+                );
+                s.insert(
+                    format!("{}.lora_b", k),
+                    Tensor::randn([16, rank], (Kind::Float, Device::Cpu)),
+                );
             }
             s
         };
@@ -720,7 +767,9 @@ mod tests {
             assert_eq!(b.size(), vec![16, 8], "{key} B");
         }
         // No optimizer/effective-rank metadata leaks into the reduced dict.
-        assert!(out.keys().all(|k| k.ends_with(".lora_a") || k.ends_with(".lora_b")));
+        assert!(out
+            .keys()
+            .all(|k| k.ends_with(".lora_a") || k.ends_with(".lora_b")));
     }
 
     #[test]

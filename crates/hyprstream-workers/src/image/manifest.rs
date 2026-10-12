@@ -85,10 +85,7 @@ impl ImageReference {
             }
         } else {
             // Simple name like "alpine" -> docker.io/library/alpine
-            (
-                "docker.io".to_owned(),
-                format!("library/{image_part}"),
-            )
+            ("docker.io".to_owned(), format!("library/{image_part}"))
         };
 
         // Docker Hub's actual registry host
@@ -340,11 +337,12 @@ impl ManifestFetcher {
             .await?;
 
         if resp.status().is_success() {
-            resp.json()
-                .await
-                .context("failed to parse manifest JSON")
+            resp.json().await.context("failed to parse manifest JSON")
         } else {
-            Err(anyhow!("fetch manifest failed with status {}", resp.status()))
+            Err(anyhow!(
+                "fetch manifest failed with status {}",
+                resp.status()
+            ))
         }
     }
 
@@ -438,9 +436,10 @@ impl ManifestFetcher {
             }
 
             let token_data: TokenResponse = token_resp.json().await?;
-            Ok(token_data.token.or(token_data.access_token).ok_or_else(|| {
-                anyhow!("no token in response")
-            })?)
+            Ok(token_data
+                .token
+                .or(token_data.access_token)
+                .ok_or_else(|| anyhow!("no token in response"))?)
         } else if resp.status().is_success() {
             // No auth needed
             Err(anyhow!("no authentication required"))
@@ -452,7 +451,6 @@ impl ManifestFetcher {
         }
     }
 }
-
 
 /// Token response from registry auth server.
 #[derive(Debug, Deserialize)]
@@ -556,10 +554,7 @@ mod tests {
         let params = parse_www_authenticate(header)?;
         assert_eq!(&params["realm"], "https://auth.docker.io/token");
         assert_eq!(&params["service"], "registry.docker.io");
-        assert_eq!(
-            &params["scope"],
-            "repository:library/alpine:pull"
-        );
+        assert_eq!(&params["scope"], "repository:library/alpine:pull");
         Ok(())
     }
 }

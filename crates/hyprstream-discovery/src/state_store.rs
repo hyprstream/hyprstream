@@ -923,10 +923,7 @@ end
         .await
     }
 
-    async fn announcements_for_inner(
-        &self,
-        service_name: &str,
-    ) -> Result<Vec<AnnouncedEndpoint>> {
+    async fn announcements_for_inner(&self, service_name: &str) -> Result<Vec<AnnouncedEndpoint>> {
         use fred::prelude::*;
 
         // Cleanup must share the transaction with reads: a later writer may
@@ -1029,7 +1026,8 @@ return 1
 "#;
         let service_id = Self::service_id(service_name);
         let mut payload = serde_json::to_value(&endpoint)?;
-        let fields = payload.as_object_mut()
+        let fields = payload
+            .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("announcement must encode as an object"))?;
         fields.remove("live_until_unix_ms");
         if endpoint.expires_at_unix_ms == 0 {
@@ -1072,8 +1070,7 @@ return 1
         service_name: &str,
         _now_unix_ms: i64,
     ) -> Result<Vec<AnnouncedEndpoint>> {
-        self.announcements_for_inner(service_name)
-            .await
+        self.announcements_for_inner(service_name).await
     }
 
     async fn all_announcements(
@@ -1159,7 +1156,11 @@ return 1
                         "node": node, "allocatable": value.allocatable,
                         "load_fraction": value.load_fraction, "shared_receipt": true,
                     }))?,
-                    value.live_until_unix_ms.saturating_sub(value.last_seen).clamp(1, 45_000).to_string(),
+                    value
+                        .live_until_unix_ms
+                        .saturating_sub(value.last_seen)
+                        .clamp(1, 45_000)
+                        .to_string(),
                     self.liveness_capacity.to_string(),
                 ],
             )
@@ -1184,7 +1185,9 @@ return 1
             .await?;
         Ok(encoded
             .map(|encoded| serde_json::from_str::<StoredLiveness>(&encoded))
-            .transpose()?.filter(|record| record.shared_receipt).map(|record| record.value))
+            .transpose()?
+            .filter(|record| record.shared_receipt)
+            .map(|record| record.value))
     }
 
     async fn all_liveness(&self, _now_unix_ms: i64) -> Result<Vec<(Did, LiveAllocatable)>> {
@@ -1218,7 +1221,10 @@ return values
             .pool
             .eval(
                 LIST,
-                vec![self.key("liveness-expiry"), self.key("liveness-global-revision")],
+                vec![
+                    self.key("liveness-expiry"),
+                    self.key("liveness-global-revision"),
+                ],
                 Vec::<String>::new(),
             )
             .await?;
@@ -1424,7 +1430,6 @@ impl TieredStateStore {
             .min(now_unix_ms.saturating_add(self.l1_max_ttl_ms));
         endpoint
     }
-
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -1648,7 +1653,10 @@ pub(crate) mod tests {
         legacy
             .as_object_mut()
             .expect("endpoint fixture is an object")
-            .insert("service_jwt".to_owned(), serde_json::json!("legacy-bearer-jwt"));
+            .insert(
+                "service_jwt".to_owned(),
+                serde_json::json!("legacy-bearer-jwt"),
+            );
 
         let parsed: AnnouncedEndpoint =
             serde_json::from_value(legacy).expect("legacy endpoint remains readable");
@@ -1761,12 +1769,18 @@ pub(crate) mod tests {
         let config = valkey_config(url, "rollback");
         let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
         let other = ValkeyStateStore::connect(&config).await.unwrap();
-        let tiered = TieredStateStore::new(Arc::new(MemoryStateStore::new(8, 8, 8)), shared.clone(), 1000);
+        let tiered = TieredStateStore::new(
+            Arc::new(MemoryStateStore::new(8, 8, 8)),
+            shared.clone(),
+            1000,
+        );
         let node = Did::new("did:web:skew.example".to_owned());
         let now = unix_millis_now();
         let mut value = LiveAllocatable {
-            allocatable: vec![], load_fraction: 0.9,
-            last_seen: now + 86_400_000, live_until_unix_ms: now + 86_400_400,
+            allocatable: vec![],
+            load_fraction: 0.9,
+            last_seen: now + 86_400_000,
+            live_until_unix_ms: now + 86_400_400,
         };
         tiered.put_liveness(&node, value.clone()).await.unwrap();
         let first = tiered.liveness(&node, i64::MAX).await.unwrap().unwrap();
@@ -1775,15 +1789,29 @@ pub(crate) mod tests {
         value.live_until_unix_ms = value.last_seen + 400;
         value.load_fraction = 0.2;
         value.allocatable = vec![("cpu".to_owned(), "8".to_owned())];
-        assert_eq!(other.put_liveness(&node, value).await.unwrap(), PutResult::Stored);
+        assert_eq!(
+            other.put_liveness(&node, value).await.unwrap(),
+            PutResult::Stored
+        );
         let latest = tiered.liveness(&node, i64::MAX).await.unwrap().unwrap();
         assert!(latest.last_seen >= first.last_seen);
         assert_eq!(latest.load_fraction, 0.2);
         assert_eq!(latest.allocatable[0].1, "8");
         assert_eq!(latest.live_until_unix_ms - latest.last_seen, 400);
         assert_eq!(tiered.all_liveness(i64::MAX).await.unwrap().len(), 1);
-        let ttl: i64 = shared.pool.pttl(format!("{}:liveness:{}", shared.prefix, ValkeyStateStore::digest(node.as_str()))).await.unwrap();
-        assert!((1..=400).contains(&ttl), "expiry uses shared receipt, not ahead host time");
+        let ttl: i64 = shared
+            .pool
+            .pttl(format!(
+                "{}:liveness:{}",
+                shared.prefix,
+                ValkeyStateStore::digest(node.as_str())
+            ))
+            .await
+            .unwrap();
+        assert!(
+            (1..=400).contains(&ttl),
+            "expiry uses shared receipt, not ahead host time"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         assert!(tiered.liveness(&node, i64::MIN).await.unwrap().is_none());
         assert!(tiered.all_liveness(i64::MIN).await.unwrap().is_empty());
@@ -1869,10 +1897,14 @@ pub(crate) mod tests {
         // Caller time cannot expire shared values. Keep the original name,
         // value, index cleanup, and capacity assertions, but wait for the
         // cohort's real server-side lease instead of advancing a replica.
-        assert_eq!(reader.all_announcements(now + 60_001).await.unwrap().len(), 256);
+        assert_eq!(
+            reader.all_announcements(now + 60_001).await.unwrap().len(),
+            256
+        );
         tokio::time::sleep(std::time::Duration::from_millis(
             (cohort_expiry + 50 - unix_millis_now()).max(0) as u64,
-        )).await;
+        ))
+        .await;
         let remaining = reader.all_announcements(now + 60_001).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, "service:0:λ");
@@ -2218,8 +2250,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn valkey_announcement_lease_uses_receipt_and_preserves_payload() {
         use fred::prelude::*;
-        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else { return; };
-        let store = ValkeyStateStore::connect(&valkey_config(url, "announcement-write-lease")).await.unwrap();
+        let Ok(url) = std::env::var("HYPRSTREAM_TEST_VALKEY_URL") else {
+            return;
+        };
+        let store = ValkeyStateStore::connect(&valkey_config(url, "announcement-write-lease"))
+            .await
+            .unwrap();
         let now: i64 = store.pool.eval(
             "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
             Vec::<String>::new(), Vec::<String>::new(),
@@ -2231,20 +2267,45 @@ pub(crate) mod tests {
             value.response_key_id = "payload with \"live_until_unix_ms\":123 and λ".to_owned();
             value.source_signer = [255; 32];
             let mut expected = serde_json::to_value(&value).unwrap();
-            expected.as_object_mut().unwrap().remove("live_until_unix_ms");
+            expected
+                .as_object_mut()
+                .unwrap()
+                .remove("live_until_unix_ms");
             let _clock = ReplicaClock::at(now + skew);
-            assert_eq!(store.put_announcement(&name, value).await.unwrap(), PutResult::Stored);
+            assert_eq!(
+                store.put_announcement(&name, value).await.unwrap(),
+                PutResult::Stored
+            );
             let rows: (String, i64, i64, i64) = store.pool.eval(
                 "local t = redis.call('TIME'); return {redis.call('GET', KEYS[1]), redis.call('PEXPIRETIME', KEYS[1]), tonumber(redis.call('ZSCORE', KEYS[2], KEYS[1])), tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)}",
                 vec![store.announcement_key(&name, "iroh"), store.key("announcement-expiry")], Vec::<String>::new(),
             ).await.unwrap();
             let mut actual: serde_json::Value = serde_json::from_str(&rows.0).unwrap();
-            let encoded_expiry = actual.as_object_mut().unwrap().remove("live_until_unix_ms").unwrap().as_i64().unwrap();
-            assert_eq!(actual, expected, "only the effective lease field may change");
+            let encoded_expiry = actual
+                .as_object_mut()
+                .unwrap()
+                .remove("live_until_unix_ms")
+                .unwrap()
+                .as_i64()
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "only the effective lease field may change"
+            );
             assert_eq!(encoded_expiry, rows.1);
             assert_eq!(encoded_expiry, rows.2);
-            assert!((89_000..=90_000).contains(&(encoded_expiry - rows.3)), "bounded shared receipt lease, independent of replica skew");
-            assert_eq!(store.announcements_for(&name, now + skew).await.unwrap().len(), 1);
+            assert!(
+                (89_000..=90_000).contains(&(encoded_expiry - rows.3)),
+                "bounded shared receipt lease, independent of replica skew"
+            );
+            assert_eq!(
+                store
+                    .announcements_for(&name, now + skew)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
     }
 
@@ -2264,15 +2325,23 @@ pub(crate) mod tests {
             let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
             let replica = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
             let tiered = TieredStateStore::new(
-                Arc::new(MemoryStateStore::new(8, 8, 8)), replica.clone(), 30_000,
+                Arc::new(MemoryStateStore::new(8, 8, 8)),
+                replica.clone(),
+                30_000,
             );
             let now: i64 = shared.pool.eval(
                 "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
                 Vec::<String>::new(), Vec::<String>::new(),
             ).await.unwrap();
-            shared.put_announcement("anchor", endpoint("iroh", 1, now + 60_000, now + 30_000)).await.unwrap();
+            shared
+                .put_announcement("anchor", endpoint("iroh", 1, now + 60_000, now + 30_000))
+                .await
+                .unwrap();
             if operation == "tiered" {
-                assert_eq!(tiered.announcements_for("anchor", now).await.unwrap().len(), 1);
+                assert_eq!(
+                    tiered.announcements_for("anchor", now).await.unwrap().len(),
+                    1
+                );
             }
             let revision = shared.announcement_revision().await.unwrap();
             let ahead = now + 3_600_000;
@@ -2280,18 +2349,49 @@ pub(crate) mod tests {
                 let _clock = ReplicaClock::at(ahead);
                 match operation {
                     "put" => {
-                        replica.put_announcement("writer", endpoint("iroh", 1, ahead + 60_000, ahead + 30_000)).await.unwrap();
+                        replica
+                            .put_announcement(
+                                "writer",
+                                endpoint("iroh", 1, ahead + 60_000, ahead + 30_000),
+                            )
+                            .await
+                            .unwrap();
                     }
-                    "point" => assert_eq!(replica.announcements_for("anchor", ahead).await.unwrap().len(), 1),
+                    "point" => assert_eq!(
+                        replica
+                            .announcements_for("anchor", ahead)
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    ),
                     "list" => assert_eq!(replica.all_announcements(ahead).await.unwrap().len(), 1),
-                    "tiered" => assert_eq!(tiered.announcements_for("anchor", ahead).await.unwrap().len(), 1),
+                    "tiered" => assert_eq!(
+                        tiered
+                            .announcements_for("anchor", ahead)
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    ),
                     _ => unreachable!(),
                 }
             }
-            assert_eq!(shared.announcements_for("anchor", now).await.unwrap().len(), 1, "{operation} deleted another replica's live announcement");
-            let exists: bool = shared.pool.exists(shared.announcement_key("anchor", "iroh")).await.unwrap();
+            assert_eq!(
+                shared.announcements_for("anchor", now).await.unwrap().len(),
+                1,
+                "{operation} deleted another replica's live announcement"
+            );
+            let exists: bool = shared
+                .pool
+                .exists(shared.announcement_key("anchor", "iroh"))
+                .await
+                .unwrap();
             assert!(exists);
-            assert_eq!(shared.announcement_revision().await.unwrap(), revision + u64::from(operation == "put"));
+            assert_eq!(
+                shared.announcement_revision().await.unwrap(),
+                revision + u64::from(operation == "put")
+            );
         }
     }
 
@@ -2306,7 +2406,9 @@ pub(crate) mod tests {
         let config = valkey_config(url, "announcement-expiry-clock");
         let shared = Arc::new(ValkeyStateStore::connect(&config).await.unwrap());
         let tiered = TieredStateStore::new(
-            Arc::new(MemoryStateStore::new(8, 8, 8)), shared.clone(), 30_000,
+            Arc::new(MemoryStateStore::new(8, 8, 8)),
+            shared.clone(),
+            30_000,
         );
         let now: i64 = shared.pool.eval(
             "local t = redis.call('TIME'); return tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)",
@@ -2315,11 +2417,27 @@ pub(crate) mod tests {
         // Either signed/accepted authority or the shorter effective heartbeat
         // lease can expire first; neither becomes a new receipt-relative lease.
         let expiry = now + 300;
-        for (name, signed, live) in [("signed", expiry, now + 60_000), ("lease", now + 60_000, expiry)] {
-            shared.put_announcement(name, endpoint("iroh", 1, signed, live)).await.unwrap();
-            let pxat: i64 = shared.pool.eval("return redis.call('PEXPIRETIME', KEYS[1])",
-                vec![shared.announcement_key(name, "iroh")], Vec::<String>::new()).await.unwrap();
-            assert_eq!(pxat, expiry, "preserve the absolute authority/lease ceiling");
+        for (name, signed, live) in [
+            ("signed", expiry, now + 60_000),
+            ("lease", now + 60_000, expiry),
+        ] {
+            shared
+                .put_announcement(name, endpoint("iroh", 1, signed, live))
+                .await
+                .unwrap();
+            let pxat: i64 = shared
+                .pool
+                .eval(
+                    "return redis.call('PEXPIRETIME', KEYS[1])",
+                    vec![shared.announcement_key(name, "iroh")],
+                    Vec::<String>::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pxat, expiry,
+                "preserve the absolute authority/lease ceiling"
+            );
             assert_eq!(tiered.announcements_for(name, now).await.unwrap().len(), 1);
         }
         let revision = shared.announcement_revision().await.unwrap();
@@ -2329,9 +2447,23 @@ pub(crate) mod tests {
         for name in ["signed", "lease"] {
             // Exercise an already-populated L1 before any separate listing
             // reaps L2 or invalidates its revision for us.
-            assert!(tiered.announcements_for(name, behind).await.unwrap().is_empty());
-            assert!(shared.announcements_for(name, behind).await.unwrap().is_empty());
-            assert_eq!(shared.put_announcement(name, endpoint("iroh", 2, expiry, now + 60_000)).await.unwrap(), PutResult::IgnoredOlder);
+            assert!(tiered
+                .announcements_for(name, behind)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(shared
+                .announcements_for(name, behind)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                shared
+                    .put_announcement(name, endpoint("iroh", 2, expiry, now + 60_000))
+                    .await
+                    .unwrap(),
+                PutResult::IgnoredOlder
+            );
         }
         assert!(shared.all_announcements(behind).await.unwrap().is_empty());
         assert!(shared.announcement_revision().await.unwrap() > revision);
@@ -2339,7 +2471,11 @@ pub(crate) mod tests {
             "return {redis.call('ZCARD', KEYS[1]), redis.call('SCARD', KEYS[2]), redis.call('HLEN', KEYS[3])}",
             vec![shared.key("announcement-expiry"), shared.key("services"), shared.key("service-names")], Vec::<String>::new(),
         ).await.unwrap();
-        assert_eq!(metadata, vec![0, 0, 0], "expired writes must not resurrect secondary indexes");
+        assert_eq!(
+            metadata,
+            vec![0, 0, 0],
+            "expired writes must not resurrect secondary indexes"
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "valkey"))]
@@ -2710,14 +2846,10 @@ pub(crate) mod tests {
         // awaits. A store-wide mutex prevents every other operation below from
         // finishing; striped ordering lets all fifteen real Valkey reads pass.
         let stalled = tier.operation("liveness", nodes[0].as_str()).lock().await;
-        let mut reads = stream::iter(
-            nodes
-                .iter()
-                .map(|node| {
-                    let tier = &tier;
-                    async move { (node, tier.liveness(node, now).await) }
-                }),
-        )
+        let mut reads = stream::iter(nodes.iter().map(|node| {
+            let tier = &tier;
+            async move { (node, tier.liveness(node, now).await) }
+        }))
         .buffer_unordered(16);
         tokio::time::timeout(Duration::from_secs(2), async {
             for _ in 0..15 {
@@ -3088,7 +3220,12 @@ pub(crate) mod tests {
                     .unwrap()
                     .unwrap()
                     .load_fraction,
-                other.liveness(&node, now).await.unwrap().unwrap().load_fraction
+                other
+                    .liveness(&node, now)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .load_fraction
             );
             let a = CachedEntityStatement {
                 jwt: "a".to_owned(),
@@ -3163,11 +3300,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert!(store
-            .all_liveness(now)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(store.all_liveness(now).await.unwrap().is_empty());
         store.put_liveness(&node, value).await.unwrap();
         assert_eq!(store.all_liveness(now).await.unwrap()[0].0, node);
     }

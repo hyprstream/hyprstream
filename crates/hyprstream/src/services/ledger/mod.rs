@@ -251,7 +251,10 @@ mod production_activation_tests {
             .validate_for_production(Some("postgres://localhost/ledger"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("backend = postgres"), "unexpected error: {err}");
+        assert!(
+            err.contains("backend = postgres"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

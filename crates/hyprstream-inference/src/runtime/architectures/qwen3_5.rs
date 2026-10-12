@@ -1,21 +1,28 @@
 //! Qwen3.5 hybrid SSM/full-attention model implementation
-#![allow(dead_code, unused_variables, clippy::redundant_closure, clippy::assign_op_pattern, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_for_method_calls)]
+#![allow(
+    dead_code,
+    unused_variables,
+    clippy::redundant_closure,
+    clippy::assign_op_pattern,
+    clippy::needless_borrows_for_generic_args,
+    clippy::redundant_closure_for_method_calls
+)]
 //!
 //! Qwen3.5 interleaves Gated DeltaNet (linear SSM attention) and standard GQA layers.
 //! Every 4th layer (by default) is full attention; the rest are GatedDeltaNet.
 //! Supports both dense (qwen3_5_text) and MoE (qwen3_5_moe) variants.
 
 use super::config::ArchitectureConfig;
-use super::llama::{LlamaMLP, LinearProjection};
+use super::llama::{LinearProjection, LlamaMLP};
 use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
 use crate::runtime::device_pool::LayerDeviceMap;
 use crate::runtime::kv_cache::KVCacheManager;
-use hyprstream_rpc_std::model_client::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{dims3, dims4};
 use anyhow::{anyhow, Result};
+use hyprstream_rpc_std::model_client::KVQuantType;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
@@ -81,17 +88,39 @@ pub struct Qwen3_5TextConfig {
 }
 
 impl ArchitectureConfig for Qwen3_5TextConfig {
-    fn num_attention_heads(&self) -> usize { self.num_attention_heads as usize }
-    fn num_key_value_heads(&self) -> usize { self.num_key_value_heads as usize }
-    fn hidden_size(&self) -> usize { self.hidden_size as usize }
-    fn intermediate_size(&self) -> usize { self.intermediate_size as usize }
-    fn head_dim(&self) -> usize { self.head_dim as usize }
-    fn vocab_size(&self) -> usize { self.vocab_size as usize }
-    fn max_position_embeddings(&self) -> usize { self.max_position_embeddings as usize }
-    fn rope_theta(&self) -> Option<f32> { Some(self.rope_theta) }
-    fn rope_dim(&self) -> Option<usize> { Some(self.rotary_dim) }
-    fn layer_norm_eps(&self) -> f32 { self.rms_norm_eps }
-    fn use_rms_norm(&self) -> bool { true }
+    fn num_attention_heads(&self) -> usize {
+        self.num_attention_heads as usize
+    }
+    fn num_key_value_heads(&self) -> usize {
+        self.num_key_value_heads as usize
+    }
+    fn hidden_size(&self) -> usize {
+        self.hidden_size as usize
+    }
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size as usize
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim as usize
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size as usize
+    }
+    fn max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings as usize
+    }
+    fn rope_theta(&self) -> Option<f32> {
+        Some(self.rope_theta)
+    }
+    fn rope_dim(&self) -> Option<usize> {
+        Some(self.rotary_dim)
+    }
+    fn layer_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+    fn use_rms_norm(&self) -> bool {
+        true
+    }
 }
 
 impl Qwen3_5TextConfig {
@@ -140,11 +169,31 @@ impl Qwen3_5TextConfig {
             partial_rotary_factor,
             rotary_dim,
             layer_types,
-            linear_conv_kernel_dim: if cfg.linear_conv_kernel_dim > 0 { cfg.linear_conv_kernel_dim } else { 4 },
-            linear_key_head_dim: if cfg.linear_key_head_dim > 0 { cfg.linear_key_head_dim } else { 128 },
-            linear_value_head_dim: if cfg.linear_value_head_dim > 0 { cfg.linear_value_head_dim } else { 128 },
-            linear_num_key_heads: if cfg.linear_num_key_heads > 0 { cfg.linear_num_key_heads } else { 16 },
-            linear_num_value_heads: if cfg.linear_num_value_heads > 0 { cfg.linear_num_value_heads } else { 32 },
+            linear_conv_kernel_dim: if cfg.linear_conv_kernel_dim > 0 {
+                cfg.linear_conv_kernel_dim
+            } else {
+                4
+            },
+            linear_key_head_dim: if cfg.linear_key_head_dim > 0 {
+                cfg.linear_key_head_dim
+            } else {
+                128
+            },
+            linear_value_head_dim: if cfg.linear_value_head_dim > 0 {
+                cfg.linear_value_head_dim
+            } else {
+                128
+            },
+            linear_num_key_heads: if cfg.linear_num_key_heads > 0 {
+                cfg.linear_num_key_heads
+            } else {
+                16
+            },
+            linear_num_value_heads: if cfg.linear_num_value_heads > 0 {
+                cfg.linear_num_value_heads
+            } else {
+                32
+            },
             is_moe: cfg.is_moe,
             num_experts: cfg.num_experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
@@ -189,7 +238,8 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
         let fused_weight = Tensor::cat(&weight_refs, 1);
         let scale = if scales.iter().any(Option::is_some) {
             #[allow(clippy::expect_used)] // all_fp8 invariant: every proj has a scale
-            let scale_refs: Vec<&Tensor> = scales.iter()
+            let scale_refs: Vec<&Tensor> = scales
+                .iter()
                 .map(|scale| scale.as_ref().expect("FP8 projection missing scale"))
                 .collect();
             Some(Tensor::cat(&scale_refs, 1))
@@ -203,24 +253,27 @@ fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
     } else if any_fp8 {
         // Mixed FP8/BF16: dequantize FP8 projections to BF16 before catting.
         // Occurs for small gating projections in hybrid layers; memory impact is minor.
-        let weights: Vec<Tensor> = projs.into_iter().map(|p| {
-            if is_fp8(p.weight.kind()) {
-                let w_bf = p.weight.to_kind(tch::Kind::BFloat16);
-                if let Some(s) = p.scale {
-                    let ws = w_bf.size();
-                    let ss = s.size();
-                    let br = ws[0] / ss[0];
-                    let bc = ws[1] / ss[1];
-                    let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
-                    let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
-                    (w_4d * s_4d).reshape([ws[0], ws[1]])
+        let weights: Vec<Tensor> = projs
+            .into_iter()
+            .map(|p| {
+                if is_fp8(p.weight.kind()) {
+                    let w_bf = p.weight.to_kind(tch::Kind::BFloat16);
+                    if let Some(s) = p.scale {
+                        let ws = w_bf.size();
+                        let ss = s.size();
+                        let br = ws[0] / ss[0];
+                        let bc = ws[1] / ss[1];
+                        let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
+                        let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1, ss[1], 1]);
+                        (w_4d * s_4d).reshape([ws[0], ws[1]])
+                    } else {
+                        w_bf
+                    }
                 } else {
-                    w_bf
+                    p.weight
                 }
-            } else {
-                p.weight
-            }
-        }).collect();
+            })
+            .collect();
         let weight_refs: Vec<&Tensor> = weights.iter().collect();
         LinearProjection::new(Tensor::cat(&weight_refs, 1))
     } else {
@@ -239,11 +292,13 @@ fn dequant_batched(w: &Tensor, scale: Option<&Tensor>) -> Tensor {
             let w_bf = w.to_kind(tch::Kind::BFloat16);
             if let Some(s) = scale {
                 let ws = w_bf.size(); // [k, in, out]
-                let ss = s.size();   // [k, in/bs, out/bs]
+                let ss = s.size(); // [k, in/bs, out/bs]
                 let br = ws[1] / ss[1];
                 let bc = ws[2] / ss[2];
                 let w_5d = w_bf.view([ss[0], ss[1], br, ss[2], bc]);
-                let s_5d = s.to_kind(tch::Kind::BFloat16).view([ss[0], ss[1], 1, ss[2], 1]);
+                let s_5d = s
+                    .to_kind(tch::Kind::BFloat16)
+                    .view([ss[0], ss[1], 1, ss[2], 1]);
                 (&w_5d * &s_5d).reshape([ws[0], ws[1], ws[2]])
             } else {
                 w_bf
@@ -268,7 +323,11 @@ struct Qwen3_5RMSNorm {
 impl Qwen3_5RMSNorm {
     fn new(weight: Tensor, eps: f32) -> Self {
         let weight_f32 = weight.to_kind(Kind::Float);
-        Self { weight, weight_f32, eps }
+        Self {
+            weight,
+            weight_f32,
+            eps,
+        }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -308,12 +367,20 @@ struct RMSNormGated {
 impl RMSNormGated {
     fn new(weight: Tensor, eps: f32) -> Self {
         let weight_f32 = weight.to_kind(Kind::Float);
-        Self { weight, weight_f32, eps }
+        Self {
+            weight,
+            weight_f32,
+            eps,
+        }
     }
 
     fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
         let orig = x.kind();
-        let x_f = if x.kind() == Kind::Float { x.shallow_clone() } else { x.to_kind(Kind::Float) };
+        let x_f = if x.kind() == Kind::Float {
+            x.shallow_clone()
+        } else {
+            x.to_kind(Kind::Float)
+        };
         let mean_sq = (&x_f * &x_f).mean_dim(&[-1i64][..], true, Kind::Float);
         let rrms = (mean_sq + self.eps as f64).rsqrt();
         let normed = &x_f * rrms;
@@ -349,28 +416,30 @@ fn l2_normalize(x: &Tensor) -> Tensor {
 /// `q` is already L2-normalized and scaled by 1/sqrt(head_k_dim).
 /// Returns (output [batch, num_v_heads, seq, head_v_dim], final state [batch, nv, hk, hv]).
 fn chunked_delta_rule(
-    q: &Tensor,       // [B, nv, T, hk]  L2-normed, scaled
-    k: &Tensor,       // [B, nv, T, hk]  L2-normed
-    v: &Tensor,       // [B, nv, T, hv]
-    g: &Tensor,       // [B, nv, T]      log-decay (negative)
-    beta: &Tensor,    // [B, nv, T]      in (0,1)
+    q: &Tensor,    // [B, nv, T, hk]  L2-normed, scaled
+    k: &Tensor,    // [B, nv, T, hk]  L2-normed
+    v: &Tensor,    // [B, nv, T, hv]
+    g: &Tensor,    // [B, nv, T]      log-decay (negative)
+    beta: &Tensor, // [B, nv, T]      in (0,1)
     initial_state: Option<&Tensor>,
     device: tch::Device,
 ) -> Result<(Tensor, Tensor)> {
     const CHUNK_SIZE: i64 = 64;
 
     let batch = q.size()[0];
-    let nv    = q.size()[1];
-    let seq   = q.size()[2];
-    let hk    = q.size()[3];
-    let hv    = v.size()[3];
+    let nv = q.size()[1];
+    let seq = q.size()[2];
+    let hk = q.size()[3];
+    let hv = v.size()[3];
 
     // Pad sequence length to multiple of CHUNK_SIZE
     let pad = (CHUNK_SIZE - seq % CHUNK_SIZE) % CHUNK_SIZE;
     let seq_p = seq + pad;
 
     let pad_tensor = |t: &Tensor, extra_dims: i64| -> Tensor {
-        if pad == 0 { return t.shallow_clone(); }
+        if pad == 0 {
+            return t.shallow_clone();
+        }
         let z = match extra_dims {
             0 => Tensor::zeros([batch, nv, pad], (Kind::Float, device)),
             _ => Tensor::zeros([batch, nv, pad, extra_dims], (Kind::Float, device)),
@@ -378,10 +447,10 @@ fn chunked_delta_rule(
         Tensor::cat(&[t, &z], 2)
     };
 
-    let q  = pad_tensor(q, hk);
-    let k  = pad_tensor(k, hk);
-    let v  = pad_tensor(v, hv);
-    let g  = pad_tensor(g, 0);
+    let q = pad_tensor(q, hk);
+    let k = pad_tensor(k, hk);
+    let v = pad_tensor(v, hv);
+    let g = pad_tensor(g, 0);
     let beta = pad_tensor(beta, 0);
 
     let v_beta = &v * beta.unsqueeze(-1);
@@ -391,9 +460,9 @@ fn chunked_delta_rule(
 
     // Reshape to [B, nv, num_chunks, chunk_size, D]
     let reshape5 = |t: &Tensor, d: i64| t.reshape([batch, nv, nc, CHUNK_SIZE, d]);
-    let q      = reshape5(&q,      hk);
-    let k      = reshape5(&k,      hk);
-    let v      = reshape5(&v,      hv);
+    let q = reshape5(&q, hk);
+    let k = reshape5(&k, hk);
+    let v = reshape5(&v, hv);
     let k_beta = reshape5(&k_beta, hk);
     let v_beta = reshape5(&v_beta, hv);
     // g: [B, nv, num_chunks, chunk_size]
@@ -404,8 +473,8 @@ fn chunked_delta_rule(
 
     // decay_mask[t, s] = exp(g[t] - g[s]) for t >= s, 0 for t < s
     // Must exp first, then tril — otherwise upper tri becomes exp(0)=1 instead of 0
-    let g_t = g.unsqueeze(-1);  // [..., C, 1]
-    let g_s = g.unsqueeze(-2);  // [..., 1, C]
+    let g_t = g.unsqueeze(-1); // [..., C, 1]
+    let g_s = g.unsqueeze(-2); // [..., 1, C]
     let decay_mask = (g_t - g_s).exp().tril(0); // [B, nv, nc, C, C]
 
     // Upper triangular mask (diagonal=0 inclusive) for masking future positions
@@ -415,8 +484,7 @@ fn chunked_delta_rule(
 
     // attn = -(k_beta @ k^T * decay_mask).masked_fill(mask0, 0)
     // [B, nv, nc, C, C]
-    let attn0 = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask)
-        .masked_fill(&mask0, 0.0f64);
+    let attn0 = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask).masked_fill(&mask0, 0.0f64);
 
     // Recursive delta-rule correction (forward substitution over chunk positions).
     //
@@ -436,23 +504,22 @@ fn chunked_delta_rule(
     for i in 1..c {
         // Original row i, columns [0, i) (columns >= i are 0 from mask0).
         let a_row = attn0.narrow(-2, i, 1).narrow(-1, 0, i).squeeze_dim(-2); // [B, nv, nc, i]
-        // T[:i, :i] — stack the already-corrected rows, take their first i cols.
+                                                                             // T[:i, :i] — stack the already-corrected rows, take their first i cols.
         let sub = Tensor::stack(&rows, -2).narrow(-1, 0, i); // [B, nv, nc, i, i]
         let correction = a_row.unsqueeze(-2).matmul(&sub).squeeze_dim(-2); // [B, nv, nc, i]
         let corrected = &a_row + &correction; // [B, nv, nc, i]
-        // Re-pad to full width C (columns [i, C) are 0, matching mask0).
+                                              // Re-pad to full width C (columns [i, C) are 0, matching mask0).
         let pad_cols = c - i;
-        let zeros = Tensor::zeros(
-            [batch, nv, nc, pad_cols],
-            (Kind::Float, device),
-        );
+        let zeros = Tensor::zeros([batch, nv, nc, pad_cols], (Kind::Float, device));
         rows.push(Tensor::cat(&[corrected, zeros], -1)); // [B, nv, nc, C]
     }
     let attn = Tensor::stack(&rows, -2); // [B, nv, nc, C, C]
 
     // Add identity
     let eye = Tensor::eye(CHUNK_SIZE, (Kind::Float, device))
-        .unsqueeze(0).unsqueeze(0).unsqueeze(0); // [1, 1, 1, C, C]
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .unsqueeze(0); // [1, 1, 1, C, C]
     let attn = attn + eye;
 
     // value_transformed = attn @ v_beta  [B, nv, nc, C, hv]
@@ -460,25 +527,25 @@ fn chunked_delta_rule(
     // k_cumdecay = attn @ (k_beta * g.exp()) [B, nv, nc, C, hk]
     let k_cumdecay = attn.matmul(&(k_beta * g.exp().unsqueeze(-1)));
 
-    let mut state = initial_state.map(|s| s.to_kind(Kind::Float)).unwrap_or_else(|| {
-        Tensor::zeros([batch, nv, hk, hv], (Kind::Float, device))
-    });
+    let mut state = initial_state
+        .map(|s| s.to_kind(Kind::Float))
+        .unwrap_or_else(|| Tensor::zeros([batch, nv, hk, hv], (Kind::Float, device)));
     let mut chunks_out = Vec::with_capacity(nc as usize);
 
     for i in 0..nc {
-        let q_i  = q.select(2, i);           // [B, nv, C, hk]
-        let k_i  = k.select(2, i);           // [B, nv, C, hk]
-        let v_i  = value_t.select(2, i);     // [B, nv, C, hv]
-        let g_i  = g.select(2, i);           // [B, nv, C]
-        let dm_i = decay_mask.select(2, i);  // [B, nv, C, C]
+        let q_i = q.select(2, i); // [B, nv, C, hk]
+        let k_i = k.select(2, i); // [B, nv, C, hk]
+        let v_i = value_t.select(2, i); // [B, nv, C, hv]
+        let g_i = g.select(2, i); // [B, nv, C]
+        let dm_i = decay_mask.select(2, i); // [B, nv, C, C]
         let kcd_i = k_cumdecay.select(2, i); // [B, nv, C, hk]
 
         // Within-chunk attention (causal, exclude future)
         let attn_inner = (q_i.matmul(&k_i.transpose(-1, -2)) * &dm_i).masked_fill(&mask1, 0.0f64);
 
         // Cross-chunk contribution from previous state
-        let v_prime = kcd_i.matmul(&state);           // [B, nv, C, hv]
-        let v_new   = v_i - v_prime;
+        let v_prime = kcd_i.matmul(&state); // [B, nv, C, hv]
+        let v_new = v_i - v_prime;
 
         // Inter-chunk: q scaled by cumulative g × state
         let attn_inter = (q_i * g_i.exp().unsqueeze(-1)).matmul(&state); // [B, nv, C, hv]
@@ -488,7 +555,7 @@ fn chunked_delta_rule(
 
         // Update state for next chunk
         let g_last = g_i.narrow(-1, CHUNK_SIZE - 1, 1); // [B, nv, 1]
-        let decay = g_last.exp().unsqueeze(-1);          // [B, nv, 1, 1]
+        let decay = g_last.exp().unsqueeze(-1); // [B, nv, 1, 1]
         let g_diff = (g_last - &g_i).exp().unsqueeze(-1); // [B, nv, C, 1]
         let update = (k_i * g_diff).transpose(-1, -2).matmul(&v_new); // [B, nv, hk, hv]
         state = &state * decay + update;
@@ -517,15 +584,15 @@ struct GatedDeltaNetLayer {
     // Split offsets (conv_dim, value_dim, num_v_heads, num_v_heads)
     proj_split: [i64; 4],
     // Depthwise conv1d on mixed QKV
-    conv1d_weight: Tensor,         // [conv_dim, 1, kernel_size]
+    conv1d_weight: Tensor, // [conv_dim, 1, kernel_size]
     // Decay and dt bias (stored in Float to avoid per-step casting)
-    a_log: Tensor,                 // [num_v_heads] original dtype
-    dt_bias: Tensor,               // [num_v_heads] original dtype
-    neg_a_exp_f32: Tensor,          // [1, 1, num_v_heads] precomputed -exp(a_log) in Float
-    dt_bias_f32: Tensor,           // [1, 1, num_v_heads] precomputed in Float
+    a_log: Tensor,         // [num_v_heads] original dtype
+    dt_bias: Tensor,       // [num_v_heads] original dtype
+    neg_a_exp_f32: Tensor, // [1, 1, num_v_heads] precomputed -exp(a_log) in Float
+    dt_bias_f32: Tensor,   // [1, 1, num_v_heads] precomputed in Float
     // Output norm and projection
     norm: RMSNormGated,
-    out_proj: LinearProjection,    // value_dim → hidden
+    out_proj: LinearProjection, // value_dim → hidden
     // Dimensions
     num_k_heads: usize,
     num_v_heads: usize,
@@ -559,7 +626,9 @@ impl GatedDeltaNetLayer {
 
         let mut get = |name: &str| -> Result<Tensor> {
             let full = format!("{prefix}.{name}");
-            weights.remove(&full).ok_or_else(|| anyhow!("Missing weight: {}", full))
+            weights
+                .remove(&full)
+                .ok_or_else(|| anyhow!("Missing weight: {}", full))
         };
 
         let conv1d_weight = get("conv1d.weight")?;
@@ -570,18 +639,20 @@ impl GatedDeltaNetLayer {
         let a_log_sq = a_log.squeeze();
         let dt_bias_sq = dt_bias.squeeze();
         // Precompute float versions with broadcast shape [1, 1, nv] for decode path
-        let neg_a_exp_f32 = -(a_log_sq.to_kind(Kind::Float).exp()
-            .unsqueeze(0).unsqueeze(0));   // [1, 1, nv] already negated
-        let dt_bias_f32 = dt_bias_sq.to_kind(Kind::Float)
-            .unsqueeze(0).unsqueeze(0);   // [1, 1, nv]
+        let neg_a_exp_f32 = -(a_log_sq
+            .to_kind(Kind::Float)
+            .exp()
+            .unsqueeze(0)
+            .unsqueeze(0)); // [1, 1, nv] already negated
+        let dt_bias_f32 = dt_bias_sq.to_kind(Kind::Float).unsqueeze(0).unsqueeze(0); // [1, 1, nv]
 
         // Fuse 4 input projections into 1 matmul.
         // Cat along output dim (dim 1, weight is [in, out] after take()), preserving FP8+scale.
         // LinearProjection::apply() dequantizes lazily at forward time — no BF16 copy at load.
         let w_qkv = LinearProjection::take(weights, &format!("{prefix}.in_proj_qkv.weight"))?;
-        let w_z   = LinearProjection::take(weights, &format!("{prefix}.in_proj_z.weight"))?;
-        let w_b   = LinearProjection::take(weights, &format!("{prefix}.in_proj_b.weight"))?;
-        let w_a   = LinearProjection::take(weights, &format!("{prefix}.in_proj_a.weight"))?;
+        let w_z = LinearProjection::take(weights, &format!("{prefix}.in_proj_z.weight"))?;
+        let w_b = LinearProjection::take(weights, &format!("{prefix}.in_proj_b.weight"))?;
+        let w_a = LinearProjection::take(weights, &format!("{prefix}.in_proj_a.weight"))?;
         let in_proj_all = cat_projs(vec![w_qkv, w_z, w_b, w_a]);
         let proj_split = [
             conv_dim as i64,
@@ -628,10 +699,25 @@ impl GatedDeltaNetLayer {
         let all_proj = self.in_proj_all.apply(&h2); // [batch*seq, conv_dim+val_dim+2*nv]
         let [cd, vd, nv_d, _] = self.proj_split;
         let mut off = 0i64;
-        let mixed_qkv = all_proj.narrow(1, off, cd).contiguous().reshape([batch, seq, cd]); off += cd;
-        let z         = all_proj.narrow(1, off, vd).contiguous().reshape([batch, seq, vd]); off += vd;
-        let b         = all_proj.narrow(1, off, nv_d).contiguous().reshape([batch, seq, nv_d]); off += nv_d;
-        let a_in      = all_proj.narrow(1, off, nv_d).contiguous().reshape([batch, seq, nv_d]);
+        let mixed_qkv = all_proj
+            .narrow(1, off, cd)
+            .contiguous()
+            .reshape([batch, seq, cd]);
+        off += cd;
+        let z = all_proj
+            .narrow(1, off, vd)
+            .contiguous()
+            .reshape([batch, seq, vd]);
+        off += vd;
+        let b = all_proj
+            .narrow(1, off, nv_d)
+            .contiguous()
+            .reshape([batch, seq, nv_d]);
+        off += nv_d;
+        let a_in = all_proj
+            .narrow(1, off, nv_d)
+            .contiguous()
+            .reshape([batch, seq, nv_d]);
 
         // Depthwise causal conv1d on mixed_qkv
         // mixed_qkv: [batch, seq, conv_dim] → need [batch, conv_dim, seq] for conv1d
@@ -645,7 +731,7 @@ impl GatedDeltaNetLayer {
             Some(ref cs) => {
                 // Prepend previous state for causal context
                 let padded = Tensor::cat(&[cs, &x_t], 2); // [batch, conv_dim, prev+seq]
-                // Keep last kernel_size-1 frames as new state
+                                                          // Keep last kernel_size-1 frames as new state
                 let total = padded.size()[2];
                 let new_state = padded.narrow(2, total - (ks - 1), ks - 1).contiguous();
                 (padded, new_state)
@@ -666,10 +752,10 @@ impl GatedDeltaNetLayer {
         let conv_out = x_for_conv.conv1d(
             &self.conv1d_weight,
             None::<&Tensor>,
-            &[1i64],      // stride=1
-            &[0i64],      // padding=0 (handled manually)
-            &[1i64],      // dilation=1
-            conv_dim,     // groups
+            &[1i64],  // stride=1
+            &[0i64],  // padding=0 (handled manually)
+            &[1i64],  // dilation=1
+            conv_dim, // groups
         ); // [batch, conv_dim, seq]
         let conv_out = conv_out.silu().permute([0, 2, 1]); // [batch, seq, conv_dim]
 
@@ -704,9 +790,9 @@ impl GatedDeltaNetLayer {
         let hk = self.head_k_dim as i64;
         let hv = self.head_v_dim as i64;
 
-        let state_init = rec_state.take().unwrap_or_else(|| {
-            Tensor::zeros([batch, nv, hk, hv], (Kind::Float, device))
-        });
+        let state_init = rec_state
+            .take()
+            .unwrap_or_else(|| Tensor::zeros([batch, nv, hk, hv], (Kind::Float, device)));
 
         let b_f = b.to_kind(Kind::Float).sigmoid(); // [batch, seq, num_v_heads]
         let v_f = v.to_kind(Kind::Float); // [batch, seq, num_v_heads, head_v_dim]
@@ -719,7 +805,8 @@ impl GatedDeltaNetLayer {
             k.to_kind(Kind::Float)
         } else {
             let repeats = (self.num_v_heads / self.num_k_heads) as i64;
-            k.repeat_interleave_self_int(repeats, 2, None).to_kind(Kind::Float)
+            k.repeat_interleave_self_int(repeats, 2, None)
+                .to_kind(Kind::Float)
         };
         // q similarly expanded with repeat_interleave
         let q_for_state = if self.num_k_heads == self.num_v_heads {
@@ -750,7 +837,8 @@ impl GatedDeltaNetLayer {
             let kv_mem = k_col.bmm(&state_3d).reshape([batch, nv, hv]);
             let delta = (v_t - kv_mem) * b_t.unsqueeze(-1);
             // outer product update: state[h,k,v] += k[h,k] * delta[h,v]
-            let state = state.reshape([batch, nv, hk, hv]) + k_t.unsqueeze(-1) * delta.unsqueeze(-2);
+            let state =
+                state.reshape([batch, nv, hk, hv]) + k_t.unsqueeze(-1) * delta.unsqueeze(-2);
             // BMM-based output readout
             let state_3d = state.reshape([batch * nv, hk, hv]);
             let q_col = q_t.reshape([batch * nv, 1, hk]);
@@ -762,23 +850,25 @@ impl GatedDeltaNetLayer {
         } else {
             // --- Prefill path: chunked GatedDeltaNet ---
             // Reorder to [batch, nv, seq, dim] for chunked_delta_rule
-            let q_h = q_for_state.permute([0, 2, 1, 3]);  // [B, nv, T, hk]
+            let q_h = q_for_state.permute([0, 2, 1, 3]); // [B, nv, T, hk]
             let k_h = k_for_state.permute([0, 2, 1, 3]);
-            let v_h = v_f.permute([0, 2, 1, 3]);           // [B, nv, T, hv]
-            let g_h = g.permute([0, 2, 1]);                 // [B, nv, T]
-            let b_h = b_f.permute([0, 2, 1]);               // [B, nv, T]
+            let v_h = v_f.permute([0, 2, 1, 3]); // [B, nv, T, hv]
+            let g_h = g.permute([0, 2, 1]); // [B, nv, T]
+            let b_h = b_f.permute([0, 2, 1]); // [B, nv, T]
 
             // The previous state was moved out above. Use that owned state
             // for cached multi-token continuation, just as single-token decode does.
-            let (out_h, new_state) = chunked_delta_rule(
-                &q_h, &k_h, &v_h, &g_h, &b_h, Some(&state_init), device,
-            )?;
+            let (out_h, new_state) =
+                chunked_delta_rule(&q_h, &k_h, &v_h, &g_h, &b_h, Some(&state_init), device)?;
             // out_h: [B, nv, T, hv]
             *rec_state = Some(new_state);
 
             // Transpose back to [B, T, nv, hv] and flatten to [B, T, nv*hv]
             // Flatten [B, nv, T, hv] → [B, T, nv*hv]
-            out_h.permute([0, 2, 1, 3]).contiguous().reshape([batch, seq, -1])
+            out_h
+                .permute([0, 2, 1, 3])
+                .contiguous()
+                .reshape([batch, seq, -1])
         };
 
         // Gated norm and output projection
@@ -791,9 +881,13 @@ impl GatedDeltaNetLayer {
 
         let out_4d = out.reshape([batch, seq, actual_nv, actual_hv]);
         let z_4d = z_f.reshape([batch, seq, actual_nv, actual_hv]);
-        let normed = self.norm.forward(&out_4d, &z_4d)?;  // out_4d may be F32 from recurrent step; RMSNormGated handles both
-        // Ensure output matches model dtype for out_proj matmul (weight is BF16)
-        let normed = if normed.kind() != dtype { normed.to_kind(dtype) } else { normed };
+        let normed = self.norm.forward(&out_4d, &z_4d)?; // out_4d may be F32 from recurrent step; RMSNormGated handles both
+                                                         // Ensure output matches model dtype for out_proj matmul (weight is BF16)
+        let normed = if normed.kind() != dtype {
+            normed.to_kind(dtype)
+        } else {
+            normed
+        };
         let flat = normed.reshape([batch * seq, actual_vd]);
 
         let projected = self.out_proj.apply(&flat);
@@ -844,9 +938,9 @@ impl GatedDeltaNetLayer {
 
 struct Qwen3_5FullAttention {
     qkv_proj: LinearProjection, // fused: hidden → (q_out + k_out + v_out)
-    qkv_split: [i64; 3],       // [q_dim, k_dim, v_dim] for narrow splits
+    qkv_split: [i64; 3],        // [q_dim, k_dim, v_dim] for narrow splits
     o_proj: LinearProjection,   // in: num_heads * head_dim
-    q_norm: Qwen3_5RMSNorm,    // per-head, weight dim = head_dim
+    q_norm: Qwen3_5RMSNorm,     // per-head, weight dim = head_dim
     k_norm: Qwen3_5RMSNorm,
     num_heads: usize,
     num_kv_heads: usize,
@@ -976,9 +1070,9 @@ impl Qwen3_5FullAttention {
         // Split query and gate (from doubled q_proj output)
         // Reference: gate.reshape(batch, seq, num_heads * head_dim), then * sigmoid(gate) before o_proj
         let q_full = q_out.reshape([batch, seq, nh, hd * 2]);
-        let query = q_full.narrow(3, 0, hd);  // [batch, seq, nh, head_dim]
-        let gate = q_full.narrow(3, hd, hd);  // [batch, seq, nh, head_dim]
-        // gate will be applied as sigmoid(gate.reshape(batch, seq, nh*hd)) * attn_output BEFORE o_proj
+        let query = q_full.narrow(3, 0, hd); // [batch, seq, nh, head_dim]
+        let gate = q_full.narrow(3, hd, hd); // [batch, seq, nh, head_dim]
+                                             // gate will be applied as sigmoid(gate.reshape(batch, seq, nh*hd)) * attn_output BEFORE o_proj
 
         let mut k = k_out.reshape([batch, seq, nkv, hd]);
         let v = v_out.reshape([batch, seq, nkv, hd]);
@@ -990,11 +1084,18 @@ impl Qwen3_5FullAttention {
         // Partial RoPE: rotate first rotary_dim dims, pass through rest
         let rd = self.rotary_dim as i64;
         let (query, k) = if rd > 0 {
-            let query_rot = self.apply_rope(&query.narrow(3, 0, rd), position_ids, start_pos, device, dtype)?;
+            let query_rot = self.apply_rope(
+                &query.narrow(3, 0, rd),
+                position_ids,
+                start_pos,
+                device,
+                dtype,
+            )?;
             let query_pass = query.narrow(3, rd, hd - rd);
             let query = Tensor::cat(&[query_rot, query_pass], 3);
 
-            let k_rot = self.apply_rope(&k.narrow(3, 0, rd), position_ids, start_pos, device, dtype)?;
+            let k_rot =
+                self.apply_rope(&k.narrow(3, 0, rd), position_ids, start_pos, device, dtype)?;
             let k_pass = k.narrow(3, rd, hd - rd);
             let k = Tensor::cat(&[k_rot, k_pass], 3);
             (query, k)
@@ -1024,9 +1125,18 @@ impl Qwen3_5FullAttention {
         // (q_seq == 1) and short prompts take the single-shot branch unchanged.
         const ATTN_CHUNK: i64 = 1024;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let q_p = query.permute([0, 2, 1, 3]).to_kind(Kind::Float).contiguous();
-        let k_p = k_exp.permute([0, 2, 3, 1]).to_kind(Kind::Float).contiguous();
-        let v_p = v_exp.permute([0, 2, 1, 3]).to_kind(Kind::Float).contiguous();
+        let q_p = query
+            .permute([0, 2, 1, 3])
+            .to_kind(Kind::Float)
+            .contiguous();
+        let k_p = k_exp
+            .permute([0, 2, 3, 1])
+            .to_kind(Kind::Float)
+            .contiguous();
+        let v_p = v_exp
+            .permute([0, 2, 1, 3])
+            .to_kind(Kind::Float)
+            .contiguous();
 
         let q_len = q_p.size()[2];
         let kv_len = k_p.size()[3];
@@ -1037,7 +1147,8 @@ impl Qwen3_5FullAttention {
                 // absolute position (kv_len - q_len) + i, so it may attend keys
                 // 0..=(kv_len - q_len + i). tril(0) would mask out all history
                 // whenever start_pos > 0 (partial prefill, speculative verify).
-                let mask = Tensor::ones([q_len, kv_len], (Kind::Float, device)).tril(kv_len - q_len);
+                let mask =
+                    Tensor::ones([q_len, kv_len], (Kind::Float, device)).tril(kv_len - q_len);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
             }
@@ -1055,7 +1166,8 @@ impl Qwen3_5FullAttention {
                 let cur = (q_len - start).min(ATTN_CHUNK);
                 let q_chunk = q_p.narrow(2, start, cur); // [batch, heads, cur, head_dim]
                 let mut scores = q_chunk.matmul(&k_p) * scale; // [batch, heads, cur, kv_seq]
-                let mask = Tensor::ones([cur, kv_len], (Kind::Float, device)).tril(kv_len - q_len + start);
+                let mask =
+                    Tensor::ones([cur, kv_len], (Kind::Float, device)).tril(kv_len - q_len + start);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
                 let attn = scores.softmax(-1, Kind::Float).to_kind(dtype);
@@ -1123,7 +1235,11 @@ impl Qwen3_5FullAttention {
         let rd = self.rotary_dim as i64;
         let seq = x.size()[1];
         let pos_ids = position_ids.map(|p| p.shallow_clone()).unwrap_or_else(|| {
-            Tensor::arange_start(start_pos as i64, start_pos as i64 + seq, (Kind::Int64, device))
+            Tensor::arange_start(
+                start_pos as i64,
+                start_pos as i64 + seq,
+                (Kind::Int64, device),
+            )
         });
 
         ROPE_CACHE.with(|cache| {
@@ -1131,9 +1247,13 @@ impl Qwen3_5FullAttention {
             let key = (self.layer_idx, self.rope_theta.to_bits(), device_key);
             let rope = match cache.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(RoPE::new_with_dtype(rd, self.rope_theta as f64, self.max_pos as i64, device, dtype)?)
-                }
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(RoPE::new_with_dtype(
+                    rd,
+                    self.rope_theta as f64,
+                    self.max_pos as i64,
+                    device,
+                    dtype,
+                )?),
             };
             rope.forward(x, Some(&pos_ids))
         })
@@ -1172,15 +1292,15 @@ unsafe impl Send for Qwen3_5Expert {}
 unsafe impl Sync for Qwen3_5Expert {}
 
 struct Qwen3_5SparseMoE {
-    gate: LinearProjection,     // router: [hidden, num_experts]
+    gate: LinearProjection, // router: [hidden, num_experts]
     // Stacked expert weights — [num_experts, in_dim, out_dim], kept in FP8 to save VRAM.
     // Companion scales — [num_experts, in/128, out/128], BF16. None for non-FP8 weights.
     // Dequantized lazily after index_select (only k=8 experts per forward, not all 256).
-    expert_gate_w: Tensor,               // [num_experts, hidden, moe_int]  FP8 or BF16
-    expert_gate_scale: Option<Tensor>,   // [num_experts, hidden/128, moe_int/128]
-    expert_up_w: Tensor,                 // [num_experts, hidden, moe_int]
+    expert_gate_w: Tensor, // [num_experts, hidden, moe_int]  FP8 or BF16
+    expert_gate_scale: Option<Tensor>, // [num_experts, hidden/128, moe_int/128]
+    expert_up_w: Tensor,   // [num_experts, hidden, moe_int]
     expert_up_scale: Option<Tensor>,
-    expert_down_w: Tensor,               // [num_experts, moe_int, hidden]
+    expert_down_w: Tensor, // [num_experts, moe_int, hidden]
     expert_down_scale: Option<Tensor>,
     shared_expert: Qwen3_5Expert,
     /// Optional gating weight for shared expert: [hidden, 1] (transposed from [1, hidden]).
@@ -1199,9 +1319,9 @@ impl Qwen3_5SparseMoE {
 
         // Router — topK on raw logits, then softmax over selected experts only.
         // Avoids softmax over all 256 experts + renormalize div+sum.
-        let logits = self.gate.apply(x);  // [batch, num_experts]
+        let logits = self.gate.apply(x); // [batch, num_experts]
         let (top_logits, top_ids) = logits.topk(k, -1, true, true);
-        let top_weights = top_logits.softmax(-1, dtype);  // softmax over k=8 only
+        let top_weights = top_logits.softmax(-1, dtype); // softmax over k=8 only
 
         // Gather expert weights on GPU — no CPU sync.
         // top_ids: [batch, k] → [batch*k]
@@ -1210,16 +1330,23 @@ impl Qwen3_5SparseMoE {
         // Select k experts and dequantize FP8 → BF16 (only k=8 of 256, not all at once).
         let gate_sel = dequant_batched(
             &self.expert_gate_w.index_select(0, &top_ids_flat),
-            self.expert_gate_scale.as_ref().map(|s| s.index_select(0, &top_ids_flat)).as_ref(),
-        );  // [batch*k, hidden, moe_int] BF16
+            self.expert_gate_scale
+                .as_ref()
+                .map(|s| s.index_select(0, &top_ids_flat))
+                .as_ref(),
+        ); // [batch*k, hidden, moe_int] BF16
         let up_sel = dequant_batched(
             &self.expert_up_w.index_select(0, &top_ids_flat),
-            self.expert_up_scale.as_ref().map(|s| s.index_select(0, &top_ids_flat)).as_ref(),
+            self.expert_up_scale
+                .as_ref()
+                .map(|s| s.index_select(0, &top_ids_flat))
+                .as_ref(),
         );
 
         // Repeat input k times: [batch*k, hidden]
         let x_rep = if x.kind() != tch::Kind::BFloat16 {
-            x.repeat_interleave_self_int(k, 0, None).to_kind(tch::Kind::BFloat16)
+            x.repeat_interleave_self_int(k, 0, None)
+                .to_kind(tch::Kind::BFloat16)
         } else {
             x.repeat_interleave_self_int(k, 0, None)
         };
@@ -1235,15 +1362,25 @@ impl Qwen3_5SparseMoE {
         // [batch*k, 1, moe_int] × [batch*k, moe_int, hidden] → [batch*k, hidden]
         let down_sel = dequant_batched(
             &self.expert_down_w.index_select(0, &top_ids_flat),
-            self.expert_down_scale.as_ref().map(|s| s.index_select(0, &top_ids_flat)).as_ref(),
-        );  // [batch*k, moe_int, hidden] BF16
-        let expert_out = (gate_out * up_out).unsqueeze(1).bmm(&down_sel).squeeze_dim(1);
+            self.expert_down_scale
+                .as_ref()
+                .map(|s| s.index_select(0, &top_ids_flat))
+                .as_ref(),
+        ); // [batch*k, moe_int, hidden] BF16
+        let expert_out = (gate_out * up_out)
+            .unsqueeze(1)
+            .bmm(&down_sel)
+            .squeeze_dim(1);
 
         // Weighted sum: [batch, k, hidden], then reduce over k.
         let expert_out = expert_out.reshape([batch, k, hidden]);
         let output = (expert_out * top_weights.unsqueeze(-1).to_kind(tch::Kind::BFloat16))
             .sum_dim_intlist(&[1i64][..], false, None);
-        let output = if dtype != tch::Kind::BFloat16 { output.to_kind(dtype) } else { output };
+        let output = if dtype != tch::Kind::BFloat16 {
+            output.to_kind(dtype)
+        } else {
+            output
+        };
 
         let shared_out = self.shared_expert.forward(x)?;
         let shared_out = if let Some(gate_proj) = &self.shared_expert_gate {
@@ -1393,12 +1530,12 @@ unsafe impl Sync for Qwen3_5Layer {}
 struct Qwen3_5MtpHead {
     pre_fc_norm_hidden: Qwen3_5RMSNorm,
     pre_fc_norm_embedding: Qwen3_5RMSNorm,
-    fc: LinearProjection,           // in: 2*hidden, out: hidden (no bias)
+    fc: LinearProjection, // in: 2*hidden, out: hidden (no bias)
     attn: Qwen3_5FullAttention,
-    mlp: LlamaMLP,                  // dense SwiGLU
+    mlp: LlamaMLP, // dense SwiGLU
     input_layernorm: Qwen3_5RMSNorm,
     post_attention_layernorm: Qwen3_5RMSNorm,
-    final_norm: Qwen3_5RMSNorm,     // mtp.norm — before the shared lm_head
+    final_norm: Qwen3_5RMSNorm, // mtp.norm — before the shared lm_head
 }
 
 unsafe impl Send for Qwen3_5MtpHead {}
@@ -1445,10 +1582,16 @@ impl Qwen3_5MtpHead {
             fc: LinearProjection::take(weights, "mtp.fc.weight")?,
             attn,
             mlp,
-            input_layernorm: take_norm(weights, &format!("{layer_prefix}.input_layernorm.weight"), eps)?,
-            post_attention_layernorm: take_norm(weights, &format!(
-                "{layer_prefix}.post_attention_layernorm.weight"
-            ), eps)?,
+            input_layernorm: take_norm(
+                weights,
+                &format!("{layer_prefix}.input_layernorm.weight"),
+                eps,
+            )?,
+            post_attention_layernorm: take_norm(
+                weights,
+                &format!("{layer_prefix}.post_attention_layernorm.weight"),
+                eps,
+            )?,
             final_norm: take_norm(weights, "mtp.norm.weight", eps)?,
         })
     }
@@ -1480,8 +1623,8 @@ pub struct Qwen3_5Model {
     embed_tokens: Tensor,
     layers: Vec<Qwen3_5Layer>,
     norm: Qwen3_5RMSNorm,
-    lm_head: Option<Tensor>,             // None = tied to embed_tokens
-    lm_head_transposed: Option<Tensor>,  // pre-transposed tied weights
+    lm_head: Option<Tensor>,            // None = tied to embed_tokens
+    lm_head_transposed: Option<Tensor>, // pre-transposed tied weights
     // Interior-mutable SSM state (required because forward_with_cache takes &self).
     // Sized to the OWNED layer count (== self.layers.len()), indexed by LOCAL
     // layer index. Stage-local: never transferred across a pipeline boundary.
@@ -1516,7 +1659,9 @@ impl Qwen3_5Model {
         // Normalize weight key prefixes:
         // Qwen3.5 Instruct weights use "model.language_model." and "model.visual." prefixes
         // Strip these so the rest of the loader sees the expected flat names
-        let needs_remap = weights.keys().any(|k| k.starts_with("model.language_model."));
+        let needs_remap = weights
+            .keys()
+            .any(|k| k.starts_with("model.language_model."));
         if needs_remap {
             info!("Remapping Qwen3.5 weight prefixes (model.language_model.* → *, model.visual.* → visual.*)");
             let remapped: HashMap<String, Tensor> = weights
@@ -1541,7 +1686,10 @@ impl Qwen3_5Model {
         let has_vision = weights.keys().any(|k| k.starts_with("visual."));
         let (vision_encoder, vision_projector) = if has_vision {
             if let Some(vcfg) = vision_cfg {
-                info!("Loading Qwen3.5 vision encoder (out_hidden_size={})", vcfg.out_hidden_size);
+                info!(
+                    "Loading Qwen3.5 vision encoder (out_hidden_size={})",
+                    vcfg.out_hidden_size
+                );
                 let out_hidden = vcfg.out_hidden_size;
                 let text_hidden = cfg.hidden_size;
                 // Best-effort: vision key naming varies across model sizes; skip on error
@@ -1558,7 +1706,10 @@ impl Qwen3_5Model {
                             Some(LinearProjection::take(weights, key)?)
                         } else {
                             info!("No vision_projector weights found; vision output will be zeros");
-                            let w = Tensor::zeros([out_hidden as i64, text_hidden as i64], (dtype, *device));
+                            let w = Tensor::zeros(
+                                [out_hidden as i64, text_hidden as i64],
+                                (dtype, *device),
+                            );
                             Some(LinearProjection::new(w))
                         };
                         (Some(enc), projector)
@@ -1599,11 +1750,15 @@ impl Qwen3_5Model {
             } else {
                 match Qwen3_5MtpHead::load(weights, &cfg) {
                     Ok(head) => {
-                        info!("Loaded Qwen3.5 MTP draft head (self-speculative decoding available)");
+                        info!(
+                            "Loaded Qwen3.5 MTP draft head (self-speculative decoding available)"
+                        );
                         Some(head)
                     }
                     Err(e) => {
-                        info!("MTP head load failed ({e}); continuing without speculative decoding");
+                        info!(
+                            "MTP head load failed ({e}); continuing without speculative decoding"
+                        );
                         weights.retain(|k, _| !k.starts_with("mtp."));
                         None
                     }
@@ -1617,10 +1772,12 @@ impl Qwen3_5Model {
         // `into_device` move that `stage_from_weights_with_config` applies.
         // Without this, constructing from CPU weights with device=Cuda(0)
         // leaves embed/norm/lm_head on CPU — a mixed-device model.
-        let embed = weights.remove("model.embed_tokens.weight")
+        let embed = weights
+            .remove("model.embed_tokens.weight")
             .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?
             .to_device(*device);
-        let norm_w = weights.remove("model.norm.weight")
+        let norm_w = weights
+            .remove("model.norm.weight")
             .ok_or_else(|| anyhow!("Missing model.norm.weight"))?
             .to_device(*device);
         let lm_head_w = if let Some(w) = weights.remove("lm_head.weight") {
@@ -1632,12 +1789,14 @@ impl Qwen3_5Model {
                     let w_bf = w.to_kind(tch::Kind::BFloat16);
                     if let Some(s) = weights.remove("lm_head.weight_scale_inv") {
                         // scale stored as [vocab/128, hidden/128]; apply block-wise
-                        let ws = w_bf.size();  // [vocab, hidden]
-                        let ss = s.size();     // [vocab/128, hidden/128]
+                        let ws = w_bf.size(); // [vocab, hidden]
+                        let ss = s.size(); // [vocab/128, hidden/128]
                         let br = ws[0] / ss[0];
                         let bc = ws[1] / ss[1];
                         let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
-                        let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1i64, ss[1], 1i64]);
+                        let s_4d = s
+                            .to_kind(tch::Kind::BFloat16)
+                            .view([ss[0], 1i64, ss[1], 1i64]);
                         Some((w_4d * s_4d).reshape([ws[0], ws[1]]).to_device(*device))
                     } else {
                         Some(w_bf.to_device(*device))
@@ -1659,7 +1818,9 @@ impl Qwen3_5Model {
         let lm_head_transposed = if lm_head_w.is_none() {
             // embed may be FP8; cast to BF16 for matmul
             let embed_bf16 = match embed.kind() {
-                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => embed.to_kind(tch::Kind::BFloat16),
+                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
+                    embed.to_kind(tch::Kind::BFloat16)
+                }
                 _ => embed.shallow_clone(),
             };
             Some(embed_bf16.tr().contiguous())
@@ -1736,23 +1897,41 @@ impl Qwen3_5Model {
                 let ep = format!("{prefix}.experts.{e}");
                 // These tensors go straight into batched stacks, never apply().
                 // Avoid constructing per-projection acceleration metadata.
-                let (g, gs) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.gate_proj.weight"))?;
-                let (u, us) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.up_proj.weight"))?;
-                let (d, ds) = LinearProjection::take_weight_and_scale(weights, &format!("{ep}.down_proj.weight"))?;
+                let (g, gs) = LinearProjection::take_weight_and_scale(
+                    weights,
+                    &format!("{ep}.gate_proj.weight"),
+                )?;
+                let (u, us) = LinearProjection::take_weight_and_scale(
+                    weights,
+                    &format!("{ep}.up_proj.weight"),
+                )?;
+                let (d, ds) = LinearProjection::take_weight_and_scale(
+                    weights,
+                    &format!("{ep}.down_proj.weight"),
+                )?;
                 gate_w_vecs.push(g.unsqueeze(0));
-                if let Some(s) = gs { gate_s_vecs.push(s.unsqueeze(0)); }
+                if let Some(s) = gs {
+                    gate_s_vecs.push(s.unsqueeze(0));
+                }
                 up_w_vecs.push(u.unsqueeze(0));
-                if let Some(s) = us { up_s_vecs.push(s.unsqueeze(0)); }
+                if let Some(s) = us {
+                    up_s_vecs.push(s.unsqueeze(0));
+                }
                 down_w_vecs.push(d.unsqueeze(0));
-                if let Some(s) = ds { down_s_vecs.push(s.unsqueeze(0)); }
+                if let Some(s) = ds {
+                    down_s_vecs.push(s.unsqueeze(0));
+                }
             }
             // Stack: [num_experts, in, out] (FP8) + optional [num_experts, in/128, out/128] scale
-            let expert_gate_w     = Tensor::cat(&gate_w_vecs.iter().collect::<Vec<_>>(), 0);
-            let expert_gate_scale = (!gate_s_vecs.is_empty()).then(|| Tensor::cat(&gate_s_vecs.iter().collect::<Vec<_>>(), 0));
-            let expert_up_w       = Tensor::cat(&up_w_vecs.iter().collect::<Vec<_>>(), 0);
-            let expert_up_scale   = (!up_s_vecs.is_empty()).then(|| Tensor::cat(&up_s_vecs.iter().collect::<Vec<_>>(), 0));
-            let expert_down_w     = Tensor::cat(&down_w_vecs.iter().collect::<Vec<_>>(), 0);
-            let expert_down_scale = (!down_s_vecs.is_empty()).then(|| Tensor::cat(&down_s_vecs.iter().collect::<Vec<_>>(), 0));
+            let expert_gate_w = Tensor::cat(&gate_w_vecs.iter().collect::<Vec<_>>(), 0);
+            let expert_gate_scale = (!gate_s_vecs.is_empty())
+                .then(|| Tensor::cat(&gate_s_vecs.iter().collect::<Vec<_>>(), 0));
+            let expert_up_w = Tensor::cat(&up_w_vecs.iter().collect::<Vec<_>>(), 0);
+            let expert_up_scale = (!up_s_vecs.is_empty())
+                .then(|| Tensor::cat(&up_s_vecs.iter().collect::<Vec<_>>(), 0));
+            let expert_down_w = Tensor::cat(&down_w_vecs.iter().collect::<Vec<_>>(), 0);
+            let expert_down_scale = (!down_s_vecs.is_empty())
+                .then(|| Tensor::cat(&down_s_vecs.iter().collect::<Vec<_>>(), 0));
 
             let sp = format!("{prefix}.shared_expert");
             let shared = Qwen3_5Expert {
@@ -1761,9 +1940,9 @@ impl Qwen3_5Model {
                 down_proj: LinearProjection::take(weights, &format!("{sp}.down_proj.weight"))?,
             };
             // Optional gating scalar for shared expert (present in 35B FP8, not all models).
-            let shared_expert_gate = LinearProjection::take(
-                weights, &format!("{prefix}.shared_expert_gate.weight")
-            ).ok();
+            let shared_expert_gate =
+                LinearProjection::take(weights, &format!("{prefix}.shared_expert_gate.weight"))
+                    .ok();
 
             Ok(Qwen3_5Mlp::Sparse(Qwen3_5SparseMoE {
                 gate: gate_proj,
@@ -1908,7 +2087,9 @@ impl Qwen3_5Model {
             let norm_w = weights
                 .remove("model.norm.weight")
                 .map(|w| w.to_device(stage_device))
-                .ok_or_else(|| anyhow!("stage_from_weights: last stage requires model.norm.weight"))?;
+                .ok_or_else(|| {
+                    anyhow!("stage_from_weights: last stage requires model.norm.weight")
+                })?;
             let lm_head_w = weights.remove("lm_head.weight").map(|w| {
                 // Cast FP8 lm_head to BF16 (applying companion scale), mirroring
                 // from_weights. On the test path (plain f32) this is a no-op clone.
@@ -1921,8 +2102,12 @@ impl Qwen3_5Model {
                             let br = ws[0] / ss[0];
                             let bc = ws[1] / ss[1];
                             let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
-                            let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1i64, ss[1], 1i64]);
-                            (w_4d * s_4d).reshape([ws[0], ws[1]]).to_device(stage_device)
+                            let s_4d = s
+                                .to_kind(tch::Kind::BFloat16)
+                                .view([ss[0], 1i64, ss[1], 1i64]);
+                            (w_4d * s_4d)
+                                .reshape([ws[0], ws[1]])
+                                .to_device(stage_device)
                         } else {
                             w_bf.to_device(stage_device)
                         }
@@ -1945,7 +2130,9 @@ impl Qwen3_5Model {
                 ));
             }
             let embed_bf16 = match embed.kind() {
-                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => embed.to_kind(tch::Kind::BFloat16),
+                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
+                    embed.to_kind(tch::Kind::BFloat16)
+                }
                 _ => embed.shallow_clone(),
             };
             Some(embed_bf16.tr().contiguous())
@@ -2057,14 +2244,23 @@ impl Qwen3_5Model {
             let delta_arg = delta.map(|d| (d, idx));
 
             let mixer_out = match &layer.mixer {
-                LayerMixer::LinearAttn(gdn) => {
-                    gdn.forward(&hidden, &mut conv_guard[idx], &mut rec_guard[idx], delta_arg)?
-                }
+                LayerMixer::LinearAttn(gdn) => gdn.forward(
+                    &hidden,
+                    &mut conv_guard[idx],
+                    &mut rec_guard[idx],
+                    delta_arg,
+                )?,
                 LayerMixer::FullAttn(attn) => {
                     if let Some(ref cache_arc) = self.kv_cache {
                         let kv = cache_arc.lock();
                         kv.with_layer_cache(idx, |lc| {
-                            attn.forward(&hidden, Some(&position_ids), Some(lc), start_pos, delta_arg)
+                            attn.forward(
+                                &hidden,
+                                Some(&position_ids),
+                                Some(lc),
+                                start_pos,
+                                delta_arg,
+                            )
                         })
                         .ok_or_else(|| anyhow!("No KV cache for layer {idx}"))??
                     } else {
@@ -2167,7 +2363,13 @@ impl Qwen3_5Model {
                     if let Some(ref cache_arc) = self.kv_cache {
                         let kv = cache_arc.lock();
                         kv.with_layer_cache(local_idx, |lc| {
-                            attn.forward(&hidden, Some(&position_ids), Some(lc), start_pos, delta_arg)
+                            attn.forward(
+                                &hidden,
+                                Some(&position_ids),
+                                Some(lc),
+                                start_pos,
+                                delta_arg,
+                            )
                         })
                         .ok_or_else(|| anyhow!("No KV cache for local layer {local_idx}"))??
                     } else {
@@ -2229,16 +2431,13 @@ impl Qwen3_5Model {
         // Training path: start_pos is always 0 → position_ids = 0..seq, built on
         // the input device and moved alongside `hidden` at each device boundary.
         let seq = hidden.size()[1];
-        let mut position_ids =
-            Tensor::arange(seq, (Kind::Int64, hidden.device()));
+        let mut position_ids = Tensor::arange(seq, (Kind::Int64, hidden.device()));
 
         // Fresh, call-local SSM state — never touches the persistent inference
         // `conv_states`/`rec_states`. Sized to the OWNED layer count and indexed
         // locally, mirroring the persistent vectors' sizing.
-        let mut conv_local: Vec<Option<Tensor>> =
-            (0..self.layers.len()).map(|_| None).collect();
-        let mut rec_local: Vec<Option<Tensor>> =
-            (0..self.layers.len()).map(|_| None).collect();
+        let mut conv_local: Vec<Option<Tensor>> = (0..self.layers.len()).map(|_| None).collect();
+        let mut rec_local: Vec<Option<Tensor>> = (0..self.layers.len()).map(|_| None).collect();
 
         for g in range {
             let local_idx = g - self.layer_offset;
@@ -2287,9 +2486,13 @@ impl Qwen3_5Model {
     /// pixel_values: [B, C, H, W]
     /// Returns: [total_image_patches, hidden_size]
     fn encode_vision_features(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let enc = self.vision_encoder.as_ref()
+        let enc = self
+            .vision_encoder
+            .as_ref()
             .ok_or_else(|| anyhow!("No vision encoder loaded"))?;
-        let proj = self.vision_projector.as_ref()
+        let proj = self
+            .vision_projector
+            .as_ref()
             .ok_or_else(|| anyhow!("No vision projector loaded"))?;
 
         // [B * out_patches, out_hidden_size]
@@ -2313,28 +2516,37 @@ impl Qwen3_5Model {
         let flat = input_ids.flatten(0, -1);
         let text_emb = self.embed_tokens.index_select(0, &flat);
         let ids_shape = input_ids.size();
-        let hidden_sz = text_emb.size().last().copied().unwrap_or(self.config.hidden_size as i64);
+        let hidden_sz = text_emb
+            .size()
+            .last()
+            .copied()
+            .unwrap_or(self.config.hidden_size as i64);
         let combined = text_emb.reshape([ids_shape[0], ids_shape[1], hidden_sz]);
 
         // If we have pixel_values and a sequence mask, inject vision embeddings
         if let (Some(pv), Some(mask)) = (pixel_values, images_seq_mask) {
             let vision_feats = self.encode_vision_features(pv)?; // [N_img, hidden]
-            // mask: [batch, seq] bool tensor marking where to inject
-            // Flatten and scatter vision features into combined at masked positions
+                                                                 // mask: [batch, seq] bool tensor marking where to inject
+                                                                 // Flatten and scatter vision features into combined at masked positions
             let (batch, seq, hs) = dims3(&combined)?;
             for b in 0..batch {
                 let mask_b = mask.select(0, b).to_kind(Kind::Bool); // [seq]
                 let positions: Vec<i64> = (0..seq)
                     .filter(|&t| mask_b.double_value(&[t]) != 0.0)
                     .collect();
-                if positions.is_empty() { continue; }
+                if positions.is_empty() {
+                    continue;
+                }
                 // Slice vision_feats to match the number of masked positions
                 let n_img = positions.len() as i64;
                 let vf_slice = vision_feats.narrow(0, 0, n_img.min(vision_feats.size()[0]));
                 for (img_idx, &pos) in positions.iter().enumerate() {
                     if (img_idx as i64) < vf_slice.size()[0] {
                         let vf = vf_slice.select(0, img_idx as i64); // [hidden]
-                        combined.select(0, b).select(0, pos).copy_(&vf.to_kind(self.dtype));
+                        combined
+                            .select(0, b)
+                            .select(0, pos)
+                            .copy_(&vf.to_kind(self.dtype));
                     }
                 }
             }
@@ -2355,11 +2567,17 @@ impl Qwen3_5Model {
     pub fn snapshot_ssm_states(&self) -> (Vec<Option<Tensor>>, Vec<Option<Tensor>>) {
         let conv_snapshot = {
             let guard = self.conv_states.lock();
-            guard.iter().map(|opt| opt.as_ref().map(|t| t.copy())).collect()
+            guard
+                .iter()
+                .map(|opt| opt.as_ref().map(|t| t.copy()))
+                .collect()
         };
         let rec_snapshot = {
             let guard = self.rec_states.lock();
-            guard.iter().map(|opt| opt.as_ref().map(|t| t.copy())).collect()
+            guard
+                .iter()
+                .map(|opt| opt.as_ref().map(|t| t.copy()))
+                .collect()
         };
         (conv_snapshot, rec_snapshot)
     }
@@ -2391,7 +2609,9 @@ impl Qwen3_5Model {
         position_ids: Option<&Tensor>,
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
-        let layer = self.layers.get(layer_idx)
+        let layer = self
+            .layers
+            .get(layer_idx)
             .ok_or_else(|| anyhow!("Layer {layer_idx} out of range"))?;
         let residual = hidden_states.shallow_clone();
         let normed = layer.input_layernorm.forward(hidden_states)?;
@@ -2402,7 +2622,12 @@ impl Qwen3_5Model {
             LayerMixer::LinearAttn(gdn) => {
                 let mut conv = self.conv_states.lock();
                 let mut rec = self.rec_states.lock();
-                gdn.forward(&normed, &mut conv[layer_idx], &mut rec[layer_idx], delta_arg)?
+                gdn.forward(
+                    &normed,
+                    &mut conv[layer_idx],
+                    &mut rec[layer_idx],
+                    delta_arg,
+                )?
             }
             LayerMixer::FullAttn(attn) => {
                 attn.forward(&normed, position_ids, None, 0, delta_arg)?
@@ -2460,7 +2685,10 @@ impl Qwen3_5Model {
     ) -> Result<(Tensor, Tensor)> {
         let hidden = self.forward_inner(Some(input), None, start_pos, None)?;
         let seq_len = hidden.size()[1];
-        anyhow::ensure!(seq_len > 0, "forward_with_cache_hidden: empty token sequence (seq_len=0)");
+        anyhow::ensure!(
+            seq_len > 0,
+            "forward_with_cache_hidden: empty token sequence (seq_len=0)"
+        );
         let logits = if last_logits_only {
             let last = hidden.narrow(1, seq_len - 1, 1);
             let normed = self.norm.forward(&last)?;
@@ -2482,12 +2710,7 @@ impl Qwen3_5Model {
     /// the draft for the position after the last consumed token.
     ///
     /// Returns logits `[1, 1, vocab]`.
-    pub fn mtp_forward(
-        &self,
-        token_ids: &Tensor,
-        hiddens: &Tensor,
-        base: usize,
-    ) -> Result<Tensor> {
+    pub fn mtp_forward(&self, token_ids: &Tensor, hiddens: &Tensor, base: usize) -> Result<Tensor> {
         let mtp = self
             .mtp
             .as_ref()
@@ -2508,11 +2731,8 @@ impl Qwen3_5Model {
         let x = Tensor::cat(&[e, h], -1).reshape([batch * seq, 2 * hidden_sz]);
         let x = mtp.fc.apply(&x).reshape([batch, seq, hidden_sz]);
 
-        let position_ids = Tensor::arange_start(
-            base as i64,
-            base as i64 + seq,
-            (Kind::Int64, x.device()),
-        );
+        let position_ids =
+            Tensor::arange_start(base as i64, base as i64 + seq, (Kind::Int64, x.device()));
 
         // Decoder block (pre-norm attention + pre-norm MLP, dense only).
         let residual = x.shallow_clone();
@@ -2520,11 +2740,13 @@ impl Qwen3_5Model {
         let attn_out = if let Some(ref cache_arc) = self.kv_cache {
             let kv = cache_arc.lock();
             kv.with_layer_cache(self.mtp_kv_slot(), |lc| {
-                mtp.attn.forward(&normed, Some(&position_ids), Some(lc), base, None)
+                mtp.attn
+                    .forward(&normed, Some(&position_ids), Some(lc), base, None)
             })
             .ok_or_else(|| anyhow!("No KV cache for MTP slot {}", self.mtp_kv_slot()))??
         } else {
-            mtp.attn.forward(&normed, Some(&position_ids), None, base, None)?
+            mtp.attn
+                .forward(&normed, Some(&position_ids), None, base, None)?
         };
         let x = residual + attn_out;
 
@@ -2562,7 +2784,10 @@ impl ModelOperations for Qwen3_5Model {
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
         let hidden = self.forward_inner(Some(input), None, start_pos, None)?;
         let seq_len = hidden.size()[1];
-        anyhow::ensure!(seq_len > 0, "forward_with_cache: empty token sequence (seq_len=0)");
+        anyhow::ensure!(
+            seq_len > 0,
+            "forward_with_cache: empty token sequence (seq_len=0)"
+        );
         // Prefill optimization (#201): only run the expensive LM-head matmul over the
         // last position — the caller always discards all but the last token's logits.
         let last = hidden.narrow(1, seq_len - 1, 1);
@@ -2573,7 +2798,10 @@ impl ModelOperations for Qwen3_5Model {
     fn forward_from_embeddings(&self, embeddings: &Tensor, start_pos: usize) -> Result<Tensor> {
         let hidden = self.forward_inner(None, Some(embeddings), start_pos, None)?;
         let seq_len = hidden.size()[1];
-        anyhow::ensure!(seq_len > 0, "forward_from_embeddings: empty embedding sequence (seq_len=0)");
+        anyhow::ensure!(
+            seq_len > 0,
+            "forward_from_embeddings: empty embedding sequence (seq_len=0)"
+        );
         let last = hidden.narrow(1, seq_len - 1, 1);
         let normed = self.norm.forward(&last)?;
         self.lm_head_apply(&normed)
@@ -2587,7 +2815,10 @@ impl ModelOperations for Qwen3_5Model {
     ) -> Result<Tensor> {
         let hidden = self.forward_inner(Some(input), None, start_pos, delta)?;
         let seq_len = hidden.size()[1];
-        anyhow::ensure!(seq_len > 0, "forward_with_cache_and_delta: empty token sequence (seq_len=0)");
+        anyhow::ensure!(
+            seq_len > 0,
+            "forward_with_cache_and_delta: empty token sequence (seq_len=0)"
+        );
         let last = hidden.narrow(1, seq_len - 1, 1);
         let normed = self.norm.forward(&last)?;
         self.lm_head_apply(&normed)
@@ -2659,8 +2890,12 @@ impl ModelOperations for Qwen3_5Model {
     fn clear_kv_cache(&self) {
         let mut conv = self.conv_states.lock();
         let mut rec = self.rec_states.lock();
-        for s in conv.iter_mut() { *s = None; }
-        for s in rec.iter_mut() { *s = None; }
+        for s in conv.iter_mut() {
+            *s = None;
+        }
+        for s in rec.iter_mut() {
+            *s = None;
+        }
         if let Some(ref cache) = self.kv_cache {
             cache.lock().clear_all();
         }
@@ -2692,7 +2927,13 @@ impl ModelOperations for Qwen3_5Model {
         let rd = self.config.rotary_dim as i64;
         let device = tensor.device();
         let dtype = tensor.kind();
-        let mut rope = RoPE::new_with_dtype(rd, self.config.rope_theta as f64, self.config.max_position_embeddings as i64, device, dtype)?;
+        let mut rope = RoPE::new_with_dtype(
+            rd,
+            self.config.rope_theta as f64,
+            self.config.max_position_embeddings as i64,
+            device,
+            dtype,
+        )?;
         rope.forward(tensor, Some(position_ids))
     }
 
@@ -2778,12 +3019,24 @@ mod pipeline_tests {
             LinearProjection::with_scale(w2, s2),
         ]);
         assert_eq!(fused.weight.size(), [256, 512]);
-        assert_eq!(fused.scale.as_ref().expect("fused FP8 scale").size(), [2, 4]);
-        assert_eq!(fused.scale_v2.as_ref().expect("fused packed scale").size(), [4, 4]);
-        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_live(), 1,
-            "fusion did not leave exactly its one derived rowwise allocation alive");
-        assert_eq!(crate::runtime::architectures::llama::rowwise_requant_peak(), 2,
-            "source rowwise allocations overlapped with fused rowwise construction");
+        assert_eq!(
+            fused.scale.as_ref().expect("fused FP8 scale").size(),
+            [2, 4]
+        );
+        assert_eq!(
+            fused.scale_v2.as_ref().expect("fused packed scale").size(),
+            [4, 4]
+        );
+        assert_eq!(
+            crate::runtime::architectures::llama::rowwise_requant_live(),
+            1,
+            "fusion did not leave exactly its one derived rowwise allocation alive"
+        );
+        assert_eq!(
+            crate::runtime::architectures::llama::rowwise_requant_peak(),
+            2,
+            "source rowwise allocations overlapped with fused rowwise construction"
+        );
         eprintln!("Qwen fused FP8 allocation probe: source rowwise copies dropped before fused allocation");
     }
 
@@ -2798,41 +3051,79 @@ mod pipeline_tests {
                 .env("HYPRSTREAM_FP8_DEQUANT_LOAD", "0")
                 .env("HYPRSTREAM_QWEN_MOE_LOADING_PROBE", "1")
                 .output().expect("spawn MoE allocation probe");
-            let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            assert!(output.status.success() && transcript.contains("1 passed"),
-                "MoE allocation probe did not pass: {transcript}");
+            let transcript = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success() && transcript.contains("1 passed"),
+                "MoE allocation probe did not pass: {transcript}"
+            );
             return;
         }
-        use crate::runtime::architectures::llama::{reset_rowwise_requant_peak, rowwise_requant_live, rowwise_requant_peak};
+        use crate::runtime::architectures::llama::{
+            reset_rowwise_requant_peak, rowwise_requant_live, rowwise_requant_peak,
+        };
         assert!(crate::config::default_fp8_gemm());
         let mut cfg = tiny_config();
         cfg.is_moe = true;
         cfg.num_experts = 3;
         cfg.num_experts_per_tok = 1;
         let mut weights = HashMap::new();
-        weights.insert("mlp.gate.weight".to_owned(), Tensor::zeros([3, 128], (Kind::Float, Device::Cpu)));
-        for (name, shape) in [("gate_proj", [256, 128]), ("up_proj", [256, 128]), ("down_proj", [128, 256])] {
-            weights.insert(format!("mlp.shared_expert.{name}.weight"), Tensor::zeros(shape, (Kind::Float, Device::Cpu)));
+        weights.insert(
+            "mlp.gate.weight".to_owned(),
+            Tensor::zeros([3, 128], (Kind::Float, Device::Cpu)),
+        );
+        for (name, shape) in [
+            ("gate_proj", [256, 128]),
+            ("up_proj", [256, 128]),
+            ("down_proj", [128, 256]),
+        ] {
+            weights.insert(
+                format!("mlp.shared_expert.{name}.weight"),
+                Tensor::zeros(shape, (Kind::Float, Device::Cpu)),
+            );
         }
         let mut expected = Vec::new();
         for e in 0..cfg.num_experts {
-            for (name, shape) in [("gate_proj", [256, 128]), ("up_proj", [256, 128]), ("down_proj", [128, 256])] {
+            for (name, shape) in [
+                ("gate_proj", [256, 128]),
+                ("up_proj", [256, 128]),
+                ("down_proj", [128, 256]),
+            ] {
                 let key = format!("mlp.experts.{e}.{name}.weight");
-                let weight = (Tensor::arange(shape[0] * shape[1], (Kind::Float, Device::Cpu)) * 0.01 + e as f64)
-                    .sin().reshape(shape).to_kind(Kind::Float8e4m3fn);
-                let scale = Tensor::from_slice(&[0.5f32 + e as f32, 1.5 + e as f32]).reshape([shape[0] / 128, shape[1] / 128]);
-                expected.push((name, e as i64, weight.transpose(0, 1).to_kind(Kind::Float), scale.transpose(0, 1).contiguous()));
+                let weight = (Tensor::arange(shape[0] * shape[1], (Kind::Float, Device::Cpu))
+                    * 0.01
+                    + e as f64)
+                    .sin()
+                    .reshape(shape)
+                    .to_kind(Kind::Float8e4m3fn);
+                let scale = Tensor::from_slice(&[0.5f32 + e as f32, 1.5 + e as f32])
+                    .reshape([shape[0] / 128, shape[1] / 128]);
+                expected.push((
+                    name,
+                    e as i64,
+                    weight.transpose(0, 1).to_kind(Kind::Float),
+                    scale.transpose(0, 1).contiguous(),
+                ));
                 weights.insert(key.clone(), weight);
                 weights.insert(format!("{key}_scale_inv"), scale);
             }
         }
         reset_rowwise_requant_peak();
-        let Qwen3_5Mlp::Sparse(loaded) = Qwen3_5Model::load_mlp(&mut weights, "mlp", &cfg, 0).unwrap() else {
+        let Qwen3_5Mlp::Sparse(loaded) =
+            Qwen3_5Model::load_mlp(&mut weights, "mlp", &cfg, 0).unwrap()
+        else {
             panic!("fixture must load sparse experts");
         };
         assert!(weights.is_empty(), "loader must consume checkpoint tensors");
         assert_eq!(rowwise_requant_live(), 0);
-        assert_eq!(rowwise_requant_peak(), 0, "transient batched experts must never construct discarded rowwise copies");
+        assert_eq!(
+            rowwise_requant_peak(),
+            0,
+            "transient batched experts must never construct discarded rowwise copies"
+        );
         for (name, e, weight, scale) in expected {
             let (stacked_w, stacked_s) = match name {
                 "gate_proj" => (&loaded.expert_gate_w, &loaded.expert_gate_scale),
@@ -2858,53 +3149,87 @@ mod pipeline_tests {
     fn gdn_chunked_continuation_preserves_recurrent_history() {
         let mut weights = tiny_weights();
         let layer = GatedDeltaNetLayer::load(
-            &mut weights, "model.layers.0.linear_attn", &tiny_config(), 0,
-        ).unwrap();
+            &mut weights,
+            "model.layers.0.linear_attn",
+            &tiny_config(),
+            0,
+        )
+        .unwrap();
         let input = (Tensor::arange(2 * HIDDEN, (Kind::Float, Device::Cpu)) * 0.13)
-            .sin().reshape([1, 2, HIDDEN]);
+            .sin()
+            .reshape([1, 2, HIDDEN]);
         let initial = Tensor::full(
             [1, LIN_V_HEADS as i64, LIN_K_DIM as i64, LIN_V_DIM as i64],
-            3.0, (Kind::Float, Device::Cpu),
+            3.0,
+            (Kind::Float, Device::Cpu),
         );
-        let conv = Tensor::zeros([1, layer.conv_dim as i64, layer.kernel_size as i64 - 1],
-            (Kind::Float, Device::Cpu));
+        let conv = Tensor::zeros(
+            [1, layer.conv_dim as i64, layer.kernel_size as i64 - 1],
+            (Kind::Float, Device::Cpu),
+        );
         let mut serial_conv = Some(conv.copy());
         let mut serial_outputs = Vec::new();
         let mut serial_rec = Some(initial.copy());
         for position in 0..2 {
-            serial_outputs.push(layer.forward(
-                &input.narrow(1, position, 1), &mut serial_conv, &mut serial_rec, None,
-            ).unwrap());
+            serial_outputs.push(
+                layer
+                    .forward(
+                        &input.narrow(1, position, 1),
+                        &mut serial_conv,
+                        &mut serial_rec,
+                        None,
+                    )
+                    .unwrap(),
+            );
         }
         let mut chunk_conv = Some(conv.copy());
         let mut chunk_rec = Some(initial);
-        let chunk_output = layer.forward(&input, &mut chunk_conv, &mut chunk_rec, None).unwrap();
+        let chunk_output = layer
+            .forward(&input, &mut chunk_conv, &mut chunk_rec, None)
+            .unwrap();
         let mut zero_conv = Some(conv);
         let mut zero_rec = None;
-        let _ = layer.forward(&input, &mut zero_conv, &mut zero_rec, None).unwrap();
+        let _ = layer
+            .forward(&input, &mut zero_conv, &mut zero_rec, None)
+            .unwrap();
         let expected = serial_rec.unwrap();
-        assert!(!expected.allclose(&zero_rec.unwrap(), 1e-4, 1e-4, false),
-            "fixture must distinguish preserved history from an empty recurrent state");
-        assert!(chunk_output.allclose(&Tensor::cat(&serial_outputs, 1), 1e-4, 1e-4, false),
-            "chunked outputs must match serial continuation");
+        assert!(
+            !expected.allclose(&zero_rec.unwrap(), 1e-4, 1e-4, false),
+            "fixture must distinguish preserved history from an empty recurrent state"
+        );
+        assert!(
+            chunk_output.allclose(&Tensor::cat(&serial_outputs, 1), 1e-4, 1e-4, false),
+            "chunked outputs must match serial continuation"
+        );
         let actual = chunk_rec.unwrap();
-        assert!(actual.allclose(&expected, 1e-4, 1e-4, false),
+        assert!(
+            actual.allclose(&expected, 1e-4, 1e-4, false),
             "chunked continuation lost recurrent history; max difference {}",
-            (&actual - &expected).abs().max().double_value(&[]));
+            (&actual - &expected).abs().max().double_value(&[])
+        );
     }
 
     #[test]
     fn gdn_short_prefill_keeps_full_convolution_history() {
         let mut weights = tiny_weights();
         let layer = GatedDeltaNetLayer::load(
-            &mut weights, "model.layers.0.linear_attn", &tiny_config(), 0,
-        ).unwrap();
+            &mut weights,
+            "model.layers.0.linear_attn",
+            &tiny_config(),
+            0,
+        )
+        .unwrap();
         let input = Tensor::ones([1, 1, HIDDEN], (Kind::Float, Device::Cpu));
         let mut conv = None;
         let mut recurrent = None;
         for _ in 0..2 {
-            let _ = layer.forward(&input, &mut conv, &mut recurrent, None).unwrap();
-            assert_eq!(conv.as_ref().unwrap().size()[2], layer.kernel_size as i64 - 1);
+            let _ = layer
+                .forward(&input, &mut conv, &mut recurrent, None)
+                .unwrap();
+            assert_eq!(
+                conv.as_ref().unwrap().size()[2],
+                layer.kernel_size as i64 - 1
+            );
         }
     }
 
@@ -2972,7 +3297,10 @@ mod pipeline_tests {
                 * 0.05
         };
 
-        w.insert("model.embed_tokens.weight".to_owned(), pat(&[VOCAB, HIDDEN]));
+        w.insert(
+            "model.embed_tokens.weight".to_owned(),
+            pat(&[VOCAB, HIDDEN]),
+        );
         w.insert("model.norm.weight".to_owned(), pat(&[HIDDEN]));
         w.insert("lm_head.weight".to_owned(), pat(&[VOCAB, HIDDEN]));
 
@@ -2984,16 +3312,31 @@ mod pipeline_tests {
         for i in 0..LAYERS {
             let p = format!("model.layers.{i}");
             w.insert(format!("{p}.input_layernorm.weight"), pat(&[HIDDEN]));
-            w.insert(format!("{p}.post_attention_layernorm.weight"), pat(&[HIDDEN]));
+            w.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                pat(&[HIDDEN]),
+            );
 
             let is_full = (i + 1) % 4 == 0;
             if is_full {
                 // Full attention: q_proj out = nh*hd*2 (q + gate), k/v out = nkv*hd.
                 let ap = format!("{p}.self_attn");
-                w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
-                w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-                w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-                w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+                w.insert(
+                    format!("{ap}.q_proj.weight"),
+                    pat(&[HEADS * HEAD_DIM * 2, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.k_proj.weight"),
+                    pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.v_proj.weight"),
+                    pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.o_proj.weight"),
+                    pat(&[HIDDEN, HEADS * HEAD_DIM]),
+                );
                 w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
                 w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
             } else {
@@ -3004,7 +3347,10 @@ mod pipeline_tests {
                 w.insert(format!("{lp}.in_proj_b.weight"), pat(&[nv, HIDDEN]));
                 w.insert(format!("{lp}.in_proj_a.weight"), pat(&[nv, HIDDEN]));
                 // conv1d_weight stays raw [conv_dim, 1, kernel_size] (not transposed).
-                w.insert(format!("{lp}.conv1d.weight"), pat(&[conv_dim, 1, CONV_KERNEL as i64]));
+                w.insert(
+                    format!("{lp}.conv1d.weight"),
+                    pat(&[conv_dim, 1, CONV_KERNEL as i64]),
+                );
                 w.insert(format!("{lp}.A_log"), pat(&[nv]));
                 w.insert(format!("{lp}.dt_bias"), pat(&[nv]));
                 w.insert(format!("{lp}.norm.weight"), pat(&[LIN_V_DIM as i64]));
@@ -3023,7 +3369,12 @@ mod pipeline_tests {
     fn whole_model() -> Qwen3_5Model {
         let mut w = tiny_weights();
         Qwen3_5Model::from_weights(
-            &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            None,
+            &Device::Cpu,
+            Kind::Float,
+            KVQuantType::None,
             false,
         )
         .unwrap()
@@ -3084,19 +3435,32 @@ mod pipeline_tests {
 
         let mut w0 = tiny_weights();
         let stage0 = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w0, tiny_config(), &map, 0..split, Kind::Float, KVQuantType::None,
+            &mut w0,
+            tiny_config(),
+            &map,
+            0..split,
+            Kind::Float,
+            KVQuantType::None,
         )
         .unwrap();
         assert_eq!(stage0.layer_offset, 0);
         assert_eq!(stage0.layers.len(), split, "stage0 owns exactly its layers");
-        assert!(stage0.lm_head.is_none(), "first (non-last) stage has no head");
+        assert!(
+            stage0.lm_head.is_none(),
+            "first (non-last) stage has no head"
+        );
         // SSM state sized to OWNED count, not global.
         assert_eq!(stage0.conv_states.lock().len(), split);
         assert_eq!(stage0.rec_states.lock().len(), split);
 
         let mut w1 = tiny_weights();
         let stage1 = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w1, tiny_config(), &map, split..LAYERS, Kind::Float, KVQuantType::None,
+            &mut w1,
+            tiny_config(),
+            &map,
+            split..LAYERS,
+            Kind::Float,
+            KVQuantType::None,
         )
         .unwrap();
         assert_eq!(stage1.layer_offset, split);
@@ -3126,12 +3490,23 @@ mod pipeline_tests {
         let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
         let mut w = tiny_weights();
         let stage = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w, tiny_config(), &map, 2..LAYERS, Kind::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            &map,
+            2..LAYERS,
+            Kind::Float,
+            KVQuantType::None,
         )
         .unwrap();
         let emb = Tensor::randn([1, 3, HIDDEN], (Kind::Float, Device::Cpu));
-        assert!(stage.forward_layers(&emb, 0..2, 0, None).is_err(), "range below window");
-        assert!(stage.forward_layers(&emb, 2..LAYERS, 0, None).is_ok(), "owned range ok");
+        assert!(
+            stage.forward_layers(&emb, 0..2, 0, None).is_err(),
+            "range below window"
+        );
+        assert!(
+            stage.forward_layers(&emb, 2..LAYERS, 0, None).is_ok(),
+            "owned range ok"
+        );
     }
 
     #[test]
@@ -3141,7 +3516,12 @@ mod pipeline_tests {
         let mut w = tiny_weights();
         w.remove("model.norm.weight");
         let result = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w, tiny_config(), &map, 0..LAYERS, Kind::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            &map,
+            0..LAYERS,
+            Kind::Float,
+            KVQuantType::None,
         );
         match result {
             Ok(_) => panic!("last stage without norm weight must error"),
@@ -3165,8 +3545,10 @@ mod pipeline_tests {
         let hidden = HIDDEN as usize;
         let gdn_in = LIN_V_HEADS * LIN_V_DIM; // out_proj input dim for GDN layers
         let full_in = (HEADS * HEAD_DIM) as usize; // o_proj input dim for full-attn layers
-        let mut per_layer: std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>> =
-            std::collections::HashMap::new();
+        let mut per_layer: std::collections::HashMap<
+            usize,
+            std::collections::HashMap<String, (usize, usize)>,
+        > = std::collections::HashMap::new();
         for i in 0..LAYERS {
             let is_full = (i + 1) % 4 == 0;
             let mut m = std::collections::HashMap::new();
@@ -3180,16 +3562,20 @@ mod pipeline_tests {
             target_modules: vec!["o_proj".to_owned()],
             ..Default::default()
         };
-        let flat: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+        let flat: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
         let delta = TenantDelta::new_with_per_layer_dims(
-            &cfg, &flat, Device::Cpu, LAYERS, Some(&per_layer),
-        ).unwrap();
+            &cfg,
+            &flat,
+            Device::Cpu,
+            LAYERS,
+            Some(&per_layer),
+        )
+        .unwrap();
 
         // Seed by a STABLE per-key offset (HashMap iteration order is not
         // deterministic, so independent builds must agree key-for-key).
-        let key_offset = |key: &str| -> i64 {
-            key.bytes().map(|b| b as i64).sum::<i64>() % 17
-        };
+        let key_offset = |key: &str| -> i64 { key.bytes().map(|b| b as i64).sum::<i64>() % 17 };
         let _g = tch::no_grad_guard();
         for (k, a) in delta.lora_a.iter() {
             let n: i64 = a.size().iter().product();
@@ -3199,7 +3585,8 @@ mod pipeline_tests {
         }
         for (k, b) in delta.lora_b.iter() {
             let n: i64 = b.size().iter().product();
-            let vals = (Tensor::arange(n, (Kind::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
+            let vals =
+                (Tensor::arange(n, (Kind::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
             b.shallow_clone().copy_(&vals.reshape(b.size()));
         }
         delta
@@ -3233,7 +3620,10 @@ mod pipeline_tests {
         // (a) whole-model training forward over a single-device map.
         let whole = whole_model();
         let whole_delta = tiny_delta();
-        let whole_stage = [TrainStage { model: &whole, range: 0..LAYERS }];
+        let whole_stage = [TrainStage {
+            model: &whole,
+            range: 0..LAYERS,
+        }];
         let loss_whole = compute_ntp_loss_split(&whole_stage, &input, Some(&whole_delta)).unwrap();
         loss_whole.backward();
         let whole_grads = grad_snapshot(&whole_delta);
@@ -3244,16 +3634,34 @@ mod pipeline_tests {
         let split = LAYERS / 2;
         let mut w0 = tiny_weights();
         let stage0 = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w0, tiny_config(), &map, 0..split, Kind::Float, KVQuantType::None,
-        ).unwrap();
+            &mut w0,
+            tiny_config(),
+            &map,
+            0..split,
+            Kind::Float,
+            KVQuantType::None,
+        )
+        .unwrap();
         let mut w1 = tiny_weights();
         let stage1 = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w1, tiny_config(), &map, split..LAYERS, Kind::Float, KVQuantType::None,
-        ).unwrap();
+            &mut w1,
+            tiny_config(),
+            &map,
+            split..LAYERS,
+            Kind::Float,
+            KVQuantType::None,
+        )
+        .unwrap();
         let split_delta = tiny_delta();
         let stages = [
-            TrainStage { model: &stage0, range: 0..split },
-            TrainStage { model: &stage1, range: split..LAYERS },
+            TrainStage {
+                model: &stage0,
+                range: 0..split,
+            },
+            TrainStage {
+                model: &stage1,
+                range: split..LAYERS,
+            },
         ];
         let loss_split = compute_ntp_loss_split(&stages, &input, Some(&split_delta)).unwrap();
         loss_split.backward();
@@ -3261,16 +3669,24 @@ mod pipeline_tests {
 
         let lw = loss_whole.double_value(&[]);
         let ls = loss_split.double_value(&[]);
-        assert!((lw - ls).abs() < 1e-4, "loss diverged: whole={lw} split={ls}");
+        assert!(
+            (lw - ls).abs() < 1e-4,
+            "loss diverged: whole={lw} split={ls}"
+        );
 
         assert_eq!(whole_grads.len(), split_grads.len());
         for (k, &gw) in &whole_grads {
-            let gs = *split_grads.get(k).unwrap_or_else(|| panic!("missing grad {k}"));
+            let gs = *split_grads
+                .get(k)
+                .unwrap_or_else(|| panic!("missing grad {k}"));
             assert!(
                 (gw - gs).abs() <= 1e-4 + 1e-4 * gw.abs(),
                 "grad norm diverged for {k}: whole={gw} split={gs}"
             );
-            assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
+            assert!(
+                gw > 0.0,
+                "grad for {k} is zero — autograd path not exercised"
+            );
         }
     }
 
@@ -3293,7 +3709,12 @@ mod pipeline_tests {
             *t = t.to_kind(dtype);
         }
         let model = Qwen3_5Model::from_weights(
-            &mut w, tiny_config(), None, &Device::Cpu, dtype, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            None,
+            &Device::Cpu,
+            dtype,
+            KVQuantType::None,
             false,
         )
         .unwrap();
@@ -3312,7 +3733,10 @@ mod pipeline_tests {
             .expect("bf16 base + fp32 delta forward must not error");
         // ...and must remain in the base (bf16) dtype.
         assert_eq!(out.kind(), dtype, "delta-injected forward must stay bf16");
-        assert!(out.isfinite().all().int64_value(&[]) == 1, "output must be finite");
+        assert!(
+            out.isfinite().all().int64_value(&[]) == 1,
+            "output must be finite"
+        );
     }
 
     #[test]
@@ -3320,11 +3744,23 @@ mod pipeline_tests {
         let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
         let mut w = tiny_weights();
         let stage = Qwen3_5Model::stage_from_weights_with_config(
-            &mut w, tiny_config(), &map, 2..LAYERS, Kind::Float, KVQuantType::None,
-        ).unwrap();
+            &mut w,
+            tiny_config(),
+            &map,
+            2..LAYERS,
+            Kind::Float,
+            KVQuantType::None,
+        )
+        .unwrap();
         let emb = Tensor::randn([1, 3, HIDDEN], (Kind::Float, Device::Cpu));
-        assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
-        assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
+        assert!(
+            stage.forward_layers_train(&emb, 0..2, None).is_err(),
+            "range below window"
+        );
+        assert!(
+            stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(),
+            "owned range ok"
+        );
     }
 
     // ========================================================================
@@ -3336,7 +3772,11 @@ mod pipeline_tests {
     use parking_lot::Mutex;
 
     fn session_cache() -> Arc<Mutex<KVCacheManager>> {
-        Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)))
+        Arc::new(Mutex::new(KVCacheManager::new(
+            LAYERS,
+            64,
+            KVQuantType::None,
+        )))
     }
 
     /// Greedy argmax of a `[1, 1, vocab]` logits tensor.
@@ -3497,8 +3937,15 @@ mod pipeline_tests {
         let (gen2_oracle, logits2_oracle, _ssm_o) =
             run_turn(&oracle_model, &prompt2, prompt1.len(), 4);
 
-        assert_eq!(gen2, gen2_oracle, "rewound run must match split-prefill oracle");
-        assert_logits_match(&logits2, &logits2_oracle, "rewound run vs split-prefill oracle");
+        assert_eq!(
+            gen2, gen2_oracle,
+            "rewound run must match split-prefill oracle"
+        );
+        assert_logits_match(
+            &logits2,
+            &logits2_oracle,
+            "rewound run vs split-prefill oracle",
+        );
 
         // Contract-level check: greedy tokens must also match a monolithic
         // fresh-cache prefill of turn 2's full prompt. (Logits are NOT
@@ -3647,7 +4094,11 @@ mod pipeline_tests {
         let prefix_len = cache.lock().prefix_match_len(&prompt);
         assert_eq!(prefix_len, prompt.len(), "exact repeat must fully match");
         let start = crate::runtime::torch_engine::rewind_session_state(&model, prefix_len);
-        assert_eq!(start, prompt.len(), "rewind alone still reports the full hit");
+        assert_eq!(
+            start,
+            prompt.len(),
+            "rewind alone still reports the full hit"
+        );
         let broken_rows = row_logits(&model);
 
         // Reference: fresh model + fresh cache, same row-wise prefill.
@@ -3718,7 +4169,11 @@ mod pipeline_tests {
         let (gen2_ref, logits2_ref, _ssm_ref) = run_turn(&ref_model, &prompt, 0, 4);
 
         assert_eq!(gen2, gen2_ref);
-        assert_logits_match(&logits2, &logits2_ref, "recomputed exact repeat vs fresh cache");
+        assert_logits_match(
+            &logits2,
+            &logits2_ref,
+            "recomputed exact repeat vs fresh cache",
+        );
     }
     /// Regression guard for the causal-mask offset in cached multi-token
     /// forwards: with `q_len > 1` and `start_pos > 0` the mask must be
@@ -3762,15 +4217,32 @@ mod pipeline_tests {
                 let p = format!("model.layers.{i}");
                 w.retain(|k, _| !k.starts_with(&format!("{p}.linear_attn.")));
                 let ap = format!("{p}.self_attn");
-                w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
-                w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-                w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-                w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+                w.insert(
+                    format!("{ap}.q_proj.weight"),
+                    pat(&[HEADS * HEAD_DIM * 2, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.k_proj.weight"),
+                    pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.v_proj.weight"),
+                    pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.o_proj.weight"),
+                    pat(&[HIDDEN, HEADS * HEAD_DIM]),
+                );
                 w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
                 w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
             }
             Qwen3_5Model::from_weights(
-                &mut w, allattn_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                &mut w,
+                allattn_config(),
+                None,
+                &Device::Cpu,
+                Kind::Float,
+                KVQuantType::None,
                 false,
             )
             .unwrap()
@@ -3795,7 +4267,9 @@ mod pipeline_tests {
         let _ = cached.forward_with_cache(&prompt_t, 0).unwrap();
         let pair = Tensor::from_slice(&[11i64, 13]).reshape([1, 2]);
         let emb = cached.embed_tokens(&pair).unwrap();
-        let h = cached.forward_layers(&emb, 0..cached.num_layers(), pos, None).unwrap();
+        let h = cached
+            .forward_layers(&emb, 0..cached.num_layers(), pos, None)
+            .unwrap();
         let h = cached.apply_final_norm(&h).unwrap();
         let logits2 = cached.lm_head(&h).unwrap(); // [1, 2, V]
 
@@ -3833,7 +4307,9 @@ pub(crate) mod mtp_tests {
     //!
     //! With near-random weights the MTP head's natural acceptance is ~0 — that
     //! is fine: correctness is the gate here, acceptance is measured on GPU.
-    use super::pipeline_tests::{tiny_config, tiny_weights, HEAD_DIM, HEADS, HIDDEN, INTER, KV_HEADS, VOCAB};
+    use super::pipeline_tests::{
+        tiny_config, tiny_weights, HEADS, HEAD_DIM, HIDDEN, INTER, KV_HEADS, VOCAB,
+    };
     use super::*;
 
     /// tiny_weights plus the 15 dense `mtp.*` tensors (HF `[out, in]` layout).
@@ -3852,16 +4328,34 @@ pub(crate) mod mtp_tests {
         };
 
         w.insert("mtp.pre_fc_norm_hidden.weight".to_owned(), pat(&[HIDDEN]));
-        w.insert("mtp.pre_fc_norm_embedding.weight".to_owned(), pat(&[HIDDEN]));
+        w.insert(
+            "mtp.pre_fc_norm_embedding.weight".to_owned(),
+            pat(&[HIDDEN]),
+        );
         w.insert("mtp.fc.weight".to_owned(), pat(&[HIDDEN, 2 * HIDDEN]));
         let lp = "mtp.layers.0";
         w.insert(format!("{lp}.input_layernorm.weight"), pat(&[HIDDEN]));
-        w.insert(format!("{lp}.post_attention_layernorm.weight"), pat(&[HIDDEN]));
+        w.insert(
+            format!("{lp}.post_attention_layernorm.weight"),
+            pat(&[HIDDEN]),
+        );
         let ap = format!("{lp}.self_attn");
-        w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
-        w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-        w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-        w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+        w.insert(
+            format!("{ap}.q_proj.weight"),
+            pat(&[HEADS * HEAD_DIM * 2, HIDDEN]),
+        );
+        w.insert(
+            format!("{ap}.k_proj.weight"),
+            pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+        );
+        w.insert(
+            format!("{ap}.v_proj.weight"),
+            pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+        );
+        w.insert(
+            format!("{ap}.o_proj.weight"),
+            pat(&[HIDDEN, HEADS * HEAD_DIM]),
+        );
         w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
         w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
         let mp = format!("{lp}.mlp");
@@ -3875,7 +4369,12 @@ pub(crate) mod mtp_tests {
     pub(crate) fn whole_model_mtp() -> Qwen3_5Model {
         let mut w = tiny_weights_mtp();
         Qwen3_5Model::from_weights(
-            &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            None,
+            &Device::Cpu,
+            Kind::Float,
+            KVQuantType::None,
             true,
         )
         .unwrap()
@@ -3893,9 +4392,15 @@ pub(crate) mod mtp_tests {
             let runtime: crate::config::RuntimeConfig = toml::from_str(&toml).unwrap();
             let mut weights = tiny_weights_mtp();
             let model = Qwen3_5Model::from_weights(
-                &mut weights, tiny_config(), None, &Device::Cpu, Kind::Float,
-                KVQuantType::None, runtime.speculative_decoding,
-            ).unwrap();
+                &mut weights,
+                tiny_config(),
+                None,
+                &Device::Cpu,
+                Kind::Float,
+                KVQuantType::None,
+                runtime.speculative_decoding,
+            )
+            .unwrap();
             assert_eq!(model.has_mtp(), enabled);
             assert!(!weights.keys().any(|name| name.starts_with("mtp.")));
         }
@@ -3992,7 +4497,9 @@ pub(crate) mod mtp_tests {
 
         // Prefill with hidden capture, then MTP prompt prefill + first draft.
         let prompt_t = Tensor::from_slice(slice).reshape([1, slice.len() as i64]);
-        let (logits, hidden) = model.forward_with_cache_hidden(&prompt_t, start_pos, true).unwrap();
+        let (logits, hidden) = model
+            .forward_with_cache_hidden(&prompt_t, start_pos, true)
+            .unwrap();
         let mut out: Vec<i64> = Vec::with_capacity(gen_tokens);
         let mut last = argmax1(&logits);
         out.push(last);
@@ -4007,12 +4514,16 @@ pub(crate) mod mtp_tests {
             let draft = match mode {
                 DraftMode::Natural => pending,
                 DraftMode::ForceReject => (pending + 1) % VOCAB,
-                DraftMode::Oracle => oracle.expect("oracle mode needs the serial output")[out.len()],
+                DraftMode::Oracle => {
+                    oracle.expect("oracle mode needs the serial output")[out.len()]
+                }
             };
 
             let snapshot = model.snapshot_ssm_states();
             let verify_in = Tensor::from_slice(&[last, draft]).reshape([1, 2]);
-            let (logits, hidden) = model.forward_with_cache_hidden(&verify_in, pos, false).unwrap();
+            let (logits, hidden) = model
+                .forward_with_cache_hidden(&verify_in, pos, false)
+                .unwrap();
             let v1 = argmax1(&logits.select(1, 0));
 
             if v1 == draft {
@@ -4051,9 +4562,18 @@ pub(crate) mod mtp_tests {
     #[test]
     fn mtp_decode_matches_serial() {
         let reference = serial_generate(&whole_model_mtp(), &PROMPT, GEN, 0);
-        let (spec, accepted, rejected) =
-            spec_generate(&whole_model_mtp(), &PROMPT, GEN, 0, DraftMode::Natural, None);
-        assert_eq!(spec, reference, "speculative output diverged from serial greedy");
+        let (spec, accepted, rejected) = spec_generate(
+            &whole_model_mtp(),
+            &PROMPT,
+            GEN,
+            0,
+            DraftMode::Natural,
+            None,
+        );
+        assert_eq!(
+            spec, reference,
+            "speculative output diverged from serial greedy"
+        );
         assert!(accepted + rejected > 0, "no speculative rounds ran");
     }
 
@@ -4062,10 +4582,22 @@ pub(crate) mod mtp_tests {
     #[test]
     fn mtp_decode_forced_reject_matches_serial() {
         let reference = serial_generate(&whole_model_mtp(), &PROMPT, GEN, 0);
-        let (spec, _accepted, rejected) =
-            spec_generate(&whole_model_mtp(), &PROMPT, GEN, 0, DraftMode::ForceReject, None);
-        assert_eq!(spec, reference, "forced-reject rewind diverged from serial greedy");
-        assert!(rejected > 0, "forced-reject mode never rejected — rewind path untested");
+        let (spec, _accepted, rejected) = spec_generate(
+            &whole_model_mtp(),
+            &PROMPT,
+            GEN,
+            0,
+            DraftMode::ForceReject,
+            None,
+        );
+        assert_eq!(
+            spec, reference,
+            "forced-reject rewind diverged from serial greedy"
+        );
+        assert!(
+            rejected > 0,
+            "forced-reject mode never rejected — rewind path untested"
+        );
     }
 
     /// Oracle drafts: acceptance is ~100%, exercising the 2-token accept path
@@ -4081,8 +4613,14 @@ pub(crate) mod mtp_tests {
             DraftMode::Oracle,
             Some(&reference),
         );
-        assert_eq!(spec, reference, "oracle-accept output diverged from serial greedy");
-        assert!(accepted > 0, "oracle drafts never accepted — accept path untested");
+        assert_eq!(
+            spec, reference,
+            "oracle-accept output diverged from serial greedy"
+        );
+        assert!(
+            accepted > 0,
+            "oracle drafts never accepted — accept path untested"
+        );
     }
 
     /// Context-boundary regression: when only one KV slot remains
@@ -4106,7 +4644,12 @@ pub(crate) mod mtp_tests {
         let build = || {
             let mut w = tiny_weights_mtp();
             let mut model = Qwen3_5Model::from_weights(
-                &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                &mut w,
+                tiny_config(),
+                None,
+                &Device::Cpu,
+                Kind::Float,
+                KVQuantType::None,
                 true,
             )
             .unwrap();
@@ -4141,7 +4684,9 @@ pub(crate) mod mtp_tests {
         // Speculative driver with the boundary fallback, mirroring
         // `sample_speculative_tokens` (forced-reject drafts for determinism).
         // `fallback_enabled = false` reproduces the pre-fix behavior.
-        let spec_until_error = |model: &Qwen3_5Model, fallback_enabled: bool| -> (Vec<i64>, u64, Option<String>) {
+        let spec_until_error = |model: &Qwen3_5Model,
+                                fallback_enabled: bool|
+         -> (Vec<i64>, u64, Option<String>) {
             let prompt_t = Tensor::from_slice(&PROMPT).reshape([1, PROMPT.len() as i64]);
             let mut out: Vec<i64> = Vec::new();
             let mut fallbacks = 0u64;
@@ -4175,7 +4720,8 @@ pub(crate) mod mtp_tests {
                 let draft = (pending + 1) % VOCAB; // forced reject
                 let snapshot = model.snapshot_ssm_states();
                 let verify_in = Tensor::from_slice(&[last, draft]).reshape([1, 2]);
-                let (logits, hidden) = match model.forward_with_cache_hidden(&verify_in, pos, false) {
+                let (logits, hidden) = match model.forward_with_cache_hidden(&verify_in, pos, false)
+                {
                     Ok(v) => v,
                     Err(e) => return (out, fallbacks, Some(e.to_string())),
                 };
@@ -4205,16 +4751,24 @@ pub(crate) mod mtp_tests {
 
         let (serial_out, serial_err) = serial_until_error(&build());
         assert!(
-            serial_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            serial_err
+                .as_deref()
+                .is_some_and(|e| e.contains("Cache overflow")),
             "serial driver must end at the context boundary, got {serial_err:?}"
         );
-        assert_eq!(serial_out.len(), 7, "prefill token + forwards at pos 6..=11");
+        assert_eq!(
+            serial_out.len(),
+            7,
+            "prefill token + forwards at pos 6..=11"
+        );
 
         // Pre-fix behavior (no fallback): the 2-token verify at pos = CAP-1
         // overflows and the stream dies one token earlier than serial.
         let (old_out, _, old_err) = spec_until_error(&build(), false);
         assert!(
-            old_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            old_err
+                .as_deref()
+                .is_some_and(|e| e.contains("Cache overflow")),
             "pre-fix behavior must overflow, got {old_err:?}"
         );
         assert!(
@@ -4227,10 +4781,18 @@ pub(crate) mod mtp_tests {
         // Fixed behavior: the boundary round falls back to a serial step and
         // yields the same tokens as serial, erroring only at the true boundary.
         let (spec_out, fallbacks, spec_err) = spec_until_error(&build(), true);
-        assert_eq!(spec_out, serial_out, "boundary fallback diverged from serial");
-        assert!(fallbacks >= 1, "serial fallback never engaged at the boundary");
+        assert_eq!(
+            spec_out, serial_out,
+            "boundary fallback diverged from serial"
+        );
         assert!(
-            spec_err.as_deref().is_some_and(|e| e.contains("Cache overflow")),
+            fallbacks >= 1,
+            "serial fallback never engaged at the boundary"
+        );
+        assert!(
+            spec_err
+                .as_deref()
+                .is_some_and(|e| e.contains("Cache overflow")),
             "spec driver must end at the true boundary like serial, got {spec_err:?}"
         );
     }
@@ -4267,8 +4829,18 @@ pub(crate) mod mtp_tests {
         // Turn 2: shared prefix + new suffix, partial prefill from prefix_len.
         let prompt2: [i64; 9] = [1, 5, 9, 2, 7, 3, 4, 8, 6];
         let s2 = serial_generate(&model_serial, &prompt2, GEN, prefix_len);
-        let (p2, _, _) = spec_generate(&model_spec, &prompt2, GEN, prefix_len, DraftMode::Natural, None);
-        assert_eq!(p2, s2, "turn 2 (prefix hit): speculative diverged from serial");
+        let (p2, _, _) = spec_generate(
+            &model_spec,
+            &prompt2,
+            GEN,
+            prefix_len,
+            DraftMode::Natural,
+            None,
+        );
+        assert_eq!(
+            p2, s2,
+            "turn 2 (prefix hit): speculative diverged from serial"
+        );
     }
 
     /// Loading without `mtp.*` keys (or with an unconsumable head) must fall
@@ -4277,11 +4849,19 @@ pub(crate) mod mtp_tests {
     fn mtp_head_absent_falls_back_to_serial() {
         let mut w = tiny_weights();
         let model = Qwen3_5Model::from_weights(
-            &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+            &mut w,
+            tiny_config(),
+            None,
+            &Device::Cpu,
+            Kind::Float,
+            KVQuantType::None,
             true,
         )
         .unwrap();
-        assert!(!model.has_mtp(), "model without mtp.* weights must not speculate");
+        assert!(
+            !model.has_mtp(),
+            "model without mtp.* weights must not speculate"
+        );
     }
 
     /// Regression guard for the causal-mask offset in cached multi-token
@@ -4326,15 +4906,32 @@ pub(crate) mod mtp_tests {
                 let p = format!("model.layers.{i}");
                 w.retain(|k, _| !k.starts_with(&format!("{p}.linear_attn.")));
                 let ap = format!("{p}.self_attn");
-                w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
-                w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-                w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
-                w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+                w.insert(
+                    format!("{ap}.q_proj.weight"),
+                    pat(&[HEADS * HEAD_DIM * 2, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.k_proj.weight"),
+                    pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.v_proj.weight"),
+                    pat(&[KV_HEADS * HEAD_DIM, HIDDEN]),
+                );
+                w.insert(
+                    format!("{ap}.o_proj.weight"),
+                    pat(&[HIDDEN, HEADS * HEAD_DIM]),
+                );
                 w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
                 w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
             }
             Qwen3_5Model::from_weights(
-                &mut w, allattn_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+                &mut w,
+                allattn_config(),
+                None,
+                &Device::Cpu,
+                Kind::Float,
+                KVQuantType::None,
                 true,
             )
             .unwrap()

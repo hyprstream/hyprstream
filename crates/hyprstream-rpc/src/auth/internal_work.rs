@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
-use super::claims::{Cnf, CnfJwk, Claims};
+use super::claims::{Claims, Cnf, CnfJwk};
 use super::jwt::{self, JwkThumbprintInput};
 
 /// URL-safe base64 without padding — the JWT/JWK encoding used by the
@@ -74,7 +74,10 @@ pub struct InternalWorkScope {
 
 impl InternalWorkScope {
     pub fn new(resource: impl Into<String>, operation: impl Into<String>) -> Self {
-        Self { resource: resource.into(), operation: operation.into() }
+        Self {
+            resource: resource.into(),
+            operation: operation.into(),
+        }
     }
 }
 
@@ -145,11 +148,12 @@ pub struct InternalWorkContext {
 }
 
 /// Encode and sign a work order (`typ: "iw+jwt"`, pinned Ed25519).
-pub fn encode_internal_work(claims: &InternalWorkClaims, signing_key: &ed25519_dalek::SigningKey) -> String {
+pub fn encode_internal_work(
+    claims: &InternalWorkClaims,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> String {
     let kid = jwt::kid_for_key(signing_key);
-    let header = format!(
-        r#"{{"alg":"EdDSA","typ":"{INTERNAL_WORK_JWT_TYP}","kid":"{kid}"}}"#
-    );
+    let header = format!(r#"{{"alg":"EdDSA","typ":"{INTERNAL_WORK_JWT_TYP}","kid":"{kid}"}}"#);
     let header_b64 = b64(header.as_bytes());
     let payload_json = serde_json::to_string(claims).unwrap_or_else(|_err| {
         #[cfg(not(target_arch = "wasm32"))]
@@ -202,10 +206,7 @@ pub fn verify_internal_work(
         claims.iss == INTERNAL_WORK_ISSUER,
         "internal work token issuer is not the internal work authority"
     );
-    anyhow::ensure!(
-        claims.exp > now,
-        "internal work token is expired"
-    );
+    anyhow::ensure!(claims.exp > now, "internal work token is expired");
     anyhow::ensure!(
         (now - claims.iat).abs() <= MAX_IAT_SKEW_SECS,
         "internal work token iat is outside the admission skew window"
@@ -218,8 +219,14 @@ pub fn verify_internal_work(
         claims.aud == expected_aud,
         "internal work token audience does not name this instance"
     );
-    anyhow::ensure!(!claims.tenant.is_empty(), "internal work token carries no tenant");
-    anyhow::ensure!(!claims.model.is_empty(), "internal work token carries no model");
+    anyhow::ensure!(
+        !claims.tenant.is_empty(),
+        "internal work token carries no tenant"
+    );
+    anyhow::ensure!(
+        !claims.model.is_empty(),
+        "internal work token carries no model"
+    );
     anyhow::ensure!(!claims.jti.is_empty(), "internal work token carries no jti");
     // Holder binding: the claims must name the pinned controller key itself.
     anyhow::ensure!(
@@ -238,8 +245,15 @@ pub fn verify_internal_work(
         .map_err(|_| anyhow::anyhow!("internal work signature has wrong length"))?;
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     controller
-        .verify(signing_input.as_bytes(), &ed25519_dalek::Signature::from_bytes(&signature))
-        .map_err(|_| anyhow::anyhow!("internal work token signature does not verify against the pinned controller key"))?;
+        .verify(
+            signing_input.as_bytes(),
+            &ed25519_dalek::Signature::from_bytes(&signature),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "internal work token signature does not verify against the pinned controller key"
+            )
+        })?;
     Ok(claims)
 }
 
@@ -369,9 +383,7 @@ fn admit_once_in(state: &mut ReplayState, jti: &str, exp: i64, now: i64) -> bool
 
 fn jti_cache() -> &'static parking_lot::Mutex<ReplayState> {
     static CACHE: OnceLock<parking_lot::Mutex<ReplayState>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        parking_lot::Mutex::new(ReplayState::new(effective_capacity()))
-    })
+    CACHE.get_or_init(|| parking_lot::Mutex::new(ReplayState::new(effective_capacity())))
 }
 
 /// Admit a work-order `jti` exactly once. Entries expire at the token's own
@@ -489,7 +501,10 @@ mod tests {
         let token = encode_internal_work(&long, &signer);
         let err = verify_internal_work(&token, &signer.verifying_key(), &long.aud, now)
             .expect_err("oversized lifetimes must deny");
-        assert!(err.to_string().contains("maximum internal lifetime"), "{err:#}");
+        assert!(
+            err.to_string().contains("maximum internal lifetime"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -526,7 +541,10 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let id = "jti-single-use".to_owned();
         assert!(admit_once_in(&mut state, &id, now + 60, now));
-        assert!(!admit_once_in(&mut state, &id, now + 60, now), "replay must deny");
+        assert!(
+            !admit_once_in(&mut state, &id, now + 60, now),
+            "replay must deny"
+        );
         // Past its exp the entry is reclaimed, so a fresh order with the same
         // id (impossible for a real mint, but proves the release) admits again.
         assert!(admit_once_in(&mut state, &id, now + 120, now + 61));
@@ -545,7 +563,10 @@ mod tests {
         // Full of UNEXPIRED entries: admission denies and nothing is evicted.
         assert!(!admit_once_in(&mut state, "overflow", now + 600, now));
         assert_eq!(state.by_jti.len(), 4);
-        assert!(state.by_jti.contains_key("sat-0"), "unexpired entry retained");
+        assert!(
+            state.by_jti.contains_key("sat-0"),
+            "unexpired entry retained"
+        );
     }
 
     #[test]
@@ -562,8 +583,14 @@ mod tests {
         // Advance past ONLY the earliest expiry: exactly it is reclaimed and
         // the admission succeeds — order comes from expiry, not insertion.
         assert!(admit_once_in(&mut state, "new", now + 60, now + 61));
-        assert!(!state.by_jti.contains_key("sat-early"), "expired entry reclaimed");
-        assert!(state.by_jti.contains_key("sat-late"), "unexpired entry never evicted");
+        assert!(
+            !state.by_jti.contains_key("sat-early"),
+            "expired entry reclaimed"
+        );
+        assert!(
+            state.by_jti.contains_key("sat-late"),
+            "unexpired entry never evicted"
+        );
         assert!(state.by_jti.contains_key("new"));
     }
 
@@ -616,7 +643,10 @@ mod tests {
         assert!(validate_replay_capacity(0).is_err());
         assert!(validate_replay_capacity(MAX_REPLAY_CAPACITY + 1).is_err());
         assert_eq!(validate_replay_capacity(1).unwrap(), 1);
-        assert_eq!(validate_replay_capacity(MAX_REPLAY_CAPACITY).unwrap(), MAX_REPLAY_CAPACITY);
+        assert_eq!(
+            validate_replay_capacity(MAX_REPLAY_CAPACITY).unwrap(),
+            MAX_REPLAY_CAPACITY
+        );
         // A zero-capacity state is fail-closed: no admission, no eviction.
         let mut state = ReplayState::new(0);
         let now = chrono::Utc::now().timestamp();

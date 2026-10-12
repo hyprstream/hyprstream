@@ -423,7 +423,8 @@ mod tests {
         );
 
         let json = serde_json::to_string(&event).expect("test: serialize event");
-        let deserialized: EventEnvelope = serde_json::from_str(&json).expect("test: deserialize event");
+        let deserialized: EventEnvelope =
+            serde_json::from_str(&json).expect("test: deserialize event");
 
         assert_eq!(deserialized.topic, "metrics.threshold_breach");
     }

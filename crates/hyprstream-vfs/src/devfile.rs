@@ -342,11 +342,11 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::mount::{Fid, Mount, Stat};
     use async_trait::async_trait;
     use hyprstream_rpc::Subject;
+    use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
-    use crate::mount::{Fid, Mount, Stat};
 
     fn subj() -> Subject {
         Subject::new("tester")
@@ -397,7 +397,9 @@ mod tests {
 
     #[tokio::test]
     async fn control_file_second_write_replaces_latch() {
-        let ctl = ControlFile::new(|data: Vec<u8>| Box::pin(async move { Ok(data) }) as DevFuture<'static, _>);
+        let ctl = ControlFile::new(|data: Vec<u8>| {
+            Box::pin(async move { Ok(data) }) as DevFuture<'static, _>
+        });
         let state = ctl.new_fid();
         ctl.handle_write(&state, b"first").await.unwrap();
         assert_eq!(ctl.handle_read(&state, 0), b"first");
@@ -409,7 +411,9 @@ mod tests {
 
     #[tokio::test]
     async fn field_file_read_only_get() {
-        let field = FieldFile::read_only(|| Box::pin(async { Some(b"42".to_vec()) }) as DevFuture<'static, _>);
+        let field = FieldFile::read_only(|| {
+            Box::pin(async { Some(b"42".to_vec()) }) as DevFuture<'static, _>
+        });
         let out = field.handle_read(0, "x").await.unwrap();
         assert_eq!(out, b"42");
     }
@@ -423,7 +427,9 @@ mod tests {
 
     #[tokio::test]
     async fn field_file_read_only_rejects_write() {
-        let field = FieldFile::read_only(|| Box::pin(async { Some(b"v".to_vec()) }) as DevFuture<'static, _>);
+        let field = FieldFile::read_only(|| {
+            Box::pin(async { Some(b"v".to_vec()) }) as DevFuture<'static, _>
+        });
         let res = field.handle_write(b"new").await;
         assert!(matches!(res, Err(MountError::NotSupported(_))));
     }
@@ -437,7 +443,8 @@ mod tests {
         let field = FieldFile::read_write(
             move || {
                 let store = get_store.clone();
-                Box::pin(async move { Some(store.lock().await.clone().into_bytes()) }) as DevFuture<'static, _>
+                Box::pin(async move { Some(store.lock().await.clone().into_bytes()) })
+                    as DevFuture<'static, _>
             },
             move |data: Vec<u8>| {
                 let store = set_store.clone();
@@ -478,7 +485,10 @@ mod tests {
 
         assert_eq!(dir.read("a", 0).await.unwrap(), b"1");
         assert_eq!(dir.read("b", 0).await.unwrap(), b"2");
-        assert!(matches!(dir.read("z", 0).await, Err(MountError::NotFound(_))));
+        assert!(matches!(
+            dir.read("z", 0).await,
+            Err(MountError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -487,7 +497,10 @@ mod tests {
         // that error, not be folded into NotFound the way `Ok(None)` is.
         let dir = DynamicDir::new(
             || Box::pin(async { vec!["a".to_string()] }) as DevFuture<'static, _>,
-            |_name: String| Box::pin(async { Err(MountError::Io("backend gone".into())) }) as DevFuture<'static, _>,
+            |_name: String| {
+                Box::pin(async { Err(MountError::Io("backend gone".into())) })
+                    as DevFuture<'static, _>
+            },
         );
         assert!(matches!(dir.read("a", 0).await, Err(MountError::Io(_))));
     }
@@ -506,9 +519,12 @@ mod tests {
         ctl_state: DevFileState,
     }
 
-    type CtlHandler = Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>;
+    type CtlHandler =
+        Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>;
     type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
-    type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
+    type GetFn = Box<
+        dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync,
+    >;
 
     /// A minimal `Mount` exercising `ControlFile` (an `eval` ctl file that
     /// uppercases its input) and `DynamicDir` (a `vars/` dir over a fixed
@@ -530,7 +546,8 @@ mod tests {
 
             let vars = DynamicDir::new(
                 Box::new(|| {
-                    Box::pin(async { vec!["x".to_string(), "y".to_string()] }) as DevFuture<'static, _>
+                    Box::pin(async { vec!["x".to_string(), "y".to_string()] })
+                        as DevFuture<'static, _>
                 }) as ListFn,
                 Box::new(|name: String| {
                     Box::pin(async move {
@@ -563,21 +580,44 @@ mod tests {
             }))
         }
 
-        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+        async fn open(
+            &self,
+            _fid: &mut Fid,
+            _mode: u8,
+            _caller: &Subject,
+        ) -> Result<(), MountError> {
             Ok(())
         }
 
-        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<DemoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn read(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid
+                .downcast_ref::<DemoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match &inner.kind {
                 DemoFidKind::Eval => Ok(self.ctl.handle_read(&inner.ctl_state, offset)),
                 DemoFidKind::Var(name) => self.vars.read(name, offset).await,
-                DemoFidKind::Root | DemoFidKind::VarsDir => Err(MountError::IsDirectory("use readdir".into())),
+                DemoFidKind::Root | DemoFidKind::VarsDir => {
+                    Err(MountError::IsDirectory("use readdir".into()))
+                }
             }
         }
 
-        async fn write(&self, fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-            let inner = fid.downcast_ref::<DemoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn write(
+            &self,
+            fid: &Fid,
+            _offset: u64,
+            data: &[u8],
+            _caller: &Subject,
+        ) -> Result<u32, MountError> {
+            let inner = fid
+                .downcast_ref::<DemoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match &inner.kind {
                 DemoFidKind::Eval => self.ctl.handle_write(&inner.ctl_state, data).await,
                 _ => Err(MountError::NotSupported("read-only".into())),
@@ -585,11 +625,23 @@ mod tests {
         }
 
         async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-            let inner = fid.downcast_ref::<DemoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<DemoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match &inner.kind {
                 DemoFidKind::Root => Ok(vec![
-                    DirEntry { name: "eval".into(), is_dir: false, size: 0, stat: None },
-                    DirEntry { name: "vars".into(), is_dir: true, size: 0, stat: None },
+                    DirEntry {
+                        name: "eval".into(),
+                        is_dir: false,
+                        size: 0,
+                        stat: None,
+                    },
+                    DirEntry {
+                        name: "vars".into(),
+                        is_dir: true,
+                        size: 0,
+                        stat: None,
+                    },
                 ]),
                 DemoFidKind::VarsDir => Ok(self.vars.readdir().await),
                 _ => Err(MountError::NotDirectory("not a directory".into())),
@@ -597,14 +649,23 @@ mod tests {
         }
 
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<DemoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<DemoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let (name, qtype) = match &inner.kind {
                 DemoFidKind::Root => ("demo".to_string(), 0x80),
                 DemoFidKind::Eval => ("eval".to_string(), 0),
                 DemoFidKind::VarsDir => ("vars".to_string(), 0x80),
                 DemoFidKind::Var(n) => (n.clone(), 0),
             };
-            Ok(Stat { qtype, version: 0, path: 0, size: 0, name, mtime: 0 })
+            Ok(Stat {
+                qtype,
+                version: 0,
+                path: 0,
+                size: 0,
+                name,
+                mtime: 0,
+            })
         }
 
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

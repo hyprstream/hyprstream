@@ -11,7 +11,7 @@
 
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -159,5 +159,4 @@ mod tests {
         let scope = Scope::new("infer".to_owned(), "model".to_owned(), "qwen-7b".to_owned());
         assert_eq!(scope.to_string(), "infer:model:qwen-7b");
     }
-
 }

@@ -18,7 +18,11 @@ use crate::schema::types::ParsedSchema;
 /// traits, JSON dispatch, and metadata. Does NOT emit server-side handlers or
 /// service implementation code.
 /// Compiles to all targets including wasm32.
-pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>) -> proc_macro2::TokenStream {
+pub fn generate_client_only(
+    service_name: &str,
+    schema: &ParsedSchema,
+    types_crate: Option<&syn::Path>,
+) -> proc_macro2::TokenStream {
     let resolved = ResolvedSchema::from(schema);
     let is_data_only = resolved.raw.request_variants.is_empty();
 
@@ -35,7 +39,10 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         Some(tc) => quote::quote! { #tc::#capnp_mod_ident },
         None => quote::quote! { crate::#capnp_mod_ident },
     };
-    let resp_type = quote::format_ident!("{}", crate::util::to_snake_case(&format!("{pascal}Response")));
+    let resp_type = quote::format_ident!(
+        "{}",
+        crate::util::to_snake_case(&format!("{pascal}Response"))
+    );
 
     let response_enum = client::generate_response_enum(service_name, &resolved, types_crate);
     let parse_response = client::generate_parse_response_fn(
@@ -48,20 +55,24 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     );
 
     // Scoped response enums + parsers (e.g., InferClientResponseVariant with parse_scoped_response)
-    let scoped_response_types = scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
+    let scoped_response_types =
+        scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
 
     // Schema metadata, JSON dispatch, and render_doc() for client-side
     // documentation and schema-driven tooling.
-    let metadata_code = metadata::generate_metadata_client_with_dispatch(service_name, &resolved, types_crate);
+    let metadata_code =
+        metadata::generate_metadata_client_with_dispatch(service_name, &resolved, types_crate);
 
     // Transport-agnostic dispatch function — routes method calls by name
-    let portable_dispatch = dispatch::generate_portable_dispatch(service_name, &resolved, types_crate);
+    let portable_dispatch =
+        dispatch::generate_portable_dispatch(service_name, &resolved, types_crate);
 
     // Client struct (cfg-gated: concrete on native, dyn on wasm)
     let client_struct = client::generate_client(service_name, &resolved, types_crate);
 
     // Scoped client structs (same cfg-gated pattern)
-    let scoped_clients = scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
+    let scoped_clients =
+        scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
 
     // Public client-side traits live with the generated clients.  Keeping these
     // traits in the contract crate lets consumers depend on a single
@@ -146,7 +157,12 @@ pub fn generate_server(
 ///
 /// When `types_crate` is `Some`, generates client-only code (no handler/dispatch)
 /// and resolves capnp module paths through the external crate.
-pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: Option<&syn::Path>, scope_handlers: bool) -> proc_macro2::TokenStream {
+pub fn generate_service(
+    service_name: &str,
+    schema: &ParsedSchema,
+    types_crate: Option<&syn::Path>,
+    scope_handlers: bool,
+) -> proc_macro2::TokenStream {
     let resolved = ResolvedSchema::from(schema);
     let is_data_only = resolved.raw.request_variants.is_empty();
 
@@ -163,8 +179,10 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
 
     let response_enum = client::generate_response_enum(service_name, &resolved, types_crate);
     let client_struct = client::generate_client(service_name, &resolved, types_crate);
-    let scoped_clients = scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
-    let scoped_response_types = scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
+    let scoped_clients =
+        scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
+    let scoped_response_types =
+        scoped::generate_scoped_response_types(service_name, &resolved, types_crate);
     let service_traits = client::generate_service_traits(service_name, &resolved, types_crate);
     let trait_impls = client::generate_trait_impls(service_name, &resolved, types_crate);
     let constructors = client::generate_constructors(service_name);

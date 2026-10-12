@@ -27,13 +27,13 @@ pub mod adbc;
 pub use hyprstream_metrics_api::storage::view;
 pub use hyprstream_metrics_api::storage::{Credentials, StorageBackend, StorageUtils};
 
+#[cfg(feature = "adbc")]
+use self::adbc::AdbcBackend;
 use self::{
     cached::CachedStorageBackend,
     duckdb::DuckDbBackend,
     view::{ViewDefinition, ViewMetadata},
 };
-#[cfg(feature = "adbc")]
-use self::adbc::AdbcBackend;
 
 pub use datafusion_provider::{DuckDBExec, DuckDBTableProvider};
 
@@ -101,19 +101,27 @@ impl StorageBackend for StorageBackendType {
                 let cache = Arc::new(DuckDbBackend::new_in_memory()?);
 
                 // Create store backend based on store_engine option
-                let store_engine = options.get("store_engine")
-                    .ok_or_else(|| Status::invalid_argument("Missing store_engine for cached backend"))?;
+                let store_engine = options.get("store_engine").ok_or_else(|| {
+                    Status::invalid_argument("Missing store_engine for cached backend")
+                })?;
 
                 let store: Arc<dyn StorageBackend> = match store_engine.as_str() {
                     #[cfg(feature = "adbc")]
-                    "adbc" => Arc::new(AdbcBackend::new_with_options(connection_string, options, credentials)?),
-                    "duckdb" => Arc::new(DuckDbBackend::new_with_options(connection_string, options, credentials)?),
+                    "adbc" => Arc::new(AdbcBackend::new_with_options(
+                        connection_string,
+                        options,
+                        credentials,
+                    )?),
+                    "duckdb" => Arc::new(DuckDbBackend::new_with_options(
+                        connection_string,
+                        options,
+                        credentials,
+                    )?),
                     _ => return Err(Status::invalid_argument("Invalid store_engine type")),
                 };
 
                 Ok(StorageBackendType::Cached(CachedStorageBackend::new(
-                    cache,
-                    store,
+                    cache, store,
                 )))
             }
             _ => Err(Status::invalid_argument("Invalid engine type")),

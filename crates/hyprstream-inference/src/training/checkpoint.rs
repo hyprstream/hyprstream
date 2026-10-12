@@ -15,8 +15,8 @@ use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use hyprstream_rpc_std::registry_client::{RepositoryClient, WorktreeClient};
 use crate::worktree_ext::WorktreeClientExt;
+use hyprstream_rpc_std::registry_client::{RepositoryClient, WorktreeClient};
 
 /// Checkpoint request sent to background worker
 #[derive(Debug, Clone)]
@@ -100,10 +100,7 @@ impl CheckpointManager {
     }
 
     /// Create checkpoint manager with a repository client for git operations
-    pub fn with_repo_client(
-        model_path: PathBuf,
-        repo_client: RepositoryClient,
-    ) -> Result<Self> {
+    pub fn with_repo_client(model_path: PathBuf, repo_client: RepositoryClient) -> Result<Self> {
         Self::with_config(
             model_path,
             CheckpointConfig::default(),
@@ -237,7 +234,8 @@ impl CheckpointManager {
                     ref data,
                     format: _,
                 } => {
-                    fs.write_file_chunked(".checkpoints/checkpoint.safetensors", data).await?;
+                    fs.write_file_chunked(".checkpoints/checkpoint.safetensors", data)
+                        .await?;
                 }
                 WeightSnapshot::FilePath {
                     ref source,
@@ -248,11 +246,13 @@ impl CheckpointManager {
                     // Otherwise fall back to reading the source and writing via FsOps.
                     if let Ok(rel) = source.strip_prefix(&self.model_path) {
                         let rel_str = rel.to_string_lossy();
-                        fs.copy_path(&rel_str, ".checkpoints/checkpoint.safetensors").await?;
+                        fs.copy_path(&rel_str, ".checkpoints/checkpoint.safetensors")
+                            .await?;
                     } else {
                         // Source outside worktree - read it directly and write via FsOps
                         let data = tokio::fs::read(source).await?;
-                        fs.write_file_chunked(".checkpoints/checkpoint.safetensors", &data).await?;
+                        fs.write_file_chunked(".checkpoints/checkpoint.safetensors", &data)
+                            .await?;
                     }
                 }
                 WeightSnapshot::Diff {
@@ -261,7 +261,9 @@ impl CheckpointManager {
                 } => {
                     let rel_diff = format!(".checkpoints/diff_from_{base_step}_to_{step}.bin");
                     fs.write_file_chunked(&rel_diff, changes).await?;
-                    return Ok(self.checkpoint_dir.join(format!("diff_from_{base_step}_to_{step}.bin")));
+                    return Ok(self
+                        .checkpoint_dir
+                        .join(format!("diff_from_{base_step}_to_{step}.bin")));
                 }
             }
 
@@ -276,14 +278,16 @@ impl CheckpointManager {
                     parent_checkpoint: None,
                 };
                 let metadata_json = serde_json::to_string_pretty(&ckpt_meta)?;
-                fs.write_file_chunked(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
+                fs.write_file_chunked(".checkpoints/checkpoint.json", metadata_json.as_bytes())
+                    .await?;
             }
 
             // Update target adapter if configured
             if let Some(ref adapter_name) = self.target_adapter {
                 fs.mkdir_p("adapters").await?;
                 let rel_adapter = format!("adapters/{adapter_name}.safetensors");
-                fs.copy_path(".checkpoints/checkpoint.safetensors", &rel_adapter).await?;
+                fs.copy_path(".checkpoints/checkpoint.safetensors", &rel_adapter)
+                    .await?;
                 tracing::info!("Updated target adapter via FsOps: {}", rel_adapter);
             }
         } else {
@@ -303,7 +307,10 @@ impl CheckpointManager {
                     let metadata = std::fs::symlink_metadata(source)
                         .map_err(|e| anyhow!("Cannot stat source file {:?}: {}", source, e))?;
                     if metadata.file_type().is_symlink() {
-                        return Err(anyhow!("Source path {:?} is a symlink; refusing to copy", source));
+                        return Err(anyhow!(
+                            "Source path {:?} is a symlink; refusing to copy",
+                            source
+                        ));
                     }
                     crate::worktree_ext::cow_copy(source, &checkpoint_path)?;
                 }
@@ -360,10 +367,7 @@ impl CheckpointManager {
         let adapter_path = adapters_dir.join(format!("{adapter_name}.safetensors"));
         crate::worktree_ext::cow_copy(checkpoint_path, &adapter_path)?;
 
-        tracing::info!(
-            "Updated target adapter: {}",
-            adapter_path.display()
-        );
+        tracing::info!("Updated target adapter: {}", adapter_path.display());
         Ok(())
     }
 
@@ -382,21 +386,28 @@ impl CheckpointManager {
         // Determine worktree branch name
         let wt_branch = if let Some(ref branch_name) = branch {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(&hyprstream_rpc_std::registry_client::BranchRequest {
-                branch_name: branch_name.clone(),
-                start_point: String::new(),
-            }).await;
+            let _ = repo_client
+                .create_branch(&hyprstream_rpc_std::registry_client::BranchRequest {
+                    branch_name: branch_name.clone(),
+                    start_point: String::new(),
+                })
+                .await;
             // Checkout within the worktree
-            repo_client.worktree(branch_name).checkout(&hyprstream_rpc_std::registry_client::CheckoutRequest {
-                ref_name: branch_name.clone(),
-                create_branch: false,
-            })
+            repo_client
+                .worktree(branch_name)
+                .checkout(&hyprstream_rpc_std::registry_client::CheckoutRequest {
+                    ref_name: branch_name.clone(),
+                    create_branch: false,
+                })
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch_name, e))?;
             branch_name.clone()
         } else {
             // Use default branch (HEAD)
-            repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
+            repo_client
+                .get_head()
+                .await
+                .unwrap_or_else(|_| "main".to_owned())
         };
         let wt = repo_client.worktree(&wt_branch);
 
@@ -431,10 +442,10 @@ impl CheckpointManager {
 
         let files_owned: Vec<String> = files_to_stage.iter().map(|s| (*s).to_owned()).collect();
         wt.stage_files(&hyprstream_rpc_std::registry_client::StageFilesRequest {
-                files: files_owned,
-            })
-            .await
-            .map_err(|e| anyhow!("Failed to stage files: {}", e))?;
+            files: files_owned,
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to stage files: {}", e))?;
 
         let commit_message = message.unwrap_or_else(|| {
             format!(
@@ -446,7 +457,8 @@ impl CheckpointManager {
             )
         });
 
-        let oid = wt.commit(&hyprstream_rpc_std::registry_client::CommitRequest {
+        let oid = wt
+            .commit(&hyprstream_rpc_std::registry_client::CommitRequest {
                 message: commit_message,
                 author: String::new(),
                 email: String::new(),
@@ -518,10 +530,16 @@ impl CheckpointManager {
     /// Get current checkpoint info (single file, git handles history)
     pub async fn get_checkpoint(&self) -> Result<Option<CheckpointInfo>> {
         if let Some(fs) = &self.fs {
-            if !fs.stat_path(".checkpoints/checkpoint.json").await.map(|s| s.exists).unwrap_or(false) {
+            if !fs
+                .stat_path(".checkpoints/checkpoint.json")
+                .await
+                .map(|s| s.exists)
+                .unwrap_or(false)
+            {
                 return Ok(None);
             }
-            let json = String::from_utf8(fs.read_file_chunked(".checkpoints/checkpoint.json").await?)?;
+            let json =
+                String::from_utf8(fs.read_file_chunked(".checkpoints/checkpoint.json").await?)?;
             let metadata: CheckpointMetadata = serde_json::from_str(&json)?;
             Ok(Some(CheckpointInfo {
                 step: metadata.step,
@@ -548,7 +566,12 @@ impl CheckpointManager {
         let checkpoint_path = self.checkpoint_dir.join("checkpoint.safetensors");
 
         if let Some(fs) = &self.fs {
-            if !fs.stat_path(".checkpoints/checkpoint.safetensors").await.map(|s| s.exists).unwrap_or(false) {
+            if !fs
+                .stat_path(".checkpoints/checkpoint.safetensors")
+                .await
+                .map(|s| s.exists)
+                .unwrap_or(false)
+            {
                 anyhow::bail!("No checkpoint found at {:?}", checkpoint_path);
             }
         } else if !checkpoint_path.exists() {
@@ -626,7 +649,8 @@ impl CheckpointManager {
                     base_step: _,
                     ref changes,
                 } => {
-                    fs.write_file_chunked(".checkpoints/checkpoint_diff.bin", changes).await?;
+                    fs.write_file_chunked(".checkpoints/checkpoint_diff.bin", changes)
+                        .await?;
                 }
             }
 
@@ -644,7 +668,8 @@ impl CheckpointManager {
                 parent_checkpoint: None,
             };
             let metadata_json = serde_json::to_string_pretty(&metadata)?;
-            fs.write_file_chunked(".checkpoints/checkpoint.json", metadata_json.as_bytes()).await?;
+            fs.write_file_chunked(".checkpoints/checkpoint.json", metadata_json.as_bytes())
+                .await?;
         } else {
             // Direct path (original behavior)
             tokio::fs::create_dir_all(checkpoint_dir).await?;
@@ -700,8 +725,7 @@ impl CheckpointManager {
         // Optionally commit to Git via RepositoryClient
         if let Some(client) = repo_client {
             if request.commit_to_git {
-                if let Err(e) =
-                    Self::git_commit_checkpoint(client, request.step, branch_name).await
+                if let Err(e) = Self::git_commit_checkpoint(client, request.step, branch_name).await
                 {
                     tracing::warn!("Failed to commit checkpoint to Git: {}", e);
                 }
@@ -726,31 +750,38 @@ impl CheckpointManager {
         // Determine worktree branch name
         let wt_branch = if let Some(branch) = branch_name {
             // create_branch may fail if it already exists — that's fine
-            let _ = repo_client.create_branch(&hyprstream_rpc_std::registry_client::BranchRequest {
-                branch_name: branch.clone(),
-                start_point: String::new(),
-            }).await;
-            repo_client.worktree(branch).checkout(&hyprstream_rpc_std::registry_client::CheckoutRequest {
-                ref_name: branch.clone(),
-                create_branch: false,
-            })
+            let _ = repo_client
+                .create_branch(&hyprstream_rpc_std::registry_client::BranchRequest {
+                    branch_name: branch.clone(),
+                    start_point: String::new(),
+                })
+                .await;
+            repo_client
+                .worktree(branch)
+                .checkout(&hyprstream_rpc_std::registry_client::CheckoutRequest {
+                    ref_name: branch.clone(),
+                    create_branch: false,
+                })
                 .await
                 .map_err(|e| anyhow!("Failed to checkout branch '{}': {}", branch, e))?;
             branch.clone()
         } else {
-            repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
+            repo_client
+                .get_head()
+                .await
+                .unwrap_or_else(|_| "main".to_owned())
         };
         let wt = repo_client.worktree(&wt_branch);
 
         // Stage checkpoint files
         wt.stage_files(&hyprstream_rpc_std::registry_client::StageFilesRequest {
-                files: vec![
-                    ".checkpoints/checkpoint.safetensors".to_owned(),
-                    ".checkpoints/checkpoint.json".to_owned(),
-                ],
-            })
-            .await
-            .map_err(|e| anyhow!("Failed to stage checkpoint files: {}", e))?;
+            files: vec![
+                ".checkpoints/checkpoint.safetensors".to_owned(),
+                ".checkpoints/checkpoint.json".to_owned(),
+            ],
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to stage checkpoint files: {}", e))?;
 
         // Commit
         let message = if let Some(name) = branch_name.as_ref() {
@@ -760,12 +791,12 @@ impl CheckpointManager {
         };
 
         wt.commit(&hyprstream_rpc_std::registry_client::CommitRequest {
-                message,
-                author: String::new(),
-                email: String::new(),
-            })
-            .await
-            .map_err(|e| anyhow!("Failed to commit: {}", e))?;
+            message,
+            author: String::new(),
+            email: String::new(),
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to commit: {}", e))?;
 
         // For major checkpoints, create human-friendly tags
         if step.is_multiple_of(50000) {
@@ -775,10 +806,12 @@ impl CheckpointManager {
                 format!("checkpoint-step-{step}")
             };
 
-            let _ = repo_client.create_tag(&hyprstream_rpc_std::registry_client::CreateTagRequest {
-                name: tag_name,
-                target: String::new(),
-            }).await;
+            let _ = repo_client
+                .create_tag(&hyprstream_rpc_std::registry_client::CreateTagRequest {
+                    name: tag_name,
+                    target: String::new(),
+                })
+                .await;
         }
 
         Ok(())

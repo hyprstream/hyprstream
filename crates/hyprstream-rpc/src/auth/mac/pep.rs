@@ -485,7 +485,8 @@ mod tests {
             MoqEventAction::JoinDecrypt,
         ] {
             assert_eq!(
-                pep.check_event_prefix(&Subject::anonymous(), "registry", action).await,
+                pep.check_event_prefix(&Subject::anonymous(), "registry", action)
+                    .await,
                 MacDecision::Deny(MacDenyReason::NoClearance)
             );
         }
@@ -562,7 +563,8 @@ mod tests {
                 &Subject::new("did:web:public"),
                 "alice/streams/run-1/i0",
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             MacDecision::Permit
         );
         // The same service on the event plane is a different, unlisted object.
@@ -571,7 +573,8 @@ mod tests {
                 &Subject::new("did:web:public"),
                 "streams.session.x",
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
     }
@@ -585,7 +588,8 @@ mod tests {
         // Malformed event grammar (uppercase service segment, map-key form).
         for bad in ["Worker", "5:acmeworker", "wor/ker"] {
             assert_eq!(
-                pep.check_event_prefix(&subject, bad, MoqEventAction::Publish).await,
+                pep.check_event_prefix(&subject, bad, MoqEventAction::Publish)
+                    .await,
                 MacDecision::Deny(MacDenyReason::UnlabeledObject),
                 "{bad:?} must not decode"
             );
@@ -593,7 +597,8 @@ mod tests {
         // Malformed stream grammar (single segment, traversal).
         for bad in ["alice", "alice/../streams/run"] {
             assert_eq!(
-                pep.check_stream_track(&subject, bad, MoqEventAction::Subscribe).await,
+                pep.check_stream_track(&subject, bad, MoqEventAction::Subscribe)
+                    .await,
                 MacDecision::Deny(MacDenyReason::UnlabeledObject),
                 "{bad:?} must not decode"
             );
@@ -646,7 +651,8 @@ mod tests {
         );
         let subject = Subject::new("did:web:cleared");
         assert_eq!(
-            pep.check_event_prefix(&subject, "worker", MoqEventAction::Publish).await,
+            pep.check_event_prefix(&subject, "worker", MoqEventAction::Publish)
+                .await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
         assert_eq!(
@@ -654,7 +660,8 @@ mod tests {
                 &subject,
                 "alice/streams/run-1/i0",
                 MoqEventAction::Subscribe
-            ).await,
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
     }
@@ -685,7 +692,8 @@ mod tests {
                 &subject,
                 &oversized_event_coordinate(),
                 MoqEventAction::Publish,
-            ).await,
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
 
@@ -721,7 +729,8 @@ mod tests {
                 &subject,
                 &oversized_stream_coordinate(),
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
 
@@ -750,7 +759,8 @@ mod tests {
         let subject = Subject::new("did:web:cleared");
         for input in [&a, &b] {
             assert_eq!(
-                pep.check_event_prefix(&subject, input, MoqEventAction::Publish).await,
+                pep.check_event_prefix(&subject, input, MoqEventAction::Publish)
+                    .await,
                 MacDecision::Deny(MacDenyReason::UnlabeledObject)
             );
         }

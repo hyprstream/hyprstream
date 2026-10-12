@@ -376,9 +376,7 @@ const MULTICODEC_ML_KEM_768_PUB: [u8; 2] = [0x8c, 0x24];
 /// runs [`RecipientPublic::validate`] — a partial, duplicated, reordered, or
 /// malformed relationship is `None` (caller fails closed), never a partial
 /// recipient.
-pub fn mesh_kem_recipient(
-    doc: &Value,
-) -> Option<crate::crypto::hybrid_kem::RecipientPublic> {
+pub fn mesh_kem_recipient(doc: &Value) -> Option<crate::crypto::hybrid_kem::RecipientPublic> {
     let kas = doc.get("keyAgreement")?.as_array()?;
     let mut x25519: Option<Vec<u8>> = None;
     let mut mlkem768: Option<Vec<u8>> = None;
@@ -692,8 +690,9 @@ impl HttpDidDocFetcher {
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(10));
         if let Some(pem) = extra_root_pem {
-            let cert = reqwest::Certificate::from_pem(pem)
-                .map_err(|e| anyhow!("extra did:web TLS root is not a valid PEM certificate: {e}"))?;
+            let cert = reqwest::Certificate::from_pem(pem).map_err(|e| {
+                anyhow!("extra did:web TLS root is not a valid PEM certificate: {e}")
+            })?;
             builder = builder.add_root_certificate(cert);
         }
         let http = builder

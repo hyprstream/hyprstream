@@ -88,8 +88,7 @@ impl RdsConfig {
     /// (metal RDS runtime contract v1.1). Never the URL itself.
     pub const RECORDS_URL_FILE_ENV: &'static str = "HYPRSTREAM_RECORDS_URL_FILE";
     /// Records-role env var carrying the PATH to the pinned RDS CA PEM.
-    pub const RECORDS_SSLROOTCERT_FILE_ENV: &'static str =
-        "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE";
+    pub const RECORDS_SSLROOTCERT_FILE_ENV: &'static str = "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE";
     /// Shared Postgres credentials directory env var (metal renders the
     /// per-role URL files and `rds-ca.pem` under it).
     pub const POSTGRES_CREDENTIALS_PATH_ENV: &'static str = "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH";
@@ -308,7 +307,8 @@ impl RdsConfig {
     /// Open replay admission without creating checkpointed PDS state.
     pub fn connect_replay_admission(&self) -> anyhow::Result<crate::pgsql_kv::PgKv> {
         let url = self.read_url()?;
-        let root_cert = self.root_cert_file()
+        let root_cert = self
+            .root_cert_file()
             .ok_or_else(|| anyhow::anyhow!("RDS root_cert_file not configured"))?;
         crate::pgsql_kv::PgKv::connect_replay_admission(&url, root_cert)
     }
@@ -362,7 +362,10 @@ mod tests {
             })
             .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
         assert!(resolved.is_configured());
-        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/run/cred/records-url")));
+        assert_eq!(
+            resolved.url_file.as_deref(),
+            Some(Path::new("/run/cred/records-url"))
+        );
         assert_eq!(
             resolved.root_cert_file.as_deref(),
             Some(Path::new("/run/cred/rds-ca.pem"))
@@ -384,7 +387,10 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|e| panic!("TOML-pinned resolution must not fail: {e}"));
-        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/toml/records-url")));
+        assert_eq!(
+            resolved.url_file.as_deref(),
+            Some(Path::new("/toml/records-url"))
+        );
         assert_eq!(
             resolved.root_cert_file.as_deref(),
             Some(Path::new("/toml/rds-ca.pem"))
@@ -419,7 +425,10 @@ mod tests {
             .resolve_with(env)
             .unwrap_or_else(|e| panic!("rendered records-url must resolve: {e}"));
         assert!(resolved.is_configured());
-        assert_eq!(resolved.url_file.as_deref(), Some(dir.path().join("records-url").as_path()));
+        assert_eq!(
+            resolved.url_file.as_deref(),
+            Some(dir.path().join("records-url").as_path())
+        );
         assert_eq!(
             resolved.root_cert_file.as_deref(),
             Some(dir.path().join("rds-ca.pem").as_path())

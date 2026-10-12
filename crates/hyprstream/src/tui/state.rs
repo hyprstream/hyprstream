@@ -140,7 +140,8 @@ impl PaneBuffer {
 
     /// Resize the buffer. Sets `force_full_frame`.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.buffer.resize(ratatui::layout::Rect::new(0, 0, cols, rows));
+        self.buffer
+            .resize(ratatui::layout::Rect::new(0, 0, cols, rows));
         self.force_full_frame = true;
         self.damage_rows = 0;
         self.scroll_log.clear();
@@ -265,7 +266,8 @@ impl TuiPane {
     pub fn enter_alternate_screen(&mut self) {
         if !self.using_alternate {
             let (cols, rows) = self.size();
-            self.alternate.get_or_insert_with(|| PaneBuffer::new(cols, rows));
+            self.alternate
+                .get_or_insert_with(|| PaneBuffer::new(cols, rows));
             self.using_alternate = true;
             // Force full frame on screen switch
             if let Some(alt) = &mut self.alternate {
@@ -327,8 +329,7 @@ impl LayoutNode {
     pub fn pane_ids(&self) -> Vec<u32> {
         match self {
             LayoutNode::Leaf { pane_id } => vec![*pane_id],
-            LayoutNode::HSplit { first, second, .. }
-            | LayoutNode::VSplit { first, second, .. } => {
+            LayoutNode::HSplit { first, second, .. } | LayoutNode::VSplit { first, second, .. } => {
                 let mut ids = first.pane_ids();
                 ids.extend(second.pane_ids());
                 ids
@@ -347,7 +348,11 @@ impl LayoutNode {
                     Some(self.clone())
                 }
             }
-            LayoutNode::HSplit { ratio, first, second } => {
+            LayoutNode::HSplit {
+                ratio,
+                first,
+                second,
+            } => {
                 let f = first.prune(target_pane_id);
                 let s = second.prune(target_pane_id);
                 match (f, s) {
@@ -360,7 +365,11 @@ impl LayoutNode {
                     (None, None) => None,
                 }
             }
-            LayoutNode::VSplit { ratio, first, second } => {
+            LayoutNode::VSplit {
+                ratio,
+                first,
+                second,
+            } => {
                 let f = first.prune(target_pane_id);
                 let s = second.prune(target_pane_id);
                 match (f, s) {
@@ -448,7 +457,14 @@ pub struct TuiSession {
 
 impl TuiSession {
     /// Create a new session with one window containing one pane.
-    pub fn new(id: u32, window_id: u32, pane_id: u32, cols: u16, rows: u16, max_scrollback: usize) -> Self {
+    pub fn new(
+        id: u32,
+        window_id: u32,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+        max_scrollback: usize,
+    ) -> Self {
         let window = TuiWindow::new(window_id, pane_id, cols, rows, max_scrollback);
         Self {
             id,
@@ -487,7 +503,11 @@ impl TuiSession {
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
     /// A pane's buffer was modified.
-    Damage { session_id: u32, window_id: u32, pane_id: u32 },
+    Damage {
+        session_id: u32,
+        window_id: u32,
+        pane_id: u32,
+    },
     /// A window was created.
     WindowCreated { session_id: u32, window_id: u32 },
     /// A window was closed.
@@ -495,9 +515,17 @@ pub enum TuiEvent {
     /// The active window changed (focus switched).
     WindowFocused { session_id: u32, window_id: u32 },
     /// A pane was created.
-    PaneCreated { session_id: u32, window_id: u32, pane_id: u32 },
+    PaneCreated {
+        session_id: u32,
+        window_id: u32,
+        pane_id: u32,
+    },
     /// A pane was closed.
-    PaneClosed { session_id: u32, window_id: u32, pane_id: u32 },
+    PaneClosed {
+        session_id: u32,
+        window_id: u32,
+        pane_id: u32,
+    },
     /// A session was created.
     SessionCreated { session_id: u32 },
     /// A session was destroyed.
@@ -611,8 +639,14 @@ impl TuiState {
         session.windows.push(window);
         session.active_window_id = window_id;
 
-        let _ = self.event_tx.send(TuiEvent::WindowCreated { session_id, window_id });
-        let _ = self.event_tx.send(TuiEvent::WindowFocused { session_id, window_id });
+        let _ = self.event_tx.send(TuiEvent::WindowCreated {
+            session_id,
+            window_id,
+        });
+        let _ = self.event_tx.send(TuiEvent::WindowFocused {
+            session_id,
+            window_id,
+        });
         Some(window_id)
     }
 
@@ -637,7 +671,10 @@ impl TuiState {
         if session.active_window_id == window_id {
             session.active_window_id = session.windows.first().map(|w| w.id).unwrap_or(0);
         }
-        let _ = self.event_tx.send(TuiEvent::WindowClosed { session_id, window_id });
+        let _ = self.event_tx.send(TuiEvent::WindowClosed {
+            session_id,
+            window_id,
+        });
         true
     }
 
@@ -651,7 +688,10 @@ impl TuiState {
             return false;
         }
         session.active_window_id = window_id;
-        let _ = self.event_tx.send(TuiEvent::WindowFocused { session_id, window_id });
+        let _ = self.event_tx.send(TuiEvent::WindowFocused {
+            session_id,
+            window_id,
+        });
         true
     }
 
@@ -675,7 +715,9 @@ impl TuiState {
         window.panes.push(new_pane);
 
         let old_layout = window.layout.clone();
-        let new_leaf = LayoutNode::Leaf { pane_id: new_pane_id };
+        let new_leaf = LayoutNode::Leaf {
+            pane_id: new_pane_id,
+        };
         window.layout = if horizontal {
             LayoutNode::HSplit {
                 ratio,
@@ -816,12 +858,24 @@ mod tests {
         buf.clear_damage();
 
         for i in 0..256 {
-            buf.record_scroll(ScrollOp { top: 0, bottom: 23, amount: 1 });
-            assert!(!buf.force_full_frame, "should not force full frame at scroll {}", i);
+            buf.record_scroll(ScrollOp {
+                top: 0,
+                bottom: 23,
+                amount: 1,
+            });
+            assert!(
+                !buf.force_full_frame,
+                "should not force full frame at scroll {}",
+                i
+            );
         }
 
         // 257th scroll should trigger force_full_frame
-        buf.record_scroll(ScrollOp { top: 0, bottom: 23, amount: 1 });
+        buf.record_scroll(ScrollOp {
+            top: 0,
+            bottom: 23,
+            amount: 1,
+        });
         assert!(buf.force_full_frame);
     }
 

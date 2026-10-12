@@ -393,8 +393,7 @@ mod tests {
             first.ipc_transport(Path::new("/run/hyprstream")),
             second.ipc_transport(Path::new("/run/hyprstream"))
         );
-        let service_key =
-            hyprstream_rpc::prelude::SigningKey::from_bytes(&[31u8; 32]);
+        let service_key = hyprstream_rpc::prelude::SigningKey::from_bytes(&[31u8; 32]);
         let first_carrier = hyprstream_rpc::node_identity::derive_purpose_key(
             &service_key,
             &first.iroh_key_purpose(),
@@ -408,7 +407,10 @@ mod tests {
             service_key.verifying_key(),
             "carrier address must not reuse application authority"
         );
-        assert_ne!(first_carrier.verifying_key(), second_carrier.verifying_key());
+        assert_ne!(
+            first_carrier.verifying_key(),
+            second_carrier.verifying_key()
+        );
         Ok(())
     }
 }

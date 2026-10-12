@@ -6425,7 +6425,10 @@ mod tests {
         );
         let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
         assert_eq!(commit_after.version, commit_before.version);
-        assert_eq!(commit_after.component_digest, commit_before.component_digest);
+        assert_eq!(
+            commit_after.component_digest,
+            commit_before.component_digest
+        );
         assert_eq!(
             std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
             pending_before
@@ -6596,10 +6599,16 @@ mod tests {
         // for explicit repair.
         std::fs::write(&marker_path, &marker_bytes).unwrap();
         let recovered = run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
-        assert!(recovered, "the rotation operation itself should remain usable");
+        assert!(
+            recovered,
+            "the rotation operation itself should remain usable"
+        );
         let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
         assert_eq!(commit_after.version, commit_before.version);
-        assert_eq!(commit_after.component_digest, commit_before.component_digest);
+        assert_eq!(
+            commit_after.component_digest,
+            commit_before.component_digest
+        );
         assert_eq!(
             std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
             pending_before

@@ -28,7 +28,6 @@ pub struct ModelConfig {
     pub quic_port: Option<u16>,
 }
 
-
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
@@ -40,7 +39,6 @@ impl Default for ModelConfig {
         }
     }
 }
-
 
 /// Runtime execution configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,7 +144,6 @@ pub struct RuntimeConfig {
     #[serde(default = "default_fp8_gemm")]
     pub fp8_gemm: bool,
 
-
     /// Self-speculative decoding via the Qwen3.5 MTP draft head. **Default: off.**
     ///
     /// When enabled (and the loaded model is a dense Qwen3.5 checkpoint with an
@@ -225,7 +222,12 @@ fn default_continuous_batch_max() -> usize {
 /// NVIDIA Hopper (SM90) + cuBLASLt ≥ 12.9 (no CPU/ROCm kernel in torch 2.11).
 pub(crate) fn default_fp8_gemm() -> bool {
     std::env::var("HYPRSTREAM_FP8_GEMM")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -235,7 +237,12 @@ pub(crate) fn default_fp8_gemm() -> bool {
 /// experiment (greedy-only, batch=1-only, dense Qwen3.5 MTP only).
 fn default_speculative_decoding() -> bool {
     std::env::var("HYPRSTREAM_SPECULATIVE_DECODE")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -244,7 +251,12 @@ fn default_speculative_decoding() -> bool {
 /// keeps FP8 weights at FP8 size in VRAM with lazy per-matmul dequantization.
 pub(crate) fn default_fp8_dequant_load() -> bool {
     std::env::var("HYPRSTREAM_FP8_DEQUANT_LOAD")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -446,7 +458,6 @@ impl Default for GenerationConfig {
         }
     }
 }
-
 
 /// Generation result with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -729,12 +740,10 @@ fn default_training_min_quality() -> f32 {
     0.3
 }
 
-
-
 /// Multi-GPU device resolution tests (#313) for the moved `RuntimeConfig`.
 #[cfg(test)]
 mod runtime_config_tests {
-#![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used)]
 
     use super::*;
 
@@ -749,12 +758,18 @@ mod runtime_config_tests {
         fn set(key: &str, val: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, val);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
         fn unset(key: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
     }
     impl Drop for EnvVarGuard {
@@ -766,241 +781,190 @@ mod runtime_config_tests {
         }
     }
 
-#[test]
-#[allow(clippy::unwrap_used)]
-fn parse_device_list_basic() {
-
-    assert_eq!(RuntimeConfig::parse_device_list("0,1").unwrap(), vec![0, 1]);
-
-    // Whitespace around entries is tolerated.
-
-    assert_eq!(
-
-        RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(),
-
-        vec![0, 2]
-
-    );
-
-    assert_eq!(RuntimeConfig::parse_device_list("3").unwrap(), vec![3]);
-
-}
-
-#[test]
-fn parse_device_list_rejects_garbage() {
-
-    // Non-numeric, empty fields, and negatives are hard errors (no silent default).
-
-    assert!(RuntimeConfig::parse_device_list("0,foo").is_err());
-
-    assert!(RuntimeConfig::parse_device_list("0,").is_err());
-
-    assert!(RuntimeConfig::parse_device_list("0,,1").is_err());
-
-    assert!(RuntimeConfig::parse_device_list("-1").is_err());
-
-}
-
-#[test]
-#[allow(clippy::unwrap_used)]
-fn validate_index_set_dedup_and_empty() {
-
-    // Empty → None (auto-detect).
-
-    assert_eq!(RuntimeConfig::validate_index_set(vec![]).unwrap(), None);
-
-    // Duplicates → error.
-
-    assert!(RuntimeConfig::validate_index_set(vec![0, 0]).is_err());
-
-    // Distinct → Some, order preserved.
-
-    assert_eq!(
-
-        RuntimeConfig::validate_index_set(vec![2, 0, 1]).unwrap(),
-
-        Some(vec![2, 0, 1])
-
-    );
-
-}
-
-/// Serializes the two tests that mutate the shared `HYPRSTREAM_GPU_DEVICES`
-/// process env var so they don't race under the parallel test runner.
-static GPU_DEVICES_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-#[test]
-#[allow(clippy::unwrap_used)]
-fn resolve_uses_devices_field_and_legacy_fallback() {
-
-    let _serial = GPU_DEVICES_ENV_LOCK.lock();
-
-    // Guard against the env var leaking from the ambient environment so the
-
-    // struct-field/legacy precedence is exercised deterministically.
-
-    let _guard = EnvVarGuard::unset("HYPRSTREAM_GPU_DEVICES");
-
-    // Explicit multi-device field wins.
-
-    let mut cfg = RuntimeConfig::default();
-
-    cfg.devices = vec![0, 1];
-
-    cfg.gpu_device_id = Some(7);
-
-    assert_eq!(
-
-        cfg.resolve_explicit_multi_device_indices().unwrap(),
-
-        Some(vec![0, 1])
-
-    );
-
-    assert_eq!(cfg.resolve_device_indices().unwrap(), Some(vec![0, 1]));
-
-    // No explicit multi-device set → explicit resolver is None, but the full
-
-    // resolver falls back to the legacy single gpu_device_id.
-
-    let mut legacy = RuntimeConfig::default();
-
-    legacy.devices = vec![];
-
-    legacy.gpu_device_id = Some(3);
-
-    assert_eq!(
-
-        legacy.resolve_explicit_multi_device_indices().unwrap(),
-
-        None
-
-    );
-
-    assert_eq!(legacy.resolve_device_indices().unwrap(), Some(vec![3]));
-
-    // Nothing requested anywhere → None (auto-detect path preserved).
-
-    let mut none = RuntimeConfig::default();
-
-    none.devices = vec![];
-
-    none.gpu_device_id = None;
-
-    assert_eq!(none.resolve_device_indices().unwrap(), None);
-
-}
-
-#[test]
-#[allow(clippy::unwrap_used)]
-fn resolve_env_var_overrides_and_is_strict() {
-
-    let _serial = GPU_DEVICES_ENV_LOCK.lock();
-
-    let mut cfg = RuntimeConfig::default();
-
-    cfg.devices = vec![5];
-
-    cfg.gpu_device_id = Some(9);
-
-    {
-
-        let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,1,2");
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn parse_device_list_basic() {
+        assert_eq!(RuntimeConfig::parse_device_list("0,1").unwrap(), vec![0, 1]);
+
+        // Whitespace around entries is tolerated.
 
         assert_eq!(
-
-            cfg.resolve_explicit_multi_device_indices().unwrap(),
-
-            Some(vec![0, 1, 2]),
-
-            "env var must override the devices field"
-
+            RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(),
+            vec![0, 2]
         );
 
+        assert_eq!(RuntimeConfig::parse_device_list("3").unwrap(), vec![3]);
     }
 
-    {
+    #[test]
+    fn parse_device_list_rejects_garbage() {
+        // Non-numeric, empty fields, and negatives are hard errors (no silent default).
 
-        // Malformed env var is a hard error (not a silent fallback to field).
+        assert!(RuntimeConfig::parse_device_list("0,foo").is_err());
 
-        let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,nope");
+        assert!(RuntimeConfig::parse_device_list("0,").is_err());
 
-        assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        assert!(RuntimeConfig::parse_device_list("0,,1").is_err());
 
+        assert!(RuntimeConfig::parse_device_list("-1").is_err());
     }
 
-    {
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn validate_index_set_dedup_and_empty() {
+        // Empty → None (auto-detect).
 
-        // Duplicate in env var → error.
+        assert_eq!(RuntimeConfig::validate_index_set(vec![]).unwrap(), None);
 
-        let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "1,1");
+        // Duplicates → error.
 
-        assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        assert!(RuntimeConfig::validate_index_set(vec![0, 0]).is_err());
 
-    }
-
-    {
-
-        // Explicitly-empty env var is treated as unset (falls back to field).
-
-        let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "  ");
+        // Distinct → Some, order preserved.
 
         assert_eq!(
+            RuntimeConfig::validate_index_set(vec![2, 0, 1]).unwrap(),
+            Some(vec![2, 0, 1])
+        );
+    }
 
+    /// Serializes the two tests that mutate the shared `HYPRSTREAM_GPU_DEVICES`
+    /// process env var so they don't race under the parallel test runner.
+    static GPU_DEVICES_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_uses_devices_field_and_legacy_fallback() {
+        let _serial = GPU_DEVICES_ENV_LOCK.lock();
+
+        // Guard against the env var leaking from the ambient environment so the
+
+        // struct-field/legacy precedence is exercised deterministically.
+
+        let _guard = EnvVarGuard::unset("HYPRSTREAM_GPU_DEVICES");
+
+        // Explicit multi-device field wins.
+
+        let mut cfg = RuntimeConfig::default();
+
+        cfg.devices = vec![0, 1];
+
+        cfg.gpu_device_id = Some(7);
+
+        assert_eq!(
             cfg.resolve_explicit_multi_device_indices().unwrap(),
-
-            Some(vec![5])
-
+            Some(vec![0, 1])
         );
 
-    }
+        assert_eq!(cfg.resolve_device_indices().unwrap(), Some(vec![0, 1]));
 
-}
+        // No explicit multi-device set → explicit resolver is None, but the full
 
-/// Serializes tests mutating the shared `HYPRSTREAM_STRICT_DEVICE` env var.
-static STRICT_DEVICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        // resolver falls back to the legacy single gpu_device_id.
 
-/// #315: strict_device defaults to fail-fast, and can be opted out via env.
-#[test]
-fn strict_device_defaults_to_true_and_respects_env() {
+        let mut legacy = RuntimeConfig::default();
 
-    let _serial = STRICT_DEVICE_ENV_LOCK.lock();
+        legacy.devices = vec![];
 
-    {
+        legacy.gpu_device_id = Some(3);
 
-        let _g = EnvVarGuard::unset("HYPRSTREAM_STRICT_DEVICE");
-
-        assert!(
-
-            RuntimeConfig::default().strict_device,
-
-            "strict_device must default to true (safe default for multi-GPU)"
-
+        assert_eq!(
+            legacy.resolve_explicit_multi_device_indices().unwrap(),
+            None
         );
 
+        assert_eq!(legacy.resolve_device_indices().unwrap(), Some(vec![3]));
+
+        // Nothing requested anywhere → None (auto-detect path preserved).
+
+        let mut none = RuntimeConfig::default();
+
+        none.devices = vec![];
+
+        none.gpu_device_id = None;
+
+        assert_eq!(none.resolve_device_indices().unwrap(), None);
     }
 
-    for falsy in ["0", "false", "no", "off"] {
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_env_var_overrides_and_is_strict() {
+        let _serial = GPU_DEVICES_ENV_LOCK.lock();
 
-        let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", falsy);
+        let mut cfg = RuntimeConfig::default();
 
-        assert!(
+        cfg.devices = vec![5];
 
-            !RuntimeConfig::default().strict_device,
+        cfg.gpu_device_id = Some(9);
 
-            "HYPRSTREAM_STRICT_DEVICE={falsy} must disable strict_device"
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,1,2");
 
-        );
+            assert_eq!(
+                cfg.resolve_explicit_multi_device_indices().unwrap(),
+                Some(vec![0, 1, 2]),
+                "env var must override the devices field"
+            );
+        }
 
+        {
+            // Malformed env var is a hard error (not a silent fallback to field).
+
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,nope");
+
+            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        }
+
+        {
+            // Duplicate in env var → error.
+
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "1,1");
+
+            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        }
+
+        {
+            // Explicitly-empty env var is treated as unset (falls back to field).
+
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "  ");
+
+            assert_eq!(
+                cfg.resolve_explicit_multi_device_indices().unwrap(),
+                Some(vec![5])
+            );
+        }
     }
 
-    {
+    /// Serializes tests mutating the shared `HYPRSTREAM_STRICT_DEVICE` env var.
+    static STRICT_DEVICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-        let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", "1");
+    /// #315: strict_device defaults to fail-fast, and can be opted out via env.
+    #[test]
+    fn strict_device_defaults_to_true_and_respects_env() {
+        let _serial = STRICT_DEVICE_ENV_LOCK.lock();
 
-        assert!(RuntimeConfig::default().strict_device);
+        {
+            let _g = EnvVarGuard::unset("HYPRSTREAM_STRICT_DEVICE");
 
+            assert!(
+                RuntimeConfig::default().strict_device,
+                "strict_device must default to true (safe default for multi-GPU)"
+            );
+        }
+
+        for falsy in ["0", "false", "no", "off"] {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", falsy);
+
+            assert!(
+                !RuntimeConfig::default().strict_device,
+                "HYPRSTREAM_STRICT_DEVICE={falsy} must disable strict_device"
+            );
+        }
+
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", "1");
+
+            assert!(RuntimeConfig::default().strict_device);
+        }
     }
-
-}
 }

@@ -41,13 +41,10 @@ pub async fn exchange_browser_session(
 
 /// Read the current server-derived viewer context from the HttpOnly session.
 #[wasm_bindgen(js_name = "browserSessionWhoami")]
-pub async fn browser_session_whoami(
-    exchange_endpoint: &str,
-) -> Result<JsValue, JsError> {
-    let context =
-        hyprstream_rpc::wasm_token_exchange::fetch_session_context(exchange_endpoint)
-            .await
-            .map_err(|error| JsError::new(&error.to_string()))?;
+pub async fn browser_session_whoami(exchange_endpoint: &str) -> Result<JsValue, JsError> {
+    let context = hyprstream_rpc::wasm_token_exchange::fetch_session_context(exchange_endpoint)
+        .await
+        .map_err(|error| JsError::new(&error.to_string()))?;
     context
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|error| JsError::new(&format!("session context serialization failed: {error}")))
@@ -149,10 +146,9 @@ impl VfsShell {
         .map_err(|e| JsError::new(&e.to_string()))?;
 
         // 2) Derive the display Subject from the freshly-minted token's `sub`.
-        let subject = hyprstream_rpc::wasm_token_exchange::subject_from_access_token(
-            &exchanged.access_token,
-        )
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        let subject =
+            hyprstream_rpc::wasm_token_exchange::subject_from_access_token(&exchanged.access_token)
+                .map_err(|e| JsError::new(&e.to_string()))?;
         web_sys::console::log_1(&"[VfsShell] Subject resolved from exchanged token".into());
         let returned_nonce = exchanged.nonce.clone();
 
@@ -228,8 +224,7 @@ impl VfsShell {
     /// Evaluate a Tcl script against the VFS namespace.
     pub async fn eval(&self, script: &str) -> Result<String, JsError> {
         let mut shell = self.shell.borrow_mut();
-        shell.eval(script).await
-            .map_err(|e| JsError::new(&e))
+        shell.eval(script).await.map_err(|e| JsError::new(&e))
     }
 
     /// The server-issued DPoP nonce from the exchange that authenticated this

@@ -160,7 +160,11 @@ pub fn build_aggregate_query(
 
     // Add group by columns
     if !group_by.columns.is_empty() {
-        let cols: Vec<&str> = group_by.columns.iter().map(std::string::String::as_str).collect();
+        let cols: Vec<&str> = group_by
+            .columns
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         query.push_str(&cols.join(", "));
         query.push_str(", ");
     }
@@ -198,7 +202,11 @@ pub fn build_aggregate_query(
         let mut group_cols = Vec::new();
 
         if !group_by.columns.is_empty() {
-            let cols: Vec<&str> = group_by.columns.iter().map(std::string::String::as_str).collect();
+            let cols: Vec<&str> = group_by
+                .columns
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
             group_cols.extend(cols);
         }
 

@@ -333,7 +333,10 @@ pub struct SessionExists;
 
 impl std::fmt::Display for SessionExists {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "session already exists (identifiers are never reassigned)")
+        write!(
+            f,
+            "session already exists (identifiers are never reassigned)"
+        )
     }
 }
 
@@ -346,10 +349,7 @@ pub struct SessionKindMismatch;
 
 impl std::fmt::Display for SessionKindMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "session key variant does not match session state kind"
-        )
+        write!(f, "session key variant does not match session state kind")
     }
 }
 
@@ -607,7 +607,10 @@ fn hex_compact(bytes: &[u8]) -> String {
     } else {
         format!(
             "{}…{}",
-            bytes[..4].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            bytes[..4]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
             bytes[bytes.len() - 4..]
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -674,7 +677,10 @@ mod tests {
         let mut empty_subject = state.clone();
         empty_subject.subject = String::new();
         let bad_state = reg
-            .register_session(SessionKey::oidc("https://a.example", "ses-1"), empty_subject)
+            .register_session(
+                SessionKey::oidc("https://a.example", "ses-1"),
+                empty_subject,
+            )
             .await;
         assert!(
             matches!(bad_state, Err(SessionRegisterError::InvalidRecord(_))),

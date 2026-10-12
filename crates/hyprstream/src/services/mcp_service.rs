@@ -19,17 +19,7 @@
 //! 2. Token expiration
 //! 3. Backend services enforce authorization via Casbin policies
 
-use hyprstream_rpc_std::mcp_client::{
-    CallTool, ErrorInfo, McpResponseVariant,
-    ServiceMetrics, ServiceStatus, ToolDefinition, ToolList,
-};
-use crate::services::generated::mcp_client::{McpHandler, dispatch_mcp, serialize_response};
-use hyprstream_rpc_std::model_client::ModelClient;
-use hyprstream_rpc_std::policy_client::PolicyCheck;
-use hyprstream_rpc_std::tui_client::TuiClient;
-use hyprstream_rpc_std::policy_client::PolicyClient;
-use hyprstream_rpc_std::registry_client::RegistryClient;
-use hyprstream_rpc_std::workflow_client::WorkflowClient;
+use crate::services::generated::mcp_client::{dispatch_mcp, serialize_response, McpHandler};
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
@@ -39,6 +29,16 @@ use hyprstream_rpc::moq_stream::MoqStreamHandle;
 use hyprstream_rpc::service::RequestService;
 use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc_std::mcp_client::{
+    CallTool, ErrorInfo, McpResponseVariant, ServiceMetrics, ServiceStatus, ToolDefinition,
+    ToolList,
+};
+use hyprstream_rpc_std::model_client::ModelClient;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::tui_client::TuiClient;
+use hyprstream_rpc_std::workflow_client::WorkflowClient;
 use hyprstream_service::ServiceContext;
 use parking_lot::RwLock;
 use rmcp::{
@@ -368,8 +368,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
                 } else {
                     method.description.to_string()
                 };
-                let required_scope =
-                    mcp_policy_scope(method.scope, &service_name, &method_name);
+                let required_scope = mcp_policy_scope(method.scope, &service_name, &method_name);
 
                 if method.is_streaming {
                     register_streaming_tool(
@@ -400,10 +399,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, registry_client::schema_metadata());
     register_top_level!(reg, policy_client::schema_metadata());
     register_top_level!(reg, tui_client::schema_metadata());
-    register_top_level!(
-        reg,
-        hyprstream_rpc_std::workflow_client::schema_metadata()
-    );
+    register_top_level!(reg, hyprstream_rpc_std::workflow_client::schema_metadata());
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(
         reg,
@@ -582,10 +578,8 @@ fn register_scoped_tools_recursive(
                                         .await?
                                 }
                                 "model" => {
-                                    let client = mcp_model_client(
-                                        &ctx.signing_key,
-                                        ctx.token.as_deref(),
-                                    )?;
+                                    let client =
+                                        mcp_model_client(&ctx.signing_key, ctx.token.as_deref())?;
                                     client
                                         .call_scoped_streaming_method(
                                             &scope_refs,
@@ -923,7 +917,11 @@ async fn dispatch_schema_call(
             // WorkflowService. WorkflowService's authorize callback relays the
             // delegated bearer to PolicyService via check_with_verified_bearer
             // (same path as WorkerService), which validates the delegation.
-            let mut client = WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)?;
+            let mut client = WorkflowClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                signing_key,
+                None,
+            )?;
             if let Some(bearer) = ctx.token.as_ref() {
                 client = client.with_delegated_bearer(bearer.clone());
             }
@@ -1021,7 +1019,11 @@ impl McpService {
         // IPC transport — registry-free, so a separate rootless Quadlet
         // process can reach the PolicyService socket.
         let policy_client = if hyprstream_discovery::native_network_required() {
-            PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, config.signing_key.clone(), None)?
+            PolicyClient::from_provider(
+                &hyprstream_discovery::ProductionRpcClientProvider,
+                config.signing_key.clone(),
+                None,
+            )?
         } else {
             PolicyClient::for_local_transport_bootstrap(
                 &config.policy_transport,
@@ -1635,8 +1637,7 @@ mod tests {
         );
         assert!(delegated_mcp_bearer(Some("\n")).is_err());
         assert_eq!(
-            delegated_mcp_bearer(Some("verified-user-token"))
-                .expect("nonblank delegated token"),
+            delegated_mcp_bearer(Some("verified-user-token")).expect("nonblank delegated token"),
             Some("verified-user-token".to_owned())
         );
     }
@@ -1703,18 +1704,22 @@ mod tests {
         let arm_end = production[arm_start..]
             .find("_ => anyhow::bail!(\"Unknown service: {service}\")")
             .expect("the workflow arm must be followed by the catch-all match arm");
-        let workflow_arm = &production[arm_start..arm_start + arm_end];
+        // The production source is intentionally checked structurally here,
+        // so make the assertions insensitive to rustfmt's line wrapping.
+        let workflow_arm = production[arm_start..arm_start + arm_end]
+            .split_whitespace()
+            .collect::<String>();
 
         assert!(
-            workflow_arm.contains("WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, None)"),
+            workflow_arm.contains("WorkflowClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,signing_key,None,)?;"),
             "workflow arm must dial with the explicit provider — no direct bearer"
         );
         assert!(
-            workflow_arm.contains("if let Some(bearer) = ctx.token.as_ref()"),
+            workflow_arm.contains("ifletSome(bearer)=ctx.token.as_ref()"),
             "workflow arm must branch on the caller's verified token"
         );
         assert!(
-            workflow_arm.contains("client = client.with_delegated_bearer(bearer.clone());"),
+            workflow_arm.contains("client=client.with_delegated_bearer(bearer.clone());"),
             "workflow arm must relay the caller token via with_delegated_bearer, not a direct bearer"
         );
         assert!(

@@ -1,7 +1,7 @@
 //! OpenAI API compatibility layer
 
-use serde::{Deserialize, Serialize};
 use hyprstream_rpc_std::inference_client::ToolCall;
+use serde::{Deserialize, Serialize};
 
 // Type aliases for API compatibility
 pub use ChatCompletionRequest as OpenAIRequest;
@@ -83,10 +83,10 @@ pub struct ToolFunction {
 #[serde(untagged)]
 pub enum ToolChoice {
     String(String), // "none", "auto", "required"
-    Specific { 
+    Specific {
         #[serde(rename = "type")]
         tool_type: String, // "function"
-        function: ToolChoiceFunction 
+        function: ToolChoiceFunction,
     },
 }
 
@@ -118,7 +118,10 @@ pub struct ChatChoice {
 impl ChatChoice {
     /// Check if this choice contains tool calls
     pub fn has_tool_calls(&self) -> bool {
-        self.message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+        self.message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tc| !tc.is_empty())
     }
 }
 
@@ -395,11 +398,17 @@ mod tests {
 
         // Verify user message
         assert_eq!(request.messages[0].role, "user");
-        assert_eq!(request.messages[0].content.as_deref(), Some("What's the weather in NYC?"));
+        assert_eq!(
+            request.messages[0].content.as_deref(),
+            Some("What's the weather in NYC?")
+        );
 
         // Verify assistant message with tool calls
         assert_eq!(request.messages[1].role, "assistant");
-        assert!(request.messages[1].content.is_none(), "assistant content should be null for tool-call-only");
+        assert!(
+            request.messages[1].content.is_none(),
+            "assistant content should be null for tool-call-only"
+        );
         let tool_calls = request.messages[1].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_123");
@@ -407,7 +416,10 @@ mod tests {
 
         // Verify tool response
         assert_eq!(request.messages[2].role, "tool");
-        assert_eq!(request.messages[2].tool_call_id.as_deref(), Some("call_123"));
+        assert_eq!(
+            request.messages[2].tool_call_id.as_deref(),
+            Some("call_123")
+        );
         assert!(request.messages[2].content.as_ref().unwrap().contains("72"));
 
         // Verify follow-up

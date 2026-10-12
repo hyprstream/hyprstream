@@ -15,10 +15,10 @@
 // The credential-authenticated notification receiver is Linux/Android-only
 // (see `ChildNotifySocket`); its imports are gated with it. Everything the
 // Immediate path and the stop/cleanup helpers use stays portable.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,11 +76,7 @@ fn detached_output_stdio() -> std::io::Result<Stdio> {
                     }
                     let mut buffer = [0u8; 8192];
                     loop {
-                        let read = nix::libc::read(
-                            0,
-                            buffer.as_mut_ptr().cast(),
-                            buffer.len(),
-                        );
+                        let read = nix::libc::read(0, buffer.as_mut_ptr().cast(), buffer.len());
                         if read <= 0 {
                             break;
                         }
@@ -206,7 +202,7 @@ impl ChildNotifySocket {
 
     fn bind_with_name_source(mut next_name: impl FnMut() -> String) -> Result<Self> {
         use nix::sys::socket::{
-            bind, setsockopt, sockopt::PassCred, socket, AddressFamily, SockFlag, SockType,
+            bind, setsockopt, socket, sockopt::PassCred, AddressFamily, SockFlag, SockType,
             UnixAddr,
         };
 
@@ -258,9 +254,7 @@ impl ChildNotifySocket {
     /// `Err` on a socket failure. Unrelated senders are ignored, not honored.
     fn try_recv_ready(&self, child_pid: i32) -> Result<bool> {
         use nix::cmsg_space;
-        use nix::sys::socket::{
-            recvmsg, ControlMessageOwned, MsgFlags, UnixAddr, UnixCredentials,
-        };
+        use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr, UnixCredentials};
         use std::io::IoSliceMut;
 
         let mut buffer = [0u8; 128];
@@ -585,7 +579,10 @@ impl StandaloneBackend {
 
         // Disable kill on drop - daemon processes should outlive the spawner
         configure_detached_stdio(&mut cmd).map_err(|e| {
-            RpcError::SpawnFailed(format!("failed to detach {} standard streams: {e}", config.name))
+            RpcError::SpawnFailed(format!(
+                "failed to detach {} standard streams: {e}",
+                config.name
+            ))
         })?;
         cmd.kill_on_drop(false);
 
@@ -622,8 +619,7 @@ impl StandaloneBackend {
             "Daemon spawned successfully"
         );
 
-        Ok(SpawnedProcess::new(id, ProcessKind::Direct(pid))
-            .with_pid_file(pid_file))
+        Ok(SpawnedProcess::new(id, ProcessKind::Direct(pid)).with_pid_file(pid_file))
     }
 
     /// Notify-supervised path (#1585): the spawn reports success only after
@@ -701,7 +697,10 @@ impl StandaloneBackend {
         // environment; the launcher's environment is untouched.
         cmd.env("NOTIFY_SOCKET", notify.endpoint());
         configure_detached_stdio(&mut cmd).map_err(|e| {
-            RpcError::SpawnFailed(format!("failed to detach {} standard streams: {e}", config.name))
+            RpcError::SpawnFailed(format!(
+                "failed to detach {} standard streams: {e}",
+                config.name
+            ))
         })?;
         cmd.kill_on_drop(false);
 
@@ -897,8 +896,7 @@ impl StandaloneBackend {
         );
 
         // ChildNotifySocket::drop closes the abstract endpoint.
-        Ok(SpawnedProcess::new(id, ProcessKind::Direct(pid))
-            .with_pid_file(pid_file))
+        Ok(SpawnedProcess::new(id, ProcessKind::Direct(pid)).with_pid_file(pid_file))
     }
 
     /// Non-Linux arm of the Notify-supervised path: an explicit pre-spawn
@@ -983,10 +981,7 @@ fn process_is_zombie(pid: i32) -> bool {
     };
     // The comm field is parenthesized and may itself contain parentheses or
     // spaces; the single-character state code follows the final ')'.
-    let Some(after_comm) = stat
-        .rsplit_once(')')
-        .map(|(_, rest)| rest.trim_start())
-    else {
+    let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
         return false;
     };
     after_comm.starts_with('Z')
@@ -1138,8 +1133,7 @@ impl StandaloneBackend {
     pub fn stop_tracked_child_by_handle_sync(&self, process: &SpawnedProcess) -> Result<()> {
         if !process.is_direct() {
             return Err(RpcError::InvalidOperation(
-                "synchronous cancellation stop requires a direct (PID-tracked) process"
-                    .to_owned(),
+                "synchronous cancellation stop requires a direct (PID-tracked) process".to_owned(),
             ));
         }
         let pid = process.pid().unwrap_or_default();
@@ -1318,8 +1312,7 @@ impl ServiceLaunchLock {
         use nix::fcntl::{flock, FlockArg};
         use std::os::fd::AsRawFd;
 
-        let path =
-            hyprstream_rpc::paths::runtime_dir().join(format!("{service}.launch.lock"));
+        let path = hyprstream_rpc::paths::runtime_dir().join(format!("{service}.launch.lock"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 RpcError::SpawnFailed(format!(
@@ -1334,9 +1327,7 @@ impl ServiceLaunchLock {
             .append(true)
             .open(&path)
             .map_err(|e| {
-                RpcError::SpawnFailed(format!(
-                    "service {service} launch lock open failed: {e}"
-                ))
+                RpcError::SpawnFailed(format!("service {service} launch lock open failed: {e}"))
             })?;
         match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
             Ok(()) => Ok(Self { _file: file }),
@@ -1441,9 +1432,7 @@ impl SpawnerBackend for StandaloneBackend {
                     if same_child {
                         if let Err(e) = std::fs::remove_file(pid_file) {
                             if e.kind() != std::io::ErrorKind::NotFound {
-                                failures.push(format!(
-                                    "PID file removal failed: {e}"
-                                ));
+                                failures.push(format!("PID file removal failed: {e}"));
                             }
                         }
                     }
@@ -1593,10 +1582,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let script = root.path().join("record-argument.sh");
         let observed = root.path().join("observed.bin");
-        std::fs::write(
-            &script,
-            b"printf '%s' \"$1\" > \"$2\"\nexec sleep 30\n",
-        )?;
+        std::fs::write(&script, b"printf '%s' \"$1\" > \"$2\"\nexec sleep 30\n")?;
         let expected = std::ffi::OsString::from_vec(b"config-\xff.toml".to_vec());
         let name = format!("non-utf8-argv-{}", uuid::Uuid::new_v4().simple());
         let backend = StandaloneBackend::new();
@@ -1614,12 +1600,16 @@ mod tests {
                 Ok(_) | Err(_) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                Ok(bytes) => break Err(anyhow::anyhow!(
-                    "child changed argument bytes: observed {bytes:?}"
-                )),
-                Err(error) => break Err(anyhow::anyhow!(
-                    "child did not record its argument before the deadline: {error}"
-                )),
+                Ok(bytes) => {
+                    break Err(anyhow::anyhow!(
+                        "child changed argument bytes: observed {bytes:?}"
+                    ))
+                }
+                Err(error) => {
+                    break Err(anyhow::anyhow!(
+                        "child did not record its argument before the deadline: {error}"
+                    ))
+                }
             }
         };
         let stop = backend.stop(&process).await;
@@ -1651,9 +1641,9 @@ mod tests {
             nix::libc::close(reader);
             nix::libc::close(writer);
         }
-        assert!(flags.iter().all(|flags| {
-            *flags >= 0 && *flags & nix::libc::FD_CLOEXEC != 0
-        }));
+        assert!(flags
+            .iter()
+            .all(|flags| { *flags >= 0 && *flags & nix::libc::FD_CLOEXEC != 0 }));
         Ok(())
     }
 }
@@ -1802,11 +1792,8 @@ mod notify_readiness_tests {
 
     /// Assert a process is reaped (`kill(pid, 0)` says ESRCH).
     fn assert_pid_gone(pid: u32) {
-        let gone = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            None,
-        )
-        .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+        let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
         assert!(gone, "child pid {pid} must be reaped after cleanup");
     }
 
@@ -1839,10 +1826,7 @@ mod notify_readiness_tests {
 
         let backend = Arc::new(StandaloneBackend::new());
         let config = ProcessConfig::new("notify-cancel", Path::new("/bin/sh"))
-            .args([
-                "-c",
-                "echo $$ > \"$OBSERVED_PID_FILE\"; exec sleep 100",
-            ])
+            .args(["-c", "echo $$ > \"$OBSERVED_PID_FILE\"; exec sleep 100"])
             .env("OBSERVED_PID_FILE", observed_pid_file.display().to_string())
             .with_notify_ready(Duration::from_secs(30));
 
@@ -1976,7 +1960,9 @@ mod notify_readiness_tests {
             .chars()
             .take_while(char::is_ascii_digit)
             .collect();
-        digits.parse().unwrap_or_else(|_| panic!("pid digits: {text}"))
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("pid digits: {text}"))
     }
 
     fn test_binary() -> std::path::PathBuf {
@@ -2072,7 +2058,10 @@ mod notify_readiness_tests {
                 "production-west-instance-0000000000000000",
             )
             .status()?;
-        assert!(status.success(), "isolated long-runtime scenario failed: {status}");
+        assert!(
+            status.success(),
+            "isolated long-runtime scenario failed: {status}"
+        );
         Ok(())
     }
 
@@ -2083,8 +2072,8 @@ mod notify_readiness_tests {
     #[tokio::test]
     async fn is_running_reports_self_exited_child_as_stopped() -> Result<()> {
         let backend = StandaloneBackend::new();
-        let config = ProcessConfig::new("notify-self-exit", Path::new("/bin/sh"))
-            .args(["-c", "exit 0"]);
+        let config =
+            ProcessConfig::new("notify-self-exit", Path::new("/bin/sh")).args(["-c", "exit 0"]);
         let process = SpawnerBackend::spawn(&backend, config).await?;
         let pid = process.pid().expect("direct child pid");
 
@@ -2146,9 +2135,8 @@ mod notify_readiness_tests {
         // duplicate; close alone would not achieve that.
         drop(held);
 
-        let reacquired = ServiceLaunchLock::acquire(&name).expect(
-            "lock must release via explicit unlock despite the retained duplicate",
-        );
+        let reacquired = ServiceLaunchLock::acquire(&name)
+            .expect("lock must release via explicit unlock despite the retained duplicate");
         drop(reacquired);
 
         // The demonstration duplicate is closed by its own RAII drop here.
@@ -2536,9 +2524,7 @@ mod notify_readiness_tests {
 
     #[test]
     fn notification_endpoint_collision_retries_are_bounded() -> anyhow::Result<()> {
-        use nix::sys::socket::{
-            bind, socket, AddressFamily, SockFlag, SockType, UnixAddr,
-        };
+        use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
 
         let occupied_name = format!("hypr-n-collision-{}", std::process::id());
         let occupied = socket(
@@ -2569,7 +2555,10 @@ mod notify_readiness_tests {
         cmd.args(["-c", "sleep 0.05; yes x | head -c 1048576"]);
         configure_detached_stdio(&mut cmd)?;
         let status = cmd.status().await?;
-        assert!(status.success(), "post-launch output child must exit cleanly");
+        assert!(
+            status.success(),
+            "post-launch output child must exit cleanly"
+        );
         Ok(())
     }
 
@@ -2654,11 +2643,7 @@ mod notify_readiness_tests {
 /// points evidence the boundary. This cfg cannot run on Linux lanes; it
 /// exists for actual non-Linux targets and makes no claim about them from
 /// Linux runs.
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android")),
-    test
-))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android")), test))]
 mod notify_refusal_non_linux_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 

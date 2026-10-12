@@ -6,31 +6,27 @@
 use async_trait::async_trait;
 #[cfg(feature = "postgres")]
 mod federate_admission;
-use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
-use crate::services::{EnvelopeContext, RequestService};
-use hyprstream_rpc_std::policy_client::{
-    ErrorInfo, PolicyResponseVariant, TokenInfo, ScopeList,
-    PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult, MediatedPolicyCheck, IssueToken, IssueTokenProfile,
-    ApplyTemplate, ApplyDraft, RollbackPolicy, GetHistory, GetDiff,
-    PolicyInfo, PolicyRule, Grouping,
-    PolicyHistory, PolicyHistoryEntry, DraftStatus,
-    AddGrouping, RemoveGrouping, SetBranchVisibility,
-    RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
-    EventPrefixAccess, PendingSubscribers,
-    ResolveServiceKey, RegisterServiceKey, ServiceKeyCandidate, ServiceKeyResponse,
-    RefreshServiceTokenRequest, ExchangeWit, ExchangeDelegated,
-    RevokeCredential, CheckCredentialRevocation,
-    RegisterSession, RevokeSession, CheckSession,
-};
+use crate::auth::PolicyManager;
 use crate::services::generated::policy_client::{
-    PolicyHandler, dispatch_policy, serialize_response,
+    dispatch_policy, serialize_response, PolicyHandler,
 };
+use crate::services::{EnvelopeContext, RequestService};
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc_std::policy_client::{
+    AddGrouping, ApplyDraft, ApplyTemplate, CheckCredentialRevocation, CheckSession,
+    DepositWrappedKeys, DraftStatus, ErrorInfo, EventPrefixAccess, ExchangeDelegated, ExchangeWit,
+    GetDiff, GetHistory, GetPendingSubscribers, Grouping, IssueToken, IssueTokenProfile,
+    MediatedPolicyCheck, PendingSubscribers, PolicyCheck, PolicyCheckBatch, PolicyCheckBatchResult,
+    PolicyHistory, PolicyHistoryEntry, PolicyInfo, PolicyResponseVariant, PolicyRule,
+    RefreshServiceTokenRequest, RegisterEventPrefix, RegisterServiceKey, RegisterSession,
+    RemoveGrouping, ResolveServiceKey, RevokeCredential, RevokeSession, RollbackPolicy, ScopeList,
+    ServiceKeyCandidate, ServiceKeyResponse, SetBranchVisibility, SubscribeEventPrefix, TokenInfo,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -65,20 +61,31 @@ pub(crate) async fn check_with_holder_evidence(
     upstream_subject: &Subject,
     evidence: Option<&[u8]>,
 ) -> Result<bool> {
-    if bearer.is_some() && !upstream_subject.is_federated()
-        && upstream_subject.name().is_some_and(|name| name.starts_with("service:"))
+    if bearer.is_some()
+        && !upstream_subject.is_federated()
+        && upstream_subject
+            .name()
+            .is_some_and(|name| name.starts_with("service:"))
     {
-        let evidence = evidence.ok_or_else(|| anyhow!("service-mediated policy check requires original holder evidence"))?;
-        return client.check_mediated(&MediatedPolicyCheck {
-            evidence: evidence.to_vec().into(), resource: request.resource.clone(), operation: request.operation.clone(),
-        }).await;
+        let evidence = evidence.ok_or_else(|| {
+            anyhow!("service-mediated policy check requires original holder evidence")
+        })?;
+        return client
+            .check_mediated(&MediatedPolicyCheck {
+                evidence: evidence.to_vec().into(),
+                resource: request.resource.clone(),
+                operation: request.operation.clone(),
+            })
+            .await;
     }
     match bearer {
-        Some(token) => client
-            .clone()
-            .with_delegated_bearer(token.to_owned())
-            .check(request)
-            .await,
+        Some(token) => {
+            client
+                .clone()
+                .with_delegated_bearer(token.to_owned())
+                .check(request)
+                .await
+        }
         None => {
             anyhow::ensure!(
                 !upstream_subject.is_federated()
@@ -114,23 +121,40 @@ struct EventPrefixState {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct EventPrefixKey { tenant: String, prefix: String }
+struct EventPrefixKey {
+    tenant: String,
+    prefix: String,
+}
 impl EventPrefixKey {
-    fn new(tenant: String, prefix: &str) -> Self { Self { tenant, prefix: prefix.to_owned() } }
+    fn new(tenant: String, prefix: &str) -> Self {
+        Self {
+            tenant,
+            prefix: prefix.to_owned(),
+        }
+    }
 }
 fn cross_tenant_prefix_shadow(a: &EventPrefixKey, b: &EventPrefixKey) -> bool {
-    a.tenant != b.tenant && a.prefix != b.prefix
+    a.tenant != b.tenant
+        && a.prefix != b.prefix
         && (a.prefix.starts_with(&b.prefix) || b.prefix.starts_with(&a.prefix))
 }
 #[derive(Debug, Eq, PartialEq)]
-enum EventPrefixRegistrationError { OwnedByAnotherSubject, CrossTenantShadow }
+enum EventPrefixRegistrationError {
+    OwnedByAnotherSubject,
+    CrossTenantShadow,
+}
 fn validate_event_prefix_registration(
-    prefixes: &HashMap<EventPrefixKey, EventPrefixState>, key: &EventPrefixKey, owner: &str,
+    prefixes: &HashMap<EventPrefixKey, EventPrefixState>,
+    key: &EventPrefixKey,
+    owner: &str,
 ) -> Result<(), EventPrefixRegistrationError> {
     if prefixes.get(key).is_some_and(|state| state.owner != owner) {
         return Err(EventPrefixRegistrationError::OwnedByAnotherSubject);
     }
-    if prefixes.keys().any(|existing| cross_tenant_prefix_shadow(existing, key)) {
+    if prefixes
+        .keys()
+        .any(|existing| cross_tenant_prefix_shadow(existing, key))
+    {
         return Err(EventPrefixRegistrationError::CrossTenantShadow);
     }
     Ok(())
@@ -180,9 +204,8 @@ pub struct PolicyService {
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
     ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
     /// Authority-owned enrollment lookup for MAC-labeled credentials.
-    token_clearance_resolver: Arc<
-        dyn Fn(&str) -> Option<hyprstream_rpc::auth::mac::SecurityLabel> + Send + Sync,
-    >,
+    token_clearance_resolver:
+        Arc<dyn Fn(&str) -> Option<hyprstream_rpc::auth::mac::SecurityLabel> + Send + Sync>,
     /// Maximum retention horizon the revocation authority accepts for a
     /// published entry (`expires_at - now`). Derived at construction from the
     /// configured issuance maxima so no issuable credential can outlive its
@@ -215,7 +238,8 @@ impl PolicyService {
         transport: TransportConfig,
     ) -> Self {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
-        let jwt_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(&signing_key, "hyprstream-jwt-v1");
+        let jwt_signing_key =
+            hyprstream_rpc::node_identity::derive_purpose_key(&signing_key, "hyprstream-jwt-v1");
         Self {
             #[cfg(feature = "postgres")]
             federate_admission: None,
@@ -310,9 +334,9 @@ impl PolicyService {
     fn enrollment(
         &self,
     ) -> Option<Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>> {
-        self.enrollment_manifest.clone().or_else(|| {
-            crate::auth::service_enrollment::global_service_enrollment().cloned()
-        })
+        self.enrollment_manifest
+            .clone()
+            .or_else(|| crate::auth::service_enrollment::global_service_enrollment().cloned())
     }
 
     /// Set the revocation-publication horizon. The service factory computes
@@ -381,13 +405,9 @@ impl PolicyService {
             return Err(anyhow!("hybrid token signing pair not provisioned"));
         };
         Ok(if is_service {
-            crate::auth::jwt::encode_composite_service_jwt(
-                claims, &ml_key, &ed_key,
-            )
+            crate::auth::jwt::encode_composite_service_jwt(claims, &ml_key, &ed_key)
         } else {
-            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-                claims, &ml_key, &ed_key,
-            )
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &ml_key, &ed_key)
         })
     }
 
@@ -517,11 +537,16 @@ impl PolicyService {
         let handle = reg.repo(&self.registry_repo_id)?;
 
         // Stage the policies/ directory
-        handle.staging().add_all().await
+        handle
+            .staging()
+            .add_all()
+            .await
             .map_err(|e| anyhow!("Failed to stage policy files: {}", e))?;
 
         // Commit
-        let oid = handle.commit(message).await
+        let oid = handle
+            .commit(message)
+            .await
             .map_err(|e| anyhow!("Failed to commit policy: {}", e))?;
 
         Ok(oid.to_string())
@@ -544,8 +569,7 @@ impl PolicyService {
             .name()
             .is_some_and(|name| name.starts_with("service:"))
             && !subject.is_federated();
-        let is_policy_authority =
-            ctx.cnf == self.signing_key.verifying_key().to_bytes();
+        let is_policy_authority = ctx.cnf == self.signing_key.verifying_key().to_bytes();
         anyhow::ensure!(
             is_global_service || is_policy_authority,
             "authorization denied: no verified tenant domain"
@@ -605,9 +629,7 @@ fn validate_event_prefix(prefix: &str) -> Result<(), String> {
         .chars()
         .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
     {
-        return Err(
-            "prefix may only contain alphanumeric, '.', '-', '_' characters".to_owned(),
-        );
+        return Err("prefix may only contain alphanumeric, '.', '-', '_' characters".to_owned());
     }
     Ok(())
 }
@@ -627,14 +649,19 @@ fn published_service_key_response(
     }
     let singleton = (keys.len() == 1).then(|| &keys[0]);
     Ok(ServiceKeyResponse {
-        verifying_key: singleton.map(|entry| entry.verifying_key.to_bytes().to_vec()).unwrap_or_default(),
+        verifying_key: singleton
+            .map(|entry| entry.verifying_key.to_bytes().to_vec())
+            .unwrap_or_default(),
         service_jwt: None,
-        keys: keys.into_iter().map(|entry| ServiceKeyCandidate {
-            key_id: entry.key_id,
-            verifying_key: entry.verifying_key.to_bytes().to_vec(),
-            service_jwt: None,
-            not_after: entry.attestation.expires_at,
-        }).collect(),
+        keys: keys
+            .into_iter()
+            .map(|entry| ServiceKeyCandidate {
+                key_id: entry.key_id,
+                verifying_key: entry.verifying_key.to_bytes().to_vec(),
+                service_jwt: None,
+                not_after: entry.attestation.expires_at,
+            })
+            .collect(),
     })
 }
 
@@ -654,8 +681,8 @@ fn renewed_service_claims(
     tenant: Option<&str>,
     cnf_key: &[u8; 32],
 ) -> hyprstream_rpc::auth::Claims {
-    let mut claims = hyprstream_rpc::auth::Claims::new(subject, now, expires_at)
-        .with_cnf_jwk(cnf_key);
+    let mut claims =
+        hyprstream_rpc::auth::Claims::new(subject, now, expires_at).with_cnf_jwk(cnf_key);
     if let Some(tenant) = tenant {
         claims = claims.with_tenant(tenant.to_owned());
     }
@@ -735,12 +762,8 @@ fn verify_service_registration_jwt(
             "Invalid service JWT: Hybrid crypto policy requires a post-quantum alg; \
              classical-only token rejected"
         );
-        hyprstream_rpc::auth::jwt::decode_with_key(
-            service_jwt,
-            &ca_jwt_key.verifying_key(),
-            None,
-        )
-        .map_err(|e| anyhow!("Invalid service JWT: {e}"))
+        hyprstream_rpc::auth::jwt::decode_with_key(service_jwt, &ca_jwt_key.verifying_key(), None)
+            .map_err(|e| anyhow!("Invalid service JWT: {e}"))
     }
 }
 
@@ -751,9 +774,14 @@ fn validate_service_key_registration(
 ) -> Result<()> {
     let expected_sub = format!("service:{service_name}");
     if claims.sub != expected_sub {
-        anyhow::bail!("JWT subject '{}' does not match service name '{}'", claims.sub, service_name);
+        anyhow::bail!(
+            "JWT subject '{}' does not match service name '{}'",
+            claims.sub,
+            service_name
+        );
     }
-    let cnf_bytes = claims.cnf_key_bytes()
+    let cnf_bytes = claims
+        .cnf_key_bytes()
         .ok_or_else(|| anyhow!("service JWT must contain a well-formed cnf.jwk"))?;
     if cnf_bytes != *verifying_key {
         anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
@@ -809,20 +837,18 @@ async fn verify_presented_credential(
     let profile = match header.typ.as_str() {
         "at+jwt" => SourceProfile::AtJwt,
         "wit+jwt" => SourceProfile::WitJwt,
-        other => anyhow::bail!(
-            "invalid source credential typ '{other}' (expected at+jwt or wit+jwt)"
-        ),
+        other => {
+            anyhow::bail!("invalid source credential typ '{other}' (expected at+jwt or wit+jwt)")
+        }
     };
 
     match header.alg.as_str() {
         "ML-DSA-65-Ed25519" => {
             // Re-parse for dispatch with the EXACT typ, so the signed header typ
             // must equal what gated the profile above.
-            let dispatch = hyprstream_rpc::auth::jwt::parse_composite_dispatch(
-                token,
-                &[header.typ.as_str()],
-            )
-            .map_err(|e| anyhow!("invalid source credential: {e}"))?;
+            let dispatch =
+                hyprstream_rpc::auth::jwt::parse_composite_dispatch(token, &[header.typ.as_str()])
+                    .map_err(|e| anyhow!("invalid source credential: {e}"))?;
             // Resolve the exact kid to an issuer-AUTHORIZED composite pair via
             // the configured key source. `ClusterKeySource::composite_pair`
             // resolves this node's exact-pair ledger AND its out-of-ledger
@@ -912,7 +938,10 @@ fn parse_capability(token: &str) -> Option<hyprstream_rpc::auth::ucan::Capabilit
     if ability.is_empty() || resource.is_empty() {
         return None;
     }
-    Some(Capability::new(Resource::new(resource), Ability::new(ability)))
+    Some(Capability::new(
+        Resource::new(resource),
+        Ability::new(ability),
+    ))
 }
 
 /// Attenuate an OAuth scope axis for a delegated hop. v16 §8.1 requires an
@@ -961,18 +990,16 @@ fn attenuate_delegated_capabilities(
     source_cap: Option<&str>,
     requested: Option<&str>,
 ) -> std::result::Result<Option<String>, String> {
-    let parse_set = |s: &str| -> std::result::Result<
-        Vec<hyprstream_rpc::auth::ucan::Capability>,
-        String,
-    > {
-        s.split_whitespace()
-            .map(|tok| {
-                parse_capability(tok).ok_or_else(|| {
-                    format!("malformed capability '{tok}' (expected ability@resource)")
+    let parse_set =
+        |s: &str| -> std::result::Result<Vec<hyprstream_rpc::auth::ucan::Capability>, String> {
+            s.split_whitespace()
+                .map(|tok| {
+                    parse_capability(tok).ok_or_else(|| {
+                        format!("malformed capability '{tok}' (expected ability@resource)")
+                    })
                 })
-            })
-            .collect()
-    };
+                .collect()
+        };
     let held = parse_set(source_cap.unwrap_or(""))?;
     let requested_str = requested.unwrap_or("").trim();
     if held.is_empty() {
@@ -1126,10 +1153,7 @@ fn enrolled_service_signer_suite(
 enum RenewalWorkloadSession {
     /// Deny the renewal with this error code + message (fail-closed: a revoked,
     /// expired, or unresolvable session never renews).
-    Deny {
-        code: &'static str,
-        message: String,
-    },
+    Deny { code: &'static str, message: String },
     /// The `workload_session_id` to stamp into the renewed credential, or `None`
     /// to OMIT it — either a deliberate family narrowing (the policy was removed
     /// from a live family) or a standalone service that carries no session.
@@ -1269,17 +1293,20 @@ impl PolicyHandler for PolicyService {
         #[cfg(feature = "postgres")]
         if let Some(reader) = &self.federate_admission {
             let result = async {
-                let prepared = reader.prepare_rpc(
-                    ctx,
-                    federate_verified_source(&data.source)?,
-                    data.requested.clone(),
-                    data.challenge_id.as_slice().try_into()?,
-                    data.challenge_created_at,
-                    data.ed_public.as_slice().try_into()?,
-                    data.pq_public.clone(),
-                ).await?;
+                let prepared = reader
+                    .prepare_rpc(
+                        ctx,
+                        federate_verified_source(&data.source)?,
+                        data.requested.clone(),
+                        data.challenge_id.as_slice().try_into()?,
+                        data.challenge_created_at,
+                        data.ed_public.as_slice().try_into()?,
+                        data.pq_public.clone(),
+                    )
+                    .await?;
                 Ok::<_, anyhow::Error>(prepared)
-            }.await;
+            }
+            .await;
             if let Ok(prepared) = result {
                 return Ok(PolicyResponseVariant::PrepareFederateSessionResult(
                     hyprstream_rpc_std::policy_client::PreparedFederateSession {
@@ -1311,17 +1338,20 @@ impl PolicyHandler for PolicyService {
         #[cfg(feature = "postgres")]
         if let Some(reader) = &self.federate_admission {
             let result = async {
-                reader.commit_rpc(
-                    ctx,
-                    data.policy_handle.as_slice().try_into()?,
-                    federate_verified_source(&data.source)?,
-                    data.challenge_id.as_slice().try_into()?,
-                    data.challenge_created_at,
-                    data.challenge_expires_at,
-                    data.ed_public.as_slice().try_into()?,
-                    data.pq_public.clone(),
-                ).await
-            }.await;
+                reader
+                    .commit_rpc(
+                        ctx,
+                        data.policy_handle.as_slice().try_into()?,
+                        federate_verified_source(&data.source)?,
+                        data.challenge_id.as_slice().try_into()?,
+                        data.challenge_created_at,
+                        data.challenge_expires_at,
+                        data.ed_public.as_slice().try_into()?,
+                        data.pq_public.clone(),
+                    )
+                    .await
+            }
+            .await;
             if let Ok(session) = result {
                 return Ok(PolicyResponseVariant::CommitFederateSessionResult(
                     hyprstream_rpc_std::policy_client::FederateCommittedSession {
@@ -1382,24 +1412,35 @@ impl PolicyHandler for PolicyService {
         }))
     }
 
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         let subject = ctx.subject();
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &subject.to_string(),
-            &domain,
-            resource,
-            operation,
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&subject.to_string(), &domain, resource, operation)
+            .await;
         if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            anyhow::bail!(
+                "Unauthorized: {} cannot {} on {}",
+                subject,
+                operation,
+                resource
+            )
         }
     }
 
     async fn handle_check_batch(
-        &self, ctx: &EnvelopeContext, request_id: u64, data: &PolicyCheckBatch,
+        &self,
+        ctx: &EnvelopeContext,
+        request_id: u64,
+        data: &PolicyCheckBatch,
     ) -> Result<PolicyResponseVariant> {
         anyhow::ensure!(data.checks.len() <= 256, "policy check batch exceeds 256");
         let mut allowed = Vec::with_capacity(data.checks.len());
@@ -1408,7 +1449,9 @@ impl PolicyHandler for PolicyService {
             let result = self.handle_check(ctx, request_id, check).await?;
             allowed.push(matches!(result, PolicyResponseVariant::CheckResult(true)));
         }
-        Ok(PolicyResponseVariant::CheckBatchResult(PolicyCheckBatchResult { allowed }))
+        Ok(PolicyResponseVariant::CheckBatchResult(
+            PolicyCheckBatchResult { allowed },
+        ))
     }
 
     async fn handle_check_mediated(
@@ -1418,24 +1461,44 @@ impl PolicyHandler for PolicyService {
         data: &MediatedPolicyCheck,
     ) -> Result<PolicyResponseVariant> {
         let mediator = ctx.subject();
-        anyhow::ensure!(ctx.claims().is_some() && !mediator.is_federated(), "authenticated local mediator required");
-        let service = mediator.name().and_then(|name| name.strip_prefix("service:"))
+        anyhow::ensure!(
+            ctx.claims().is_some() && !mediator.is_federated(),
+            "authenticated local mediator required"
+        );
+        let service = mediator
+            .name()
+            .and_then(|name| name.strip_prefix("service:"))
             .ok_or_else(|| anyhow!("service mediator required"))?;
-        anyhow::ensure!(self.accept_delegated_bearer(&ctx.cnf), "mediator is not admitted for policy queries");
+        anyhow::ensure!(
+            self.accept_delegated_bearer(&ctx.cnf),
+            "mediator is not admitted for policy queries"
+        );
         // The original request is not a local transport call to Policy. Use
         // the network provenance constructor, then the normal credential
         // verifier; never grant the empty-issuer/local system shortcuts.
-        let mut holder = EnvelopeContext::from_mediated_evidence(&data.evidence, service, &data.operation)?;
+        let mut holder =
+            EnvelopeContext::from_mediated_evidence(&data.evidence, service, &data.operation)?;
         self.verify_claims(&mut holder).await?;
         let holder_subject = holder.subject();
-        anyhow::ensure!(holder.claims().is_some() && !holder_subject.is_federated()
-            && holder_subject.name().is_some_and(|name| name.starts_with("service:")),
-            "mediated evidence must identify a verified service holder");
+        anyhow::ensure!(
+            holder.claims().is_some()
+                && !holder_subject.is_federated()
+                && holder_subject
+                    .name()
+                    .is_some_and(|name| name.starts_with("service:")),
+            "mediated evidence must identify a verified service holder"
+        );
         holder.admit_mediated_query(service, &data.resource, &data.operation)?;
         let domain = self.request_domain(&holder)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &holder_subject.to_string(), &domain, &data.resource, &data.operation,
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(
+                &holder_subject.to_string(),
+                &domain,
+                &data.resource,
+                &data.operation,
+            )
+            .await;
         holder.audit_authz(&data.resource, &data.operation, allowed);
         Ok(PolicyResponseVariant::CheckMediatedResult(allowed))
     }
@@ -1477,19 +1540,25 @@ impl PolicyHandler for PolicyService {
 
         trace!(
             "Policy check: verified_subject={}, verified_domain={}, resource={}, operation={}",
-            subject, domain, data.resource, data.operation
+            subject,
+            domain,
+            data.resource,
+            data.operation
         );
 
         // Subject and domain are derived exclusively from the verified envelope.
         // The request fields remain on the wire for compatibility, but cannot
         // select another identity or tenant. Pass the operation string directly
         // so dot-namespaced actions are forwarded verbatim to Casbin.
-        let allowed = self.policy_manager.check_with_domain(
-            &subject.to_string(),
-            &domain,
-            &data.resource,
-            &data.operation,
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(
+                &subject.to_string(),
+                &domain,
+                &data.resource,
+                &data.operation,
+            )
+            .await;
 
         if allowed {
             debug!(caller = %subject, %domain, "policy check allowed");
@@ -1539,15 +1608,13 @@ impl PolicyHandler for PolicyService {
             // TARGET tenant. This permits deliberate delegation only when the
             // caller has policy:IssueToken/manage there.
             let caller = ctx.subject().to_string();
-            let allowed = self.policy_manager.check_with_domain(
-                &caller,
-                &target_domain,
-                "policy:IssueToken",
-                "manage",
-            ).await;
+            let allowed = self
+                .policy_manager
+                .check_with_domain(&caller, &target_domain, "policy:IssueToken", "manage")
+                .await;
             if !allowed {
-                let target_subject = requested_subject
-                    .map_or_else(|| ctx.user().to_owned(), Clone::clone);
+                let target_subject =
+                    requested_subject.map_or_else(|| ctx.user().to_owned(), Clone::clone);
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!(
                         "Subject '{}' is not authorized to issue tokens on behalf of '{}' in tenant '{}'",
@@ -1576,7 +1643,8 @@ impl PolicyHandler for PolicyService {
             IssueTokenProfile::InteractiveSession => {
                 if is_service_token {
                     return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "service credentials must use the service issuance profile".to_owned(),
+                        message: "service credentials must use the service issuance profile"
+                            .to_owned(),
                         code: "INVALID_ISSUANCE_PROFILE".to_owned(),
                         details: String::new(),
                     }));
@@ -1592,14 +1660,16 @@ impl PolicyHandler for PolicyService {
             IssueTokenProfile::Rfc8693 | IssueTokenProfile::Rfc7523 => {
                 if is_service_token {
                     return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "service credentials must use the service issuance profile".to_owned(),
+                        message: "service credentials must use the service issuance profile"
+                            .to_owned(),
                         code: "INVALID_ISSUANCE_PROFILE".to_owned(),
                         details: String::new(),
                     }));
                 }
                 if data.session_id.is_some() {
                     return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "non-interactive RFC issuance cannot carry an OIDC session id".to_owned(),
+                        message: "non-interactive RFC issuance cannot carry an OIDC session id"
+                            .to_owned(),
                         code: "INVALID_SESSION".to_owned(),
                         details: String::new(),
                     }));
@@ -1608,7 +1678,9 @@ impl PolicyHandler for PolicyService {
             IssueTokenProfile::Service => {
                 if !is_service_token || data.session_id.is_some() {
                     return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "service issuance requires a service subject and no OIDC session id".to_owned(),
+                        message:
+                            "service issuance requires a service subject and no OIDC session id"
+                                .to_owned(),
                         code: "INVALID_ISSUANCE_PROFILE".to_owned(),
                         details: String::new(),
                     }));
@@ -1665,7 +1737,8 @@ impl PolicyHandler for PolicyService {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Subject '{subject}' has no verified enrollment clearance"),
                 code: "UNLABELED_SUBJECT".to_owned(),
-                details: "MAC-enforcing token issuance fails closed for unenrolled subjects".to_owned(),
+                details: "MAC-enforcing token issuance fails closed for unenrolled subjects"
+                    .to_owned(),
             }));
         }
 
@@ -1686,14 +1759,19 @@ impl PolicyHandler for PolicyService {
         let default_ttl = if is_service_token {
             data.ttl.filter(|&t| t != 0).unwrap_or(604800) // 7 days for service tokens
         } else {
-            data.ttl.filter(|&t| t != 0).unwrap_or(self.token_config.default_ttl_seconds)
+            data.ttl
+                .filter(|&t| t != 0)
+                .unwrap_or(self.token_config.default_ttl_seconds)
         };
         let requested_ttl = default_ttl;
 
         const MIN_TTL_SECONDS: u32 = 60;
         if requested_ttl < MIN_TTL_SECONDS {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("TTL too short: {} < {} seconds minimum", requested_ttl, MIN_TTL_SECONDS),
+                message: format!(
+                    "TTL too short: {} < {} seconds minimum",
+                    requested_ttl, MIN_TTL_SECONDS
+                ),
                 code: "TTL_TOO_SHORT".to_owned(),
                 details: String::new(),
             }));
@@ -1701,7 +1779,10 @@ impl PolicyHandler for PolicyService {
 
         if requested_ttl > self.token_config.max_ttl_seconds {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("TTL exceeds maximum: {} > {}", requested_ttl, self.token_config.max_ttl_seconds),
+                message: format!(
+                    "TTL exceeds maximum: {} > {}",
+                    requested_ttl, self.token_config.max_ttl_seconds
+                ),
                 code: "TTL_EXCEEDED".to_owned(),
                 details: String::new(),
             }));
@@ -1711,7 +1792,11 @@ impl PolicyHandler for PolicyService {
         // scope ceiling. Casbin still supplies subject policy; verifiers must
         // intersect it with this signed per-grant authority (#1146 T2.1).
         let now = chrono::Utc::now().timestamp();
-        let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
+        let audience = data
+            .audience
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
             .or_else(|| self.default_audience.clone());
 
         // ServiceEnrollmentManifest (v16 §11): for service subjects the
@@ -1721,13 +1806,10 @@ impl PolicyHandler for PolicyService {
         // manifest does not grant); a declared audience list is enforced
         // fail-closed.
         if let Some(service_name) = subject.strip_prefix("service:") {
-            if let Some(manifest) = crate::auth::service_enrollment::global_service_enrollment()
-            {
+            if let Some(manifest) = crate::auth::service_enrollment::global_service_enrollment() {
                 let Some(clearance) = manifest.clearance_for_service(service_name) else {
                     return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: format!(
-                            "service '{service_name}' has no enrollment entry"
-                        ),
+                        message: format!("service '{service_name}' has no enrollment entry"),
                         code: "UNENROLLED_SERVICE".to_owned(),
                         details: String::new(),
                     }));
@@ -1750,7 +1832,8 @@ impl PolicyHandler for PolicyService {
         }
 
         let granted_scope = data.requested_scopes.as_ref().map(|scopes| {
-            scopes.iter()
+            scopes
+                .iter()
                 .map(String::as_str)
                 .filter(|scope| !scope.is_empty())
                 .collect::<Vec<_>>()
@@ -1778,35 +1861,46 @@ impl PolicyHandler for PolicyService {
             };
             let decoded = match URL_SAFE_NO_PAD.decode(encoded) {
                 Ok(decoded) => decoded,
-                Err(_) => return Ok(invalid_assertion_key(
-                    "service token assertion key is not base64url",
-                )),
+                Err(_) => {
+                    return Ok(invalid_assertion_key(
+                        "service token assertion key is not base64url",
+                    ))
+                }
             };
             let requested_bytes: [u8; 32] = match decoded.try_into() {
                 Ok(bytes) => bytes,
-                Err(_) => return Ok(invalid_assertion_key(
-                    "service token assertion key must be 32 bytes",
-                )),
+                Err(_) => {
+                    return Ok(invalid_assertion_key(
+                        "service token assertion key must be 32 bytes",
+                    ))
+                }
             };
             let requested = match VerifyingKey::from_bytes(&requested_bytes) {
                 Ok(requested) => requested,
-                Err(_) => return Ok(invalid_assertion_key(
-                    "service token assertion key is not a valid Ed25519 verifying key",
-                )),
+                Err(_) => {
+                    return Ok(invalid_assertion_key(
+                        "service token assertion key is not a valid Ed25519 verifying key",
+                    ))
+                }
             };
             if trust.is_authorized(&requested, svc_name) {
                 Some(requested_bytes)
             } else {
-                let caller = match VerifyingKey::from_bytes(&ctx.cnf) {
-                    Ok(caller) => caller,
-                    Err(_) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                        message: "service key rotation caller has an invalid Ed25519 verifying key".to_owned(),
-                        code: "UNAUTHORIZED_SERVICE_KEY".to_owned(),
-                        details: String::new(),
-                    })),
-                };
+                let caller =
+                    match VerifyingKey::from_bytes(&ctx.cnf) {
+                        Ok(caller) => caller,
+                        Err(_) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                            message:
+                                "service key rotation caller has an invalid Ed25519 verifying key"
+                                    .to_owned(),
+                            code: "UNAUTHORIZED_SERVICE_KEY".to_owned(),
+                            details: String::new(),
+                        })),
+                    };
                 let expected_subject = format!("service:{svc_name}");
-                if ctx.subject().name() != Some(expected_subject.as_str()) || !trust.is_authorized(&caller, svc_name) {
+                if ctx.subject().name() != Some(expected_subject.as_str())
+                    || !trust.is_authorized(&caller, svc_name)
+                {
                     return Ok(PolicyResponseVariant::Error(ErrorInfo {
                         message: format!(
                             "unregistered service key for '{svc_name}' may only be attested by a registered sibling"
@@ -1819,25 +1913,25 @@ impl PolicyHandler for PolicyService {
             }
         } else {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            data.user_pub_key.as_deref().and_then(|s| {
-                URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()
-            })
+            data.user_pub_key
+                .as_deref()
+                .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok())
         };
 
         // OAuth may override the issuer for a profile-specific token (atproto
         // requires an origin). Other callers retain the configured default.
-        let issuer = data.issuer.as_ref()
+        let issuer = data
+            .issuer
+            .as_ref()
             .filter(|issuer| !issuer.is_empty())
             .cloned()
             .or_else(|| self.default_audience.clone())
             .unwrap_or_default();
-        let mut claims = hyprstream_rpc::auth::Claims::new(
-            subject.clone(),
-            now,
-            now + requested_ttl as i64,
-        ).with_issuer(issuer.clone())
-         .with_audience(audience)
-         .with_scope(granted_scope);
+        let mut claims =
+            hyprstream_rpc::auth::Claims::new(subject.clone(), now, now + requested_ttl as i64)
+                .with_issuer(issuer.clone())
+                .with_audience(audience)
+                .with_scope(granted_scope);
         if target_domain != "*" {
             claims = claims.with_tenant(target_domain.clone());
         }
@@ -1950,45 +2044,42 @@ impl PolicyHandler for PolicyService {
             // record / key mismatch all FAIL CLOSED (frozen A §5). A no-cnf
             // bearer (no `service_key_bytes`) is non-dispatch and stamps none.
             if let Some(key) = service_key_bytes {
-            let Some(resolver) = self.primary_enrollment_resolver.as_deref() else {
-                return Ok(issue_err(
+                let Some(resolver) = self.primary_enrollment_resolver.as_deref() else {
+                    return Ok(issue_err(
                     "PRIMARY_RESOLVER_UNAVAILABLE",
                     "primary-enrollment resolver is not installed; user issuance is fail-closed \
                      until the authoritative primary enrollment is available"
                         .to_owned(),
                 ));
-            };
-            let Some(group) = resolver.primary_group(&subject, &target_domain) else {
-                return Ok(issue_err(
-                    "PRIMARY_UNRESOLVABLE",
-                    format!("no active authoritative primary enrollment for '{subject}'"),
-                ));
-            };
-            // Frozen-registry suite/shape + exact key binding.
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let keys = &group.ordered_component_keys;
-            let shape_ok = if group.suite_id == hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519 {
-                keys.len() == 1 && keys[0].len() == 32
-            } else if group.suite_id == hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65 {
-                keys.len() == 2 && keys[0].len() == 32 && keys[1].len() == 1952
-            } else {
-                false
-            };
-            if !shape_ok || keys[0].as_slice() != key {
-                return Ok(issue_err(
-                    "PRIMARY_UNRESOLVABLE",
-                    "user cnf key does not match the authoritative primary enrollment, or the \
+                };
+                let Some(group) = resolver.primary_group(&subject, &target_domain) else {
+                    return Ok(issue_err(
+                        "PRIMARY_UNRESOLVABLE",
+                        format!("no active authoritative primary enrollment for '{subject}'"),
+                    ));
+                };
+                // Frozen-registry suite/shape + exact key binding.
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                let keys = &group.ordered_component_keys;
+                let shape_ok = if group.suite_id == hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519 {
+                    keys.len() == 1 && keys[0].len() == 32
+                } else if group.suite_id == hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65 {
+                    keys.len() == 2 && keys[0].len() == 32 && keys[1].len() == 1952
+                } else {
+                    false
+                };
+                if !shape_ok || keys[0].as_slice() != key {
+                    return Ok(issue_err(
+                        "PRIMARY_UNRESOLVABLE",
+                        "user cnf key does not match the authoritative primary enrollment, or the \
                      enrolled suite/shape is not a frozen-registry signer suite"
-                        .to_owned(),
+                            .to_owned(),
+                    ));
+                }
+                let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+                claims = claims.with_cnf_hs_signer_suite(URL_SAFE_NO_PAD.encode(
+                    hyprstream_rpc::auth::signer_suite_thumbprint(&group.suite_id, &refs),
                 ));
-            }
-            let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-            claims = claims.with_cnf_hs_signer_suite(
-                URL_SAFE_NO_PAD.encode(hyprstream_rpc::auth::signer_suite_thumbprint(
-                    &group.suite_id,
-                    &refs,
-                )),
-            );
             }
             // else: no-cnf bearer → non-dispatch OAuth token; no suite stamped.
         }
@@ -2068,9 +2159,10 @@ impl PolicyHandler for PolicyService {
         // authority on the explicit global bootstrap domain, while ordinary
         // tenantless callers remain denied by `request_domain`.
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &caller, &domain, "policy:*", "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:*", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage policy", caller),
@@ -2127,9 +2219,10 @@ impl PolicyHandler for PolicyService {
             Err(e) => {
                 // Policy is already reloaded and valid, just commit failed
                 warn!("Template applied but commit failed: {}", e);
-                Ok(PolicyResponseVariant::ApplyTemplateResult(
-                    format!("policy: apply {} template (commit failed: {})", data.name, e)
-                ))
+                Ok(PolicyResponseVariant::ApplyTemplateResult(format!(
+                    "policy: apply {} template (commit failed: {})",
+                    data.name, e
+                )))
             }
         }
     }
@@ -2142,9 +2235,10 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &caller, &domain, "policy:*", "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:*", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage policy", caller),
@@ -2169,10 +2263,15 @@ impl PolicyHandler for PolicyService {
         }
 
         // Generate commit message
-        let commit_msg = data.message.as_ref().filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| {
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-            format!("policy: update access control rules ({timestamp})")
-        });
+        let commit_msg = data
+            .message
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                format!("policy: update access control rules ({timestamp})")
+            });
 
         // Stage and commit
         match self.stage_and_commit_policies(&commit_msg).await {
@@ -2180,13 +2279,11 @@ impl PolicyHandler for PolicyService {
                 info!("Draft policy applied: {}", commit_msg);
                 Ok(PolicyResponseVariant::ApplyDraftResult(commit_msg))
             }
-            Err(e) => {
-                Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Commit failed: {}", e),
-                    code: "COMMIT_FAILED".to_owned(),
-                    details: String::new(),
-                }))
-            }
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Commit failed: {}", e),
+                code: "COMMIT_FAILED".to_owned(),
+                details: String::new(),
+            })),
         }
     }
 
@@ -2198,9 +2295,10 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &caller, &domain, "policy:*", "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:*", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage policy", caller),
@@ -2217,10 +2315,15 @@ impl PolicyHandler for PolicyService {
         {
             let valid = !git_ref.is_empty()
                 && git_ref.len() <= 256
-                && git_ref.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
+                && git_ref
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
             if !valid {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Invalid git ref '{}': only [a-zA-Z0-9._/-] allowed", git_ref),
+                    message: format!(
+                        "Invalid git ref '{}': only [a-zA-Z0-9._/-] allowed",
+                        git_ref
+                    ),
                     code: "INVALID_GIT_REF".into(),
                     details: String::new(),
                 }));
@@ -2234,23 +2337,29 @@ impl PolicyHandler for PolicyService {
         // Use git2 escape hatch to checkout policies/ from the target ref
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
-        let repo = handle.open_repo()
+        let repo = handle
+            .open_repo()
             .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
 
         // Resolve ref and checkout policies/ from it
         let git_ref_clone = git_ref.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let obj = repo.revparse_single(&git_ref_clone)
+            let obj = repo
+                .revparse_single(&git_ref_clone)
                 .map_err(|e| anyhow!("Invalid git ref '{}': {}", git_ref_clone, e))?;
-            let commit = obj.peel_to_commit()
-                .map_err(|e| anyhow!("Ref '{}' does not point to a commit: {}", git_ref_clone, e))?;
-            let tree = commit.tree()
+            let commit = obj.peel_to_commit().map_err(|e| {
+                anyhow!("Ref '{}' does not point to a commit: {}", git_ref_clone, e)
+            })?;
+            let tree = commit
+                .tree()
                 .map_err(|e| anyhow!("Failed to get tree: {}", e))?;
 
             // Find the policies/ subtree
-            let policies_entry = tree.get_path(std::path::Path::new("policies"))
+            let policies_entry = tree
+                .get_path(std::path::Path::new("policies"))
                 .map_err(|e| anyhow!("No policies/ directory in {}: {}", git_ref_clone, e))?;
-            let policies_tree = repo.find_tree(policies_entry.id())
+            let policies_tree = repo
+                .find_tree(policies_entry.id())
                 .map_err(|e| anyhow!("Failed to read policies tree: {}", e))?;
 
             // Checkout the policies tree to the workdir
@@ -2258,11 +2367,14 @@ impl PolicyHandler for PolicyService {
             checkout_opts.force();
             checkout_opts.path("policies");
             repo.checkout_tree(policies_tree.as_object(), Some(&mut checkout_opts))
-                .map_err(|e| anyhow!("Failed to checkout policies/ from {}: {}", git_ref_clone, e))?;
+                .map_err(|e| {
+                    anyhow!("Failed to checkout policies/ from {}: {}", git_ref_clone, e)
+                })?;
 
             Ok(())
-        }).await
-            .map_err(|e| anyhow!("Checkout task failed: {}", e))??;
+        })
+        .await
+        .map_err(|e| anyhow!("Checkout task failed: {}", e))??;
 
         // Validate the restored policy
         if let Err(e) = self.policy_manager.reload().await {
@@ -2280,13 +2392,11 @@ impl PolicyHandler for PolicyService {
                 info!("Policy rolled back to {}", git_ref);
                 Ok(PolicyResponseVariant::RollbackResult(commit_msg))
             }
-            Err(e) => {
-                Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Rollback commit failed: {}", e),
-                    code: "COMMIT_FAILED".to_owned(),
-                    details: String::new(),
-                }))
-            }
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Rollback commit failed: {}", e),
+                code: "COMMIT_FAILED".to_owned(),
+                details: String::new(),
+            })),
         }
     }
 
@@ -2298,9 +2408,10 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &caller, &domain, "policy:*", "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:*", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage policy", caller),
@@ -2309,20 +2420,27 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        let count = if data.count == 0 { 10 } else { data.count as usize };
+        let count = if data.count == 0 {
+            10
+        } else {
+            data.count as usize
+        };
 
         trace!("Getting policy history (count={})", count);
 
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
-        let repo = handle.open_repo()
+        let repo = handle
+            .open_repo()
             .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
 
         let entries = tokio::task::spawn_blocking(move || -> Result<Vec<PolicyHistoryEntry>> {
             let mut entries = Vec::new();
-            let mut revwalk = repo.revwalk()
+            let mut revwalk = repo
+                .revwalk()
                 .map_err(|e| anyhow!("Failed to create revwalk: {}", e))?;
-            revwalk.push_head()
+            revwalk
+                .push_head()
                 .map_err(|e| anyhow!("Failed to push HEAD: {}", e))?;
 
             for oid_result in revwalk {
@@ -2331,7 +2449,8 @@ impl PolicyHandler for PolicyService {
                 }
 
                 let oid = oid_result.map_err(|e| anyhow!("Revwalk error: {}", e))?;
-                let commit = repo.find_commit(oid)
+                let commit = repo
+                    .find_commit(oid)
                     .map_err(|e| anyhow!("Failed to find commit: {}", e))?;
 
                 // Check if this commit touches policies/
@@ -2342,8 +2461,8 @@ impl PolicyHandler for PolicyService {
                         let diff = repo.diff_tree_to_tree(Some(&pt), Some(&ct), None).ok();
                         diff.is_some_and(|d| {
                             d.deltas().any(|delta| {
-                                let path = delta.new_file().path()
-                                    .or_else(|| delta.old_file().path());
+                                let path =
+                                    delta.new_file().path().or_else(|| delta.old_file().path());
                                 path.is_some_and(|p| p.starts_with("policies"))
                             })
                         })
@@ -2352,7 +2471,9 @@ impl PolicyHandler for PolicyService {
                     }
                 } else {
                     // Root commit — check if it has policies/
-                    commit.tree().ok()
+                    commit
+                        .tree()
+                        .ok()
                         .and_then(|t| t.get_path(std::path::Path::new("policies")).ok())
                         .is_some()
                 };
@@ -2372,10 +2493,13 @@ impl PolicyHandler for PolicyService {
             }
 
             Ok(entries)
-        }).await
-            .map_err(|e| anyhow!("History task failed: {}", e))??;
+        })
+        .await
+        .map_err(|e| anyhow!("History task failed: {}", e))??;
 
-        Ok(PolicyResponseVariant::GetHistoryResult(PolicyHistory { entries }))
+        Ok(PolicyResponseVariant::GetHistoryResult(PolicyHistory {
+            entries,
+        }))
     }
 
     async fn handle_get_diff(
@@ -2386,9 +2510,10 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &caller, &domain, "policy:*", "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:*", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage policy", caller),
@@ -2397,26 +2522,33 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        let git_ref = data.git_ref.as_ref().filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| "HEAD".to_owned());
+        let git_ref = data
+            .git_ref
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "HEAD".to_owned());
 
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
-        let repo = handle.open_repo()
+        let repo = handle
+            .open_repo()
             .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
 
         let output = tokio::task::spawn_blocking(move || -> Result<String> {
-            let obj = repo.revparse_single(&git_ref)
+            let obj = repo
+                .revparse_single(&git_ref)
                 .map_err(|e| anyhow!("Invalid git ref '{}': {}", git_ref, e))?;
-            let tree = obj.peel_to_tree()
+            let tree = obj
+                .peel_to_tree()
                 .map_err(|e| anyhow!("Could not peel {} to tree: {}", git_ref, e))?;
 
             let mut diff_opts = git2::DiffOptions::new();
             diff_opts.pathspec("policies/");
 
-            let diff = repo.diff_tree_to_workdir_with_index(
-                Some(&tree),
-                Some(&mut diff_opts),
-            ).map_err(|e| anyhow!("Failed to compute diff: {}", e))?;
+            let diff = repo
+                .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut diff_opts))
+                .map_err(|e| anyhow!("Failed to compute diff: {}", e))?;
 
             let mut result = String::new();
             diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
@@ -2431,8 +2563,9 @@ impl PolicyHandler for PolicyService {
             })?;
 
             Ok(result)
-        }).await
-            .map_err(|e| anyhow!("Diff task failed: {}", e))??;
+        })
+        .await
+        .map_err(|e| anyhow!("Diff task failed: {}", e))??;
 
         Ok(PolicyResponseVariant::GetDiffResult(output))
     }
@@ -2444,9 +2577,10 @@ impl PolicyHandler for PolicyService {
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
         let domain = self.request_domain(ctx)?;
-        let allowed = self.policy_manager.check_with_domain(
-            &caller, &domain, "policy:*", "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:*", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage policy", caller),
@@ -2457,26 +2591,30 @@ impl PolicyHandler for PolicyService {
 
         let reg = self.git2db.read().await;
         let handle = reg.repo(&self.registry_repo_id)?;
-        let repo = handle.open_repo()
+        let repo = handle
+            .open_repo()
             .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
 
-        let (has_changes, summary) = tokio::task::spawn_blocking(move || -> Result<(bool, String)> {
-            let mut opts = git2::StatusOptions::new();
-            opts.pathspec("policies/");
-            opts.include_untracked(true);
+        let (has_changes, summary) =
+            tokio::task::spawn_blocking(move || -> Result<(bool, String)> {
+                let mut opts = git2::StatusOptions::new();
+                opts.pathspec("policies/");
+                opts.include_untracked(true);
 
-            let statuses = repo.statuses(Some(&mut opts))
-                .map_err(|e| anyhow!("Failed to get status: {}", e))?;
+                let statuses = repo
+                    .statuses(Some(&mut opts))
+                    .map_err(|e| anyhow!("Failed to get status: {}", e))?;
 
-            let count = statuses.len();
-            let summary = if count == 0 {
-                "no changes".to_owned()
-            } else {
-                format!("{} file(s) changed", count)
-            };
+                let count = statuses.len();
+                let summary = if count == 0 {
+                    "no changes".to_owned()
+                } else {
+                    format!("{} file(s) changed", count)
+                };
 
-            Ok((count > 0, summary))
-        }).await
+                Ok((count > 0, summary))
+            })
+            .await
             .map_err(|e| anyhow!("Status task failed: {}", e))??;
 
         Ok(PolicyResponseVariant::GetDraftStatusResult(DraftStatus {
@@ -2495,12 +2633,10 @@ impl PolicyHandler for PolicyService {
         let domain = self.request_domain(ctx)?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
-        let allowed = self.policy_manager.check_with_domain(
-            &caller,
-            &domain,
-            "policy:roles",
-            "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:roles", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!(
@@ -2524,9 +2660,7 @@ impl PolicyHandler for PolicyService {
         // Elevated roles can only be assigned by policy service.
         const ELEVATED_ROLES: &[&str] = &["ttt.privileged", "operator"];
         let caller_subject = ctx.subject().to_string();
-        if ELEVATED_ROLES.contains(&data.role.as_str())
-            && caller_subject != "service:policy"
-        {
+        if ELEVATED_ROLES.contains(&data.role.as_str()) && caller_subject != "service:policy" {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!(
                     "Role '{}' is an elevated role and can only be assigned by policy service",
@@ -2551,7 +2685,9 @@ impl PolicyHandler for PolicyService {
         // relation; tenant-scoped memberships live in `g2`. Do not turn a
         // global authority domain into a literal `g2(..., "*")` row.
         let changed = if domain == "*" {
-            self.policy_manager.add_role_for_user(&data.user, &data.role).await
+            self.policy_manager
+                .add_role_for_user(&data.user, &data.role)
+                .await
         } else {
             self.policy_manager
                 .add_role_for_user_in_domain(&data.user, &data.role, &domain)
@@ -2561,7 +2697,10 @@ impl PolicyHandler for PolicyService {
 
         if !changed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Role '{}' is already assigned to '{}'", data.role, data.user),
+                message: format!(
+                    "Role '{}' is already assigned to '{}'",
+                    data.role, data.user
+                ),
                 code: "NO_CHANGE".to_owned(),
                 details: "No policy update was committed.".to_owned(),
             }));
@@ -2581,16 +2720,22 @@ impl PolicyHandler for PolicyService {
                     .await
             };
             match rollback {
-                Ok(true) => return Err(anyhow!("Failed to save policy after role grant: {}", error)),
-                Ok(false) => return Err(anyhow!(
-                    "Failed to save policy after role grant: {}; rollback was not applied",
-                    error
-                )),
-                Err(rollback_error) => return Err(anyhow!(
-                    "Failed to save policy after role grant: {}; rollback failed: {}",
-                    error,
-                    rollback_error
-                )),
+                Ok(true) => {
+                    return Err(anyhow!("Failed to save policy after role grant: {}", error))
+                }
+                Ok(false) => {
+                    return Err(anyhow!(
+                        "Failed to save policy after role grant: {}; rollback was not applied",
+                        error
+                    ))
+                }
+                Err(rollback_error) => {
+                    return Err(anyhow!(
+                        "Failed to save policy after role grant: {}; rollback failed: {}",
+                        error,
+                        rollback_error
+                    ))
+                }
             }
         }
 
@@ -2606,7 +2751,8 @@ impl PolicyHandler for PolicyService {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!("Role grant persisted but audit commit failed: {e}"),
                     code: "COMMIT_FAILED".to_owned(),
-                    details: "The role change was retained; investigate the audit repository.".to_owned(),
+                    details: "The role change was retained; investigate the audit repository."
+                        .to_owned(),
                 }));
             }
         };
@@ -2628,12 +2774,10 @@ impl PolicyHandler for PolicyService {
         let domain = self.request_domain(ctx)?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
-        let allowed = self.policy_manager.check_with_domain(
-            &caller,
-            &domain,
-            "policy:roles",
-            "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, "policy:roles", "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!(
@@ -2680,23 +2824,34 @@ impl PolicyHandler for PolicyService {
         // remains a real mutation instead of silently reporting NOT_FOUND.
         if let Err(error) = self.policy_manager.save().await {
             let rollback = if domain == "*" {
-                self.policy_manager.add_role_for_user(&data.user, &data.role).await
+                self.policy_manager
+                    .add_role_for_user(&data.user, &data.role)
+                    .await
             } else {
                 self.policy_manager
                     .add_role_for_user_in_domain(&data.user, &data.role, &domain)
                     .await
             };
             match rollback {
-                Ok(true) => return Err(anyhow!("Failed to save policy after role revoke: {}", error)),
-                Ok(false) => return Err(anyhow!(
-                    "Failed to save policy after role revoke: {}; rollback was not applied",
-                    error
-                )),
-                Err(rollback_error) => return Err(anyhow!(
-                    "Failed to save policy after role revoke: {}; rollback failed: {}",
-                    error,
-                    rollback_error
-                )),
+                Ok(true) => {
+                    return Err(anyhow!(
+                        "Failed to save policy after role revoke: {}",
+                        error
+                    ))
+                }
+                Ok(false) => {
+                    return Err(anyhow!(
+                        "Failed to save policy after role revoke: {}; rollback was not applied",
+                        error
+                    ))
+                }
+                Err(rollback_error) => {
+                    return Err(anyhow!(
+                        "Failed to save policy after role revoke: {}; rollback failed: {}",
+                        error,
+                        rollback_error
+                    ))
+                }
             }
         }
 
@@ -2712,7 +2867,8 @@ impl PolicyHandler for PolicyService {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!("Role revoke persisted but audit commit failed: {e}"),
                     code: "COMMIT_FAILED".to_owned(),
-                    details: "The role change was retained; investigate the audit repository.".to_owned(),
+                    details: "The role change was retained; investigate the audit repository."
+                        .to_owned(),
                 }));
             }
         };
@@ -2735,12 +2891,10 @@ impl PolicyHandler for PolicyService {
         let resource = format!("model:{}:{}", data.model_name, data.branch_name);
 
         // Require manage (ttt.writeback) on the model resource
-        let allowed = self.policy_manager.check_with_domain(
-            &caller,
-            &domain,
-            &resource,
-            "ttt.writeback",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&caller, &domain, &resource, "ttt.writeback")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("Unauthorized: {} cannot manage {}", caller, resource),
@@ -2755,20 +2909,30 @@ impl PolicyHandler for PolicyService {
 
         if data.public {
             // Make public: add wildcard infer+query rules
-            let _ = self.policy_manager.add_policy_with_domain(
-                "*", "*", &resource, "infer.generate", "allow").await;
-            let _ = self.policy_manager.add_policy_with_domain(
-                "*", "*", &resource, "query.status", "allow").await;
+            let _ = self
+                .policy_manager
+                .add_policy_with_domain("*", "*", &resource, "infer.generate", "allow")
+                .await;
+            let _ = self
+                .policy_manager
+                .add_policy_with_domain("*", "*", &resource, "query.status", "allow")
+                .await;
         } else {
             // Make private: remove wildcard rules
-            let _ = self.policy_manager.remove_policy_with_domain(
-                "*", "*", &resource, "infer.generate", "allow").await;
-            let _ = self.policy_manager.remove_policy_with_domain(
-                "*", "*", &resource, "query.status", "allow").await;
+            let _ = self
+                .policy_manager
+                .remove_policy_with_domain("*", "*", &resource, "infer.generate", "allow")
+                .await;
+            let _ = self
+                .policy_manager
+                .remove_policy_with_domain("*", "*", &resource, "query.status", "allow")
+                .await;
         }
 
         // Persist in-memory Casbin state to disk before staging
-        self.policy_manager.save().await
+        self.policy_manager
+            .save()
+            .await
             .map_err(|e| anyhow!("Failed to save policy after visibility change: {}", e))?;
 
         let vis_str = if data.public { "public" } else { "private" };
@@ -2826,16 +2990,37 @@ impl PolicyHandler for PolicyService {
         let mut prefixes = self.event_prefixes.write().await;
         match validate_event_prefix_registration(&prefixes, &key, &owner) {
             Ok(()) => {}
-            Err(EventPrefixRegistrationError::OwnedByAnotherSubject) => return Ok(PolicyResponseVariant::Error(ErrorInfo { message: format!("prefix '{}' is already registered by another subject in this tenant", data.prefix), code: "ALREADY_EXISTS".to_owned(), details: String::new() })),
-            Err(EventPrefixRegistrationError::CrossTenantShadow) => return Ok(PolicyResponseVariant::Error(ErrorInfo { message: format!("prefix '{}' conflicts with a cross-tenant prefix", data.prefix), code: "CONFLICT".to_owned(), details: String::new() })),
+            Err(EventPrefixRegistrationError::OwnedByAnotherSubject) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!(
+                        "prefix '{}' is already registered by another subject in this tenant",
+                        data.prefix
+                    ),
+                    code: "ALREADY_EXISTS".to_owned(),
+                    details: String::new(),
+                }))
+            }
+            Err(EventPrefixRegistrationError::CrossTenantShadow) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!(
+                        "prefix '{}' conflicts with a cross-tenant prefix",
+                        data.prefix
+                    ),
+                    code: "CONFLICT".to_owned(),
+                    details: String::new(),
+                }))
+            }
         }
-        prefixes.insert(key, EventPrefixState {
-            owner,
-            publisher_pubkey: pubkey,
-            schema: data.schema.clone(),
-            subscriber_pubkeys: HashMap::new(),
-            wrapped_keys: HashMap::new(),
-        });
+        prefixes.insert(
+            key,
+            EventPrefixState {
+                owner,
+                publisher_pubkey: pubkey,
+                schema: data.schema.clone(),
+                subscriber_pubkeys: HashMap::new(),
+                wrapped_keys: HashMap::new(),
+            },
+        );
 
         tracing::info!(prefix = %data.prefix, "Registered event prefix");
         Ok(PolicyResponseVariant::RegisterEventPrefixResult)
@@ -2880,23 +3065,31 @@ impl PolicyHandler for PolicyService {
         let mut prefixes = self.event_prefixes.write().await;
         let state = match prefixes.get_mut(&key) {
             Some(s) => s,
-            None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("prefix '{}' not registered", data.prefix),
-                code: "NOT_FOUND".to_owned(),
-                details: String::new(),
-            })),
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("prefix '{}' not registered", data.prefix),
+                    code: "NOT_FOUND".to_owned(),
+                    details: String::new(),
+                }))
+            }
         };
 
         state.subscriber_pubkeys.insert(hash_bytes, sub_pubkey);
 
         // If publisher has already wrapped a key for this subscriber, return it.
-        let wrapped = state.wrapped_keys.get(&hash_bytes).cloned().unwrap_or_default();
+        let wrapped = state
+            .wrapped_keys
+            .get(&hash_bytes)
+            .cloned()
+            .unwrap_or_default();
 
-        Ok(PolicyResponseVariant::SubscribeEventPrefixResult(EventPrefixAccess {
-            publisher_ephemeral_pubkey: state.publisher_pubkey.to_vec(),
-            wrapped_group_key: wrapped,
-            schema: state.schema.clone(),
-        }))
+        Ok(PolicyResponseVariant::SubscribeEventPrefixResult(
+            EventPrefixAccess {
+                publisher_ephemeral_pubkey: state.publisher_pubkey.to_vec(),
+                wrapped_group_key: wrapped,
+                schema: state.schema.clone(),
+            },
+        ))
     }
 
     /// Publisher fetches new subscriber pubkeys that need wrapping.
@@ -2923,22 +3116,26 @@ impl PolicyHandler for PolicyService {
         let prefixes = self.event_prefixes.read().await;
         let state = match prefixes.get(&key) {
             Some(s) => s,
-            None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("prefix '{}' not registered", data.prefix),
-                code: "NOT_FOUND".to_owned(),
-                details: String::new(),
-            })),
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("prefix '{}' not registered", data.prefix),
+                    code: "NOT_FOUND".to_owned(),
+                    details: String::new(),
+                }))
+            }
         };
 
         // Return pubkeys that don't have wrapped keys yet.
-        let pending: Vec<Vec<u8>> = state.subscriber_pubkeys.iter()
+        let pending: Vec<Vec<u8>> = state
+            .subscriber_pubkeys
+            .iter()
             .filter(|(hash, _)| !state.wrapped_keys.contains_key(*hash))
             .map(|(_, pubkey)| pubkey.to_vec())
             .collect();
 
-        Ok(PolicyResponseVariant::GetPendingSubscribersResult(PendingSubscribers {
-            pubkeys: pending,
-        }))
+        Ok(PolicyResponseVariant::GetPendingSubscribersResult(
+            PendingSubscribers { pubkeys: pending },
+        ))
     }
 
     /// Publisher deposits wrapped group key blobs (opaque to PolicyService).
@@ -2965,11 +3162,13 @@ impl PolicyHandler for PolicyService {
         let mut prefixes = self.event_prefixes.write().await;
         let state = match prefixes.get_mut(&key) {
             Some(s) => s,
-            None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("prefix '{}' not registered", data.prefix),
-                code: "NOT_FOUND".to_owned(),
-                details: String::new(),
-            })),
+            None => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("prefix '{}' not registered", data.prefix),
+                    code: "NOT_FOUND".to_owned(),
+                    details: String::new(),
+                }))
+            }
         };
 
         let mut deposited = 0u32;
@@ -3013,7 +3212,10 @@ impl PolicyHandler for PolicyService {
             hyprstream_service::global_trust_store(),
             &data.service_name,
         )?;
-        debug!(key_count = response.keys.len(), "Resolved service key set for '{}'", data.service_name);
+        debug!(
+            key_count = response.keys.len(),
+            "Resolved service key set for '{}'", data.service_name
+        );
         Ok(PolicyResponseVariant::ResolveServiceKeyResult(response))
     }
 
@@ -3036,7 +3238,10 @@ impl PolicyHandler for PolicyService {
         )?;
 
         // Verify the provided verifying key matches the JWT's cnf.jwk claim.
-        let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
+        let vk_bytes: [u8; 32] = data
+            .verifying_key
+            .as_slice()
+            .try_into()
             .map_err(|_| anyhow!("verifying_key must be 32 bytes"))?;
         let vk = VerifyingKey::from_bytes(&vk_bytes)
             .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
@@ -3046,13 +3251,17 @@ impl PolicyHandler for PolicyService {
         // Store in trust store (key-centric: the key IS the identity)
         {
             let trust = hyprstream_service::global_trust_store();
-            trust.publish_service_registration(vk, &data.service_name, hyprstream_service::Attestation {
-                scopes: std::iter::once(data.service_name.clone()).collect(),
-                subject: None,
-                jwt: Some(data.service_jwt.clone()),
-                expires_at: claims.exp,
-                attested_by: Some(self.signing_key.verifying_key().to_bytes()),
-            })?;
+            trust.publish_service_registration(
+                vk,
+                &data.service_name,
+                hyprstream_service::Attestation {
+                    scopes: std::iter::once(data.service_name.clone()).collect(),
+                    subject: None,
+                    jwt: Some(data.service_jwt.clone()),
+                    expires_at: claims.exp,
+                    attested_by: Some(self.signing_key.verifying_key().to_bytes()),
+                },
+            )?;
         }
 
         info!(service = %data.service_name, caller = %caller, "Registered service verifying key");
@@ -3067,13 +3276,15 @@ impl PolicyHandler for PolicyService {
         data: &RefreshServiceTokenRequest,
     ) -> Result<PolicyResponseVariant> {
         const MAX_TTL: i64 = 2_592_000; // 30 days
-        const MIN_TTL: i64 = 3_600;     // 1 hour
+        const MIN_TTL: i64 = 3_600; // 1 hour
 
         let subject = match ctx.subject().name() {
             Some(s) if s.starts_with("service:") => s.to_owned(),
             Some(s) => {
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                    message: format!("Subject '{s}' is not a service identity; only services may self-renew"),
+                    message: format!(
+                        "Subject '{s}' is not a service identity; only services may self-renew"
+                    ),
                     code: "NOT_A_SERVICE".to_owned(),
                     details: String::new(),
                 }));
@@ -3114,8 +3325,14 @@ impl PolicyHandler for PolicyService {
         } else {
             None
         };
-        let mut claims =
-            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant.as_deref(), &ctx.cnf);
+        let mut claims = renewed_service_claims(
+            subject.clone(),
+            now,
+            expires_at,
+            &issuer,
+            tenant.as_deref(),
+            &ctx.cnf,
+        );
 
         // ServiceEnrollmentManifest (v16 §11): renewal re-derives clearance
         // from the manifest — authority removed from enrollment never
@@ -3215,10 +3432,9 @@ impl PolicyHandler for PolicyService {
         }
 
         info!(service = svc_name, expires_at, "Renewed service JWT");
-        Ok(PolicyResponseVariant::RefreshServiceTokenResult(TokenInfo {
-            token,
-            expires_at,
-        }))
+        Ok(PolicyResponseVariant::RefreshServiceTokenResult(
+            TokenInfo { token, expires_at },
+        ))
     }
     async fn handle_exchange_wit(
         &self,
@@ -3251,25 +3467,28 @@ impl PolicyHandler for PolicyService {
         }
 
         // cnf.jwk from the verified WIT — carried through into the issued at+jwt.
-        let cnf_key_bytes = ctx.claims().and_then(hyprstream_rpc::auth::Claims::cnf_key_bytes);
+        let cnf_key_bytes = ctx
+            .claims()
+            .and_then(hyprstream_rpc::auth::Claims::cnf_key_bytes);
         if cnf_key_bytes.is_none() {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: "Caller WIT missing cnf.jwk — key binding required for ExchangeWit".to_owned(),
+                message: "Caller WIT missing cnf.jwk — key binding required for ExchangeWit"
+                    .to_owned(),
                 code: "NO_CNF_JWK".to_owned(),
                 details: String::new(),
             }));
         }
 
         // Casbin: caller must have 'exchange' on 'policy:exchange-wit'.
-        let allowed = self.policy_manager.check_with_domain(
-            &sub,
-            &domain,
-            "policy:exchange-wit",
-            "exchange",
-        ).await;
+        let allowed = self
+            .policy_manager
+            .check_with_domain(&sub, &domain, "policy:exchange-wit", "exchange")
+            .await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
-                message: format!("Subject '{sub}' is not authorized to exchange WIT for access token"),
+                message: format!(
+                    "Subject '{sub}' is not authorized to exchange WIT for access token"
+                ),
                 code: "UNAUTHORIZED".to_owned(),
                 details: "Requires 'exchange' permission on 'policy:exchange-wit'".to_owned(),
             }));
@@ -3395,7 +3614,10 @@ impl PolicyHandler for PolicyService {
         {
             Ok(c) => c,
             Err(e) => {
-                return Ok(deny("INVALID_SOURCE", &format!("source credential rejected: {e}")))
+                return Ok(deny(
+                    "INVALID_SOURCE",
+                    &format!("source credential rejected: {e}"),
+                ))
             }
         };
         let now = chrono::Utc::now().timestamp();
@@ -3451,7 +3673,10 @@ impl PolicyHandler for PolicyService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let source_sid = source.sid.as_deref().filter(|s| !s.is_empty());
-        let source_wsid = source.workload_session_id.as_deref().filter(|s| !s.is_empty());
+        let source_wsid = source
+            .workload_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty());
         match profile {
             SourceProfile::AtJwt => {
                 // Malformations of a user at+jwt (frozen A): client_id is always
@@ -3754,7 +3979,11 @@ impl PolicyHandler for PolicyService {
             }
             retained_sid = Some(sid.to_owned());
         }
-        if let Some(wsid) = source.workload_session_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(wsid) = source
+            .workload_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             let Some(registry) = hyprstream_rpc::auth::global_session_registry() else {
                 return Ok(deny("UNAVAILABLE", "session registry is not initialized"));
             };
@@ -3885,8 +4114,7 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
         data: &RevokeCredential,
     ) -> Result<PolicyResponseVariant> {
-        let Some(id) = crate::services::revocation::credential_id_from_ref(&data.credential)
-        else {
+        let Some(id) = crate::services::revocation::credential_id_from_ref(&data.credential) else {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: "malformed credential id (empty issuer or value)".to_owned(),
                 code: "INVALID_ARGUMENT".to_owned(),
@@ -3960,7 +4188,9 @@ impl PolicyHandler for PolicyService {
             },
             None => true,
         };
-        Ok(PolicyResponseVariant::CheckCredentialRevocationResult(revoked))
+        Ok(PolicyResponseVariant::CheckCredentialRevocationResult(
+            revoked,
+        ))
     }
 
     /// Register a session with the canonical registry this service owns.
@@ -4112,7 +4342,11 @@ impl RequestService for PolicyService {
         crate::services::generated::policy_client::decode_policy_request_body(signed_body)
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody,) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "Policy request from {} (id={})",
             ctx.subject(),
@@ -4141,7 +4375,10 @@ impl RequestService for PolicyService {
         self.jwt_key_source.clone()
     }
 
-    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+    fn resolve_key_subject(
+        &self,
+        signer_pubkey: &[u8; 32],
+    ) -> Option<hyprstream_rpc::envelope::Subject> {
         hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
     }
 
@@ -4155,18 +4392,20 @@ impl RequestService for PolicyService {
         jwt: &str,
         expires_at: i64,
     ) {
-        hyprstream_service::global_trust_store().insert(verifying_key, hyprstream_service::Attestation {
-            scopes: std::collections::HashSet::new(),
-            subject: Some(subject.to_owned()),
-            jwt: Some(jwt.to_owned()),
-            expires_at,
-            attested_by: Some(self.signing_key.verifying_key().to_bytes()),
-        });
+        hyprstream_service::global_trust_store().insert(
+            verifying_key,
+            hyprstream_service::Attestation {
+                scopes: std::collections::HashSet::new(),
+                subject: Some(subject.to_owned()),
+                jwt: Some(jwt.to_owned()),
+                expires_at,
+                attested_by: Some(self.signing_key.verifying_key().to_bytes()),
+            },
+        );
     }
 
     fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
-        let Some(actor) =
-            hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
+        let Some(actor) = hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
         else {
             return false;
         };
@@ -4278,8 +4517,7 @@ mod tests {
     /// `ca_jwt_key`.
     fn bootstrap_hybrid_service_jwt(ca_jwt_key: &SigningKey, name: &str) -> String {
         let now = chrono::Utc::now().timestamp();
-        let claims =
-            hyprstream_rpc::auth::Claims::new(format!("service:{name}"), now, now + 3600);
+        let claims = hyprstream_rpc::auth::Claims::new(format!("service:{name}"), now, now + 3600);
         let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key);
         let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
         hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(&claims, ca_jwt_key, &ca_pq, &ca_pq_vk)
@@ -4481,7 +4719,9 @@ mod tests {
     ) -> (PolicyService, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("test: create policy git directory");
         let git2db = Arc::new(RwLock::new(
-            Git2DB::open(root.path()).await.expect("test: open policy git database"),
+            Git2DB::open(root.path())
+                .await
+                .expect("test: open policy git database"),
         ));
         let service = PolicyService::new(
             manager,
@@ -4494,7 +4734,11 @@ mod tests {
     }
 
     async fn test_service() -> (PolicyService, tempfile::TempDir) {
-        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let manager = Arc::new(
+            PolicyManager::permissive()
+                .await
+                .expect("test: policy manager"),
+        );
         test_service_with_manager(manager).await
     }
 
@@ -4506,14 +4750,23 @@ mod tests {
             SigningKey::from_bytes(&[77; 32]).verifying_key(),
         );
         let data = hyprstream_rpc_std::policy_client::ResolveSessionPrimary {
-            issuer: "https://host.test".into(), profile: "federate-session-v1".into(),
-            sid: "sid".into(), subject: "alice".into(), tenant: "tenant".into(),
-            client: "client".into(), audience: "https://host.test".into(),
-            scopes: vec!["model:query".into()], ed_public: vec![1; 32],
-            suite_thumbprint: vec![2; 32], generation: vec![3; 32], expires_at: 1,
+            issuer: "https://host.test".into(),
+            profile: "federate-session-v1".into(),
+            sid: "sid".into(),
+            subject: "alice".into(),
+            tenant: "tenant".into(),
+            client: "client".into(),
+            audience: "https://host.test".into(),
+            scopes: vec!["model:query".into()],
+            ed_public: vec![1; 32],
+            suite_thumbprint: vec![2; 32],
+            generation: vec![3; 32],
+            expires_at: 1,
         };
-        assert!(matches!(service.handle_resolve_session_primary(&ctx, 1, &data).await,
-            Ok(PolicyResponseVariant::Error(ref error)) if error.code == "SESSION_PRIMARY_DENIED"));
+        assert!(
+            matches!(service.handle_resolve_session_primary(&ctx, 1, &data).await,
+            Ok(PolicyResponseVariant::Error(ref error)) if error.code == "SESSION_PRIMARY_DENIED")
+        );
     }
 
     #[tokio::test]
@@ -4808,10 +5061,12 @@ mod tests {
             .await
             .expect("global policy authority must grant a global role");
         assert!(
-            matches!(granted, PolicyResponseVariant::AddGroupingResult(_)) || matches!(
-            granted,
-            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
-        ));
+            matches!(granted, PolicyResponseVariant::AddGroupingResult(_))
+                || matches!(
+                    granted,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+                )
+        );
         assert!(
             service
                 .policy_manager
@@ -4853,10 +5108,12 @@ mod tests {
             .await
             .expect("global policy authority must revoke a global role");
         assert!(
-            matches!(revoked, PolicyResponseVariant::RemoveGroupingResult(_)) || matches!(
-            revoked,
-            PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
-        ));
+            matches!(revoked, PolicyResponseVariant::RemoveGroupingResult(_))
+                || matches!(
+                    revoked,
+                    PolicyResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "COMMIT_FAILED"
+                )
+        );
         assert!(
             !service
                 .policy_manager
@@ -4929,13 +5186,7 @@ mod tests {
                 .expect("test: policy manager"),
         );
         manager
-            .add_policy_with_domain(
-                "alice",
-                "tenant-a",
-                "model:own",
-                "infer.generate",
-                "allow",
-            )
+            .add_policy_with_domain("alice", "tenant-a", "model:own", "infer.generate", "allow")
             .await
             .expect("test: own-tenant grant");
         manager
@@ -4965,10 +5216,7 @@ mod tests {
             .handle_check(&ctx, 1, &forged_probe)
             .await
             .expect("denial is a policy response");
-        assert!(matches!(
-            denied,
-            PolicyResponseVariant::CheckResult(false)
-        ));
+        assert!(matches!(denied, PolicyResponseVariant::CheckResult(false)));
 
         let stale_wire_identity = PolicyCheck {
             subject: "victim".to_owned(),
@@ -4980,10 +5228,7 @@ mod tests {
             .handle_check(&ctx, 2, &stale_wire_identity)
             .await
             .expect("allow is a policy response");
-        assert!(matches!(
-            allowed,
-            PolicyResponseVariant::CheckResult(true)
-        ));
+        assert!(matches!(allowed, PolicyResponseVariant::CheckResult(true)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5047,19 +5292,21 @@ mod tests {
             crate::auth::federation_registration_resource("https://blocked.example")
                 .expect("test: federation resource");
         manager
-            .add_policy_with_domain(
-                "*",
-                "*",
-                &allowed_federation,
-                "check",
-                "allow",
-            )
+            .add_policy_with_domain("*", "*", &allowed_federation, "check", "allow")
             .await
             .expect("test: per-origin federation grant");
 
         let endpoint = format!("policy-delegation-{}", rand::random::<u64>());
-        manager.add_policy_with_domain("alice", "did:web:tenant-a.example",
-            "placement:candidate:*", "query", "allow").await.expect("capacity grant");
+        manager
+            .add_policy_with_domain(
+                "alice",
+                "did:web:tenant-a.example",
+                "placement:candidate:*",
+                "query",
+                "allow",
+            )
+            .await
+            .expect("capacity grant");
         let policy_key = SigningKey::from_bytes(&[0x70; 32]);
         let actor_key = SigningKey::from_bytes(&[0x71; 32]);
         let actor_verifying_key = actor_key.verifying_key();
@@ -5165,31 +5412,88 @@ mod tests {
 
         let provider = crate::services::discovery::PolicyAuthProvider::new(client.clone());
         let batched = hyprstream_discovery::AuthorizationProvider::check_batch(
-            &provider, "alice", "forged-other-tenant",
+            &provider,
+            "alice",
+            "forged-other-tenant",
             &["model:allowed".to_owned(), "model:deputy-only".to_owned()],
-            "infer.generate", Some(&user_token),
-        ).await.expect("real batched Policy RPC with delegated identity");
-        assert_eq!(batched, vec![true, false], "batch preserves user authority, not deputy grants");
-        assert!(hyprstream_discovery::AuthorizationProvider::check_batch(
-            &provider, "alice", "*", &["model:allowed".to_owned()], "infer.generate", None,
-        ).await.is_err(), "batch cannot mediate a user without verified bearer");
-        assert!(client.clone().with_delegated_bearer(user_token.clone()).check_batch(&PolicyCheckBatch {
-            checks: vec![PolicyCheck { subject: String::new(), domain: String::new(),
-                resource: "model:allowed".to_owned(), operation: "infer.generate".to_owned() }; 257],
-        }).await.is_err(), "batch bound enforced by server, not only adapter");
+            "infer.generate",
+            Some(&user_token),
+        )
+        .await
+        .expect("real batched Policy RPC with delegated identity");
+        assert_eq!(
+            batched,
+            vec![true, false],
+            "batch preserves user authority, not deputy grants"
+        );
+        assert!(
+            hyprstream_discovery::AuthorizationProvider::check_batch(
+                &provider,
+                "alice",
+                "*",
+                &["model:allowed".to_owned()],
+                "infer.generate",
+                None,
+            )
+            .await
+            .is_err(),
+            "batch cannot mediate a user without verified bearer"
+        );
+        assert!(
+            client
+                .clone()
+                .with_delegated_bearer(user_token.clone())
+                .check_batch(&PolicyCheckBatch {
+                    checks: vec![
+                        PolicyCheck {
+                            subject: String::new(),
+                            domain: String::new(),
+                            resource: "model:allowed".to_owned(),
+                            operation: "infer.generate".to_owned()
+                        };
+                        257
+                    ],
+                })
+                .await
+                .is_err(),
+            "batch bound enforced by server, not only adapter"
+        );
 
         // Exercise the real adapter, generated wire codec and Policy handler
         // for a full configured fleet, separately from Valkey snapshot timing.
         use futures::{stream, StreamExt, TryStreamExt};
-        let resources: Vec<_> = (0..65_536).map(|i| format!("placement:candidate:did:web:capacity-{i}.example")).collect();
+        let resources: Vec<_> = (0..65_536)
+            .map(|i| format!("placement:candidate:did:web:capacity-{i}.example"))
+            .collect();
         let started = std::time::Instant::now();
-        let decisions = stream::iter(resources.chunks(256)).map(|batch| {
-            hyprstream_discovery::AuthorizationProvider::check_batch(&provider,
-                "alice", "*", batch, "query", Some(&user_token))
-        }).buffer_unordered(16).try_collect::<Vec<_>>().await.expect("full-fleet Policy batch RPC");
-        assert_eq!(decisions.iter().flatten().filter(|allowed| **allowed).count(), 65_536);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5),
-            "healthy Policy batching exceeded candidate deadline: {:?}", started.elapsed());
+        let decisions = stream::iter(resources.chunks(256))
+            .map(|batch| {
+                hyprstream_discovery::AuthorizationProvider::check_batch(
+                    &provider,
+                    "alice",
+                    "*",
+                    batch,
+                    "query",
+                    Some(&user_token),
+                )
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("full-fleet Policy batch RPC");
+        assert_eq!(
+            decisions
+                .iter()
+                .flatten()
+                .filter(|allowed| **allowed)
+                .count(),
+            65_536
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "healthy Policy batching exceeded candidate deadline: {:?}",
+            started.elapsed()
+        );
 
         let cross_tenant = client
             .clone()
@@ -5640,7 +5944,10 @@ mod tests {
         let mut relabeled = issue("service:model");
         relabeled.issuance_profile = IssueTokenProfile::InteractiveSession;
         relabeled.session_id = Some("sid-illegal".to_owned());
-        let response = service.handle_issue_token(&ctx, 2, &relabeled).await.unwrap();
+        let response = service
+            .handle_issue_token(&ctx, 2, &relabeled)
+            .await
+            .unwrap();
         assert!(
             matches!(
                 response,
@@ -5963,7 +6270,14 @@ mod tests {
             clearance_epoch: 0,
         };
         let decide = |fp: Option<bool>, wsid: Option<&'static str>| {
-            service.resolve_renewal_workload_session(issuer, "service:model", "tenant-a", now, fp, wsid)
+            service.resolve_renewal_workload_session(
+                issuer,
+                "service:model",
+                "tenant-a",
+                now,
+                fp,
+                wsid,
+            )
         };
 
         // Register one ACTIVE session used by the two contrasting live cases.
@@ -5980,7 +6294,10 @@ mod tests {
         // credential. This is the positive proof that `family_allowed = false`
         // actually narrows (not a vacuous always-None).
         assert!(
-            matches!(decide(Some(false), Some(active)).await, RenewalWorkloadSession::Stamp(None)),
+            matches!(
+                decide(Some(false), Some(active)).await,
+                RenewalWorkloadSession::Stamp(None)
+            ),
             "active session + removed family policy must OMIT the workload_session_id"
         );
 
@@ -6000,7 +6317,9 @@ mod tests {
         // never launder a revoked family into an unsessioned renewal.
         let revoked = "wl-revoked-narrow";
         let rk = hyprstream_rpc::auth::SessionKey::workload(issuer, revoked);
-        reg.register_session(rk.clone(), active_state(now + 3600)).await.unwrap();
+        reg.register_session(rk.clone(), active_state(now + 3600))
+            .await
+            .unwrap();
         reg.revoke_session(&rk).await.unwrap();
         for fp in [Some(false), Some(true), None] {
             assert!(
@@ -6040,11 +6359,17 @@ mod tests {
         // (6) No carried session: a disabled (`Some(false)`) or legacy (`None`)
         // family manufactures none.
         assert!(
-            matches!(decide(Some(false), None).await, RenewalWorkloadSession::Stamp(None)),
+            matches!(
+                decide(Some(false), None).await,
+                RenewalWorkloadSession::Stamp(None)
+            ),
             "no session + disabled family stays unsessioned"
         );
         assert!(
-            matches!(decide(None, None).await, RenewalWorkloadSession::Stamp(None)),
+            matches!(
+                decide(None, None).await,
+                RenewalWorkloadSession::Stamp(None)
+            ),
             "no session + legacy family stays unsessioned"
         );
 
@@ -6055,9 +6380,10 @@ mod tests {
             panic!("an enrolled family with no carried session must create one: {created:?}");
         };
         assert!(
-            !reg
-                .is_revoked(&hyprstream_rpc::auth::SessionKey::workload(issuer, &new_wsid))
-                .await,
+            !reg.is_revoked(&hyprstream_rpc::auth::SessionKey::workload(
+                issuer, &new_wsid
+            ))
+            .await,
             "the freshly created workload session must be registered ACTIVE"
         );
     }
@@ -6074,11 +6400,10 @@ mod tests {
         // resolver + a matching cnf key so the positive reaches the signing
         // boundary rather than the fail-closed Primary gate.
         let user_ed = SigningKey::from_bytes(&[0x88; 32]);
-        let service = service
-            .with_primary_enrollment_resolver(v16_primary_resolver(
-                "alice",
-                user_ed.verifying_key().to_bytes(),
-            ));
+        let service = service.with_primary_enrollment_resolver(v16_primary_resolver(
+            "alice",
+            user_ed.verifying_key().to_bytes(),
+        ));
         let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
 
         // User profile (RFC 8693) with a MISSING client_id → denied.
@@ -6197,12 +6522,31 @@ mod tests {
             Err(error) => panic!("key set: {error}"),
         };
         assert!(response.verifying_key.is_empty(), "no singleton fallback");
-        assert!(response.service_jwt.is_none(), "no singleton attestation fallback");
-        assert_eq!(response.keys.len(), 2, "overlap keys must both be published");
-        assert!(response.keys.iter().any(|entry| entry.verifying_key == retired.to_bytes()));
-        assert!(response.keys.iter().any(|entry| entry.verifying_key == lead.to_bytes()));
-        assert!(response.keys.iter().all(|entry| entry.key_id.starts_with("ed25519:")));
-        assert!(response.keys.iter().all(|entry| entry.service_jwt.is_none()));
+        assert!(
+            response.service_jwt.is_none(),
+            "no singleton attestation fallback"
+        );
+        assert_eq!(
+            response.keys.len(),
+            2,
+            "overlap keys must both be published"
+        );
+        assert!(response
+            .keys
+            .iter()
+            .any(|entry| entry.verifying_key == retired.to_bytes()));
+        assert!(response
+            .keys
+            .iter()
+            .any(|entry| entry.verifying_key == lead.to_bytes()));
+        assert!(response
+            .keys
+            .iter()
+            .all(|entry| entry.key_id.starts_with("ed25519:")));
+        assert!(response
+            .keys
+            .iter()
+            .all(|entry| entry.service_jwt.is_none()));
     }
 
     #[test]
@@ -6223,7 +6567,10 @@ mod tests {
     fn one_key_response_projects_verification_key_but_never_credential() {
         let trust = hyprstream_service::TrustStore::new();
         let key = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
-        trust.insert(key, attestation(chrono::Utc::now().timestamp() + 60, "certificate"));
+        trust.insert(
+            key,
+            attestation(chrono::Utc::now().timestamp() + 60, "certificate"),
+        );
 
         let response = match published_service_key_response(&trust, "model") {
             Ok(response) => response,
@@ -6282,13 +6629,16 @@ mod tests {
             requested.to_bytes(),
         ));
         let trust = hyprstream_service::global_trust_store();
-        trust.insert(caller, hyprstream_service::Attestation {
-            scopes: std::iter::once("rotation-sibling-test".to_owned()).collect(),
-            subject: None,
-            jwt: Some("registered-sibling".to_owned()),
-            expires_at: chrono::Utc::now().timestamp() + 60,
-            attested_by: None,
-        });
+        trust.insert(
+            caller,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("rotation-sibling-test".to_owned()).collect(),
+                subject: None,
+                jwt: Some("registered-sibling".to_owned()),
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                attested_by: None,
+            },
+        );
 
         let mut ctx = EnvelopeContext::from_callback_service(1, "rotation-sibling-test");
         ctx.cnf = caller.to_bytes();
@@ -6318,7 +6668,13 @@ mod event_prefix_registry_tests {
     use super::*;
 
     fn state(owner: &str, key: u8) -> EventPrefixState {
-        EventPrefixState { owner: owner.to_owned(), publisher_pubkey: [key; 32], schema: String::new(), subscriber_pubkeys: HashMap::new(), wrapped_keys: HashMap::new() }
+        EventPrefixState {
+            owner: owner.to_owned(),
+            publisher_pubkey: [key; 32],
+            schema: String::new(),
+            subscriber_pubkeys: HashMap::new(),
+            wrapped_keys: HashMap::new(),
+        }
     }
 
     #[test]
@@ -6333,8 +6689,14 @@ mod event_prefix_registry_tests {
         prefixes.insert(b.clone(), state("subject-b", 0x0B));
         assert_eq!(prefixes[&a].publisher_pubkey, [0x0A; 32]);
         assert_eq!(prefixes[&b].publisher_pubkey, [0x0B; 32]);
-        assert_eq!(validate_event_prefix_registration(&prefixes, &shadow, "subject-b"), Err(EventPrefixRegistrationError::CrossTenantShadow));
-        assert_eq!(validate_event_prefix_registration(&prefixes, &a, "subject-b"), Err(EventPrefixRegistrationError::OwnedByAnotherSubject));
+        assert_eq!(
+            validate_event_prefix_registration(&prefixes, &shadow, "subject-b"),
+            Err(EventPrefixRegistrationError::CrossTenantShadow)
+        );
+        assert_eq!(
+            validate_event_prefix_registration(&prefixes, &a, "subject-b"),
+            Err(EventPrefixRegistrationError::OwnedByAnotherSubject)
+        );
     }
 }
 
@@ -6348,757 +6710,232 @@ mod event_prefix_registry_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exchange_delegated_tests {
-        use super::*;
-        use hyprstream_rpc::auth::{
-            ClusterKeySource, CompositeKeyPair, CompositeKeySet, CompositePairRole,
-            CompositePairState,
-        };
-        use hyprstream_rpc::auth::mac::{
-            Assurance, CompartmentSet, CredentialClearance, Level, SecurityLabel,
-        };
-        use crate::auth::service_enrollment::{
-            ServiceEnrollment, ServiceEnrollmentManifest, SERVICE_ENROLLMENT_VERSION,
-        };
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
+    use super::*;
+    use crate::auth::service_enrollment::{
+        ServiceEnrollment, ServiceEnrollmentManifest, SERVICE_ENROLLMENT_VERSION,
+    };
+    use hyprstream_rpc::auth::mac::{
+        Assurance, CompartmentSet, CredentialClearance, Level, SecurityLabel,
+    };
+    use hyprstream_rpc::auth::{
+        ClusterKeySource, CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-        const ISSUER: &str = "https://deleg.test";
-        const TENANT: &str = "did:web:acme.example";
-        const CLIENT_ID: &str = "hyprstream-oauth-client-1";
+    const ISSUER: &str = "https://deleg.test";
+    const TENANT: &str = "did:web:acme.example";
+    const CLIENT_ID: &str = "hyprstream-oauth-client-1";
 
-        struct Fixture {
-            service: PolicyService,
-            ml_dsa: Arc<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
-            ed: Arc<SigningKey>,
-            actor_ed: SigningKey,
-            user_ed: SigningKey,
-            // Owned so per-path RAII removes exactly this fixture's scratch tree.
-            _root: tempfile::TempDir,
+    struct Fixture {
+        service: PolicyService,
+        ml_dsa: Arc<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+        ed: Arc<SigningKey>,
+        actor_ed: SigningKey,
+        user_ed: SigningKey,
+        // Owned so per-path RAII removes exactly this fixture's scratch tree.
+        _root: tempfile::TempDir,
+    }
+
+    struct MockAuthorizer {
+        allow: bool,
+        require_source_aud: Option<String>,
+        require_method: Option<String>,
+    }
+    impl DelegationEdgeAuthorizer for MockAuthorizer {
+        fn authorize(&self, edge: &DelegationEdge<'_>) -> bool {
+            self.allow
+                && self
+                    .require_source_aud
+                    .as_deref()
+                    .is_none_or(|w| edge.source_audience == Some(w))
+                && self
+                    .require_method
+                    .as_deref()
+                    .is_none_or(|w| edge.target_method_id == Some(w))
+                && edge.target_method_id.is_some()
         }
+    }
 
-        struct MockAuthorizer {
-            allow: bool,
-            require_source_aud: Option<String>,
-            require_method: Option<String>,
-        }
-        impl DelegationEdgeAuthorizer for MockAuthorizer {
-            fn authorize(&self, edge: &DelegationEdge<'_>) -> bool {
-                self.allow
-                    && self
-                        .require_source_aud
-                        .as_deref()
-                        .is_none_or(|w| edge.source_audience == Some(w))
-                    && self
-                        .require_method
-                        .as_deref()
-                        .is_none_or(|w| edge.target_method_id == Some(w))
-                    && edge.target_method_id.is_some()
-            }
-        }
-
-        /// Authoritative primary resolver mock: returns the configured Ed key for
-        /// `subject`, or `None` for anyone else (unknown ⇒ deny).
-        struct MockPrimaryResolver {
-            subject: String,
-            ed25519: [u8; 32],
-        }
-        impl PrimaryEnrollmentResolver for MockPrimaryResolver {
-            fn primary_group(&self, principal: &str, _tenant: &str) -> Option<PrimaryGroup> {
-                (principal == self.subject).then(|| PrimaryGroup {
-                    suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
-                    ordered_component_keys: vec![self.ed25519.to_vec()],
-                })
-            }
-        }
-
-        fn label() -> SecurityLabel {
-            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY)
-        }
-
-        async fn fixture(
-            authorizer: Option<Arc<dyn DelegationEdgeAuthorizer>>,
-            resolver: Option<Arc<dyn PrimaryEnrollmentResolver>>,
-        ) -> Fixture {
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let ca = SigningKey::from_bytes(&[0x40; 32]);
-            let ed = Arc::new(SigningKey::from_bytes(&[0x41; 32]));
-            let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
-            let ml_dsa = Arc::new(ml_dsa_sk);
-            let kid = hyprstream_rpc::auth::composite_kid(&ml_dsa_vk, &ed.verifying_key());
-            let pair = CompositeKeyPair::signing(
-                kid,
-                ml_dsa.clone(),
-                ed.clone(),
-                CompositePairRole::Policy,
-                CompositePairState::Active,
-                0,
-                i64::MAX,
-            );
-            // The service's OWN isolated authority: source verification AND the
-            // output mint both resolve from this exact ledger.
-            let root = tempfile::tempdir().unwrap();
-            let key_set = Arc::new(CompositeKeySet::default());
-            key_set.publish(1, "deleg-fixture".to_owned(), vec![pair]).unwrap();
-            // Configure the isolated ledger as a disk-backed minting authority
-            // (per-fixture, never the process global) so `sign_token` can mint
-            // the output on the SAME ledger it verifies sources against.
-            let auth = root.path().join("composite-authority");
-            std::fs::create_dir_all(&auth).unwrap();
-            let marker =
-                serde_json::json!({ "version": 1, "component_digest": "deleg-fixture" });
-            let ledger_path = auth.join("ledger.json");
-            let committed_path = auth.join("committed.json");
-            std::fs::write(&ledger_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-            std::fs::write(&committed_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-            key_set.configure_authority(
-                ledger_path,
-                committed_path,
-                auth.join("ledger-prefix"),
-                auth.join("ledger.lock"),
-            );
-            let key_source = ClusterKeySource::new(ca.verifying_key(), ISSUER.to_owned())
-                .with_composite_key_set(key_set);
-
-            let actor_ed = SigningKey::from_bytes(&[0x42; 32]);
-            let user_ed = SigningKey::from_bytes(&[0x43; 32]);
-
-            let mut services = BTreeMap::new();
-            services.insert(
-                "mcp".to_owned(),
-                ServiceEnrollment {
-                    ed25519_pubkey: URL_SAFE_NO_PAD.encode(actor_ed.verifying_key().to_bytes()),
-                    ml_dsa_pubkey: None,
-                    clearance: label(),
-                    allowed_audiences: Some(vec!["res-b".to_owned()]),
-                    workload_session: false,
-                },
-            );
-            let manifest = Arc::new(ServiceEnrollmentManifest {
-                version: SERVICE_ENROLLMENT_VERSION,
-                services,
-            });
-
-            let git2db = Arc::new(RwLock::new(Git2DB::open(root.path()).await.unwrap()));
-            let manager = Arc::new(PolicyManager::permissive().await.unwrap());
-            let mut service = PolicyService::new(
-                manager,
-                Arc::new(ca),
-                crate::config::TokenConfig::default(),
-                git2db,
-                TransportConfig::inproc("deleg-test"),
-            )
-            .with_default_audience(ISSUER.to_owned())
-            .with_jwt_key_source(Arc::new(key_source))
-            .with_enrollment_manifest(manifest);
-            if let Some(a) = authorizer {
-                service = service.with_delegation_edge_authorizer(a);
-            }
-            if let Some(r) = resolver {
-                service = service.with_primary_enrollment_resolver(r);
-            }
-            Fixture { service, ml_dsa, ed, actor_ed, user_ed, _root: root }
-        }
-
-        fn allow_authorizer() -> Arc<dyn DelegationEdgeAuthorizer> {
-            Arc::new(MockAuthorizer { allow: true, require_source_aud: None, require_method: None })
-        }
-
-        fn user_resolver(user_ed: &SigningKey) -> Arc<dyn PrimaryEnrollmentResolver> {
-            Arc::new(MockPrimaryResolver {
-                subject: "alice".to_owned(),
-                ed25519: user_ed.verifying_key().to_bytes(),
+    /// Authoritative primary resolver mock: returns the configured Ed key for
+    /// `subject`, or `None` for anyone else (unknown ⇒ deny).
+    struct MockPrimaryResolver {
+        subject: String,
+        ed25519: [u8; 32],
+    }
+    impl PrimaryEnrollmentResolver for MockPrimaryResolver {
+        fn primary_group(&self, principal: &str, _tenant: &str) -> Option<PrimaryGroup> {
+            (principal == self.subject).then(|| PrimaryGroup {
+                suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                ordered_component_keys: vec![self.ed25519.to_vec()],
             })
         }
+    }
 
-        fn sign_source(fx: &Fixture, claims: &hyprstream_rpc::auth::Claims) -> String {
-            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &fx.ml_dsa, &fx.ed)
-        }
+    fn label() -> SecurityLabel {
+        SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY)
+    }
 
-        /// A valid interactive user `at+jwt` source. Its `cnf.hs_signer_suite` is
-        /// the suite over the AUTHORITATIVE primary key (the resolver's key), not
-        /// a value the handler re-derives from the wire.
-        fn user_source_claims(fx: &Fixture, now: i64) -> hyprstream_rpc::auth::Claims {
-            let hs = hyprstream_rpc::auth::service_signer_suite_b64(
-                &fx.user_ed.verifying_key().to_bytes(),
-                None,
-            );
-            hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
-                .with_issuer(ISSUER.to_owned())
-                .with_tenant(TENANT.to_owned())
-                .with_sid("sess-1")
-                .with_client_id(CLIENT_ID)
-                .with_scope(Some("read write".to_owned()))
-                .with_clearance(label())
-                .with_audience(Some("res-a".to_owned()))
-                .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes())
-                .with_cnf_hs_signer_suite(hs)
-        }
-
-        fn actor_ctx(fx: &Fixture, now: i64) -> EnvelopeContext {
-            let actor_claims =
-                hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600)
-                    .with_clearance(label());
-            EnvelopeContext::for_test_authenticated_subject_with_claims(
-                Subject::new("service:mcp"),
-                TENANT,
-                fx.actor_ed.verifying_key(),
-                actor_claims,
-            )
-        }
-
-        fn session_registry() -> &'static Arc<dyn hyprstream_rpc::auth::SessionRegistry> {
-            if hyprstream_rpc::auth::global_session_registry().is_none() {
-                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
-                    hyprstream_rpc::auth::InMemorySessionRegistry::new(),
-                ));
-            }
-            hyprstream_rpc::auth::global_session_registry().expect("session registry published")
-        }
-
-        async fn register_active_sid(now: i64) {
-            let reg = session_registry();
-            let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, "sess-1");
-            let _ = reg
-                .register_session(
-                    key,
-                    hyprstream_rpc::auth::SessionState {
-                        subject: "alice".to_owned(),
-                        tenant: TENANT.to_owned(),
-                        kind: hyprstream_rpc::auth::SessionKind::Interactive,
-                        created_at: now,
-                        expires_at: now + 3600,
-                        status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
-                        clearance_epoch: 0,
-                    },
-                )
-                .await;
-        }
-
-        fn ensure_revocation_store() {
-            if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
-                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
-                    hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
-                ));
-            }
-        }
-
-        fn request(source: String) -> ExchangeDelegated {
-            ExchangeDelegated {
-                source_credential: source,
-                requested_scopes: Some("read".to_owned()),
-                requested_capabilities: None,
-                audience: Some("res-b".to_owned()),
-                target_method_id: Some("model.Infer".to_owned()),
-                ttl: Some(300),
-            }
-        }
-
-        fn err_code(resp: &PolicyResponseVariant) -> Option<&str> {
-            match resp {
-                PolicyResponseVariant::Error(ErrorInfo { code, .. }) => Some(code.as_str()),
-                _ => None,
-            }
-        }
-
-        /// Happy path: a valid interactive user source + enrolled actor + allowing
-        /// edge + authoritative primary resolver mints a delegated `at+jwt` whose
-        /// `jti` is fresh (≠ source), `sub` is the originator, `act` nests the
-        /// terminal actor, `cnf.hs_signer_suite` equals the ACTOR's authoritative
-        /// suite (jwk preserved), clearance is the meet, scope is attenuated,
-        /// client_id is inherited, and the active sid is retained.
-        #[tokio::test]
-        async fn delegated_mint_happy_path_stamps_expected_output() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), None).await;
-            let resolver = user_resolver(&fx.user_ed);
-            let fx = Fixture {
-                service: fx.service.with_primary_enrollment_resolver(resolver),
-                ..fx
-            };
-
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let source_jti = hyprstream_rpc::auth::decode_unverified(&source).unwrap().jti;
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx
-                .service
-                .handle_exchange_delegated(&ctx, 1, &request(source))
-                .await
-                .unwrap();
-
-            let token = match resp {
-                PolicyResponseVariant::ExchangeDelegatedResult(info) => info.token,
-                other => panic!("expected a minted delegated token, got {other:?}"),
-            };
-            let minted = hyprstream_rpc::auth::decode_unverified(&token).unwrap();
-            assert_eq!(minted.sub, "alice", "originator sub preserved");
-            assert_ne!(minted.jti, source_jti, "fresh jti distinct from the source");
-            assert!(minted.jti.is_some());
-            let act = minted.act.expect("act chain present");
-            assert_eq!(act.sub, "service:mcp", "terminal actor nested in act");
-            let cnf = minted.cnf.expect("cnf present");
-            let expected_actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
-                &fx.actor_ed.verifying_key().to_bytes(),
-                None,
-            );
-            assert_eq!(
-                cnf.hs_signer_suite.as_deref(),
-                Some(expected_actor_hs.as_str()),
-                "cnf binds the terminal actor's authoritative signer suite"
-            );
-            assert!(cnf.jwk.is_some(), "legacy cnf.jwk preserved");
-            assert_eq!(
-                minted.clearance,
-                Some(CredentialClearance::from_label(label())),
-                "clearance is the meet"
-            );
-            assert_eq!(minted.scope.as_deref(), Some("read"), "scope attenuated to subset");
-            assert_eq!(minted.client_id.as_deref(), Some(CLIENT_ID), "client_id inherited");
-            assert_eq!(minted.sid.as_deref(), Some("sess-1"), "active sid retained");
-            assert_eq!(minted.iss, ISSUER, "minted under the authority issuer");
-        }
-
-        /// A first-hop delegated token (its `cnf` bound to the first terminal
-        /// actor `service:worker`) is a valid SECOND-hop source: its `cnf`
-        /// resolves against `act.sub` (the terminal actor enrollment), not `sub`.
-        #[tokio::test]
-        async fn two_hop_delegated_source_resolves_cnf_against_terminal_actor() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-
-            // The first-hop terminal actor is `service:worker`, enrolled with the
-            // fixture's actor Ed key (reuse `mcp`'s key is fine — we add worker).
-            // Build a source: sub = alice (originator), act = service:mcp (the
-            // enrolled terminal actor), cnf bound to service:mcp's enrolled key.
-            let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
-                &fx.actor_ed.verifying_key().to_bytes(),
-                None,
-            );
-            let src_claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
-                .with_issuer(ISSUER.to_owned())
-                .with_tenant(TENANT.to_owned())
-                .with_sid("sess-1")
-                .with_client_id(CLIENT_ID)
-                .with_scope(Some("read".to_owned()))
-                .with_clearance(label())
-                .with_audience(Some("res-a".to_owned()))
-                .with_act(hyprstream_rpc::auth::ActClaim {
-                    sub: "service:mcp".to_owned(),
-                    clearance: Some(CredentialClearance::from_label(label())),
-                    act: None,
-                })
-                .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
-                .with_cnf_hs_signer_suite(actor_hs);
-            let source = sign_source(&fx, &src_claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            // The source cnf validates against the terminal actor enrollment, so
-            // the delegated mint proceeds to a token (not INVALID_SOURCE_CNF).
-            assert!(
-                matches!(resp, PolicyResponseVariant::ExchangeDelegatedResult(_)),
-                "two-hop source cnf must resolve against act.sub, got {resp:?}"
-            );
-        }
-
-        /// The bound applies to the minted chain, including the new actor.
-        #[tokio::test]
-        async fn delegated_mint_reserves_terminal_actor_hop() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), None).await;
-            let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
-                &fx.actor_ed.verifying_key().to_bytes(), None,
-            );
-            for existing_hops in [7, 8] {
-                let mut chain = None;
-                for index in 0..existing_hops {
-                    chain = Some(Box::new(hyprstream_rpc::auth::ActClaim {
-                        sub: if index == existing_hops - 1 {
-                            "service:mcp".to_owned()
-                        } else {
-                            format!("service:prior-{index}")
-                        },
-                        clearance: Some(CredentialClearance::from_label(label())),
-                        act: chain,
-                    }));
-                }
-                let claims = user_source_claims(&fx, now)
-                    .with_act(*chain.expect("nonempty source chain"))
-                    .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
-                    .with_cnf_hs_signer_suite(actor_hs.clone());
-                let response = fx.service.handle_exchange_delegated(
-                    &actor_ctx(&fx, now), 1, &request(sign_source(&fx, &claims)),
-                ).await.expect("exchange returns a response");
-                if existing_hops == 8 {
-                    assert_eq!(err_code(&response), Some("MALFORMED_ACTOR_CHAIN"));
-                } else {
-                    let PolicyResponseVariant::ExchangeDelegatedResult(info) = response else {
-                        panic!("seven existing actors must permit one final actor");
-                    };
-                    let minted = hyprstream_rpc::auth::decode_unverified(&info.token)
-                        .expect("issued token parses");
-                    let mut depth = 0;
-                    let mut actor = minted.act.as_ref();
-                    while let Some(hop) = actor {
-                        depth += 1;
-                        actor = hop.act.as_deref();
-                    }
-                    assert_eq!(depth, 8, "issued chain includes the new terminal actor");
-                }
-            }
-        }
-
-        /// A user source whose primary is UNKNOWN to the resolver denies.
-        #[tokio::test]
-        async fn user_primary_unknown_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            // Resolver only knows "someone-else", not "alice".
-            let resolver: Arc<dyn PrimaryEnrollmentResolver> = Arc::new(MockPrimaryResolver {
-                subject: "someone-else".to_owned(),
-                ed25519: [0u8; 32],
-            });
-            let fx = fixture(Some(allow_authorizer()), Some(resolver)).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
-        }
-
-        /// A user source whose presented `cnf.jwk` mismatches the resolved primary
-        /// Ed key denies (the wire key never self-confirms).
-        #[tokio::test]
-        async fn user_primary_key_mismatch_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            // Resolver returns a DIFFERENT key than the source's cnf.jwk.
-            let resolver: Arc<dyn PrimaryEnrollmentResolver> = Arc::new(MockPrimaryResolver {
-                subject: "alice".to_owned(),
-                ed25519: SigningKey::from_bytes(&[0x55; 32]).verifying_key().to_bytes(),
-            });
-            let fx = fixture(Some(allow_authorizer()), Some(resolver)).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
-        }
-
-        /// An uninstalled primary resolver denies a user source (fail closed).
-        #[tokio::test]
-        async fn uninstalled_primary_resolver_denies_user_source() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), None).await; // no resolver
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
-        }
-
-        /// An uninstalled edge authorizer denies every delegation (fail closed).
-        #[tokio::test]
-        async fn uninstalled_edge_authorizer_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(None, Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("EDGE_AUTHORIZER_UNAVAILABLE"));
-        }
-
-        /// A cross-service source (source `aud` names another resource) is denied
-        /// by the edge authorizer despite the actor's valid enrollment.
-        #[tokio::test]
-        async fn cross_service_source_audience_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let authz: Arc<dyn DelegationEdgeAuthorizer> = Arc::new(MockAuthorizer {
-                allow: true,
-                require_source_aud: Some("res-for-A".to_owned()),
-                require_method: None,
-            });
-            let fx = fixture(Some(authz), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("EDGE_DENIED"));
-        }
-
-        /// A missing/empty target method id denies (no wildcard).
-        #[tokio::test]
-        async fn missing_target_method_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let mut req = request(source);
-            req.target_method_id = Some("   ".to_owned());
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &req).await.unwrap();
-            assert_eq!(err_code(&resp), Some("TARGET_METHOD_REQUIRED"));
-        }
-
-        /// Requested scope that broadens the source scope is denied.
-        #[tokio::test]
-        async fn scope_broadening_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let mut req = request(source);
-            req.requested_scopes = Some("read admin".to_owned());
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &req).await.unwrap();
-            assert_eq!(err_code(&resp), Some("SCOPE_ATTENUATION"));
-        }
-
-        /// A non-service caller cannot be a terminal actor.
-        #[tokio::test]
-        async fn non_service_actor_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let user_claims =
-                hyprstream_rpc::auth::Claims::new("bob".to_owned(), now, now + 3600).with_clearance(label());
-            let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
-                Subject::new("bob"), TENANT, fx.actor_ed.verifying_key(), user_claims,
-            );
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("NOT_A_TERMINAL_ACTOR"));
-        }
-
-        /// A source `at+jwt` with no sid (ambiguous non-interactive) is unsupported.
-        #[tokio::test]
-        async fn user_source_without_sid_is_unsupported() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.sid = None;
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("UNSUPPORTED_SOURCE"));
-        }
-
-        /// A revoked source credential is denied.
-        #[tokio::test]
-        async fn revoked_source_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let jti = hyprstream_rpc::auth::decode_unverified(&source).unwrap().jti.unwrap();
-            let store = hyprstream_rpc::auth::global_credential_revocation_store().unwrap();
-            store
-                .revoke_credential(hyprstream_rpc::auth::CredentialId::jwt(ISSUER, jti), now + 3600)
-                .await
-                .unwrap();
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("SOURCE_REVOKED"));
-        }
-
-        /// A source tenant that differs from the actor's verified tenant denies.
-        #[tokio::test]
-        async fn tenant_mismatch_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.tenant = Some("did:web:other.example".to_owned());
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("TENANT_MISMATCH"));
-        }
-
-        /// A source signed by a FOREIGN composite pair (not in the authority's
-        /// ledger) is denied — key possession is not issuer trust.
-        #[tokio::test]
-        async fn foreign_pair_source_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let foreign_ed = Arc::new(SigningKey::from_bytes(&[0x77; 32]));
-            let (foreign_ml, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
-            let foreign_ml = Arc::new(foreign_ml);
-            let source = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-                &user_source_claims(&fx, now), &foreign_ml, &foreign_ed,
-            );
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("INVALID_SOURCE"));
-        }
-
-        /// An edge whose target method is not the exact reviewed method denies.
-        #[tokio::test]
-        async fn wrong_target_method_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let authz: Arc<dyn DelegationEdgeAuthorizer> = Arc::new(MockAuthorizer {
-                allow: true,
-                require_source_aud: None,
-                require_method: Some("only.Allowed".to_owned()),
-            });
-            let fx = fixture(Some(authz), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let ctx = actor_ctx(&fx, now);
-            // request() uses "model.Infer" ≠ "only.Allowed".
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("EDGE_DENIED"));
-        }
-
-        /// A capability that broadens the source `cap` is denied (monotonic
-        /// attenuation on the capability axis).
-        #[tokio::test]
-        async fn capability_broadening_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let claims = user_source_claims(&fx, now).with_cap("read@mac://model/x".to_owned());
-            let source = sign_source(&fx, &claims);
-            let mut req = request(source);
-            req.requested_capabilities = Some("write@mac://model/x".to_owned()); // not covered by read
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &req).await.unwrap();
-            assert_eq!(err_code(&resp), Some("CAPABILITY_ATTENUATION"));
-        }
-
-        /// An expired source credential is denied. The signed-credential decoder
-        /// enforces `exp` first (fail-closed at verification), so the stable deny
-        /// is `INVALID_SOURCE` — the decoder never admits an expired token to the
-        /// later `SOURCE_EXPIRED` re-check.
-        #[tokio::test]
-        async fn expired_source_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.exp = now - 10; // already expired
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("INVALID_SOURCE"));
-        }
-
-        /// A source whose `iss` is not this authority's configured issuer denies
-        /// (key possession is not issuer trust).
-        #[tokio::test]
-        async fn untrusted_issuer_source_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.iss = "https://evil.example".to_owned();
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("UNTRUSTED_ISSUER"));
-        }
-
-        /// A terminal actor whose verified signer key does NOT match its enrolled
-        /// key cannot resolve a v16 signer suite for the output (fail closed).
-        #[tokio::test]
-        async fn actor_cnf_not_enrolled_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            // Actor authenticates with a key that is NOT the enrolled `mcp` key.
-            let wrong = SigningKey::from_bytes(&[0x99; 32]);
-            let actor_claims =
-                hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600).with_clearance(label());
-            let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
-                Subject::new("service:mcp"), TENANT, wrong.verifying_key(), actor_claims,
-            );
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("ACTOR_SUITE_UNRESOLVABLE"));
-        }
-
-        /// An unlabeled terminal actor (no clearance) denies.
-        #[tokio::test]
-        async fn unlabeled_actor_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let source = sign_source(&fx, &user_source_claims(&fx, now));
-            let actor_claims =
-                hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600); // no clearance
-            let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
-                Subject::new("service:mcp"), TENANT, fx.actor_ed.verifying_key(), actor_claims,
-            );
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("UNLABELED_ACTOR"));
-        }
-
-        /// A source OIDC session that is REVOKED denies (unique sid, no shared
-        /// session-registry contamination).
-        #[tokio::test]
-        async fn revoked_session_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            let sid = "sess-revoked-unique-1";
-            let reg = session_registry();
-            let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid);
-            reg.register_session(
-                key.clone(),
-                hyprstream_rpc::auth::SessionState {
-                    subject: "alice".to_owned(),
-                    tenant: TENANT.to_owned(),
-                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
-                    created_at: now,
-                    expires_at: now + 3600,
-                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
-                    clearance_epoch: 0,
-                },
-            )
-            .await
+    async fn fixture(
+        authorizer: Option<Arc<dyn DelegationEdgeAuthorizer>>,
+        resolver: Option<Arc<dyn PrimaryEnrollmentResolver>>,
+    ) -> Fixture {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let ca = SigningKey::from_bytes(&[0x40; 32]);
+        let ed = Arc::new(SigningKey::from_bytes(&[0x41; 32]));
+        let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ml_dsa = Arc::new(ml_dsa_sk);
+        let kid = hyprstream_rpc::auth::composite_kid(&ml_dsa_vk, &ed.verifying_key());
+        let pair = CompositeKeyPair::signing(
+            kid,
+            ml_dsa.clone(),
+            ed.clone(),
+            CompositePairRole::Policy,
+            CompositePairState::Active,
+            0,
+            i64::MAX,
+        );
+        // The service's OWN isolated authority: source verification AND the
+        // output mint both resolve from this exact ledger.
+        let root = tempfile::tempdir().unwrap();
+        let key_set = Arc::new(CompositeKeySet::default());
+        key_set
+            .publish(1, "deleg-fixture".to_owned(), vec![pair])
             .unwrap();
-            reg.revoke_session(&key).await.unwrap();
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.sid = Some(sid.to_owned());
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
-        }
+        // Configure the isolated ledger as a disk-backed minting authority
+        // (per-fixture, never the process global) so `sign_token` can mint
+        // the output on the SAME ledger it verifies sources against.
+        let auth = root.path().join("composite-authority");
+        std::fs::create_dir_all(&auth).unwrap();
+        let marker = serde_json::json!({ "version": 1, "component_digest": "deleg-fixture" });
+        let ledger_path = auth.join("ledger.json");
+        let committed_path = auth.join("committed.json");
+        std::fs::write(&ledger_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        std::fs::write(&committed_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        key_set.configure_authority(
+            ledger_path,
+            committed_path,
+            auth.join("ledger-prefix"),
+            auth.join("ledger.lock"),
+        );
+        let key_source = ClusterKeySource::new(ca.verifying_key(), ISSUER.to_owned())
+            .with_composite_key_set(key_set);
 
-        /// A source OIDC session bound to a DIFFERENT subject denies (mismatch).
-        #[tokio::test]
-        async fn mismatched_session_subject_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            let sid = "sess-mismatch-unique-1";
-            let reg = session_registry();
-            let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid);
-            reg.register_session(
+        let actor_ed = SigningKey::from_bytes(&[0x42; 32]);
+        let user_ed = SigningKey::from_bytes(&[0x43; 32]);
+
+        let mut services = BTreeMap::new();
+        services.insert(
+            "mcp".to_owned(),
+            ServiceEnrollment {
+                ed25519_pubkey: URL_SAFE_NO_PAD.encode(actor_ed.verifying_key().to_bytes()),
+                ml_dsa_pubkey: None,
+                clearance: label(),
+                allowed_audiences: Some(vec!["res-b".to_owned()]),
+                workload_session: false,
+            },
+        );
+        let manifest = Arc::new(ServiceEnrollmentManifest {
+            version: SERVICE_ENROLLMENT_VERSION,
+            services,
+        });
+
+        let git2db = Arc::new(RwLock::new(Git2DB::open(root.path()).await.unwrap()));
+        let manager = Arc::new(PolicyManager::permissive().await.unwrap());
+        let mut service = PolicyService::new(
+            manager,
+            Arc::new(ca),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc("deleg-test"),
+        )
+        .with_default_audience(ISSUER.to_owned())
+        .with_jwt_key_source(Arc::new(key_source))
+        .with_enrollment_manifest(manifest);
+        if let Some(a) = authorizer {
+            service = service.with_delegation_edge_authorizer(a);
+        }
+        if let Some(r) = resolver {
+            service = service.with_primary_enrollment_resolver(r);
+        }
+        Fixture {
+            service,
+            ml_dsa,
+            ed,
+            actor_ed,
+            user_ed,
+            _root: root,
+        }
+    }
+
+    fn allow_authorizer() -> Arc<dyn DelegationEdgeAuthorizer> {
+        Arc::new(MockAuthorizer {
+            allow: true,
+            require_source_aud: None,
+            require_method: None,
+        })
+    }
+
+    fn user_resolver(user_ed: &SigningKey) -> Arc<dyn PrimaryEnrollmentResolver> {
+        Arc::new(MockPrimaryResolver {
+            subject: "alice".to_owned(),
+            ed25519: user_ed.verifying_key().to_bytes(),
+        })
+    }
+
+    fn sign_source(fx: &Fixture, claims: &hyprstream_rpc::auth::Claims) -> String {
+        crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &fx.ml_dsa, &fx.ed)
+    }
+
+    /// A valid interactive user `at+jwt` source. Its `cnf.hs_signer_suite` is
+    /// the suite over the AUTHORITATIVE primary key (the resolver's key), not
+    /// a value the handler re-derives from the wire.
+    fn user_source_claims(fx: &Fixture, now: i64) -> hyprstream_rpc::auth::Claims {
+        let hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &fx.user_ed.verifying_key().to_bytes(),
+            None,
+        );
+        hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(ISSUER.to_owned())
+            .with_tenant(TENANT.to_owned())
+            .with_sid("sess-1")
+            .with_client_id(CLIENT_ID)
+            .with_scope(Some("read write".to_owned()))
+            .with_clearance(label())
+            .with_audience(Some("res-a".to_owned()))
+            .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes())
+            .with_cnf_hs_signer_suite(hs)
+    }
+
+    fn actor_ctx(fx: &Fixture, now: i64) -> EnvelopeContext {
+        let actor_claims =
+            hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600)
+                .with_clearance(label());
+        EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:mcp"),
+            TENANT,
+            fx.actor_ed.verifying_key(),
+            actor_claims,
+        )
+    }
+
+    fn session_registry() -> &'static Arc<dyn hyprstream_rpc::auth::SessionRegistry> {
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ));
+        }
+        hyprstream_rpc::auth::global_session_registry().expect("session registry published")
+    }
+
+    async fn register_active_sid(now: i64) {
+        let reg = session_registry();
+        let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, "sess-1");
+        let _ = reg
+            .register_session(
                 key,
                 hyprstream_rpc::auth::SessionState {
-                    subject: "carol".to_owned(), // NOT alice
+                    subject: "alice".to_owned(),
                     tenant: TENANT.to_owned(),
                     kind: hyprstream_rpc::auth::SessionKind::Interactive,
                     created_at: now,
@@ -7107,136 +6944,899 @@ mod exchange_delegated_tests {
                     clearance_epoch: 0,
                 },
             )
+            .await;
+    }
+
+    fn ensure_revocation_store() {
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+    }
+
+    fn request(source: String) -> ExchangeDelegated {
+        ExchangeDelegated {
+            source_credential: source,
+            requested_scopes: Some("read".to_owned()),
+            requested_capabilities: None,
+            audience: Some("res-b".to_owned()),
+            target_method_id: Some("model.Infer".to_owned()),
+            ttl: Some(300),
+        }
+    }
+
+    fn err_code(resp: &PolicyResponseVariant) -> Option<&str> {
+        match resp {
+            PolicyResponseVariant::Error(ErrorInfo { code, .. }) => Some(code.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Happy path: a valid interactive user source + enrolled actor + allowing
+    /// edge + authoritative primary resolver mints a delegated `at+jwt` whose
+    /// `jti` is fresh (≠ source), `sub` is the originator, `act` nests the
+    /// terminal actor, `cnf.hs_signer_suite` equals the ACTOR's authoritative
+    /// suite (jwk preserved), clearance is the meet, scope is attenuated,
+    /// client_id is inherited, and the active sid is retained.
+    #[tokio::test]
+    async fn delegated_mint_happy_path_stamps_expected_output() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(Some(allow_authorizer()), None).await;
+        let resolver = user_resolver(&fx.user_ed);
+        let fx = Fixture {
+            service: fx.service.with_primary_enrollment_resolver(resolver),
+            ..fx
+        };
+
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let source_jti = hyprstream_rpc::auth::decode_unverified(&source)
+            .unwrap()
+            .jti;
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
             .await
             .unwrap();
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.sid = Some(sid.to_owned());
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
-        }
 
-        /// A source whose sid is UNKNOWN to the registry denies.
-        #[tokio::test]
-        async fn unknown_session_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            let _ = session_registry(); // ensure the registry exists (empty for this sid)
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.sid = Some("sess-never-registered-unique-1".to_owned());
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
-        }
+        let token = match resp {
+            PolicyResponseVariant::ExchangeDelegatedResult(info) => info.token,
+            other => panic!("expected a minted delegated token, got {other:?}"),
+        };
+        let minted = hyprstream_rpc::auth::decode_unverified(&token).unwrap();
+        assert_eq!(minted.sub, "alice", "originator sub preserved");
+        assert_ne!(minted.jti, source_jti, "fresh jti distinct from the source");
+        assert!(minted.jti.is_some());
+        let act = minted.act.expect("act chain present");
+        assert_eq!(act.sub, "service:mcp", "terminal actor nested in act");
+        let cnf = minted.cnf.expect("cnf present");
+        let expected_actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &fx.actor_ed.verifying_key().to_bytes(),
+            None,
+        );
+        assert_eq!(
+            cnf.hs_signer_suite.as_deref(),
+            Some(expected_actor_hs.as_str()),
+            "cnf binds the terminal actor's authoritative signer suite"
+        );
+        assert!(cnf.jwk.is_some(), "legacy cnf.jwk preserved");
+        assert_eq!(
+            minted.clearance,
+            Some(CredentialClearance::from_label(label())),
+            "clearance is the meet"
+        );
+        assert_eq!(
+            minted.scope.as_deref(),
+            Some("read"),
+            "scope attenuated to subset"
+        );
+        assert_eq!(
+            minted.client_id.as_deref(),
+            Some(CLIENT_ID),
+            "client_id inherited"
+        );
+        assert_eq!(minted.sid.as_deref(), Some("sess-1"), "active sid retained");
+        assert_eq!(minted.iss, ISSUER, "minted under the authority issuer");
+    }
 
-        /// A source whose sid is registered but EXPIRED denies.
-        #[tokio::test]
-        async fn expired_session_denies() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            let sid = "sess-expired-unique-1";
-            let reg = session_registry();
-            reg.register_session(
-                hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid),
-                hyprstream_rpc::auth::SessionState {
-                    subject: "alice".to_owned(),
-                    tenant: TENANT.to_owned(),
-                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
-                    created_at: now - 7200,
-                    expires_at: now - 3600, // already expired
-                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
-                    clearance_epoch: 0,
-                },
+    /// A first-hop delegated token (its `cnf` bound to the first terminal
+    /// actor `service:worker`) is a valid SECOND-hop source: its `cnf`
+    /// resolves against `act.sub` (the terminal actor enrollment), not `sub`.
+    #[tokio::test]
+    async fn two_hop_delegated_source_resolves_cnf_against_terminal_actor() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+
+        // The first-hop terminal actor is `service:worker`, enrolled with the
+        // fixture's actor Ed key (reuse `mcp`'s key is fine — we add worker).
+        // Build a source: sub = alice (originator), act = service:mcp (the
+        // enrolled terminal actor), cnf bound to service:mcp's enrolled key.
+        let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &fx.actor_ed.verifying_key().to_bytes(),
+            None,
+        );
+        let src_claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(ISSUER.to_owned())
+            .with_tenant(TENANT.to_owned())
+            .with_sid("sess-1")
+            .with_client_id(CLIENT_ID)
+            .with_scope(Some("read".to_owned()))
+            .with_clearance(label())
+            .with_audience(Some("res-a".to_owned()))
+            .with_act(hyprstream_rpc::auth::ActClaim {
+                sub: "service:mcp".to_owned(),
+                clearance: Some(CredentialClearance::from_label(label())),
+                act: None,
+            })
+            .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
+            .with_cnf_hs_signer_suite(actor_hs);
+        let source = sign_source(&fx, &src_claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        // The source cnf validates against the terminal actor enrollment, so
+        // the delegated mint proceeds to a token (not INVALID_SOURCE_CNF).
+        assert!(
+            matches!(resp, PolicyResponseVariant::ExchangeDelegatedResult(_)),
+            "two-hop source cnf must resolve against act.sub, got {resp:?}"
+        );
+    }
+
+    /// The bound applies to the minted chain, including the new actor.
+    #[tokio::test]
+    async fn delegated_mint_reserves_terminal_actor_hop() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(Some(allow_authorizer()), None).await;
+        let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &fx.actor_ed.verifying_key().to_bytes(),
+            None,
+        );
+        for existing_hops in [7, 8] {
+            let mut chain = None;
+            for index in 0..existing_hops {
+                chain = Some(Box::new(hyprstream_rpc::auth::ActClaim {
+                    sub: if index == existing_hops - 1 {
+                        "service:mcp".to_owned()
+                    } else {
+                        format!("service:prior-{index}")
+                    },
+                    clearance: Some(CredentialClearance::from_label(label())),
+                    act: chain,
+                }));
+            }
+            let claims = user_source_claims(&fx, now)
+                .with_act(*chain.expect("nonempty source chain"))
+                .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
+                .with_cnf_hs_signer_suite(actor_hs.clone());
+            let response = fx
+                .service
+                .handle_exchange_delegated(
+                    &actor_ctx(&fx, now),
+                    1,
+                    &request(sign_source(&fx, &claims)),
+                )
+                .await
+                .expect("exchange returns a response");
+            if existing_hops == 8 {
+                assert_eq!(err_code(&response), Some("MALFORMED_ACTOR_CHAIN"));
+            } else {
+                let PolicyResponseVariant::ExchangeDelegatedResult(info) = response else {
+                    panic!("seven existing actors must permit one final actor");
+                };
+                let minted = hyprstream_rpc::auth::decode_unverified(&info.token)
+                    .expect("issued token parses");
+                let mut depth = 0;
+                let mut actor = minted.act.as_ref();
+                while let Some(hop) = actor {
+                    depth += 1;
+                    actor = hop.act.as_deref();
+                }
+                assert_eq!(depth, 8, "issued chain includes the new terminal actor");
+            }
+        }
+    }
+
+    /// A user source whose primary is UNKNOWN to the resolver denies.
+    #[tokio::test]
+    async fn user_primary_unknown_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        // Resolver only knows "someone-else", not "alice".
+        let resolver: Arc<dyn PrimaryEnrollmentResolver> = Arc::new(MockPrimaryResolver {
+            subject: "someone-else".to_owned(),
+            ed25519: [0u8; 32],
+        });
+        let fx = fixture(Some(allow_authorizer()), Some(resolver)).await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+    }
+
+    /// A user source whose presented `cnf.jwk` mismatches the resolved primary
+    /// Ed key denies (the wire key never self-confirms).
+    #[tokio::test]
+    async fn user_primary_key_mismatch_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        // Resolver returns a DIFFERENT key than the source's cnf.jwk.
+        let resolver: Arc<dyn PrimaryEnrollmentResolver> = Arc::new(MockPrimaryResolver {
+            subject: "alice".to_owned(),
+            ed25519: SigningKey::from_bytes(&[0x55; 32])
+                .verifying_key()
+                .to_bytes(),
+        });
+        let fx = fixture(Some(allow_authorizer()), Some(resolver)).await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+    }
+
+    /// An uninstalled primary resolver denies a user source (fail closed).
+    #[tokio::test]
+    async fn uninstalled_primary_resolver_denies_user_source() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(Some(allow_authorizer()), None).await; // no resolver
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+    }
+
+    /// An uninstalled edge authorizer denies every delegation (fail closed).
+    #[tokio::test]
+    async fn uninstalled_edge_authorizer_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            None,
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("EDGE_AUTHORIZER_UNAVAILABLE"));
+    }
+
+    /// A cross-service source (source `aud` names another resource) is denied
+    /// by the edge authorizer despite the actor's valid enrollment.
+    #[tokio::test]
+    async fn cross_service_source_audience_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let authz: Arc<dyn DelegationEdgeAuthorizer> = Arc::new(MockAuthorizer {
+            allow: true,
+            require_source_aud: Some("res-for-A".to_owned()),
+            require_method: None,
+        });
+        let fx = fixture(
+            Some(authz),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("EDGE_DENIED"));
+    }
+
+    /// A missing/empty target method id denies (no wildcard).
+    #[tokio::test]
+    async fn missing_target_method_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let mut req = request(source);
+        req.target_method_id = Some("   ".to_owned());
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &req)
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("TARGET_METHOD_REQUIRED"));
+    }
+
+    /// Requested scope that broadens the source scope is denied.
+    #[tokio::test]
+    async fn scope_broadening_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let mut req = request(source);
+        req.requested_scopes = Some("read admin".to_owned());
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &req)
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("SCOPE_ATTENUATION"));
+    }
+
+    /// A non-service caller cannot be a terminal actor.
+    #[tokio::test]
+    async fn non_service_actor_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let user_claims = hyprstream_rpc::auth::Claims::new("bob".to_owned(), now, now + 3600)
+            .with_clearance(label());
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("bob"),
+            TENANT,
+            fx.actor_ed.verifying_key(),
+            user_claims,
+        );
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("NOT_A_TERMINAL_ACTOR"));
+    }
+
+    /// A source `at+jwt` with no sid (ambiguous non-interactive) is unsupported.
+    #[tokio::test]
+    async fn user_source_without_sid_is_unsupported() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.sid = None;
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("UNSUPPORTED_SOURCE"));
+    }
+
+    /// A revoked source credential is denied.
+    #[tokio::test]
+    async fn revoked_source_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let jti = hyprstream_rpc::auth::decode_unverified(&source)
+            .unwrap()
+            .jti
+            .unwrap();
+        let store = hyprstream_rpc::auth::global_credential_revocation_store().unwrap();
+        store
+            .revoke_credential(
+                hyprstream_rpc::auth::CredentialId::jwt(ISSUER, jti),
+                now + 3600,
             )
             .await
             .unwrap();
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let mut claims = user_source_claims(&fx, now);
-            claims.sid = Some(sid.to_owned());
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
-        }
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("SOURCE_REVOKED"));
+    }
 
-        /// A low-clearance INTERMEDIATE actor in the source's delegation chain
-        /// lowers the effective meet: the minted credential's clearance is the
-        /// intersection/min across originator, every actor, and the terminal
-        /// actor — never above any input.
-        #[tokio::test]
-        async fn low_clearance_intermediate_lowers_the_meet() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            let public = SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY);
-            let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
-                &fx.actor_ed.verifying_key().to_bytes(), None,
-            );
-            // Source: originator alice (Internal), act = terminal service:mcp
-            // (Internal) nesting an intermediate service:low (Public). The cnf
-            // resolves against the OUTERMOST act (service:mcp).
-            let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
-                .with_issuer(ISSUER.to_owned())
-                .with_tenant(TENANT.to_owned())
-                .with_sid("sess-1")
-                .with_client_id(CLIENT_ID)
-                .with_scope(Some("read".to_owned()))
-                .with_clearance(label())
-                .with_audience(Some("res-a".to_owned()))
-                .with_act(hyprstream_rpc::auth::ActClaim {
-                    sub: "service:mcp".to_owned(),
-                    clearance: Some(CredentialClearance::from_label(label())),
-                    act: Some(Box::new(hyprstream_rpc::auth::ActClaim {
-                        sub: "service:low".to_owned(),
-                        clearance: Some(CredentialClearance::from_label(public)),
-                        act: None,
-                    })),
-                })
-                .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
-                .with_cnf_hs_signer_suite(actor_hs);
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let token = match fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap() {
-                PolicyResponseVariant::ExchangeDelegatedResult(info) => info.token,
-                other => panic!("expected a minted token, got {other:?}"),
-            };
-            let minted = hyprstream_rpc::auth::decode_unverified(&token).unwrap();
-            assert_eq!(
-                minted.clearance,
-                Some(CredentialClearance::from_label(public)),
-                "the low-clearance intermediate must lower the effective meet to Public"
-            );
-        }
+    /// A source tenant that differs from the actor's verified tenant denies.
+    #[tokio::test]
+    async fn tenant_mismatch_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.tenant = Some("did:web:other.example".to_owned());
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("TENANT_MISMATCH"));
+    }
 
-        /// A NON-DISPATCH OAuth token (valid signature/profile but NO
-        /// `cnf.hs_signer_suite`) presented as a delegation SOURCE is denied —
-        /// issuance may accept such a bearer, but delegation admission rejects it
-        /// for the missing authoritative confirmation.
-        #[tokio::test]
-        async fn non_dispatch_source_without_hs_is_denied() {
-            ensure_revocation_store();
-            let now = chrono::Utc::now().timestamp();
-            register_active_sid(now).await;
-            let fx = fixture(Some(allow_authorizer()), Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32])))).await;
-            // The same valid interactive user source, but WITHOUT the v16 cnf
-            // signer-suite confirmation (a bearer/non-dispatch shape).
-            let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
-                .with_issuer(ISSUER.to_owned())
-                .with_tenant(TENANT.to_owned())
-                .with_sid("sess-1")
-                .with_client_id(CLIENT_ID)
-                .with_scope(Some("read write".to_owned()))
-                .with_clearance(label())
-                .with_audience(Some("res-a".to_owned()))
-                .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes());
-            let source = sign_source(&fx, &claims);
-            let ctx = actor_ctx(&fx, now);
-            let resp = fx.service.handle_exchange_delegated(&ctx, 1, &request(source)).await.unwrap();
-            assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
-        }
+    /// A source signed by a FOREIGN composite pair (not in the authority's
+    /// ledger) is denied — key possession is not issuer trust.
+    #[tokio::test]
+    async fn foreign_pair_source_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let foreign_ed = Arc::new(SigningKey::from_bytes(&[0x77; 32]));
+        let (foreign_ml, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let foreign_ml = Arc::new(foreign_ml);
+        let source = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &user_source_claims(&fx, now),
+            &foreign_ml,
+            &foreign_ed,
+        );
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("INVALID_SOURCE"));
+    }
+
+    /// An edge whose target method is not the exact reviewed method denies.
+    #[tokio::test]
+    async fn wrong_target_method_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let authz: Arc<dyn DelegationEdgeAuthorizer> = Arc::new(MockAuthorizer {
+            allow: true,
+            require_source_aud: None,
+            require_method: Some("only.Allowed".to_owned()),
+        });
+        let fx = fixture(
+            Some(authz),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let ctx = actor_ctx(&fx, now);
+        // request() uses "model.Infer" ≠ "only.Allowed".
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("EDGE_DENIED"));
+    }
+
+    /// A capability that broadens the source `cap` is denied (monotonic
+    /// attenuation on the capability axis).
+    #[tokio::test]
+    async fn capability_broadening_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let claims = user_source_claims(&fx, now).with_cap("read@mac://model/x".to_owned());
+        let source = sign_source(&fx, &claims);
+        let mut req = request(source);
+        req.requested_capabilities = Some("write@mac://model/x".to_owned()); // not covered by read
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &req)
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("CAPABILITY_ATTENUATION"));
+    }
+
+    /// An expired source credential is denied. The signed-credential decoder
+    /// enforces `exp` first (fail-closed at verification), so the stable deny
+    /// is `INVALID_SOURCE` — the decoder never admits an expired token to the
+    /// later `SOURCE_EXPIRED` re-check.
+    #[tokio::test]
+    async fn expired_source_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.exp = now - 10; // already expired
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("INVALID_SOURCE"));
+    }
+
+    /// A source whose `iss` is not this authority's configured issuer denies
+    /// (key possession is not issuer trust).
+    #[tokio::test]
+    async fn untrusted_issuer_source_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.iss = "https://evil.example".to_owned();
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("UNTRUSTED_ISSUER"));
+    }
+
+    /// A terminal actor whose verified signer key does NOT match its enrolled
+    /// key cannot resolve a v16 signer suite for the output (fail closed).
+    #[tokio::test]
+    async fn actor_cnf_not_enrolled_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        // Actor authenticates with a key that is NOT the enrolled `mcp` key.
+        let wrong = SigningKey::from_bytes(&[0x99; 32]);
+        let actor_claims =
+            hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600)
+                .with_clearance(label());
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:mcp"),
+            TENANT,
+            wrong.verifying_key(),
+            actor_claims,
+        );
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("ACTOR_SUITE_UNRESOLVABLE"));
+    }
+
+    /// An unlabeled terminal actor (no clearance) denies.
+    #[tokio::test]
+    async fn unlabeled_actor_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let source = sign_source(&fx, &user_source_claims(&fx, now));
+        let actor_claims =
+            hyprstream_rpc::auth::Claims::new("service:mcp".to_owned(), now, now + 3600); // no clearance
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:mcp"),
+            TENANT,
+            fx.actor_ed.verifying_key(),
+            actor_claims,
+        );
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("UNLABELED_ACTOR"));
+    }
+
+    /// A source OIDC session that is REVOKED denies (unique sid, no shared
+    /// session-registry contamination).
+    #[tokio::test]
+    async fn revoked_session_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        let sid = "sess-revoked-unique-1";
+        let reg = session_registry();
+        let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid);
+        reg.register_session(
+            key.clone(),
+            hyprstream_rpc::auth::SessionState {
+                subject: "alice".to_owned(),
+                tenant: TENANT.to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        reg.revoke_session(&key).await.unwrap();
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.sid = Some(sid.to_owned());
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+    }
+
+    /// A source OIDC session bound to a DIFFERENT subject denies (mismatch).
+    #[tokio::test]
+    async fn mismatched_session_subject_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        let sid = "sess-mismatch-unique-1";
+        let reg = session_registry();
+        let key = hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid);
+        reg.register_session(
+            key,
+            hyprstream_rpc::auth::SessionState {
+                subject: "carol".to_owned(), // NOT alice
+                tenant: TENANT.to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now,
+                expires_at: now + 3600,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.sid = Some(sid.to_owned());
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+    }
+
+    /// A source whose sid is UNKNOWN to the registry denies.
+    #[tokio::test]
+    async fn unknown_session_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        let _ = session_registry(); // ensure the registry exists (empty for this sid)
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.sid = Some("sess-never-registered-unique-1".to_owned());
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+    }
+
+    /// A source whose sid is registered but EXPIRED denies.
+    #[tokio::test]
+    async fn expired_session_denies() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        let sid = "sess-expired-unique-1";
+        let reg = session_registry();
+        reg.register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(ISSUER, sid),
+            hyprstream_rpc::auth::SessionState {
+                subject: "alice".to_owned(),
+                tenant: TENANT.to_owned(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now - 7200,
+                expires_at: now - 3600, // already expired
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let mut claims = user_source_claims(&fx, now);
+        claims.sid = Some(sid.to_owned());
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("SESSION_INVALID"));
+    }
+
+    /// A low-clearance INTERMEDIATE actor in the source's delegation chain
+    /// lowers the effective meet: the minted credential's clearance is the
+    /// intersection/min across originator, every actor, and the terminal
+    /// actor — never above any input.
+    #[tokio::test]
+    async fn low_clearance_intermediate_lowers_the_meet() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        let public = SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY);
+        let actor_hs = hyprstream_rpc::auth::service_signer_suite_b64(
+            &fx.actor_ed.verifying_key().to_bytes(),
+            None,
+        );
+        // Source: originator alice (Internal), act = terminal service:mcp
+        // (Internal) nesting an intermediate service:low (Public). The cnf
+        // resolves against the OUTERMOST act (service:mcp).
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(ISSUER.to_owned())
+            .with_tenant(TENANT.to_owned())
+            .with_sid("sess-1")
+            .with_client_id(CLIENT_ID)
+            .with_scope(Some("read".to_owned()))
+            .with_clearance(label())
+            .with_audience(Some("res-a".to_owned()))
+            .with_act(hyprstream_rpc::auth::ActClaim {
+                sub: "service:mcp".to_owned(),
+                clearance: Some(CredentialClearance::from_label(label())),
+                act: Some(Box::new(hyprstream_rpc::auth::ActClaim {
+                    sub: "service:low".to_owned(),
+                    clearance: Some(CredentialClearance::from_label(public)),
+                    act: None,
+                })),
+            })
+            .with_cnf_jwk(&fx.actor_ed.verifying_key().to_bytes())
+            .with_cnf_hs_signer_suite(actor_hs);
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let token = match fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap()
+        {
+            PolicyResponseVariant::ExchangeDelegatedResult(info) => info.token,
+            other => panic!("expected a minted token, got {other:?}"),
+        };
+        let minted = hyprstream_rpc::auth::decode_unverified(&token).unwrap();
+        assert_eq!(
+            minted.clearance,
+            Some(CredentialClearance::from_label(public)),
+            "the low-clearance intermediate must lower the effective meet to Public"
+        );
+    }
+
+    /// A NON-DISPATCH OAuth token (valid signature/profile but NO
+    /// `cnf.hs_signer_suite`) presented as a delegation SOURCE is denied —
+    /// issuance may accept such a bearer, but delegation admission rejects it
+    /// for the missing authoritative confirmation.
+    #[tokio::test]
+    async fn non_dispatch_source_without_hs_is_denied() {
+        ensure_revocation_store();
+        let now = chrono::Utc::now().timestamp();
+        register_active_sid(now).await;
+        let fx = fixture(
+            Some(allow_authorizer()),
+            Some(user_resolver(&SigningKey::from_bytes(&[0x43; 32]))),
+        )
+        .await;
+        // The same valid interactive user source, but WITHOUT the v16 cnf
+        // signer-suite confirmation (a bearer/non-dispatch shape).
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(ISSUER.to_owned())
+            .with_tenant(TENANT.to_owned())
+            .with_sid("sess-1")
+            .with_client_id(CLIENT_ID)
+            .with_scope(Some("read write".to_owned()))
+            .with_clearance(label())
+            .with_audience(Some("res-a".to_owned()))
+            .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes());
+        let source = sign_source(&fx, &claims);
+        let ctx = actor_ctx(&fx, now);
+        let resp = fx
+            .service
+            .handle_exchange_delegated(&ctx, 1, &request(source))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&resp), Some("INVALID_SOURCE_CNF"));
+    }
 }

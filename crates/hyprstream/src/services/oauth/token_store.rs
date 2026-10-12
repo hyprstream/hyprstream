@@ -4,14 +4,14 @@
 //! wraps the existing rocksdb::DB. A Valkey implementation is provided when
 //! the `valkey` feature is enabled.
 
-#[cfg(any(feature = "rocksdb", feature = "valkey"))]
-use std::sync::Arc;
-#[cfg(feature = "rocksdb")]
-use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 #[cfg(feature = "rocksdb")]
 use parking_lot::Mutex;
+#[cfg(feature = "rocksdb")]
+use std::path::Path;
+#[cfg(any(feature = "rocksdb", feature = "valkey"))]
+use std::sync::Arc;
 
 use super::state::RefreshTokenEntry;
 
@@ -107,7 +107,10 @@ impl ValkeyTokenStore {
         let pool = Builder::from_config(config).build_pool(8)?;
         pool.connect();
         pool.wait_for_connect().await?;
-        Ok(Self { pool, key_prefix: "hs:token:".to_owned() })
+        Ok(Self {
+            pool,
+            key_prefix: "hs:token:".to_owned(),
+        })
     }
 
     fn key(&self, token: &str) -> String {
@@ -122,7 +125,13 @@ impl TokenStore for ValkeyTokenStore {
         use fred::prelude::*;
         let bytes = serde_json::to_string(entry)?;
         self.pool
-            .set::<(), _, _>(self.key(token), bytes, Some(Expiration::EX(ttl_secs as i64)), None, false)
+            .set::<(), _, _>(
+                self.key(token),
+                bytes,
+                Some(Expiration::EX(ttl_secs as i64)),
+                None,
+                false,
+            )
             .await?;
         Ok(())
     }
@@ -186,7 +195,10 @@ mod tests {
         let first = store.take("refresh").await.unwrap();
         let second = store.take("refresh").await.unwrap();
 
-        assert_eq!(first.as_ref().map(|entry| entry.client_id.as_str()), Some("client"));
+        assert_eq!(
+            first.as_ref().map(|entry| entry.client_id.as_str()),
+            Some("client")
+        );
         assert!(second.is_none());
     }
 }

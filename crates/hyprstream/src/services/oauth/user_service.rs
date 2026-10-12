@@ -9,8 +9,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 
 use crate::auth::{
-    ProductionUserStore, PubkeyEntry, UserFilter, UserProfilePatch, UserStore,
-    decode_pubkey_base64,
+    decode_pubkey_base64, ProductionUserStore, PubkeyEntry, UserFilter, UserProfilePatch, UserStore,
 };
 
 /// Shared user information type (SCIM-informed).
@@ -109,7 +108,8 @@ impl UserService {
                     .sub
                     .ok_or_else(|| anyhow!("User '{username}' has no stable subject"))?;
                 // For backward compat, use first pubkey as the primary
-                let primary_pubkey = pubkeys.first()
+                let primary_pubkey = pubkeys
+                    .first()
                     .map(|pk| STANDARD.encode(pk.pubkey.as_bytes()))
                     .unwrap_or_default();
 
@@ -174,7 +174,8 @@ impl UserService {
     /// Update a user's profile fields.
     pub async fn update(&self, username: &str, update: UserUpdate) -> Result<UserInfo> {
         self.store
-            .get_profile(username).await?
+            .get_profile(username)
+            .await?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
         let patch = UserProfilePatch {

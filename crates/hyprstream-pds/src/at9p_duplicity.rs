@@ -1277,128 +1277,133 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                     .map_err(AdmissionError::AcceptedHeadNotFresh)?;
                 let watermark = accepted.watermark();
 
-            // (1) Idempotent replay of the accepted head: same epoch AND same
-            // recomputed digest as the persisted watermark means the candidate is
-            // byte-identical to the record we already accepted. Return AlreadyKnown —
-            // even when that head is terminal — so a caller retrying a rotation after
-            // a lost response can learn its write already succeeded. No state changes
-            // and no alarm; checked before B3 so the terminal head's own record does
-            // not surface as FrozenIdentity.
-            let cand_epoch = candidate.epoch;
-            let cand_digest = record_digest(candidate);
-            if cand_epoch == watermark.epoch && cand_digest == watermark.record_digest {
-                return Ok(Admission::AlreadyKnown);
-            }
+                // (1) Idempotent replay of the accepted head: same epoch AND same
+                // recomputed digest as the persisted watermark means the candidate is
+                // byte-identical to the record we already accepted. Return AlreadyKnown —
+                // even when that head is terminal — so a caller retrying a rotation after
+                // a lost response can learn its write already succeeded. No state changes
+                // and no alarm; checked before B3 so the terminal head's own record does
+                // not surface as FrozenIdentity.
+                let cand_epoch = candidate.epoch;
+                let cand_digest = record_digest(candidate);
+                if cand_epoch == watermark.epoch && cand_digest == watermark.record_digest {
+                    return Ok(Admission::AlreadyKnown);
+                }
 
-            // (2) B3: a terminal identity admits no NEW successor, ever. Checked
-            // before the fork classification and B1 so a frozen DID short-circuits
-            // without spending a signature verify — and so the reason surfaced is
-            // "frozen", not an incidental later gate.
-            if watermark.terminal {
-                return Err(AdmissionError::FrozenIdentity {
-                    epoch: watermark.epoch,
-                });
-            }
+                // (2) B3: a terminal identity admits no NEW successor, ever. Checked
+                // before the fork classification and B1 so a frozen DID short-circuits
+                // without spending a signature verify — and so the reason surfaced is
+                // "frozen", not an incidental later gate.
+                if watermark.terminal {
+                    return Err(AdmissionError::FrozenIdentity {
+                        epoch: watermark.epoch,
+                    });
+                }
 
-            // (3) Position vs watermark by the candidate's OWN digest/epoch. These
-            // verdicts are independent of any predecessor, so B1 is not run and no
-            // unanchored predecessor commitment is ever consulted (#961): the only
-            // path that admits a successor — and therefore the only path that needs
-            // B1's signer-authorization gate — is the advance path below.
-            if cand_epoch < watermark.epoch {
-                // A valid record below the high-watermark. We keep only the
-                // complete current head, not full history, so we cannot prove this is the record
-                // we accepted at that epoch — and per R6 a client that has accepted
-                // epoch N never accepts < N. Fail closed as a fork; never prefer.
-                return Err(self.raise_duplicity(
-                    subject,
-                    DuplicityKind::BelowWatermarkFork,
-                    &watermark,
-                    cand_epoch,
-                    cand_digest,
-                ));
-            }
+                // (3) Position vs watermark by the candidate's OWN digest/epoch. These
+                // verdicts are independent of any predecessor, so B1 is not run and no
+                // unanchored predecessor commitment is ever consulted (#961): the only
+                // path that admits a successor — and therefore the only path that needs
+                // B1's signer-authorization gate — is the advance path below.
+                if cand_epoch < watermark.epoch {
+                    // A valid record below the high-watermark. We keep only the
+                    // complete current head, not full history, so we cannot prove this is the record
+                    // we accepted at that epoch — and per R6 a client that has accepted
+                    // epoch N never accepts < N. Fail closed as a fork; never prefer.
+                    return Err(self.raise_duplicity(
+                        subject,
+                        DuplicityKind::BelowWatermarkFork,
+                        &watermark,
+                        cand_epoch,
+                        cand_digest,
+                    ));
+                }
 
-            if cand_epoch == watermark.epoch {
-                // The equal-digest case already returned AlreadyKnown at (1); a
-                // same-epoch candidate with a DIFFERENT digest is a divergent record
-                // at an epoch we have already accepted → equivocation indication.
-                return Err(self.raise_duplicity(
-                    subject,
-                    DuplicityKind::SameEpochFork,
-                    &watermark,
-                    cand_epoch,
-                    cand_digest,
-                ));
-            }
+                if cand_epoch == watermark.epoch {
+                    // The equal-digest case already returned AlreadyKnown at (1); a
+                    // same-epoch candidate with a DIFFERENT digest is a divergent record
+                    // at an epoch we have already accepted → equivocation indication.
+                    return Err(self.raise_duplicity(
+                        subject,
+                        DuplicityKind::SameEpochFork,
+                        &watermark,
+                        cand_epoch,
+                        cand_digest,
+                    ));
+                }
 
-            // A higher record must explicitly extend the persisted accepted
-            // head. This is classified before signature validation because the
-            // retained watermark is the authority boundary; selecting a
-            // maximum epoch on another branch is forbidden.
-            if candidate.prev_record_digest != watermark.record_digest {
-                return Err(self.raise_duplicity(
-                    subject,
-                    DuplicityKind::HigherEpochFork,
-                    &watermark,
-                    cand_epoch,
-                    cand_digest,
-                ));
-            }
+                // A higher record must explicitly extend the persisted accepted
+                // head. This is classified before signature validation because the
+                // retained watermark is the authority boundary; selecting a
+                // maximum epoch on another branch is forbidden.
+                if candidate.prev_record_digest != watermark.record_digest {
+                    return Err(self.raise_duplicity(
+                        subject,
+                        DuplicityKind::HigherEpochFork,
+                        &watermark,
+                        cand_epoch,
+                        cand_digest,
+                    ));
+                }
 
-            // (4) Advance path (cand_epoch > watermark). ANCHOR (#961): recompute the
-            // predecessor's H512 from its bytes and refuse to trust ANY field of it
-            // unless it matches the persisted watermark digest. This is the structural
-            // enforcement — the next_key_commitments B1 is about to key off are proven
-            // to belong to the anchored head, not a caller-forged record that merely
-            // claims the honest digest. (A caller cannot pair evil commitments with the
-            // honest digest: that is a BLAKE3-512 preimage. The worst they can do is
-            // present a foreign record with its own, different digest — caught here.)
-            // The check runs BEFORE B1 so a forged/foreign predecessor never reaches
-            // the signer-authorization gate.
-            let predecessor = accepted.predecessor();
-            let pred_digest = predecessor.record_digest();
-            if pred_digest != watermark.record_digest {
-                // Higher-epoch record chained through a non-watermark head — the
-                // "never select max epoch" trap. Fail closed, alarm, watermark stays.
-                return Err(self.raise_duplicity(
-                    subject,
-                    DuplicityKind::HigherEpochFork,
-                    &watermark,
-                    cand_epoch,
-                    cand_digest,
-                ));
-            }
+                // (4) Advance path (cand_epoch > watermark). ANCHOR (#961): recompute the
+                // predecessor's H512 from its bytes and refuse to trust ANY field of it
+                // unless it matches the persisted watermark digest. This is the structural
+                // enforcement — the next_key_commitments B1 is about to key off are proven
+                // to belong to the anchored head, not a caller-forged record that merely
+                // claims the honest digest. (A caller cannot pair evil commitments with the
+                // honest digest: that is a BLAKE3-512 preimage. The worst they can do is
+                // present a foreign record with its own, different digest — caught here.)
+                // The check runs BEFORE B1 so a forged/foreign predecessor never reaches
+                // the signer-authorization gate.
+                let predecessor = accepted.predecessor();
+                let pred_digest = predecessor.record_digest();
+                if pred_digest != watermark.record_digest {
+                    // Higher-epoch record chained through a non-watermark head — the
+                    // "never select max epoch" trap. Fail closed, alarm, watermark stays.
+                    return Err(self.raise_duplicity(
+                        subject,
+                        DuplicityKind::HigherEpochFork,
+                        &watermark,
+                        cand_epoch,
+                        cand_digest,
+                    ));
+                }
 
-            // The predecessor is anchored. Derive its authoritative ChainState from
-            // the record's own fields (never a caller claim). `derive_chain_state` only
-            // fails on a structural decode inconsistency against an already-hashed
-            // record — fail closed as malformed rather than trust a partial state.
-            let predecessor_state = predecessor
-                .derive_chain_state()
-                .map_err(AdmissionError::MalformedPredecessor)?;
+                // The predecessor is anchored. Derive its authoritative ChainState from
+                // the record's own fields (never a caller claim). `derive_chain_state` only
+                // fails on a structural decode inconsistency against an already-hashed
+                // record — fail closed as malformed rather than trust a partial state.
+                let predecessor_state = predecessor
+                    .derive_chain_state()
+                    .map_err(AdmissionError::MalformedPredecessor)?;
 
-            // (5) B1: is the candidate an authorized successor of the AUTHENTIC
-            // predecessor? `predecessor_state` is proven to be the watermark head, so
-            // the signer-authorization gate keys off anchored commitments only.
-            let state = validate_successor(&predecessor_state, candidate, now)
-                .map_err(AdmissionError::Successor)?;
+                // (5) B1: is the candidate an authorized successor of the AUTHENTIC
+                // predecessor? `predecessor_state` is proven to be the watermark head, so
+                // the signer-authorization gate keys off anchored commitments only.
+                let state = validate_successor(&predecessor_state, candidate, now)
+                    .map_err(AdmissionError::Successor)?;
 
-            // (6) Honest forward progress: the predecessor is the head and the
-            // candidate is a valid successor of it. Advance the watermark; freeze if
-            // the new head pre-commits to nothing (B3).
-            let terminal = state.next_key_commitments.is_empty();
-            let accepted = AcceptedAt9pState::from_accepted_update(candidate.clone());
-            debug_assert_eq!(accepted.watermark(), Watermark::from_state(&state));
-            match self.store.conditional_advance(Some(watermark), &accepted)
-                .map_err(AdmissionError::Store)? {
-                ConditionalAdvance::Committed => return Ok(if terminal {
-                    Admission::Frozen(state)
-                } else {
-                    Admission::Advanced(state)
-                }),
-                ConditionalAdvance::Conflict(_) => continue,
-            }
+                // (6) Honest forward progress: the predecessor is the head and the
+                // candidate is a valid successor of it. Advance the watermark; freeze if
+                // the new head pre-commits to nothing (B3).
+                let terminal = state.next_key_commitments.is_empty();
+                let accepted = AcceptedAt9pState::from_accepted_update(candidate.clone());
+                debug_assert_eq!(accepted.watermark(), Watermark::from_state(&state));
+                match self
+                    .store
+                    .conditional_advance(Some(watermark), &accepted)
+                    .map_err(AdmissionError::Store)?
+                {
+                    ConditionalAdvance::Committed => {
+                        return Ok(if terminal {
+                            Admission::Frozen(state)
+                        } else {
+                            Admission::Advanced(state)
+                        })
+                    }
+                    ConditionalAdvance::Conflict(_) => continue,
+                }
             }
         })
     }
@@ -1838,7 +1843,10 @@ mod tests {
             guard.admit_successor(&r2, "2026-07-11T00:00:00Z"),
             Err(AdmissionError::AcceptedHeadNotFresh(_))
         ));
-        assert_eq!(guard.watermark(&s0.subject_cid512).unwrap().unwrap().epoch, 1);
+        assert_eq!(
+            guard.watermark(&s0.subject_cid512).unwrap().unwrap().epoch,
+            1
+        );
         assert_eq!(guard.store_alarm_count(), 0);
     }
 
@@ -2273,10 +2281,21 @@ mod tests {
             Admission::Advanced(state) => state,
             other => panic!("expected advance, got {other:?}"),
         };
-        let records: Vec<_> = nexts.iter().enumerate().map(|(i, next)| update_salted(
-            &s1.subject_cid512, 2, s1.record_digest, &n2, &[next], FUTURE,
-            Some(&format!("independent-{i}")),
-        )).collect();
+        let records: Vec<_> = nexts
+            .iter()
+            .enumerate()
+            .map(|(i, next)| {
+                update_salted(
+                    &s1.subject_cid512,
+                    2,
+                    s1.record_digest,
+                    &n2,
+                    &[next],
+                    FUTURE,
+                    Some(&format!("independent-{i}")),
+                )
+            })
+            .collect();
         let barrier = std::sync::Barrier::new(N);
         let outcomes = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
@@ -2291,8 +2310,20 @@ mod tests {
             }
         });
         let outcomes = outcomes.into_inner();
-        assert_eq!(outcomes.iter().filter(|o| matches!(o, Ok(Admission::Advanced(_)))).count(), 1);
-        assert_eq!(outcomes.iter().filter(|o| matches!(o, Err(AdmissionError::Duplicity(_)))).count(), N - 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, Ok(Admission::Advanced(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, Err(AdmissionError::Duplicity(_))))
+                .count(),
+            N - 1
+        );
         assert_eq!(b.watermark(&s0.subject_cid512).unwrap().unwrap().epoch, 2);
     }
 

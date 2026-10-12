@@ -70,9 +70,7 @@ pub struct ImageBackendRegistration {
     pub name: &'static str,
     /// Construct the store from an `ImageConfig`. Boxed because the config is
     /// owned by the caller and construction may fail.
-    pub construct: fn(
-        &crate::config::ImageConfig,
-    ) -> anyhow::Result<Arc<dyn ImageStore>>,
+    pub construct: fn(&crate::config::ImageConfig) -> anyhow::Result<Arc<dyn ImageStore>>,
 }
 
 inventory::collect!(ImageBackendRegistration);

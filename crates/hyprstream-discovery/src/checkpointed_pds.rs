@@ -75,7 +75,11 @@ impl CheckpointedPdsAcceptedStateSource {
     ) -> Result<Self> {
         let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
             .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
-        Ok(Self { path: path.to_path_buf(), acceptance_identity: Arc::new(acceptance_identity), network_bootstrap: false })
+        Ok(Self {
+            path: path.to_path_buf(),
+            acceptance_identity: Arc::new(acceptance_identity),
+            network_bootstrap: false,
+        })
     }
 
     pub(super) fn with_network_bootstrap(mut self, required: bool) -> Self {
@@ -88,9 +92,13 @@ impl CheckpointedPdsAcceptedStateSource {
         let mut states = Vec::new();
         for entry in db.prefix_iterator(b"at9p-state\0") {
             let (key, _) = entry?;
-            let Some(subject) = key.strip_prefix(b"at9p-state\0") else { break; };
+            let Some(subject) = key.strip_prefix(b"at9p-state\0") else {
+                break;
+            };
             let subject = std::str::from_utf8(subject)?;
-            if let Some(state) = load_at9p_state_from_db(&db, subject, self.acceptance_identity.as_ref())? {
+            if let Some(state) =
+                load_at9p_state_from_db(&db, subject, self.acceptance_identity.as_ref())?
+            {
                 states.push(state);
             }
         }
@@ -174,7 +182,12 @@ impl CheckpointedPgAcceptedStateSource {
             .context("checkpointed PDS Postgres read failed")?;
         let checkpoint = values.pop().flatten();
         let envelope = values.pop().flatten();
-        verify_state_pair(subject, envelope, checkpoint, self.acceptance_identity.as_ref())
+        verify_state_pair(
+            subject,
+            envelope,
+            checkpoint,
+            self.acceptance_identity.as_ref(),
+        )
     }
 
     fn bootstrap_states(&self) -> Result<Vec<AcceptedAt9pState>> {
@@ -186,7 +199,13 @@ impl CheckpointedPgAcceptedStateSource {
             .ok_or_else(|| anyhow::anyhow!("at9p checkpoint prefix has no upper bound"))?;
         let snap = self
             .kv
-            .read_snapshot(&[(state_prefix, state_upper), (checkpoint_prefix, checkpoint_upper)], &[])
+            .read_snapshot(
+                &[
+                    (state_prefix, state_upper),
+                    (checkpoint_prefix, checkpoint_upper),
+                ],
+                &[],
+            )
             .context("checkpointed PDS Postgres snapshot read failed")?;
         let mut ranges = snap.ranges.into_iter();
         let (states, checkpoints) = match (ranges.next(), ranges.next()) {
@@ -197,12 +216,17 @@ impl CheckpointedPgAcceptedStateSource {
             checkpoints.into_iter().collect();
         let mut out = Vec::new();
         for (key, envelope) in states {
-            let Some(subject) = key.strip_prefix(b"at9p-state\0".as_slice()) else { continue; };
+            let Some(subject) = key.strip_prefix(b"at9p-state\0".as_slice()) else {
+                continue;
+            };
             let subject = std::str::from_utf8(subject)?;
             let checkpoint = checkpoints.get(checkpoint_key(subject).as_slice()).cloned();
-            if let Some(state) =
-                verify_state_pair(subject, Some(envelope), checkpoint, self.acceptance_identity.as_ref())?
-            {
+            if let Some(state) = verify_state_pair(
+                subject,
+                Some(envelope),
+                checkpoint,
+                self.acceptance_identity.as_ref(),
+            )? {
                 out.push(state);
             }
         }
@@ -227,12 +251,18 @@ impl super::service::AcceptedStateSource for CheckpointedPgAcceptedStateSource {
         self.bootstrap_states()
     }
 
-    fn bootstrap_endpoints(&self, service_name: &str) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
+    fn bootstrap_endpoints(
+        &self,
+        service_name: &str,
+    ) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
         if !self.network_bootstrap || !matches!(service_name, "discovery" | "policy") {
             return Ok(None);
         }
-        let key = hyprstream_service::global_trust_store().resolve_one(service_name)
-            .ok_or_else(|| anyhow::anyhow!("trusted bootstrap {service_name} response key is missing"))?;
+        let key = hyprstream_service::global_trust_store()
+            .resolve_one(service_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("trusted bootstrap {service_name} response key is missing")
+            })?;
         super::service::project_bootstrap_endpoint(&self.bootstrap_states()?, service_name, &key)
             .map(|endpoint| Some(vec![endpoint]))
     }
@@ -337,12 +367,18 @@ impl super::service::AcceptedStateSource for CheckpointedPdsAcceptedStateSource 
         self.bootstrap_states()
     }
 
-    fn bootstrap_endpoints(&self, service_name: &str) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
+    fn bootstrap_endpoints(
+        &self,
+        service_name: &str,
+    ) -> Result<Option<Vec<crate::state_store::AnnouncedEndpoint>>> {
         if !self.network_bootstrap || !matches!(service_name, "discovery" | "policy") {
             return Ok(None);
         }
-        let key = hyprstream_service::global_trust_store().resolve_one(service_name)
-            .ok_or_else(|| anyhow::anyhow!("trusted bootstrap {service_name} response key is missing"))?;
+        let key = hyprstream_service::global_trust_store()
+            .resolve_one(service_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("trusted bootstrap {service_name} response key is missing")
+            })?;
         super::service::project_bootstrap_endpoint(&self.bootstrap_states()?, service_name, &key)
             .map(|endpoint| Some(vec![endpoint]))
     }
@@ -598,7 +634,11 @@ fn decode_state_body(subject: &str, bytes: &[u8]) -> Result<AcceptedAt9pState> {
 }
 
 #[cfg(all(test, feature = "rocksdb"))]
-pub(super) fn write_test_state(path: &Path, state: &AcceptedAt9pState, identity: &ed25519_dalek::SigningKey) -> Result<()> {
+pub(super) fn write_test_state(
+    path: &Path,
+    state: &AcceptedAt9pState,
+    identity: &ed25519_dalek::SigningKey,
+) -> Result<()> {
     let audit = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
     let (envelope, checkpoint) = tests::encode_fixture(state, identity, &audit);
     let mut options = rocksdb::Options::default();
@@ -708,10 +748,9 @@ mod tests {
             &pq_signing,
         )
         .expect("signed update");
-        let state = AcceptedAt9pState::from_persisted_update(
-            &update.to_dag_cbor().expect("update bytes"),
-        )
-        .expect("accepted update");
+        let state =
+            AcceptedAt9pState::from_persisted_update(&update.to_dag_cbor().expect("update bytes"))
+                .expect("accepted update");
         assert_eq!(encode_body(&state)[AT9P_STATE_MAGIC.len()], 1);
 
         let identity = ed25519_dalek::SigningKey::from_bytes(&[0x45; 32]);
@@ -771,8 +810,9 @@ mod tests {
             .expect("write checkpoint");
         drop(db);
 
-        let source = CheckpointedPdsAcceptedStateSource::open_test(dir.path(), identity.verifying_key())
-            .expect("open checkpointed source");
+        let source =
+            CheckpointedPdsAcceptedStateSource::open_test(dir.path(), identity.verifying_key())
+                .expect("open checkpointed source");
         let recovered = source
             .accepted_state(&state.did)
             .expect("read checkpointed state")
@@ -780,10 +820,12 @@ mod tests {
         assert_eq!(recovered.watermark(), state.watermark());
 
         let wrong_identity = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
-        let rejected =
-            CheckpointedPdsAcceptedStateSource::open_test(dir.path(), wrong_identity.verifying_key())
-                .expect("open same store")
-                .accepted_state(&state.did);
+        let rejected = CheckpointedPdsAcceptedStateSource::open_test(
+            dir.path(),
+            wrong_identity.verifying_key(),
+        )
+        .expect("open same store")
+        .accepted_state(&state.did);
         assert!(
             rejected.is_err(),
             "caller-selected checkpoint identity accepted"
@@ -830,17 +872,28 @@ mod pg_tests {
         }};
     }
 
-    fn deployment_verifier(seed: u8) -> (ed25519_dalek::SigningKey, crate::service::RegistryDeploymentVerifier) {
+    fn deployment_verifier(
+        seed: u8,
+    ) -> (
+        ed25519_dalek::SigningKey,
+        crate::service::RegistryDeploymentVerifier,
+    ) {
         let ed = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
         let pq = hyprstream_crypto::pq::ml_dsa_sk_from_seed(&[seed; 32]);
-        let verifier = crate::service::RegistryDeploymentVerifier::for_test_deployment_root(&ed, &pq)
-            .expect("test deployment verifier");
+        let verifier =
+            crate::service::RegistryDeploymentVerifier::for_test_deployment_root(&ed, &pq)
+                .expect("test deployment verifier");
         (ed, verifier)
     }
 
     /// Run test-side DDL against the scratch server over a direct NoTls
     /// connection (database lifecycle for the unprovisioned gate).
-    fn with_direct_connection(url: &str, ddl: impl Fn(tokio_postgres::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+    fn with_direct_connection(
+        url: &str,
+        ddl: impl Fn(
+            tokio_postgres::Client,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -874,8 +927,12 @@ mod pg_tests {
 
         // Writer posture: migrates and commits the pair.
         let writer = PgKv::connect_test(&url, "test-cell").expect("writer connect");
-        writer.put(&state_key(&state.subject_cid512), &envelope).expect("write state");
-        writer.put(&checkpoint_key(&state.subject_cid512), &checkpoint).expect("write checkpoint");
+        writer
+            .put(&state_key(&state.subject_cid512), &envelope)
+            .expect("write state");
+        writer
+            .put(&checkpoint_key(&state.subject_cid512), &checkpoint)
+            .expect("write checkpoint");
         drop(writer);
 
         // Resolver posture: read-only, no migration.
@@ -890,7 +947,9 @@ mod pg_tests {
         assert_eq!(recovered.watermark(), state.watermark());
         let roster = reader.accepted_states().expect("roster read");
         assert!(
-            roster.iter().any(|s| s.subject_cid512 == state.subject_cid512),
+            roster
+                .iter()
+                .any(|s| s.subject_cid512 == state.subject_cid512),
             "roster must include the writer-committed state"
         );
 
@@ -901,7 +960,10 @@ mod pg_tests {
             wrong.verifying_key(),
         )
         .accepted_state(&state.did);
-        assert!(rejected.is_err(), "caller-selected checkpoint identity accepted");
+        assert!(
+            rejected.is_err(),
+            "caller-selected checkpoint identity accepted"
+        );
     }
 
     /// A state envelope without its monotonic checkpoint is torn security
@@ -920,7 +982,9 @@ mod pg_tests {
             .unwrap_or(0);
         let subject = format!("torn-{}-{nanos}", std::process::id());
         let writer = PgKv::connect_test(&url, "test-cell").expect("writer connect");
-        writer.put(&state_key(&subject), &envelope).expect("write lone state");
+        writer
+            .put(&state_key(&subject), &envelope)
+            .expect("write lone state");
 
         let reader = CheckpointedPgAcceptedStateSource::connect_test(
             PgKv::connect_test_readonly(&url).expect("readonly connect"),
@@ -931,7 +995,9 @@ mod pg_tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("without its monotonic checkpoint"),
+            error
+                .to_string()
+                .contains("without its monotonic checkpoint"),
             "unexpected error: {error}"
         );
 
@@ -1010,15 +1076,11 @@ mod pg_tests {
         };
         assert!(records.is_configured());
         let local_store = dir.path().join("pds-store");
-        let error = match open_deployment_accepted_state_source(
-            &local_store,
-            verifier,
-            &records,
-            false,
-        ) {
-            Ok(_) => panic!("a broken configured PostgreSQL binding unexpectedly succeeded"),
-            Err(error) => error,
-        };
+        let error =
+            match open_deployment_accepted_state_source(&local_store, verifier, &records, false) {
+                Ok(_) => panic!("a broken configured PostgreSQL binding unexpectedly succeeded"),
+                Err(error) => error,
+            };
         assert!(
             format!("{error:#}").contains("RDS url_file"),
             "unexpected error: {error:#}"

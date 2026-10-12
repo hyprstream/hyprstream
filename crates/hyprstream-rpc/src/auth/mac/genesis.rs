@@ -19,7 +19,7 @@
 //! adding an explicit assignment, never by widening a default.
 
 use super::label::SecurityLabel;
-use super::lattice::{Lattice, LabelError};
+use super::lattice::{LabelError, Lattice};
 use super::manifest::StaticNodeLabel;
 use std::collections::BTreeMap;
 
@@ -82,9 +82,7 @@ impl GenesisMap {
     /// [`GenesisMap::report`] for operator visibility.
     pub fn resolve_node(&self, path: &str, lattice: &Lattice) -> StaticNodeLabel {
         match self.assignments.get(path) {
-            Some(label) if lattice.validate(label).is_ok() => {
-                StaticNodeLabel::labeled(*label)
-            }
+            Some(label) if lattice.validate(label).is_ok() => StaticNodeLabel::labeled(*label),
             _ => StaticNodeLabel::unlabeled(),
         }
     }
@@ -144,7 +142,8 @@ mod tests {
             )
             .assign(
                 "/ctl/policy",
-                l.label(Level::Secret, Assurance::PqHybrid, [comp("pii")]).unwrap(),
+                l.label(Level::Secret, Assurance::PqHybrid, [comp("pii")])
+                    .unwrap(),
             )
     }
 
@@ -169,10 +168,16 @@ mod tests {
 
     #[test]
     fn report_detects_gaps() {
-        let report = map().report(["/health", "/ctl/policy", "/streams", "/metrics"], &lattice());
+        let report = map().report(
+            ["/health", "/ctl/policy", "/streams", "/metrics"],
+            &lattice(),
+        );
         assert_eq!(report.labeled.len(), 2);
         // `report` preserves input order of `all_nodes`.
-        assert_eq!(report.unlabeled, vec!["/streams".to_owned(), "/metrics".to_owned()]);
+        assert_eq!(
+            report.unlabeled,
+            vec!["/streams".to_owned(), "/metrics".to_owned()]
+        );
         assert!(!report.is_complete());
     }
 
@@ -206,6 +211,9 @@ mod tests {
             SecurityLabel::from_bits(Level::Public, Assurance::Classical, [9]),
         );
         // resolve_node fails closed: ill-formed → unlabeled → deny.
-        assert!(m.resolve_node("/bad", &lattice()).security_label().is_none());
+        assert!(m
+            .resolve_node("/bad", &lattice())
+            .security_label()
+            .is_none());
     }
 }

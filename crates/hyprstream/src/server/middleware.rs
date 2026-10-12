@@ -1487,7 +1487,11 @@ mod rotation_aware_tests {
             .await
             .unwrap();
         // This mirrors the exact post-decode check in `verify_token_claims`.
-        assert!(store.is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap())).await);
+        assert!(
+            store
+                .is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap()))
+                .await
+        );
     }
 
     #[test]

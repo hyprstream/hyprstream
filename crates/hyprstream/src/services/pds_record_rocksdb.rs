@@ -6,9 +6,6 @@
 //! feature, valkey precedent); `discovery.rs` re-exports it unchanged so
 //! callers keep addressing `services::discovery::PdsRecordStore`.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use anyhow::{anyhow, bail, Context as _, Result as AnyResult};
 use async_trait::async_trait;
 use hyprstream_discovery::{RecordCarData, RecordResolver};
@@ -26,6 +23,9 @@ use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_pds::tid::Tid;
 use sha2::Digest as _;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ============================================================================
 // PdsRecordStore — durable, keyless-read atproto record store (#910a)
@@ -214,7 +214,10 @@ impl PdsRecordStore {
         // not turn missing retained state into a newly initialized path.
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("PDS read-only store directory is unavailable: {path:?}"))?;
-        anyhow::ensure!(metadata.is_dir(), "PDS read-only store path is not a directory: {path:?}");
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "PDS read-only store path is not a directory: {path:?}"
+        );
         let opts = readonly_opts();
         let _probe = rocksdb::DB::open_for_read_only(&opts, path, false)
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
@@ -351,7 +354,12 @@ impl PdsRecordStore {
     /// is refreshed. `expected_head` gates the Postgres compare-and-swap
     /// exactly as in `put_record_and_commit`: a re-sign based on a head that
     /// was concurrently advanced is rejected, never silently overwritten.
-    fn put_commit(&self, did: &str, commit: &Commit, expected_head: Option<&[u8]>) -> AnyResult<()> {
+    fn put_commit(
+        &self,
+        did: &str,
+        commit: &Commit,
+        expected_head: Option<&[u8]>,
+    ) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
             #[cfg(feature = "pds-postgres")]
             if let RecordBacking::Postgres { kv, readonly } = &self.backing {
@@ -359,7 +367,13 @@ impl PdsRecordStore {
                     bail!("PdsRecordStore::put_commit called on a read-only Postgres store");
                 }
                 let committed = kv
-                    .cas_put(&commit_key(did), expected_head, &commit.to_dag_cbor(), &[], &[])
+                    .cas_put(
+                        &commit_key(did),
+                        expected_head,
+                        &commit.to_dag_cbor(),
+                        &[],
+                        &[],
+                    )
                     .context("PDS commit-only Postgres write failed")?;
                 anyhow::ensure!(
                     committed,
@@ -505,15 +519,20 @@ impl PdsRecordStore {
                 }
                 let mut states = Vec::new();
                 for (key, value) in state_pairs {
-                    let subject_bytes = key.get(state_prefix.len()..).ok_or_else(|| {
-                        anyhow!("accepted-state key is shorter than its prefix")
-                    })?;
+                    let subject_bytes = key
+                        .get(state_prefix.len()..)
+                        .ok_or_else(|| anyhow!("accepted-state key is shorter than its prefix"))?;
                     let subject = std::str::from_utf8(subject_bytes)
                         .context("accepted-state key is not UTF-8")?;
                     let checkpoint = checkpoints.remove(subject_bytes).ok_or_else(|| {
                         anyhow!("accepted at9p state exists without its monotonic checkpoint")
                     })?;
-                    states.push(verify_at9p_pair(subject, &value, &checkpoint, acceptance_identity)?);
+                    states.push(verify_at9p_pair(
+                        subject,
+                        &value,
+                        &checkpoint,
+                        acceptance_identity,
+                    )?);
                 }
                 anyhow::ensure!(
                     checkpoints.is_empty(),
@@ -581,9 +600,7 @@ impl PdsRecordStore {
             );
             return kv.reset_to_first_boot(hyprstream_discovery::FIRST_BOOT_KEY);
         }
-        bail!(
-            "fresh-genesis reset is supported only for the writable RDS records store"
-        )
+        bail!("fresh-genesis reset is supported only for the writable RDS records store")
     }
 
     fn conditional_advance_at9p_state(
@@ -651,7 +668,9 @@ impl PdsRecordStore {
                         &[(checkpoint_key, checkpoint)],
                         &[hyprstream_discovery::FIRST_BOOT_KEY.to_vec()],
                     )
-                    .context("synchronous accepted did:at9p state+checkpoint Postgres commit failed")?;
+                    .context(
+                        "synchronous accepted did:at9p state+checkpoint Postgres commit failed",
+                    )?;
                 if !committed {
                     // Lost the commit race between the precondition read and
                     // the CAS: re-read and report the winner's durable state.
@@ -799,12 +818,12 @@ impl PdsRecordStore {
         let mut records = BTreeMap::new();
         let upper = super::pds_record_pg::prefix_upper_bound(&prefix);
         let (pairs, commit_bytes) = if let Some(end) = &upper {
-            let snap = kv.read_snapshot(
-                &[(prefix.clone(), end.clone())],
-                &[commit_key(did)],
-            )?;
+            let snap = kv.read_snapshot(&[(prefix.clone(), end.clone())], &[commit_key(did)])?;
             let mut values = snap.values.into_iter();
-            (snap.ranges.into_iter().next().unwrap_or_default(), values.next().flatten())
+            (
+                snap.ranges.into_iter().next().unwrap_or_default(),
+                values.next().flatten(),
+            )
         } else {
             // Unreachable for well-formed prefixes (they end in NUL, so an
             // upper bound always exists); kept as a defensive fallback.
@@ -989,9 +1008,12 @@ fn load_at9p_state_from_db(
         (None, None) => Ok(None),
         (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
         (None, Some(_)) => bail!("accepted at9p checkpoint exists without its state envelope"),
-        (Some(envelope), Some(checkpoint)) => {
-            Ok(Some(verify_at9p_pair(subject, &envelope, &checkpoint, identity)?))
-        }
+        (Some(envelope), Some(checkpoint)) => Ok(Some(verify_at9p_pair(
+            subject,
+            &envelope,
+            &checkpoint,
+            identity,
+        )?)),
     }
 }
 
@@ -1008,9 +1030,9 @@ fn load_at9p_state_from_pg(
         (None, None) => Ok(None),
         (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
         (None, Some(_)) => bail!("accepted at9p checkpoint exists without its state envelope"),
-        (Some(envelope), Some(checkpoint)) => {
-            Ok(Some(verify_at9p_pair(subject, envelope, checkpoint, identity)?))
-        }
+        (Some(envelope), Some(checkpoint)) => Ok(Some(verify_at9p_pair(
+            subject, envelope, checkpoint, identity,
+        )?)),
     }
 }
 
@@ -2652,7 +2674,10 @@ mod pds_store_tests {
     #[test]
     fn readonly_roster_store_open_never_creates_missing_directories() -> AnyResult<()> {
         let root = tempfile::tempdir()?;
-        for path in [root.path().join("missing"), root.path().join("absent-parent/nested/store")] {
+        for path in [
+            root.path().join("missing"),
+            root.path().join("absent-parent/nested/store"),
+        ] {
             assert!(PdsRecordStore::open_readonly(&path).is_err());
             assert!(!path.exists());
             assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
@@ -2709,7 +2734,14 @@ mod pds_store_tests {
         let unsigned = UnsignedCommit::new("did:key:zX", tree.root_cid(), Tid::now(), None);
         let commit = Commit::sign(&unsigned, &sk);
         let err = ro
-            .put_record_and_commit("did:key:zX", COLLECTION_NSID, Tid::now(), &record, &commit, None)
+            .put_record_and_commit(
+                "did:key:zX",
+                COLLECTION_NSID,
+                Tid::now(),
+                &record,
+                &commit,
+                None,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -3861,7 +3893,10 @@ mod pg_tests {
                 .load_repo(&did)
                 .expect("read via AZ-b handle")
                 .expect("repo visible through the second handle");
-            assert_eq!(repo.records.get(&(COLLECTION.to_owned(), tid)), Some(&record));
+            assert_eq!(
+                repo.records.get(&(COLLECTION.to_owned(), tid)),
+                Some(&record)
+            );
             assert_eq!(repo.commit_bytes, commit.to_dag_cbor());
 
             // The resolver posture is read-only.
@@ -3880,12 +3915,10 @@ mod pg_tests {
         assert_eq!(repo.commit_bytes, commit.to_dag_cbor());
 
         // An unknown DID is absent, never an error and never a torn read.
-        assert!(
-            reopened
-                .load_repo(&unique_did("Absent"))
-                .expect("absent repo read")
-                .is_none()
-        );
+        assert!(reopened
+            .load_repo(&unique_did("Absent"))
+            .expect("absent repo read")
+            .is_none());
     }
 
     #[test]
@@ -4099,7 +4132,9 @@ mod pg_tests {
     fn live_first_boot_marker_visible_across_handles() {
         let url = require_db!();
         let (writer, reader) = open_pair(&url);
-        writer.mark_first_boot().expect("write marker via writer handle");
+        writer
+            .mark_first_boot()
+            .expect("write marker via writer handle");
         assert!(
             writer.first_boot_pending().expect("read via writer"),
             "writer observes its own marker"

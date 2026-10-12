@@ -158,11 +158,11 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
             && ctx.jwt_token().is_none()
             && !ctx.subject().is_federated()
             && ctx.subject().name() == Some("service:policy");
-        let is_local_policy_control_plane = is_local_policy_check || (service_domain == "policy"
-            && matches!(
-                method,
-                Some([
-                    policy_methods::GET_POLICY
+        let is_local_policy_control_plane = is_local_policy_check
+            || (service_domain == "policy"
+                && matches!(
+                    method,
+                    Some([policy_methods::GET_POLICY
                         | policy_methods::APPLY_TEMPLATE
                         | policy_methods::APPLY_DRAFT
                         | policy_methods::ROLLBACK
@@ -170,9 +170,8 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for ProductionDispatchPep {
                         | policy_methods::GET_DIFF
                         | policy_methods::GET_DRAFT_STATUS
                         | policy_methods::ADD_GROUPING
-                        | policy_methods::REMOVE_GROUPING
-                ])
-            ));
+                        | policy_methods::REMOVE_GROUPING])
+                ));
         if is_local_policy_control_plane {
             if !self.default.is_declared(service_domain, method) {
                 return hyprstream_rpc::auth::mac::MacDecision::Deny(
@@ -248,7 +247,8 @@ mod production_dispatch_tests {
     }
 
     #[test]
-    fn local_policy_control_plane_requires_the_exact_tokenless_policy_authority() -> anyhow::Result<()> {
+    fn local_policy_control_plane_requires_the_exact_tokenless_policy_authority(
+    ) -> anyhow::Result<()> {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]).verifying_key();
         let policy =
             EnvelopeContext::for_test_authenticated_subject(Subject::new("service:policy"), signer);

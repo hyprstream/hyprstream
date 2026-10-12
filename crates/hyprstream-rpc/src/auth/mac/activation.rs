@@ -614,10 +614,14 @@ mod tests {
         assert_eq!(verified_subjects().read().subjects.len(), 1);
         let other_id = crate::auth::CredentialId::jwt("https://local.example", "other-jti");
         let revocable_id = crate::auth::CredentialId::jwt("https://local.example", "revocable-jti");
-        let cross_issuer_id = crate::auth::CredentialId::jwt("https://other.example", "revocable-jti");
+        let cross_issuer_id =
+            crate::auth::CredentialId::jwt("https://other.example", "revocable-jti");
         assert_eq!(revoke_verified_subject_credential(&other_id), 0);
-        assert_eq!(revoke_verified_subject_credential(&cross_issuer_id), 0,
-            "same jti from a different issuer must NOT evict");
+        assert_eq!(
+            revoke_verified_subject_credential(&cross_issuer_id),
+            0,
+            "same jti from a different issuer must NOT evict"
+        );
         assert_eq!(revoke_verified_subject_credential(&revocable_id), 1);
         assert!(verified_subjects().read().subjects.is_empty());
 
