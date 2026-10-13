@@ -114,8 +114,11 @@ jobs:
             --digestfile "${digest_file}" "${CANDIDATE}"
           digest="$(cat "${digest_file}")"
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          podman manifest inspect "${CANDIDATE}@${digest}" >/dev/null
-          printf 'Candidate: `%s@%s`\n' "${CANDIDATE}" "${digest}" >> "$GITHUB_STEP_SUMMARY"
+          # A successful push plus Podman's digest file is the registry write
+          # receipt. `podman manifest inspect` rejects tag@digest references
+          # and treats this single-image OCI manifest as a manifest list.
+          printf 'Candidate tag: `%s`\nDeploy image: `%s@%s`\n' \
+            "${CANDIDATE}" "${IMAGE}" "${digest}" >> "$GITHUB_STEP_SUMMARY"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Clean up candidate build storage
