@@ -1352,6 +1352,11 @@ impl PolicyHandler for PolicyService {
                     .await
             }
             .await;
+            if let Err(error) = &result {
+                // Keep the RPC response generic. The Policy-only,
+                // redacted error journal retains the internal failure.
+                tracing::error!(error = %error, "Federate session commit failed");
+            }
             if let Ok(session) = result {
                 return Ok(PolicyResponseVariant::CommitFederateSessionResult(
                     hyprstream_rpc_std::policy_client::FederateCommittedSession {
