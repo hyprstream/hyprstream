@@ -101,7 +101,7 @@ use crate::mac::te::{Action, Decision, ObjectCtx, ObjectType, SubjectCtx, Subjec
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -1370,22 +1370,52 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, AuditError> {
     Ok(out)
 }
 
-/// Read the journal's last record and return its `(seq, content_hash)` — the
-/// chain head a restart continues from. The hash is recomputed from the stored
-/// payload (BLAKE3 of the canonical bytes), identical to how it was chained on
-/// write, so the next record links correctly. `None` for an empty/absent log.
+/// Read only the journal's last nonempty record. The WAL can grow indefinitely;
+/// loading it all at every restart can exhaust a small host before Event starts.
+/// A single record over this limit is rejected rather than allocating without
+/// bound. Full-chain verification remains the separate offline operation.
+const MAX_AUDIT_TAIL_LINE: usize = 1024 * 1024;
+
+/// Return the last `(seq, content_hash)` so the next record continues the chain.
 fn journal_tail(path: &Path) -> Result<Option<(u64, [u8; 32])>, AuditError> {
-    if !path.exists() {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut offset = file.metadata()?.len();
+    let mut reversed = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while offset > 0 {
+        let length = offset.min(chunk.len() as u64) as usize;
+        offset -= length as u64;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut chunk[..length])?;
+        for &byte in chunk[..length].iter().rev() {
+            if byte == b'\n' {
+                if let Some(tail) = parse_reversed_tail(&mut reversed)? {
+                    return Ok(Some(tail));
+                }
+            } else {
+                if reversed.len() == MAX_AUDIT_TAIL_LINE {
+                    return Err(AuditError::Decode("journal tail line exceeds limit".into()));
+                }
+                reversed.push(byte);
+            }
+        }
+    }
+    parse_reversed_tail(&mut reversed)
+}
+
+fn parse_reversed_tail(reversed: &mut Vec<u8>) -> Result<Option<(u64, [u8; 32])>, AuditError> {
+    reversed.reverse();
+    let last = std::str::from_utf8(reversed)
+        .map_err(|_| AuditError::Decode("journal tail is not UTF-8".into()))?
+        .trim_end_matches('\r');
+    if last.is_empty() {
+        reversed.clear();
         return Ok(None);
     }
-    let content = std::fs::read_to_string(path)?;
-    let Some(last) = content
-        .lines()
-        .map(|l| l.trim_end_matches('\r'))
-        .rfind(|l| !l.is_empty())
-    else {
-        return Ok(None);
-    };
     let mut parts = last.split('\t');
     let seq_s = parts
         .next()
@@ -1998,6 +2028,44 @@ mod tests {
             subject_id: None,
             object_id: None,
         }
+    }
+
+    #[test]
+    fn reopen_reads_only_the_tail_of_a_large_journal() {
+        let dir = tmp_dir("bounded_tail");
+        let store = WalAuditStore::open(&dir, StubSigner { key: [7; 32] }).unwrap();
+        store.record(&perm_rec()).unwrap();
+        let journal = dir.join("journal.log");
+        let expected = journal_tail(&journal).unwrap();
+        let last_line = std::fs::read(&journal).unwrap();
+
+        // A sparse prefix makes the file large without consuming disk or RAM.
+        // Runtime open must seek to the last record instead of reading it all.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&journal)
+            .unwrap();
+        file.seek(SeekFrom::Start(256 * 1024 * 1024)).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.write_all(&last_line).unwrap();
+        drop(file);
+
+        assert_eq!(journal_tail(&journal).unwrap(), expected);
+        WalAuditStore::open(&dir, StubSigner { key: [7; 32] }).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_unterminated_tail_fails_without_unbounded_allocation() {
+        let dir = tmp_dir("oversized_tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("journal.log");
+        std::fs::write(&journal, vec![b'x'; MAX_AUDIT_TAIL_LINE + 1]).unwrap();
+        assert!(
+            matches!(journal_tail(&journal), Err(AuditError::Decode(message)) if message.contains("exceeds limit"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Drop the last journal line (simulate a truncated tail).
