@@ -793,6 +793,20 @@ impl<S: AuditSigner> WalAuditStore<S> {
         let signing_input = audit_signing_input(&hash);
         let signature = self.signer.sign(&signing_input)?;
 
+        // Keep the writer and bounded startup reader in agreement. Refuse an
+        // oversized record before writing CAS, WAL, checkpoint, or chain head.
+        let line = format!(
+            "{}\t{}\t{}\n",
+            stored.seq,
+            hex_encode(&signature),
+            base64_encode(&bytes),
+        );
+        if line.len() - 1 > MAX_AUDIT_TAIL_LINE {
+            return Err(AuditError::Encode(
+                "audit journal line exceeds limit".into(),
+            ));
+        }
+
         // 3. Content-addressed CAS write (dedup + second tamper-evidence layer).
         //    Named by its own hash, so an overwrite is a no-op and a name never
         //    points at different bytes.
@@ -816,12 +830,6 @@ impl<S: AuditSigner> WalAuditStore<S> {
         // 4. Append to the journal: <seq>\t<sig_hex>\t<cbor_b64>\n, then fsync
         // the file AND the directory (WAL durability: the append is
         // durably on disk before we return).
-        let line = format!(
-            "{}\t{}\t{}\n",
-            stored.seq,
-            hex_encode(&signature),
-            base64_encode(&bytes),
-        );
         {
             let mut f = OpenOptions::new()
                 .create(true)
@@ -2065,6 +2073,31 @@ mod tests {
         assert!(
             matches!(journal_tail(&journal), Err(AuditError::Decode(message)) if message.contains("exceeds limit"))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_record_cannot_commit_an_unreadable_tail() {
+        let dir = tmp_dir("oversized_write");
+        let store = WalAuditStore::open(&dir, StubSigner { key: [7; 32] }).unwrap();
+        store.record(&perm_rec()).unwrap();
+        let journal = dir.join("journal.log");
+        let checkpoint = dir.join("checkpoint");
+        let original_journal = std::fs::read(&journal).unwrap();
+        let original_checkpoint = std::fs::read(&checkpoint).unwrap();
+
+        let mut oversized = perm_rec();
+        oversized.object_id = Some("x".repeat(MAX_AUDIT_TAIL_LINE));
+        assert!(
+            matches!(store.record(&oversized), Err(AuditError::Encode(message)) if message.contains("exceeds limit"))
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), original_checkpoint);
+
+        drop(store);
+        let reopened = WalAuditStore::open(&dir, StubSigner { key: [7; 32] }).unwrap();
+        reopened.record(&perm_rec()).unwrap();
+        assert_eq!(journal_tail(&journal).unwrap().unwrap().0, 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
