@@ -1645,7 +1645,7 @@ fn certificate_validity_exceeds_limit(cert_der: &[u8], max_validity_days: u32) -
         .is_none_or(|(_, certificate)| {
             certificate.validity().not_after.timestamp()
                 - certificate.validity().not_before.timestamp()
-                >= i64::from(max_validity_days) * 86_400
+                > i64::from(max_validity_days) * 86_400
         })
 }
 
@@ -2219,6 +2219,34 @@ mod tests {
             std::fs::read(dir.path().join("quic-cert")).unwrap(),
             legacy_der
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_exact_limit_quic_cert_remains_usable_when_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["discovery.example.test".into()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::days(14);
+        let cert_der = params.self_signed(&key_pair).unwrap().der().to_vec();
+        assert!(!certificate_validity_exceeds_limit(&cert_der, 14));
+        write_secret(dir.path(), "quic-key", &key_pair.serialize_der()).unwrap();
+        write_secret(dir.path(), "quic-cert", &cert_der).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let loaded = load_or_generate_tls_materials_named(
+            dir.path(),
+            "discovery.example.test",
+            14,
+            "quic-key",
+            "quic-cert",
+        )
+        .unwrap();
+        assert_eq!(loaded.cert_der, cert_der);
     }
 
     #[test]
