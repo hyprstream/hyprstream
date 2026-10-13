@@ -1272,6 +1272,10 @@ impl RefreshTokenEntry {
 
 /// Shared OAuth server state.
 pub struct OAuthState {
+    /// Public HTTPS projection signer. It authenticates the representation,
+    /// not the accepted-current Registry/Model response keys inside it.
+    pub(crate) browser_provisioning_signer: Option<Arc<hyprstream_rpc::crypto::SigningKey>>,
+    pub(crate) browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
     /// Exact Federate host exchange remains disabled until an authenticated
     /// Policy admission adapter and composite signer are installed together.
     #[cfg(feature = "postgres")]
@@ -1594,6 +1598,10 @@ impl OAuthState {
         verifying_key_bytes: [u8; 32],
     ) -> Self {
         Self {
+            browser_provisioning_signer: None,
+            browser_provisioning_rate_limiter: Arc::new(
+                crate::server::middleware::RateLimiter::new(60, 60),
+            ),
             #[cfg(feature = "postgres")]
             federate_issuer: None,
             clients: RwLock::new(HashMap::new()),
@@ -1680,6 +1688,14 @@ impl OAuthState {
             iroh_node_id: None,
             iroh_relays: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_browser_provisioning_signer(
+        mut self,
+        signing_key: hyprstream_rpc::crypto::SigningKey,
+    ) -> Self {
+        self.browser_provisioning_signer = Some(Arc::new(signing_key));
+        self
     }
 
     /// Attach the anonymous device store.

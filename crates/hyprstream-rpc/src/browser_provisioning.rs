@@ -210,15 +210,28 @@ impl BrowserProvisioningDocument {
     /// Hybrid-sign the complete projection. This signature protects the HTTP
     /// representation and cache boundary; it is not accepted-state authority.
     pub fn sign_projection(mut self, signing_key: &crate::crypto::SigningKey) -> Result<Self> {
+        self = self.sign_projection_for_https_origin(signing_key)?;
+        anyhow::ensure!(
+            self.projection_signer_ed25519 == self.response_ed25519
+                && self.projection_signer_ml_dsa65 == self.response_ml_dsa65,
+            "projection signer is not the accepted-current response signing authority"
+        );
+        Ok(self)
+    }
+
+    /// Sign a projection served only by an authenticated HTTPS origin. The
+    /// origin's signing key need not be the target Registry/Model response key;
+    /// accepted-current service keys are independently carried in the document.
+    /// Consumers may accept this form only after the same-origin Web-PKI fetch.
+    pub fn sign_projection_for_https_origin(
+        mut self,
+        signing_key: &crate::crypto::SigningKey,
+    ) -> Result<Self> {
         let pq_signing_key = crate::node_identity::derive_mesh_mldsa_key(signing_key);
         let pq_verifying_key = ml_dsa::Keypair::verifying_key(&pq_signing_key);
         let projection_ed = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
         let projection_pq =
             URL_SAFE_NO_PAD.encode(crate::crypto::pq::ml_dsa_vk_bytes(&pq_verifying_key));
-        anyhow::ensure!(
-            projection_ed == self.response_ed25519 && projection_pq == self.response_ml_dsa65,
-            "projection signer is not the accepted-current response signing authority"
-        );
         self.projection_signer_ed25519 = projection_ed;
         self.projection_signer_ml_dsa65 = projection_pq;
         self.projection_signature.clear();
@@ -612,13 +625,22 @@ impl BrowserProvisioning {
         expected: &BrowserProvisioningRequest,
         now_unix_ms: i64,
     ) -> Result<Self> {
+        Self::from_json_with_trust(json, expected, now_unix_ms, false)
+    }
+
+    fn from_json_with_trust(
+        json: &[u8],
+        expected: &BrowserProvisioningRequest,
+        now_unix_ms: i64,
+        authenticated_https_origin: bool,
+    ) -> Result<Self> {
         anyhow::ensure!(
             json.len() <= MAX_PROVISIONING_BYTES,
             "browser provisioning document exceeds {MAX_PROVISIONING_BYTES} bytes"
         );
         let document: BrowserProvisioningDocument =
             serde_json::from_slice(json).context("invalid browser provisioning document")?;
-        Self::validate(document, expected, now_unix_ms)
+        Self::validate_with_trust(document, expected, now_unix_ms, authenticated_https_origin)
     }
 
     pub fn validate(
@@ -626,27 +648,50 @@ impl BrowserProvisioning {
         expected: &BrowserProvisioningRequest,
         now_unix_ms: i64,
     ) -> Result<Self> {
+        Self::validate_with_trust(document, expected, now_unix_ms, false)
+    }
+
+    fn validate_with_trust(
+        document: BrowserProvisioningDocument,
+        expected: &BrowserProvisioningRequest,
+        now_unix_ms: i64,
+        authenticated_https_origin: bool,
+    ) -> Result<Self> {
         expected.validate()?;
         anyhow::ensure!(
             document.version == BROWSER_PROVISIONING_VERSION,
             "unsupported browser provisioning version"
         );
-        anyhow::ensure!(
-            document.projection_signer_ed25519 == document.response_ed25519
-                && document.projection_signer_ml_dsa65 == document.response_ml_dsa65,
-            "projection signer is not equality-bound to accepted-current response keys"
-        );
+        if !authenticated_https_origin {
+            anyhow::ensure!(
+                document.projection_signer_ed25519 == document.response_ed25519
+                    && document.projection_signer_ml_dsa65 == document.response_ml_dsa65,
+                "projection signer is not equality-bound to accepted-current response keys"
+            );
+        }
         let response_ed25519 = decode_exact::<32>(&document.response_ed25519, "response Ed25519")?;
         let server_verifying_key = VerifyingKey::from_bytes(&response_ed25519)
             .context("invalid browser response Ed25519 key")?;
         let response_ml_dsa65 = decode(&document.response_ml_dsa65, "response ML-DSA-65")?;
-        let projection_pq = crate::crypto::pq::ml_dsa_vk_from_bytes(&response_ml_dsa65)
+        crate::crypto::pq::ml_dsa_vk_from_bytes(&response_ml_dsa65)
+            .context("invalid browser response ML-DSA-65 key")?;
+        let projection_ed25519 = decode_exact::<32>(
+            &document.projection_signer_ed25519,
+            "projection signer Ed25519",
+        )?;
+        let projection_verifying_key = VerifyingKey::from_bytes(&projection_ed25519)
+            .context("invalid browser projection signer Ed25519 key")?;
+        let projection_pq_bytes = decode(
+            &document.projection_signer_ml_dsa65,
+            "projection signer ML-DSA-65",
+        )?;
+        let projection_pq = crate::crypto::pq::ml_dsa_vk_from_bytes(&projection_pq_bytes)
             .context("invalid browser response ML-DSA-65 key")?;
         let projection_signature = decode(&document.projection_signature, "projection signature")?;
         let projection_payload = document.projection_payload()?;
         crate::crypto::cose_sign::verify_composite(
             &projection_signature,
-            &server_verifying_key,
+            &projection_verifying_key,
             Some(&projection_pq),
             &projection_payload,
             &projection_external_aad(),
@@ -1077,7 +1122,10 @@ pub async fn fetch_browser_provisioning(
         "browser provisioning response size did not match its bounded content-length"
     );
     let now = chrono::Utc::now().timestamp_millis();
-    let provisioned = BrowserProvisioning::from_json(&bytes, expected, now)?;
+    // The response URL was checked against the requested HTTPS origin above.
+    // Only this transport-authenticated path may accept an origin signer
+    // distinct from the target service's response key.
+    let provisioned = BrowserProvisioning::from_json_with_trust(&bytes, expected, now, true)?;
     let service_origin = parse_https_url(provisioned.service_origin(), "service origin")?;
     anyhow::ensure!(
         service_origin.host_str() == url.host_str(),
@@ -1233,6 +1281,60 @@ mod tests {
         .expect("open payload");
         assert_eq!(opened_binding.expect("transcript").binding, binding);
         assert_eq!(opened_payload, application);
+    }
+
+    #[test]
+    fn distinct_https_origin_signer_requires_authenticated_fetch_boundary() {
+        let now = 1_000_000;
+        let origin_key = crate::crypto::SigningKey::from_bytes(&[0x42; 32]);
+        let unsigned = BrowserProvisioningDocument::from_material(material(now));
+        assert!(unsigned.clone().sign_projection(&origin_key).is_err());
+        let signed = unsigned
+            .clone()
+            .sign_projection_for_https_origin(&origin_key)
+            .expect("sign HTTPS projection");
+        let json = serde_json::to_vec(&signed).expect("encode projection");
+        assert!(BrowserProvisioning::from_json(&json, &request(), now).is_err());
+        let provisioned = BrowserProvisioning::from_json_with_trust(&json, &request(), now, true)
+            .expect("HTTPS-authenticated projection");
+        assert_eq!(
+            provisioned.server_verifying_key().to_bytes(),
+            crate::crypto::SigningKey::from_bytes(&[0x41; 32])
+                .verifying_key()
+                .to_bytes()
+        );
+        let mut tampered = signed.clone();
+        tampered.response_key_id.push_str("-attacker");
+        let tampered_json = serde_json::to_vec(&tampered).expect("encode mutation");
+        assert!(
+            BrowserProvisioning::from_json_with_trust(&tampered_json, &request(), now, true,)
+                .is_err()
+        );
+        let mut malformed_response_key = unsigned;
+        malformed_response_key.response_ml_dsa65 = URL_SAFE_NO_PAD.encode([0u8; 4]);
+        let malformed_response_key = malformed_response_key
+            .sign_projection_for_https_origin(&origin_key)
+            .expect("sign malformed response key projection");
+        let malformed_json =
+            serde_json::to_vec(&malformed_response_key).expect("encode malformed projection");
+        assert!(
+            BrowserProvisioning::from_json_with_trust(&malformed_json, &request(), now, true)
+                .is_err()
+        );
+        let mut wrong_signer = signed;
+        wrong_signer.projection_signer_ed25519 = URL_SAFE_NO_PAD.encode(
+            crate::crypto::SigningKey::from_bytes(&[0x43; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let wrong_signer_json = serde_json::to_vec(&wrong_signer).expect("encode signer mutation");
+        assert!(BrowserProvisioning::from_json_with_trust(
+            &wrong_signer_json,
+            &request(),
+            now,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
