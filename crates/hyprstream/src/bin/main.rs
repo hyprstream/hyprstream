@@ -2958,8 +2958,8 @@ fn main() -> Result<()> {
             init_telemetry(telemetry_provider)?;
         } else {
             let default_log_level = match telemetry_provider {
-                TelemetryProvider::Otlp => "hyprstream=info",
-                TelemetryProvider::Stdout => "hyprstream=warn",
+                TelemetryProvider::Otlp => "hyprstream=info,hyprstream_core=info",
+                TelemetryProvider::Stdout => "hyprstream=warn,hyprstream_core=warn",
             };
 
             if let Ok(log_dir) = std::env::var("HYPRSTREAM_LOG_DIR") {
@@ -2996,9 +2996,9 @@ fn main() -> Result<()> {
     #[cfg(any(not(feature = "otel"), target_arch = "wasm32"))]
     {
         let default_log_level = if is_service_command {
-            "hyprstream=info"
+            "hyprstream=info,hyprstream_core=info"
         } else {
-            "hyprstream=warn"
+            "hyprstream=warn,hyprstream_core=warn"
         };
 
         if let Ok(log_dir) = std::env::var("HYPRSTREAM_LOG_DIR") {
@@ -3873,6 +3873,20 @@ fn main() -> Result<()> {
                                     let (cert_chain, key_der) = qc
                                         .load_tls_materials()
                                         .context("Failed to load QUIC TLS materials")?;
+                                    // Browser WebTransport authenticates short-lived self-signed
+                                    // leaves by their DER SHA-256 hash. WebPKI chains instead use
+                                    // ordinary CA validation and advertise no pin.
+                                    let certificate_hashes = if qc.use_self_signed() {
+                                        use sha2::Digest as _;
+                                        vec![sha2::Sha256::digest(
+                                            cert_chain
+                                                .first()
+                                                .context("QUIC TLS chain is empty")?,
+                                        )
+                                        .into()]
+                                    } else {
+                                        Vec::new()
+                                    };
 
                                     // Print cert hash if requested (hash of leaf cert)
                                     if print_cert_hash {
@@ -3925,6 +3939,7 @@ fn main() -> Result<()> {
                                         ctx.transport("discovery", SocketKind::Rep);
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
+                                        certificate_hashes,
                                         key_der,
                                         base_ip: qc.socket_addr()?.ip(),
                                         server_name: qc.server_name.clone(),
@@ -5889,6 +5904,7 @@ mod native_announcement_wiring {
                 NativeAnnouncementReach::Quic {
                     address: "127.0.0.1:12345".parse().unwrap(),
                     server_name: "fixture".to_owned(),
+                    certificate_hashes: Vec::new(),
                 },
             ] {
                 let fatal =

@@ -44,6 +44,7 @@ pub enum NativeAnnouncementReach {
     Quic {
         address: SocketAddr,
         server_name: String,
+        certificate_hashes: Vec<[u8; 32]>,
     },
     Iroh {
         node_id: [u8; 32],
@@ -63,7 +64,20 @@ impl NativeAnnouncementReach {
             Self::Quic {
                 address,
                 server_name,
-            } => format!("quic://{server_name}:{address}"),
+                certificate_hashes,
+            } => {
+                if certificate_hashes.is_empty() {
+                    format!("quic://{server_name}:{address}")
+                } else {
+                    use base64::Engine as _;
+                    let hashes = certificate_hashes
+                        .iter()
+                        .map(|hash| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("quic://{server_name}:{address}#{hashes}")
+                }
+            }
             Self::Iroh { node_id } => format!("iroh://{}", lowercase_hex(node_id)),
         }
     }
@@ -345,6 +359,9 @@ impl NativeServiceAnnouncement {
 pub struct QuicSharedConfig {
     /// DER-encoded TLS certificate chain (leaf first, then intermediates/CA)
     pub cert_chain: Vec<Vec<u8>>,
+    /// SHA-256 leaf pins for short-lived self-signed WebTransport certificates.
+    /// Empty for WebPKI certificates, which authenticate through the CA chain.
+    pub certificate_hashes: Vec<[u8; 32]>,
     /// DER-encoded TLS private key — zeroed on drop.
     pub key_der: Zeroizing<Vec<u8>>,
     /// Base IP address for binding (e.g., 0.0.0.0)
@@ -468,6 +485,7 @@ impl QuicSharedConfig {
         let quic_signing_key = signing_key.clone();
         let quic_jwt = service_jwt.clone();
         let quic_accepted = accepted.clone();
+        let quic_certificate_hashes = self.certificate_hashes.clone();
         let quic_cancellation = config.announcement_cancellation.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
             if let Err(error) = publish_native_announcement(
@@ -477,6 +495,7 @@ impl QuicSharedConfig {
                 NativeAnnouncementReach::Quic {
                     address: addr,
                     server_name: sn,
+                    certificate_hashes: quic_certificate_hashes.clone(),
                 },
                 quic_signing_key.clone(),
                 quic_jwt.clone(),
@@ -1374,6 +1393,7 @@ mod tests {
         let signer = SigningKey::from_bytes(&[0x41; 32]);
         QuicSharedConfig {
             cert_chain: Vec::new(),
+            certificate_hashes: Vec::new(),
             key_der: Zeroizing::new(Vec::new()),
             base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             server_name: "model.example.test".to_owned(),
@@ -1469,6 +1489,7 @@ mod tests {
         .with_service_key("model", own_key.clone())
         .with_quic(QuicSharedConfig {
             cert_chain: Vec::new(),
+            certificate_hashes: Vec::new(),
             key_der: Zeroizing::new(Vec::new()),
             base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             server_name: "model.example.test".to_owned(),
@@ -1500,6 +1521,7 @@ mod tests {
         );
         let shared = QuicSharedConfig {
             cert_chain: Vec::new(),
+            certificate_hashes: Vec::new(),
             key_der: Zeroizing::new(Vec::new()),
             base_ip: "127.0.0.1".parse().expect("loopback"),
             server_name: "test".to_owned(),
@@ -1659,6 +1681,7 @@ mod tests {
         let published = Arc::new(Mutex::new(Vec::new()));
         let shared = QuicSharedConfig {
             cert_chain: Vec::new(),
+            certificate_hashes: vec![[0x55; 32]],
             key_der: Zeroizing::new(Vec::new()),
             base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             server_name: "model.example.test".to_owned(),
@@ -1704,9 +1727,13 @@ mod tests {
         let iroh = &published[1];
         assert_eq!(quic.reach.socket_kind(), "quic");
         assert_eq!(iroh.reach.socket_kind(), "iroh");
+        use base64::Engine as _;
         assert_eq!(
             quic.reach.endpoint(),
-            "quic://model.example.test:127.0.0.1:4242"
+            format!(
+                "quic://model.example.test:127.0.0.1:4242#{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x55; 32])
+            )
         );
         assert_eq!(iroh.reach.endpoint(), format!("iroh://{}", "ab".repeat(32)));
         assert_eq!(iroh.reach.endpoint().len(), "iroh://".len() + 64);

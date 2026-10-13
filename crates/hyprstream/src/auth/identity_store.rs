@@ -1501,8 +1501,8 @@ pub fn load_or_generate_tls_materials(
 /// caller-specified secret names.
 ///
 /// - If `secrets_dir` contains both `key_name` and `cert_name`, load them.
-/// - If the cert's file mtime is older than `(max_validity_days - 1)` days,
-///   regenerate the cert (reusing the same key) to keep the key hash stable.
+/// - If the cert is nearing expiry or its SAN no longer covers `server_name`,
+///   regenerate the cert using the same key.
 /// - If writable and files are missing, generate key + cert and write both.
 /// - If read-only and files are missing, hard error.
 ///
@@ -1521,8 +1521,11 @@ pub fn load_or_generate_tls_materials_named(
 
     match (key_bytes, cert_bytes) {
         (Some(key_der), Some(cert_der)) => {
-            // Check if cert needs renewal based on file mtime.
-            let needs_renewal = cert_renewal_needed(secrets_dir, cert_name, max_validity_days);
+            // A configured public QUIC name can change independently of the
+            // persisted key. Never keep serving a fresh but wrong-name leaf.
+            let name_mismatch = !certificate_covers_name(&cert_der, server_name);
+            let needs_renewal =
+                name_mismatch || cert_renewal_needed(secrets_dir, cert_name, max_validity_days);
 
             if needs_renewal && is_writable(secrets_dir) {
                 tracing::info!(
@@ -1539,6 +1542,10 @@ pub fn load_or_generate_tls_materials_named(
             }
 
             if needs_renewal {
+                anyhow::ensure!(
+                    !name_mismatch,
+                    "TLS cert '{cert_name}' does not cover configured server name '{server_name}' and credentials are read-only"
+                );
                 // Read-only credentials dir (e.g. systemd $CREDENTIALS_DIRECTORY):
                 // the imported cert ages past validity with no on-disk remedy from
                 // inside the service. Fail loud so operators re-provision (#808).
@@ -1601,6 +1608,24 @@ pub fn load_or_generate_tls_materials_named(
     }
 }
 
+fn certificate_covers_name(cert_der: &[u8], server_name: &str) -> bool {
+    x509_parser::parse_x509_certificate(cert_der)
+        .ok()
+        .is_some_and(|(_, certificate)| {
+            certificate.extensions().iter().any(|extension| {
+                matches!(
+                    extension.parsed_extension(),
+                    x509_parser::extensions::ParsedExtension::SubjectAlternativeName(names)
+                        if names.general_names.iter().any(|name| matches!(
+                            name,
+                            x509_parser::extensions::GeneralName::DNSName(dns)
+                                if dns.eq_ignore_ascii_case(server_name)
+                        ))
+                )
+            })
+        })
+}
+
 // ─── TLS helpers ────────────────────────────────────────────────────────────
 
 /// Check whether the persisted cert needs renewal.
@@ -1657,9 +1682,12 @@ fn generate_cert_from_rcgen_keypair(
     max_validity_days: u32,
 ) -> Result<Vec<u8>> {
     let mut params = rcgen::CertificateParams::new(vec![server_name.to_owned()])?;
-    params.not_before = time::OffsetDateTime::now_utc();
+    let now = time::OffsetDateTime::now_utc();
+    // A small clock-skew allowance and a sub-limit lifetime keep WebTransport
+    // self-signed leaves strictly below its two-week maximum.
+    params.not_before = now - time::Duration::minutes(5);
     params.not_after =
-        time::OffsetDateTime::now_utc() + time::Duration::days(i64::from(max_validity_days));
+        now + time::Duration::days(i64::from(max_validity_days)) - time::Duration::hours(1);
     let cert = params.self_signed(key_pair)?;
     Ok(cert.der().to_vec())
 }
@@ -2074,6 +2102,39 @@ mod tests {
         assert!(
             dir.path().join("tls-cert").exists(),
             "tls-cert file should exist"
+        );
+    }
+
+    #[test]
+    fn test_tls_materials_name_change_renews_leaf_without_rotating_key() {
+        let dir = TempDir::new().unwrap();
+        let old = load_or_generate_tls_materials_named(
+            dir.path(),
+            "localhost",
+            14,
+            "quic-key",
+            "quic-cert",
+        )
+        .unwrap();
+        let renewed = load_or_generate_tls_materials_named(
+            dir.path(),
+            "discovery.example.test",
+            14,
+            "quic-key",
+            "quic-cert",
+        )
+        .unwrap();
+        assert_eq!(*old.key_der, *renewed.key_der);
+        assert!(certificate_covers_name(
+            &renewed.cert_der,
+            "discovery.example.test"
+        ));
+        assert!(!certificate_covers_name(&renewed.cert_der, "localhost"));
+        let (_, certificate) = x509_parser::parse_x509_certificate(&renewed.cert_der).unwrap();
+        assert!(
+            certificate.validity().not_after.timestamp()
+                - certificate.validity().not_before.timestamp()
+                < 14 * 86_400
         );
     }
 
