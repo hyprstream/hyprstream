@@ -2158,6 +2158,56 @@ mod offline_policy_provision_tests {
     }
 
     #[tokio::test]
+    async fn staging_e2e_template_grants_only_the_test_did_and_pinned_resources() {
+        let root = tempfile::tempdir().expect("temporary models root");
+        let templates = vec!["cyberdione-staging-e2e".to_owned()];
+        handle_service_provision_policy_templates(root.path(), &templates)
+            .await
+            .expect("provision exact staging grant");
+        let manager = PolicyManager::new(root.path().join(".registry/policies"))
+            .await
+            .expect("reopen policy store");
+        let did = "did:plc:3f7ldey5bivhfjapwqi2sljy";
+        for (resource, action) in [
+            ("registry:qwen2.5-0.5b-instruct", "query"),
+            ("model:Load", "write"),
+            ("model:Status", "query"),
+            ("model:qwen2.5-0.5b-instruct:main", "infer"),
+        ] {
+            assert!(
+                manager
+                    .check_with_domain(did, "local", resource, action)
+                    .await
+            );
+            assert!(
+                !manager
+                    .check_with_domain(did, "other", resource, action)
+                    .await
+            );
+            assert!(
+                !manager
+                    .check_with_domain(
+                        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                        "local",
+                        resource,
+                        action
+                    )
+                    .await
+            );
+        }
+        assert!(
+            !manager
+                .check_with_domain(did, "local", "registry:other", "query")
+                .await
+        );
+        assert!(
+            !manager
+                .check_with_domain(did, "local", "model:qwen2.5-0.5b-instruct:other", "infer")
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_and_repeat_public_staging_policy_is_canonical() {
         let root = tempfile::tempdir().expect("temporary models root");
         handle_service_provision_policy_templates(root.path(), &public_templates())
