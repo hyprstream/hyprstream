@@ -154,6 +154,17 @@ pub(crate) fn runtime_policy_client(
 /// any inner middleware (like logging) runs. This fixes the previous ordering
 /// where logging was outermost and CORS was inner.
 pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfig) -> Router {
+    // The public TLS hostname terminates on OAuth. Keep this one bootstrap
+    // route independently rate-limited before accepted-state resolution.
+    let browser_provisioning_router = Router::new()
+        .route(
+            "/.well-known/hyprstream/browser-provisioning/:service",
+            get(crate::server::routes::browser_provisioning::oauth_browser_provisioning),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state.browser_provisioning_rate_limiter),
+            crate::server::middleware::browser_provisioning_rate_limit_middleware,
+        ));
     // ── Public routes ──────────────────────────────────────────────────────────
     // No Bearer token required. Includes all OAuth flow endpoints (clients are
     // unauthenticated when they arrive) and SCIM discovery (RFC 7644 §4).
@@ -373,6 +384,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         );
 
     let mut api_router = public_router
+        .merge(browser_provisioning_router)
         .merge(protected_router)
         .merge(self_service_identity_router);
 
@@ -1150,7 +1162,8 @@ impl Spawnable for OAuthService {
                 policy_client,
                 discovery_client.clone(),
                 jwt_verifying_key,
-            );
+            )
+            .with_browser_provisioning_signer(self.signing_key.clone());
             if let Some(store) = &hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
             }
