@@ -1851,7 +1851,13 @@ impl DiscoveryServiceResolver {
                             "browser provisioning requires selected QUIC/WebTransport network reach"
                         );
                     };
-                    let authority = format!("{server_name}:{}", addr.port());
+                    // URL parsers elide the default HTTPS port. Emit that same
+                    // canonical form before signing the browser projection.
+                    let authority = if addr.port() == 443 {
+                        server_name.clone()
+                    } else {
+                        format!("{server_name}:{}", addr.port())
+                    };
                     let origin = format!("https://{authority}/");
                     let route = format!(
                         "https://{authority}{}",
@@ -5979,6 +5985,33 @@ mod resolver_tests {
         assert_eq!(validated.service_name(), "model");
         assert_eq!(validated.accepted_state_epoch(), 1);
         assert!(validated.service_did().starts_with("did:at9p:"));
+    }
+
+    #[tokio::test]
+    async fn production_browser_projection_normalizes_default_https_port() {
+        let (resolver, _) = production_fixture(false);
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = "quic://localhost:127.0.0.1:443".to_owned();
+        })
+        .await;
+        let document = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .expect("project default HTTPS port")
+            .sign_projection(&SigningKey::from_bytes(&[11; 32]))
+            .expect("sign projection");
+        assert_eq!(document.service_origin, "https://localhost/");
+        assert_eq!(
+            document.webtransport_url,
+            "https://localhost/hyprstream/browser-rpc"
+        );
+        let json = serde_json::to_vec(&document).expect("serialize provisioning");
+        hyprstream_rpc::browser_provisioning::BrowserProvisioning::from_json(
+            &json,
+            &owned_browser_request(),
+            unix_millis_now(),
+        )
+        .expect("default-port projection must validate in the browser");
     }
 
     #[tokio::test]
