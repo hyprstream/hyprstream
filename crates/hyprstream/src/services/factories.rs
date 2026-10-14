@@ -3817,6 +3817,7 @@ mod tests {
         )
         .with_quic(hyprstream_service::QuicSharedConfig {
             cert_chain: Vec::new(),
+            certificate_hashes: Vec::new(),
             key_der: zeroize::Zeroizing::new(Vec::new()),
             base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             server_name: "policy.test".to_owned(),
@@ -3874,6 +3875,7 @@ mod tests {
         let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, custom.clone())
             .with_quic(hyprstream_service::QuicSharedConfig {
                 cert_chain: Vec::new(),
+                certificate_hashes: Vec::new(),
                 key_der: zeroize::Zeroizing::new(Vec::new()),
                 base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
                 server_name: "policy.test".to_owned(),
@@ -3950,6 +3952,7 @@ mod tests {
         let ctx = ServiceContext::new(signer.clone(), signer.verifying_key(), true, custom.clone())
             .with_quic(hyprstream_service::QuicSharedConfig {
                 cert_chain: Vec::new(),
+                certificate_hashes: Vec::new(),
                 key_der: zeroize::Zeroizing::new(Vec::new()),
                 base_ip: std::net::Ipv4Addr::LOCALHOST.into(),
                 server_name: "policy.test".to_owned(),
