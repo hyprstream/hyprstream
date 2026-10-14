@@ -1541,7 +1541,7 @@ fn accepted_expiry_unix_ms(
 
 /// Fixed bootstrap roles use only checkpoint-authenticated capsule contents.
 /// Carrier addresses and caller-provided public keys never mint authority.
-#[cfg_attr(all(not(feature = "rocksdb"), not(test)), allow(dead_code))]
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 pub(super) fn project_bootstrap_endpoint(
     states: &[hyprstream_pds::at9p_duplicity::AcceptedAt9pState],
     service_name: &str,
@@ -1851,7 +1851,13 @@ impl DiscoveryServiceResolver {
                             "browser provisioning requires selected QUIC/WebTransport network reach"
                         );
                     };
-                    let authority = format!("{server_name}:{}", addr.port());
+                    // URL parsers elide the default HTTPS port. Emit that same
+                    // canonical form before signing the browser projection.
+                    let authority = if addr.port() == 443 {
+                        server_name.clone()
+                    } else {
+                        format!("{server_name}:{}", addr.port())
+                    };
                     let origin = format!("https://{authority}/");
                     let route = format!(
                         "https://{authority}{}",
@@ -3707,6 +3713,7 @@ struct ProcessBootstrapAuthority {
 enum ProcessAcceptanceIdentity {
     Deployment(RegistryDeploymentVerifier),
     #[cfg(test)]
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     Test(VerifyingKey),
 }
 
@@ -4082,6 +4089,7 @@ pub async fn resolve_and_authenticate_did_anchors(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 fn authenticate_discovery_bootstrap_identity(
     acceptance_identity: ed25519_dalek::VerifyingKey,
 ) -> Result<ProcessBootstrapAuthority> {
@@ -5982,6 +5990,33 @@ mod resolver_tests {
     }
 
     #[tokio::test]
+    async fn production_browser_projection_normalizes_default_https_port() {
+        let (resolver, _) = production_fixture(false);
+        mutate_endpoint(&resolver, "model", "quic", |endpoint| {
+            endpoint.endpoint = "quic://localhost:127.0.0.1:443".to_owned();
+        })
+        .await;
+        let document = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .expect("project default HTTPS port")
+            .sign_projection(&SigningKey::from_bytes(&[11; 32]))
+            .expect("sign projection");
+        assert_eq!(document.service_origin, "https://localhost/");
+        assert_eq!(
+            document.webtransport_url,
+            "https://localhost/hyprstream/browser-rpc"
+        );
+        let json = serde_json::to_vec(&document).expect("serialize provisioning");
+        hyprstream_rpc::browser_provisioning::BrowserProvisioning::from_json(
+            &json,
+            &owned_browser_request(),
+            unix_millis_now(),
+        )
+        .expect("default-port projection must validate in the browser");
+    }
+
+    #[tokio::test]
     async fn network_iroh_profile_rejects_quic_and_browser_profile_rejects_iroh() {
         let (resolver, _) = production_fixture(false);
         let native = match resolver
@@ -6867,6 +6902,7 @@ mod resolver_tests {
         assert!(status.success(), "isolated resolver subprocess failed");
     }
 
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     struct NoopBootstrapClient;
 
     #[async_trait::async_trait]
@@ -6932,6 +6968,7 @@ mod resolver_tests {
         }
     }
 
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     fn authenticated_registry_identity(tag: u8) -> ed25519_dalek::VerifyingKey {
         SigningKey::from_bytes(&[tag; 32]).verifying_key()
     }
@@ -7383,6 +7420,7 @@ mod resolver_tests {
         assert!(status.success(), "resolver bootstrap subprocess failed");
     }
 
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     fn seed_registry_for_bootstrap(tag: u8) {
         let registry = SigningKey::from_bytes(&[tag; 32]);
         hyprstream_service::global_trust_store().insert(
