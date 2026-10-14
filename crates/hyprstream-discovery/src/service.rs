@@ -1541,7 +1541,7 @@ fn accepted_expiry_unix_ms(
 
 /// Fixed bootstrap roles use only checkpoint-authenticated capsule contents.
 /// Carrier addresses and caller-provided public keys never mint authority.
-#[cfg_attr(all(not(feature = "rocksdb"), not(test)), allow(dead_code))]
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 pub(super) fn project_bootstrap_endpoint(
     states: &[hyprstream_pds::at9p_duplicity::AcceptedAt9pState],
     service_name: &str,
@@ -3713,6 +3713,7 @@ struct ProcessBootstrapAuthority {
 enum ProcessAcceptanceIdentity {
     Deployment(RegistryDeploymentVerifier),
     #[cfg(test)]
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     Test(VerifyingKey),
 }
 
@@ -4088,6 +4089,7 @@ pub async fn resolve_and_authenticate_did_anchors(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 fn authenticate_discovery_bootstrap_identity(
     acceptance_identity: ed25519_dalek::VerifyingKey,
 ) -> Result<ProcessBootstrapAuthority> {
@@ -6900,6 +6902,7 @@ mod resolver_tests {
         assert!(status.success(), "isolated resolver subprocess failed");
     }
 
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     struct NoopBootstrapClient;
 
     #[async_trait::async_trait]
@@ -6965,6 +6968,7 @@ mod resolver_tests {
         }
     }
 
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     fn authenticated_registry_identity(tag: u8) -> ed25519_dalek::VerifyingKey {
         SigningKey::from_bytes(&[tag; 32]).verifying_key()
     }
@@ -7416,6 +7420,7 @@ mod resolver_tests {
         assert!(status.success(), "resolver bootstrap subprocess failed");
     }
 
+    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     fn seed_registry_for_bootstrap(tag: u8) {
         let registry = SigningKey::from_bytes(&[tag; 32]);
         hyprstream_service::global_trust_store().insert(
