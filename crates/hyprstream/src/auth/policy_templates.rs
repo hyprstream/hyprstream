@@ -392,6 +392,23 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
         action: "write",
         effect: "allow",
     },
+    // OAuth serves browser provisioning for the two staging RPC services.
+    // Its production resolver must query their accepted-current Discovery
+    // records; this grants no announcement mutation or unrelated lookups.
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "discovery:registry",
+        action: "query",
+        effect: "allow",
+    },
+    ServicePolicyRule {
+        subject: "service:oauth",
+        domain: "*",
+        resource: "discovery:model",
+        action: "query",
+        effect: "allow",
+    },
     ServicePolicyRule {
         subject: "service:event",
         domain: "*",
