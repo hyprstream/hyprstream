@@ -1612,6 +1612,26 @@ mod tests {
             "service:oauth should be able to query policy:ResolveServiceKey via base rules"
         );
 
+        // OAuth's public browser-provisioning route uses its own resolver to
+        // project only Registry and Model accepted-current reach.
+        for service in ["registry", "model"] {
+            assert!(
+                pm.check_with_domain(
+                    "service:oauth",
+                    "*",
+                    &format!("discovery:{service}"),
+                    "query"
+                )
+                .await,
+                "service:oauth must resolve {service} for browser provisioning"
+            );
+        }
+        assert!(
+            !pm.check_with_domain("service:oauth", "*", "discovery:policy", "query")
+                .await,
+            "browser provisioning must not grant arbitrary Discovery queries"
+        );
+
         // Other service grants from SERVICE_BASE_POLICIES
         assert!(
             pm.check_with_domain("service:policy", "*", "policy:IssueToken", "manage")
