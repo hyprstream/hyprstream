@@ -25,6 +25,9 @@ cat > "${test_root}/cargo" <<'EOF'
 set -euo pipefail
 # libtest must expose stderr even for passing tests that return early.
 [[ " $* " == *' --show-output '* ]] || exit 65
+if [[ " $* " == *' -p hyprstream '* ]]; then
+  [[ " $* " == *' --features '*pglite* ]] || exit 70
+fi
 case " $* " in
   *' auth::postgres_store::tests:: '*) sentinel='auth::postgres_store::tests::add_list_remove_pubkey' ;;
   *' pgsql_kv::tests::live_ '*)
