@@ -52,8 +52,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Keep container builds on the same compiler/components as local builds and CI.
+# Placing the override at / also covers the later /build working directory.
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install sccache for compilation caching (works with BuildKit cache mounts)
@@ -92,7 +95,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
@@ -413,6 +418,7 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # defaulting to the in-container /build/target for every other invocation
 # (docker-build.yml, build-image.yml).
 ARG CARGO_TARGET_DIR=/build/target
+ARG CARGO_BUILD_JOBS=4
 ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \

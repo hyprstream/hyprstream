@@ -35,6 +35,15 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
+  dev-loop-contract:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check guest build and rollback behavior
+      run: |
+        bash -n scripts/staging-live-loop.sh
+        python3 scripts/tests/test_staging_live_loop.py
+
   # Required-check placeholder. The protection ruleset requires the context
   # "build-runtime-and-smoke-test", which the real job below only reports in
   # merge_group/dispatch context; a required context that NEVER reports on a
@@ -57,6 +66,7 @@ jobs:
     # The real job never runs on pull_request — the placeholder above reports
     # the required context there instead.
     if: github.event_name != 'pull_request'
+    needs: dev-loop-contract
     # Same self-hosted Graviton pool as build-image.yml and the merge gate:
     # native arm64 (no qemu), podman-only (Rocky 10 golden AMI).
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
