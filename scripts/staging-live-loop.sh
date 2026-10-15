@@ -102,9 +102,14 @@ build() {
   [ -d "$graph_root" ] || { echo "Missing Podman storage: $graph_root" >&2; exit 2; }
   source_free_kib="$(df -Pk -- "$cache_dir" | awk 'NR == 2 { print $4 }')"
   image_free_kib="$(df -Pk -- "$graph_root" | awk 'NR == 2 { print $4 }')"
-  if [ "$source_free_kib" -lt $((30 * 1024 * 1024)) ] ||
-     [ "$image_free_kib" -lt $((30 * 1024 * 1024)) ]; then
-    echo 'Refusing a cold image build with less than 30 GiB free; use dedicated build storage.' >&2
+  minimum_kib=$((30 * 1024 * 1024))
+  if [ "$(stat -f -c %i -- "$cache_dir")" = "$(stat -f -c %i -- "$graph_root")" ]; then
+    # These two consumers share one pool; do not count the same free blocks twice.
+    minimum_kib=$((2 * minimum_kib))
+  fi
+  if [ "$source_free_kib" -lt "$minimum_kib" ] ||
+     [ "$image_free_kib" -lt "$minimum_kib" ]; then
+    echo 'Refusing a cold image build: require 30 GiB per filesystem, or 60 GiB when build cache and image storage share one.' >&2
     exit 75
   fi
   mkdir -p -m 0700 "$state_dir"

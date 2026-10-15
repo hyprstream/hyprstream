@@ -92,6 +92,22 @@ exec /usr/bin/cp "$@"
         self.assertEqual(self.quadlet.read_text(), self.original)
         self.assertFalse(backup.exists())
 
+    def test_shared_storage_requires_combined_build_headroom(self):
+        self.stub("df", "printf 'Filesystem 1024-blocks Used Available Capacity Mounted\\ntest 200000000 1 41943040 1%% /\\n'")
+        result = self.run_guest("build")
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("60 GiB", result.stderr)
+        self.assertNotIn("podman build", self.log.read_text())
+
+    def test_distinct_filesystems_each_have_their_own_headroom(self):
+        self.stub("df", "printf 'Filesystem 1024-blocks Used Available Capacity Mounted\\ntest 200000000 1 41943040 1%% /\\n'")
+        self.stub("stat", '''
+for stat_arg do stat_path=$stat_arg; done
+case "$stat_path" in */cache) echo cache-filesystem ;; *) echo image-filesystem ;; esac
+''')
+        self.assert_ok(self.run_guest("build"))
+        self.assertIn("podman build", self.log.read_text())
+
     def test_event_uses_the_deployed_quadlet_and_unit_names(self):
         event = self.quadlets / "hyprstream.container"
         event.write_text(self.original)

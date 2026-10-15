@@ -16,7 +16,8 @@ scratch disk when necessary. The cache and container storage filesystems must
 support the guest's container access: the script privately relabels only this
 guest-owned cache with Podman's `:Z` option for SELinux. This is separate from
 the shared BuildQ pool on hypr1 and must never point at it. Both filesystems must
-each have at least 30 GiB free before building. This is a minimum check; measure
+each have at least 30 GiB free before building, or 60 GiB total when they share
+one filesystem. This is a minimum check; measure
 the first build's peak space/RAM and cold/warm elapsed time before selecting a
 default VM size. This script has not yet been qualified on a real guest.
 
