@@ -28,15 +28,29 @@ service_file() {
     *) echo "Unknown staging service: $1" >&2; exit 2 ;;
   esac
   if [ "$1" = event ]; then
-    printf '%s/hyprstream.container\n' "$quadlet_dir"
+    local current="$quadlet_dir/hyprstream-event.container"
+    local legacy="$quadlet_dir/hyprstream.container"
+    if { [ -e "$current" ] || [ -L "$current" ]; } &&
+       { [ -e "$legacy" ] || [ -L "$legacy" ]; }; then
+      echo 'Ambiguous Event Quadlets: both hyprstream-event.container and hyprstream.container exist.' >&2
+      return 2
+    fi
+    if [ -e "$current" ] || [ -L "$current" ]; then
+      printf '%s\n' "$current"
+    elif [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      printf '%s\n' "$legacy"
+    else
+      echo 'Missing Event Quadlet: expected hyprstream-event.container or hyprstream.container.' >&2
+      return 2
+    fi
     return
   fi
   printf '%s/hyprstream-%s.container\n' "$quadlet_dir" "$1"
 }
 
 service_unit() {
-  if [ "$1" = event ]; then printf 'hyprstream.service\n';
-  else printf 'hyprstream-%s.service\n' "$1"; fi
+  local filename="${1##*/}"
+  printf '%s.service\n' "${filename%.container}"
 }
 
 restore_quadlet() {
@@ -133,7 +147,7 @@ activate() {
   service="$1"
   image="$2"
   file="$(service_file "$service")"
-  unit="$(service_unit "$service")"
+  unit="$(service_unit "$file")"
   case "$image" in
     localhost/hyprstream-staging-dev:*) ;;
     *) echo 'Only a locally built staging-dev image may be activated.' >&2; exit 2 ;;
@@ -195,7 +209,7 @@ rollback() {
   require_guest
   service="$1"
   file="$(service_file "$service")"
-  unit="$(service_unit "$service")"
+  unit="$(service_unit "$file")"
   exec 8>"$state_dir/update.lock"
   flock -n 8 || { echo 'A staging service update is already running.' >&2; exit 75; }
   backup="$state_dir/hyprstream-$service.container.original"

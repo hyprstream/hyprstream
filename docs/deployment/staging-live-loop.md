@@ -32,6 +32,10 @@ bash scripts/staging-live-loop.sh rollback policy
 Activation stages a Quadlet change, disables registry auto-update for that
 local image, restarts the service and checks systemd readiness. Repeated
 activations preserve the original deployed configuration.
+For `event`, the helper selects the existing `hyprstream-event.container`
+and its matching `hyprstream-event.service`, or the legacy `hyprstream.container`
+and `hyprstream.service`. It refuses to activate or roll back Event when both
+filenames exist or neither supported filename exists.
 After a normal deployment replaces the local override, a new activation
 checkpoints that newer release; rollback refuses to overwrite an intervening
 deployment with a stale checkpoint. Failed activation

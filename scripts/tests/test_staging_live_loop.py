@@ -108,7 +108,7 @@ case "$stat_path" in */cache) echo cache-filesystem ;; *) echo image-filesystem 
         self.assert_ok(self.run_guest("build"))
         self.assertIn("podman build", self.log.read_text())
 
-    def test_event_uses_the_deployed_quadlet_and_unit_names(self):
+    def test_event_supports_the_legacy_quadlet_and_matching_unit(self):
         event = self.quadlets / "hyprstream.container"
         event.write_text(self.original)
         self.assert_ok(self.run_guest("activate", "event", "localhost/hyprstream-staging-dev:first"))
@@ -117,6 +117,50 @@ case "$stat_path" in */cache) echo cache-filesystem ;; *) echo image-filesystem 
         self.assertNotIn("hyprstream-event.service", self.log.read_text())
         self.assert_ok(self.run_guest("rollback", "event"))
         self.assertEqual(event.read_text(), self.original)
+        commands = self.log.read_text()
+        self.assertEqual(commands.count("systemctl --user restart hyprstream.service"), 2)
+        self.assertNotIn("hyprstream-event.service", commands)
+
+    def test_event_uses_the_current_quadlet_and_matching_unit(self):
+        event = self.quadlets / "hyprstream-event.container"
+        event.write_text(self.original)
+        self.assert_ok(self.run_guest("activate", "event", "localhost/hyprstream-staging-dev:first"))
+        self.assertIn("Image=localhost/hyprstream-staging-dev:first", event.read_text())
+        self.assert_ok(self.run_guest("rollback", "event"))
+        self.assertEqual(event.read_text(), self.original)
+        commands = self.log.read_text()
+        self.assertEqual(commands.count("systemctl --user restart hyprstream-event.service"), 2)
+        self.assertNotIn("systemctl --user restart hyprstream.service", commands)
+        self.assertEqual(self.quadlet.read_text(), self.original)
+
+    def test_event_rejects_ambiguous_or_unsupported_layout_before_changes(self):
+        current = self.quadlets / "hyprstream-event.container"
+        legacy = self.quadlets / "hyprstream.container"
+        unsupported = self.quadlets / "event.container"
+        for layout in [(current, legacy), (unsupported,), ()]:
+            with self.subTest(layout=[file.name for file in layout]):
+                for file in layout:
+                    file.write_text(self.original)
+                for args in [("activate", "event", "localhost/hyprstream-staging-dev:first"),
+                             ("rollback", "event")]:
+                    result = self.run_guest(*args)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("Ambiguous" if len(layout) == 2 else "Missing Event Quadlet", result.stderr)
+                    self.assertFalse(self.log.exists())
+                    self.assertFalse(self.state.exists())
+                    for file in layout:
+                        self.assertEqual(file.read_text(), self.original)
+                for file in layout:
+                    file.unlink()
+
+    def test_event_rejects_symlink_instead_of_falling_back(self):
+        event = self.quadlets / "hyprstream-event.container"
+        event.symlink_to(self.quadlet)
+        result = self.run_guest("activate", "event", "localhost/hyprstream-staging-dev:first")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Invalid Quadlet", result.stderr)
+        self.assertEqual(self.quadlet.read_text(), self.original)
+        self.assertFalse(self.log.exists())
 
     def test_normal_deployment_supersedes_previous_rollback_checkpoint(self):
         self.assert_ok(self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:first"))
