@@ -1225,7 +1225,7 @@ impl Spawnable for OAuthService {
                 oauth_state = oauth_state.with_signing_key_store(store);
             }
             #[cfg(feature = "postgres")]
-            {
+            if federate_source::FederateHost::new(&oauth_state.issuer_url).is_ok() {
                 let admission = std::sync::Arc::new(
                     crate::services::oauth::federate_policy::PolicyFederateAdmission::new(
                         oauth_state.policy_client.clone(),
@@ -1242,6 +1242,8 @@ impl Spawnable for OAuthService {
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
                         format!("FederateIssuer installation failed: {e:#}"),
                     ))?;
+            } else {
+                tracing::warn!("Federate exchange disabled: OAuth issuer must be an exact canonical HTTPS origin");
             }
             oauth_state = oauth_state.with_root_identity_key_store(root_identity_store);
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));

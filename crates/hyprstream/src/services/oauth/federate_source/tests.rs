@@ -90,6 +90,88 @@ async fn source(v: &Verifier, t: &str) -> Source {
 }
 
 #[tokio::test]
+async fn configured_hosts_bind_source_nonce_and_possession() {
+    let a = FederateHost::new("https://vm-a.example").unwrap();
+    let b = FederateHost::new("https://vm-b.example:8443").unwrap();
+    let local_commitment = |host: &FederateHost| {
+        let mut c = commitment();
+        c.host = host.clone();
+        c
+    };
+    assert_ne!(local_commitment(&a).nonce(), local_commitment(&b).nonce());
+    let mut transcripts = Vec::new();
+    for host in [&a, &b] {
+        let mut v = verifier();
+        v.host = Some(host.clone());
+        let mut upstream = claims();
+        upstream["nonce"] = local_commitment(host).nonce().into();
+        let signed = token(&upstream);
+        let s = v
+            .source(&signed, CODE, local_commitment(host), NOW, None)
+            .await
+            .unwrap();
+        let challenge = s.challenge(binding(), [9; 32], NOW).unwrap();
+        transcripts.push(challenge.transcript().to_vec());
+        let ed = SigningKey::from_bytes(&[7; 32])
+            .sign(challenge.transcript())
+            .to_bytes();
+        let pq = ml_dsa_sign(&ml_dsa_sk_from_seed(&[8; 32]), challenge.transcript());
+        let s = v
+            .source(&signed, CODE, local_commitment(host), NOW, None)
+            .await
+            .unwrap();
+        challenge.verify(s, &[9; 32], &ed, &pq, NOW + 1).unwrap();
+        let other = if host == &a { &b } else { &a };
+        // Matching the untrusted upstream nonce alone cannot cross the
+        // verifier's configured authority boundary.
+        assert!(v
+            .source(&signed, CODE, local_commitment(other), NOW, None)
+            .await
+            .is_err());
+        let mut other_upstream = upstream.clone();
+        other_upstream["nonce"] = local_commitment(other).nonce().into();
+        assert!(v
+            .source(
+                &token(&other_upstream),
+                CODE,
+                local_commitment(host),
+                NOW,
+                None
+            )
+            .await
+            .is_err());
+    }
+    assert_ne!(transcripts[0], transcripts[1]);
+    assert!(transcripts[0]
+        .windows(a.token_endpoint().len())
+        .any(|w| w == a.token_endpoint().as_bytes()));
+    assert!(transcripts[1]
+        .windows(b.token_endpoint().len())
+        .any(|w| w == b.token_endpoint().as_bytes()));
+    let mut verifier_b = verifier();
+    verifier_b.host = Some(b.clone());
+    let mut upstream_b = claims();
+    upstream_b["nonce"] = local_commitment(&b).nonce().into();
+    let token_b = token(&upstream_b);
+    let source_b = verifier_b
+        .source(&token_b, CODE, local_commitment(&b), NOW, None)
+        .await
+        .unwrap();
+    let challenge_b = source_b.challenge(binding(), [9; 32], NOW).unwrap();
+    let ed_a = SigningKey::from_bytes(&[7; 32])
+        .sign(&transcripts[0])
+        .to_bytes();
+    let pq_a = ml_dsa_sign(&ml_dsa_sk_from_seed(&[8; 32]), &transcripts[0]);
+    let source_b = verifier_b
+        .source(&token_b, CODE, local_commitment(&b), NOW, None)
+        .await
+        .unwrap();
+    assert!(challenge_b
+        .verify(source_b, &[9; 32], &ed_a, &pq_a, NOW + 1)
+        .is_err());
+}
+
+#[tokio::test]
 async fn valid_source_and_both_signatures_only() {
     let v = verifier();
     let t = token(&claims());
@@ -495,6 +577,7 @@ fn published_cross_language_framing_vectors() {
         .collect();
     // Patterned PQ data is only an encoding fixture, not a signing identity.
     let c = Commitment {
+        host: FederateHost::new(HOST).unwrap(),
         random: fields[6].clone().try_into().unwrap(),
         state: B64.encode((32..64).collect::<Vec<u8>>()),
         pkce: String::from_utf8(fields[10].clone()).unwrap(),

@@ -19,6 +19,23 @@ const MAX_BODY: usize = 24 * 1024;
 const MAX_SOURCE_TOKEN: usize = 16 * 1024;
 const MAX_CODE: usize = 2048;
 
+#[cfg(all(test, feature = "postgres"))]
+pub(crate) fn committed_claims(
+    session: &Session,
+    now: i64,
+    issuer: &str,
+    subject: &str,
+) -> Result<Claims, federate_source::Error> {
+    committed_claims_for_host(
+        session,
+        now,
+        issuer,
+        subject,
+        &federate_source::FederateHost::new(federate_source::HOST)
+            .map_err(|_| federate_source::Error::Invalid)?,
+    )
+}
+
 /// The exact A0 challenge envelope. `deny_unknown_fields` and serde's
 /// duplicate-field rejection prevent browser-chosen authority from being
 /// silently ignored or ambiguously interpreted.
@@ -40,7 +57,18 @@ pub(crate) struct ChallengeRequest {
 }
 
 impl ChallengeRequest {
+    #[cfg(test)]
     pub(crate) fn parse(body: &[u8]) -> Result<Self, federate_source::Error> {
+        Self::parse_for_host(
+            body,
+            &federate_source::FederateHost::new(federate_source::HOST)
+                .map_err(|_| federate_source::Error::Invalid)?,
+        )
+    }
+    pub(crate) fn parse_for_host(
+        body: &[u8],
+        host: &federate_source::FederateHost,
+    ) -> Result<Self, federate_source::Error> {
         if body.is_empty() || body.len() > MAX_BODY {
             return Err(federate_source::Error::Invalid);
         }
@@ -49,7 +77,7 @@ impl ChallengeRequest {
         if request.profile != PROFILE
             || request.client_id != federate_source::CLIENT
             || request.subject_token_type != ID_TOKEN_TYPE
-            || request.resource != federate_source::HOST
+            || request.resource != host.as_str()
             || request.subject_token.is_empty()
             || request.subject_token.len() > MAX_SOURCE_TOKEN
             || request.authorization_code.is_empty()
@@ -81,7 +109,11 @@ impl ChallengeRequest {
         verifier: &Verifier,
         now: u64,
     ) -> Result<Source, federate_source::Error> {
-        let commitment = Commitment::new(
+        if self.resource != verifier.host()?.as_str() {
+            return Err(federate_source::Error::Invalid);
+        }
+        let commitment = Commitment::for_host(
+            verifier.host()?.clone(),
             &self.login_random,
             &self.state,
             &self.pkce_challenge,
@@ -130,7 +162,18 @@ pub(crate) struct ExchangeRequest {
 }
 
 impl ExchangeRequest {
+    #[cfg(test)]
     pub(crate) fn parse(body: &[u8]) -> Result<Self, federate_source::Error> {
+        Self::parse_for_host(
+            body,
+            &federate_source::FederateHost::new(federate_source::HOST)
+                .map_err(|_| federate_source::Error::Invalid)?,
+        )
+    }
+    pub(crate) fn parse_for_host(
+        body: &[u8],
+        host: &federate_source::FederateHost,
+    ) -> Result<Self, federate_source::Error> {
         if body.is_empty() || body.len() > MAX_BODY {
             return Err(federate_source::Error::Invalid);
         }
@@ -150,7 +193,7 @@ impl ExchangeRequest {
             || request.client_id != federate_source::CLIENT
             || request.subject_token_type != ID_TOKEN_TYPE
             || request.requested_token_type != ACCESS_TOKEN_TYPE
-            || request.resource != federate_source::HOST
+            || request.resource != host.as_str()
             || request.subject_token.is_empty()
             || request.subject_token.len() > MAX_SOURCE_TOKEN
         {
@@ -216,15 +259,16 @@ impl ExchangeRequest {
 /// Only a committed Policy session can be passed to this constructor by the
 /// host issuer. It derives every authority claim from the durable record.
 #[cfg(feature = "postgres")]
-pub(crate) fn committed_claims(
+pub(crate) fn committed_claims_for_host(
     session: &Session,
     now: i64,
     source_issuer: &str,
     source_subject: &str,
+    host: &federate_source::FederateHost,
 ) -> Result<Claims, federate_source::Error> {
-    if session.host != federate_source::HOST
+    if session.host != host.as_str()
         || session.client_id != federate_source::CLIENT
-        || session.resource != federate_source::HOST
+        || session.resource != host.as_str()
         || session.sid.is_empty()
         || session.tenant.is_empty()
         || session.tenant == "*"
@@ -285,14 +329,15 @@ pub(crate) fn committed_claims(
 /// Attach only the exact subject's authority-enrolled MAC clearance. Policy's
 /// action grants do not imply a clearance, and browser inputs cannot select it.
 #[cfg(feature = "postgres")]
-pub(crate) fn authorized_committed_claims(
+pub(crate) fn authorized_committed_claims_for_host(
     session: &Session,
     now: i64,
     source_issuer: &str,
     source_subject: &str,
     resolver: &dyn super::token_exchange::SubjectContextResolver,
+    host: &federate_source::FederateHost,
 ) -> Result<Claims, federate_source::Error> {
-    let claims = committed_claims(session, now, source_issuer, source_subject)?;
+    let claims = committed_claims_for_host(session, now, source_issuer, source_subject, host)?;
     let context = resolver
         .resolve(&claims.sub)
         .ok_or(federate_source::Error::Unavailable)?;
@@ -312,14 +357,33 @@ pub(crate) struct ExchangeResponse {
 
 #[cfg(feature = "postgres")]
 impl ExchangeResponse {
+    #[cfg(test)]
     pub(crate) fn committed(
+        token: String,
+        session: &Session,
+        now: i64,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Self, federate_source::Error> {
+        Self::committed_for_host(
+            token,
+            session,
+            now,
+            issuer,
+            subject,
+            &federate_source::FederateHost::new(federate_source::HOST)
+                .map_err(|_| federate_source::Error::Invalid)?,
+        )
+    }
+    pub(crate) fn committed_for_host(
         token: String,
         session: &Session,
         now: i64,
         source_issuer: &str,
         source_subject: &str,
+        host: &federate_source::FederateHost,
     ) -> Result<Self, federate_source::Error> {
-        committed_claims(session, now, source_issuer, source_subject)?;
+        committed_claims_for_host(session, now, source_issuer, source_subject, host)?;
         if token.is_empty() || token.len() > MAX_SOURCE_TOKEN * 2 {
             return Err(federate_source::Error::Invalid);
         }
@@ -503,6 +567,72 @@ mod tests {
             "ed25519_public": "d",
             "ml_dsa65_public": "e"
         })
+    }
+
+    #[test]
+    fn configured_resource_is_exact_for_challenge_and_exchange() -> anyhow::Result<()> {
+        for local in ["https://vm-a.example", "https://vm-b.example:8443"] {
+            let host = federate_source::FederateHost::new(local)?;
+            let mut body = request();
+            body["resource"] = local.into();
+            assert!(ChallengeRequest::parse_for_host(&serde_json::to_vec(&body)?, &host).is_ok());
+            let form: String = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(url::form_urlencoded::parse(exchange_form().as_bytes()).map(
+                    |(k, v)| {
+                        let v = if k == "resource" {
+                            local.to_owned()
+                        } else {
+                            v.into_owned()
+                        };
+                        (k.into_owned(), v)
+                    },
+                ))
+                .finish();
+            assert!(ExchangeRequest::parse_for_host(form.as_bytes(), &host).is_ok());
+            let other = federate_source::FederateHost::new("https://other.example")?;
+            assert!(ChallengeRequest::parse_for_host(&serde_json::to_vec(&body)?, &other).is_err());
+            assert!(ExchangeRequest::parse_for_host(form.as_bytes(), &other).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn configured_claims_reject_policy_record_from_another_host() -> anyhow::Result<()> {
+        for local in ["https://vm-a.example", "https://vm-b.example:8443"] {
+            let host = federate_source::FederateHost::new(local)?;
+            let other = federate_source::FederateHost::new("https://other.example")?;
+            let mut session = committed_session();
+            session.host = local.into();
+            session.resource = local.into();
+            let claims = committed_claims_for_host(
+                &session,
+                1_800_000_000,
+                federate_source::ISSUER,
+                "source-sub",
+                &host,
+            )?;
+            assert_eq!(claims.iss, local);
+            assert_eq!(claims.aud.as_deref(), Some(local));
+            assert!(committed_claims_for_host(
+                &session,
+                1_800_000_000,
+                federate_source::ISSUER,
+                "source-sub",
+                &other
+            )
+            .is_err());
+            session.resource = other.as_str().into();
+            assert!(committed_claims_for_host(
+                &session,
+                1_800_000_000,
+                federate_source::ISSUER,
+                "source-sub",
+                &host
+            )
+            .is_err());
+        }
+        Ok(())
     }
 
     #[test]

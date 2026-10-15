@@ -279,12 +279,14 @@ impl PolicyService {
         mut self,
         enrollment: Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>,
         collision_inventory: hyprstream_session_store::primary::CollisionInventory,
+        host: crate::services::oauth::federate_source::FederateHost,
     ) -> Self {
         let admission = Arc::new(federate_admission::AdmissionService::configured(
             Arc::clone(&self.policy_manager),
             enrollment,
             collision_inventory,
             None,
+            host,
         ));
         self.federate_request_use = Some(federate_admission::RequestUseReader::new(
             Arc::clone(&admission),

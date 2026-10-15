@@ -1,4 +1,4 @@
-//! Fixed staging Federate source/possession verification.
+//! Exact configured-host Federate source/possession verification.
 //!
 //! This verifies cryptographic evidence, NOT account authority, callback execution,
 //! PKCE redemption, key freshness, or global replay consumption. Policy must
@@ -26,9 +26,10 @@ pub(crate) const ISSUER: &str = "https://login.federate.to";
 pub(crate) const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
 pub(crate) const WEBSITE: &str = "https://www.staging.lab.hyprstream.com";
 pub(crate) const CALLBACK: &str = "https://www.staging.lab.hyprstream.com/federate/callback";
+#[cfg(test)]
 pub(crate) const HOST: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_HOST;
+pub(crate) use hyprstream_rpc::auth::claims::FederateHost;
 const JWKS: &str = "https://login.federate.to/keys";
-const TOKEN_ENDPOINT: &str = "https://discovery.staging.lab.hyprstream.com/oauth/token";
 const SUITE: &str = "hs-cose-sign-ed25519-mldsa65-wns-v1";
 const MAX_JWS: usize = 16 * 1024;
 const MAX_JWKS: usize = 64 * 1024;
@@ -150,6 +151,7 @@ fn json(bytes: &[u8]) -> Result<Value> {
 
 /// Validated commitment inputs. The host cannot prove browser key freshness.
 pub(crate) struct Commitment {
+    host: FederateHost,
     random: [u8; 32],
     state: String,
     pkce: String,
@@ -157,7 +159,25 @@ pub(crate) struct Commitment {
     pq: Vec<u8>,
 }
 impl Commitment {
+    #[cfg(test)]
     pub(crate) fn new(random: &str, state: &str, pkce: &str, ed: &str, pq: &str) -> Result<Self> {
+        Self::for_host(
+            FederateHost::new(HOST).map_err(|_| Error::Invalid)?,
+            random,
+            state,
+            pkce,
+            ed,
+            pq,
+        )
+    }
+    pub(crate) fn for_host(
+        host: FederateHost,
+        random: &str,
+        state: &str,
+        pkce: &str,
+        ed: &str,
+        pq: &str,
+    ) -> Result<Self> {
         let ed = fixed(ed)?;
         let vk = VerifyingKey::from_bytes(&ed).map_err(|_| Error::Invalid)?;
         require(!vk.is_weak())?;
@@ -166,6 +186,7 @@ impl Commitment {
         fixed::<32>(state)?;
         fixed::<32>(pkce)?;
         Ok(Self {
+            host,
             random: fixed(random)?,
             state: state.into(),
             pkce: pkce.into(),
@@ -181,8 +202,8 @@ impl Commitment {
                 CLIENT.as_bytes(),
                 WEBSITE.as_bytes(),
                 CALLBACK.as_bytes(),
-                HOST.as_bytes(),
-                HOST.as_bytes(),
+                self.host.as_str().as_bytes(),
+                self.host.as_str().as_bytes(),
                 &self.random,
                 &self.ed,
                 &self.pq,
@@ -259,22 +280,31 @@ fn parse_keys(bytes: &[u8]) -> Result<BTreeMap<String, DecodingKey>> {
     Ok(keys)
 }
 
-/// Disabled by default. No application constructs/enables this component yet.
+/// Disabled by default; enabled only with a validated server-configured host.
 #[derive(Default)]
 pub(crate) struct Verifier {
+    host: Option<FederateHost>,
     client: Option<reqwest::Client>,
     keys: Mutex<Option<Keys>>,
     #[cfg(test)]
     responses: Option<parking_lot::Mutex<Vec<Result<Vec<u8>>>>>,
 }
 impl Verifier {
+    #[cfg(test)]
     pub(crate) fn fixed_staging() -> Result<Self> {
+        Self::for_host(FederateHost::new(HOST).map_err(|_| Error::Invalid)?)
+    }
+    pub(crate) fn host(&self) -> Result<&FederateHost> {
+        self.host.as_ref().ok_or(Error::Disabled)
+    }
+    pub(crate) fn for_host(host: FederateHost) -> Result<Self> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
+            host: Some(host),
             client: Some(client),
             keys: Mutex::new(None),
             #[cfg(test)]
@@ -343,6 +373,7 @@ impl Verifier {
         now: u64,
         access_token: Option<&str>,
     ) -> Result<Source> {
+        require(self.host()? == &commitment.host)?;
         require(token.len() <= MAX_JWS && !token.is_empty())?;
         let parts: Vec<_> = token.split('.').collect();
         require(parts.len() == 3)?;
@@ -608,8 +639,8 @@ impl Source {
         let transcript = frame(
             "hyprstream.session-primary.possession.v1",
             &[
-                HOST.as_bytes(),
-                TOKEN_ENDPOINT.as_bytes(),
+                self.commitment.host.as_str().as_bytes(),
+                self.commitment.host.token_endpoint().as_bytes(),
                 ISSUER.as_bytes(),
                 CLIENT.as_bytes(),
                 WEBSITE.as_bytes(),
@@ -621,7 +652,7 @@ impl Source {
                 binding.account.as_bytes(),
                 binding.subject.as_bytes(),
                 binding.tenant.as_bytes(),
-                HOST.as_bytes(),
+                self.commitment.host.as_str().as_bytes(),
                 binding.requested.as_bytes(),
                 binding.granted.as_bytes(),
                 &created.to_be_bytes(),

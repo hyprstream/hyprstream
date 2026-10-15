@@ -1562,7 +1562,8 @@ impl OAuthState {
         admission: std::sync::Arc<dyn super::federate_host::FederateAdmission>,
         signer: std::sync::Arc<dyn super::federate_host::FederateSigner>,
     ) -> anyhow::Result<()> {
-        let issuer = super::federate_host::FederateIssuer::new(admission, signer)?;
+        let host = super::federate_source::FederateHost::new(&self.issuer_url)?;
+        let issuer = super::federate_host::FederateIssuer::new(admission, signer, host)?;
         self.federate_issuer = Some(std::sync::Arc::new(issuer));
         Ok(())
     }

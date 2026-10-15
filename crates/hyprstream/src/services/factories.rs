@@ -74,12 +74,26 @@ fn policy_client_for_transport(
 #[cfg(feature = "postgres")]
 fn federate_dispatch_for_service(
     policy_client: PolicyClient,
+    configured_issuer: Option<&str>,
 ) -> anyhow::Result<Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>> {
     if hyprstream_rpc::proof::enrollment::global_enrollment_resolver().is_none() {
         return Ok(None);
     }
+    // This is also the RPC expected audience installed below. Without that
+    // authoritative identity, the Federate consumer must remain disabled.
+    let Some(configured_issuer) = configured_issuer else {
+        return Ok(None);
+    };
+    let Ok(host) = crate::services::oauth::federate_source::FederateHost::new(configured_issuer)
+    else {
+        tracing::warn!(
+            "Federate dispatch disabled: OAuth issuer must be an exact canonical HTTPS origin"
+        );
+        return Ok(None);
+    };
     let adapter = crate::services::oauth::federate_proof::DispatchAdapter::from_global_enrollment(
         policy_client,
+        host,
     )?;
     Ok(Some(Arc::new(adapter)))
 }
@@ -1242,9 +1256,13 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // bootstrap for short-lived signed credentials.
     #[cfg(feature = "postgres")]
     {
-        if let Some(enrollment) =
-            crate::auth::service_enrollment::global_service_enrollment().cloned()
-        {
+        let host = crate::services::oauth::federate_source::FederateHost::new(
+            ctx.oauth_issuer_url().unwrap_or(&config.oauth.issuer_url()),
+        );
+        if let (Some(enrollment), Ok(host)) = (
+            crate::auth::service_enrollment::global_service_enrollment().cloned(),
+            host,
+        ) {
             // The complete manifest-validated bootstrap roster is the
             // deployed service authority. Compiled but unprovisioned factories
             // must not block otherwise-valid Policy startup.
@@ -1260,10 +1278,11 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     ctx.signing_key(),
                     &required_services,
                 )?;
-            policy_service = policy_service.with_federate_runtime(enrollment, collision_inventory);
+            policy_service =
+                policy_service.with_federate_runtime(enrollment, collision_inventory, host);
             info!("Federate stateless Policy and request-use authorities installed");
         } else {
-            tracing::warn!("Federate Policy runtime disabled: service enrollment is unavailable");
+            tracing::warn!("Federate Policy runtime disabled: service enrollment or canonical HTTPS OAuth origin is unavailable");
         }
     }
 
@@ -1330,7 +1349,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_client =
         policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     #[cfg(feature = "postgres")]
-    let federate_dispatch = federate_dispatch_for_service(policy_client.clone())?;
+    let federate_dispatch =
+        federate_dispatch_for_service(policy_client.clone(), ctx.oauth_issuer_url())?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -1694,7 +1714,8 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_client =
         policy_client_for_deployment(ctx, sk.clone(), policy_vk, service_token(&sk))?;
     #[cfg(feature = "postgres")]
-    let federate_dispatch = federate_dispatch_for_service(policy_client.clone())?;
+    let federate_dispatch =
+        federate_dispatch_for_service(policy_client.clone(), ctx.oauth_issuer_url())?;
 
     // Create registry client
     let registry_client: RegistryClient = RegistryClient::from_provider(

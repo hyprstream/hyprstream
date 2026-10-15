@@ -1,10 +1,19 @@
-# Federate verifier (H4a only)
+# Federate verifier
 
-Fixed staging profile from the accepted A0 direct-exchange contract. No route,
-configuration switch, application constructor, credential issuer, Policy call or
-database connection is installed. `Verifier::default()` is disabled;
-`fixed_staging()` is an explicit crate-internal constructor for later reviewed
-wiring. Generic ID-token exchange rejection is unchanged.
+The accepted A0 direct-exchange contract uses the exact API origin from the
+server's configured OAuth issuer URL (the same identity as the RPC expected
+audience). Enabling Federate requires a canonical HTTPS origin without a path,
+trailing slash, credentials, query or fragment. Request headers, browser inputs
+and JWT claims cannot choose this authority. `Verifier::default()` is disabled;
+production installs `for_host()` with the validated configuration.
+
+The upstream issuer remains `https://login.federate.to`; the website client,
+origin and callback remain the existing staging values. The browser must use
+the selected API origin as `resource` and in both host/resource fields of its
+nonce commitment, and verify that origin and its `/oauth/token` endpoint in the
+possession transcript. No wire field names change. Existing staging vectors
+remain valid for the configured staging origin. These offline checks do not
+prove a live browser callback, launch, SSH or inference workflow.
 
 The fixed HTTPS JWKS URL uses normal TLS verification, no redirects, a 2-second
 deadline, 64 KiB body limit, at most 16 RSA signing keys and a 60-second cache.

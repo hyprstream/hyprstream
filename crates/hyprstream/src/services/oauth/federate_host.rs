@@ -98,9 +98,10 @@ impl FederateIssuer {
     pub(crate) fn new(
         admission: Arc<dyn FederateAdmission>,
         signer: Arc<dyn FederateSigner>,
+        host: federate_source::FederateHost,
     ) -> Result<Self, federate_source::Error> {
         Ok(Self {
-            verifier: Verifier::fixed_staging()?,
+            verifier: Verifier::for_host(host)?,
             admission,
             signer,
             pending: Mutex::new(BTreeMap::new()),
@@ -112,7 +113,7 @@ impl FederateIssuer {
         body: &[u8],
         now: u64,
     ) -> Result<ChallengeResponse, federate_source::Error> {
-        let request = ChallengeRequest::parse(body)?;
+        let request = ChallengeRequest::parse_for_host(body, self.verifier.host()?)?;
         let source = request.verify_source(&self.verifier, now).await?;
         let mut id = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut id);
@@ -159,7 +160,7 @@ impl FederateIssuer {
         body: &[u8],
         now: u64,
     ) -> Result<super::federate_exchange::ExchangeResponse, federate_source::Error> {
-        let request = ExchangeRequest::parse(body)?;
+        let request = ExchangeRequest::parse_for_host(body, self.verifier.host()?)?;
         let id = request.challenge_id()?;
         // Remove before network calls: a duplicate or uncertain retry cannot
         // race the same challenge to a second Policy commit.
@@ -199,24 +200,26 @@ impl FederateIssuer {
             return Err(federate_source::Error::Unavailable);
         }
         let now = i64::try_from(now).map_err(|_| federate_source::Error::Invalid)?;
-        let claims = super::federate_exchange::authorized_committed_claims(
+        let claims = super::federate_exchange::authorized_committed_claims_for_host(
             &committed,
             now,
             &source_issuer,
             &source_subject,
             crate::mac::exchange_enrollment_resolver().as_ref(),
+            self.verifier.host()?,
         )?;
         let token = tokio::time::timeout(Duration::from_secs(2), self.signer.sign(&claims))
             .await
             .map_err(|_| federate_source::Error::Unavailable)?;
         let token = token.map_err(|_| federate_source::Error::Unavailable)?;
         let response_now = chrono::Utc::now().timestamp();
-        super::federate_exchange::ExchangeResponse::committed(
+        super::federate_exchange::ExchangeResponse::committed_for_host(
             token,
             &committed,
             response_now,
             &source_issuer,
             &source_subject,
+            self.verifier.host()?,
         )
     }
 }

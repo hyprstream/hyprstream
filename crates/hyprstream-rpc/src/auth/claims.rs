@@ -282,6 +282,37 @@ pub struct Claims {
 pub const FEDERATE_STAGING_HOST: &str = "https://discovery.staging.lab.hyprstream.com";
 pub const FEDERATE_STAGING_CLIENT: &str = "cyberdione-www-staging";
 
+/// Server-configured Federate API identity. Accept only an exact canonical
+/// HTTPS origin; never construct this authority from a request or JWT claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FederateHost(String);
+
+impl FederateHost {
+    pub fn new(configured: &str) -> anyhow::Result<Self> {
+        let parsed = url::Url::parse(configured)?;
+        anyhow::ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.path() == "/"
+                && parsed.origin().ascii_serialization() == configured,
+            "Federate requires an exact canonical HTTPS origin"
+        );
+        Ok(Self(configured.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn token_endpoint(&self) -> String {
+        format!("{}/oauth/token", self.0)
+    }
+}
+
 // Custom Debug impl — NEVER log the bearer token
 impl std::fmt::Debug for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -585,8 +616,11 @@ impl Claims {
     /// Recognize the fixed host/client even when one profile marker was
     /// removed by a faulty issuer or token transformation.
     pub fn is_reserved_federate_staging_credential(&self) -> bool {
-        self.iss == FEDERATE_STAGING_HOST
-            && self.client_id.as_deref() == Some(FEDERATE_STAGING_CLIENT)
+        self.is_reserved_federate_credential(FEDERATE_STAGING_HOST)
+    }
+
+    pub fn is_reserved_federate_credential(&self, configured_host: &str) -> bool {
+        self.iss == configured_host && self.client_id.as_deref() == Some(FEDERATE_STAGING_CLIENT)
     }
 
     /// Any signed Federate-only marker takes the deferred, fail-closed path;
@@ -916,6 +950,33 @@ impl crate::auth::mac::SubjectContextClaims for Claims {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn federate_host_requires_exact_canonical_https_origin() {
+        for host in [
+            FEDERATE_STAGING_HOST,
+            "https://vm-a.example",
+            "https://vm-b.example:8443",
+        ] {
+            let configured = FederateHost::new(host).unwrap();
+            assert_eq!(configured.as_str(), host);
+            assert_eq!(configured.token_endpoint(), format!("{host}/oauth/token"));
+        }
+        for host in [
+            "http://vm.example",
+            "https://vm.example/",
+            "https://VM.example",
+            "https://vm.example:443",
+            "https://user@vm.example",
+            "https://vm.example/path",
+            "https://vm.example?",
+            "https://vm.example#",
+            " https://vm.example",
+            "https://vm.example\\evil",
+        ] {
+            assert!(FederateHost::new(host).is_err(), "{host}");
+        }
+    }
 
     #[test]
     fn oauth_scope_claim_is_exact_and_absence_fails_closed() {

@@ -30,7 +30,9 @@ use hyprstream_session_store::{primary::ExpectedPrimary, PROFILE, SUITE};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::federate_source::{session_primary_kids, CLIENT, HOST};
+#[cfg(test)]
+use super::federate_source::HOST;
+use super::federate_source::{session_primary_kids, FederateHost, CLIENT};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Error {
@@ -52,8 +54,9 @@ pub(crate) async fn verify_dispatch_fixture(
     service: &str,
     schema_id: u64,
     body: &[u8],
+    host: &FederateHost,
 ) -> Result<(VerifiedProof, [u8; 32])> {
-    let handle = CredentialHandle::from_verified_context(ctx)?;
+    let handle = CredentialHandle::from_verified_context(ctx, host)?;
     let enrollments = hyprstream_rpc::proof::enrollment::InMemoryEnrollmentResolver::new();
     let semaphore = Semaphore::new(1);
     let local = LocalPolicy {
@@ -85,6 +88,7 @@ pub(crate) async fn verify_dispatch_fixture(
 /// Immutable verified credential facts, never a positive authority snapshot.
 /// No Deserialize, subject-keyed registry, Clone or production constructor.
 struct CredentialHandle {
+    host: FederateHost,
     expected: ExpectedPrimary,
     credential_id: String,
     credential_hash: [u8; 32],
@@ -97,20 +101,20 @@ impl CredentialHandle {
     /// JWT and deferred identity publication. This creates only a credential
     /// snapshot; original-holder proof, shared replay and fresh Policy action
     /// authority must all succeed before dispatch.
-    fn from_verified_context(ctx: &EnvelopeContext) -> Result<Self> {
+    fn from_verified_context(ctx: &EnvelopeContext, host: &FederateHost) -> Result<Self> {
         let (claims, token) = ctx.deferred_federate_credential().ok_or(Error::Denied)?;
         let header = parse_protected_header(token).map_err(|_| Error::Denied)?;
         if header.typ != "at+jwt" {
             return Err(Error::Denied);
         }
-        Self::from_claims_snapshot(claims, token)
+        Self::from_claims_for_host(claims, token, host)
     }
 
     /// The dispatcher calls this only after the holder proof has been
     /// committed to the request context. The claims and token remain the
     /// exact facts verified by the envelope verifier; no caller-supplied
     /// identity is accepted here.
-    fn from_committed_context(ctx: &EnvelopeContext) -> Result<Self> {
+    fn from_committed_context(ctx: &EnvelopeContext, host: &FederateHost) -> Result<Self> {
         if !ctx.is_federate_admitted() {
             return Err(Error::Denied);
         }
@@ -120,12 +124,20 @@ impl CredentialHandle {
         if header.typ != "at+jwt" {
             return Err(Error::Denied);
         }
-        Self::from_claims_snapshot(claims, token)
+        Self::from_claims_for_host(claims, token, host)
     }
 
     /// Fixture-accessible parser of already signed facts. Never call on an
     /// unverified JWT; only `from_verified_context` is a production entry.
+    #[cfg(test)]
     fn from_claims_snapshot(claims: &Claims, token: &str) -> Result<Self> {
+        Self::from_claims_for_host(
+            claims,
+            token,
+            &FederateHost::new(HOST).map_err(|_| Error::Denied)?,
+        )
+    }
+    fn from_claims_for_host(claims: &Claims, token: &str, host: &FederateHost) -> Result<Self> {
         let cnf = claims.cnf.as_ref().ok_or(Error::Denied)?;
         let jwk = cnf.jwk.as_ref().ok_or(Error::Denied)?;
         let ed = claims.cnf_key_bytes().ok_or(Error::Denied)?;
@@ -151,8 +163,8 @@ impl CredentialHandle {
         let jti = claims.jti.as_deref().ok_or(Error::Denied)?;
         let scope = claims.scope.as_deref().ok_or(Error::Denied)?;
         let scopes: Vec<String> = scope.split(' ').map(str::to_owned).collect();
-        if claims.iss != HOST
-            || claims.aud.as_deref() != Some(HOST)
+        if claims.iss != host.as_str()
+            || claims.aud.as_deref() != Some(host.as_str())
             || claims.client_id.as_deref() != Some(CLIENT)
             || claims.workload_session_id.is_some()
             || claims.act.is_some()
@@ -205,6 +217,7 @@ impl CredentialHandle {
             return Err(Error::Denied);
         }
         Ok(Self {
+            host: host.clone(),
             expected: ExpectedPrimary {
                 issuer: claims.iss.clone(),
                 profile: PROFILE.into(),
@@ -212,7 +225,7 @@ impl CredentialHandle {
                 subject: subject.into(),
                 tenant: tenant.into(),
                 client: CLIENT.into(),
-                audience: HOST.into(),
+                audience: host.as_str().into(),
                 scopes,
                 ed_public: ed,
                 suite_thumbprint,
@@ -292,6 +305,7 @@ struct LocalPolicy<'a> {
 /// inventory at login and checks its signed digest at every action; serving
 /// services do not need the node root key or a session database.
 pub(crate) struct DispatchAdapter {
+    host: FederateHost,
     client: PolicyClient,
     static_enrollments: Arc<dyn EnrollmentResolver>,
     in_flight: Semaphore,
@@ -314,10 +328,14 @@ impl EnrollmentResolver for GlobalEnrollmentResolver {
 }
 
 impl DispatchAdapter {
-    pub(crate) fn from_global_enrollment(client: PolicyClient) -> anyhow::Result<Self> {
+    pub(crate) fn from_global_enrollment(
+        client: PolicyClient,
+        host: FederateHost,
+    ) -> anyhow::Result<Self> {
         let resolver = hyprstream_rpc::proof::enrollment::global_enrollment_resolver()
             .ok_or_else(|| anyhow::anyhow!("Federate proof enrollment is unavailable"))?;
         Ok(Self {
+            host,
             client,
             static_enrollments: Arc::new(GlobalEnrollmentResolver(resolver)),
             in_flight: Semaphore::new(32),
@@ -337,7 +355,7 @@ impl DispatchAdapter {
         hyprstream_rpc::proof::admission::ProofReplayKey,
         u64,
     )> {
-        let handle = CredentialHandle::from_verified_context(ctx)?;
+        let handle = CredentialHandle::from_verified_context(ctx, &self.host)?;
         let raw = ctx.request_proof_cwt().ok_or(Error::Denied)?;
         let consumer = Consumer {
             provider: Some(Arc::new(SignedCredentialPrimaryProvider)),
@@ -390,7 +408,7 @@ impl DispatchAdapter {
         if replay_expiry <= now || !ctx.admitted_federate_operation(resource, operation) {
             return Err(Error::Denied);
         }
-        let handle = CredentialHandle::from_committed_context(ctx)?;
+        let handle = CredentialHandle::from_committed_context(ctx, &self.host)?;
         let active = SignedCredentialPrimaryProvider
             .resolve_current(&handle)
             .await?;
@@ -451,8 +469,8 @@ impl Consumer {
         let provider = self.provider.as_ref().ok_or(Error::Disabled)?;
         let now = clock();
         let e = &handle.expected;
-        if e.issuer != HOST
-            || e.audience != HOST
+        if e.issuer != handle.host.as_str()
+            || e.audience != handle.host.as_str()
             || e.client != CLIENT
             || e.profile != PROFILE
             || !bounded(&e.sid, 128)

@@ -1645,15 +1645,27 @@ pub trait RequestService: 'static {
         // malformed or mixed profiles here before publishing identity or
         // caching a key binding; the serving adapter still verifies holder
         // proof, shared replay, and fresh Policy authority before dispatch.
-        if verified.has_federate_profile_marker()
-            || verified.is_reserved_federate_staging_credential()
-        {
+        let reserved_federate = self
+            .expected_audience()
+            .is_some_and(|host| verified.is_reserved_federate_credential(host))
+            || key_source
+                .local_issuers()
+                .iter()
+                .any(|host| verified.is_reserved_federate_credential(host));
+        if verified.has_federate_profile_marker() || reserved_federate {
             let inventory = verified.federate_signer_inventory()?;
             let session_generation = verified.session_authority_generation()?;
             anyhow::ensure!(
                 self.accept_deferred_federate_credential()
                     && matches!(self.name(), "registry" | "model")
-                    && verified.is_reserved_federate_staging_credential()
+                    && reserved_federate
+                    && self
+                        .expected_audience()
+                        .is_some_and(|host| { verified.is_reserved_federate_credential(host) })
+                    && verified.aud.as_deref() == self.expected_audience()
+                    && self.expected_audience().is_some_and(|host| {
+                        crate::auth::claims::FederateHost::new(host).is_ok()
+                    })
                     && verified.hs_profile.as_deref() == Some("federate-session-v1")
                     && inventory.is_some_and(|value| value != [0; 32])
                     && session_generation.is_none()
@@ -2168,6 +2180,7 @@ mod empty_iss_gate_tests {
         /// (mirrors the Inference subprocessor adapter shape).
         internal_controller: Option<ed25519_dalek::VerifyingKey>,
         federate_opt_in: bool,
+        audience: Option<String>,
     }
 
     #[async_trait(?Send)]
@@ -2197,6 +2210,9 @@ mod empty_iss_gate_tests {
         }
         fn accept_deferred_federate_credential(&self) -> bool {
             self.federate_opt_in
+        }
+        fn expected_audience(&self) -> Option<&str> {
+            self.audience.as_deref()
         }
         fn transport(&self) -> &TransportConfig {
             &self.transport
@@ -2381,6 +2397,7 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
             federate_opt_in: false,
+            audience: None,
         };
         (svc, ca)
     }
@@ -2531,6 +2548,7 @@ mod empty_iss_gate_tests {
     async fn opted_in_federate_jwt_is_deferred_and_marker_stripping_denies() {
         let (mut svc, ca) = mock_service();
         svc.federate_opt_in = true;
+        svc.audience = Some(crate::auth::claims::FEDERATE_STAGING_HOST.into());
         svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
             ca.verifying_key(),
             crate::auth::claims::FEDERATE_STAGING_HOST.into(),
@@ -2587,6 +2605,55 @@ mod empty_iss_gate_tests {
     }
 
     #[tokio::test]
+    async fn configured_federate_host_tokens_cannot_cross_or_downgrade() {
+        for local in ["https://vm-a.example", "https://vm-b.example:8443"] {
+            let (mut svc, ca) = mock_service();
+            svc.federate_opt_in = true;
+            svc.audience = Some(local.into());
+            svc.key_source =
+                std::sync::Arc::new(ClusterKeySource::new(ca.verifying_key(), local.into()));
+            let now = chrono::Utc::now().timestamp();
+            let claims = Claims::new("alice".into(), now, now + 120)
+                .with_issuer(local.into())
+                .with_audience(Some(local.into()))
+                .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
+                .with_federate_signer_suite("fixture-suite".into())
+                .with_federate_signer_inventory([7; 32]);
+            let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
+            svc.verify_claims(&mut ctx).await.unwrap();
+            assert!(ctx.deferred_federate_credential().is_some());
+            for variant in 0..5 {
+                let mut bad = claims.clone();
+                match variant {
+                    0 => {
+                        bad.iss = "https://other.example".into();
+                        bad.aud = Some("https://other.example".into());
+                    }
+                    1 => {
+                        bad.hs_profile = None;
+                        bad.hs_signer_suite_v1 = None;
+                        bad.hs_signer_inventory_v1 = None;
+                    }
+                    2 => bad.hs_signer_inventory_v1 = Some("malformed".into()),
+                    3 => {
+                        bad.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode([8; 32]));
+                    }
+                    _ => bad.aud = Some("https://other.example".into()),
+                }
+                let mut ctx = ctx_with_token(crate::auth::jwt::encode(&bad, &ca), false);
+                assert!(
+                    svc.verify_claims(&mut ctx).await.is_err(),
+                    "{local} variant {variant}"
+                );
+                assert!(ctx.subject().is_anonymous());
+                assert!(ctx.deferred_federate_credential().is_none());
+                assert!(ctx.claims().is_none());
+                assert!(svc.cached_subjects.lock().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn hybrid_federate_access_token_passes_production_verification_gate() {
         use crate::auth::{
             CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
@@ -2594,6 +2661,7 @@ mod empty_iss_gate_tests {
 
         let (mut svc, ca) = mock_service();
         svc.federate_opt_in = true;
+        svc.audience = Some(crate::auth::claims::FEDERATE_STAGING_HOST.into());
         svc.policy = crate::crypto::CryptoPolicy::Hybrid;
 
         let ed = SigningKey::from_bytes(&[61; 32]);
@@ -2905,6 +2973,7 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
             federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -2945,6 +3014,7 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
             federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -2986,6 +3056,7 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
             federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -3066,6 +3137,7 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
             federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
 
@@ -3183,6 +3255,7 @@ mod empty_iss_gate_tests {
             cached_subjects: std::sync::Arc::default(),
             internal_controller: None,
             federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
         // Local-issuer credentials must carry a credential ID (jti is a
