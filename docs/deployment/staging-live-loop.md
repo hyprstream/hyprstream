@@ -30,7 +30,10 @@ bash scripts/staging-live-loop.sh rollback policy
 
 Activation stages a Quadlet change, disables registry auto-update for that
 local image, restarts the service and checks systemd readiness. Repeated
-activations preserve the original deployed configuration. Failed activation
+activations preserve the original deployed configuration.
+After a normal deployment replaces the local override, a new activation
+checkpoints that newer release; rollback refuses to overwrite an intervening
+deployment with a stale checkpoint. Failed activation
 restores that configuration; if recovery also fails, the saved rollback file
 remains available. Activation/rollback share an exclusive lock. The script
 does not alter trust, signing keys, database schemas or grants. An incompatible

@@ -102,6 +102,17 @@ exec /usr/bin/cp "$@"
         self.assert_ok(self.run_guest("rollback", "event"))
         self.assertEqual(event.read_text(), self.original)
 
+    def test_normal_deployment_supersedes_previous_rollback_checkpoint(self):
+        self.assert_ok(self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:first"))
+        deployed = self.original.replace("sha256:original", "sha256:new-release")
+        self.quadlet.write_text(deployed)
+        self.assertEqual(self.run_guest("rollback", "policy").returncode, 2)
+        self.assertEqual(self.quadlet.read_text(), deployed)
+        self.assert_ok(self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:second"))
+        self.assertEqual((self.state / "hyprstream-policy.container.original").read_text(), deployed)
+        self.assert_ok(self.run_guest("rollback", "policy"))
+        self.assertEqual(self.quadlet.read_text(), deployed)
+
     def test_failed_recovery_retains_rollback_configuration(self):
         result = self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:bad", TEST_FAIL_RESTART="true")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

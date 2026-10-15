@@ -140,8 +140,12 @@ activate() {
   flock -n 8 || { echo 'A staging service update is already running.' >&2; exit 75; }
   backup="$state_dir/hyprstream-$service.container.original"
   [ "$(grep -c '^Image=' "$file")" -eq 1 ] || { echo 'Expected exactly one Image= line.' >&2; exit 2; }
-  # Keep the first deployed configuration across repeated hot updates.
-  if [ ! -e "$backup" ]; then
+  if [ -e "$backup" ]; then
+    [ -f "$backup" ] && [ ! -L "$backup" ] || { echo 'Invalid rollback configuration.' >&2; exit 2; }
+  fi
+  # Preserve the release during a hot-update sequence, but refresh it after
+  # normal deployment has replaced the local override with a newer release.
+  if [ ! -e "$backup" ] || ! grep -q '^Image=localhost/hyprstream-staging-dev:' "$file"; then
     backup_stage="$(mktemp "$state_dir/.hyprstream-$service.backup.XXXXXX")"
     if ! cp -p -- "$file" "$backup_stage"; then
       rm -f -- "$backup_stage"
@@ -191,6 +195,11 @@ rollback() {
   flock -n 8 || { echo 'A staging service update is already running.' >&2; exit 75; }
   backup="$state_dir/hyprstream-$service.container.original"
   [ -f "$backup" ] && [ ! -L "$backup" ] || { echo "No saved Quadlet: $backup" >&2; exit 2; }
+  [ -f "$file" ] && [ ! -L "$file" ] || { echo "Invalid Quadlet: $file" >&2; exit 2; }
+  if ! grep -q '^Image=localhost/hyprstream-staging-dev:' "$file" && ! cmp -s -- "$file" "$backup"; then
+    echo 'Normal deployment superseded this checkpoint; refusing to overwrite its configuration.' >&2
+    exit 2
+  fi
   restore_quadlet "$service" "$file" "$backup"
   systemctl --user daemon-reload
   systemctl --user restart "$unit"
