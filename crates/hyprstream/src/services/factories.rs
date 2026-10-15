@@ -874,24 +874,13 @@ fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     if !hyprstream_rpc::events::event_authz_installed() {
         let config = load_config()?;
         let sk = ctx.service_signing_key("event");
-        // Declared MoQ/event track policy (v16 §10 / #1510). The generated
-        // dispatch inventory (WS-D / #1505) is the end-state producer of these
-        // rows; until it lands the empty table is the honest state and every
-        // unlisted track/prefix denies.
-        let track_policy = hyprstream_rpc::auth::mac::MoqEventPolicyTable::empty();
-        let pep = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(crate::mac::production_moq_event_pep(
-                sk,
-                &config.oauth,
-                "moq-event",
-                track_policy,
-            ))
+        let authz = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                super::native_event_policy::production_event_authz(sk, &config, "moq-event"),
+            )
         })
         .context("construct MoQ/event MAC PEP")?;
-        hyprstream_rpc::events::install_event_authz(Arc::new(
-            hyprstream_rpc::events::MacEventAuthz::new(pep),
-        ))
-        .map_err(anyhow::Error::msg)?;
+        hyprstream_rpc::events::install_event_authz(authz).map_err(anyhow::Error::msg)?;
     }
 
     let origin = MoqEventOrigin::new();

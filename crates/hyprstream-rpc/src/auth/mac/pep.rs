@@ -96,6 +96,8 @@ pub enum MoqMacAuditReason {
     /// The transport denies the whole session until #276 lands rather than
     /// serving tracks that bypass the installed policy.
     TrackAdmissionHookUnavailable,
+    /// MAC clearance is insufficient to grant a service's source/operation.
+    SourceOwnershipDenied,
 }
 
 /// Plane-neutral denial record handed to the parent crate's MAC audit adapter.
@@ -190,6 +192,17 @@ pub struct MoqEventPep {
 }
 
 impl MoqEventPep {
+    /// Audit an explicit service/source ownership denial in addition to MAC.
+    pub fn deny_event_scope(&self, subject: &Subject, prefix: &str, action: MoqEventAction) {
+        self.audit_deny(
+            subject,
+            &bounded_audit_coordinate(prefix),
+            action,
+            None,
+            None,
+            MoqMacAuditReason::SourceOwnershipDenied,
+        );
+    }
     /// Construct an active, fail-closed PEP from this plane's typed
     /// object-label resolver, verified-subject clearance source, and
     /// mandatory audit sink.
@@ -289,6 +302,22 @@ impl MoqEventPep {
             );
             MacDecision::Deny(reason)
         }
+    }
+
+    /// Boundary check for an event-plane topic prefix.
+    /// Fresh held-grant validation, not an attempted operation. Do not write
+    /// audit records for watchdog ticks; never cache clearance or label state.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn event_grant_is_current(&self, subject: &Subject, prefix: &str) -> bool {
+        let Some(object) = MoqEventObjectRef::parse(MoqEventPlane::Event, prefix) else {
+            return false;
+        };
+        let Some(context) = self.clearance.clearance(subject).await else {
+            return false;
+        };
+        self.resolver
+            .resolve(&object)
+            .is_some_and(|label| context.can_access(&label))
     }
 
     /// Boundary check for an event-plane topic prefix.

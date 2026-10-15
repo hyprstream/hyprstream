@@ -304,10 +304,8 @@ impl IrohMoqProtocolHandler {
                 return (subscribe, publish);
             }
             let subject = crate::envelope::Subject::new(subject.clone());
-            // Source inventory only, not label policy. Missing policy rows and
-            // absent verified clearances continue to deny through EventAuthz.
-            // TODO(#1530): consume the generated Event source inventory.
-            for source in ["system", "worker", "model"] {
+            // Inventory comes from the same reference monitor as label policy.
+            for source in authz.sources() {
                 let path = format!("local/events/{source}");
                 if authz.can_subscribe(&subject, source).await {
                     subscribe.push(path.clone());
@@ -318,6 +316,40 @@ impl IrohMoqProtocolHandler {
             }
         }
         (subscribe, publish)
+    }
+
+    /// Revalidate only grants this session actually holds. Probing unrelated
+    /// denied scopes on every watchdog tick emits an unbounded denial WAL.
+    /// This caches no permit: every held operation is checked afresh.
+    async fn event_grants_current(
+        &self,
+        peer: &PeerIdentity,
+        scopes: &(Vec<String>, Vec<String>),
+    ) -> bool {
+        let Some(authz) = &self.inner.event_authz else {
+            return true;
+        };
+        let Some(subject) = &peer.subject else {
+            return false;
+        };
+        let subject = crate::envelope::Subject::new(subject.clone());
+        for path in &scopes.0 {
+            let Some(source) = path.strip_prefix("local/events/") else {
+                return false;
+            };
+            if !authz.revalidate_subscribe(&subject, source).await {
+                return false;
+            }
+        }
+        for path in &scopes.1 {
+            let Some(source) = path.strip_prefix("local/events/") else {
+                return false;
+            };
+            if !authz.revalidate_publish(&subject, source).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Mutate the inner config, cloning the shared `Arc<HandlerInner>` only when
@@ -462,6 +494,18 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // the peer a scoped writable origin. This keeps an ordinary subscriber
         // from colliding with a producer's broadcast names.
         let ingress_granted = self.inner.authz.authorizes_ingress(&peer, &tenant);
+        if let Some(authz) = &self.inner.event_authz {
+            if !admitted
+                .as_ref()
+                .is_some_and(|peer| authz.admission_is_current(peer))
+            {
+                conn.close(
+                    0u32.into(),
+                    b"Event enrollment does not bind admitted key/head",
+                );
+                return Ok(());
+            }
+        }
         let event_scopes = self.event_scopes(&peer, &tenant, ingress_granted).await;
         let server = if self.inner.event_authz.is_some() {
             if event_scopes.0.is_empty() && event_scopes.1.is_empty() {
@@ -545,9 +589,9 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                             break;
                         }
                     }
-                    if self.inner.event_authz.is_some()
-                        && self.event_scopes(&peer, &tenant, ingress_granted).await != event_scopes
-                    {
+                    if !self.inner.event_authz.as_ref().is_none_or(|authz|
+                        admitted_for_session.as_ref().is_some_and(|peer| authz.admission_is_current(peer)))
+                        || !self.event_grants_current(&peer, &event_scopes).await {
                         session_conn.close(0u32.into(), b"event policy changed");
                         break;
                     }

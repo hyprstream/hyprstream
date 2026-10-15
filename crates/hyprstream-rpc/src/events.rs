@@ -292,6 +292,27 @@ struct PrefixState {
 /// subject contexts against the canonical revocation authority on every check.
 #[async_trait::async_trait]
 pub trait EventAuthz: Send + Sync {
+    /// Bind a verified carrier witness to the authority granting clearance.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn admission_is_current(
+        &self,
+        _peer: &crate::transport::moql_admission::AdmittedMoqPeer,
+    ) -> bool {
+        true
+    }
+    /// Finite source inventory used at session admission. A held session only
+    /// revalidates its acquired grants; adding scope requires new admission.
+    fn sources(&self) -> &[&str] {
+        INTERNAL_EVENT_SOURCES
+    }
+    /// Watchdog checks must consult current authority without sampling or
+    /// suppressing audits on actual attempted operations.
+    async fn revalidate_publish(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_publish(caller, prefix).await
+    }
+    async fn revalidate_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_subscribe(caller, prefix).await
+    }
     /// May `caller` publish to the group/`prefix`? Maps to the `publish`
     /// ScopeAction.
     async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
@@ -305,6 +326,9 @@ pub trait EventAuthz: Send + Sync {
 }
 
 static EVENT_AUTHZ: OnceLock<Arc<dyn EventAuthz>> = OnceLock::new();
+
+/// Reviewed native health/lifecycle producers. Worker workflows are separate.
+pub const INTERNAL_EVENT_SOURCES: &[&str] = &["system", "model"];
 
 /// Clone the process reference monitor for authenticated network Event sessions.
 pub fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
@@ -371,6 +395,11 @@ pub struct MacEventAuthz {
 }
 
 impl MacEventAuthz {
+    /// Service-specific ownership is independent of the MAC lattice floor.
+    pub fn deny_scope(&self, subject: &Subject, prefix: &str, action: MoqEventAction) -> bool {
+        self.pep.deny_event_scope(subject, prefix, action);
+        false
+    }
     pub fn new(pep: MoqEventPep) -> Self {
         Self { pep }
     }
@@ -378,6 +407,12 @@ impl MacEventAuthz {
 
 #[async_trait::async_trait]
 impl EventAuthz for MacEventAuthz {
+    async fn revalidate_publish(&self, caller: &Subject, prefix: &str) -> bool {
+        self.pep.event_grant_is_current(caller, prefix).await
+    }
+    async fn revalidate_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+        self.pep.event_grant_is_current(caller, prefix).await
+    }
     async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep

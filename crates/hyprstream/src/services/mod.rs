@@ -87,6 +87,7 @@ pub mod mcp_service;
 pub mod metrics;
 pub mod model;
 pub mod namespace_builder;
+pub mod native_event_policy;
 pub mod ninep_bridge;
 pub mod oai;
 pub mod oauth;
