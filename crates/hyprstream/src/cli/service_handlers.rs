@@ -2159,21 +2159,47 @@ mod offline_policy_provision_tests {
 
     #[tokio::test]
     async fn staging_e2e_template_grants_only_the_test_did_and_pinned_resources() {
+        assert_staging_owner_template(
+            "cyberdione-staging-e2e",
+            "did:plc:3f7ldey5bivhfjapwqi2sljy",
+            "did:plc:rjqczurevrpoz4mcnax2kgw4",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn staging_operator_template_grants_only_the_operator_did_and_pinned_resources() {
+        assert_staging_owner_template(
+            "cyberdione-staging-operator",
+            "did:plc:rjqczurevrpoz4mcnax2kgw4",
+            "did:plc:3f7ldey5bivhfjapwqi2sljy",
+        )
+        .await;
+    }
+
+    async fn assert_staging_owner_template(template: &str, did: &str, other_owner: &str) {
         let root = tempfile::tempdir().expect("temporary models root");
-        let templates = vec!["cyberdione-staging-e2e".to_owned()];
+        let templates = vec![template.to_owned()];
         handle_service_provision_policy_templates(root.path(), &templates)
             .await
             .expect("provision exact staging grant");
         let manager = PolicyManager::new(root.path().join(".registry/policies"))
             .await
             .expect("reopen policy store");
-        let did = "did:plc:3f7ldey5bivhfjapwqi2sljy";
         for (resource, action) in [
             ("registry:qwen2.5-0.5b-instruct", "query"),
             ("model:Load", "write"),
             ("model:Status", "query"),
             ("model:qwen2.5-0.5b-instruct:main", "infer"),
         ] {
+            for denied in [other_owner, "anonymous", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"] {
+                assert!(
+                    !manager
+                        .check_with_domain(denied, "local", resource, action)
+                        .await,
+                    "owner template must not grant {denied} {resource} {action}",
+                );
+            }
             assert!(
                 manager
                     .check_with_domain(did, "local", resource, action)

@@ -601,6 +601,17 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
             groupings: None,
         },
         PolicyTemplate {
+            name: "cyberdione-staging-operator",
+            description: "One authorized staging operator DID in the local tenant, limited to the pinned Registry and Model acceptance calls",
+            policies: Some(&[
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "registry:qwen2.5-0.5b-instruct", action: "query", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "model:Load", action: "write", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "model:Status", action: "query", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "model:qwen2.5-0.5b-instruct:main", action: "infer", effect: "allow" },
+            ]),
+            groupings: None,
+        },
+        PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",
             policies: Some(&[
