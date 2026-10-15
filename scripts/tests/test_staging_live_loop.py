@@ -71,7 +71,7 @@ exec /usr/bin/cp "$@"
         self.assertIn("--target runtime", commands)
         self.assertIn("HYPRSTREAM_BUILD_JOBS=2", commands)
         self.assertIn(f"CARGO_TARGET_DIR={self.cache}/target", commands)
-        self.assertIn(f"--volume {self.cache}:{self.cache}", commands)
+        self.assertIn(f"--volume {self.cache}:{self.cache}:Z", commands)
         self.assertNotIn("systemctl", commands)
         self.assertEqual(self.quadlet.read_text(), self.original)
 
@@ -85,6 +85,16 @@ exec /usr/bin/cp "$@"
         self.assert_ok(self.run_guest("rollback", "policy"))
         self.assertEqual(self.quadlet.read_text(), self.original)
         self.assertFalse(backup.exists())
+
+    def test_event_uses_the_deployed_quadlet_and_unit_names(self):
+        event = self.quadlets / "hyprstream.container"
+        event.write_text(self.original)
+        self.assert_ok(self.run_guest("activate", "event", "localhost/hyprstream-staging-dev:first"))
+        self.assertIn("Image=localhost/hyprstream-staging-dev:first", event.read_text())
+        self.assertIn("systemctl --user restart hyprstream.service", self.log.read_text())
+        self.assertNotIn("hyprstream-event.service", self.log.read_text())
+        self.assert_ok(self.run_guest("rollback", "event"))
+        self.assertEqual(event.read_text(), self.original)
 
     def test_failed_recovery_retains_rollback_configuration(self):
         result = self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:bad", TEST_FAIL_RESTART="true")

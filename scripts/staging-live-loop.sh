@@ -27,7 +27,16 @@ service_file() {
     event|registry|policy|discovery|streams|model|oai|oauth) ;;
     *) echo "Unknown staging service: $1" >&2; exit 2 ;;
   esac
+  if [ "$1" = event ]; then
+    printf '%s/hyprstream.container\n' "$quadlet_dir"
+    return
+  fi
   printf '%s/hyprstream-%s.container\n' "$quadlet_dir" "$1"
+}
+
+service_unit() {
+  if [ "$1" = event ]; then printf 'hyprstream.service\n';
+  else printf 'hyprstream-%s.service\n' "$1"; fi
 }
 
 restore_quadlet() {
@@ -106,7 +115,7 @@ build() {
   echo "Building $image from $repo_root (arch=$variant); no service will change."
   podman build --target runtime --build-arg "VARIANT=$variant" \
     --build-arg "HYPRSTREAM_BUILD_JOBS=$jobs" \
-    --volume "$cache_dir:$cache_dir" \
+    --volume "$cache_dir:$cache_dir:Z" \
     --build-arg "CARGO_TARGET_DIR=$cache_dir/target" \
     -t "$image" -f "$repo_root/Dockerfile" "$repo_root"
   podman image exists "$image"
@@ -119,6 +128,7 @@ activate() {
   service="$1"
   image="$2"
   file="$(service_file "$service")"
+  unit="$(service_unit "$service")"
   case "$image" in
     localhost/hyprstream-staging-dev:*) ;;
     *) echo 'Only a locally built staging-dev image may be activated.' >&2; exit 2 ;;
@@ -143,23 +153,23 @@ activate() {
   mv -f -- "$stage" "$file"
   trap - EXIT
   if ! systemctl --user daemon-reload ||
-     ! systemctl --user restart "hyprstream-$service.service" ||
-     ! systemctl --user is-active --quiet "hyprstream-$service.service"; then
+     ! systemctl --user restart "$unit" ||
+     ! systemctl --user is-active --quiet "$unit"; then
     echo 'Service failed; restoring original Quadlet.' >&2
     if ! restore_quadlet "$service" "$file" "$backup"; then
       echo "Could not restore the original Quadlet; retained rollback configuration: $backup" >&2
       exit 1
     fi
     systemctl --user daemon-reload
-    if systemctl --user restart "hyprstream-$service.service" &&
-       systemctl --user is-active --quiet "hyprstream-$service.service"; then
+    if systemctl --user restart "$unit" &&
+       systemctl --user is-active --quiet "$unit"; then
       rm -f -- "$backup"
     else
       echo "Original service is still unhealthy; retained rollback configuration: $backup" >&2
     fi
     exit 1
   fi
-  echo "active_image=$image service=hyprstream-$service.service"
+  echo "active_image=$image service=$unit"
   echo "rollback_command=$0 rollback $service"
 }
 
@@ -168,16 +178,17 @@ rollback() {
   require_guest
   service="$1"
   file="$(service_file "$service")"
+  unit="$(service_unit "$service")"
   exec 8>"$state_dir/update.lock"
   flock -n 8 || { echo 'A staging service update is already running.' >&2; exit 75; }
   backup="$state_dir/hyprstream-$service.container.original"
   [ -f "$backup" ] && [ ! -L "$backup" ] || { echo "No saved Quadlet: $backup" >&2; exit 2; }
   restore_quadlet "$service" "$file" "$backup"
   systemctl --user daemon-reload
-  systemctl --user restart "hyprstream-$service.service"
-  systemctl --user is-active --quiet "hyprstream-$service.service"
+  systemctl --user restart "$unit"
+  systemctl --user is-active --quiet "$unit"
   rm -f -- "$backup"
-  echo "restored=hyprstream-$service.service"
+  echo "restored=$unit"
 }
 
 case "$command_name" in
