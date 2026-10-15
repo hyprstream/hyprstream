@@ -132,6 +132,10 @@ fn fixture() -> &'static Fixture {
 }
 
 fn token(subject: &str) -> String {
+    token_for_host(subject, HOST)
+}
+
+fn token_for_host(subject: &str, host: &str) -> String {
     let f = fixture();
     let now = chrono::Utc::now().timestamp();
     let holder_ed = f.holder.verifying_key().to_bytes();
@@ -141,8 +145,8 @@ fn token(subject: &str) -> String {
         &[&holder_ed, &holder_pq],
     );
     let mut claims = Claims::new(subject.into(), now, now + 120)
-        .with_issuer(HOST.into())
-        .with_audience(Some(HOST.into()))
+        .with_issuer(host.into())
+        .with_audience(Some(host.into()))
         .with_client_id(CLIENT)
         .with_tenant("tenant-a".into())
         .with_sid("sid-a")
@@ -255,6 +259,7 @@ fn proof_without_recipient_binding(token: &str, body: &[u8]) -> Vec<u8> {
 struct Service {
     transport: TransportConfig,
     key_source: Arc<dyn JwtKeySource>,
+    expected_audience: Option<String>,
     revocations: InMemoryCredentialRevocationStore,
     expected_body: Vec<u8>,
     revoked: AtomicBool,
@@ -264,14 +269,20 @@ struct Service {
 
 impl Service {
     fn new() -> Self {
+        Self::for_host(HOST)
+    }
+
+    fn for_host(host: &str) -> Self {
+        hyprstream_rpc::auth::claims::FederateHost::new(host).unwrap();
         let f = fixture();
         Self {
             transport: TransportConfig::inproc("model"),
             key_source: Arc::new(
-                ClusterKeySource::new(f.ca.verifying_key(), HOST.into()).with_ca_composite_key(
+                ClusterKeySource::new(f.ca.verifying_key(), host.into()).with_ca_composite_key(
                     ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&f.ca_pq)).unwrap(),
                 ),
             ),
+            expected_audience: Some(host.into()),
             revocations: InMemoryCredentialRevocationStore::new(),
             expected_body: f.body.clone(),
             revoked: AtomicBool::new(false),
@@ -297,6 +308,9 @@ impl RequestService for Service {
     }
     fn jwt_key_source(&self) -> Option<Arc<dyn JwtKeySource>> {
         Some(self.key_source.clone())
+    }
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
     }
     fn credential_revocation_store(
         &self,
@@ -477,6 +491,43 @@ async fn send(service: &Service, bytes: &[u8]) -> Result<Vec<u8>> {
         CarrierContext::iroh(),
     )
     .await
+}
+
+#[tokio::test]
+async fn configured_hosts_dispatch_only_with_the_matching_explicit_audience() -> Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    MAC_ALLOW.store(true, Ordering::SeqCst);
+    let f = fixture();
+    let hosts = ["https://vm-a.example", "https://vm-b.example:8443"];
+    for (index, host) in hosts.iter().enumerate() {
+        let service = Service::for_host(host);
+        let foreign_service = Service::for_host(hosts[1 - index]);
+        let mut missing_audience = Service::for_host(host);
+        missing_audience.expected_audience = None;
+        let mut wrong_audience = Service::for_host(host);
+        wrong_audience.expected_audience = Some(hosts[1 - index].into());
+        let bearer = token_for_host(TEST_DID, host);
+        let (response, stream) = recipients();
+        let request = wire(
+            &bearer,
+            proof(&bearer, &f.body, &response, &stream, CLIENT_DH),
+            &f.body,
+            &response,
+            &stream,
+            CLIENT_DH,
+        );
+        for denied_service in [&foreign_service, &missing_audience, &wrong_audience] {
+            let denied = send(denied_service, &request).await?;
+            assert_denial_has_no_success_payload(&denied);
+            assert_eq!(denied_service.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(denied_service.policy_admissions.load(Ordering::SeqCst), 0);
+        }
+        // Wrong-host/configuration denials must not consume this holder proof.
+        send(&service, &request).await?;
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.policy_admissions.load(Ordering::SeqCst), 1);
+    }
+    Ok(())
 }
 
 #[tokio::test]
