@@ -349,7 +349,7 @@ impl RequestUseReader {
 }
 
 impl AdmissionService {
-    /// Construct the fixed staging profile from host-owned protocol constants.
+    /// Construct the exact configured-host profile from host-owned configuration.
     /// The policy factory must separately qualify the TLS pool and active
     /// profile generation before installing this authority.
     pub(super) fn configured(
@@ -357,6 +357,7 @@ impl AdmissionService {
         enrollment: Arc<ServiceEnrollmentManifest>,
         collision_inventory: CollisionInventory,
         session_pool: Option<deadpool_postgres::Pool>,
+        host: crate::services::oauth::federate_source::FederateHost,
     ) -> Self {
         let inventory_id = collision_inventory.id();
         let scopes = BTreeSet::from([
@@ -371,9 +372,9 @@ impl AdmissionService {
                 enrollment,
                 profile: Profile {
                     issuer: crate::services::oauth::federate_source::ISSUER.into(),
-                    host: crate::services::oauth::federate_source::HOST.into(),
+                    host: host.as_str().into(),
                     client: crate::services::oauth::federate_source::CLIENT.into(),
-                    resource: crate::services::oauth::federate_source::HOST.into(),
+                    resource: host.as_str().into(),
                     client_scopes: scopes.clone(),
                     resource_scopes: scopes,
                 },

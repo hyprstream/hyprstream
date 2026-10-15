@@ -819,6 +819,57 @@ async fn stateless_request_use_rechecks_the_live_did_grant_each_call() {
 }
 
 #[tokio::test]
+async fn configured_host_policy_admits_only_its_exact_issuer_and_resource() {
+    for local in ["https://vm-a.example", "https://vm-b.example:8443"] {
+        let (mut fixture, _) = fixture().await;
+        let authority = fixture.authority.take().unwrap();
+        let service = AdmissionService::configured(
+            authority.policy,
+            authority.enrollment,
+            authority.collision_inventory,
+            None,
+            crate::services::oauth::federate_source::FederateHost::new(local).unwrap(),
+        );
+        let authority = service.authority.as_ref().unwrap();
+        assert_eq!(authority.profile.host, local);
+        assert_eq!(authority.profile.resource, local);
+        let mut request = AdmitFederateRequest {
+            issuer: local.into(),
+            profile: hyprstream_session_store::PROFILE.into(),
+            sid: "correlation-only".into(),
+            subject: ATPROTO_DID.into(),
+            tenant: "tenant".into(),
+            client: crate::services::oauth::federate_source::CLIENT.into(),
+            audience: local.into(),
+            scopes: vec![STAGING_SCOPE.into()],
+            ed_public: vec![1; 32],
+            suite_thumbprint: vec![2; 32],
+            generation: authority.serving_generation.to_vec(),
+            collision_inventory_id: authority.local_collision_inventory_id.to_vec(),
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            proof_epoch: 1,
+            verified_namespace: vec![4; 32],
+            request_id: vec![5; 16],
+            resource: format!("model:{STAGING_MODEL_REF}"),
+            operation: "infer".into(),
+        };
+        let reader = RequestUseReader::new(Arc::new(service), None);
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("service:model"),
+            "*",
+            SigningKey::from_bytes(&[25; 32]).verifying_key(),
+            hyprstream_rpc::auth::Claims::new("service:model".into(), 0, i64::MAX),
+        );
+        reader.admit(&ctx, &request).await.unwrap();
+        request.issuer = "https://other.example".into();
+        assert!(reader.admit(&ctx, &request).await.is_err());
+        request.issuer = local.into();
+        request.audience = "https://other.example".into();
+        assert!(reader.admit(&ctx, &request).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn h2_admission_disabled_caller_and_scope_boundaries() {
     let (service, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into(), "read:model:other".into()];

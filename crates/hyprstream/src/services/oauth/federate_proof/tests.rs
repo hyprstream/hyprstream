@@ -52,6 +52,58 @@ fn host_claims() -> Claims {
     claims
 }
 
+#[tokio::test]
+async fn configured_host_credential_and_holder_proof_are_bound() {
+    let enrollments = InMemoryEnrollmentResolver::new();
+    let permits = Semaphore::new(1);
+    let local = LocalPolicy {
+        static_enrollments: &enrollments,
+        in_flight: &permits,
+    };
+    let consumer = Consumer {
+        provider: Some(Arc::new(SignedCredentialPrimaryProvider)),
+    };
+    for local_host in ["https://vm-a.example", "https://vm-b.example:8443"] {
+        let host = FederateHost::new(local_host).unwrap();
+        let other = FederateHost::new("https://other.example").unwrap();
+        let mut claims = host_claims();
+        claims.iss = local_host.into();
+        claims.aud = Some(local_host.into());
+        // These are already-signature-verified snapshot facts; RPC signature
+        // verification is exercised separately by the service verifier tests.
+        let token = serde_json::to_vec(&claims).unwrap();
+        let token = std::str::from_utf8(&token).unwrap();
+        let handle = CredentialHandle::from_claims_for_host(&claims, token, &host).unwrap();
+        assert!(CredentialHandle::from_claims_for_host(&claims, token, &other).is_err());
+        let bytes = proof(41, 42, token.as_bytes());
+        let request = Request {
+            proof: &bytes,
+            credential: token.as_bytes(),
+            service: "registry",
+            schema_id: SCHEMA,
+            body: BODY,
+        };
+        consumer
+            .verify(&handle, &request, &local, || NOW)
+            .await
+            .unwrap();
+        let mut claims_other = claims.clone();
+        claims_other.iss = other.as_str().into();
+        claims_other.aud = Some(other.as_str().into());
+        let other_token = serde_json::to_string(&claims_other).unwrap();
+        let other_handle =
+            CredentialHandle::from_claims_for_host(&claims_other, &other_token, &other).unwrap();
+        let crossed = Request {
+            credential: other_token.as_bytes(),
+            ..request
+        };
+        assert!(consumer
+            .verify(&other_handle, &crossed, &local, || NOW)
+            .await
+            .is_err());
+    }
+}
+
 #[test]
 fn h3b_verified_host_snapshot_requires_complete_exact_signed_facts() {
     let valid = host_claims();
@@ -106,7 +158,10 @@ fn h3b_verified_host_snapshot_requires_complete_exact_signed_facts() {
     bad.workload_session_id = Some("other-session".into());
     assert!(CredentialHandle::from_claims_snapshot(&bad, "fixture-token").is_err());
     let callback = EnvelopeContext::from_callback_service(1, "oauth");
-    assert!(CredentialHandle::from_verified_context(&callback).is_err());
+    assert!(
+        CredentialHandle::from_verified_context(&callback, &FederateHost::new(HOST).unwrap())
+            .is_err()
+    );
 }
 
 struct Provider {
@@ -183,6 +238,7 @@ fn fixture() -> (CredentialHandle, SessionPrimary, CollisionInventory) {
     };
     (
         CredentialHandle {
+            host: FederateHost::new(HOST).unwrap(),
             expected,
             credential_id: "jti-a".into(),
             credential_hash: Sha256::digest(TOKEN).into(),

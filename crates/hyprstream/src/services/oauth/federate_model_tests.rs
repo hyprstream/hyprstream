@@ -6,7 +6,7 @@
 use super::super::{
     federate_exchange,
     federate_host::FederateSigner,
-    federate_source::{CLIENT, HOST, ISSUER},
+    federate_source::{FederateHost, CLIENT, HOST, ISSUER},
 };
 use crate::{
     mac::{
@@ -69,6 +69,7 @@ const RESOURCE: &str = "model:qwen2.5-0.5b-instruct:main";
 const SCHEMA: u64 = 0xe7339d5d26ab3076;
 
 struct ModelBoundary {
+    host: FederateHost,
     model: ModelService,
     server: SigningKey,
     transport: TransportConfig,
@@ -95,6 +96,9 @@ impl RequestService for ModelBoundary {
     }
     fn jwt_key_source(&self) -> Option<Arc<dyn JwtKeySource>> {
         Some(self.keys.clone())
+    }
+    fn expected_audience(&self) -> Option<&str> {
+        Some(self.host.as_str())
     }
     fn credential_revocation_store(
         &self,
@@ -129,6 +133,7 @@ impl RequestService for ModelBoundary {
             "model",
             SCHEMA,
             body.bytes(),
+            &self.host,
         )
         .await?;
         anyhow::ensure!(
@@ -283,12 +288,18 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     // Global crypto/PEP settings are process-lifetime: do not pollute other tests.
     const CHILD: &str = "HYPRSTREAM_MODEL_MINT_FIXTURE_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe()?)
+        for host in [HOST, "https://vm-a.example", "https://vm-b.example:8443"] {
+            let status = std::process::Command::new(std::env::current_exe()?)
             .args(["--exact", "services::oauth::state::federate_model_tests::federate_minted_token_reaches_real_model_authorization", "--nocapture"])
-            .env(CHILD, "1").status()?;
-        anyhow::ensure!(status.success(), "isolated Model mint regression failed");
+            .env(CHILD, host).status()?;
+            anyhow::ensure!(
+                status.success(),
+                "isolated Model mint regression failed for {host}"
+            );
+        }
         return Ok(());
     }
+    let host = FederateHost::new(&std::env::var(CHILD)?)?;
     struct FixturePep;
     impl hyprstream_rpc::auth::mac::MacDispatchPep for FixturePep {
         fn check(
@@ -359,11 +370,12 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     )
     .await?;
     let service = ModelBoundary {
+        host: host.clone(),
         model,
         server,
         transport,
         keys: Arc::new(
-            ClusterKeySource::new(*pair.ed25519(), HOST.into())
+            ClusterKeySource::new(*pair.ed25519(), host.as_str().into())
                 .with_ca_composite_key(pair.ml_dsa().clone()),
         ),
         revocations: InMemoryCredentialRevocationStore::new(),
@@ -373,13 +385,13 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     };
     let now = chrono::Utc::now().timestamp();
     let session = hyprstream_session_store::Session {
-        host: HOST.into(),
+        host: host.as_str().into(),
         sid: "mint-model-sid".into(),
         account_id: "fixture-account".into(),
         subject: DID.into(),
         tenant: "tenant-a".into(),
         client_id: CLIENT.into(),
-        resource: HOST.into(),
+        resource: host.as_str().into(),
         scopes: vec![format!("infer:{RESOURCE}")],
         grant_revision: "revision-1".into(),
         ed_public: holder.verifying_key().to_bytes(),
@@ -391,12 +403,13 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     };
     let hybrid_policy = enrollment_policy(Level::Internal, Assurance::PqHybrid);
     let hybrid_resolver = EnrollmentSubjectContextResolver::new(Arc::new(hybrid_policy.clone()));
-    let allowed = federate_exchange::authorized_committed_claims(
+    let allowed = federate_exchange::authorized_committed_claims_for_host(
         &session,
         now,
         ISSUER,
         "opaque-sub",
         &hybrid_resolver,
+        &host,
     )?;
     let authority_clearance = hybrid_policy.clearance_for(DID).unwrap();
     assert_eq!(
@@ -424,7 +437,7 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
     assert!(hybrid_context.can_access(&required));
     assert!(!classical_context.can_access(&required));
 
-    let insufficient = federate_exchange::authorized_committed_claims(
+    let insufficient = federate_exchange::authorized_committed_claims_for_host(
         &session,
         now,
         ISSUER,
@@ -433,14 +446,16 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             Level::Public,
             Assurance::PqHybrid,
         ))),
+        &host,
     )?;
     assert!(!insufficient
         .security_context(VerifiedKeyMaterial::PqHybrid)
         .unwrap()
         .can_access(&required));
-    let missing = federate_exchange::committed_claims(&session, now, ISSUER, "opaque-sub")?;
+    let missing =
+        federate_exchange::committed_claims_for_host(&session, now, ISSUER, "opaque-sub", &host)?;
     assert!(missing.clearance.is_none());
-    let public = federate_exchange::authorized_committed_claims(
+    let public = federate_exchange::authorized_committed_claims_for_host(
         &session,
         now,
         ISSUER,
@@ -449,10 +464,11 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             Level::Public,
             Assurance::PqHybrid,
         ))),
+        &host,
     )?;
     let mut unknown = session.clone();
     unknown.subject = "did:plc:abcdefghijklmnopqrstuvwx".into();
-    assert!(federate_exchange::authorized_committed_claims(
+    assert!(federate_exchange::authorized_committed_claims_for_host(
         &unknown,
         now,
         ISSUER,
@@ -460,7 +476,8 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         &EnrollmentSubjectContextResolver::new(Arc::new(enrollment_policy(
             Level::Internal,
             Assurance::PqHybrid,
-        )))
+        ))),
+        &host,
     )
     .is_err());
     let body = hyprstream_rpc::serialize_message(|message| {
@@ -538,6 +555,57 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         3,
         "all signed credentials must reach the real Model authorization handler"
     );
+    for variant in 0..4 {
+        let mut bad = allowed.clone();
+        match variant {
+            0 => {
+                bad.iss = "https://another-vm.example".into();
+                bad.aud = Some("https://another-vm.example".into());
+            }
+            1 => {
+                bad.hs_profile = None;
+                bad.hs_signer_suite_v1 = None;
+                bad.hs_signer_pq_key_v1 = None;
+                bad.hs_signer_inventory_v1 = None;
+                bad.hs_source_issuer_v1 = None;
+                bad.hs_source_subject_v1 = None;
+            }
+            2 => {
+                bad.hs_session_authority_generation = Some(base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    [8; 32],
+                ));
+            }
+            _ => bad.hs_signer_inventory_v1 = Some("malformed".into()),
+        }
+        let token = signer.sign(&bad).await?;
+        let bytes = signed_model_request_bytes(
+            token.as_bytes(),
+            &body,
+            now,
+            &holder,
+            &holder_pq,
+            &relay,
+            &relay_pq,
+            &service.server,
+        )
+        .await?;
+        process_request(
+            &bytes,
+            &service,
+            EnvelopeVerification::AnySigner,
+            &service.server,
+            &envelope::InMemoryNonceCache::new(),
+            CarrierContext::iroh(),
+        )
+        .await?;
+        assert_eq!(
+            service.attempts.load(Ordering::SeqCst),
+            3,
+            "{host:?} variant {variant} must fail before Model authorization"
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    }
     let errors = service.authorization_errors.lock();
     assert_eq!(errors.len(), 2, "the two weaker clearances must be denied");
     Ok(())
