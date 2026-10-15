@@ -47,6 +47,11 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v4
+    - name: Check guest build and rollback behavior
+      run: |
+        bash -n scripts/staging-live-loop.sh
+        python3 scripts/tests/test_staging_live_loop.py
     - run: |
         echo "OCI runtime image validation is deferred to the merge queue:"
         echo "this context is a placeholder success on PR heads; the real"
@@ -77,6 +82,11 @@ jobs:
       POSTGRES_QUALIFICATION_NETWORK: hs-postgres-qualification-net-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check guest build and rollback behavior
+        run: |
+          bash -n scripts/staging-live-loop.sh
+          python3 scripts/tests/test_staging_live_loop.py
 
       - name: Runner sanity
         run: |

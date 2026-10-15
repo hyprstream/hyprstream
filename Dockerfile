@@ -52,12 +52,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Keep container builds on the same compiler/components as local builds and CI.
+# Placing the override at / also covers the later /build working directory.
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install sccache for compilation caching (works with BuildKit cache mounts)
-RUN cargo install sccache --locked
+ARG HYPRSTREAM_BUILD_JOBS
+RUN if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
@@ -92,9 +97,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install sccache --locked
+ARG HYPRSTREAM_BUILD_JOBS
+RUN if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
@@ -413,12 +422,14 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # defaulting to the in-container /build/target for every other invocation
 # (docker-build.yml, build-image.yml).
 ARG CARGO_TARGET_DIR=/build/target
+ARG HYPRSTREAM_BUILD_JOBS
 ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features "${HYPRSTREAM_FEATURES}" \
+    if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features "${HYPRSTREAM_FEATURES}" \
     && mkdir -p /out \
     && cp "${CARGO_TARGET_DIR:-/build/target}/release/hyprstream" /out/hyprstream
 
