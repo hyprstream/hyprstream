@@ -316,8 +316,8 @@ pub use dispatch_labels::{
     SERVICE_SUBJECT_PREFIX,
 };
 pub use moq_audit::{
-    audited_moq_event_pep, production_moq_event_pep, MoqAuditSinkAdapter,
-    VerifiedClaimsMoqClearanceSource,
+    audited_moq_event_pep, production_moq_event_pep, production_moq_event_pep_with_clearance,
+    MoqAuditSinkAdapter, VerifiedClaimsMoqClearanceSource,
 };
 pub use pds_pep::{
     production_pds_account_read_authorizer, EnrollmentPdsClearanceSource,

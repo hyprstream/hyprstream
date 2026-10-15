@@ -50,6 +50,9 @@ struct Policy {
 }
 #[async_trait::async_trait]
 impl EventAuthz for Policy {
+    fn sources(&self) -> &[&str] {
+        &["system", "worker", "model"]
+    }
     async fn can_publish(&self, subject: &Subject, source: &str) -> bool {
         self.enabled.load(Ordering::SeqCst) && self.mac.can_publish(subject, source).await
     }

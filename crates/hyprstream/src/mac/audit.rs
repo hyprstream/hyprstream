@@ -280,6 +280,8 @@ pub enum DecisionReason {
     /// preflight) could not durably audit it — the permit is downgraded to
     /// deny, mirroring [`DecisionReason::AuditFailClosed`] for the grant path.
     GrantAuditFailClosed,
+    /// Native Event service identity does not own the requested source/op.
+    MoqSourceOwnershipDenied,
 }
 
 impl DecisionReason {
@@ -298,6 +300,7 @@ impl DecisionReason {
             DecisionReason::MoqUnlabeledSubject => "moq_unlabeled_subject",
             DecisionReason::MoqNoPepInstalled => "moq_no_pep_installed",
             DecisionReason::MoqStaleAuthority => "moq_stale_authority",
+            DecisionReason::MoqSourceOwnershipDenied => "moq_source_ownership_denied",
             DecisionReason::MoqUnknownObjectIdentity => "moq_unknown_object_identity",
             DecisionReason::MoqTrackAdmissionHookUnavailable => {
                 "moq_track_admission_hook_unavailable"
