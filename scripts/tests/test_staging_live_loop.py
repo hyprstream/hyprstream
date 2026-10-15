@@ -47,6 +47,12 @@ if [ "${TEST_FAIL_RESTART:-}" = true ] && [ "$2" = restart ]; then exit 1; fi
         self.stub("cp", '''
 case "$*" in
   *.restore.*) [ "${TEST_FAIL_RESTORE:-}" != true ] || exit 1 ;;
+  *.backup.*)
+    if [ "${TEST_FAIL_BACKUP:-}" = true ]; then
+      for cp_arg do cp_target=$cp_arg; done
+      printf partial > "$cp_target"
+      exit 1
+    fi ;;
 esac
 exec /usr/bin/cp "$@"
 ''')
@@ -114,6 +120,15 @@ exec /usr/bin/cp "$@"
         self.assertEqual(result.returncode, 1)
         self.assertEqual((self.state / "hyprstream-policy.container.original").read_text(), self.original)
         self.assertEqual(self.log.read_text().count("systemctl --user restart"), 1)
+
+    def test_partial_initial_backup_never_becomes_a_rollback_checkpoint(self):
+        result = self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:first",
+                                TEST_FAIL_BACKUP="true")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((self.state / "hyprstream-policy.container.original").exists())
+        self.assertEqual(self.quadlet.read_text(), self.original)
+        self.assert_ok(self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:second"))
+        self.assertEqual((self.state / "hyprstream-policy.container.original").read_text(), self.original)
 
     def test_rejects_unowned_service_or_nonlocal_image(self):
         for args in [("activate", "sshd", "localhost/hyprstream-staging-dev:first"),

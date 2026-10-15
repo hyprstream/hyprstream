@@ -141,7 +141,15 @@ activate() {
   backup="$state_dir/hyprstream-$service.container.original"
   [ "$(grep -c '^Image=' "$file")" -eq 1 ] || { echo 'Expected exactly one Image= line.' >&2; exit 2; }
   # Keep the first deployed configuration across repeated hot updates.
-  [ -e "$backup" ] || cp -p -- "$file" "$backup"
+  if [ ! -e "$backup" ]; then
+    backup_stage="$(mktemp "$state_dir/.hyprstream-$service.backup.XXXXXX")"
+    if ! cp -p -- "$file" "$backup_stage"; then
+      rm -f -- "$backup_stage"
+      exit 1
+    fi
+    mv -f -- "$backup_stage" "$backup"
+  fi
+  [ -f "$backup" ] && [ ! -L "$backup" ] || { echo 'Invalid rollback configuration.' >&2; exit 2; }
   stage="$(mktemp "$quadlet_dir/.hyprstream-$service.XXXXXX")"
   trap 'rm -f -- "$stage"' EXIT
   awk -v image="$image" '
