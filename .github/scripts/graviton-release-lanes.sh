@@ -17,11 +17,10 @@
 set -euo pipefail
 
 # This is the exact feature set embedded in the staging OCI artifact. Keep
-# PGlite's credential-pds feature out of this binary; networked Postgres is
-# the account and PDS store, while RocksDB remains only for device/refresh
-# persistence. The OCI runtime job exercises this same profile against a real
-# disposable PostgreSQL instance.
-readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay'
+# the credential-pds umbrella out of this binary. Standalone pglite enables
+# encrypted pilot-local accounts; Postgres and replay remain available for
+# staging. The OCI job exercises the networked profile against a disposable DB.
+readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay,pglite'
 
 bash "$(dirname "${BASH_SOURCE[0]}")/verify-libtorch.sh"
 

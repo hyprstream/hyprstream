@@ -19,7 +19,7 @@ replay_url_file="${HYPRSTREAM_REPLAY_TEST_URL_FILE}"
   exit 1
 }
 
-readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay'
+readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay,pglite'
 
 # These test modules each call require_db! and touch the supplied PostgreSQL
 # instance. Keep the account-store and PDS record-store coverage separate so a

@@ -405,10 +405,9 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
 # Note: --no-default-features excludes systemd (not needed in containers).
-# The staging production profile uses the encrypted networked account store and
-# the networked PDS record store.  It intentionally excludes credential-pds,
-# which selects PGlite, while retaining RocksDB for the independent anonymous
-# device/refresh-token store.
+# CPU consumers support encrypted networked accounts AND pilot-local PGlite
+# accounts. Keep the standalone pglite feature (not the credential-pds umbrella)
+# alongside Postgres/replay; GPU publication explicitly selects its own profile.
 # Cache mounts:
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
@@ -423,7 +422,7 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # (docker-build.yml, build-image.yml).
 ARG CARGO_TARGET_DIR=/build/target
 ARG HYPRSTREAM_BUILD_JOBS
-ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb
+ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay,pglite
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
