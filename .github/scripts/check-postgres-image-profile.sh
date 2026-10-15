@@ -9,6 +9,7 @@ readonly PROFILE_SOURCES=(
   .github/workflows/graviton-build-validate.yml
   .github/scripts/postgres-image-qualification.sh
   .github/workflows/docker-build.yml
+  .github/workflows/pr-affected.yml
 )
 
 # Python is part of the pinned builder; ripgrep is not. Use one parser for
