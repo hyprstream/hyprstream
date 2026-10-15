@@ -44,6 +44,12 @@ if [ "$1" = info ]; then printf '%s\n' "$TEST_GRAPH_ROOT"; fi
 printf 'systemctl %s\n' "$*" >> "$TEST_COMMAND_LOG"
 if [ "${TEST_FAIL_RESTART:-}" = true ] && [ "$2" = restart ]; then exit 1; fi
 ''')
+        self.stub("cp", '''
+case "$*" in
+  *.restore.*) [ "${TEST_FAIL_RESTORE:-}" != true ] || exit 1 ;;
+esac
+exec /usr/bin/cp "$@"
+''')
 
     def stub(self, name, body):
         path = self.bin / name
@@ -63,7 +69,7 @@ if [ "${TEST_FAIL_RESTART:-}" = true ] && [ "$2" = restart ]; then exit 1; fi
         self.assert_ok(self.run_guest("build"))
         commands = self.log.read_text()
         self.assertIn("--target runtime", commands)
-        self.assertIn("CARGO_BUILD_JOBS=2", commands)
+        self.assertIn("HYPRSTREAM_BUILD_JOBS=2", commands)
         self.assertIn(f"CARGO_TARGET_DIR={self.cache}/target", commands)
         self.assertIn(f"--volume {self.cache}:{self.cache}", commands)
         self.assertNotIn("systemctl", commands)
@@ -91,6 +97,13 @@ if [ "${TEST_FAIL_RESTART:-}" = true ] && [ "$2" = restart ]; then exit 1; fi
         result = self.run_guest("build", HYPRSTREAM_DEV_BUILD_JOBS="32")
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.log.exists())
+
+    def test_restore_copy_failure_keeps_backup_and_does_not_retry_new_image(self):
+        result = self.run_guest("activate", "policy", "localhost/hyprstream-staging-dev:bad",
+                                TEST_FAIL_RESTART="true", TEST_FAIL_RESTORE="true")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual((self.state / "hyprstream-policy.container.original").read_text(), self.original)
+        self.assertEqual(self.log.read_text().count("systemctl --user restart"), 1)
 
     def test_rejects_unowned_service_or_nonlocal_image(self):
         for args in [("activate", "sshd", "localhost/hyprstream-staging-dev:first"),

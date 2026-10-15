@@ -54,7 +54,8 @@ probe() {
   else
     echo 'source_worktree=clean'
   fi
-  df -h -- "$repo_root" "$quadlet_dir"
+  df -h -- "$repo_root"
+  [ ! -d "$quadlet_dir" ] || df -h -- "$quadlet_dir"
   if command -v podman >/dev/null; then
     graph_root="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || true)"
     [ -z "$graph_root" ] || df -h -- "$graph_root"
@@ -104,7 +105,7 @@ build() {
   image="localhost/hyprstream-staging-dev:${revision}-$(date -u +%Y%m%d%H%M%S)"
   echo "Building $image from $repo_root (arch=$variant); no service will change."
   podman build --target runtime --build-arg "VARIANT=$variant" \
-    --build-arg "CARGO_BUILD_JOBS=$jobs" \
+    --build-arg "HYPRSTREAM_BUILD_JOBS=$jobs" \
     --volume "$cache_dir:$cache_dir" \
     --build-arg "CARGO_TARGET_DIR=$cache_dir/target" \
     -t "$image" -f "$repo_root/Dockerfile" "$repo_root"
@@ -145,7 +146,10 @@ activate() {
      ! systemctl --user restart "hyprstream-$service.service" ||
      ! systemctl --user is-active --quiet "hyprstream-$service.service"; then
     echo 'Service failed; restoring original Quadlet.' >&2
-    restore_quadlet "$service" "$file" "$backup"
+    if ! restore_quadlet "$service" "$file" "$backup"; then
+      echo "Could not restore the original Quadlet; retained rollback configuration: $backup" >&2
+      exit 1
+    fi
     systemctl --user daemon-reload
     if systemctl --user restart "hyprstream-$service.service" &&
        systemctl --user is-active --quiet "hyprstream-$service.service"; then
