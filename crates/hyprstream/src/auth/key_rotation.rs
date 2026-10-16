@@ -1357,6 +1357,41 @@ fn generate_slot(nbf: i64, exp: i64) -> KeySlot {
 
 // ── Load or initialize slots at startup ────────────────────────────────────
 
+/// Serialize component reads/creation with other starters and slot mutations.
+/// A slot is two files, so atomic replacement of each file alone does not make
+/// first boot atomic. Every contender must re-read under this lock and adopt
+/// the durable winner, never publish a process-local losing key.
+///
+/// This is deliberately NOT the composite cycle/ledger lock: subscribers load
+/// slots while holding the ledger lock. Rotators release this short-lived lock
+/// before publication/acknowledgements, avoiding a ledger -> cycle inversion.
+fn lock_signing_slots(state_dir: &Path, nonblocking: bool) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::{flock, FlockArg};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(state_dir.join("signing-slots.lock"))?;
+    flock(
+        file.as_raw_fd(),
+        if nonblocking {
+            FlockArg::LockExclusiveNonblock
+        } else {
+            FlockArg::LockExclusive
+        },
+    )?;
+    Ok(file)
+}
+
 /// Load all three JWT key slots from `secrets_dir`.
 ///
 /// If no active slot exists, generate one immediately (first boot) — but only
@@ -1371,6 +1406,13 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     // Slots are state: read/write them via the writable state dir (#803),
     // falling back to the (possibly read-only, provisioned) secrets dir.
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, false) {
+        Ok(lock) => lock,
+        Err(error) => {
+            error!("Could not lock JWT signing slots: {error}; refusing initialization");
+            return SigningKeyStore::new(KeySlots::default());
+        }
+    };
     let has_committed_authority = has_committed_composite_marker(secrets_dir);
     let drain = load_slot(&state_dir, "drain").or_else(|| load_slot(secrets_dir, "drain"));
     let mut active = load_slot(&state_dir, "active").or_else(|| load_slot(secrets_dir, "active"));
@@ -1392,7 +1434,7 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
             match persist_slot(&state_dir, "active", &slot) {
                 Ok(()) => {
                     info!("Active JWT key generated (kid={})", slot.kid());
-                    active = Some(slot);
+                    active = load_slot(&state_dir, "active");
                 }
                 Err(e) => error!(
                     "Could not persist active JWT key to '{}': {e}. Refusing to \
@@ -1509,6 +1551,13 @@ pub async fn rotate_jwt_keys(
     now: i64,
 ) -> bool {
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, true) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("Could not lock JWT signing slots; deferring rotation: {error}");
+            return false;
+        }
+    };
     rotate_jwt_keys_in_state_dir(config, &state_dir, store, now).await
 }
 
@@ -2384,7 +2433,7 @@ pub fn load_or_init_es256_key_store(
             error!(
                 "Could not resolve durable ES256 operation-log authority: {error}; refusing implicit key generation"
             );
-            load_or_init_es256_key_store_with_authority(secrets_dir, config, true)
+            load_or_init_es256_key_store_with_authority(secrets_dir, config, || true)
         }
     }
 }
@@ -2394,16 +2443,17 @@ fn load_or_init_es256_key_store_with_oplog_state_dir(
     config: &OAuthConfig,
     oplog_state_dir: &Path,
 ) -> Es256SigningKeyStore {
-    let has_durable_authority = match has_es256_oplog_authority(oplog_state_dir) {
-        Ok(present) => present,
-        Err(error) => {
-            error!(
-                "Could not inspect durable ES256 operation-log authority: {error}; refusing implicit key generation"
-            );
-            true
+    load_or_init_es256_key_store_with_authority(secrets_dir, config, || {
+        match has_es256_oplog_authority(oplog_state_dir) {
+            Ok(present) => present,
+            Err(error) => {
+                error!(
+                    "Could not inspect durable ES256 operation-log authority: {error}; refusing implicit key generation"
+                );
+                true
+            }
         }
-    };
-    load_or_init_es256_key_store_with_authority(secrets_dir, config, has_durable_authority)
+    })
 }
 
 fn has_es256_oplog_authority(state_dir: &Path) -> std::io::Result<bool> {
@@ -2426,13 +2476,21 @@ fn has_es256_oplog_authority(state_dir: &Path) -> std::io::Result<bool> {
 fn load_or_init_es256_key_store_with_authority(
     secrets_dir: &Path,
     config: &OAuthConfig,
-    has_durable_authority: bool,
+    has_durable_authority: impl FnOnce() -> bool,
 ) -> Es256SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
 
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, false) {
+        Ok(lock) => lock,
+        Err(error) => {
+            error!("Could not lock ES256 signing slots: {error}; refusing initialization");
+            return Es256SigningKeyStore::new(Es256KeySlots::default());
+        }
+    };
+    let has_durable_authority = has_durable_authority();
     let mut drain =
         load_es256_slot(&state_dir, "drain").or_else(|| load_es256_slot(secrets_dir, "drain"));
     let mut active =
@@ -2463,7 +2521,7 @@ fn load_or_init_es256_key_store_with_authority(
             match persist_es256_slot(&state_dir, "active", &slot) {
                 Ok(()) => {
                     info!("Active ES256 key generated (kid={})", slot.kid());
-                    active = Some(slot);
+                    active = load_es256_slot(&state_dir, "active");
                 }
                 Err(error) => error!(
                     "Could not persist active ES256 key to '{}': {error}. Refusing \
@@ -2517,6 +2575,13 @@ pub async fn rotate_es256_keys(
     now: i64,
 ) -> bool {
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, true) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("Could not lock ES256 signing slots; deferring rotation: {error}");
+            return false;
+        }
+    };
     rotate_es256_keys_in_state_dir(config, &state_dir, store, now).await
 }
 
@@ -2801,6 +2866,13 @@ mod ml_dsa_rotation {
         let lead_secs = config.lead_secs();
 
         let state_dir = rotation_state_dir(secrets_dir);
+        let _slot_lock = match lock_signing_slots(&state_dir, false) {
+            Ok(lock) => lock,
+            Err(error) => {
+                error!("Could not lock ML-DSA signing slots: {error}; refusing initialization");
+                return MlDsaSigningKeyStore::new(MlDsaKeySlots::default());
+            }
+        };
         let has_committed_authority = has_committed_composite_marker(secrets_dir);
         let drain = load_ml_dsa_slot(&state_dir, "drain")
             .or_else(|| load_ml_dsa_slot(secrets_dir, "drain"));
@@ -2823,7 +2895,7 @@ mod ml_dsa_rotation {
                 match persist_ml_dsa_slot(&state_dir, "active", &slot) {
                     Ok(()) => {
                         info!("Active ML-DSA-65 key generated");
-                        active = Some(slot);
+                        active = load_ml_dsa_slot(&state_dir, "active");
                     }
                     Err(e) => error!(
                         "Could not persist active ML-DSA key to '{}': {e}. Refusing \
@@ -2875,6 +2947,13 @@ mod ml_dsa_rotation {
         now: i64,
     ) -> bool {
         let state_dir = rotation_state_dir(secrets_dir);
+        let _slot_lock = match lock_signing_slots(&state_dir, true) {
+            Ok(lock) => lock,
+            Err(error) => {
+                warn!("Could not lock ML-DSA signing slots; deferring rotation: {error}");
+                return false;
+            }
+        };
         rotate_ml_dsa_keys_in_state_dir(config, &state_dir, store, now).await
     }
 
@@ -7822,6 +7901,152 @@ mod tests {
             marker
         );
         assert_eq!(std::fs::read(immutable_path).unwrap(), immutable);
+    }
+
+    #[tokio::test]
+    async fn first_boot_slot_lock_failure_never_creates_or_activates_keys() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("signing-slots.lock")).unwrap();
+        let config = test_config();
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let es = load_or_init_es256_key_store(dir.path(), &config);
+        assert!(ed.0.read().await.active.is_none());
+        assert!(pq.active_key().await.is_none());
+        assert!(es.0.read().active.is_none());
+        for family in ["jwt", "ml-dsa", "es256"] {
+            assert!(!dir
+                .path()
+                .join(format!("{family}-signing-key.active"))
+                .exists());
+        }
+        assert!(
+            initialize_composite_key_set(dir.path(), &ed, &pq, authority_ca_key(), 300)
+                .await
+                .is_err()
+        );
+        assert!(!composite_committed_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn first_boot_slot_lock_defers_rotation_without_mutation() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let es = load_or_init_es256_key_store(dir.path(), &config);
+        let ca = authority_ca_key();
+        let before = component_state_digest(&ed, &pq, ca.verifying_key()).await;
+        let es_before = es.0.read().active.as_ref().unwrap().kid();
+        let lock = lock_signing_slots(dir.path(), false).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(!rotate_jwt_keys(&config, dir.path(), &ed, now).await);
+        assert!(!rotate_ml_dsa_keys(&config, dir.path(), &pq, now).await);
+        assert!(!rotate_es256_keys(&config, dir.path(), &es, now).await);
+        assert_eq!(
+            component_state_digest(&ed, &pq, ca.verifying_key()).await,
+            before
+        );
+        drop(lock);
+        let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+        let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let reloaded_es = load_or_init_es256_key_store(dir.path(), &config);
+        assert_eq!(
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await,
+            before
+        );
+        assert_eq!(
+            reloaded_es.0.read().active.as_ref().unwrap().kid(),
+            es_before
+        );
+        assert!(rotate_jwt_keys(&config, dir.path(), &ed, now).await);
+        assert!(rotate_ml_dsa_keys(&config, dir.path(), &pq, now).await);
+    }
+
+    #[tokio::test]
+    async fn first_boot_slot_creation_is_serialized_across_processes() {
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::fd::AsRawFd;
+
+        const CHILD: &str = "HYPRSTREAM_FIRST_BOOT_SLOT_CHILD";
+        const DIRECTORY: &str = "HYPRSTREAM_FIRST_BOOT_SLOT_DIR";
+        const TEST: &str =
+            "auth::key_rotation::tests::first_boot_slot_creation_is_serialized_across_processes";
+        if let Ok(child) = std::env::var(CHILD) {
+            let dir = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+            std::fs::write(dir.join(format!("{child}.ready")), b"ready").unwrap();
+            let config = test_config();
+            // Match service startup: PQ before Ed, then the factory's ES256.
+            let pq = load_or_init_ml_dsa_key_store(&dir, &config);
+            let ed = load_or_init_key_store(&dir, &config);
+            let es = load_or_init_es256_key_store(&dir, &config);
+            let ca = authority_ca_key();
+            initialize_composite_key_set(&dir, &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .unwrap();
+            // Only public identity digests leave this disposable test process.
+            let digest = component_state_digest(&ed, &pq, ca.verifying_key()).await;
+            let es_kid = es.0.read().active.as_ref().unwrap().kid();
+            std::fs::write(
+                dir.join(format!("{child}.done")),
+                format!("{digest}:{es_kid}"),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("signing-slots.lock"))
+            .unwrap();
+        flock(lock.as_raw_fd(), FlockArg::LockExclusive).unwrap();
+        let spawn = |name: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, name)
+                .env(DIRECTORY, dir.path())
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn("first");
+        let mut second = spawn("second");
+        wait_path(&dir.path().join("first.ready"));
+        wait_path(&dir.path().join("second.ready"));
+        // The old initializer ignores this held interprocess lock and writes
+        // active slots. Check the causal boundary before releasing either child.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let wrote_while_locked = ["jwt", "ml-dsa", "es256"].iter().any(|family| {
+            dir.path()
+                .join(format!("{family}-signing-key.active"))
+                .exists()
+        });
+        drop(lock);
+        assert!(first.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        assert!(
+            !wrote_while_locked,
+            "slot creation ignored the interprocess lock"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("first.done")).unwrap(),
+            std::fs::read(dir.path().join("second.done")).unwrap(),
+            "concurrent starters must adopt the same durable component identities"
+        );
+        let marker = std::fs::read(composite_committed_path(dir.path())).unwrap();
+        let mut restarted = spawn("restarted");
+        assert!(restarted.wait().unwrap().success());
+        assert_eq!(
+            std::fs::read(dir.path().join("first.done")).unwrap(),
+            std::fs::read(dir.path().join("restarted.done")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(composite_committed_path(dir.path())).unwrap(),
+            marker
+        );
     }
 
     #[tokio::test]
