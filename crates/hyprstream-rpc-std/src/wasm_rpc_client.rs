@@ -138,9 +138,7 @@ impl FederateProofProvider for BrowserFederateProofProvider {
         let credential = envelope.jwt_token().ok_or_else(|| {
             anyhow::anyhow!("Federate proof requires the host session credential")
         })?;
-        let issued_at = u64::try_from(envelope.iat).map_err(|_| {
-            anyhow::anyhow!("Federate proof requires a nonnegative request timestamp")
-        })?;
+        let (issued_at, expires_at) = crate::federate_proof_time::proof_timestamps(envelope.iat)?;
         let binding = FederateRecipientBinding::from_recipients(
             envelope.response_kem_recipient.as_ref(),
             envelope.client_kem_public.as_ref(),
@@ -150,9 +148,7 @@ impl FederateProofProvider for BrowserFederateProofProvider {
             service_domain: service,
             credential: credential.as_bytes(),
             issued_at,
-            expires_at: issued_at
-                .checked_add(30)
-                .ok_or_else(|| anyhow::anyhow!("Federate proof timestamp overflow"))?,
+            expires_at,
             capnp_schema_id: self.request_schema_id,
             capnp_body,
             // v16 response-proof binding is a separate COSE response model.
