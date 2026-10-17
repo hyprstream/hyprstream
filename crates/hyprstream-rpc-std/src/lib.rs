@@ -348,6 +348,8 @@ mod contract_compat_tests {
 // Generic codegen-driven service→9p projection (`ServiceMount`) + stream pipes.
 // Native and wasm both: the same generated dispatch drives the file surface on
 // either target. (#539 T3)
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser_moq_stream;
 #[cfg(target_arch = "wasm32")]
 pub mod browser_session;
 #[cfg(any(target_arch = "wasm32", test))]

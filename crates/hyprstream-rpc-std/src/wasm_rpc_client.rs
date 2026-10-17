@@ -550,12 +550,19 @@ impl WasmRpcClient {
                 &response,
             )
             .map_err(|error| JsError::new(&error.to_string()))?;
-            let handle = self
-                .inner
-                .open_stream_from_info(info, &secret.scalar().to_bytes(), &public_bytes)
-                .await
-                .map_err(|error| JsError::new(&error.to_string()))?;
-            return Ok(WasmStreamHandle { inner: handle });
+            let (tls_url, tls_pins) = self.inner.transport.tls_policy();
+            let handle = crate::browser_moq_stream::BrowserMoqHandle::open(
+                info,
+                &secret.scalar().to_bytes(),
+                &public_bytes,
+                tls_url,
+                tls_pins,
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            return Ok(WasmStreamHandle {
+                inner: BrowserStreamHandle::Moq(handle),
+            });
         }
         let handle = self
             .inner
@@ -566,7 +573,9 @@ impl WasmRpcClient {
             )
             .await
             .map_err(|error| JsError::new(&error.to_string()))?;
-        Ok(WasmStreamHandle { inner: handle })
+        Ok(WasmStreamHandle {
+            inner: BrowserStreamHandle::Legacy(handle),
+        })
     }
 
     /// Open an option-bearing generated stream with explicit service and method metadata.
@@ -599,12 +608,19 @@ impl WasmRpcClient {
                 &response,
             )
             .map_err(|error| JsError::new(&error.to_string()))?;
-            let handle = self
-                .inner
-                .open_stream_from_info(info, &secret.scalar().to_bytes(), &public_bytes)
-                .await
-                .map_err(|error| JsError::new(&error.to_string()))?;
-            return Ok(WasmStreamHandle { inner: handle });
+            let (tls_url, tls_pins) = self.inner.transport.tls_policy();
+            let handle = crate::browser_moq_stream::BrowserMoqHandle::open(
+                info,
+                &secret.scalar().to_bytes(),
+                &public_bytes,
+                tls_url,
+                tls_pins,
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            return Ok(WasmStreamHandle {
+                inner: BrowserStreamHandle::Moq(handle),
+            });
         }
         let handle = self
             .inner
@@ -616,7 +632,9 @@ impl WasmRpcClient {
             )
             .await
             .map_err(|error| JsError::new(&error.to_string()))?;
-        Ok(WasmStreamHandle { inner: handle })
+        Ok(WasmStreamHandle {
+            inner: BrowserStreamHandle::Legacy(handle),
+        })
     }
 
     /// Open a verified streaming subscription.
@@ -627,7 +645,9 @@ impl WasmRpcClient {
             .open_stream(payload.to_vec())
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(WasmStreamHandle { inner: handle })
+        Ok(WasmStreamHandle {
+            inner: BrowserStreamHandle::Legacy(handle),
+        })
     }
 }
 
@@ -641,7 +661,12 @@ impl WasmRpcClient {
 /// Cap'n Proto parsing as the native `StreamHandle<LazyUdsTransport>`.
 #[wasm_bindgen(js_name = "StreamHandle")]
 pub struct WasmStreamHandle {
-    inner: StreamHandleImpl<WtConnection>,
+    inner: BrowserStreamHandle,
+}
+
+enum BrowserStreamHandle {
+    Legacy(StreamHandleImpl<WtConnection>),
+    Moq(crate::browser_moq_stream::BrowserMoqHandle),
 }
 
 #[wasm_bindgen(js_class = "StreamHandle")]
@@ -652,7 +677,11 @@ impl WasmStreamHandle {
     /// null on stream end, or throws on error.
     #[wasm_bindgen(js_name = "nextPayload")]
     pub async fn next_payload(&mut self) -> Result<JsValue, JsError> {
-        match self.inner.next_payload().await {
+        let result = match &mut self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle.next_payload().await,
+            BrowserStreamHandle::Moq(handle) => handle.next_payload().await,
+        };
+        match result {
             Ok(Some(StreamPayload::Data(data))) => Ok(js_sys::Uint8Array::from(&data[..]).into()),
             Ok(Some(StreamPayload::Complete(meta))) => {
                 Ok(js_sys::Uint8Array::from(&meta[..]).into())
@@ -666,23 +695,36 @@ impl WasmStreamHandle {
         }
     }
 
-    /// Cancel the stream via authenticated ctrl channel.
+    /// Cancel consumption. MoQ closes its subscription/session; legacy streams
+    /// retain their authenticated ctrl channel. No RPC PUB fallback is used.
     pub async fn cancel(&mut self) -> Result<(), JsError> {
-        self.inner
-            .cancel()
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))
+        match &mut self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle
+                .cancel()
+                .await
+                .map_err(|e| JsError::new(&e.to_string())),
+            BrowserStreamHandle::Moq(handle) => {
+                handle.cancel();
+                Ok(())
+            }
+        }
     }
 
     /// Get the stream ID.
     #[wasm_bindgen(js_name = "streamId")]
     pub fn stream_id(&self) -> String {
-        self.inner.stream_id().to_owned()
+        match &self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle.stream_id().to_owned(),
+            BrowserStreamHandle::Moq(handle) => handle.stream_id().to_owned(),
+        }
     }
 
     /// Check if stream is completed.
     #[wasm_bindgen(js_name = "isCompleted")]
     pub fn is_completed(&self) -> bool {
-        self.inner.is_completed()
+        match &self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle.is_completed(),
+            BrowserStreamHandle::Moq(handle) => handle.is_completed(),
+        }
     }
 }

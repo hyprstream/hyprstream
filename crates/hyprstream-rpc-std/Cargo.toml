@@ -66,6 +66,8 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
+url = "2"
+moq-net = { workspace = true }
 
 # wasm32-only test deps: a real, browser-executed test for the
 # `BrowserSession` API (mirrors hyprstream-rpc/tests/wasm_browser_fetch.rs).
