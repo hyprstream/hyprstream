@@ -3,6 +3,7 @@
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -11,6 +12,33 @@ CHECK = ROOT / '.github/scripts/check-runtime-pinned-model.sh'
 
 
 class RuntimePrerequisiteTests(unittest.TestCase):
+    def test_real_parent_copy_installs_cache_directory_metadata(self):
+        builder = shutil.which('podman') or shutil.which('docker')
+        if builder is None:
+            self.skipTest('Docker or Podman required for cache COPY integration fixture')
+        with tempfile.TemporaryDirectory(prefix='runtime-cache-copy-', dir=Path.home()) as directory:
+            context = Path(directory) / 'context'
+            cache = context / 'private-cache/hyprstream-pinned'
+            cache.mkdir(parents=True, mode=0o700)
+            (context / 'runtime/var/cache').mkdir(parents=True)
+            (context / 'Dockerfile').write_text(
+                'FROM scratch\nCOPY runtime/ /\n'
+                'COPY --chown=65532:65532 private-cache/ /var/cache/\n')
+            output = Path(directory) / 'rootfs.tar'
+            pull = '--pull=never' if Path(builder).name == 'podman' else '--pull=false'
+            result = subprocess.run(
+                [builder, 'build', pull, '--network=none', '--no-cache',
+                 '--output', f'type=tar,dest={output}', str(context)],
+                capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            with tarfile.open(output) as archive:
+                matches = [item for item in archive.getmembers()
+                           if item.name.strip('./') == 'var/cache/hyprstream-pinned']
+                self.assertEqual(len(matches), 1)
+                entry = matches[0]
+                self.assertTrue(entry.isdir())
+                self.assertEqual((entry.uid, entry.gid, entry.mode), (65532, 65532, 0o700))
+
     def test_real_build_context_includes_only_the_runtime_probe(self):
         builder = shutil.which('podman') or shutil.which('docker')
         if builder is None:
@@ -73,7 +101,7 @@ class RuntimePrerequisiteTests(unittest.TestCase):
         runtime = dockerfile.split('FROM runtime-${VARIANT} AS runtime', 1)[1]
         self.assertIn('COPY --from=builder /out/runtime/ /', runtime)
         cache_copy = ('COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} '
-                      '/out/runtime/var/cache/hyprstream-pinned /var/cache/hyprstream-pinned')
+                      '/out/private-cache/ /var/cache/')
         self.assertIn(cache_copy, runtime)
         self.assertLess(runtime.index('ARG RUNTIME_UID'), runtime.index(cache_copy))
         self.assertLess(runtime.index('ARG RUNTIME_GID'), runtime.index(cache_copy))
@@ -83,6 +111,8 @@ class RuntimePrerequisiteTests(unittest.TestCase):
         self.assertIn('ldd /usr/bin/git > /out/git.ldd', dockerfile)
         self.assertIn('libc.so.*|ld-linux*) continue', dockerfile)
         self.assertIn('install -d -m 0700 -o "$RUNTIME_UID" -g "$RUNTIME_GID"', dockerfile)
+        self.assertNotIn('/out/runtime/var/cache/hyprstream-pinned', dockerfile)
+        self.assertIn('/out/private-cache/hyprstream-pinned', dockerfile)
 
 
 if __name__ == '__main__':

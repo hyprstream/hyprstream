@@ -393,7 +393,7 @@ RUN set -eu; \
       case "${library##*/}" in libc.so.*|ld-linux*) continue ;; esac; \
       install -m 0644 "$library" "/out/runtime/usr/lib64/${library##*/}"; \
     done; \
-    install -d -m 0700 -o "$RUNTIME_UID" -g "$RUNTIME_GID" /out/runtime/var/cache/hyprstream-pinned
+    install -d -m 0700 -o "$RUNTIME_UID" -g "$RUNTIME_GID" /out/private-cache/hyprstream-pinned
 
 # Set working directory
 WORKDIR /build
@@ -585,7 +585,7 @@ COPY --from=builder /out/hyprstream /hyprstream
 COPY --from=builder /out/runtime/ /
 # Only this private mutable cache belongs to the runtime account. Keep Git and
 # its libraries root-owned, and make ownership explicit across the stage COPY.
-COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /out/runtime/var/cache/hyprstream-pinned /var/cache/hyprstream-pinned
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /out/private-cache/ /var/cache/
 COPY --chmod=0555 .github/scripts/check-runtime-pinned-model.sh /usr/local/libexec/check-runtime-pinned-model
 
 # Set library paths
