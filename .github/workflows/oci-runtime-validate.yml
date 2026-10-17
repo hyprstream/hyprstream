@@ -52,6 +52,8 @@ jobs:
       run: |
         bash -n scripts/staging-live-loop.sh
         python3 scripts/tests/test_staging_live_loop.py
+        sh -n .github/scripts/check-runtime-pinned-model.sh
+        python3 .github/scripts/test-runtime-pinned-model.py
     - run: |
         echo "OCI runtime image validation is deferred to the merge queue:"
         echo "this context is a placeholder success on PR heads; the real"
@@ -87,6 +89,8 @@ jobs:
         run: |
           bash -n scripts/staging-live-loop.sh
           python3 scripts/tests/test_staging_live_loop.py
+          sh -n .github/scripts/check-runtime-pinned-model.sh
+          python3 .github/scripts/test-runtime-pinned-model.py
 
       - name: Runner sanity
         run: |

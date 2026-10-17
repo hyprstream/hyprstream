@@ -40,7 +40,6 @@ use anyhow::{anyhow, Context, Result};
 use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc_std::inference_client::InferenceClient;
@@ -952,7 +951,10 @@ impl ModelService {
     }
 
     fn inference_transport(instance: &InferenceInstanceId) -> TransportConfig {
-        registry().endpoint(&instance.service_name(), SocketKind::Rep)
+        // This worker is always spawned on a thread in the Model process.
+        // Standalone Model's global IPC profile is for external services, not
+        // its co-located worker; keep both worker and client on the same typed arm.
+        TransportConfig::inproc(format!("hyprstream/{}", instance.service_name()))
     }
 
     /// The deterministic local InferenceService endpoint string for diagnostics.
@@ -3532,6 +3534,7 @@ impl crate::services::RequestService for ModelService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyprstream_rpc::registry::{global as registry, SocketKind};
 
     #[cfg(feature = "postgres")]
     #[test]
@@ -4037,15 +4040,37 @@ mod tests {
         assert!(admit_in_process_tenant(&admitted, "tenant-b").is_err());
     }
 
-    /// #320: the co-located InferenceService resolves (via the local Resolver
-    /// registry) to an `Inproc` transport — the same arm the spawner registers in
-    /// the in-process dial registry and the router single-selects.
+    /// A threaded worker stays Inproc even when standalone Model uses global IPC.
+    /// Isolate the first-write registry so other tests cannot mask the profile.
     #[test]
-    fn inference_transport_is_inproc_co_located() {
-        // Default registry mode is Inproc; idempotent if another test inited it.
-        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
+    fn inference_transport_is_inproc_co_located() -> Result<()> {
+        const CHILD: &str = "HYPRSTREAM_TEST_INFERENCE_IPC_PROFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "services::model::tests::inference_transport_is_inproc_co_located",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Ipc, None);
         let instance = InferenceInstanceId::new("tenant-a", "qwen3-small:main", 0)
             .unwrap_or_else(|e| panic!("valid instance: {e}"));
+        assert!(matches!(
+            registry()
+                .endpoint(&instance.service_name(), SocketKind::Rep)
+                .endpoint,
+            hyprstream_rpc::transport::EndpointType::Ipc { .. }
+        ));
         let t = ModelService::inference_transport(&instance);
         match &t.endpoint {
             hyprstream_rpc::transport::EndpointType::Inproc { endpoint } => {
@@ -4053,9 +4078,20 @@ mod tests {
                     endpoint.contains("inference-"),
                     "opaque deterministic per-tenant/model inproc name, got {endpoint}"
                 );
+                assert_eq!(endpoint, &format!("hyprstream/{}", instance.service_name()));
             }
             other => panic!("expected Inproc co-located transport, got {other:?}"),
         }
+        let other = InferenceInstanceId::new("tenant-b", "qwen3-small:main", 0)?;
+        assert_ne!(
+            t.endpoint_string(),
+            ModelService::inference_endpoint(&other)
+        );
+        assert_eq!(
+            t.endpoint_string(),
+            ModelService::inference_endpoint(&instance)
+        );
+        Ok(())
     }
 
     /// #320: a co-located (`Inproc`) service publishes an EMPTY wire reach list —
