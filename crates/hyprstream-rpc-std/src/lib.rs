@@ -350,6 +350,8 @@ mod contract_compat_tests {
 // either target. (#539 T3)
 #[cfg(target_arch = "wasm32")]
 pub mod browser_session;
+#[cfg(any(target_arch = "wasm32", test))]
+mod federate_proof_time;
 pub mod stream_mount;
 pub mod vfs_mount;
 #[cfg(target_arch = "wasm32")]
