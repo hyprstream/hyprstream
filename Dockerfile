@@ -379,6 +379,22 @@ ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 FROM builder-${VARIANT} AS builder
 
+# The pinned-disk reader invokes absolute /usr/bin/git with env_clear. Carry
+# the selected architecture's Git and its actual non-glibc dependency closure;
+# do not copy a host binary or replace the pinned runtime base's libc/loader.
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+RUN set -eu; \
+    install -D -m 0755 /usr/bin/git /out/runtime/usr/bin/git; \
+    ldd /usr/bin/git > /out/git.ldd; \
+    ! grep -q 'not found' /out/git.ldd; \
+    mkdir -p /out/runtime/usr/lib64; \
+    awk '/=> \// { print $3 }' /out/git.ldd | while read -r library; do \
+      case "${library##*/}" in libc.so.*|ld-linux*) continue ;; esac; \
+      install -m 0644 "$library" "/out/runtime/usr/lib64/${library##*/}"; \
+    done; \
+    install -d -m 0700 -o "$RUNTIME_UID" -g "$RUNTIME_GID" /out/runtime/var/cache/hyprstream-pinned
+
 # Set working directory
 WORKDIR /build
 
@@ -563,6 +579,8 @@ FROM runtime-${VARIANT} AS runtime
 # cache mount, so tens of gigabytes of intermediate objects never enter an OCI
 # layer (critical on the Graviton publisher's small root filesystem).
 COPY --from=builder /out/hyprstream /hyprstream
+COPY --from=builder /out/runtime/ /
+COPY --chmod=0555 .github/scripts/check-runtime-pinned-model.sh /usr/local/libexec/check-runtime-pinned-model
 
 # Set library paths
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64
@@ -580,6 +598,10 @@ EXPOSE 8080 50051
 ARG RUNTIME_UID
 ARG RUNTIME_GID
 USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# Runs in every actual amd64/arm64 published image, as its default non-root
+# account, without inherited library/config environment in the Git child.
+RUN /bin/sh /usr/local/libexec/check-runtime-pinned-model
 
 # Run hyprstream (the runtime base has no working directory conventions of its
 # own, so use an absolute path)
