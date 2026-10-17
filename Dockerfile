@@ -575,11 +575,17 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 FROM runtime-${VARIANT} AS runtime
 
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+
 # Copy only the final binary out of the builder. Cargo's target directory is a
 # cache mount, so tens of gigabytes of intermediate objects never enter an OCI
 # layer (critical on the Graviton publisher's small root filesystem).
 COPY --from=builder /out/hyprstream /hyprstream
 COPY --from=builder /out/runtime/ /
+# Only this private mutable cache belongs to the runtime account. Keep Git and
+# its libraries root-owned, and make ownership explicit across the stage COPY.
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /out/runtime/var/cache/hyprstream-pinned /var/cache/hyprstream-pinned
 COPY --chmod=0555 .github/scripts/check-runtime-pinned-model.sh /usr/local/libexec/check-runtime-pinned-model
 
 # Set library paths
@@ -595,8 +601,6 @@ EXPOSE 8080 50051
 # binary and its libraries are root-owned and world-readable/executable, which
 # is what an immutable runtime wants: the service can execute them and cannot
 # rewrite them.
-ARG RUNTIME_UID
-ARG RUNTIME_GID
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 
 # Runs in every actual amd64/arm64 published image, as its default non-root

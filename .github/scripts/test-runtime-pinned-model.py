@@ -43,6 +43,12 @@ class RuntimePrerequisiteTests(unittest.TestCase):
         dockerfile = (ROOT / 'Dockerfile').read_text()
         runtime = dockerfile.split('FROM runtime-${VARIANT} AS runtime', 1)[1]
         self.assertIn('COPY --from=builder /out/runtime/ /', runtime)
+        cache_copy = ('COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} '
+                      '/out/runtime/var/cache/hyprstream-pinned /var/cache/hyprstream-pinned')
+        self.assertIn(cache_copy, runtime)
+        self.assertLess(runtime.index('ARG RUNTIME_UID'), runtime.index(cache_copy))
+        self.assertLess(runtime.index('ARG RUNTIME_GID'), runtime.index(cache_copy))
+        self.assertEqual(runtime.count('--chown='), 1)
         self.assertLess(runtime.index('USER ${RUNTIME_UID}:${RUNTIME_GID}'),
                         runtime.index('RUN /bin/sh /usr/local/libexec/check-runtime-pinned-model'))
         self.assertIn('ldd /usr/bin/git > /out/git.ldd', dockerfile)
