@@ -531,6 +531,32 @@ impl WasmRpcClient {
         method_discriminator: u16,
         payload: &[u8],
     ) -> Result<WasmStreamHandle, JsError> {
+        if service_name == "model" && method_discriminator == 6 {
+            let (secret, public) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+            let public_bytes = public.to_bytes();
+            let response = self
+                .inner
+                .call_streaming_for_service_with_method(
+                    service_name,
+                    method_discriminator,
+                    payload.to_vec(),
+                    public_bytes,
+                )
+                .await
+                .map_err(|error| JsError::new(&error.to_string()))?;
+            let info = crate::model_stream_response::decode_model_stream_response(
+                service_name,
+                method_discriminator,
+                &response,
+            )
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            let handle = self
+                .inner
+                .open_stream_from_info(info, &secret.scalar().to_bytes(), &public_bytes)
+                .await
+                .map_err(|error| JsError::new(&error.to_string()))?;
+            return Ok(WasmStreamHandle { inner: handle });
+        }
         let handle = self
             .inner
             .open_stream_for_service_with_method(
@@ -553,6 +579,33 @@ impl WasmRpcClient {
         jwt: Option<String>,
         delegated_bearer: Option<String>,
     ) -> Result<WasmStreamHandle, JsError> {
+        if service_name == "model" && method_discriminator == 6 {
+            let (secret, public) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+            let public_bytes = public.to_bytes();
+            let response = self
+                .inner
+                .call_streaming_with_options_for_service_with_method(
+                    service_name,
+                    method_discriminator,
+                    payload.to_vec(),
+                    public_bytes,
+                    call_options(jwt, delegated_bearer),
+                )
+                .await
+                .map_err(|error| JsError::new(&error.to_string()))?;
+            let info = crate::model_stream_response::decode_model_stream_response(
+                service_name,
+                method_discriminator,
+                &response,
+            )
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            let handle = self
+                .inner
+                .open_stream_from_info(info, &secret.scalar().to_bytes(), &public_bytes)
+                .await
+                .map_err(|error| JsError::new(&error.to_string()))?;
+            return Ok(WasmStreamHandle { inner: handle });
+        }
         let handle = self
             .inner
             .open_stream_with_options_for_service_with_method(
