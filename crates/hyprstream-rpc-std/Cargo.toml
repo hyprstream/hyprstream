@@ -55,6 +55,7 @@ hyprstream-9p = { path = "../hyprstream-9p" }
 # web-transport-wasm's concrete `web_sys::WebTransport` Session, adapted to
 # `web_transport_trait::Session` in `moq_wt_session.rs`.
 moq-net = { workspace = true }
+web-async = "0.1.5"
 web-transport-trait = { workspace = true }
 web-transport-wasm = "0.5"
 bytes = "1"
@@ -66,6 +67,9 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
+url = "2"
+moq-net = { workspace = true }
+web-async = "0.1.5"
 
 # wasm32-only test deps: a real, browser-executed test for the
 # `BrowserSession` API (mirrors hyprstream-rpc/tests/wasm_browser_fetch.rs).

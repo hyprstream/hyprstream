@@ -27,6 +27,8 @@ use crate::zmtp_framing;
 /// Renamed from `WtClient` for consistency with `ZmqConnection`.
 pub struct WtConnection {
     wt: web_sys::WebTransport,
+    tls_url: String,
+    tls_hashes: Vec<[u8; 32]>,
 }
 
 // SAFETY: wasm32 is single-threaded.
@@ -76,7 +78,18 @@ impl WtConnection {
             .await
             .map_err(|e| anyhow!("WebTransport connect failed: {:?}", e))?;
 
-        Ok(Self { wt })
+        Ok(Self {
+            wt,
+            tls_url: url.to_owned(),
+            tls_hashes: cert_hashes.to_vec(),
+        })
+    }
+
+    /// Effective TLS policy used by this connection. Browser provisioning
+    /// validates it before dialing; stream consumers may reuse it only after
+    /// matching the signed stream destination to this exact authority.
+    pub fn tls_policy(&self) -> (&str, &[[u8; 32]]) {
+        (&self.tls_url, &self.tls_hashes)
     }
 
     /// Send a REQ/REP request. Returns response payload bytes.
