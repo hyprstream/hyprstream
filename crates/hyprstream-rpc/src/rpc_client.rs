@@ -31,6 +31,15 @@ type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait PreSealGuard: Send + Sync {
     async fn ensure_current(&self) -> Result<()>;
+
+    /// A browser guard may supply a fresh projection of its unchanged anchor.
+    /// The result belongs to this request only; legacy guards are unchanged.
+    async fn current_browser_binding(
+        &self,
+    ) -> Result<Option<crate::browser_provisioning::BrowserRequestBinding>> {
+        self.ensure_current().await?;
+        Ok(None)
+    }
 }
 
 /// Builds a holder proof after all forwarded recipients exist. `capnp_body`
@@ -405,7 +414,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
-        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
@@ -472,7 +480,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
-        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
@@ -582,7 +589,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
-        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         anyhow::ensure!(
             !(options.jwt.is_some() && options.delegated_bearer.is_some()),
@@ -661,7 +667,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
-        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         anyhow::ensure!(
             !(options.jwt.is_some() && options.delegated_bearer.is_some()),
@@ -695,13 +700,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Get the next monotonically increasing request ID.
     pub fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    async fn ensure_pre_seal_current(&self) -> Result<()> {
-        if let Some(guard) = &self.pre_seal_guard {
-            guard.ensure_current().await?;
-        }
-        Ok(())
     }
 
     /// Unwrap + verify a `ResponseEnvelope` (#275/#277).
@@ -823,19 +821,40 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
-        let inferred_method =
-            if self.browser_provisioning_binding.is_some() && method_discriminator.is_none() {
-                Some(crate::browser_provisioning::canonical_method_discriminator(
-                    &payload,
-                )?)
-            } else {
-                None
-            };
-        let service_domain = service_domain.or_else(|| {
-            self.browser_provisioning_binding
-                .as_ref()
-                .map(|binding| binding.service_name.as_str())
-        });
+        // Centralize the guard at sealing so every call variant uses exactly
+        // one fresh fetch and keeps its binding local (including concurrent calls).
+        let refreshed = match &self.pre_seal_guard {
+            Some(guard) => guard.current_browser_binding().await?,
+            None => None,
+        };
+        if let Some(current) = &refreshed {
+            let original = self.browser_provisioning_binding.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("fresh browser binding has no immutable client anchor")
+            })?;
+            let mut stable = current.clone();
+            stable.expires_at_unix_ms = original.expires_at_unix_ms;
+            anyhow::ensure!(
+                stable == *original,
+                "fresh browser binding changed client anchor"
+            );
+            current.validate_shape()?;
+            anyhow::ensure!(
+                current.expires_at_unix_ms > chrono::Utc::now().timestamp_millis(),
+                "fresh browser binding expired before seal"
+            );
+        }
+        let browser_binding = refreshed
+            .as_ref()
+            .or(self.browser_provisioning_binding.as_ref());
+        let inferred_method = if browser_binding.is_some() && method_discriminator.is_none() {
+            Some(crate::browser_provisioning::canonical_method_discriminator(
+                &payload,
+            )?)
+        } else {
+            None
+        };
+        let service_domain =
+            service_domain.or_else(|| browser_binding.map(|binding| binding.service_name.as_str()));
         let method_discriminator = method_discriminator.or(inferred_method);
         let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
@@ -861,7 +880,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .federate_proof_provider
             .as_ref()
             .map(|_| envelope.payload.clone());
-        if let Some(binding) = &self.browser_provisioning_binding {
+        if let Some(binding) = browser_binding {
             let service_domain = service_domain.ok_or_else(|| {
                 anyhow::anyhow!("browser request extension requires a canonical service domain")
             })?;
@@ -1027,6 +1046,14 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         }
         let mut bytes = Vec::new();
         capnp::serialize::write_message(&mut bytes, &message)?;
+        // Async proof/sign callbacks may consume the remainder of the fetched
+        // projection's lifetime. Never send a binding which expired while sealing.
+        if let Some(current) = &refreshed {
+            anyhow::ensure!(
+                current.expires_at_unix_ms > chrono::Utc::now().timestamp_millis(),
+                "fresh browser binding expired during seal"
+            );
+        }
         Ok((bytes, pending))
     }
 
@@ -2045,6 +2072,120 @@ mod request_kem_tests {
             !binding.matches(Some(&replacement), None, None),
             "substituting the forwarded recipient must invalidate the signed binding"
         );
+    }
+
+    struct FreshBindingGuard {
+        binding: crate::browser_provisioning::BrowserRequestBinding,
+        fail: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PreSealGuard for FreshBindingGuard {
+        async fn ensure_current(&self) -> Result<()> {
+            anyhow::bail!("fixture must use the single-fetch binding seam")
+        }
+
+        async fn current_browser_binding(
+            &self,
+        ) -> Result<Option<crate::browser_provisioning::BrowserRequestBinding>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            anyhow::ensure!(!self.fail, "fixture fetch failure");
+            Ok(Some(self.binding.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshed_browser_binding_is_sealed_after_original_projection_expires() {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _) = generate_signing_keypair();
+        let server_recipient = derive_mesh_kem_recipient(&server_sk).unwrap();
+        let mut kem_store = KeyedKemTrustStore::new();
+        kem_store.bind(server_vk.to_bytes(), server_recipient.public());
+        let mut original = browser_test_binding();
+        original.expires_at_unix_ms = 1;
+        let mut current = original.clone();
+        current.expires_at_unix_ms = chrono::Utc::now().timestamp_millis() + 30_000;
+        let guard = Arc::new(FreshBindingGuard {
+            binding: current.clone(),
+            fail: false,
+            calls: Default::default(),
+        });
+        let mut client = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            ForbidsCleartextMock,
+            Some(server_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store))
+        .with_browser_provisioning_binding(original.clone())
+        .unwrap()
+        .with_pre_seal_guard(guard.clone());
+        let application = browser_capnp_request(7);
+        let (wire, _) = client
+            .sign_envelope(
+                17,
+                application.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some("model"),
+                Some(7),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+        let mut signed = signed_envelope_from_bytes(&wire);
+        signed.decrypt_in_place_mesh_kem(&server_recipient).unwrap();
+        let (extension, body) = crate::browser_provisioning::recover_request_payload(
+            &signed.envelope.payload,
+            crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+                request_id: 17,
+                service_name: "model",
+                carrier_profile:
+                    crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+            },
+        )
+        .unwrap();
+        assert_eq!(body, application);
+        assert_eq!(extension.unwrap().binding, current);
+        assert!(current.expires_at_unix_ms > chrono::Utc::now().timestamp_millis());
+        assert_eq!(
+            client.browser_provisioning_binding.as_ref(),
+            Some(&original)
+        );
+        // No fallback to stale binding on network failure, expired fresh data,
+        // or an attempted authority/key change, even from a faulty guard.
+        for case in 0..4 {
+            let mut binding = current.clone();
+            if case == 1 {
+                binding.expires_at_unix_ms = 1;
+            }
+            if case == 2 {
+                binding.accepted_state_epoch += 1;
+            }
+            if case == 3 {
+                binding.response_key_id.push_str("-changed");
+            }
+            client.pre_seal_guard = Some(Arc::new(FreshBindingGuard {
+                binding,
+                fail: case == 0,
+                calls: Default::default(),
+            }));
+            assert!(client
+                .sign_envelope(
+                    18,
+                    application.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("model"),
+                    Some(7)
+                )
+                .await
+                .is_err());
+        }
     }
 
     fn browser_test_binding() -> crate::browser_provisioning::BrowserRequestBinding {

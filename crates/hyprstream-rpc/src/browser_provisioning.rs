@@ -842,6 +842,24 @@ impl BrowserProvisioning {
         left == right
     }
 
+    /// The immutable snapshot anchors identity, not an indefinitely reusable
+    /// HTTP projection. Only a newly validated, still-fresh identical projection
+    /// can supply the expiry carried by this individual request.
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn refreshed_request_binding(
+        &self,
+        current: Result<Self>,
+        now_unix_ms: i64,
+    ) -> Result<BrowserRequestBinding> {
+        let current = current?;
+        current.ensure_fresh(now_unix_ms)?;
+        anyhow::ensure!(
+            self.same_snapshot(&current),
+            "accepted browser provisioning changed; re-resolution required before seal"
+        );
+        current.request_binding()
+    }
+
     pub fn service_name(&self) -> &str {
         &self.document.service_name
     }
@@ -1163,14 +1181,15 @@ impl BrowserProvisioningGuard {
 #[async_trait::async_trait(?Send)]
 impl crate::rpc_client::PreSealGuard for BrowserProvisioningGuard {
     async fn ensure_current(&self) -> Result<()> {
-        self.snapshot
-            .ensure_fresh(chrono::Utc::now().timestamp_millis())?;
-        let current = fetch_browser_provisioning(&self.provisioning_origin, &self.expected).await?;
-        anyhow::ensure!(
-            self.snapshot.same_snapshot(&current),
-            "accepted browser provisioning changed; re-resolution required before seal"
-        );
+        self.current_browser_binding().await?;
         Ok(())
+    }
+
+    async fn current_browser_binding(&self) -> Result<Option<BrowserRequestBinding>> {
+        let current = fetch_browser_provisioning(&self.provisioning_origin, &self.expected).await;
+        self.snapshot
+            .refreshed_request_binding(current, chrono::Utc::now().timestamp_millis())
+            .map(Some)
     }
 }
 
@@ -1354,6 +1373,59 @@ mod tests {
             .sign_projection(&crate::crypto::SigningKey::from_bytes(&[0x41; 32]))
             .expect("sign classical mutation");
         assert!(BrowserProvisioning::validate(classical, &request(), now).is_err());
+    }
+
+    #[test]
+    fn refreshed_browser_projection_keeps_expired_anchor_but_requires_fresh_identical_authority() {
+        let then = 1_000_000;
+        let now = then + 60_000;
+        let anchor = BrowserProvisioning::validate(signed(material(then)), &request(), then)
+            .expect("anchor");
+        assert!(anchor.ensure_fresh(now).is_err()); // actual old pre-fetch failure
+        let current =
+            BrowserProvisioning::validate(signed(material(now)), &request(), now).expect("current");
+        let expected = current.request_binding().expect("current binding");
+        assert_eq!(
+            anchor
+                .refreshed_request_binding(Ok(current.clone()), now)
+                .expect("fresh identical projection"),
+            expected
+        );
+        assert_eq!(anchor.expires_at_unix_ms(), then + 30_000); // never mutate the anchor
+        assert!(anchor
+            .refreshed_request_binding(Err(anyhow::anyhow!("fixture network failure")), now)
+            .is_err());
+        assert!(anchor
+            .refreshed_request_binding(Ok(current.clone()), now + 30_000)
+            .is_err());
+        // Exercise EVERY stable document field, not just selected key/view fields.
+        // Fetch validation remains independently covered by the signed-document tests.
+        let document = serde_json::to_value(&current.document).expect("document JSON");
+        for field in document.as_object().expect("document object").keys() {
+            if field == "expires_at_unix_ms" || field == "projection_signature" {
+                continue;
+            }
+            let mut changed = current.clone();
+            let mut value = document.clone();
+            let slot = value.get_mut(field).expect("existing field");
+            match slot {
+                serde_json::Value::String(text) => text.push('x'),
+                serde_json::Value::Number(number) => {
+                    *number = (number.as_u64().expect("unsigned field") + 1).into();
+                }
+                serde_json::Value::Bool(flag) => *flag = !*flag,
+                serde_json::Value::Array(values) => values.push(serde_json::json!("fixture")),
+                _ => panic!("unexpected document field shape: {field}"),
+            }
+            // Enum mutations may fail to deserialize first: that is also fail-closed.
+            if let Ok(changed_document) = serde_json::from_value(value) {
+                changed.document = changed_document;
+                assert!(
+                    anchor.refreshed_request_binding(Ok(changed), now).is_err(),
+                    "field {field}"
+                );
+            }
+        }
     }
 
     #[test]

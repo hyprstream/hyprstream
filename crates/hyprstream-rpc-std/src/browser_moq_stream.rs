@@ -233,12 +233,77 @@ fn application_payload(payload: StreamPayload) -> Result<Option<StreamPayload>> 
     }
 }
 
+// Match the native MoQ consumer's startup, group-idle and frame deadlines.
+// web-async uses the browser timer on WASM, not a Tokio runtime clock.
+const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const GROUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn announced_broadcast(
+    consumer: &moq_net::OriginConsumer,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<moq_net::BroadcastConsumer> {
+    web_async::time::timeout(timeout, consumer.announced_broadcast(path))
+        .await
+        .map_err(|_| anyhow::anyhow!("signed MoQ broadcast announcement timed out"))?
+        .ok_or_else(|| anyhow::anyhow!("signed MoQ broadcast not announced"))
+}
+
+struct OrderedGroups {
+    track: moq_net::TrackConsumer,
+    group: Option<moq_net::GroupConsumer>,
+    expected_sequence: u64,
+}
+
+impl OrderedGroups {
+    fn new(track: moq_net::TrackConsumer) -> Self {
+        Self {
+            track,
+            group: None,
+            expected_sequence: 0,
+        }
+    }
+
+    async fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        loop {
+            if self.group.is_none() {
+                // QUIC group streams may arrive out of order. next_group()
+                // skips late lower sequences, invalidating the chained MAC.
+                self.group = web_async::time::timeout(
+                    GROUP_TIMEOUT,
+                    self.track.get_group(self.expected_sequence),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("signed MoQ group timed out"))??;
+                if self.group.is_none() {
+                    return Ok(None);
+                }
+            }
+            if let Some(group) = self.group.as_mut() {
+                match web_async::time::timeout(FRAME_TIMEOUT, group.read_frame())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("signed MoQ frame timed out"))??
+                {
+                    Some(frame) => return Ok(Some(frame.to_vec())),
+                    None => {
+                        self.group = None;
+                        self.expected_sequence = self
+                            .expected_sequence
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("signed MoQ group sequence overflow"))?;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(crate) struct BrowserMoqHandle {
     stream: BrowserStream,
     session: moq_net::Session,
-    track: moq_net::TrackConsumer,
-    group: Option<moq_net::GroupConsumer>,
+    groups: OrderedGroups,
     pending: std::collections::VecDeque<StreamPayload>,
     completed: bool,
 }
@@ -264,20 +329,23 @@ impl BrowserMoqHandle {
         let origin = moq_net::Origin::random().produce();
         let consumer = origin.consume();
         // Consume only. No publisher or SUB/PUB stream is opened on RPC.
-        let session = moq_net::Client::new()
+        let mut session = moq_net::Client::new()
             .with_consume(origin)
             .connect(crate::moq_wt_session::WtSession(transport))
             .await?;
-        let broadcast = consumer
-            .announced_broadcast(&stream.broadcast_path)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("signed MoQ broadcast not announced"))?;
+        let broadcast =
+            match announced_broadcast(&consumer, &stream.broadcast_path, ANNOUNCE_TIMEOUT).await {
+                Ok(broadcast) => broadcast,
+                Err(error) => {
+                    session.close(moq_net::Error::Cancel);
+                    return Err(error);
+                }
+            };
         let track = broadcast.subscribe_track(&moq_net::Track::new("stream"))?;
         Ok(Self {
             stream,
             session,
-            track,
-            group: None,
+            groups: OrderedGroups::new(track),
             pending: Default::default(),
             completed: false,
         })
@@ -306,18 +374,12 @@ impl BrowserMoqHandle {
             if self.completed {
                 return Ok(None);
             }
-            if self.group.is_none() {
-                self.group = self.track.next_group().await?;
-                if self.group.is_none() {
+            match self.groups.next_frame().await? {
+                Some(frame) => self.pending.extend(self.stream.verify_frame(&frame)?),
+                None => {
                     self.stream.eof()?;
                     self.completed = true;
                     return Ok(None);
-                }
-            }
-            if let Some(group) = self.group.as_mut() {
-                match group.read_frame().await? {
-                    Some(frame) => self.pending.extend(self.stream.verify_frame(&frame)?),
-                    None => self.group = None,
                 }
             }
         }
@@ -326,7 +388,7 @@ impl BrowserMoqHandle {
     pub(crate) fn cancel(&mut self) {
         self.completed = true;
         self.pending.clear();
-        self.group = None;
+        self.groups.group = None;
         self.session.close(moq_net::Error::Cancel);
     }
     pub(crate) fn stream_id(&self) -> &str {
@@ -342,6 +404,105 @@ mod tests {
     use super::*;
     use hyprstream_rpc::crypto::{generate_ephemeral_keypair, keyed_mac_truncated_parts};
     use hyprstream_rpc::stream_info::{Destination, Job, QuicReach, Role, StreamOptPreset};
+
+    #[tokio::test]
+    async fn browser_moq_announcement_is_bounded() -> Result<()> {
+        assert_eq!(
+            ANNOUNCE_TIMEOUT,
+            hyprstream_rpc::moq_stream::BROADCAST_ANNOUNCE_TIMEOUT
+        );
+        assert_eq!(
+            GROUP_TIMEOUT,
+            hyprstream_rpc::moq_stream::GROUP_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            FRAME_TIMEOUT,
+            hyprstream_rpc::moq_stream::FRAME_READ_TIMEOUT
+        );
+        let origin = moq_net::Origin::random().produce();
+        let consumer = origin.consume();
+        // A publisher can disappear before the second WebTransport connects.
+        let broadcast = moq_net::Broadcast::default().produce();
+        origin.publish_broadcast("fixture/gone", broadcast.consume());
+        drop(broadcast);
+        tokio::task::yield_now().await;
+        let result = announced_broadcast(
+            &consumer,
+            "fixture/gone",
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "signed MoQ broadcast announcement timed out"
+        );
+        let broadcast = moq_net::Broadcast::default().produce();
+        origin.publish_broadcast("fixture/present", broadcast.consume());
+        announced_broadcast(&consumer, "fixture/present", ANNOUNCE_TIMEOUT).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_moq_reordered_groups_preserve_native_mac_chain() -> Result<()> {
+        use hyprstream_rpc::moq_stream::MoqStreamOrigin;
+        use hyprstream_rpc::streaming::StreamContext;
+        let (secret, public) = generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&public.to_bytes())?
+            .with_qos_preset::<Job>();
+        let mut stream = BrowserStream::from_verified_info(
+            info(&ctx),
+            &secret.scalar().to_bytes(),
+            &public.to_bytes(),
+        )?;
+        let origin = MoqStreamOrigin::standalone().build();
+        let mut publisher = origin.publisher(&ctx)?;
+        publisher.publish_data(b"ordered native data").await?;
+        publisher.complete_ref(b"terminal metadata").await?;
+        let broadcast =
+            announced_broadcast(origin.consumer(), &stream.broadcast_path, ANNOUNCE_TIMEOUT)
+                .await?;
+        let original = broadcast.subscribe_track(&moq_net::Track::new("stream"))?;
+        let mut frames = Vec::new();
+        for sequence in 0..2 {
+            frames.push(
+                original
+                    .get_group(sequence)
+                    .await?
+                    .unwrap()
+                    .read_frame()
+                    .await?
+                    .unwrap(),
+            );
+        }
+        let mut producer = moq_net::Track::new("stream").produce();
+        let mut legacy = producer.consume();
+        let mut ordered = OrderedGroups::new(producer.consume());
+        let mut terminal = producer.create_group(moq_net::Group { sequence: 1 })?;
+        terminal.write_frame(frames[1].clone())?;
+        terminal.finish()?;
+        // Demonstrate the old cursor's causal failure: it returns terminal first.
+        assert_eq!(legacy.next_group().await?.unwrap().sequence, 1);
+        assert!(web_async::time::timeout(
+            std::time::Duration::from_millis(5),
+            ordered.next_frame()
+        )
+        .await
+        .is_err());
+        let mut data = producer.create_group(moq_net::Group { sequence: 0 })?;
+        data.write_frame(frames[0].clone())?;
+        data.finish()?;
+        producer.finish_at(1)?;
+        assert!(legacy.next_group().await?.is_none()); // late Data was skipped
+        let payloads = stream.verify_frame(&ordered.next_frame().await?.unwrap())?;
+        assert!(
+            matches!(&payloads[0], StreamPayload::Data(bytes) if bytes == b"ordered native data")
+        );
+        let payloads = stream.verify_frame(&ordered.next_frame().await?.unwrap())?;
+        assert!(matches!(&payloads[0], StreamPayload::Complete(_)));
+        assert!(ordered.next_frame().await?.is_none());
+        stream.eof()?;
+        Ok(())
+    }
 
     #[test]
     fn browser_moq_normalizes_only_absent_webtransport_subprotocol() {
