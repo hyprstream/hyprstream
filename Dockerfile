@@ -387,7 +387,7 @@ ARG RUNTIME_GID
 RUN set -eu; \
     install -D -m 0755 /usr/bin/git /out/runtime/usr/bin/git; \
     ldd /usr/bin/git > /out/git.ldd; \
-    ! grep -q 'not found' /out/git.ldd; \
+    if grep -q 'not found' /out/git.ldd; then exit 1; fi; \
     mkdir -p /out/runtime/usr/lib64; \
     awk '/=> \// { print $3 }' /out/git.ldd | while read -r library; do \
       case "${library##*/}" in libc.so.*|ld-linux*) continue ;; esac; \
