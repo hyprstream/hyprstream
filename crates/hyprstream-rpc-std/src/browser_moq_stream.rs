@@ -9,6 +9,14 @@ use hyprstream_rpc::crypto::{derive_stream_keys, ristretto_dh_raw};
 use hyprstream_rpc::stream_consumer::{StreamPayload, StreamVerifier};
 use hyprstream_rpc::stream_info::{Completion, Ordering, StreamInfo, TransportConfig};
 
+// WebTransport reports an empty string when no application subprotocol was
+// negotiated. The transport trait represents that state as None, which lets
+// moq-net negotiate using its existing SETUP exchange. Never rewrite a real
+// (including unknown or whitespace-only) nonempty protocol.
+pub(crate) fn negotiated_protocol(protocol: Option<&str>) -> Option<&str> {
+    protocol.filter(|value| !value.is_empty())
+}
+
 pub(crate) struct BrowserStream {
     pub(crate) url: url::Url,
     pub(crate) cert_hashes: Vec<Vec<u8>>,
@@ -334,6 +342,20 @@ mod tests {
     use super::*;
     use hyprstream_rpc::crypto::{generate_ephemeral_keypair, keyed_mac_truncated_parts};
     use hyprstream_rpc::stream_info::{Destination, Job, QuicReach, Role, StreamOptPreset};
+
+    #[test]
+    fn browser_moq_normalizes_only_absent_webtransport_subprotocol() {
+        assert_eq!(negotiated_protocol(None), None);
+        assert_eq!(negotiated_protocol(Some("")), None);
+        for value in ["moql", "moq-00", "unknown-protocol", " "] {
+            assert_eq!(negotiated_protocol(Some(value)), Some(value));
+        }
+        // The actual browser adapter must apply this tested normalization,
+        // rather than preserving Some("") and triggering UnknownAlpn("").
+        assert!(
+            include_str!("moq_wt_session.rs").contains("negotiated_protocol(self.0.protocol())")
+        );
+    }
 
     fn info(ctx: &hyprstream_rpc::streaming::StreamContext) -> StreamInfo {
         StreamInfo {
