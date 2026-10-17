@@ -201,6 +201,7 @@ impl BrowserStream {
 
 fn validate_host(host: Option<&str>) -> Result<()> {
     let host = host.ok_or_else(|| anyhow::anyhow!("missing MoQ host"))?;
+    let host = host.trim_end_matches('.');
     ensure!(
         !host.eq_ignore_ascii_case("localhost")
             && !host.ends_with(".localhost")
@@ -211,6 +212,17 @@ fn validate_host(host: Option<&str>) -> Result<()> {
         "signed MoQ destination is not externally routable"
     );
     Ok(())
+}
+
+// Completion metadata is authenticated control data, never generated text.
+// Keep this projection local to MoQ; the legacy stream API is unchanged.
+fn application_payload(payload: StreamPayload) -> Result<Option<StreamPayload>> {
+    match payload {
+        StreamPayload::Data(data) => Ok(Some(StreamPayload::Data(data))),
+        StreamPayload::Complete(_) => Ok(None),
+        StreamPayload::Error(message) => Err(anyhow::Error::msg(message)),
+        StreamPayload::Tagged { .. } => anyhow::bail!("unopened encrypted stream payload"),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -281,7 +293,7 @@ impl BrowserMoqHandle {
                     self.completed = true;
                     self.session.close(moq_net::Error::Cancel);
                 }
-                return Ok(Some(payload));
+                return application_payload(payload);
             }
             if self.completed {
                 return Ok(None);
@@ -380,21 +392,67 @@ mod tests {
                 .read_frame()
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("fixture frame absent"))?;
-            let payloads = stream.verify_frame(&frame)?;
+            let mut payloads = stream.verify_frame(&frame)?;
             assert_eq!(payloads.len(), 1);
             if terminal {
                 assert!(
                     matches!(&payloads[0], StreamPayload::Complete(data) if data == b"finished")
                 );
+                assert!(application_payload(payloads.remove(0))?.is_none());
             } else {
                 assert!(
                     matches!(&payloads[0], StreamPayload::Data(data) if data == b"genuine native encrypted frame")
                 );
+                assert!(matches!(application_payload(payloads.remove(0))?,
+                    Some(StreamPayload::Data(data)) if data == b"genuine native encrypted frame"));
                 assert!(stream.eof().is_err());
             }
         }
         stream.eof()?;
         assert!(stream.verify_frame(&[0; 32]).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_moq_empty_generation_does_not_emit_completion_metadata() -> Result<()> {
+        use hyprstream_rpc::moq_stream::MoqStreamOrigin;
+        use hyprstream_rpc::streaming::StreamContext;
+        let (secret, public) = generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&public.to_bytes())?
+            .with_qos_preset::<Job>();
+        let mut stream = BrowserStream::from_verified_info(
+            info(&ctx),
+            &secret.scalar().to_bytes(),
+            &public.to_bytes(),
+        )?;
+        let origin = MoqStreamOrigin::standalone().build();
+        let mut publisher = origin.publisher(&ctx)?;
+        publisher.complete_ref(&[0xff, 0, 0x80, 42]).await?;
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(&stream.broadcast_path)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("fixture broadcast absent"))?;
+        let mut track = broadcast.subscribe_track(&moq_net::Track::new("stream"))?;
+        let mut group = track
+            .next_group()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fixture group absent"))?;
+        let frame = group
+            .read_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fixture frame absent"))?;
+        let payloads = stream.verify_frame(&frame)?;
+        assert_eq!(payloads.len(), 1);
+        let mut output_bytes = Vec::new();
+        for payload in payloads {
+            if let Some(StreamPayload::Data(data)) = application_payload(payload)? {
+                output_bytes.extend(data);
+            }
+        }
+        assert!(output_bytes.is_empty());
+        stream.eof()?;
+        assert!(application_payload(StreamPayload::Error("fixture failure".into())).is_err());
         Ok(())
     }
 
@@ -558,6 +616,8 @@ mod tests {
             "",
             "model.example/evil",
             "localhost",
+            "localhost.",
+            "child.localhost.",
             "127.0.0.1",
             "0.0.0.0",
             "[::1]",

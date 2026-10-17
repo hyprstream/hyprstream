@@ -673,7 +673,8 @@ enum BrowserStreamHandle {
 impl WasmStreamHandle {
     /// Get next verified payload as raw bytes.
     ///
-    /// Returns the payload data bytes for Data/Complete variants,
+    /// Returns Data bytes; MoQ completion returns null, never completion metadata.
+    /// Legacy streams also return bytes for Complete variants,
     /// null on stream end, or throws on error.
     #[wasm_bindgen(js_name = "nextPayload")]
     pub async fn next_payload(&mut self) -> Result<JsValue, JsError> {
