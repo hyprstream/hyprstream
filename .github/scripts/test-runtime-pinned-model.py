@@ -11,6 +11,35 @@ CHECK = ROOT / '.github/scripts/check-runtime-pinned-model.sh'
 
 
 class RuntimePrerequisiteTests(unittest.TestCase):
+    def test_real_build_context_includes_only_the_runtime_probe(self):
+        builder = shutil.which('podman') or shutil.which('docker')
+        if builder is None:
+            self.skipTest('Docker or Podman required for the build-context integration fixture')
+        with tempfile.TemporaryDirectory(prefix='runtime-context-', dir=Path.home()) as directory:
+            context = Path(directory) / 'context'
+            context.mkdir()
+            probe = '.github/scripts/check-runtime-pinned-model.sh'
+            excluded = ('.github/workflows/private.yml', '.github/scripts/other.sh',
+                        '.github/scripts/other.py', '.env', 'private.key', 'other.sh')
+            for name in (probe, *excluded):
+                path = context / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(CHECK.read_bytes() if name == probe else b'excluded fixture\n')
+            shutil.copyfile(ROOT / '.dockerignore', context / '.dockerignore')
+            (context / 'Dockerfile').write_text(
+                'FROM scratch\nCOPY ' + probe + ' /probe\nCOPY . /context\n')
+            output = Path(directory) / 'output'
+            pull = '--pull=never' if Path(builder).name == 'podman' else '--pull=false'
+            result = subprocess.run(
+                [builder, 'build', pull, '--network=none', '--no-cache',
+                 '--output', f'type=local,dest={output}', str(context)],
+                capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual((output / 'probe').read_bytes(), CHECK.read_bytes())
+            self.assertEqual((output / 'context' / probe).read_bytes(), CHECK.read_bytes())
+            for name in excluded:
+                self.assertFalse((output / 'context' / name).exists(), name)
+
     def run_check(self, git, cache):
         return subprocess.run(['/bin/sh', str(CHECK), str(git), str(cache)],
                               capture_output=True, timeout=15)
