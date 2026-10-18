@@ -1280,8 +1280,10 @@ impl ModelFactory {
     /// Preflight all shard headers before materializing any MTP tensor. The
     /// same resolved bytes/LFS handling as normal loading are used locally.
     /// Channel preflight and materialization share exactly one resolution per
-    /// shard. File-backed staging remains mmap-backed; pointer-owned buffers
-    /// are moved into the loader, never cloned or resolved a second time.
+    /// shard. File-backed staging remains mmap-backed. Each pointer-owned
+    /// buffer is verified/spilled to anonymous private disk backing before the
+    /// next resolution, never retained as a whole-checkpoint heap or resolved
+    /// a second time. The same file serves preflight and tensor loading.
     async fn prepare_channel_inputs<F, Fut>(
         profile: &super::channel_fp8::ChannelFp8Profile,
         shards: &[PathBuf],
@@ -1291,9 +1293,33 @@ impl ModelFactory {
         F: FnMut(PathBuf) -> Fut,
         Fut: std::future::Future<Output = Result<ResolvedWeight>>,
     {
+        Self::prepare_channel_inputs_spooling(profile, shards, &mut resolve, |bytes| async move {
+            tokio::task::spawn_blocking(move || super::resolved_spool::spool(bytes))
+                .await
+                .context("resolved FP8 spool task failed")?
+        })
+        .await
+    }
+
+    async fn prepare_channel_inputs_spooling<F, Fut, S, SFut>(
+        profile: &super::channel_fp8::ChannelFp8Profile,
+        shards: &[PathBuf],
+        mut resolve: F,
+        mut spool: S,
+    ) -> Result<Vec<(PathBuf, ResolvedWeight)>>
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<ResolvedWeight>>,
+        S: FnMut(Vec<u8>) -> SFut,
+        SFut: std::future::Future<Output = Result<std::fs::File>>,
+    {
         let mut inputs = Vec::with_capacity(shards.len());
         for path in shards {
-            inputs.push((path.clone(), resolve(path.clone()).await?));
+            let resolved = match resolve(path.clone()).await? {
+                ResolvedWeight::Owned(bytes) => ResolvedWeight::File(spool(bytes).await?),
+                file @ ResolvedWeight::File(_) => file,
+            };
+            inputs.push((path.clone(), resolved));
         }
         profile.preflight_resolved(&mut inputs)?;
         Ok(inputs)
@@ -2787,6 +2813,292 @@ mod stage_subset_tests {
             results.push(result);
         }
         assert!(results[0].allclose(&results[1], 1e-6, 1e-6, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn channel_private_spool_fixture_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_prepared_cancel_during_spool_does_not_resolve_next_and_releases_fd() {
+        use parking_lot::{Condvar, Mutex as TestMutex};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = channel_private_spool_fixture_dir();
+        write_shard(
+            dir.path(),
+            "w.safetensors",
+            &[FixtureTensor {
+                name: "p.weight".into(),
+                dtype: Dtype::F8_E4M3,
+                shape: vec![2, 3],
+                data: vec![0x38; 6],
+            }],
+        );
+        let mut payload = std::fs::read(dir.path().join("w.safetensors")).unwrap();
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let fd_witness = Arc::new(TestMutex::new(None));
+        let task = {
+            let count = resolve_count.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let witness = fd_witness.clone();
+            let parent = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                ModelFactory::prepare_channel_inputs_spooling(
+                    &profile,
+                    &[PathBuf::from("w"), PathBuf::from("later")],
+                    move |_| {
+                        assert_eq!(
+                            count.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "cancelled preparation resolved another shard"
+                        );
+                        std::future::ready(Ok(ResolvedWeight::Owned(std::mem::take(&mut payload))))
+                    },
+                    move |bytes| {
+                        let parent = parent.clone();
+                        let started = started.clone();
+                        let release = release.clone();
+                        let witness = witness.clone();
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                let file = super::super::resolved_spool::spool_in(bytes, &parent)?;
+                                *witness.lock() = Some((file.as_raw_fd(), file.metadata()?.ino()));
+                                started.notify_one();
+                                let (lock, cv) = &*release;
+                                let mut guard = lock.lock();
+                                cv.wait_while(&mut guard, |ready| !*ready);
+                                drop(guard);
+                                Ok(file)
+                            })
+                            .await?
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+        {
+            let (lock, cv) = &*release;
+            *lock.lock() = true;
+            cv.notify_one();
+        }
+        let (fd, ino) = fd_witness.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map(|m| m.ino() == ino)
+                .unwrap_or(false)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn channel_prepared_multiple_owned_spool_before_next_resolution() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = channel_private_spool_fixture_dir();
+        let config = channel_profile_config();
+        finite_config(dir.path(), config.clone());
+        let profile = super::super::channel_fp8::ChannelFp8Profile::parse(&config)
+            .unwrap()
+            .unwrap();
+        for (name, tensor) in [("a.safetensors", "p.weight"), ("b.safetensors", "q.weight")] {
+            write_shard(
+                dir.path(),
+                name,
+                &[FixtureTensor {
+                    name: tensor.into(),
+                    dtype: Dtype::F8_E4M3,
+                    shape: vec![2, 3],
+                    data: vec![0x38; 6],
+                }],
+            );
+        }
+        write_shard(
+            dir.path(),
+            "c.safetensors",
+            &[
+                FixtureTensor::f32("p.weight_scale", &[2, 1], 0.5),
+                FixtureTensor::f32("q.weight_scale", &[2, 1], 0.5),
+            ],
+        );
+        let paths: Vec<_> = ["a.safetensors", "b.safetensors", "c.safetensors"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        let mut payloads: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        for path in &paths {
+            std::fs::write(path, b"version https://git-lfs.github.com/spec/v1\n").unwrap();
+        }
+        let resolved = AtomicUsize::new(0);
+        let spooled = AtomicUsize::new(0);
+        let mut fds = Vec::new();
+        let inputs = ModelFactory::prepare_channel_inputs_spooling(
+            &profile,
+            &paths,
+            |_| {
+                let index = resolved.fetch_add(1, Ordering::SeqCst);
+                // Fails causally if the factory resolves all Owned payloads before
+                // converting/releasing the earlier buffer.
+                assert_eq!(spooled.load(Ordering::SeqCst), index);
+                std::future::ready(Ok(ResolvedWeight::Owned(std::mem::take(
+                    &mut payloads[index],
+                ))))
+            },
+            |bytes| {
+                let file = super::super::resolved_spool::spool_in(bytes, dir.path()).unwrap();
+                fds.push((file.as_raw_fd(), file.metadata().unwrap().ino()));
+                spooled.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(file))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.load(Ordering::SeqCst), 3);
+        assert!(inputs
+            .iter()
+            .all(|(_, r)| matches!(r, ResolvedWeight::File(_))));
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut weights = HashMap::new();
+        for (path, input) in inputs {
+            ModelFactory::load_resolved_safetensors_file_inner(
+                &path,
+                input,
+                None,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let p =
+            crate::runtime::architectures::llama::LinearProjection::take(&mut weights, "p.weight")
+                .unwrap();
+        let output = p
+            .try_apply(&Tensor::ones([1, 3], (DType::Float, Device::Cpu)))
+            .unwrap();
+        assert!((output.double_value(&[0, 0]) - 1.5).abs() < 1e-6);
+        assert!((output.double_value(&[0, 1]) - 1.53).abs() < 1e-6);
+        for (fd, ino) in fds {
+            assert!(
+                std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                    .map(|m| m.ino() != ino)
+                    .unwrap_or(true),
+                "retained spool FD leaked after load"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn channel_prepared_owned_preflight_failure_releases_all_spools() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = channel_private_spool_fixture_dir();
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        write_shard(
+            dir.path(),
+            "a.safetensors",
+            &[FixtureTensor {
+                name: "p.weight".into(),
+                dtype: Dtype::F8_E4M3,
+                shape: vec![2, 3],
+                data: vec![0x38; 6],
+            }],
+        );
+        let path = dir.path().join("a.safetensors");
+        let mut payload = std::fs::read(&path).unwrap();
+        let mut fds = Vec::new();
+        let result = ModelFactory::prepare_channel_inputs_spooling(
+            &profile,
+            &[path],
+            |_| std::future::ready(Ok(ResolvedWeight::Owned(std::mem::take(&mut payload)))),
+            |bytes| {
+                let file = super::super::resolved_spool::spool_in(bytes, dir.path()).unwrap();
+                fds.push((file.as_raw_fd(), file.metadata().unwrap().ino()));
+                std::future::ready(Ok(file))
+            },
+        )
+        .await;
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("scale"), "{error}");
+        for (fd, ino) in fds {
+            assert!(std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map(|m| m.ino() != ino)
+                .unwrap_or(true));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn channel_prepared_file_inputs_never_require_spool_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        write_shard(
+            dir.path(),
+            "a.safetensors",
+            &[
+                FixtureTensor {
+                    name: "p.weight".into(),
+                    dtype: Dtype::F8_E4M3,
+                    shape: vec![2, 3],
+                    data: vec![0x38; 6],
+                },
+                FixtureTensor::f32("p.weight_scale", &[2, 1], 0.5),
+            ],
+        );
+        let path = dir.path().join("a.safetensors");
+        let inputs = ModelFactory::prepare_channel_inputs_spooling(
+            &profile,
+            &[path],
+            |path| std::future::ready(Ok(ResolvedWeight::File(std::fs::File::open(path).unwrap()))),
+            |_| std::future::ready(Err(anyhow!("cache unavailable"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inputs.len(), 1);
     }
 
     #[tokio::test]

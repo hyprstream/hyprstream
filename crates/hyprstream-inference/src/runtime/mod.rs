@@ -19,6 +19,7 @@ pub use crate::config::{
 };
 
 pub(crate) mod channel_fp8;
+mod resolved_spool;
 pub use channel_fp8::Fp8ExecutionError;
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod batched_lora;
