@@ -4,14 +4,18 @@
 //! AGPL engine, an in-memory backend in tests) — the two-process serving
 //! shape means this crate never sees an AGPL type.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyprstream_decision::arrow::{
     DecisionSchema, CALIB_VERSION_COLUMN, FIELD_META_KIND, FIELD_META_LABELS, MODEL_VERSION_COLUMN,
     SCHEMA_VERSION_COLUMN,
 };
+use hyprstream_decision::confidence::{self, PRODUCER_SUM_TOLERANCE};
 use hyprstream_decision::spec::{ChoiceOption, QuestionBody, QuestionKind, QuestionSpec};
-use hyprstream_metrics_api::arrow::array::{Array, RecordBatch, StringArray};
+use hyprstream_metrics_api::arrow::array::{
+    Array, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
+};
 use hyprstream_metrics_api::{DecisionBatchStore, StorageBackend};
 
 use crate::error::EvalError;
@@ -163,6 +167,7 @@ fn validate_provenance(
             "run requires nonempty schema, model, and present calibration versions",
         ));
     }
+    validate_row_values(&schema, batch)?;
     for (name, expected) in [
         (SCHEMA_VERSION_COLUMN, Some(output.version.schema.as_str())),
         (MODEL_VERSION_COLUMN, Some(output.version.model.as_str())),
@@ -178,6 +183,83 @@ fn validate_provenance(
                 return Err(invalid(
                     "run version triple differs from an embedded batch row",
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Inspect actual Arrow values: public RunOutput callers can replace columns
+/// without changing the schema, fingerprint, or version triple.
+fn validate_row_values(schema: &DecisionSchema, batch: &RecordBatch) -> Result<(), EvalError> {
+    let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
+    for question in schema.questions() {
+        let labels = question.labels();
+        let allowed: HashSet<&str> = labels.iter().map(String::as_str).collect();
+        let probabilities = batch
+            .column_by_name(&format!("{}.probabilities", question.id))
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
+            .ok_or_else(|| invalid("batch has an invalid probability column"))?;
+        let predicted = batch
+            .column_by_name(&format!("{}.label", question.id))
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| invalid("batch has an invalid label column"))?;
+        let conformal = batch
+            .column_by_name(&format!("{}.conformal_set", question.id))
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| invalid("batch has an invalid conformal column"))
+            })
+            .transpose()?;
+        for row in 0..batch.num_rows() {
+            if probabilities.is_null(row) {
+                if !predicted.is_null(row) || conformal.is_some_and(|sets| !sets.is_null(row)) {
+                    return Err(invalid(
+                        "abstained batch answer carries a label or conformal set",
+                    ));
+                }
+                // Child slots of a null parent are not logical answer values.
+                continue;
+            }
+            if predicted.is_null(row) {
+                return Err(invalid("answered batch row has a null label"));
+            }
+            let values = probabilities.value(row);
+            let values = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| invalid("batch has invalid probability values"))?;
+            if values.null_count() != 0 {
+                return Err(invalid(
+                    "answered batch distribution contains a null component",
+                ));
+            }
+            let distribution = values.values().as_ref();
+            confidence::check_distribution(distribution, PRODUCER_SUM_TOLERANCE)
+                .map_err(|_| invalid("batch contains an invalid probability distribution"))?;
+            let winner = confidence::argmax_index(distribution)
+                .ok_or_else(|| invalid("batch contains an empty probability distribution"))?;
+            if predicted.value(row) != labels[winner] {
+                return Err(invalid(
+                    "batch label differs from the canonical distribution argmax",
+                ));
+            }
+            if let Some(sets) = conformal.filter(|sets| !sets.is_null(row)) {
+                let members = sets.value(row);
+                let members = members
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| invalid("batch has invalid conformal values"))?;
+                if members
+                    .iter()
+                    .any(|member| member.is_none_or(|label| !allowed.contains(label)))
+                {
+                    return Err(invalid(
+                        "batch conformal set contains a null or unknown label",
+                    ));
+                }
             }
         }
     }
