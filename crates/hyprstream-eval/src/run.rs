@@ -500,10 +500,9 @@ fn validate_one_answer(
     use hyprstream_decision::spec::QuestionKind;
 
     let id = &question.id;
-    let answer = row
-        .answers
-        .get(id)
-        .ok_or_else(|| format!("row is missing an answer for question `{id}` (abstain explicitly instead)"))?;
+    let answer = row.answers.get(id).ok_or_else(|| {
+        format!("row is missing an answer for question `{id}` (abstain explicitly instead)")
+    })?;
     let Some(value) = &answer.value else {
         if answer.conformal_set.is_some() {
             return Err("an abstained answer cannot carry a conformal set".to_owned());

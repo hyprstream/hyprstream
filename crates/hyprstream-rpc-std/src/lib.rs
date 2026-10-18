@@ -129,7 +129,11 @@ pub mod oauth_capnp {
 pub mod decision_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/decision_capnp.rs"));
 }
 
