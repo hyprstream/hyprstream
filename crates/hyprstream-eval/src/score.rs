@@ -246,9 +246,85 @@ fn field_metrics(
     ))
 }
 
+/// Validate every input before fit/eval splitting or any metric aggregation.
+fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
+    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
+    use hyprstream_metrics_api::arrow::array::{Array, FixedSizeListArray, Float32Array};
+    let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
+    for obs in &output.observations {
+        crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
+        if obs.truth.is_some_and(|truth| truth >= obs.labels.len()) {
+            return Err(invalid("observation truth is outside its declared labels"));
+        }
+        if let Some(probabilities) = &obs.probabilities {
+            if probabilities.len() != obs.labels.len() {
+                return Err(invalid(
+                    "observation probability width differs from its labels",
+                ));
+            }
+            check_distribution(probabilities, PRODUCER_SUM_TOLERANCE)
+                .map_err(|_| invalid("observation has an invalid probability distribution"))?;
+        }
+    }
+    if let Some(batch) = &output.batch {
+        let fingerprint = output
+            .schema_fingerprint
+            .as_deref()
+            .ok_or_else(|| invalid("set run has no schema fingerprint"))?;
+        let schema = crate::persist::validate_provenance(output, batch, fingerprint)?;
+        let expected = batch
+            .num_rows()
+            .checked_mul(schema.questions().len())
+            .ok_or_else(|| invalid("set observation count overflow"))?;
+        if output.observations.len() != expected {
+            return Err(invalid(
+                "set observation count differs from its Arrow batch",
+            ));
+        }
+        for (question_index, question) in schema.questions().iter().enumerate() {
+            let probabilities = batch
+                .column_by_name(&format!("{}.probabilities", question.id))
+                .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
+                .ok_or_else(|| invalid("set run has an invalid probability column"))?;
+            let labels = question.labels();
+            for row in 0..batch.num_rows() {
+                let obs = &output.observations[row * schema.questions().len() + question_index];
+                if obs.question_id != question.id
+                    || obs.kind != question.kind
+                    || obs.labels != labels
+                {
+                    return Err(invalid(
+                        "set observation profile/order differs from its Arrow batch",
+                    ));
+                }
+                if probabilities.is_null(row) {
+                    if obs.probabilities.is_some() {
+                        return Err(invalid(
+                            "set observation abstention differs from its Arrow batch",
+                        ));
+                    }
+                } else {
+                    let values = probabilities.value(row);
+                    let values = values
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or_else(|| invalid("set run has invalid probability values"))?;
+                    if obs.probabilities.as_deref() != Some(values.values().as_ref()) {
+                        return Err(invalid(
+                            "set observation probabilities differ from its Arrow batch",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Score a run's observations under the pinned protocol.
 pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport, EvalError> {
     output.validate_model_provenance()?;
+    validate_observations(output)?;
     let by_question = output.batch.is_some();
     let multi_family = family_count(&output.observations) > 1;
     // Group labeled, answered observations into fields.
@@ -343,8 +419,8 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
         gate,
         by_family: breakdown(&output.observations, by_question, |obs| {
             Some(family_identity(obs.family.as_deref()))
-        }),
-        by_stratum: breakdown(&output.observations, by_question, |obs| obs.stratum.clone()),
+        })?,
+        by_stratum: breakdown(&output.observations, by_question, |obs| obs.stratum.clone())?,
         flip_rate: None,
         abstention_rate,
         accuracy,
@@ -361,7 +437,7 @@ fn breakdown(
     observations: &[crate::run::Observation],
     by_question: bool,
     key_of: impl Fn(&crate::run::Observation) -> Option<String>,
-) -> Vec<BreakdownMetrics> {
+) -> Result<Vec<BreakdownMetrics>, EvalError> {
     let mut buckets: BTreeMap<String, Vec<&crate::run::Observation>> = BTreeMap::new();
     for obs in observations {
         if let Some(key) = key_of(obs) {
@@ -394,14 +470,14 @@ fn breakdown(
             }
             let eces: Vec<f64> = fields
                 .values()
-                .filter_map(|(probs, labels)| {
+                .map(|(probs, labels)| {
                     let refs: Vec<&[f64]> = probs.iter().map(std::vec::Vec::as_slice).collect();
-                    metrics::ece(&refs, labels, GATE_BIN_COUNT).ok()
+                    metrics::ece(&refs, labels, GATE_BIN_COUNT)
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             #[allow(clippy::cast_precision_loss)]
             let n = bucket.len();
-            BreakdownMetrics {
+            Ok(BreakdownMetrics {
                 key,
                 n,
                 macro_ece: hyprstream_calibration::protocol::macro_average(&eces),
@@ -413,7 +489,7 @@ fn breakdown(
                 } else {
                     abstained as f64 / n as f64
                 },
-            }
+            })
         })
         .collect()
 }
@@ -573,6 +649,18 @@ pub fn score_bench_run(
             return Err(EvalError::InvalidInput(format!(
                 "observation identity ({:?}, {:?}) has no matching eval item",
                 obs.id, obs.question_id
+            )));
+        }
+        let item = by_identity[&identity];
+        if obs.kind != item.question.kind
+            || obs.labels != item.question.labels()
+            || obs.truth != item.truth
+            || obs.family != item.family
+            || obs.stratum != item.stratum
+            || obs.group != item.group
+        {
+            return Err(EvalError::InvalidInput(format!(
+                "observation identity {identity:?} differs from its benchmark item metadata"
             )));
         }
     }
