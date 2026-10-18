@@ -272,18 +272,7 @@ pub fn clef_render(value: &Value) -> String {
                 )
             }
             Value::Array(a) => format!("[{}]", a.iter().map(json).collect::<Vec<_>>().join(",")),
-            Value::Number(n) if n.is_f64() => {
-                // Rust Debug and CPython repr both use shortest round-trip decimal,
-                // switching to scientific below 1e-4 and from 1e16. Python spells
-                // the exponent with an explicit sign and at least two digits.
-                let text = format!("{:?}", n.as_f64().unwrap_or(0.0));
-                if let Some((mantissa, exponent)) = text.split_once('e') {
-                    let exponent: i32 = exponent.parse().unwrap_or(0);
-                    format!("{mantissa}e{exponent:+03}")
-                } else {
-                    text
-                }
-            }
+            Value::Number(n) if n.is_f64() => python_float(n.as_f64().unwrap_or(0.0)),
             _ => v.to_string(),
         }
     }
@@ -292,6 +281,50 @@ pub fn clef_render(value: &Value) -> String {
         _ => json(value),
     }
 }
+/// CPython's shortest round-trip digits use round-to-nearest, ties-to-even.
+/// Rust Debug is not that contract (some shortest decimal ties round away).
+/// Ryū supplies the correctly selected digits; presentation is separate because
+/// its built-in fixed/scientific boundary differs from Python's repr/json.
+fn python_float(value: f64) -> String {
+    debug_assert!(value.is_finite()); // serde_json::Number admits finite f64 only.
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0.0");
+    }
+    let mut buffer = ryu::Buffer::new();
+    let shortest = buffer.format_finite(value.abs());
+    let (mantissa, explicit_exponent) = match shortest.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().unwrap_or(0)),
+        None => (shortest, 0),
+    };
+    let fractional_digits = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fractional)| fractional.len() as i32);
+    let all_digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let significant = all_digits.trim_start_matches('0');
+    let exponent = explicit_exponent - fractional_digits + significant.len() as i32 - 1;
+    let digits = significant.trim_end_matches('0');
+    if !(-4..16).contains(&exponent) {
+        let (first, tail) = digits.split_at(1);
+        let decimal = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(".{tail}")
+        };
+        format!("{sign}{first}{decimal}e{exponent:+03}")
+    } else if exponent < 0 {
+        format!("{sign}0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+    } else {
+        let point = exponent as usize + 1;
+        if point >= digits.len() {
+            format!("{sign}{digits}{}.0", "0".repeat(point - digits.len()))
+        } else {
+            let (whole, fractional) = digits.split_at(point);
+            format!("{sign}{whole}.{fractional}")
+        }
+    }
+}
+
 fn options(q: &ClefQuestion) -> Result<Vec<(String, Value)>, ClefError> {
     match q.kind {
         ClefQuestionType::Noul => {
@@ -809,6 +842,68 @@ mod tests {
         );
         assert_eq!(clef_render(&Value::String("raw\ntext".into())), "raw\ntext");
     }
+    const PYTHON_FLOAT_GOLDENS: &str =
+        include_str!("../../tests/fixtures/python-json-float-v1/expected.tsv");
+    #[test]
+    fn clef_float_bits_match_cpython_shortest_corpus() {
+        for line in PYTHON_FLOAT_GOLDENS.lines() {
+            let (bits, expected) = line.split_once('\t').expect("fixture columns");
+            let bits = u64::from_str_radix(bits, 16).expect("fixture bits");
+            let value = f64::from_bits(bits);
+            let number = serde_json::Number::from_f64(value).expect("finite fixture");
+            assert_eq!(
+                clef_render(&Value::Number(number)),
+                expected,
+                "bits {bits:016x}"
+            );
+        }
+    }
+    #[test]
+    fn clef_float_wire_parse_bits_and_render_match_cpython_corpus() {
+        let mut failures = Vec::new();
+        let mut count = 0;
+        for line in PYTHON_FLOAT_GOLDENS.lines() {
+            let (bits, expected) = line.split_once('\t').expect("fixture columns");
+            let bits = u64::from_str_radix(bits, 16).expect("fixture bits");
+            let body = format!(
+                r#"{{"model":"m","state":{expected},"questions":{{"q":{{"type":"noul"}}}}}}"#
+            );
+            let request = serde_json::from_str::<ClefRequest>(&body);
+            let problem = match request {
+                Ok(request) => {
+                    let actual = request.record.state.as_f64().expect("float");
+                    let rendered = clef_render(&request.record.state);
+                    (actual.to_bits() != bits || rendered != expected).then(|| {
+                        format!(
+                            "{expected}: expected {bits:016x}, parsed {:016x}, rendered {rendered}",
+                            actual.to_bits()
+                        )
+                    })
+                }
+                Err(error) => Some(format!("{expected}: {error}")),
+            };
+            if let Some(problem) = problem {
+                count += 1;
+                if failures.len() < 12 {
+                    failures.push(problem);
+                }
+            }
+        }
+        assert_eq!(
+            count, 0,
+            "wire numeric parity failures (first12): {failures:?}"
+        );
+        for nonfinite in ["NaN", "Infinity", "-Infinity", "1e400", "-1e400"] {
+            let body = format!(
+                r#"{{"model":"m","state":{nonfinite},"questions":{{"q":{{"type":"noul"}}}}}}"#
+            );
+            assert!(
+                serde_json::from_str::<ClefRequest>(&body).is_err(),
+                "{nonfinite}"
+            );
+        }
+    }
+
     #[test]
     fn clef_noul_label_mapping() {
         assert_eq!(
