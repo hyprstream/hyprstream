@@ -85,7 +85,7 @@ pub enum WireJson {
     Null,
     /// JSON bool.
     Bool(bool),
-    /// JSON number (non-finite values serialize as null, matching serde_json).
+    /// JSON number (non-finite values fail serialization).
     Number(f64),
     /// JSON string.
     Str(String),
@@ -103,7 +103,7 @@ impl serde::Serialize for WireJson {
             Self::Bool(value) => serializer.serialize_bool(*value),
             Self::Number(value) => match serde_json::Number::from_f64(*value) {
                 Some(number) => number.serialize(serializer),
-                None => serializer.serialize_unit(),
+                None => Err(serde::ser::Error::custom("non-finite Entry::Number")),
             },
             Self::Str(text) => serializer.serialize_str(text),
             Self::Array(items) => {
@@ -207,29 +207,21 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 }
 
 /// Renormalize an accepted distribution to producer tolerance, in stages:
-/// (0) if the input ALREADY passes producer tolerance, return untouched —
-/// dividing a valid vector by its sum can push it out of tolerance again
-/// (f32 division rounding, e.g. a 49-way vector whose sequential sum is
-/// 0.9999996 divides up to 1.0000012, after which the uniform-share
-/// correction would drive a zero component NEGATIVE); (1) divide through;
-/// (2) an order-preserving uniform-share correction (monotone in f32, so
-/// ties and leader gaps survive), with the share bounded below by
-/// `-min_component` so no component ever leaves [0, 1]; (3) as a last
-/// resort for vectors no uniform correction can reach (f32 sequential-sum
-/// granularity, e.g. near-uniform high-cardinality ones), a top-level
-/// correction that never changes the D6 argmax: a shortfall bumps the
-/// EARLIEST maximal component; an overage water-fills the maximal levels
-/// downward (equal shrinkage keeps them exactly tied, so the
-/// earliest-index tie-break keeps the winner — and no runner-up is ever
-/// crossed). Wire distributions are accepted at consumer
-/// tolerance; the producer-side IR and batch validators require the
-/// tighter producer tolerance, so the boundary normalizes on the way in.
-/// Also used for locally constructed distributions (TruthSubject's
-/// uniform fallback, teacher ensemble averages) that must satisfy the
-/// same producer tolerance.
+/// Producer-valid vectors remain untouched. Otherwise divide through and
+/// apply a uniform correction first, preserving ties where f32 permits it.
+/// If rounding merges a later-index winner with an earlier runner-up, lift
+/// that original D6 winner by one representable step. Residual shortfalls go
+/// to the winner; overages are removed from another component. The winner
+/// is never lowered to a runner-up level, so normalization cannot change
+/// the predicted label. Very wide uniform vectors may require breaking a
+/// tie to meet producer tolerance; their earliest-index winner is retained.
+/// Also used by TruthSubject's uniform fallback and teacher averages.
 pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
+    let Some(winner) = hyprstream_decision::confidence::argmax_index(probabilities) else {
+        return;
+    };
     // Stage 0: a producer-valid input is already fine — normalizing it
     // further can push it out of tolerance AND below zero (see the doc
     // comment's 49-way example).
@@ -241,6 +233,10 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
         for p in probabilities.iter_mut() {
             *p /= sum;
         }
+    }
+    if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
+        let max = probabilities.iter().copied().fold(0.0f32, f32::max);
+        probabilities[winner] = max.next_up().min(1.0);
     }
     if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
         return;
@@ -263,59 +259,38 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
             *p += share;
         }
     }
+    if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
+        let max = probabilities.iter().copied().fold(0.0f32, f32::max);
+        probabilities[winner] = max.next_up().min(1.0);
+    }
     if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
         return;
     }
-    // Last resort (f32 sequential-sum granularity makes some vectors,
-    // e.g. near-uniform high-cardinality ones, unreachable by uniform
-    // correction): correct the top WITHOUT ever changing the D6 argmax,
-    // re-evaluating the residual after every round (per-component f32
-    // rounding can overshoot a removal into a shortfall and vice versa).
-    // A shortfall bumps the EARLIEST maximal component (extending its
-    // lead can only keep its win). An overage WATER-FILLS the top levels
-    // downward: every maximal component shrinks by the same amount, so
-    // they stay exactly tied and the earliest-index tie-break keeps the
-    // argmax even when a level merges into the next (a single-component
-    // subtraction larger than the max/runner-up gap — observed on a
-    // consumer-valid 59-way near-uniform vector, residual −1.19e-6 vs
-    // gap 1.9e-9 — would flip the argmax to the runner-up).
+    // Correct remaining f32 summation error without lowering the original
+    // winner. Correcting another component may change loser ordering by a
+    // few ulps; it cannot change D6's selected label.
     for _ in 0..probabilities.len().saturating_add(8) {
-        let residual = 1.0 - probabilities.iter().sum::<f32>();
-        if residual == 0.0 || check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
+        if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
             return;
         }
-        let max = probabilities
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        if max <= 0.0 {
-            break;
-        }
+        let residual = 1.0 - probabilities.iter().sum::<f32>();
         if residual > 0.0 {
-            #[allow(clippy::float_cmp)]
-            if let Some(index) = probabilities.iter().position(|p| *p == max) {
-                probabilities[index] = (probabilities[index] + residual).clamp(0.0, 1.0);
-            }
-            continue;
-        }
-        // The highest level strictly below `max` (0.0 when none): the
-        // top group may sink to it but never below, so no runner-up is
-        // ever crossed.
-        let next = probabilities
+            probabilities[winner] = (probabilities[winner] + residual).min(1.0);
+        } else if let Some((index, _)) = probabilities
             .iter()
-            .copied()
-            .filter(|p| *p < max)
-            .fold(0.0f32, f32::max);
-        #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
-        let count = probabilities.iter().filter(|p| **p == max).count() as f32;
-        let remove = (-residual).min((max - next) * count);
-        if remove <= 0.0 {
+            .enumerate()
+            .filter(|(index, value)| *index != winner && **value > 0.0)
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        {
+            let previous = probabilities[index];
+            let corrected = (previous + residual).max(0.0);
+            probabilities[index] = if corrected < previous {
+                corrected
+            } else {
+                previous.next_down().max(0.0)
+            };
+        } else {
             break;
-        }
-        let per = remove / count;
-        #[allow(clippy::float_cmp)]
-        for p in probabilities.iter_mut().filter(|p| **p == max) {
-            *p -= per;
         }
     }
 }
@@ -498,12 +473,16 @@ impl HttpSubject {
         set: &QuestionSet,
         state: &Entry,
     ) -> Result<(AnswerRow, String), EvalError> {
-        let body = request_body(set, state, &self.model);
+        // Encode before opening a connection: serde_json otherwise turns a
+        // directly-constructed non-finite IR number into JSON null.
+        let body = serde_json::to_vec(&request_body(set, state, &self.model))
+            .map_err(|error| EvalError::InvalidInput(format!("invalid request entry: {error}")))?;
         let response = self
             .client
             .post(self.endpoint())
             .bearer_auth(&self.token)
-            .json(&body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await
             .map_err(|error| EvalError::Http(format!("request failed: {error}")))?;
@@ -1110,27 +1089,21 @@ questions:
     // to the exact bit patterns at issue, so keep the full decimals.
     #[allow(clippy::excessive_precision)]
     fn normalization_overage_never_flips_the_argmax() {
-        // Consumer-valid 59-way near-uniform vector (sequential sum
-        // 0.9902): after division and the uniform-share step a residual of
-        // about −1.19e-6 remains — dwarfing the 1.9e-9 gap between the
-        // unique maximum (index 0) and the runner-up. Subtracting that
-        // residual from the maximum (the old fallback) flipped the argmax
-        // to index 1; the water-filling correction sinks the top levels
-        // together, keeping index 0 ahead (or exactly tied, which the
-        // earliest-index tie-break still awards to index 0).
-        let mut probabilities = vec![0.0167830512f32; 59];
-        probabilities[0] = 0.0167830531f32;
-        normalize_distribution(&mut probabilities);
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
-        assert!(
-            probabilities.iter().all(|p| (0.0..=1.0).contains(p)),
-            "no component may leave [0, 1]: {probabilities:?}"
-        );
-        assert_eq!(
-            confidence::argmax_index(&probabilities),
-            Some(0),
-            "normalization must not change the predicted label: {probabilities:?}"
-        );
+        // Rotate the unique winner through every index: merging its level
+        // with an earlier runner-up must not change D6's selected label.
+        for winner in 0..59 {
+            let mut probabilities = vec![0.0167830512f32; 59];
+            probabilities[winner] = 0.0167830531f32;
+            normalize_distribution(&mut probabilities);
+            confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+                .unwrap();
+            assert!(probabilities.iter().all(|p| (0.0..=1.0).contains(p)));
+            assert_eq!(
+                confidence::argmax_index(&probabilities),
+                Some(winner),
+                "normalization changed winner {winner}: {probabilities:?}"
+            );
+        }
     }
 
     #[test]
@@ -1162,6 +1135,51 @@ questions:
                     raw_argmax,
                     "cardinality {cardinality} seed {seed}: normalization changed the label"
                 );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn http_rejects_nonfinite_nested_entries_before_connecting() {
+        let subject = HttpSubject::new("http://127.0.0.1:1", "model", "token");
+        for location in 0..6 {
+            for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.25] {
+                let mut set = fixture();
+                let mut state = Entry::Null;
+                let entry = Entry::Seq(vec![Entry::Map(vec![(
+                    "nested".into(),
+                    Entry::Number(number),
+                )])]);
+                match location {
+                    0 => state = entry,
+                    1 => set.questions[0].instructions = Some(entry),
+                    2 | 3 => {
+                        set.questions[0].body = QuestionBody::Noul {
+                            criteria: Some(hyprstream_decision::NoulCriteria {
+                                on_false: (location == 2).then(|| entry.clone()),
+                                on_true: (location == 3).then_some(entry),
+                            }),
+                        }
+                    }
+                    4 => {
+                        if let QuestionBody::Choice { options } = &mut set.questions[1].body {
+                            options[0].rubric = Some(entry);
+                        }
+                    }
+                    _ => {
+                        if let QuestionBody::Score { levels } = &mut set.questions[2].body {
+                            levels[0] = Some(entry);
+                        }
+                    }
+                }
+                if number.is_finite() {
+                    assert!(serde_json::to_vec(&request_body(&set, &state, "model")).is_ok());
+                } else {
+                    let error = subject.post(&set, &state).await.unwrap_err();
+                    assert!(
+                        matches!(error, EvalError::InvalidInput(_)),
+                        "location {location} must fail input validation before HTTP: {error:?}"
+                    );
+                }
             }
         }
     }
