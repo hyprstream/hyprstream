@@ -10,18 +10,12 @@
 use hyprstream_rpc_build::schema::types::{FieldDef, ParsedSchema, ScopedClient};
 use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
-/// Emit an error-variant check that throws an `Error` with the RPC error message.
-///
-/// Generates:
-/// ```text
-/// if ({parsed_var}.variant === 'error') {
-///   throw new Error(({parsed_var}.data as { message?: string })?.message ?? 'RPC error');
-/// }
-/// ```
+/// Preserve decoded remote application error codes without interpreting messages.
+/// The error type is not a cryptographic verification or admission marker.
 fn emit_error_throw(out: &mut String, parsed_var: &str) {
     out.push_str(&format!(
         "    if ({parsed_var}.variant === 'error') {{\n\
-         \x20     throw new Error(({parsed_var}.data as {{ message?: string }})?.message ?? 'RPC error');\n\
+         \x20     throw new RpcError({parsed_var}.data);\n\
          \x20   }}\n"
     ));
 }
@@ -381,12 +375,14 @@ fn generate_scoped_client(
                     "    const {inner_var} = {current_var} as {{ variant: string; data: unknown }};\n"
                 ));
 
+                // Every ancestor can carry its own ErrorInfo. Check before
+                // unwrapping so an intermediate error cannot become payload.
+                emit_error_throw(out, &inner_var);
                 if depth < chain_depth - 1 {
-                    // Intermediate level: just unwrap to next level
+                    // Intermediate level: unwrap only a non-error response
                     current_var = format!("{inner_var}.data");
                 } else {
-                    // Final scope level: check for error and return the method result
-                    emit_error_throw(out, &inner_var);
+                    // Final scope level: return the non-error method result
                     out.push_str(&format!(
                         "    return {inner_var}.data as {};\n",
                         return_type
@@ -566,5 +562,55 @@ mod browser_binding_tests {
         );
         assert!(!out.contains("this.client.call(bytes)"), "{out}");
         assert!(!out.contains("this.client.openStream(bytes)"), "{out}");
+    }
+    #[test]
+    fn scoped_error_checks_precede_every_ancestor_unwrap() {
+        let ancestor = ScopedClient {
+            factory_name: "repo".to_owned(),
+            client_name: "RepositoryClient".to_owned(),
+            scope_fields: vec![],
+            inner_request_variants: vec![],
+            inner_response_variants: vec![],
+            capnp_inner_response: "repository_response".to_owned(),
+            nested_clients: vec![],
+        };
+        let leaf = ScopedClient {
+            factory_name: "worktree".to_owned(),
+            client_name: "WorktreeClient".to_owned(),
+            scope_fields: vec![],
+            inner_request_variants: vec![variant("probe", "Void")],
+            inner_response_variants: vec![variant("probe", "Void")],
+            capnp_inner_response: "worktree_response".to_owned(),
+            nested_clients: vec![],
+        };
+        let schema = ParsedSchema {
+            request_variants: vec![],
+            response_variants: vec![],
+            structs: vec![],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: None,
+            response_struct: None,
+        };
+        let mut out = String::new();
+        generate_scoped_client(&mut out, "registry", &leaf, &[&ancestor], &schema, 8);
+        let outer = out
+            .find("throw new RpcError(parsed.data)")
+            .expect("outer typed error");
+        let first = out
+            .find("throw new RpcError(_r0.data)")
+            .expect("intermediate typed error");
+        let unwrap = out
+            .find("const _r1 = _r0.data")
+            .expect("second ancestor unwrap");
+        let final_error = out
+            .find("throw new RpcError(_r1.data)")
+            .expect("final typed error");
+        let result = out.find("return _r1.data").expect("final result");
+        assert!(
+            outer < first && first < unwrap && unwrap < final_error && final_error < result,
+            "{out}"
+        );
+        assert!(!out.contains("throw new Error"), "{out}");
     }
 }

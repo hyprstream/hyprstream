@@ -265,7 +265,7 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
 /// Skips Option* wrapper structs and service request/response structs.
 pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
     for sd in &schema.structs {
-        if sd.option_inner_type().is_some() {
+        if super::ts_option_inner(sd).is_some() {
             continue;
         }
         // Skip service request/response structs (handled by generate_parsers)
@@ -407,6 +407,14 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
                         variant.name, variant.type_name
                     );
                 }
+            } else if let Some(ed) = schema.enums.iter().find(|ed| ed.name == variant.type_name) {
+                let data = super::emit_enum_getter_expr(
+                    "reader",
+                    data_byte_offset(variant),
+                    &variant.type_name,
+                    ed,
+                );
+                emit_return(out, &non_union_fields, &variant.name, &data);
             } else {
                 // Struct type
                 if let Some(struct_def) =
@@ -762,8 +770,10 @@ fn emit_inner_variant_read_from(
             }
         }
         _ => {
-            // Struct — read its fields as an object via getStruct
-            if let Some(sd) = schema.structs.iter().find(|s| s.name == type_name) {
+            if let Some(ed) = schema.enums.iter().find(|ed| ed.name == type_name) {
+                super::emit_enum_getter_expr(reader_var, data_byte_offset(f), type_name, ed)
+            // Struct — read its fields as an object via getStruct.
+            } else if let Some(sd) = schema.structs.iter().find(|s| s.name == type_name) {
                 emit_struct_pointer_expr(reader_var, f.slot_offset, sd, schema, depth)
             } else {
                 "null".into()
@@ -795,6 +805,9 @@ fn emit_struct_pointer_expr(
     schema: &ParsedSchema,
     depth: usize,
 ) -> String {
+    if super::is_recursive_struct(&sd.name, &schema.structs) {
+        return format!("(() => {{ const _recursive = {reader_var}.getStruct({slot}, {}, {}); return _recursive ? _read{}(_recursive) : null; }})()", sd.data_words, sd.pointer_words, sd.name);
+    }
     if depth > 4 {
         return "null".into(); // guard against hypothetical recursive schemas
     }
@@ -912,7 +925,7 @@ fn emit_pointer_read_expr(
         None => {
             // Non-list pointer: Struct, Text, Data, or unknown
             if let Some(sd) = schema.structs.iter().find(|s| s.name == field.type_name) {
-                if let Some(inner_name) = sd.option_inner_type() {
+                if let Some(inner_name) = super::ts_option_inner(sd) {
                     emit_option_read_expr(reader_var, field, sd, inner_name, schema)
                 } else {
                     emit_struct_pointer_expr(reader_var, field.slot_offset, sd, schema, depth)
@@ -958,8 +971,56 @@ fn emit_struct_element_field_read_inner(
             }
         }
         FieldSection::Pointer => emit_pointer_read_expr(reader_var, field, schema, depth),
-        FieldSection::Group => "undefined".into(),
+        FieldSection::Group => field
+            .named_group
+            .as_ref()
+            .map(|group| emit_named_group_read(reader_var, group, schema, depth))
+            .unwrap_or_else(|| "undefined".into()),
     }
+}
+
+/// Read a named group on the enclosing reader using its original absolute
+/// field/discriminant offsets. The group is not an allocated pointer target.
+fn emit_named_group_read(
+    reader: &str,
+    group: &StructDef,
+    schema: &ParsedSchema,
+    depth: usize,
+) -> String {
+    let mut out = String::from("(() => { ");
+    let mut fields = Vec::new();
+    for (index, field) in group.non_union_fields().enumerate() {
+        let value = emit_struct_element_field_read_inner(reader, field, schema, depth);
+        let local = format!("_ng{index}");
+        out.push_str(&format!("const {local} = {value}; "));
+        fields.push(format!("{}: {local}", to_camel_case(&field.name)));
+    }
+    let fields = fields.join(", ");
+    if group.has_union {
+        let comma = if fields.is_empty() { "" } else { ", " };
+        out.push_str(&format!(
+            "switch ({reader}.getUint16({})) {{ ",
+            group.discriminant_offset * 2
+        ));
+        for field in group.union_fields() {
+            let value = if let Some(leaves) = super::group_arm_leaves(group, field) {
+                emit_group_arm_read(reader, leaves, schema)
+            } else {
+                emit_inner_variant_read_from(reader, Some(field), &field.type_name, schema, depth)
+            };
+            out.push_str(&format!(
+                "case {}: return {{ {fields}{comma}variant: '{}' as const, data: {value} }}; ",
+                field.discriminant_value, field.name
+            ));
+        }
+        out.push_str(&format!(
+            "default: return {{ {fields}{comma}variant: 'unknown' as const, data: null }}; }} "
+        ));
+    } else {
+        out.push_str(&format!("return {{ {fields} }}; "));
+    }
+    out.push_str("})()");
+    out
 }
 
 /// Read an inline union `group` arm's leaf fields into an object literal
@@ -989,6 +1050,12 @@ fn emit_struct_list_field_expr(
     sd: &StructDef,
     schema: &ParsedSchema,
 ) -> String {
+    if super::is_recursive_struct(&sd.name, &schema.structs) {
+        return format!(
+            "{reader_var}.getStructList({slot}, {}, {}).map(_el => _read{}(_el))",
+            sd.data_words, sd.pointer_words, sd.name
+        );
+    }
     if sd.has_union {
         return emit_union_struct_list_field_expr(reader_var, slot, sd, schema);
     }
@@ -1137,9 +1204,8 @@ fn emit_reader_field(
             out.push_str(&format!("{indent}const {local_name} = {read_expr};\n"));
         }
         FieldSection::Group => {
-            out.push_str(&format!(
-                "{indent}const {local_name} = undefined; // group\n"
-            ));
+            let expr = emit_struct_element_field_read_inner(reader_var, field, schema, 0);
+            out.push_str(&format!("{indent}const {local_name} = {expr};\n"));
         }
     }
 }
@@ -1262,6 +1328,53 @@ fn emit_option_read_expr(
          return _optR.getUint16({disc_byte_off}) === 1 ? {read_val} : undefined; }})()",
         field.slot_offset, opt_struct.data_words, opt_struct.pointer_words
     )
+}
+
+/// One private reader per cyclic node prevents generator recursion and avoids
+/// truncating legitimate nested Entry seq/map payloads at a fixed inline depth.
+pub fn generate_recursive_readers(out: &mut String, schema: &ParsedSchema) {
+    for sd in &schema.structs {
+        if !super::is_recursive_struct(&sd.name, &schema.structs) {
+            continue;
+        }
+        out.push_str(&format!(
+            "function _read{}(_reader: StructReader): {} {{\n",
+            sd.name, sd.name
+        ));
+        let mut fields = Vec::new();
+        for field in sd.non_union_fields() {
+            let name = to_camel_case(&field.name);
+            let read = emit_struct_element_field_read_inner("_reader", field, schema, 0);
+            out.push_str(&format!("  const {name} = {read};\n"));
+            fields.push(name);
+        }
+        let fields = fields.join(", ");
+        if sd.has_union {
+            let comma = if fields.is_empty() { "" } else { ", " };
+            out.push_str(&format!(
+                "  switch (_reader.getUint16({})) {{\n",
+                sd.discriminant_offset * 2
+            ));
+            for field in sd.union_fields() {
+                let read = if let Some(leaves) = super::group_arm_leaves(sd, field) {
+                    emit_group_arm_read("_reader", leaves, schema)
+                } else {
+                    emit_inner_variant_read_from(
+                        "_reader",
+                        Some(field),
+                        &field.type_name,
+                        schema,
+                        0,
+                    )
+                };
+                out.push_str(&format!("    case {}: return {{ {fields}{comma}variant: '{}' as const, data: {read} }};\n", field.discriminant_value, field.name));
+            }
+            out.push_str(&format!("    default: return {{ {fields}{comma}variant: 'unknown' as const, data: null }};\n  }}\n"));
+        } else {
+            out.push_str(&format!("  return {{ {fields} }};\n"));
+        }
+        out.push_str("}\n\n");
+    }
 }
 
 #[cfg(test)]

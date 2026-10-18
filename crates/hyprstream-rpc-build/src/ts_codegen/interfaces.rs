@@ -72,12 +72,18 @@ fn emit_group_interface(out: &mut String, name: &str, leaves: &[FieldDef]) {
 /// properties the generated request serializer switches on (#1616).
 /// Service/scoped envelopes and plain structs get a named-fields interface.
 fn emit_struct_interface(out: &mut String, s: &StructDef, schema: &ParsedSchema) {
+    for field in &s.fields {
+        if let Some(group) = &field.named_group {
+            emit_struct_interface(out, group, schema);
+        }
+    }
+    let emitted_name = super::ts_struct_name(&s.name);
     // Structural optional text lists use the same flattened presence contract
     // as the option reader/writer, including wrappers without an Option prefix.
     if s.option_inner_type() == Some("List(Text)") {
         out.push_str(&format!(
             "export type {} = string[] | undefined;\n\n",
-            s.name
+            emitted_name
         ));
         return;
     }
@@ -99,15 +105,15 @@ fn emit_struct_interface(out: &mut String, s: &StructDef, schema: &ParsedSchema)
             // which key the discriminated `variant` on the capnp field name.
             .map(|f| (f.name.clone(), super::union_arm_data_type(s, f)))
             .collect();
-        super::emit_union_alias(out, &s.name, &shared_fields, &arms);
+        super::emit_union_alias(out, &emitted_name, &shared_fields, &arms);
         return;
     }
 
     let non_union_fields: Vec<_> = s.non_union_fields().collect();
 
-    out.push_str(&format!("export interface {} {{\n", s.name));
+    out.push_str(&format!("export interface {emitted_name} {{\n"));
     for f in &non_union_fields {
-        let ts = capnp_to_ts_type(&f.type_name);
+        let ts = super::field_ts_type(f);
         let opt = if f.optional { "?" } else { "" };
         // Struct pointer fields are nullable (getStruct can return null).
         // Option* types already encode absence as `undefined` — don't add `| null`.
