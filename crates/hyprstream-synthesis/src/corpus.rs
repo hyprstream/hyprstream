@@ -322,11 +322,18 @@ impl Corpus {
 
     /// Parse a JSONL corpus. A trailing `{"synth_stats": ...}` line (see
     /// [`Self::to_jsonl_with_stats`]) populates the audit trail; a
-    /// rows-only export yields default stats.
+    /// rows-only export yields default stats. A statistics record must occur
+    /// only once, after every row; trailing blank lines remain allowed.
     pub fn from_jsonl(text: &str) -> Result<Self, serde_json::Error> {
         let mut rows = Vec::new();
         let mut stats = SynthStats::default();
+        let mut seen_stats = false;
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            if seen_stats {
+                return Err(<serde_json::Error as serde::de::Error>::custom(
+                    "synth_stats must be unique and the final nonblank record",
+                ));
+            }
             if serde_json::from_str::<serde_json::Value>(line)
                 .ok()
                 .is_some_and(|value| value.get("synth_stats").is_some())
@@ -337,6 +344,7 @@ impl Corpus {
                     stats: SynthStats,
                 }
                 stats = serde_json::from_str::<StatsLine>(line)?.stats;
+                seen_stats = true;
                 continue;
             }
             rows.push(CorpusRow::from_json_line(line)?);
@@ -424,6 +432,42 @@ mod tests {
         assert_eq!(parsed.stats, corpus.stats);
         let rows_only = Corpus::from_jsonl(&corpus.to_jsonl(false)).unwrap();
         assert_eq!(rows_only.stats, SynthStats::default());
+    }
+
+    #[test]
+    fn statistics_record_is_unique_and_final_without_changing_rows_only_inputs() {
+        let corpus = Corpus {
+            rows: vec![sample_row(TosClass::OpenWeights)],
+            stats: SynthStats {
+                generated: 3,
+                accepted: 1,
+                dedup_dropped: 1,
+                label_deferred: 1,
+                correction_temperatures: [("sim".to_owned(), 2.5)].into(),
+                ..Default::default()
+            },
+        };
+        let rows = corpus.to_jsonl(false);
+        let exported = corpus.to_jsonl_with_stats(false);
+        let stats_line = exported.lines().last().unwrap();
+        for malformed in [
+            format!("{exported}{exported}"),
+            format!("{exported}{rows}"),
+            format!("{stats_line}\n{stats_line}\n"),
+        ] {
+            let error = Corpus::from_jsonl(&malformed).unwrap_err();
+            assert!(error.to_string().contains("unique and the final"));
+        }
+        let final_stats = Corpus::from_jsonl(&format!("{exported}\n \n")).unwrap();
+        assert_eq!(final_stats.rows, corpus.rows);
+        assert_eq!(final_stats.stats, corpus.stats);
+        let legacy = Corpus::from_jsonl(&rows).unwrap();
+        assert_eq!(legacy.rows, corpus.rows);
+        assert_eq!(legacy.stats, SynthStats::default());
+        assert!(Corpus::from_jsonl("\n \n").unwrap().rows.is_empty());
+        let stats_only = Corpus::from_jsonl(&format!("{stats_line}\n")).unwrap();
+        assert!(stats_only.rows.is_empty());
+        assert_eq!(stats_only.stats, corpus.stats);
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub enum SynthError {
     /// `base_items_per_family` of 0 (a zero-sized run would write an empty
     /// corpus while reporting success).
     ZeroBaseItems,
+    /// Balanced label control requires a positive slack.
+    ZeroLabelSlack,
     /// No teacher targets can be produced from an empty roster.
     EmptyRoster,
     /// Empty id/version cannot identify an auditable teacher.
@@ -78,6 +80,7 @@ impl std::fmt::Display for SynthError {
                 f,
                 "paraphrase_variants must be in 2..={PARAPHRASES} (paraphrase augmentation is mandatory, S6b1); got {n}"
             ),
+            Self::ZeroLabelSlack => f.write_str("balanced label_slack must be at least 1"),
             Self::EmptyRoster => f.write_str("teacher roster must not be empty"),
             Self::BadTeacherIdentity(id) => write!(f, "teacher identity must contain nonempty id/version: {id:?}"),
             Self::ZeroBaseItems => write!(
@@ -143,6 +146,9 @@ pub fn run(
     firewall: &Firewall,
     temperatures: &HashMap<String, f64>,
 ) -> Result<Corpus, SynthError> {
+    if matches!(config.label_policy, LabelPolicy::Balanced { slack: 0 }) {
+        return Err(SynthError::ZeroLabelSlack);
+    }
     firewall
         .ensure_content_index()
         .map_err(SynthError::Firewall)?;

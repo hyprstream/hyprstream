@@ -4,12 +4,12 @@ set -euo pipefail
 
 case "${1:-}" in
   lint)
-    cargo clippy --locked -p hyprstream-synthesis --all-targets -- -D warnings
+    cargo clippy --locked --release -p hyprstream-synthesis --all-targets -- -D warnings
     ;;
   test)
-    cargo nextest run --locked --cargo-profile ci-test --profile ci \
+    cargo nextest run --locked --cargo-profile release --profile ci \
       -p hyprstream-synthesis --all-targets
-    cargo test --locked --profile ci-test -p hyprstream-synthesis --doc
+    cargo test --locked --release -p hyprstream-synthesis --doc
     ;;
   *)
     echo "usage: synthesis-ci.sh lint|test" >&2

@@ -282,9 +282,13 @@ fn parse_config(text: &str) -> Option<SynthConfig> {
     let label_slack = get_u64("label_slack", 1)?;
     let policy = match value.get("label_policy") {
         None => LabelPolicy::Unlimited,
-        Some(serde_json::Value::String(s)) if s == "balanced" => LabelPolicy::Balanced {
-            slack: usize::try_from(label_slack).ok()?,
-        },
+        Some(serde_json::Value::String(s)) if s == "balanced" => {
+            let slack = usize::try_from(label_slack).ok()?;
+            if slack == 0 {
+                return None;
+            }
+            LabelPolicy::Balanced { slack }
+        }
         Some(serde_json::Value::String(s)) if s == "unlimited" => LabelPolicy::Unlimited,
         // Unknown or non-string policies fail loud — silently dropping label
         // control would skew a training run without any signal.

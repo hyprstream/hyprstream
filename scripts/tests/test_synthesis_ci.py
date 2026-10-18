@@ -22,14 +22,14 @@ def assert_selection(commands):
         assert "--locked" in command, command
         package = command.index("-p")
         assert command[package + 1] == "hyprstream-synthesis", command
-    assert lint[0] == "clippy" and "--all-targets" in lint, lint
+    assert lint[0] == "clippy" and "--all-targets" in lint and "--release" in lint, lint
     assert lint[-3:] == ["--", "-D", "warnings"], lint
     assert nextest[:2] == ["nextest", "run"], nextest
     assert "--all-targets" in nextest, nextest
-    assert nextest[nextest.index("--cargo-profile") + 1] == "ci-test", nextest
+    assert nextest[nextest.index("--cargo-profile") + 1] == "release", nextest
     assert nextest[nextest.index("--profile") + 1] == "ci", nextest
     assert docs[0] == "test" and "--doc" in docs, docs
-    assert docs[docs.index("--profile") + 1] == "ci-test", docs
+    assert "--release" in docs and "--profile" not in docs, docs
 
 
 class SynthesisCi(unittest.TestCase):
@@ -76,7 +76,10 @@ class SynthesisCi(unittest.TestCase):
 
     def test_wrong_profile_or_missing_targets_or_docs_is_rejected(self):
         for source in [
-            SCRIPT.read_text().replace("ci-test", "release"),
+            SCRIPT.read_text().replace("--cargo-profile release", "--cargo-profile ci-test"),
+            SCRIPT.read_text().replace("--cargo-profile release", "--cargo-profile dev"),
+            SCRIPT.read_text().replace("cargo clippy --locked --release", "cargo clippy --locked"),
+            SCRIPT.read_text().replace("cargo test --locked --release", "cargo test --locked"),
             SCRIPT.read_text().replace("--all-targets", ""),
             SCRIPT.read_text().replace("--doc", ""),
         ]:

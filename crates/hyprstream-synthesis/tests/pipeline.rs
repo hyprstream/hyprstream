@@ -49,6 +49,7 @@ fn cli_rejects_malformed_config_values() {
         r#"{"paraphrase_variants":-1}"#,
         r#"{"seed_base":"0x51A1"}"#,
         r#"{"label_policy":"balanced","label_slack":-1}"#,
+        r#"{"label_policy":"balanced","label_slack":0}"#,
         r#"{"base_item_per_family":5}"#,
         r#"{"base_items_per_family":0}"#,
         r#"{"unknown_key":1}"#,
@@ -62,13 +63,28 @@ fn cli_rejects_malformed_config_values() {
             "config {bad} must be rejected, stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("config unreadable or unparseable"),
+            "invalid config must fail before content-index admission: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-    let good = run_with(r#"{"label_policy":"unlimited","base_items_per_family":1}"#);
-    assert!(
-        !good.status.success() && String::from_utf8_lossy(&good.stderr).contains("content index"),
-        "stderr: {}",
-        String::from_utf8_lossy(&good.stderr)
-    );
+    for config in [
+        r#"{"label_policy":"unlimited","base_items_per_family":1}"#.to_owned(),
+        r#"{"label_policy":"balanced","label_slack":1}"#.to_owned(),
+        format!(
+            r#"{{"label_policy":"balanced","label_slack":{}}}"#,
+            usize::MAX
+        ),
+    ] {
+        let good = run_with(&config);
+        assert!(
+            !good.status.success()
+                && String::from_utf8_lossy(&good.stderr).contains("content index"),
+            "stderr: {}",
+            String::from_utf8_lossy(&good.stderr)
+        );
+    }
 }
 
 #[test]

@@ -452,6 +452,40 @@ impl Teacher for CountTeacher {
     }
 }
 #[test]
+fn balanced_zero_slack_rejects_before_admission_or_teacher_calls() {
+    let teacher = CountTeacher {
+        pin: pin("counter", TosClass::OpenWeights),
+        calls: std::cell::Cell::new(0),
+        answer: vec![0.5, 0.5],
+    };
+    let item = Firewall::tiny_item();
+    let missing = Firewall::tiny_unattested(std::slice::from_ref(&item));
+    let mut config = small_config();
+    config.label_policy = LabelPolicy::Balanced { slack: 0 };
+    assert!(matches!(
+        run(&config, &[&teacher], &missing, &HashMap::new()),
+        Err(SynthError::ZeroLabelSlack)
+    ));
+    assert_eq!(teacher.calls.get(), 0);
+    // Valid policies pass configuration validation and reach the independent
+    // missing-index gate, still without generating items or querying a teacher.
+    for policy in [
+        LabelPolicy::Unlimited,
+        LabelPolicy::Balanced { slack: 1 },
+        LabelPolicy::Balanced { slack: usize::MAX },
+    ] {
+        config.label_policy = policy;
+        assert!(matches!(
+            run(&config, &[&teacher], &missing, &HashMap::new()),
+            Err(SynthError::Firewall(
+                crate::firewall::FirewallViolation::MissingContentIndex
+            ))
+        ));
+        assert_eq!(teacher.calls.get(), 0);
+    }
+}
+
+#[test]
 fn admission_is_before_teachers_and_teacher_probabilities_are_strict() {
     let t = CountTeacher {
         pin: pin("counter", TosClass::OpenWeights),
