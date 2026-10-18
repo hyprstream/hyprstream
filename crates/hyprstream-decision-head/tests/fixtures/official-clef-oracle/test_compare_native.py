@@ -2,6 +2,12 @@
 import copy
 import importlib.util
 import json
+import contextlib
+import hashlib
+import io
+import math
+import types
+from unittest import mock
 from pathlib import Path
 import subprocess
 import sys
@@ -32,6 +38,27 @@ class ComparatorAdmissionTests(unittest.TestCase):
                                                include_hidden=include_hidden, has_native_records=False)
         compare.admit_comparison_mode("full", backbone_only=False, head_only=False,
                                      include_hidden=True, has_native_records=True)
+
+    def test_full_port_requires_hidden_even_with_records_present(self):
+        with self.assertRaisesRegex(ValueError, "requires --include-hidden"):
+            compare.admit_comparison_mode("full", backbone_only=False, head_only=False,
+                                          include_hidden=False, has_native_records=True)
+        compare.admit_comparison_mode("full", backbone_only=False, head_only=False,
+                                     include_hidden=True, has_native_records=True)
+
+    def test_cli_full_profile_without_hidden_fails_before_tensor_or_record_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "provenance.json").write_text(json.dumps({"mode": "full"}))
+            result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                "--reference", str(root), "--native-tensors", str(root / "unused"),
+                "--native-records", str(root / "missing-records.json"),
+                "--tolerance-file", str(HERE / "full-port-tolerances-v1.json"),
+                "--report", str(root / "report.json")], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires --include-hidden", result.stderr)
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
+            self.assertFalse((root / "report.json").exists())
 
     def test_head_and_backbone_are_explicit_separate_scopes(self):
         compare.admit_comparison_mode("head", backbone_only=False, head_only=True,
@@ -111,6 +138,37 @@ class ComparatorAdmissionTests(unittest.TestCase):
 
 
 class WinnerReportingTests(unittest.TestCase):
+    def test_actual_committed_numeric_records_cover_all_three_types(self):
+        records = json.loads((HERE / "records.json").read_text())
+        seen = set()
+        for ri, record in enumerate(records["records"]):
+            for qi, question in enumerate(record["questions"]):
+                tag = question["question_type"]
+                self.assertIs(type(tag), int)
+                expected_kind = ("noul", "choice", "score")[tag]
+                ids = question["option_ids"]
+                values = [float(i) for i in range(len(ids))]
+                result = compare.question_winners(f"r{ri}.q{qi}.logits", values, values, records)
+                self.assertEqual(result["question_type"], expected_kind)
+                self.assertEqual(result["native_winner"]["option_id"], ids[-1])
+                self.assertFalse(result["disagreement"])
+                seen.add(tag)
+        self.assertEqual(seen, {0, 1, 2})
+
+    def test_numeric_tags_match_string_kind_and_reject_bool_float_or_unknown(self):
+        records = fixture()
+        for qi, tag in enumerate((0, 1, 2)):
+            values = [float(i) for i in range(len(records["records"][0]["questions"][qi]["option_ids"]))]
+            expected = compare.question_winners(f"r0.q{qi}.probabilities", values, values, records)
+            numeric = copy.deepcopy(records)
+            numeric["records"][0]["questions"][qi]["question_type"] = tag
+            self.assertEqual(compare.question_winners(f"r0.q{qi}.probabilities", values, values, numeric), expected)
+        for invalid in (True, False, 0.0, 1.0, -1, 3, "0", None):
+            bad = fixture()
+            bad["records"][0]["questions"][0]["question_type"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "unknown question type"):
+                compare.question_winners("r0.q0.logits", [1, 0], [1, 0], bad)
+
     def test_near_tie_flip_is_reported_despite_numeric_tolerance(self):
         baseline, candidate = [0.50001, 0.49999], [0.49999, 0.50001]
         self.assertTrue(all(abs(x - y) <= 1e-4 + 1e-4 * abs(x) for x, y in zip(baseline, candidate)))
@@ -151,6 +209,115 @@ class WinnerReportingTests(unittest.TestCase):
         invalid["records"][0]["questions"][0]["option_ids"] = ["true", "true"]
         with self.assertRaisesRegex(ValueError, "invalid option domain"):
             compare.question_winners("r0.q0.logits", [1, 0], [1, 0], invalid)
+
+
+class SingleValueTensor:
+    """Stdlib numerical loader fixture; no Torch/safetensors or model execution."""
+    shape = (1,)
+    dtype = "float32"
+    def __init__(self, value): self.value = value
+    def double(self): return self
+    def all(self): return bool(self.value)
+    def abs(self): return SingleValueTensor(abs(self.value))
+    def __sub__(self, other): return SingleValueTensor(self.value - other.value)
+    def __add__(self, other): return SingleValueTensor(self.value + other)
+    __radd__ = __add__
+    def __mul__(self, other): return SingleValueTensor(self.value * (other.value if isinstance(other, SingleValueTensor) else other))
+    __rmul__ = __mul__
+    def __truediv__(self, other): return SingleValueTensor(self.value / other.value)
+    def __le__(self, other): return SingleValueTensor(self.value <= other.value)
+    def max(self): return self.value
+    def argmax(self): return 0
+    def square(self): return SingleValueTensor(self.value ** 2)
+    def mean(self): return self
+    def sqrt(self): return SingleValueTensor(math.sqrt(self.value))
+    def clamp_min(self, minimum): return SingleValueTensor(max(self.value, minimum))
+    def log(self): return SingleValueTensor(math.log(self.value))
+    def sum(self): return self.value
+    def __float__(self): return float(self.value)
+    def tolist(self): return [self.value]
+
+
+class FiniteReportAndProfileTests(unittest.TestCase):
+    def run_small_report(self, reference_value, native_value):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / "reference"
+            reference.mkdir()
+            tensor_path, native_path = reference / "tensors.safetensors", root / "native.safetensors"
+            # Deliberately synthetic loader bytes, hashed by the REAL CLI report.
+            tensor_path.write_bytes(b"stdlib-reference-tensor-fixture")
+            native_path.write_bytes(b"stdlib-native-tensor-fixture")
+            records = {"records": [{"id":"record", "input_ids":[1], "questions":[
+                {"question_id":"one", "question_type":2, "option_ids":["0"]}],
+                "state_tokens_before_truncation":0, "state_tokens_admitted":0, "state_truncated":False}]}
+            (reference / "records.json").write_text(json.dumps(records))
+            provenance = {"mode":"head", "source_revision":"source-fixture", "files":{
+                name:hashlib.sha256((reference/name).read_bytes()).hexdigest()
+                for name in ("records.json", "tensors.safetensors")}}
+            (reference / "provenance.json").write_text(json.dumps(provenance))
+            safe = types.ModuleType("safetensors")
+            loader = types.ModuleType("safetensors.torch")
+            key = "r0.q0.probabilities"
+            loader.load_file = lambda path: {key:SingleValueTensor(reference_value if path == tensor_path else native_value)}
+            torch = types.ModuleType("torch")
+            torch.int64 = "int64"
+            torch.isfinite = lambda x: SingleValueTensor(math.isfinite(x.value))
+            torch.unravel_index = lambda index, shape: [index]
+            report = root / "report.json"
+            argv = ["compare_native.py", "--reference", str(reference), "--native-tensors", str(native_path),
+                    "--atol", "0", "--rtol", "0", "--report", str(report), "--head-only"]
+            with mock.patch.dict(sys.modules, {"safetensors":safe, "safetensors.torch":loader, "torch":torch}), \
+                 mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as exited: compare.main()
+            data = json.loads(report.read_text(), parse_constant=lambda value: self.fail("nonstandard JSON " + value))
+            self.assertEqual(data["native_tensors_sha256"], hashlib.sha256(native_path.read_bytes()).hexdigest())
+            self.assertEqual(data["reference_provenance_sha256"], hashlib.sha256((reference / "provenance.json").read_bytes()).hexdigest())
+            return exited.exception.code, data
+
+    def test_nonfinite_required_tensor_writes_hashed_failed_json_not_exception(self):
+        for left, right in ((1.0, float("nan")), (1.0, float("inf")),
+                            (float("-inf"), 1.0), (float("nan"), 1.0)):
+            with self.subTest(left=left, right=right):
+                code, report = self.run_small_report(left, right)
+                self.assertEqual(code, 1)
+                self.assertFalse(report["pass"])
+                entry = report["tensors"]["r0.q0.probabilities"]
+                self.assertFalse(entry["pass"])
+                self.assertFalse(entry["finite"])
+                for field in ("max_absolute_index", "max_absolute_error", "max_relative_error", "rmse", "kl_reference_native"):
+                    self.assertIsNone(entry[field])
+                self.assertNotIn("argmax", entry)
+
+    def test_finite_equal_tensor_still_writes_passing_numeric_metrics(self):
+        code, report = self.run_small_report(1.0, 1.0)
+        self.assertEqual(code, 0)
+        self.assertTrue(report["pass"])
+        entry = report["tensors"]["r0.q0.probabilities"]
+        self.assertTrue(entry["finite"])
+        self.assertEqual(entry["max_absolute_error"], 0.0)
+        self.assertEqual(entry["kl_reference_native"], 0.0)
+
+    def test_full_original_profile_rejects_bf16_and_gpu_before_tensor_import(self):
+        for dtype, device in (("bfloat16", "cpu"), ("float32", "cuda"), ("float32", "cuda:0")):
+            with self.subTest(dtype=dtype, device=device), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "provenance.json").write_text(json.dumps({"mode":"full", "compute_dtype":dtype, "device":device, "files":{}}))
+                result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                    "--reference", str(root), "--native-tensors", str(root/"unused"),
+                    "--native-records", str(root/"unread-records"), "--include-hidden",
+                    "--tolerance-file", str(HERE/"full-port-tolerances-v1.json"), "--report", str(root/"report")],
+                    capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires a full Float32 CPU official oracle", result.stderr)
+                self.assertNotIn("ModuleNotFoundError", result.stderr)
+                self.assertFalse((root/"report").exists())
+
+    def test_original_cpu_profile_positive_and_separate_head_admission(self):
+        compare.admit_original_f32_cpu_profile({"mode":"full", "compute_dtype":"float32", "device":"cpu"},
+                                              backbone_only=False, tolerance_profile={"profile":"original"})
+        compare.admit_original_f32_cpu_profile({"mode":"head", "compute_dtype":"bfloat16", "device":"cuda"},
+                                              backbone_only=False, tolerance_profile=None)
 
 
 if __name__ == "__main__":
