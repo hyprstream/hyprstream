@@ -746,6 +746,8 @@ async fn serve_budget_reply(
     let (accepted, witness) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        // Witness the TCP connection itself, before any request headers.
+        accepted.send(()).unwrap();
         let mut request = [0_u8; 8192];
         let mut filled = 0;
         while !request[..filled]
@@ -757,7 +759,6 @@ async fn serve_budget_reply(
             assert!(count > 0);
             filled += count;
         }
-        accepted.send(()).unwrap();
         socket.write_all(&reply).await.unwrap();
         if hold_open {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1014,4 +1015,91 @@ fn public_response_parser_rejects_duplicate_choice_identity() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn direct_http_rejects_duplicate_question_ids_before_connecting() {
+    for duplicate in [false, true] {
+        let body = r#"{"model":"resolved-v1","answers":{"left":{"type":"noul","noul":0.5},"right":{"type":"noul","noul":0.25}}}"#;
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (address, server, mut accepted) = serve_budget_reply(reply.into_bytes(), false).await;
+        let mut set =
+            author::parse_yaml("questions:\n  left: {type: noul}\n  right: {type: noul}\n")
+                .unwrap();
+        if duplicate {
+            set.questions[1] = set.questions[0].clone();
+        }
+        let subject = HttpSubject::new(format!("http://{address}"), "alias", "token");
+        let result = subject.decide(&set, &Entry::Str("state".into()), 0).await;
+        if duplicate {
+            assert!(
+                matches!(result, Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("duplicate question id"))
+            );
+            assert!(matches!(
+                accepted.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(subject.resolved_model_id(), "alias");
+            server.abort();
+        } else {
+            assert_eq!(result.unwrap().answers.len(), 2);
+            assert_eq!(subject.resolved_model_id(), "resolved-v1");
+            accepted.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+}
+
+#[test]
+fn public_response_decode_rejects_duplicate_ids_and_indexes_wide_exact_keys() {
+    use hyprstream_eval::subject::{decode_response, parse_response_answers};
+    let base =
+        author::parse_yaml("questions:\n  left: {type: noul}\n  right: {type: noul}\n").unwrap();
+    let collapsed = serde_json::json!({"answers": {"left": {"type":"noul", "noul":0.5}}});
+    let mut duplicate = base.clone();
+    duplicate.questions[1] = duplicate.questions[0].clone();
+    assert!(
+        matches!(parse_response_answers(&duplicate, &collapsed), Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("duplicate question id"))
+    );
+    let mut set = hyprstream_decision::QuestionSet {
+        state: None,
+        questions: Vec::new(),
+    };
+    let mut answers = serde_json::Map::new();
+    for i in (0..4096).rev() {
+        let mut question = base.questions[0].clone();
+        question.id = format!("q{i}");
+        answers.insert(
+            question.id.clone(),
+            serde_json::json!({"type":"noul", "noul":0.5}),
+        );
+        set.questions.push(question);
+    }
+    let envelope = serde_json::json!({"model":"wide-v1", "answers": answers, "usage":{"input_tokens":0,"output_tokens":0}});
+    let text = serde_json::to_string(&envelope).unwrap();
+    let (row, model) = decode_response(&set, &text).unwrap();
+    assert_eq!(model, "wide-v1");
+    assert_eq!(row.answers.len(), 4096);
+    assert!(row
+        .answers
+        .values()
+        .all(|answer| answer.value.as_ref().unwrap().probabilities() == vec![0.5, 0.5]));
+    assert_eq!(set.questions[0].id, "q4095");
+    assert_eq!(set.questions[4095].id, "q0");
+    let mut replaced = envelope.clone();
+    let answers = replaced["answers"].as_object_mut().unwrap();
+    let answer = answers.remove("q2048").unwrap();
+    answers.insert("outside".into(), answer);
+    assert!(
+        matches!(parse_response_answers(&set, &replaced), Err(hyprstream_eval::EvalError::InvalidAnswer {ref question_id, ref message}) if question_id == "outside" && message == "response answers an undeclared question")
+    );
+    let mut missing = envelope;
+    missing["answers"].as_object_mut().unwrap().remove("q2048");
+    assert!(
+        matches!(parse_response_answers(&set, &missing), Err(hyprstream_eval::EvalError::InvalidAnswer {ref question_id, ref message}) if question_id == "q2048" && message == "response has no answer for a declared question")
+    );
 }

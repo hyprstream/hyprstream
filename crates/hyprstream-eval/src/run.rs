@@ -550,6 +550,18 @@ pub(crate) fn validate_answer_row(
     validate_one_answer(question, row)
 }
 
+/// Index declared IDs once without changing their original order. Direct
+/// programmatic inputs must not collapse duplicate declarations into one map key.
+pub(crate) fn question_ids(set: &QuestionSet) -> Result<std::collections::HashSet<&str>, String> {
+    let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
+    for question in &set.questions {
+        if !ids.insert(question.id.as_str()) {
+            return Err(format!("duplicate question id `{}`", question.id));
+        }
+    }
+    Ok(ids)
+}
+
 /// The same rules for a full row over a question set (the teacher ensemble's
 /// shape): every answered key must be declared, and every declared question
 /// must be answered per the per-answer rules.
@@ -557,8 +569,9 @@ pub(crate) fn validate_set_answer_row(
     set: &hyprstream_decision::spec::QuestionSet,
     row: &hyprstream_decision::arrow::AnswerRow,
 ) -> Result<(), String> {
+    let ids = question_ids(set)?;
     for answered_id in row.answers.keys() {
-        if set.question(answered_id).is_none() {
+        if !ids.contains(answered_id.as_str()) {
             return Err(format!("row answers unknown question `{answered_id}`"));
         }
     }
@@ -624,4 +637,49 @@ fn validate_one_answer(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod row_identity_tests {
+    use super::*;
+    use hyprstream_decision::answer::QuestionAnswer;
+    use hyprstream_decision::arrow::AnswerRow;
+    use hyprstream_decision::author;
+
+    #[test]
+    fn row_validation_rejects_duplicate_declarations_and_exact_key_substitution(
+    ) -> Result<(), String> {
+        let set = author::parse_yaml("questions:\n  left: {type: noul}\n  right: {type: noul}\n")
+            .map_err(|error| error.to_string())?;
+        let valid = AnswerRow {
+            answers: set
+                .questions
+                .iter()
+                .map(|question| (question.id.clone(), QuestionAnswer::abstained()))
+                .collect(),
+        };
+        validate_set_answer_row(&set, &valid)?;
+        let mut duplicate = set.clone();
+        duplicate.questions[1] = duplicate.questions[0].clone();
+        let collapsed = AnswerRow {
+            answers: [("left".to_owned(), QuestionAnswer::abstained())].into(),
+        };
+        assert!(
+            matches!(validate_set_answer_row(&duplicate, &collapsed), Err(ref message) if message.contains("duplicate question id"))
+        );
+        let mut replaced = valid.clone();
+        replaced.answers.remove("right");
+        replaced
+            .answers
+            .insert("outside".into(), QuestionAnswer::abstained());
+        assert!(
+            matches!(validate_set_answer_row(&set, &replaced), Err(ref message) if message == "row answers unknown question `outside`")
+        );
+        let mut missing = valid;
+        missing.answers.remove("right");
+        assert!(
+            matches!(validate_set_answer_row(&set, &missing), Err(ref message) if message.contains("missing an answer for question `right`"))
+        );
+        Ok(())
+    }
 }
