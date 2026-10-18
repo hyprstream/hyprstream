@@ -213,7 +213,20 @@ impl CorpusRow {
 
     /// Parse one JSONL row.
     pub fn from_json_line(line: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(line)
+        let row: Self = serde_json::from_str(line)?;
+        let mut distributable = true;
+        for teacher in &row.teachers {
+            let class = parse_tos_class(&teacher.tos_class).ok_or_else(|| {
+                <serde_json::Error as serde::de::Error>::custom("unknown teacher ToS class")
+            })?;
+            distributable &= class.is_distributable();
+        }
+        if row.distributable != distributable {
+            return Err(<serde_json::Error as serde::de::Error>::custom(
+                "row distributability differs from its teacher ToS classes",
+            ));
+        }
+        Ok(row)
     }
 }
 
@@ -480,5 +493,44 @@ mod tests {
             assert_eq!(parse_tos_class(class.as_str()), Some(class));
         }
         assert_eq!(parse_tos_class("unknown"), None);
+    }
+    #[test]
+    fn imported_rows_validate_distributability_against_all_teacher_classes() {
+        for class in [
+            TosClass::OpenWeights,
+            TosClass::ApiDistillationPermitted,
+            TosClass::ApiProhibited,
+        ] {
+            let row = sample_row(class);
+            let parsed = CorpusRow::from_json_line(&row.to_json_line()).unwrap();
+            assert_eq!(parsed.distributable, class.is_distributable());
+            let corpus = Corpus::from_jsonl(&row.to_json_line()).unwrap();
+            assert_eq!(
+                corpus.publishable().count(),
+                usize::from(class.is_distributable())
+            );
+            assert_eq!(
+                corpus.to_jsonl(true).lines().count(),
+                usize::from(class.is_distributable())
+            );
+            let mut forged = row;
+            forged.distributable = !forged.distributable;
+            assert!(CorpusRow::from_json_line(&forged.to_json_line()).is_err());
+            assert!(Corpus::from_jsonl(&forged.to_json_line()).is_err());
+        }
+        let mut mixed = sample_row(TosClass::OpenWeights);
+        mixed
+            .teachers
+            .push(sample_row(TosClass::ApiProhibited).teachers.remove(0));
+        assert!(Corpus::from_jsonl(&mixed.to_json_line()).is_err());
+        mixed.distributable = false;
+        let corpus = Corpus::from_jsonl(&mixed.to_json_line()).unwrap();
+        assert_eq!(corpus.publishable().count(), 0);
+        for flag in [false, true] {
+            let mut unknown = sample_row(TosClass::OpenWeights);
+            unknown.teachers[0].tos_class = "unknown-policy".into();
+            unknown.distributable = flag;
+            assert!(CorpusRow::from_json_line(&unknown.to_json_line()).is_err());
+        }
     }
 }
