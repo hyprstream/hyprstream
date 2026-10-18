@@ -1,0 +1,36 @@
+{
+  "receipt_version": 1,
+  "kind": "fp8-weight-scale-finite-audit",
+  "written_at": "2026-10-18T03:56:05Z",
+  "scope": "weight-scale tensors of the pinned FP8 artifact ONLY; whole-backbone weight finite-load verification is NOT covered by this receipt and remains a load-time requirement without implementation evidence",
+  "artifact_binding": {
+    "producer_repo": "kurcontko/clef-flash-FP8-Dynamic",
+    "producer_revision": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+    "file": "model.safetensors",
+    "bytes": 11910387016,
+    "sha256": "7799d5c3a47b8f249d667a040e3fd538ccbf47bd958dc6f2aa52af8346aefa6b",
+    "manifest": "crates/hyprstream-decision-head/fixtures/clef-artifact-manifest.json"
+  },
+  "procedure": [
+    "parse the safetensors header (8-byte little-endian length + JSON) of model.safetensors",
+    "select every tensor whose key ends with '.weight_scale' (200 tensors; header dtype BF16; per-output-channel shapes [out_features, 1])",
+    "read each tensor's byte range at data_offsets + header offset; upcast BF16 to Float32 by zero-extending the 16-bit words into the f32 high halves (exact), then widen to Float64",
+    "count values equal to 0.0, values < 0.0, and non-finite values; record min/max over all values",
+    "no model code is executed; the pass is an offline data inspection bound to the sha256 above"
+  ],
+  "results": {
+    "tensor_count": 200,
+    "value_count": 1425408,
+    "zero_count": 0,
+    "negative_count": 0,
+    "nonfinite_count": 0,
+    "min_scale": 9.5367431640625e-06,
+    "max_scale": 0.0023956298828125
+  },
+  "interpretation": "every audited scale value is strictly positive and finite, so a strict scale > 0 load policy admits the artifact; producer zero-amax handling uses a positive dtype epsilon (compressed-tensors 0.19.0 @ 525a7a7b84ebccdbc0db07956338b6f8c851d58f, calculate_qparams)",
+  "provenance": {
+    "first_measured_by": "fp8 lane, recorded in coord fp8-review-response.txt (M3) and fp8-scale-values-audit.json (coord-side, not committed here)",
+    "independently_reproduced": "2026-10-18 by the R0 contract seat against the locally cached pinned artifact; results identical",
+    "developmental_scope": "receipt numbers are developmental evidence bound to the pinned artifact bytes; they are not permanent source/commit identity and do not certify runtime behavior"
+  }
+}

@@ -85,15 +85,16 @@ encoding exactly. The normative behaviors below are read from the pinned
   order `true`,`false`; the typed IR/Arrow distribution order is `[P(false), P(true)]`
   (existing IR contract; see `hyprstream-decision-head` lib doc). The native path
   performs this single explicit remap. Score levels and ties are preserved.
-- **Integer domain and `-0` (normative, implemented).** Raw-JSON integers are
-  admitted in the i64/u64 domain; integers outside it are rejected with a typed
-  error rather than silently converted, and integer `-0` canonicalizes to `0`
-  while floating `-0.0` is preserved. This is implemented in the native
-  `ClefRequest` canonicalization — `clef_render` in
-  `crates/hyprstream-decision-head/src/clef/encoding.rs`, covered by the
-  encoder's shared tests. Typed-IR values normalize to f64 as a **distinct**
-  domain — raw-JSON domain rules must not leak into, or be inferred from,
-  IR-side f64 normalization.
+- **Integer domain and `-0` (normative; implementation future).** Raw-JSON
+  integers are admitted in the i64/u64 domain; integers outside it must be
+  rejected with a typed error rather than silently converted, and integer `-0`
+  must canonicalize to `0` while floating `-0.0` is preserved. This PR pins the
+  required behavior and its tests-to-be; the implementing canonicalization
+  belongs to the native `ClefRequest` encoder (`clef_render` in
+  `crates/hyprstream-decision-head/src/clef/encoding.rs`) and lands with that
+  PR — it is absent at this head and no implementation is claimed here.
+  Typed-IR values normalize to f64 as a **distinct** domain — raw-JSON domain
+  rules must not leak into, or be inferred from, IR-side f64 normalization.
 - **Structure.** Fixed chat prefix/suffix frames (system prompt, `STATE:`,
   `\n\nSCHEMA FIELDS:\n`, per-field `FIELD n / ID / TYPE / INSTRUCTION /
   ALLOWED OPTIONS / OPTION n / END FIELD` blocks, assistant frame with empty
