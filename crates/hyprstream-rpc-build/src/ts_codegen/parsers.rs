@@ -1229,6 +1229,13 @@ fn emit_option_read_expr(
         "_optR.getText(0)".to_owned()
     } else if inner_type_name == "Data" {
         "_optR.getData(0)".to_owned()
+    } else if inner_type_name == "List(Text)" {
+        let some_field = opt_struct
+            .fields
+            .iter()
+            .find(|f| f.name == "some")
+            .expect("validated option wrapper has a some field");
+        format!("_optR.getTextList({})", some_field.slot_offset)
     } else {
         // Data-section scalar or enum: find the 'some' field to get its byte offset
         let some_field = opt_struct.fields.iter().find(|f| f.name == "some");

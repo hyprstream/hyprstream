@@ -143,6 +143,33 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
         );
     }
 
+    // Exercise the actual canonical public builders/parsers, not a mirrored
+    // option implementation. Absent and present-empty must remain distinct.
+    let consumer = output_dir.join("optional_text_list_consumer.ts");
+    fs::write(
+        &consumer,
+        r#"
+import { buildQuestionAnswer, parseQuestionAnswer, QuestionAnswer } from './inference';
+
+for (const conformalSet of [undefined, [], ['alpha', 'λ', 'quote"slash\\']] as const) {
+  const input: QuestionAnswer = {
+    questionId: 'presence',
+    value: { variant: 'noul', data: 0.5 },
+    conformalSet: conformalSet === undefined ? undefined : [...conformalSet],
+  };
+  const decoded = parseQuestionAnswer(buildQuestionAnswer(input));
+  if (JSON.stringify(decoded.conformalSet) !== JSON.stringify(input.conformalSet)) {
+    throw new Error('optional text list lost presence or payload');
+  }
+  const again = parseQuestionAnswer(buildQuestionAnswer(decoded));
+  if (JSON.stringify(again.conformalSet) !== JSON.stringify(input.conformalSet)) {
+    throw new Error('optional text list changed on consumer read-modify-write');
+  }
+}
+"#,
+    )
+    .expect("write canonical optional text-list consumer");
+
     let mut sources: Vec<PathBuf> = fs::read_dir(&output_dir)
         .expect("read generated TypeScript directory")
         .map(|entry| entry.expect("read generated entry").path())
@@ -153,7 +180,8 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
     command
         .args(&tsc[1..])
         .args([
-            "--noEmit",
+            "--outDir",
+            "compiled",
             "--module",
             "commonjs",
             "--moduleResolution",
@@ -175,6 +203,15 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
     assert!(
         status.success(),
         "generated canonical TypeScript sources do not type-check"
+    );
+
+    let status = Command::new("node")
+        .arg(output_dir.join("compiled/optional_text_list_consumer.js"))
+        .status()
+        .expect("run canonical optional text-list consumer");
+    assert!(
+        status.success(),
+        "canonical optional text-list consumer failed"
     );
 
     fs::remove_dir_all(root).expect("remove consumer test directory");
