@@ -216,7 +216,8 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 }
 
 /// Renormalize an accepted distribution to producer tolerance, in stages:
-/// Producer-valid vectors remain untouched. Otherwise divide through and
+/// Producer-valid vectors retain their values when the intended winner
+/// survived narrowing. Otherwise divide through and
 /// apply a uniform correction first, preserving ties where f32 permits it.
 /// If rounding merges a later-index winner with an earlier runner-up, lift
 /// that original D6 winner by one representable step. Residual shortfalls go
@@ -226,11 +227,19 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 /// tie to meet producer tolerance; their earliest-index winner is retained.
 /// Also used by TruthSubject's uniform fallback and teacher averages.
 pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
+    if let Some(winner) = hyprstream_decision::confidence::argmax_index(probabilities) {
+        normalize_distribution_with_winner(probabilities, winner);
+    }
+}
+
+fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
-    let Some(winner) = hyprstream_decision::confidence::argmax_index(probabilities) else {
-        return;
-    };
+    // The caller may have selected the winner before narrowing wire f64 values.
+    if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
+        let max = probabilities.iter().copied().fold(0.0f32, f32::max);
+        probabilities[winner] = max.next_up().min(1.0);
+    }
     // Stage 0: a producer-valid input is already fine — normalizing it
     // further can push it out of tolerance AND below zero (see the doc
     // comment's 49-way example).
@@ -339,7 +348,8 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                     )));
                 }
                 let mut probabilities = Vec::with_capacity(labels.len());
-                for label in &labels {
+                let mut wire_winner: Option<(usize, f64)> = None;
+                for (index, label) in labels.iter().enumerate() {
                     let p = map
                         .get(label)
                         .and_then(Value::as_f64)
@@ -349,6 +359,9 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                             "probability for `{label}` out of range: {p}"
                         )));
                     }
+                    if wire_winner.is_none_or(|(_, best)| p > best) {
+                        wire_winner = Some((index, p));
+                    }
                     probabilities.push(p as f32);
                 }
                 confidence::check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE)
@@ -356,7 +369,10 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                 // The wire accepts consumer-tolerance sums (e.g. a rounded
                 // [0.333, 0.333, 0.333]); renormalize so the IR meets the
                 // producer tolerance the run/batch validators require.
-                normalize_distribution(&mut probabilities);
+                let winner = wire_winner
+                    .map(|(index, _)| index)
+                    .ok_or_else(|| invalid("empty wire distribution".to_owned()))?;
+                normalize_distribution_with_winner(&mut probabilities, winner);
                 Ok(Some(probabilities))
             }
             Some(_) => Err(invalid(format!("`{key}` is neither null nor an object"))),
@@ -373,8 +389,15 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                 if !(0.0..=1.0).contains(&p_true) {
                     return Err(invalid(format!("`noul` out of range: {p_true}")));
                 }
+                let narrowed = p_true as f32;
+                // Noul's implicit [1-p, p] must retain a true wire winner.
+                let narrowed = if p_true > 0.5 && narrowed == 0.5 {
+                    narrowed.next_up()
+                } else {
+                    narrowed
+                };
                 Ok(QuestionAnswer::answered(AnswerValue::Noul {
-                    p_true: p_true as f32,
+                    p_true: narrowed,
                 }))
             }
         },

@@ -112,6 +112,8 @@ pub struct Observation {
     pub question_id: String,
     /// Question primitive.
     pub kind: QuestionKind,
+    /// Canonical labels bound to this observation's probabilities and truth.
+    pub labels: Vec<String>,
     /// Family tag (if any).
     pub family: Option<String>,
     /// Stratum tag (if any).
@@ -208,6 +210,11 @@ impl Harness {
         // labeled denominator — fail loudly instead. A truth index outside
         // the question's cardinality is likewise an input error, caught here
         // rather than at scoring time (after every billed call).
+        let cardinalities: std::collections::HashMap<&str, usize> = question_set
+            .questions
+            .iter()
+            .map(|question| (question.id.as_str(), question.cardinality()))
+            .collect();
         let mut row_ids = std::collections::HashSet::with_capacity(set.rows.len());
         for row in &set.rows {
             validate_entry(&row.state).map_err(EvalError::InvalidInput)?;
@@ -218,17 +225,17 @@ impl Harness {
                 )));
             }
             for (question_id, &label) in &row.truth {
-                let Some(question) = question_set.question(question_id) else {
+                let Some(&cardinality) = cardinalities.get(question_id.as_str()) else {
                     return Err(EvalError::InvalidInput(format!(
                         "row `{}` has a truth entry for undeclared question `{question_id}`",
                         row.id
                     )));
                 };
-                if label >= question.cardinality() {
+                if label >= cardinality {
                     return Err(EvalError::InvalidInput(format!(
                         "row `{}` truth index {label} is outside question `{question_id}`'s cardinality {}",
                         row.id,
-                        question.cardinality()
+                        cardinality
                     )));
                 }
             }
@@ -297,6 +304,7 @@ impl Harness {
                     id: row.id.clone(),
                     question_id: question.id.clone(),
                     kind: question.kind,
+                    labels: question.labels(),
                     family: row.family.clone(),
                     stratum: row.stratum.clone(),
                     group: row.group.clone(),
@@ -410,6 +418,7 @@ impl Harness {
                 id: item.id.clone(),
                 question_id: item.question.id.clone(),
                 kind: item.question.kind,
+                labels: item.question.labels(),
                 family: item.family.clone(),
                 stratum: item.stratum.clone(),
                 group: item.group.clone(),
@@ -654,6 +663,48 @@ fn validate_one_answer(
         }
     }
     Ok(())
+}
+
+/// Reuse the emitted label/profile contract when only denormalized labels are available.
+pub(crate) fn question_from_labels(
+    id: &str,
+    kind: QuestionKind,
+    labels: &[String],
+) -> Result<QuestionSpec, EvalError> {
+    use hyprstream_decision::spec::{ChoiceOption, QuestionBody};
+    let body = match kind {
+        QuestionKind::Noul => QuestionBody::Noul { criteria: None },
+        QuestionKind::Choice => QuestionBody::Choice {
+            options: labels
+                .iter()
+                .map(|name| ChoiceOption {
+                    name: name.clone(),
+                    rubric: None,
+                })
+                .collect(),
+        },
+        QuestionKind::Score => QuestionBody::Score {
+            levels: vec![None; labels.len()],
+        },
+        _ => {
+            return Err(EvalError::InvalidInput(
+                "question kind is not supported in v1".to_owned(),
+            ))
+        }
+    };
+    let question = QuestionSpec {
+        id: id.to_owned(),
+        kind,
+        instructions: None,
+        body,
+    };
+    validate_question_profile(&question).map_err(EvalError::InvalidInput)?;
+    if question.labels() != labels {
+        return Err(EvalError::InvalidInput(
+            "question labels disagree with its kind".to_owned(),
+        ));
+    }
+    Ok(question)
 }
 
 #[cfg(test)]

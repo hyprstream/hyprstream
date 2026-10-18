@@ -711,3 +711,73 @@ async fn contradictory_model_provenance_is_rejected_by_scoring_and_persistence()
     let (meta, _) = sink.store().get(&id).await.unwrap().unwrap();
     assert_eq!(meta.model_id, valid.model_id);
 }
+
+#[tokio::test]
+async fn wire_precision_winner_survives_scoring_and_persistence_for_all_kinds() {
+    use hyprstream_eval::{score_run, ScoreConfig, Subject};
+    struct PrecisionSubject(f64);
+    #[async_trait]
+    impl Subject for PrecisionSubject {
+        fn model_id(&self) -> &str {
+            "precision-1"
+        }
+        async fn decide(
+            &self,
+            set: &hyprstream_decision::QuestionSet,
+            _state: &hyprstream_decision::Entry,
+            _row: usize,
+        ) -> Result<hyprstream_decision::arrow::AnswerRow, hyprstream_eval::EvalError> {
+            hyprstream_eval::subject::parse_response_answers(
+                set,
+                &serde_json::json!({"answers": {
+                    "binary": {"type": "noul", "noul": self.0},
+                    "route": {"type": "choice", "probabilities": {"first": 1.0-self.0, "later": self.0}},
+                    "rank": {"type": "score", "probabilities": {"0": 1.0-self.0, "1": self.0}}
+                }}),
+            )
+        }
+    }
+    let questions = hyprstream_decision::author::parse_yaml("questions:\n  binary: {type: noul}\n  route: {type: choice, criteria: {first: null, later: null}}\n  rank: {type: score, criteria: [low, high]}\n").unwrap().questions;
+    for (wire, winner) in [(0.50000001, 1), (0.49999999, 0), (0.5, 0)] {
+        let set = EvalSet {
+            name: "wire-precision".into(),
+            schema_version: "v1".into(),
+            questions: questions.clone(),
+            rows: vec![EvalRow {
+                id: "row".into(),
+                family: None,
+                stratum: None,
+                group: None,
+                state: hyprstream_decision::Entry::Null,
+                truth: questions.iter().map(|q| (q.id.clone(), winner)).collect(),
+            }],
+        };
+        let output = Harness
+            .run_set(&set, &PrecisionSubject(wire))
+            .await
+            .unwrap();
+        for obs in &output.observations {
+            assert_eq!(obs.argmax_label_index(), Some(winner));
+        }
+        assert_eq!(
+            score_run(&output, &ScoreConfig::default())
+                .unwrap()
+                .accuracy,
+            Some(1.0)
+        );
+        let backend = Arc::new(MemoryBackend::default());
+        let sink = BatchSink::new(backend);
+        sink.init().await.unwrap();
+        let id = sink.persist_run(&output).await.unwrap();
+        let (_, stored) = sink.store().get(&id).await.unwrap().unwrap();
+        for question in &set.questions {
+            let labels = stored
+                .column_by_name(&format!("{}.label", question.id))
+                .unwrap()
+                .as_any()
+                .downcast_ref::<hyprstream_metrics_api::arrow::array::StringArray>()
+                .unwrap();
+            assert_eq!(labels.value(0), question.labels()[winner]);
+        }
+    }
+}
