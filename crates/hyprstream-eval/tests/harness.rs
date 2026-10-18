@@ -1256,3 +1256,147 @@ async fn duplicate_observation_identities_fail_before_subject_calls() {
     ));
     assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn nonfinite_request_entries_fail_before_any_subject_or_teacher_call() {
+    use hyprstream_decision::spec::{ChoiceOption, NoulCriteria, QuestionBody, QuestionKind};
+    use hyprstream_eval::teacher::{Teacher, TeacherEnsemble, TosClass};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct CountValid(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Subject for CountValid {
+        fn model_id(&self) -> &str {
+            "finite-input-control"
+        }
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            state: &Entry,
+            row: usize,
+        ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            UniformSubject.decide(set, state, row).await
+        }
+    }
+
+    // Each request-bearing Entry position is nested through both Map and Seq.
+    // Invalid item/row is second: no earlier request may escape preflight.
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.25] {
+        for position in 0..6 {
+            let entry = Entry::Map(vec![(
+                "nested".into(),
+                Entry::Seq(vec![Entry::Number(value)]),
+            )]);
+            let mut item = noul_item();
+            item.id = "second".into();
+            match position {
+                0 => item.state = entry,
+                1 => item.question.instructions = Some(entry),
+                2 | 3 => {
+                    item.question.body = QuestionBody::Noul {
+                        criteria: Some(NoulCriteria {
+                            on_true: (position == 2).then(|| entry.clone()),
+                            on_false: (position == 3).then_some(entry),
+                        }),
+                    }
+                }
+                4 => {
+                    item.question.kind = QuestionKind::Choice;
+                    item.question.body = QuestionBody::Choice {
+                        options: vec![
+                            ChoiceOption {
+                                name: "a".into(),
+                                rubric: None,
+                            },
+                            ChoiceOption {
+                                name: "b".into(),
+                                rubric: Some(entry),
+                            },
+                        ],
+                    };
+                }
+                _ => {
+                    item.question.kind = QuestionKind::Score;
+                    item.question.body = QuestionBody::Score {
+                        levels: vec![None, Some(entry)],
+                    };
+                }
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let subject = CountValid(calls.clone());
+            let items = vec![noul_item(), item.clone()];
+            let result = Harness.run_items(&items, &subject).await;
+            if value.is_finite() {
+                assert_eq!(result.unwrap().observations.len(), 2);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(hyprstream_eval::EvalError::InvalidInput(_))
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "item position {position}");
+            }
+            calls.store(0, Ordering::SeqCst);
+            let row = hyprstream_eval::EvalRow {
+                id: "first".into(),
+                family: None,
+                stratum: None,
+                group: None,
+                state: Entry::Null,
+                truth: std::collections::BTreeMap::new(),
+            };
+            let set = hyprstream_eval::EvalSet {
+                name: "finite-input".into(),
+                schema_version: "v1".into(),
+                questions: vec![item.question.clone()],
+                rows: vec![
+                    row.clone(),
+                    hyprstream_eval::EvalRow {
+                        id: "second".into(),
+                        state: item.state.clone(),
+                        ..row
+                    },
+                ],
+            };
+            let result = Harness.run_set(&set, &subject).await;
+            if value.is_finite() {
+                assert_eq!(result.unwrap().observations.len(), 2);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(hyprstream_eval::EvalError::InvalidInput(_))
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "set position {position}");
+            }
+            calls.store(0, Ordering::SeqCst);
+            let ensemble = TeacherEnsemble::new(vec![Teacher {
+                id: "teacher".into(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(CountValid(calls.clone())),
+            }])
+            .unwrap();
+            let result = ensemble
+                .decide(&set.question_set(), &item.state, 0, "item")
+                .await;
+            if value.is_finite() {
+                assert!(result.is_ok());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(hyprstream_eval::EvalError::InvalidInput(_))
+                ));
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "teacher position {position}"
+                );
+            }
+        }
+    }
+}
