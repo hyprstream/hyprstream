@@ -937,6 +937,16 @@ fn emit_option_setter(
         out.push_str(&format!("{indent}  _opt.setText(0, {value_expr});\n"));
     } else if inner_type_name == "Data" {
         out.push_str(&format!("{indent}  _opt.setData(0, {value_expr});\n"));
+    } else if inner_type_name == "List(Text)" {
+        let some_field = opt_struct
+            .fields
+            .iter()
+            .find(|f| f.name == "some")
+            .expect("validated option wrapper has a some field");
+        out.push_str(&format!(
+            "{indent}  _opt.setTextList({}, {value_expr});\n",
+            some_field.slot_offset
+        ));
     } else if let Some(method) = super::setter_method(inner_type_name) {
         // Find the 'some' field slot offset for computing the byte offset
         let some_field = opt_struct.fields.iter().find(|f| f.name == "some");

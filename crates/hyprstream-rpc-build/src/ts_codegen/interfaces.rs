@@ -72,6 +72,15 @@ fn emit_group_interface(out: &mut String, name: &str, leaves: &[FieldDef]) {
 /// properties the generated request serializer switches on (#1616).
 /// Service/scoped envelopes and plain structs get a named-fields interface.
 fn emit_struct_interface(out: &mut String, s: &StructDef, schema: &ParsedSchema) {
+    // Structural optional text lists use the same flattened presence contract
+    // as the option reader/writer, including wrappers without an Option prefix.
+    if s.option_inner_type() == Some("List(Text)") {
+        out.push_str(&format!(
+            "export type {} = string[] | undefined;\n\n",
+            s.name
+        ));
+        return;
+    }
     if super::emits_union_alias(schema, s) {
         let union_fields: Vec<_> = s.union_fields().collect();
         // Synthesize a named interface for each inline `group` arm. Its leaf
