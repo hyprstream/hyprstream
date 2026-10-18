@@ -419,6 +419,44 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     Ok(AnswerRow { answers: row })
 }
 
+/// Operational bounds for remote evaluation, not inference latency targets.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpBudget {
+    /// Maximum connection-establishment time.
+    pub connect_timeout: std::time::Duration,
+    /// Whole HTTP query deadline, including response-body consumption.
+    pub request_timeout: std::time::Duration,
+    /// Maximum response-body bytes, for successful and error responses alike.
+    pub max_response_bytes: usize,
+}
+
+impl Default for HttpBudget {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(10),
+            request_timeout: std::time::Duration::from_secs(120),
+            max_response_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl HttpBudget {
+    fn validate(self) -> Result<(), &'static str> {
+        let now = std::time::Instant::now();
+        if self.connect_timeout.is_zero()
+            || self.request_timeout.is_zero()
+            || now.checked_add(self.connect_timeout).is_none()
+            || now.checked_add(self.request_timeout).is_none()
+            || self.max_response_bytes == 0
+        {
+            return Err(
+                "HTTP budgets require positive, representable deadlines and a positive body cap",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A subject reached over the jev-1 JSON/HTTPS wire (`POST /v1/systemone`).
 ///
 /// This is the reference client for every remote arm: the P0.7 stub, the
@@ -429,7 +467,8 @@ pub struct HttpSubject {
     base_url: String,
     model: String,
     token: String,
-    client: reqwest::Client,
+    client: Result<reqwest::Client, &'static str>,
+    budget: HttpBudget,
     /// The latest fully accepted response's resolved id. `Arc` so clones
     /// share the cache; version-bound results never depend on this slot.
     resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
@@ -440,10 +479,11 @@ impl std::fmt::Debug for HttpSubject {
         // Never print the bearer token: Debug output lands in logs and panic
         // diagnostics, and the token is a provider credential.
         f.debug_struct("HttpSubject")
-            .field("base_url", &self.base_url)
+            .field("base_url", &"<redacted>")
             .field("model", &self.model)
             .field("token", &"<redacted>")
-            .field("client", &self.client)
+            .field("client_ready", &self.client.is_ok())
+            .field("budget", &self.budget)
             .field("resolved", &self.resolved)
             .finish()
     }
@@ -458,11 +498,31 @@ impl HttpSubject {
         model: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
+        Self::new_with_budget(base_url, model, token, HttpBudget::default())
+    }
+
+    /// Configure finite evaluation safeguards. Invalid budgets or client
+    /// initialization are rejected by pure preflight before any teacher call;
+    /// construction never falls back to an unbounded client or panics.
+    pub fn new_with_budget(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        token: impl Into<String>,
+        budget: HttpBudget,
+    ) -> Self {
+        let client = budget.validate().and_then(|()| {
+            reqwest::Client::builder()
+                .connect_timeout(budget.connect_timeout)
+                .timeout(budget.request_timeout)
+                .build()
+                .map_err(|_| "HTTP client initialization failed")
+        });
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client,
+            budget,
             resolved: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
@@ -474,11 +534,15 @@ impl HttpSubject {
 
     // Shared with side-effect-free preflight so request construction cannot
     // fail deterministically after an earlier ensemble teacher was queried.
-    fn request_builder(&self) -> reqwest::RequestBuilder {
-        self.client
+    fn request_builder(&self) -> Result<reqwest::RequestBuilder, EvalError> {
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|message| EvalError::InvalidInput((*message).to_owned()))?;
+        Ok(client
             .post(self.endpoint())
             .bearer_auth(&self.token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json"))
     }
 
     /// The requested model string (possibly an alias), as configured.
@@ -502,25 +566,42 @@ impl HttpSubject {
         // directly-constructed non-finite IR number into JSON null.
         let body = serde_json::to_vec(&request_body(set, state, &self.model))
             .map_err(|error| EvalError::InvalidInput(format!("invalid request entry: {error}")))?;
-        let response = self
-            .request_builder()
+        let mut response = self
+            .request_builder()?
             .body(body)
             .send()
             .await
-            .map_err(|error| EvalError::Http(format!("request failed: {error}")))?;
+            .map_err(|_| EvalError::Http("HTTP request failed or timed out".to_owned()))?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| EvalError::Http(format!("reading body: {error}")))?;
-        if !status.is_success() {
-            return Err(EvalError::Http(format!(
-                "status {}: {}",
-                status.as_u16(),
-                text
-            )));
+        let limit = self.budget.max_response_bytes;
+        if response
+            .content_length()
+            .is_some_and(|length| !usize::try_from(length).is_ok_and(|length| length <= limit))
+        {
+            return Err(EvalError::Http(
+                "HTTP response exceeds the byte budget".to_owned(),
+            ));
         }
-        let parsed: Value = serde_json::from_str(&text)
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| EvalError::Http("reading HTTP response failed or timed out".to_owned()))?
+        {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(EvalError::Http(
+                    "HTTP response exceeds the byte budget".to_owned(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            // Providers may echo credentials in their bodies. Keep only status.
+            return Err(EvalError::Http(format!("status {}", status.as_u16())));
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| EvalError::Http("HTTP response is not UTF-8".to_owned()))?;
+        let parsed: Value = serde_json::from_str(text)
             .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
         let Some(resolved) = parsed
             .get("model")
@@ -548,6 +629,9 @@ impl HttpSubject {
 #[async_trait]
 impl Subject for HttpSubject {
     fn preflight(&self, _set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+        self.budget
+            .validate()
+            .map_err(|message| EvalError::InvalidInput(message.to_owned()))?;
         if self.model.is_empty() {
             return Err(EvalError::InvalidInput(
                 "the HTTP subject requires a non-empty model".to_owned(),
@@ -573,7 +657,7 @@ impl Subject for HttpSubject {
                 "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
             ));
         }
-        self.request_builder().build().map_err(|_| {
+        self.request_builder()?.build().map_err(|_| {
             // Request/headers/URL may contain credentials. Never include the
             // underlying error or Debug representation in this public error.
             EvalError::InvalidInput("invalid HTTP subject request configuration".to_owned())
