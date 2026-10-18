@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use hyprstream_decision::QuestionKind;
 
 use crate::corpus::{Corpus, CorpusRow, LabelCount, Provenance, SynthStats};
-use crate::ensemble::{argmax_label, corrected_average};
+use crate::ensemble::{argmax_label, corrected_average, valid_probabilities};
 use crate::family::SynthFamily;
 use crate::firewall::{Firewall, FirewallViolation};
 use crate::gen::{generate, item_seed, PARAPHRASES};
@@ -48,6 +48,10 @@ pub enum SynthError {
     /// `base_items_per_family` of 0 (a zero-sized run would write an empty
     /// corpus while reporting success).
     ZeroBaseItems,
+    /// No teacher targets can be produced from an empty roster.
+    EmptyRoster,
+    /// Empty id/version cannot identify an auditable teacher.
+    BadTeacherIdentity(String),
     /// Two roster teachers share an id.
     DuplicateTeacherId(String),
     /// A correction temperature referenced a teacher id outside the roster.
@@ -74,6 +78,8 @@ impl std::fmt::Display for SynthError {
                 f,
                 "paraphrase_variants must be in 2..={PARAPHRASES} (paraphrase augmentation is mandatory, S6b1); got {n}"
             ),
+            Self::EmptyRoster => f.write_str("teacher roster must not be empty"),
+            Self::BadTeacherIdentity(id) => write!(f, "teacher identity must contain nonempty id/version: {id:?}"),
             Self::ZeroBaseItems => write!(
                 f,
                 "base_items_per_family must be at least 1 (zero-sized run)"
@@ -101,8 +107,28 @@ impl std::fmt::Display for SynthError {
 
 impl std::error::Error for SynthError {}
 
-/// Producer-sum tolerance, mirrored from the jev-1 contract (D5).
-const PRODUCER_SUM_TOLERANCE: f32 = 1e-6;
+/// The production per-item teacher gate, also exercised with a call counter.
+/// Rechecks content immediately before inference, even if an earlier dedup
+/// preflight already checked it; no future caller can bypass the firewall.
+pub(crate) fn answer_checked_item(
+    item: &crate::SynthItem,
+    teachers: &[&dyn Teacher],
+    firewall: &Firewall,
+) -> Result<Vec<Vec<f32>>, SynthError> {
+    firewall.check_item(item).map_err(SynthError::Firewall)?;
+    let mut answers = Vec::with_capacity(teachers.len());
+    for teacher in teachers {
+        let probs = teacher.answer(item);
+        if !valid_probabilities(&probs, item.question.cardinality()) {
+            return Err(SynthError::BadTeacherAnswer {
+                teacher: teacher.pin().id.clone(),
+                item: item.id.clone(),
+            });
+        }
+        answers.push(probs);
+    }
+    Ok(answers)
+}
 
 /// Run the pipeline. `teachers` is the roster order; every item is answered
 /// by every teacher and all raw vectors are persisted. `temperatures` is the
@@ -117,6 +143,9 @@ pub fn run(
     firewall: &Firewall,
     temperatures: &HashMap<String, f64>,
 ) -> Result<Corpus, SynthError> {
+    firewall
+        .ensure_content_index()
+        .map_err(SynthError::Firewall)?;
     if !(2..=PARAPHRASES).contains(&config.paraphrase_variants) {
         return Err(SynthError::BadParaphraseVariants(
             config.paraphrase_variants,
@@ -127,8 +156,14 @@ pub fn run(
     }
     // Roster ids key the persisted per-teacher vectors and the correction
     // map; a duplicate id would make rows and corrections indistinguishable.
+    if teachers.is_empty() {
+        return Err(SynthError::EmptyRoster);
+    }
     let mut roster_ids = HashSet::new();
     for teacher in teachers {
+        if teacher.pin().id.trim().is_empty() || teacher.pin().version.trim().is_empty() {
+            return Err(SynthError::BadTeacherIdentity(teacher.pin().id.clone()));
+        }
         if !roster_ids.insert(teacher.pin().id.as_str()) {
             return Err(SynthError::DuplicateTeacherId(teacher.pin().id.clone()));
         }
@@ -177,19 +212,7 @@ pub fn run(
                             stats.dedup_dropped += 1;
                             continue;
                         }
-                        let mut answers = Vec::with_capacity(teachers.len());
-                        for teacher in teachers {
-                            let probs = teacher.answer(&item);
-                            if probs.len() != item.question.cardinality()
-                                || (probs.iter().sum::<f32>() - 1.0).abs() > PRODUCER_SUM_TOLERANCE
-                            {
-                                return Err(SynthError::BadTeacherAnswer {
-                                    teacher: teacher.pin().id.clone(),
-                                    item: item.id.clone(),
-                                });
-                            }
-                            answers.push(probs);
-                        }
+                        let answers = answer_checked_item(&item, teachers, firewall)?;
                         let row =
                             CorpusRow::from_item(&item, teachers, answers, provenance.clone());
                         // The label histogram is recorded under every policy
@@ -219,7 +242,10 @@ pub fn run(
         }
     }
     stats.label_histogram = LabelCount::rows_from(labels.histogram());
-    stats.correction_temperatures = temperatures.iter().map(|(teacher, t)| (teacher.clone(), *t)).collect();
+    stats.correction_temperatures = temperatures
+        .iter()
+        .map(|(teacher, t)| (teacher.clone(), *t))
+        .collect();
     corpus.stats = stats;
     Ok(corpus)
 }

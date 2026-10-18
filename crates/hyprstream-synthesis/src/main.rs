@@ -4,7 +4,7 @@
 //! ```text
 //! hyprstream-synthesis pins
 //! hyprstream-synthesis run --roster roster.json [--manifest <path>] \
-//!     [--config <config.json>] [--out corpus.jsonl] [--publishable-only]
+//!     [--config <config.json>] --content-index index.json [--out corpus.jsonl] [--publishable-only]
 //! hyprstream-synthesis roster-md --roster roster.json   # DISCLOSURE table
 //! ```
 //!
@@ -129,7 +129,13 @@ fn roster_md(args: &[String]) -> i32 {
 fn synthesize(args: &[String]) -> i32 {
     if let Some(err) = reject_unknown_args(
         args,
-        &["--roster", "--manifest", "--config", "--out"],
+        &[
+            "--roster",
+            "--manifest",
+            "--config",
+            "--out",
+            "--content-index",
+        ],
         &["--publishable-only"],
     ) {
         eprintln!("run: {err}");
@@ -161,6 +167,25 @@ fn synthesize(args: &[String]) -> i32 {
             }
         },
         None => SynthConfig::default(),
+    };
+    // Missing/incomplete/corrupt index fails before constructing or calling teachers.
+    let Some(index_path) = flag_value(args, "--content-index") else {
+        eprintln!("attested complete benchmark content index is required (--content-index)");
+        return 1;
+    };
+    let index_text = match std::fs::read_to_string(index_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("content index unreadable: {e}");
+            return 1;
+        }
+    };
+    let firewall = match firewall.with_content_index_json(&index_text) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
     };
     // Simulated stand-in teachers, keyed per roster position. Versions are
     // pinned by the roster file itself.

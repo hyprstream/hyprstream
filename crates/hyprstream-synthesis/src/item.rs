@@ -100,14 +100,19 @@ impl SynthItem {
         ))
     }
 
+    /// Shared typed content identity; does not change the frozen artifact hash.
+    pub fn content_fingerprint(
+        &self,
+    ) -> Result<String, hyprstream_bench::content::ContentFingerprintError> {
+        hyprstream_bench::content::content_fingerprint(&self.state, &self.question)
+    }
+
     /// Canonical byte form — the exact input the dedup and item-level
     /// contamination firewall hashes.
     ///
-    /// `FROZEN (syn-item/1)`: length-prefixed fields, one per line, so the
-    /// hash is independent of any serializer's key order. Note the distinct
-    /// format tag: a synthesized item can never byte-collide with a `vob-item/1`
-    /// benchmark item even if every text field matched — the item-level
-    /// firewall is a *hash* check, so the formats must not overlap.
+    /// `FROZEN (syn-item/1)`: immutable source/augmentation artifact identity.
+    /// Its domain intentionally differs from benchmark artifact identity;
+    /// cross-source contamination uses content_fingerprint instead.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = String::new();
         out.push_str("syn-item/1\n");
@@ -162,7 +167,7 @@ impl SynthItem {
         out.into_bytes()
     }
 
-    /// blake3 hex digest of [`Self::canonical_bytes`] — the dedup/firewall hash.
+    /// blake3 hex digest of [`Self::canonical_bytes`] — artifact/dedup identity.
     pub fn hash(&self) -> String {
         blake3::hash(&self.canonical_bytes()).to_hex().to_string()
     }

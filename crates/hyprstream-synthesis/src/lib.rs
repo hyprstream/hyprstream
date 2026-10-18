@@ -45,6 +45,7 @@
 //! (`DISCLOSURE.md`) states plainly that calibration-to-teacher ≠
 //! calibration-to-reality.
 
+mod content_index;
 pub mod corpus;
 pub mod ensemble;
 pub mod family;
@@ -66,3 +67,6 @@ pub use teacher::{HashTeacher, Teacher, TeacherPin, TosClass};
 /// The pinned splitmix64 stream, shared with the benchmark harness so the
 /// two generators can never silently diverge in stream semantics.
 pub use hyprstream_bench::rng::BenchRng;
+
+#[cfg(test)]
+mod pipeline_tests;

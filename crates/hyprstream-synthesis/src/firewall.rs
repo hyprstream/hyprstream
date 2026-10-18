@@ -7,14 +7,15 @@
 //!   training data. Synthesis families are structurally disjoint
 //!   (`family.rs`), and this module re-checks every generated item's family
 //!   against the manifest's `gate` designations at run time.
-//! - **Item-level**: no synthesized item may hash-collide with a frozen
-//!   benchmark item (dedup and the firewall use the same canonical hash).
+//! - **Item-level**: synthesized state/question content must not match the
+//!   shared typed fingerprint of any completely attested frozen benchmark
+//!   item. Source-specific artifact/dedup hashes remain distinct and unchanged.
 //!
 //! The loader **verifies the pins** before any check: the manifest file's
 //! blake3, the embedded release id, and the embedded DISCLOSURE digest must
 //! match the constants below, or loading fails loudly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use hyprstream_bench::manifest::{blake3_hex, Manifest};
@@ -41,6 +42,8 @@ pub const DEFAULT_MANIFEST_PATH: &str = "crates/hyprstream-bench/manifest/vob-1.
 pub enum FirewallError {
     /// Manifest file unreadable.
     Io(std::io::Error),
+    /// Missing, incomplete or corrupt caller-supplied benchmark content index.
+    ContentIndex(String),
     /// The pinned DISCLOSURE file unreadable (missing = drift).
     DisclosureIo(std::io::Error),
     /// Manifest JSON unparseable.
@@ -57,6 +60,7 @@ pub enum FirewallError {
 impl std::fmt::Display for FirewallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ContentIndex(err) => write!(f, "benchmark content index rejected: {err}"),
             Self::Io(err) => write!(f, "manifest unreadable: {err}"),
             Self::DisclosureIo(err) => {
                 write!(f, "pinned DISCLOSURE file unreadable: {err}")
@@ -104,7 +108,11 @@ fn disclosure_path_for(manifest_path: &Path, manifest: &Manifest) -> Option<std:
 pub enum FirewallViolation {
     /// The item's family is a designated gate family.
     GateFamily(String),
-    /// The item's canonical hash matches a frozen benchmark item.
+    /// Artifact hashes alone cannot authorize synthesis.
+    MissingContentIndex,
+    /// Invalid typed content cannot pass a fingerprint gate.
+    InvalidContent(String),
+    /// The shared typed content fingerprint matches a frozen benchmark item.
     ContaminatedItem {
         /// Synthesized item id.
         id: String,
@@ -116,13 +124,17 @@ pub enum FirewallViolation {
 impl std::fmt::Display for FirewallViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingContentIndex => f.write_str(
+                "attested complete benchmark content index is required before synthesis",
+            ),
+            Self::InvalidContent(error) => write!(f, "invalid typed content: {error}"),
             Self::GateFamily(family) => write!(
                 f,
                 "family {family} is a designated gate family — never synthesized"
             ),
             Self::ContaminatedItem { id, hash } => write!(
                 f,
-                "synthesized item {id} hash-collides with frozen benchmark item {hash}"
+                "synthesized item {id} matches frozen content fingerprint {hash}"
             ),
         }
     }
@@ -130,12 +142,42 @@ impl std::fmt::Display for FirewallViolation {
 
 impl std::error::Error for FirewallViolation {}
 
+/// The source-qualified typed profile of the frozen vob1.1 generators.
+/// Frozen artifact bytes render Entry values and omit some rubric fields;
+/// admitting other types would not bind a typed fingerprint to those hashes.
+pub const FROZEN_CONTENT_PROFILE: &str = "vob-1.1-text/1";
+
+fn validate_frozen_profile(item: &hyprstream_bench::Item) -> Result<(), FirewallError> {
+    use hyprstream_decision::{Entry, QuestionBody, QuestionKind};
+    let typed = matches!(&item.state, Entry::Str(_))
+        && matches!(&item.question.instructions, Some(Entry::Str(_)));
+    let body = match (item.question.kind, &item.question.body) {
+        (QuestionKind::Noul, QuestionBody::Noul { criteria: None }) => true,
+        (QuestionKind::Choice, QuestionBody::Choice { options }) => {
+            options.len() >= 2 && options.iter().all(|o| o.rubric.is_none())
+        }
+        (QuestionKind::Score, QuestionBody::Score { levels }) => {
+            levels.len() >= 2 && levels.iter().all(Option::is_none)
+        }
+        _ => false,
+    };
+    if !typed || !body || item.truth >= item.question.cardinality() {
+        return Err(FirewallError::ContentIndex(format!(
+            "item {} violates source-qualified {FROZEN_CONTENT_PROFILE}",
+            item.id
+        )));
+    }
+    Ok(())
+}
+
 /// The loaded, pin-verified firewall.
 #[derive(Debug, Clone)]
 pub struct Firewall {
     release: String,
     manifest_blake3: String,
     item_hashes: HashSet<String>,
+    expected_items: Vec<(String, String)>,
+    content_hashes: Option<HashSet<String>>,
     gate_families: HashSet<String>,
 }
 
@@ -203,6 +245,12 @@ impl Firewall {
         Ok(Self {
             release: manifest.release,
             manifest_blake3,
+            expected_items: manifest
+                .items
+                .iter()
+                .map(|i| (i.id.clone(), i.blake3.clone()))
+                .collect(),
+            content_hashes: None,
             item_hashes: manifest
                 .items
                 .iter()
@@ -215,6 +263,62 @@ impl Firewall {
                 .map(|row| row.id.clone())
                 .collect(),
         })
+    }
+
+    /// Attach COMPLETE typed benchmark content after verifying every artifact
+    /// against the already pin-verified manifest. No generation or pin override.
+    /// This consumes self so a failed replacement cannot be silently used.
+    pub fn with_attested_items(
+        mut self,
+        items: &[hyprstream_bench::Item],
+    ) -> Result<Self, FirewallError> {
+        if items.len() != self.expected_items.len() {
+            return Err(FirewallError::ContentIndex("incomplete item count".into()));
+        }
+        let expected: HashMap<_, _> = self
+            .expected_items
+            .iter()
+            .map(|(id, hash)| (id.as_str(), hash.as_str()))
+            .collect();
+        if expected.len() != self.expected_items.len() {
+            return Err(FirewallError::ContentIndex("duplicate manifest IDs".into()));
+        }
+        let mut seen = HashSet::new();
+        let mut content = HashSet::new();
+        for item in items {
+            validate_frozen_profile(item)?;
+            if !seen.insert(item.id.as_str())
+                || item.question.id != item.id
+                || expected.get(item.id.as_str()).copied() != Some(item.hash().as_str())
+            {
+                return Err(FirewallError::ContentIndex(format!(
+                    "unknown, duplicate or corrupt item {}",
+                    item.id
+                )));
+            }
+            let fingerprint = item
+                .content_fingerprint()
+                .map_err(|e| FirewallError::ContentIndex(e.to_string()))?;
+            content.insert(fingerprint);
+        }
+        self.content_hashes = Some(content);
+        Ok(self)
+    }
+
+    /// Decode caller-supplied content; all trust still comes from exact
+    /// frozen artifact verification in with_attested_items.
+    pub fn with_content_index_json(self, text: &str) -> Result<Self, FirewallError> {
+        let items = crate::content_index::decode(text).map_err(FirewallError::ContentIndex)?;
+        self.with_attested_items(&items)
+    }
+
+    /// Pipeline preflight: even an empty manifest requires an explicitly
+    /// attested empty index; absence is never an allow state.
+    pub fn ensure_content_index(&self) -> Result<(), FirewallViolation> {
+        self.content_hashes
+            .as_ref()
+            .map(|_| ())
+            .ok_or(FirewallViolation::MissingContentIndex)
     }
 
     /// The consumed release id.
@@ -234,13 +338,20 @@ impl Firewall {
 
     /// Check a synthesized item against both firewalls.
     pub fn check_item(&self, item: &SynthItem) -> Result<(), FirewallViolation> {
+        self.ensure_content_index()?;
         if self.gate_families.contains(item.family.as_str()) {
             return Err(FirewallViolation::GateFamily(
                 item.family.as_str().to_owned(),
             ));
         }
-        let hash = item.hash();
-        if self.item_hashes.contains(&hash) {
+        let hash = item
+            .content_fingerprint()
+            .map_err(|e| FirewallViolation::InvalidContent(e.to_string()))?;
+        if self
+            .content_hashes
+            .as_ref()
+            .is_some_and(|hashes| hashes.contains(&hash))
+        {
             return Err(FirewallViolation::ContaminatedItem {
                 id: item.id.clone(),
                 hash,
@@ -252,6 +363,36 @@ impl Firewall {
     /// Whether a raw canonical hash collides with a frozen item.
     pub fn is_contaminated_hash(&self, hash: &str) -> bool {
         self.item_hashes.contains(hash)
+    }
+    #[cfg(test)]
+    pub(crate) fn tiny_unattested(items: &[hyprstream_bench::Item]) -> Self {
+        Self {
+            release: "test-only".into(),
+            manifest_blake3: "private-tiny-fixture".into(),
+            item_hashes: items.iter().map(hyprstream_bench::Item::hash).collect(),
+            expected_items: items.iter().map(|i| (i.id.clone(), i.hash())).collect(),
+            content_hashes: None,
+            gate_families: HashSet::from(["temporal".into(), "syllogism".into()]),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn tiny_item() -> hyprstream_bench::Item {
+        hyprstream_bench::Item::noul(
+            hyprstream_bench::Family::Arith,
+            hyprstream_bench::Stratum::Clean,
+            7,
+            hyprstream_decision::Entry::Str("private tiny benchmark".into()),
+            "fixture predicate",
+            true,
+        )
+    }
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn tiny_fixture() -> Self {
+        let item = Self::tiny_item();
+        Self::tiny_unattested(std::slice::from_ref(&item))
+            .with_attested_items(&[item])
+            .expect("private tiny attestation")
     }
 }
 
@@ -380,5 +521,162 @@ mod tests {
             Firewall::load(&missing.join("crates/hyprstream-bench/manifest/vob-1.1.manifest.json")),
             Err(FirewallError::DisclosureIo(_))
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod content_admission_tests {
+    use super::*;
+    #[test]
+    fn only_complete_verified_content_can_enable_checking() {
+        let item = Firewall::tiny_item();
+        let missing = Firewall::tiny_unattested(std::slice::from_ref(&item));
+        assert_eq!(
+            missing.ensure_content_index(),
+            Err(FirewallViolation::MissingContentIndex)
+        );
+        assert!(missing.clone().with_attested_items(&[]).is_err());
+        let mut corrupt = item.clone();
+        corrupt.state = hyprstream_decision::Entry::Str("changed".into());
+        assert!(missing.clone().with_attested_items(&[corrupt]).is_err());
+        let mut corrupt = item.clone();
+        corrupt.id = "other".into();
+        assert!(missing.clone().with_attested_items(&[corrupt]).is_err());
+        let mut unbound = item.clone();
+        unbound.question.id = "unbound".into();
+        assert!(missing.clone().with_attested_items(&[unbound]).is_err());
+        assert!(missing
+            .with_attested_items(std::slice::from_ref(&item))
+            .unwrap()
+            .ensure_content_index()
+            .is_ok());
+        let empty = Firewall::tiny_unattested(&[]);
+        assert!(empty.ensure_content_index().is_err());
+        assert!(empty
+            .with_attested_items(&[])
+            .unwrap()
+            .ensure_content_index()
+            .is_ok());
+        let mut second = item.clone();
+        second.id = "second".into();
+        second.question.id = "second".into();
+        let expected = Firewall::tiny_unattested(&[item.clone(), second]);
+        assert!(expected.with_attested_items(&[item.clone(), item]).is_err());
+    }
+    #[test]
+    fn copied_content_is_blocked_even_when_every_source_identity_differs() {
+        let benchmark = Firewall::tiny_item();
+        let firewall = Firewall::tiny_unattested(std::slice::from_ref(&benchmark))
+            .with_attested_items(std::slice::from_ref(&benchmark))
+            .unwrap();
+        let copied = crate::item::SynthItem::new(
+            crate::family::SynthFamily::Triage,
+            999,
+            0,
+            1,
+            benchmark.state.clone(),
+            benchmark
+                .question
+                .instructions
+                .as_ref()
+                .map(hyprstream_decision::Entry::canonical_text),
+            benchmark.question.body.clone(),
+        );
+        assert_ne!(copied.hash(), benchmark.hash());
+        assert_eq!(
+            copied.content_fingerprint().unwrap(),
+            benchmark.content_fingerprint().unwrap()
+        );
+        assert!(matches!(
+            firewall.check_item(&copied),
+            Err(FirewallViolation::ContaminatedItem { .. })
+        ));
+        let mut safe = copied.clone();
+        safe.state = hyprstream_decision::Entry::Str("different meaningful content".into());
+        assert!(firewall.check_item(&safe).is_ok());
+    }
+    #[test]
+    fn actual_json_index_is_attested_not_trusted() {
+        let item = Firewall::tiny_item();
+        let json=serde_json::json!({"version":hyprstream_bench::content::CONTENT_FINGERPRINT_VERSION,"items":[{"id":item.id,"family":"arith","stratum":"clean","group":item.group,"seed":7,"truth":1,"state":"private tiny benchmark","question":{"instructions":"fixture predicate","body":{"type":"noul","criteria":null}}}]}).to_string();
+        assert!(Firewall::tiny_unattested(std::slice::from_ref(&item))
+            .with_content_index_json(&json)
+            .unwrap()
+            .ensure_content_index()
+            .is_ok());
+        for bad in [
+            json.replace("private tiny benchmark", "corrupt content"),
+            json.replace("decision-content/1", "unknown"),
+        ] {
+            assert!(Firewall::tiny_unattested(std::slice::from_ref(&item))
+                .with_content_index_json(&bad)
+                .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod frozen_profile_tests {
+    use super::*;
+    use hyprstream_decision::{Entry, NoulCriteria, QuestionBody, QuestionKind};
+    fn rejects_against(original: &hyprstream_bench::Item, substitution: hyprstream_bench::Item) {
+        // Causal witness: the old artifact hash alone admits this substitution.
+        assert_eq!(original.hash(), substitution.hash());
+        assert!(Firewall::tiny_unattested(std::slice::from_ref(original))
+            .with_attested_items(&[substitution])
+            .is_err());
+    }
+    #[test]
+    fn old_artifact_hash_aliases_cannot_change_typed_index_content() {
+        let mut original = Firewall::tiny_item();
+        original.state = Entry::Str("true".into());
+        let mut alternative = original.clone();
+        alternative.state = Entry::Bool(true);
+        rejects_against(&original, alternative);
+        let mut original = Firewall::tiny_item();
+        original.question.instructions = Some(Entry::Str(String::new()));
+        let mut alternative = original.clone();
+        alternative.question.instructions = None;
+        rejects_against(&original, alternative);
+        let original = Firewall::tiny_item();
+        let mut alternative = original.clone();
+        alternative.question.body = QuestionBody::Noul {
+            criteria: Some(NoulCriteria {
+                on_true: None,
+                on_false: None,
+            }),
+        };
+        rejects_against(&original, alternative);
+        let mut original = Firewall::tiny_item();
+        original.question.kind = QuestionKind::Score;
+        original.question.body = QuestionBody::Score {
+            levels: vec![None, None],
+        };
+        let mut alternative = original.clone();
+        if let QuestionBody::Score { levels } = &mut alternative.question.body {
+            levels[0] = Some(Entry::Str("unhashed rubric".into()));
+        }
+        rejects_against(&original, alternative);
+        let original = hyprstream_bench::Item::choice(
+            hyprstream_bench::Family::Arith,
+            hyprstream_bench::Stratum::Clean,
+            9,
+            Entry::Str("s".into()),
+            "q",
+            vec!["a".into(), "b".into()],
+            0,
+        );
+        let mut alternative = original.clone();
+        if let QuestionBody::Choice { options } = &mut alternative.question.body {
+            options[0].rubric = Some(Entry::Str(String::new()));
+        }
+        rejects_against(&original, alternative);
+        let mut alternative = original.clone();
+        alternative.question.kind = QuestionKind::Noul;
+        assert!(Firewall::tiny_unattested(std::slice::from_ref(&original))
+            .with_attested_items(&[alternative])
+            .is_err());
     }
 }
