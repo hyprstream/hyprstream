@@ -38,16 +38,40 @@ def admit_original_f32_cpu_profile(provenance, *, backbone_only, tolerance_profi
                 or provenance.get("device") != "cpu"):
             raise ValueError("original-Float32 CPU gate requires a full Float32 CPU official oracle")
 
-def admit_tolerance_corpus(provenance, tolerance_profile):
-    """Bind a declared comparison profile to its exact source corpus."""
+def ordered_json(value):
+    """Serialize JSON while retaining object order for source-order checks."""
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+def admit_tolerance_corpus(reference, provenance, tolerance_profile, *, corpus_path=None):
+    """Bind provenance and generated record sources to the pinned corpus."""
     if tolerance_profile is None:
-        return
+        return None
     expected = tolerance_profile.get("corpus_sha256")
     actual = provenance.get("corpus_sha256")
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise ValueError("tolerance profile must declare a lowercase SHA-256 corpus_sha256")
     if actual != expected:
         raise ValueError("reference corpus_sha256 does not match tolerance profile")
+    if corpus_path is None:
+        corpus_path = Path(__file__).with_name("corpus.json")
+    if digest(corpus_path) != expected:
+        raise ValueError("pinned corpus.json does not match tolerance profile")
+    corpus = json.loads(corpus_path.read_text())
+    records = json.loads((reference / "records.json").read_text())
+    source_records = corpus.get("records")
+    generated_records = records.get("records")
+    if records.get("corpus_version") != corpus.get("corpus_version"):
+        raise ValueError("reference records corpus_version does not match pinned corpus")
+    if not isinstance(source_records, list) or not isinstance(generated_records, list) or len(generated_records) != len(source_records):
+        raise ValueError("reference records count does not match pinned corpus")
+    for index, (source, generated) in enumerate(zip(source_records, generated_records)):
+        expected_request = dict(source["request"], id=source["id"])
+        if (generated.get("id") != source["id"]
+                or ordered_json(generated.get("request")) != ordered_json(expected_request)
+                or generated.get("max_length") != source["max_length"]
+                or generated.get("max_state_tokens") != source.get("max_state_tokens")):
+            raise ValueError(f"reference record source fields/order do not match pinned corpus at index {index}")
+    return records
 
 
 def floating_comparison_entry(key, x, y, used_atol, used_rtol, torch):
@@ -191,10 +215,11 @@ def main():
     except ValueError as error:
         raise SystemExit(str(error)) from error
     try:
-        admit_tolerance_corpus(provenance, tolerance_profile)
+        records = admit_tolerance_corpus(a.reference, provenance, tolerance_profile)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    records = json.loads((a.reference / "records.json").read_text())
+    if records is None:
+        records = json.loads((a.reference / "records.json").read_text())
     record_match = None
     if a.native_records:
         native_records = json.loads(a.native_records.read_text())

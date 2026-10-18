@@ -35,12 +35,19 @@ class ComparatorAdmissionTests(unittest.TestCase):
         profile = json.loads((HERE / "full-port-tolerances-v1.json").read_text())
         corpus_digest = hashlib.sha256((HERE / "corpus.json").read_bytes()).hexdigest()
         self.assertEqual(profile["corpus_sha256"], corpus_digest)
-        compare.admit_tolerance_corpus({"corpus_sha256": corpus_digest}, profile)
+        compare.admit_tolerance_corpus(HERE, {"corpus_sha256": corpus_digest}, profile)
+        with tempfile.TemporaryDirectory() as directory:
+            altered = Path(directory)
+            altered_corpus = altered / "corpus.json"
+            altered_corpus.write_bytes((HERE / "corpus.json").read_bytes() + b" ")
+            with self.assertRaisesRegex(ValueError, "pinned corpus.json does not match"):
+                compare.admit_tolerance_corpus(altered, {"corpus_sha256": corpus_digest}, profile,
+                                               corpus_path=altered_corpus)
         with self.assertRaisesRegex(ValueError, "does not match tolerance profile"):
-            compare.admit_tolerance_corpus({"corpus_sha256": "0" * 64}, profile)
+            compare.admit_tolerance_corpus(HERE, {"corpus_sha256": "0" * 64}, profile)
         for invalid in (None, "", "A" * 64, "0" * 63):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "must declare"):
-                compare.admit_tolerance_corpus({"corpus_sha256": corpus_digest}, {"corpus_sha256": invalid})
+                compare.admit_tolerance_corpus(HERE, {"corpus_sha256": corpus_digest}, {"corpus_sha256": invalid})
 
     def test_cli_rejects_mismatched_corpus_before_tensor_import(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -59,6 +66,40 @@ class ComparatorAdmissionTests(unittest.TestCase):
             self.assertIn("reference corpus_sha256 does not match tolerance profile", result.stderr)
             self.assertNotIn("ModuleNotFoundError", result.stderr)
             self.assertFalse((root / "report").exists())
+
+    def test_cli_rejects_truncated_or_reordered_records_with_self_claimed_hashes(self):
+        committed = json.loads((HERE / "records.json").read_text())
+        for mutation in ("truncated", "reordered"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                records = copy.deepcopy(committed)
+                if mutation == "truncated":
+                    records["records"].pop()
+                else:
+                    records["records"].reverse()
+                records_path = root / "records.json"
+                records_path.write_text(json.dumps(records))
+                tensors_path = root / "tensors.safetensors"
+                tensors_path.write_bytes(b"not imported before admission")
+                provenance = {
+                    "mode": "full", "compute_dtype": "float32", "device": "cpu",
+                    "corpus_sha256": hashlib.sha256((HERE / "corpus.json").read_bytes()).hexdigest(),
+                    "files": {
+                        "records.json": hashlib.sha256(records_path.read_bytes()).hexdigest(),
+                        "tensors.safetensors": hashlib.sha256(tensors_path.read_bytes()).hexdigest(),
+                    },
+                }
+                (root / "provenance.json").write_text(json.dumps(provenance))
+                result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                    "--reference", str(root), "--native-tensors", str(root / "native.safetensors"),
+                    "--native-records", str(root / "native-records.json"), "--include-hidden",
+                    "--tolerance-file", str(HERE / "full-port-tolerances-v1.json"),
+                    "--report", str(root / "report")], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                expected_error = "reference records count" if mutation == "truncated" else "source fields/order"
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotIn("ModuleNotFoundError", result.stderr)
+                self.assertFalse((root / "report").exists())
 
     def test_full_port_requires_native_records_with_any_tolerance_source(self):
         for include_hidden in (False, True):
