@@ -94,7 +94,9 @@ async fn http_subject_surfaces_http_errors() {
     let subject = HttpSubject::new(format!("http://{address}"), "jev-stub-latest", "");
     let set = fixture();
     // Empty bearer token → the facade 401s; the subject must surface it.
-    let result = subject.decide(&set, &Entry::Null, 0).await;
+    let result = subject
+        .decide(&set, &Entry::Str("valid state".into()), 0)
+        .await;
     let error = result.err().unwrap();
     assert!(
         matches!(error, hyprstream_eval::EvalError::Http(_)),
@@ -369,12 +371,12 @@ async fn rejected_http_answers_never_change_the_resolved_model_cache() {
     let set =
         hyprstream_decision::author::parse_yaml("questions:\n  q:\n    type: noul\n").unwrap();
     subject
-        .decide_with_version(&set, &Entry::Null, 0)
+        .decide_with_version(&set, &Entry::Str("valid state".into()), 0)
         .await
         .unwrap();
     assert_eq!(subject.resolved_model_id(), "accepted-1");
     assert!(subject
-        .decide_with_version(&set, &Entry::Null, 1)
+        .decide_with_version(&set, &Entry::Str("valid state".into()), 1)
         .await
         .is_err());
     assert_eq!(
@@ -383,9 +385,157 @@ async fn rejected_http_answers_never_change_the_resolved_model_cache() {
         "rejected exchange cannot poison provenance"
     );
     subject
-        .decide_with_version(&set, &Entry::Null, 2)
+        .decide_with_version(&set, &Entry::Str("valid state".into()), 2)
         .await
         .unwrap();
     assert_eq!(subject.resolved_model_id(), "accepted-2");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_http_null_states_fail_before_any_request_or_teacher_query() {
+    use hyprstream_eval::{
+        EvalError, EvalRow, EvalSet, Teacher, TeacherEnsemble, TosClass, TruthSubject,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    struct CountNative(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Subject for CountNative {
+        fn model_id(&self) -> &str {
+            "native-null-control"
+        }
+        async fn decide(
+            &self,
+            set: &hyprstream_decision::QuestionSet,
+            state: &Entry,
+            row: usize,
+        ) -> Result<hyprstream_decision::arrow::AnswerRow, EvalError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            TruthSubject::new(self.model_id())
+                .decide(set, state, row)
+                .await
+        }
+    }
+    // A real listening socket records any attempted connection. A regression
+    // cannot hang waiting for a response: each run has a bounded timeout.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let http = HttpSubject::new(&endpoint, "alias", "token");
+    let question = fixture().questions.remove(0);
+    let item = EvalItem {
+        id: "first".into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: Entry::Str("valid state".into()),
+        question,
+        truth: None,
+    };
+    let null_item = EvalItem {
+        id: "second".into(),
+        state: Entry::Null,
+        ..item.clone()
+    };
+    let items = vec![item.clone(), null_item.clone()];
+    let result = tokio::time::timeout(Duration::from_secs(1), Harness.run_items(&items, &http))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+    let row = EvalRow {
+        id: "first".into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: item.state.clone(),
+        truth: std::collections::BTreeMap::new(),
+    };
+    let set = EvalSet {
+        name: "null-transport".into(),
+        schema_version: "v1".into(),
+        questions: vec![item.question.clone()],
+        rows: vec![
+            row.clone(),
+            EvalRow {
+                id: "second".into(),
+                state: Entry::Null,
+                ..row
+            },
+        ],
+    };
+    let result = tokio::time::timeout(Duration::from_secs(1), Harness.run_set(&set, &http))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+    let question_set = set.question_set();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        http.decide(&question_set, &Entry::Null, 0),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ensemble = TeacherEnsemble::new(vec![
+        Teacher {
+            id: "native-first".into(),
+            tos_class: TosClass::Unknown,
+            subject: Box::new(CountNative(calls.clone())),
+        },
+        Teacher {
+            id: "http-second".into(),
+            tos_class: TosClass::Unknown,
+            subject: Box::new(HttpSubject::new(&endpoint, "alias", "token")),
+        },
+    ])
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        ensemble.decide(&question_set, &Entry::Null, 0, "null"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "preflight all teachers before querying any"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no rejected run may open even one HTTP connection"
+    );
+
+    // The default hook preserves explicit null for native/in-process subjects.
+    let native = CountNative(calls.clone());
+    let output = Harness.run_items(&[null_item], &native).await.unwrap();
+    assert_eq!(output.observations.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let local_set = EvalSet {
+        rows: vec![EvalRow {
+            id: "null".into(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::new(),
+        }],
+        ..set
+    };
+    assert_eq!(
+        Harness
+            .run_set(&local_set, &native)
+            .await
+            .unwrap()
+            .observations
+            .len(),
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
