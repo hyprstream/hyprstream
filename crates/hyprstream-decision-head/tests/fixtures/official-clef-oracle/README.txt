@@ -58,3 +58,20 @@ This proves encoder/head port parity on these saved synthetic hidden inputs.
 It does NOT prove the backbone, FP8 quantization profile, calibration, performance,
 full CPU serving, GPU qualification, or R5 acceptance. Full original-Float32
 backbone and candidate-FP8 comparisons remain separate gates.
+
+Saved native backbone export (no full model load)
+------------------------------------------------
+The separate ignored clef_export_native_head test accepts:
+  CLEF_OFFICIAL_ORACLE_DIR: original full Float32 CPU oracle records/provenance
+  CLEF_HEAD_DIRECTORY: pinned original tokenizer and original joint head
+  CLEF_NATIVE_INPUT_TENSORS: saved native hidden and actual LM row safetensors
+  CLEF_NATIVE_INPUT_PROFILE: original-f32 or fp8-w8a8
+  CLEF_NATIVE_ORACLE_OUTPUT_DIR: distinct task-owned output directory
+Run via the canonical CPU build helper:
+  cargo test -p hyprstream-decision-head clef_export_native_head --lib -- --ignored
+It checks exact official encoding and exports the actual native hidden/rows,
+head-normalized hidden, logits, probabilities and labels. Export success is
+not a numerical parity assertion. Apply the predeclared original full-port
+comparison separately; native-to-native FP8 development drift is a distinct
+gate. A head-only second export tests head repeatability only, not backbone
+process restart or RPC determinism.
