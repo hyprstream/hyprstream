@@ -675,13 +675,13 @@ fn decode_rejects_invalid_wire_specs() {
     );
 }
 
-/// The calib version survives a round-trip with the uncalibrated state
-/// distinct from any string value (explicit OptionText wrapper — a null Text
-/// pointer would collapse to "" in consumers without pointer-presence
-/// tracking).
+/// Valid calibration versions round-trip exactly; absence is uncalibrated.
+/// A present empty ID is rejected by the separate direct-wire negative below,
+/// since it cannot reference calibration parameters and persistence treats the
+/// empty string as the uncalibrated sentinel.
 #[test]
-fn calib_none_is_distinct_from_empty_string() {
-    for calib in [None, Some(String::new()), Some("calib-1".to_owned())] {
+fn calib_none_and_nonempty_versions_roundtrip_exactly() {
+    for calib in [None, Some("calib-1".to_owned())] {
         let version = VersionTriple {
             schema: "s".into(),
             model: "m".into(),
@@ -1712,6 +1712,46 @@ fn wire_rejects_empty_schema_versions() {
             let (decoded, rows) = decoded.unwrap();
             assert_eq!(decoded, version);
             assert!(rows.is_empty());
+        }
+    }
+}
+
+#[test]
+fn wire_rejects_present_empty_calibration_version_ids() {
+    use hyprstream_rpc_std::decision_capnp;
+
+    let version = VersionTriple {
+        schema: "schema".into(),
+        model: "resolved-model@revision".into(),
+        calib: Some(String::new()),
+    };
+    assert!(matches!(
+        decision::batch_to_message(&version, &[]),
+        Err(decision::EncodeError::EmptyCalibrationVersion)
+    ));
+    // Direct wire construction bypasses the encoder to prove independent decode admission.
+    for calib in [None, Some(""), Some("calib-1")] {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut triple = message
+                .init_root::<decision_capnp::decision_batch::Builder<'_>>()
+                .init_version();
+            triple.set_schema("schema");
+            triple.set_model("resolved-model@revision");
+            match calib {
+                None => triple.init_calib().set_none(()),
+                Some(id) => triple.init_calib().set_some(id),
+            }
+        }
+        let bytes = wire_roundtrip(&message);
+        let wire =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .unwrap();
+        let decoded = decision::batch_from_reader(wire.get_root().unwrap());
+        if calib == Some("") {
+            assert_eq!(decoded, Err(decision::DecodeError::EmptyCalibrationVersion));
+        } else {
+            assert_eq!(decoded.unwrap().0.calib.as_deref(), calib);
         }
     }
 }

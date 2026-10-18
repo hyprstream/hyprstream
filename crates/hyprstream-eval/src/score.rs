@@ -248,6 +248,7 @@ fn field_metrics(
 
 /// Score a run's observations under the pinned protocol.
 pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport, EvalError> {
+    output.validate_model_provenance()?;
     let by_question = output.batch.is_some();
     let multi_family = family_count(&output.observations) > 1;
     // Group labeled, answered observations into fields.
@@ -432,15 +433,16 @@ pub fn flip_rate_with_labels(
     observations: &[crate::run::Observation],
     labels_of: impl Fn(&str) -> Option<Vec<String>>,
 ) -> FlipRate {
-    flip_rate_with_observation_labels(observations, |obs| labels_of(&obs.question_id))
+    flip_rate_with_observation_labels(observations, false, |obs| labels_of(&obs.question_id))
 }
 
 fn flip_rate_with_observation_labels(
     observations: &[crate::run::Observation],
+    known_bench: bool,
     labels_of: impl Fn(&crate::run::Observation) -> Option<Vec<String>>,
 ) -> FlipRate {
     let mut groups: BTreeMap<&str, Vec<&crate::run::Observation>> = BTreeMap::new();
-    // Run shape per group, over ALL observations (abstained included):
+    // Legacy observation-only shape inference uses ALL observations (abstained included):
     // bench-shaped groups (cyclic rotations of one choice item) give every
     // rotation its own question id, so observation count == distinct
     // question count. Set-shaped groups repeat question ids across rows —
@@ -484,9 +486,12 @@ fn flip_rate_with_observation_labels(
         // single base is the only possible comparison. Set-shaped groups
         // repeat question ids across rows — there, only a same-question
         // base is a valid comparison.
-        let bench_shaped = shapes
-            .get(base_id)
-            .is_some_and(|(observations, questions)| *observations == questions.len());
+        // score_bench_run knows the shape even when some rotations reuse IDs.
+        // Retain inference only for the legacy observation-only public helper.
+        let bench_shaped = known_bench
+            || shapes
+                .get(base_id)
+                .is_some_and(|(observations, questions)| *observations == questions.len());
         let mut counted = false;
         for member in members.iter().filter(|member| member.id != base_id) {
             // The base for THIS member: match the member's own question —
@@ -540,7 +545,8 @@ fn flip_rate_with_observation_labels(
 /// None`, "not computed".) The flip rate stays `None` when no permutation
 /// group contributed a base/member pair (no groups, all-abstained bases, …)
 /// — an unmeasured robustness result must never look like a computed
-/// zero-flip result.
+/// zero-flip result. Requires exactly one observation for every supplied
+/// (item id, question id), with no extra or duplicate identities.
 pub fn score_bench_run(
     output: &RunOutput,
     items: &[crate::run::EvalItem],
@@ -555,16 +561,31 @@ pub fn score_bench_run(
             )));
         }
     }
+    let mut observed = std::collections::BTreeSet::new();
     for obs in &output.observations {
-        if !by_identity.contains_key(&(obs.id.as_str(), obs.question_id.as_str())) {
+        let identity = (obs.id.as_str(), obs.question_id.as_str());
+        if !observed.insert(identity) {
+            return Err(EvalError::InvalidInput(format!(
+                "duplicate observation identity {identity:?}"
+            )));
+        }
+        if !by_identity.contains_key(&identity) {
             return Err(EvalError::InvalidInput(format!(
                 "observation identity ({:?}, {:?}) has no matching eval item",
                 obs.id, obs.question_id
             )));
         }
     }
+    if let Some(identity) = by_identity
+        .keys()
+        .find(|identity| !observed.contains(*identity))
+    {
+        return Err(EvalError::InvalidInput(format!(
+            "eval item identity {identity:?} has no matching observation"
+        )));
+    }
     let mut report = score_run(output, config)?;
-    let flip = flip_rate_with_observation_labels(&output.observations, |obs| {
+    let flip = flip_rate_with_observation_labels(&output.observations, true, |obs| {
         by_identity
             .get(&(obs.id.as_str(), obs.question_id.as_str()))
             .map(|item| item.question.labels())

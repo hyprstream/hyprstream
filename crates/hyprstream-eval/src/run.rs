@@ -151,6 +151,20 @@ pub struct RunOutput {
     pub schema_fingerprint: Option<String>,
 }
 
+impl RunOutput {
+    /// Both public model coordinates name the same resolved producer. Check
+    /// them again at consuming boundaries because callers may mutate a run.
+    pub(crate) fn validate_model_provenance(&self) -> Result<(), EvalError> {
+        if self.model_id.is_empty() || self.model_id != self.version.model {
+            return Err(EvalError::InvalidInput(
+                "run requires one nonempty resolved model id matching its version triple"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The harness. Stateless; every method is a pure function of its inputs plus
 /// the subject's behavior.
 #[derive(Debug, Clone, Copy, Default)]
@@ -553,6 +567,9 @@ pub(crate) fn validate_answer_row(
 /// Index declared IDs once without changing their original order. Direct
 /// programmatic inputs must not collapse duplicate declarations into one map key.
 pub(crate) fn question_ids(set: &QuestionSet) -> Result<std::collections::HashSet<&str>, String> {
+    if set.questions.is_empty() {
+        return Err("a question set requires at least one question".to_owned());
+    }
     let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
     for question in &set.questions {
         if !ids.insert(question.id.as_str()) {

@@ -37,6 +37,9 @@ pub enum DecodeError {
     /// Every batch must identify its question-set schema version.
     #[error("empty question-set schema version on the wire")]
     EmptySchemaVersion,
+    /// A present calibration identifier must reference a nonempty version.
+    #[error("empty calibration version id")]
+    EmptyCalibrationVersion,
     /// capnp-level structural failure (truncated message, bad pointer).
     #[error("capnp decode failed: {0}")]
     Capnp(String),
@@ -144,6 +147,9 @@ pub enum EncodeError {
     /// Empty schema provenance cannot be encoded as a decision batch.
     #[error("empty question-set schema version cannot be encoded")]
     EmptySchemaVersion,
+    /// A present calibration identifier must reference a nonempty version.
+    #[error("empty calibration version id")]
+    EmptyCalibrationVersion,
     /// An abstained answer carried a conformal set — the wire contract forbids
     /// it (abstention already says "no commitment") and this module's own
     /// decoder rejects such messages.
@@ -707,6 +713,9 @@ pub fn batch_to_message(
     if version.schema.is_empty() {
         return Err(EncodeError::EmptySchemaVersion);
     }
+    if version.calib.as_ref().is_some_and(String::is_empty) {
+        return Err(EncodeError::EmptyCalibrationVersion);
+    }
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
     {
@@ -818,7 +827,13 @@ pub fn batch_from_reader(
         model: model.to_owned(),
         calib: match triple.get_calib()?.which()? {
             crate::optional_capnp::option_text::None(()) => None,
-            crate::optional_capnp::option_text::Some(calib) => Some(calib?.to_str()?.to_owned()),
+            crate::optional_capnp::option_text::Some(calib) => {
+                let calib = calib?.to_str()?;
+                if calib.is_empty() {
+                    return Err(DecodeError::EmptyCalibrationVersion);
+                }
+                Some(calib.to_owned())
+            }
         },
     };
     let rows_reader = reader.get_rows()?;
