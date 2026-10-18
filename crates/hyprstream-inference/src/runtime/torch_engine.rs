@@ -1053,7 +1053,17 @@ impl TorchEngine {
         let model = ModelFactory::create(
             model_path,
             &self.device,
-            tch::Kind::BFloat16,
+            match self.config.precision_mode.as_deref().unwrap_or("auto") {
+                "fp32" | "float32" if self.device == tch::Device::Cpu => tch::Kind::Float,
+                "auto"
+                    if self.device == tch::Device::Cpu
+                        && super::channel_fp8::ChannelFp8Profile::read(model_path)?.is_some() =>
+                {
+                    tch::Kind::Float
+                }
+                "auto" | "bf16" | "bfloat16" => tch::Kind::BFloat16,
+                mode => anyhow::bail!("unsupported inference precision mode: {mode}"),
+            },
             self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
             self.device_pool.as_deref(),
@@ -2323,6 +2333,59 @@ impl TorchEngine {
         let logits = model_guard.lm_head(&hidden_states)?;
 
         Ok(logits)
+    }
+
+    /// Execute a decision head against fresh full-sequence hidden states while
+    /// holding the backbone lock. The supplied gather reads original LM-head
+    /// rows without allocating token-by-vocabulary logits. No cache is reused.
+    pub fn with_decision_backbone<T>(
+        &self,
+        token_ids: &[i64],
+        head: impl FnOnce(&Tensor, &dyn Fn(&[i64]) -> Result<Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_decision_backbone_checked(token_ids, &|| Ok(()), head)
+    }
+
+    /// Cooperative cancellation/deadline variant. The checker runs before
+    /// admission, between decoder layers, and around head evaluation. An active
+    /// libtorch kernel completes before the next check; dropping a future alone
+    /// is not a compute-cancellation mechanism.
+    pub fn with_decision_backbone_checked<T>(
+        &self,
+        token_ids: &[i64],
+        check: &dyn Fn() -> Result<()>,
+        head: impl FnOnce(&Tensor, &dyn Fn(&[i64]) -> Result<Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        check()?;
+        anyhow::ensure!(!token_ids.is_empty(), "decision token sequence is empty");
+        let limit = self
+            .config
+            .max_context
+            .map(|v| v as usize)
+            .unwrap_or(self.config.context_length);
+        anyhow::ensure!(
+            token_ids.len() <= limit,
+            "decision input exceeds context limit"
+        );
+        anyhow::ensure!(
+            self.device == tch::Device::Cpu,
+            "decision backbone is CPU-only pending CPU acceptance"
+        );
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        let model = model.lock();
+        let _guard = tch::no_grad_guard();
+        let input = Tensor::from_slice(token_ids)
+            .reshape([1, token_ids.len() as i64])
+            .to_device(self.device);
+        let hidden = model.decision_hidden_states_checked(&input, check)?;
+        check()?;
+        let gather = |ids: &[i64]| model.decision_output_embedding_rows(ids);
+        let output = head(&hidden, &gather)?;
+        check()?;
+        Ok(output)
     }
 
     /// Get the number of layers in the loaded model.
