@@ -251,6 +251,11 @@ fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
     use hyprstream_metrics_api::arrow::array::{Array, FixedSizeListArray, Float32Array};
     let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
+    if output.batch.is_some() != output.schema_fingerprint.is_some() {
+        return Err(invalid(
+            "run batch and schema fingerprint must either both be present or both be absent",
+        ));
+    }
     for obs in &output.observations {
         crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
         if obs.truth.is_some_and(|truth| truth >= obs.labels.len()) {

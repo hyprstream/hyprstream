@@ -1801,3 +1801,52 @@ async fn wide_set_truth_index_preserves_all_input_preflight() {
         .items
         .is_empty());
 }
+
+#[tokio::test]
+async fn scoring_rejects_inconsistent_batch_and_schema_fingerprint_presence() {
+    let config = ScoreConfig::default();
+    let mut item = Harness
+        .run_items(&[noul_item()], &UniformSubject)
+        .await
+        .unwrap();
+    assert!(item.batch.is_none());
+    assert!(item.schema_fingerprint.is_none());
+    score_run(&item, &config).unwrap();
+    item.schema_fingerprint = Some("detached-set-fingerprint".into());
+    assert!(matches!(
+        score_run(&item, &config),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
+            if message.contains("must either both be present or both be absent")
+    ));
+
+    let set = hyprstream_eval::EvalSet {
+        name: "run-shape-presence".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: "row".into(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::new(),
+        }],
+    };
+    let mut output = Harness.run_set(&set, &UniformSubject).await.unwrap();
+    assert!(output.batch.is_some());
+    assert!(output.schema_fingerprint.is_some());
+    score_run(&output, &config).unwrap();
+    let batch = output.batch.take();
+    assert!(matches!(
+        score_run(&output, &config),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
+            if message.contains("must either both be present or both be absent")
+    ));
+    output.batch = batch;
+    output.schema_fingerprint = None;
+    assert!(matches!(
+        score_run(&output, &config),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
+            if message.contains("must either both be present or both be absent")
+    ));
+}
