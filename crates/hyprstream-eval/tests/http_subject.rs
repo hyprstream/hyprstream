@@ -90,19 +90,51 @@ async fn http_subject_drives_a_full_bench_slice() {
 
 #[tokio::test]
 async fn http_subject_surfaces_http_errors() {
-    let (address, server) = serve_stub().await;
-    let subject = HttpSubject::new(format!("http://{address}"), "jev-stub-latest", "");
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    // Valid local configuration can still receive a provider auth rejection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 8192];
+        let mut filled = 0;
+        while !request[..filled]
+            .windows(4)
+            .any(|bytes| bytes == b"\r\n\r\n")
+        {
+            assert!(
+                filled < request.len(),
+                "provider fixture request header too large"
+            );
+            let count = socket.read(&mut request[filled..]).await.unwrap();
+            assert!(count > 0, "provider fixture request ended before headers");
+            filled += count;
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let subject = HttpSubject::new(
+        format!("http://{address}"),
+        "jev-stub-latest",
+        "provider-rejected-token",
+    );
     let set = fixture();
-    // Empty bearer token → the facade 401s; the subject must surface it.
-    let result = subject
-        .decide(&set, &Entry::Str("valid state".into()), 0)
-        .await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        subject.decide(&set, &Entry::Str("valid state".into()), 0),
+    )
+    .await
+    .unwrap();
     let error = result.err().unwrap();
     assert!(
-        matches!(error, hyprstream_eval::EvalError::Http(_)),
-        "expected Http error, got {error:?}"
+        matches!(error, hyprstream_eval::EvalError::Http(ref message) if message.contains("status 401")),
+        "expected provider401 Http error, got {error:?}"
     );
-    server.abort();
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -538,4 +570,87 @@ async fn legacy_http_null_states_fail_before_any_request_or_teacher_query() {
         1
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
+    use hyprstream_eval::{EvalError, Teacher, TeacherEnsemble, TosClass, TruthSubject};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    struct CountNative(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Subject for CountNative {
+        fn model_id(&self) -> &str {
+            "native-configuration-control"
+        }
+        async fn decide(
+            &self,
+            set: &hyprstream_decision::QuestionSet,
+            state: &Entry,
+            row: usize,
+        ) -> Result<hyprstream_decision::arrow::AnswerRow, EvalError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            TruthSubject::new(self.model_id())
+                .decide(set, state, row)
+                .await
+        }
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let set = fixture();
+    let state = Entry::Str("valid non-null state".into());
+    for (model, token) in [("", "token"), ("alias", ""), ("alias", " \t ")] {
+        let http = HttpSubject::new(&endpoint, model, token);
+        let direct = tokio::time::timeout(Duration::from_secs(1), http.decide(&set, &state, 0))
+            .await
+            .unwrap();
+        assert!(matches!(direct, Err(EvalError::InvalidInput(_))));
+        let item = EvalItem {
+            id: "configuration".into(),
+            question: set.questions[0].clone(),
+            state: state.clone(),
+            family: None,
+            stratum: None,
+            group: None,
+            truth: None,
+        };
+        let items = tokio::time::timeout(Duration::from_secs(1), Harness.run_items(&[item], &http))
+            .await
+            .unwrap();
+        assert!(matches!(items, Err(EvalError::InvalidInput(_))));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let teachers = TeacherEnsemble::new(vec![
+            Teacher {
+                id: "native-first".into(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(CountNative(calls.clone())),
+            },
+            Teacher {
+                id: "http-later".into(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(HttpSubject::new(&endpoint, model, token)),
+            },
+        ])
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            teachers.decide(&set, &state, 0, "configuration"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "later deterministic error must not bill earlier teacher"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
 }
