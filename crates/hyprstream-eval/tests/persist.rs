@@ -397,3 +397,251 @@ async fn detached_or_embedded_provenance_forgery_is_rejected_before_backend_writ
     assert_eq!(meta.calib_version.as_deref(), Some("calibration-1"));
     assert_eq!(meta.model_id, "truth-1");
 }
+
+/// Changes only data arrays, preserving the already-valid schema and provenance.
+fn replace_answer_column(
+    output: &mut hyprstream_eval::RunOutput,
+    name: &str,
+    replacement: hyprstream_metrics_api::arrow::array::ArrayRef,
+) {
+    let batch = output.batch.as_ref().unwrap();
+    let index = batch.schema().index_of(name).unwrap();
+    let mut columns = batch.columns().to_vec();
+    columns[index] = replacement;
+    output.batch = Some(RecordBatch::try_new(batch.schema(), columns).unwrap());
+}
+
+fn choice_probabilities(
+    first: Option<Vec<Option<f32>>>,
+) -> hyprstream_metrics_api::arrow::array::ArrayRef {
+    use hyprstream_metrics_api::arrow::array::{FixedSizeListBuilder, Float32Builder};
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+    for row in [first, Some(vec![Some(0.4), Some(0.4), Some(0.2)]), None] {
+        match row {
+            Some(values) => {
+                for value in values {
+                    builder.values().append_option(value);
+                }
+                builder.append(true);
+            }
+            None => {
+                for _ in 0..3 {
+                    builder.values().append_value(f32::NAN);
+                }
+                builder.append(false);
+            }
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn choice_conformal(
+    first: Option<Vec<Option<&str>>>,
+    last: Option<Vec<Option<&str>>>,
+) -> hyprstream_metrics_api::arrow::array::ArrayRef {
+    use hyprstream_metrics_api::arrow::array::{ListBuilder, StringBuilder};
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for row in [first, Some(vec![]), last] {
+        match row {
+            Some(values) => {
+                for value in values {
+                    builder.values().append_option(value);
+                }
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+#[tokio::test]
+async fn mutable_batch_row_values_are_validated_before_backend_write() {
+    use hyprstream_decision::answer::{AnswerValue, QuestionAnswer};
+    use hyprstream_decision::arrow::{AnswerRow, DecisionSchema};
+    use hyprstream_metrics_api::arrow::array::StringArray;
+
+    let questions = hyprstream_decision::author::parse_yaml(
+        r#"
+questions:
+  is_refund:
+    type: noul
+  severity:
+    type: score
+    criteria: ["cosmetic", "usable", "unusable"]
+  route:
+    type: choice
+    criteria: {zebra: null, alpha: null, omega: null}
+"#,
+    )
+    .unwrap()
+    .questions;
+    let schema = DecisionSchema::new(questions).unwrap();
+    let mut valid = Harness
+        .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+        .await
+        .unwrap();
+    let rows = (0..3)
+        .map(|row| AnswerRow {
+            answers: schema
+                .questions()
+                .iter()
+                .map(|question| {
+                    let answer = if row == 2 {
+                        QuestionAnswer::abstained()
+                    } else {
+                        let probabilities = if row == 0 {
+                            vec![0.1, 0.2, 0.7]
+                        } else {
+                            vec![0.4, 0.4, 0.2]
+                        };
+                        let value = match question.id.as_str() {
+                            "is_refund" => AnswerValue::Noul {
+                                p_true: if row == 0 { 0.7 } else { 0.5 },
+                            },
+                            "severity" => AnswerValue::Score { probabilities },
+                            "route" => AnswerValue::Choice { probabilities },
+                            _ => unreachable!(),
+                        };
+                        QuestionAnswer {
+                            value: Some(value),
+                            conformal_set: Some(if row == 0 {
+                                // Preserve builder semantics: repeated members are allowed.
+                                vec![question.labels()[0].clone(), question.labels()[0].clone()]
+                            } else {
+                                vec![]
+                            }),
+                        }
+                    };
+                    (question.id.clone(), answer)
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    valid.batch = Some(schema.build_batch(&valid.version, &rows).unwrap());
+    valid.schema_fingerprint = Some(schema.fingerprint());
+    let original = valid.batch.clone().unwrap();
+    let backend = Arc::new(MemoryBackend::default());
+    let sink = BatchSink::new(backend.clone());
+    sink.init().await.unwrap();
+    for mutation in [
+        "unknown-label",
+        "wrong-argmax",
+        "wrong-tie-break",
+        "nan",
+        "infinity",
+        "negative",
+        "above-one",
+        "not-normalized",
+        "null-component",
+        "null-label",
+        "null-probabilities-with-label",
+        "unknown-conformal",
+        "null-conformal-member",
+        "abstained-with-conformal",
+    ] {
+        valid.batch = Some(original.clone());
+        match mutation {
+            "unknown-label" | "wrong-argmax" | "wrong-tie-break" | "null-label" => {
+                let (first, second) = match mutation {
+                    "unknown-label" => (Some("outside"), Some("zebra")),
+                    "wrong-argmax" => (Some("zebra"), Some("zebra")),
+                    "wrong-tie-break" => (Some("omega"), Some("alpha")),
+                    "null-label" => (None, Some("zebra")),
+                    _ => unreachable!(),
+                };
+                replace_answer_column(
+                    &mut valid,
+                    "route.label",
+                    Arc::new(StringArray::from(vec![first, second, None])),
+                );
+            }
+            "unknown-conformal" | "null-conformal-member" | "abstained-with-conformal" => {
+                let first = match mutation {
+                    "unknown-conformal" => Some(vec![Some("outside")]),
+                    "null-conformal-member" => Some(vec![None]),
+                    _ => Some(vec![Some("zebra")]),
+                };
+                let last = (mutation == "abstained-with-conformal").then(Vec::new);
+                replace_answer_column(
+                    &mut valid,
+                    "route.conformal_set",
+                    choice_conformal(first, last),
+                );
+            }
+            "null-probabilities-with-label" => {
+                replace_answer_column(
+                    &mut valid,
+                    "route.probabilities",
+                    choice_probabilities(None),
+                );
+                // Isolate the label mismatch from the independent conformal invariant.
+                replace_answer_column(
+                    &mut valid,
+                    "route.conformal_set",
+                    choice_conformal(None, None),
+                );
+            }
+            _ => {
+                let first = match mutation {
+                    "nan" => Some(vec![Some(f32::NAN), Some(0.2), Some(0.7)]),
+                    "infinity" => Some(vec![Some(f32::INFINITY), Some(0.2), Some(0.7)]),
+                    "negative" => Some(vec![Some(-0.1), Some(0.4), Some(0.7)]),
+                    "above-one" => Some(vec![Some(1.1), Some(0.0), Some(0.0)]),
+                    "not-normalized" => Some(vec![Some(0.1), Some(0.2), Some(0.6)]),
+                    "null-component" => Some(vec![None, Some(0.2), Some(0.8)]),
+                    _ => unreachable!(),
+                };
+                replace_answer_column(
+                    &mut valid,
+                    "route.probabilities",
+                    choice_probabilities(first),
+                );
+            }
+        }
+        // Every adversary keeps all admission checks from the previous validator true.
+        assert_eq!(valid.batch.as_ref().unwrap().schema(), original.schema());
+        assert_eq!(
+            valid.schema_fingerprint.as_deref(),
+            Some(schema.fingerprint().as_str())
+        );
+        assert!(
+            matches!(
+                sink.persist_run(&valid).await,
+                Err(hyprstream_eval::EvalError::InvalidInput(_))
+            ),
+            "mutation {mutation}"
+        );
+        assert!(
+            backend.tables.lock()["decision_batches"].1.is_empty(),
+            "mutation {mutation} reached backend"
+        );
+    }
+    // Valid soft distributions, canonical ties, all three kinds, abstention,
+    // repeated members and present-empty conformal sets survive unchanged.
+    valid.batch = Some(original.clone());
+    let id = sink.persist_run(&valid).await.unwrap();
+    let (_, stored) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(stored, original);
+    // Null-parent children are inactive; even NaN filler must not be interpreted.
+    replace_answer_column(
+        &mut valid,
+        "route.probabilities",
+        choice_probabilities(Some(vec![Some(0.1), Some(0.2), Some(0.7)])),
+    );
+    let id = sink.persist_run(&valid).await.unwrap();
+    let (_, stored) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.num_rows(), 3);
+    // Consumers that omit the reserved conformal columns remain supported.
+    let without_conformal = schema.without_conformal_set();
+    valid.batch = Some(
+        without_conformal
+            .build_batch(&valid.version, &rows)
+            .unwrap(),
+    );
+    valid.schema_fingerprint = Some(without_conformal.fingerprint());
+    let expected = valid.batch.clone().unwrap();
+    let id = sink.persist_run(&valid).await.unwrap();
+    let (_, stored) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(stored, expected);
+}
