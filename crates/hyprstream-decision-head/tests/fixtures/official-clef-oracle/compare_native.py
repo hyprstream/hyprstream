@@ -5,9 +5,87 @@ Explicit tolerances are REQUIRED. Does not run any model or loosen a gate.
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
-from safetensors.torch import load_file
-import torch
+import re
+
+ENCODED_FIELDS = ("id", "input_ids", "questions", "state_tokens_before_truncation", "state_tokens_admitted", "state_truncated")
+
+def encoded_records_match(reference, native):
+    """Compare every declared encoding/label field, without tensor imports."""
+    left, right = reference["records"], native["records"]
+    return len(left) == len(right) and all(
+        all(field in r and field in n and r[field] == n[field] for field in ENCODED_FIELDS)
+        for r, n in zip(left, right)
+    )
+
+def admit_comparison_mode(reference_mode, *, backbone_only, head_only, include_hidden, has_native_records):
+    if reference_mode not in ("head", "full"):
+        raise ValueError("reference mode must be head or full")
+    if head_only and (reference_mode != "head" or include_hidden):
+        raise ValueError("head-only requires a head reference and excludes --include-hidden")
+    if backbone_only and reference_mode != "full":
+        raise ValueError("backbone-only requires a full reference")
+    if reference_mode == "full" and not backbone_only and not has_native_records:
+        raise ValueError("full-port comparison requires --native-records for exact encoding and labels")
+
+def question_winners(key, reference, native, records):
+    """Report first-index argmax in model and canonical label coordinates.
+
+    Winner stability is reported, not silently added to the numerical gate.
+    Inputs are finite vector lists from tensors that passed shape/dtype checks.
+    """
+    match = re.fullmatch(r"r(\d+)\.q(\d+)\.(logits|probabilities)", key)
+    if match is None:
+        raise ValueError(f"invalid question tensor key: {key}")
+    record_index, question_index = int(match[1]), int(match[2])
+    record = records["records"][record_index]
+    question = record["questions"][question_index]
+    ids = question["option_ids"]
+    kind = question["question_type"]
+    if kind == "noul":
+        canonical = ["false", "true"]
+    elif kind == "choice":
+        canonical = sorted(ids)
+    elif kind == "score":
+        canonical = [str(i) for i in range(len(ids))]
+    else:
+        raise ValueError(f"unknown question type: {kind}")
+    if not ids or len(set(ids)) != len(ids) or set(ids) != set(canonical):
+        raise ValueError(f"invalid option domain: {key}")
+    if len(reference) != len(ids) or len(native) != len(ids):
+        raise ValueError(f"winner vector/domain cardinality mismatch: {key}")
+    if not all(math.isfinite(v) for v in reference + native):
+        raise ValueError(f"nonfinite winner vector: {key}")
+    def winner(values):
+        index = max(range(len(values)), key=values.__getitem__)
+        return {"model_index": index, "option_id": ids[index], "canonical_index": canonical.index(ids[index])}
+    left, right = winner(reference), winner(native)
+    return {"record_index": record_index, "question_index": question_index,
+            "record_id": record["id"], "question_id": question["question_id"],
+            "question_type": kind, "model_option_ids": ids, "canonical_option_ids": canonical,
+            "canonical_to_model_permutation": [ids.index(label) for label in canonical],
+            "tensor_kind": match[3], "reference_winner": left, "native_winner": right,
+            "disagreement": left["option_id"] != right["option_id"]}
+
+def summarize_winners(comparisons):
+    questions = {}
+    for comparison in comparisons:
+        coordinate = (comparison["record_index"], comparison["question_index"])
+        if coordinate not in questions:
+            questions[coordinate] = {key: value for key, value in comparison.items()
+                                    if key not in ("tensor_kind", "reference_winner", "native_winner", "disagreement")}
+            questions[coordinate].update(tensors={}, disagreement=False)
+        question = questions[coordinate]
+        question["tensors"][comparison["tensor_kind"]] = {
+            key: comparison[key] for key in ("reference_winner", "native_winner", "disagreement")}
+        question["disagreement"] |= comparison["disagreement"]
+    return {"policy": "report-only; original full-port numerical tolerances unchanged",
+            "tensor_comparison_count": len(comparisons),
+            "tensor_disagreement_count": sum(c["disagreement"] for c in comparisons),
+            "question_comparison_count": len(questions),
+            "question_disagreement_count": sum(q["disagreement"] for q in questions.values()),
+            "questions": [questions[key] for key in sorted(questions)]}
 
 def digest(path):
     h = hashlib.sha256()
@@ -25,7 +103,9 @@ def main():
     p.add_argument("--rtol", type=float)
     p.add_argument("--report", required=True, type=Path)
     p.add_argument("--probability-atol", type=float, help="separate pre-agreed absolute bound for probability tensors")
-    p.add_argument("--backbone-only", action="store_true", help="only original-FP32 hidden and original embedding row comparison; no head claim")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--backbone-only", action="store_true", help="only original-FP32 hidden and original embedding row comparison; no head claim")
+    mode.add_argument("--head-only", action="store_true", help="explicit synthetic-head comparison; requires a head-mode reference and excludes hidden tensors")
     p.add_argument("--tolerance-file", type=Path, help="predeclared original-Float32 full-port tolerance profile")
     p.add_argument("--include-hidden", action="store_true", help="full-backbone comparison only; synthetic head inputs aren't a backbone oracle")
     a = p.parse_args()
@@ -39,12 +119,29 @@ def main():
         raise SystemExit("negative tolerance")
     if a.backbone_only and not tolerance_profile:
         raise SystemExit("backbone-only comparison requires predeclared --tolerance-file")
+    if tolerance_profile and not a.backbone_only and not a.native_records:
+        raise SystemExit("full-port tolerance profile requires --native-records")
     provenance = json.loads((a.reference / "provenance.json").read_text())
+    try:
+        admit_comparison_mode(provenance["mode"], backbone_only=a.backbone_only,
+                              head_only=a.head_only, include_hidden=a.include_hidden,
+                              has_native_records=a.native_records is not None)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     for name, checksum in provenance["files"].items():
         if digest(a.reference / name) != checksum:
             raise SystemExit(f"reference file hash mismatch: {name}")
     if a.backbone_only and (provenance["mode"] != "full" or provenance["compute_dtype"] != "float32" or provenance["device"] != "cpu"):
         raise SystemExit("original-Float32 CPU backbone gate requires a full Float32 CPU official oracle")
+    records = json.loads((a.reference / "records.json").read_text())
+    record_match = None
+    if a.native_records:
+        native_records = json.loads(a.native_records.read_text())
+        record_match = encoded_records_match(records, native_records)
+    # CLI/mode/record admission precedes even tensor-library imports. Tiny
+    # regression tests can exercise the fail-closed boundary without Torch.
+    from safetensors.torch import load_file
+    import torch
     expected = load_file(a.reference / "tensors.safetensors")
     actual = load_file(a.native_tensors)
     if a.backbone_only:
@@ -55,7 +152,8 @@ def main():
             required += [k for k in expected if k.endswith(".hidden")]
             required += ["embedding_rows", "embedding_token_ids"]
     entries = {}
-    passed = True
+    passed = record_match is not False
+    winners = []
     for key in sorted(required):
         if key not in actual:
             entries[key] = {"pass": False, "error": "missing native tensor"}
@@ -86,18 +184,14 @@ def main():
         entry = {"shape": list(x.shape), "absolute_tolerance": used_atol, "relative_tolerance": used_rtol, "max_absolute_index": [int(v) for v in torch.unravel_index(difference.argmax(), difference.shape)], "pass": within, "finite": finite, "max_absolute_error": float(difference.max()), "max_relative_error": float((difference / x.abs().clamp_min(1e-30)).max()), "rmse": float(difference.square().mean().sqrt())}
         if key.endswith(".probabilities"):
             entry["kl_reference_native"] = float((x * (x.clamp_min(1e-30).log() - y.clamp_min(1e-30).log())).sum())
+        if key.endswith((".logits", ".probabilities")) and finite:
+            winner = question_winners(key, x.tolist(), y.tolist(), records)
+            entry["argmax"] = winner
+            winners.append(winner)
         entries[key] = entry
         passed = passed and within
-    record_match = None
-    if a.native_records:
-        ref = json.loads((a.reference / "records.json").read_text())
-        native = json.loads(a.native_records.read_text())
-        # Native emitter must preserve every encoded token/span/ID and accounting
-        # field, independent of irrelevant corpus-mode/provenance envelope fields.
-        fields = ["id", "input_ids", "questions", "state_tokens_before_truncation", "state_tokens_admitted", "state_truncated"]
-        record_match = len(ref["records"]) == len(native["records"]) and all(all(r[k] == n[k] for k in fields) for r, n in zip(ref["records"], native["records"]))
-        passed = passed and record_match
     report = {"pass": passed, "scope": "backbone-only-original-f32" if a.backbone_only else provenance["mode"], "tolerance_profile": tolerance_profile, "tolerance_profile_sha256": digest(a.tolerance_file) if a.tolerance_file else None, "source_revision": provenance["source_revision"], "reference_provenance_sha256": digest(a.reference / "provenance.json"), "native_tensors_sha256": digest(a.native_tensors), "atol": a.atol, "rtol": a.rtol, "probability_atol": a.probability_atol, "exact_encoded_record_match": record_match, "tensors": entries, "limitation": "Head-only parity is not full backbone/FP8/calibration/CPU serving qualification."}
+    report["argmax"] = summarize_winners(winners)
     a.report.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(json.dumps({"pass": passed, "tensor_count": len(entries), "exact_encoded_record_match": record_match, "report": str(a.report)}))
     raise SystemExit(0 if passed else 1)
