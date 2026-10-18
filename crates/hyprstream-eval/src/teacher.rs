@@ -138,6 +138,7 @@ impl TeacherEnsemble {
                 "a teacher ensemble cannot answer an empty question set".to_owned(),
             ));
         }
+        crate::run::validate_entry(state).map_err(EvalError::InvalidInput)?;
         let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
         for question in &set.questions {
             if !ids.insert(&question.id) {

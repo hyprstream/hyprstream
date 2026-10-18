@@ -191,6 +191,7 @@ impl Harness {
         // rather than at scoring time (after every billed call).
         let mut row_ids = std::collections::HashSet::with_capacity(set.rows.len());
         for row in &set.rows {
+            validate_entry(&row.state).map_err(EvalError::InvalidInput)?;
             if !row_ids.insert(&row.id) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate eval row id `{}`",
@@ -313,6 +314,7 @@ impl Harness {
         // N−1 items have invoked (and possibly billed) the subject.
         let mut identities = std::collections::HashSet::with_capacity(items.len());
         for item in items {
+            validate_entry(&item.state).map_err(EvalError::InvalidInput)?;
             if !identities.insert((&item.id, &item.question.id)) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate eval item identity ({:?}, {:?})",
@@ -411,6 +413,21 @@ fn final_model_id(pinned: Option<String>, subject: &dyn Subject) -> Result<Strin
     Ok(model)
 }
 
+/// Programmatic entries bypass the parser's finite-number invariant. Check
+/// recursively during all-input preflight, before any subject can be billed.
+pub(crate) fn validate_entry(entry: &Entry) -> Result<(), String> {
+    match entry {
+        Entry::Number(value) if !value.is_finite() => {
+            Err("non-finite Entry::Number in eval input".to_owned())
+        }
+        Entry::Seq(entries) => entries.iter().try_for_each(validate_entry),
+        Entry::Map(entries) => entries
+            .iter()
+            .try_for_each(|(_, value)| validate_entry(value)),
+        _ => Ok(()),
+    }
+}
+
 /// The jev-1 v1 question-profile rules the authoring layer enforces at
 /// parse time, applied to programmatically constructed questions (which
 /// bypass parsing): v1 kinds only, kind/body agreement, choice cardinality
@@ -420,6 +437,9 @@ fn final_model_id(pinned: Option<String>, subject: &dyn Subject) -> Result<Strin
 pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), String> {
     use hyprstream_decision::spec::{QuestionBody, QuestionKind};
 
+    if let Some(instructions) = &question.instructions {
+        validate_entry(instructions)?;
+    }
     let id = &question.id;
     if question.id.is_empty() {
         return Err("a question id must be nonempty".to_owned());
@@ -458,6 +478,9 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
             }
             let mut names = std::collections::HashSet::with_capacity(options.len());
             for option in options {
+                if let Some(rubric) = &option.rubric {
+                    validate_entry(rubric)?;
+                }
                 if option.name.is_empty() {
                     return Err(format!("choice question `{id}` has an empty option name"));
                 }
@@ -470,6 +493,9 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
             }
         }
         QuestionBody::Score { levels } => {
+            for rubric in levels.iter().flatten() {
+                validate_entry(rubric)?;
+            }
             if levels.len() < 2 {
                 return Err(format!(
                     "score question `{id}` needs at least 2 levels, got {}",
@@ -477,7 +503,16 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
                 ));
             }
         }
-        QuestionBody::Noul { .. } => {}
+        QuestionBody::Noul { criteria } => {
+            if let Some(criteria) = criteria {
+                for rubric in [&criteria.on_true, &criteria.on_false]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_entry(rubric)?;
+                }
+            }
+        }
     }
     Ok(())
 }
