@@ -68,7 +68,8 @@ impl EvalSet {
 /// A one-question eval item: question, state, verifiable truth. This is the
 /// shape [`hyprstream_bench::Item`] converts into; runs over items produce
 /// observations (scoring input) but no single shared-schema batch — items
-/// carry distinct question ids, and the Arrow contract keys columns to them.
+/// can carry different label sets, so metadata binds to each (item id,
+/// question id) pair rather than a single shared schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalItem {
     /// Stable item id.
@@ -188,7 +189,14 @@ impl Harness {
         // labeled denominator — fail loudly instead. A truth index outside
         // the question's cardinality is likewise an input error, caught here
         // rather than at scoring time (after every billed call).
+        let mut row_ids = std::collections::HashSet::with_capacity(set.rows.len());
         for row in &set.rows {
+            if !row_ids.insert(&row.id) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate eval row id `{}`",
+                    row.id
+                )));
+            }
             for (question_id, &label) in &row.truth {
                 let Some(question) = question_set.question(question_id) else {
                     return Err(EvalError::InvalidInput(format!(
@@ -275,7 +283,7 @@ impl Harness {
         }
         let version = VersionTriple {
             schema: set.schema_version.clone(),
-            model: pinned_model.unwrap_or_else(|| subject.resolved_model_id()),
+            model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
         let batch = schema.build_batch(&version, &rows)?;
@@ -303,7 +311,14 @@ impl Harness {
         // Preflight EVERY item's truth index before the first subject call:
         // item N's invalid truth must not surface only after the preceding
         // N−1 items have invoked (and possibly billed) the subject.
+        let mut identities = std::collections::HashSet::with_capacity(items.len());
         for item in items {
+            if !identities.insert((&item.id, &item.question.id)) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate eval item identity ({:?}, {:?})",
+                    item.id, item.question.id
+                )));
+            }
             validate_question_profile(&item.question).map_err(EvalError::InvalidInput)?;
             if let Some(truth) = item.truth {
                 if truth >= item.question.cardinality() {
@@ -371,7 +386,7 @@ impl Harness {
         }
         let version = VersionTriple {
             schema: "items".to_owned(),
-            model: pinned_model.unwrap_or_else(|| subject.resolved_model_id()),
+            model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
         Ok(RunOutput {
@@ -382,6 +397,18 @@ impl Harness {
             schema_fingerprint: None,
         })
     }
+}
+
+/// Empty runs have no response capture, but still require usable provenance.
+fn final_model_id(pinned: Option<String>, subject: &dyn Subject) -> Result<String, EvalError> {
+    let model = pinned.unwrap_or_else(|| subject.resolved_model_id());
+    if model.is_empty() {
+        return Err(EvalError::InvalidInput(format!(
+            "subject `{}` resolved an empty model id — a run requires model provenance",
+            subject.model_id()
+        )));
+    }
+    Ok(model)
 }
 
 /// The jev-1 v1 question-profile rules the authoring layer enforces at

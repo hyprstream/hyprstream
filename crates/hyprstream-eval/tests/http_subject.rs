@@ -322,3 +322,70 @@ async fn http_subject_rejects_an_empty_resolved_model() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn rejected_http_answers_never_change_the_resolved_model_cache() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        for (model, valid) in [
+            ("accepted-1", true),
+            ("rejected", false),
+            ("accepted-2", true),
+        ] {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(socket);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let length = content_length.unwrap();
+            assert!(length <= 65536);
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request["model"], "requested");
+            let mut socket = reader.into_inner();
+            let answers = if valid {
+                serde_json::json!({"q": {"type":"noul", "noul":0.5}})
+            } else {
+                serde_json::json!({})
+            };
+            let body = serde_json::json!({"model":model, "answers":answers}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        }
+    });
+    let subject = HttpSubject::new(format!("http://{address}"), "requested", "t");
+    let set =
+        hyprstream_decision::author::parse_yaml("questions:\n  q:\n    type: noul\n").unwrap();
+    subject
+        .decide_with_version(&set, &Entry::Null, 0)
+        .await
+        .unwrap();
+    assert_eq!(subject.resolved_model_id(), "accepted-1");
+    assert!(subject
+        .decide_with_version(&set, &Entry::Null, 1)
+        .await
+        .is_err());
+    assert_eq!(
+        subject.resolved_model_id(),
+        "accepted-1",
+        "rejected exchange cannot poison provenance"
+    );
+    subject
+        .decide_with_version(&set, &Entry::Null, 2)
+        .await
+        .unwrap();
+    assert_eq!(subject.resolved_model_id(), "accepted-2");
+    server.await.unwrap();
+}

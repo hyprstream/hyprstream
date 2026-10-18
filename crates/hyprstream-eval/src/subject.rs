@@ -335,6 +335,11 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                         .get(label)
                         .and_then(Value::as_f64)
                         .ok_or_else(|| invalid(format!("probabilities missing label `{label}`")))?;
+                    if !(0.0..=1.0).contains(&p) {
+                        return Err(invalid(format!(
+                            "probability for `{label}` out of range: {p}"
+                        )));
+                    }
                     probabilities.push(p as f32);
                 }
                 confidence::check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE)
@@ -355,12 +360,13 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             Some(number) => {
                 let p_true = number
                     .as_f64()
-                    .ok_or_else(|| invalid("`noul` is not a number".to_owned()))?
-                    as f32;
+                    .ok_or_else(|| invalid("`noul` is not a number".to_owned()))?;
                 if !(0.0..=1.0).contains(&p_true) {
                     return Err(invalid(format!("`noul` out of range: {p_true}")));
                 }
-                Ok(QuestionAnswer::answered(AnswerValue::Noul { p_true }))
+                Ok(QuestionAnswer::answered(AnswerValue::Noul {
+                    p_true: p_true as f32,
+                }))
             }
         },
         QuestionBody::Choice { .. } => Ok(match probabilities_from("probabilities")? {
@@ -415,8 +421,8 @@ pub struct HttpSubject {
     model: String,
     token: String,
     client: reqwest::Client,
-    /// The server's resolved id (`response.model`), set on the first
-    /// successful decide. `Arc` so clones observe the same resolution.
+    /// The latest fully accepted response's resolved id. `Arc` so clones
+    /// share the cache; version-bound results never depend on this slot.
     resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
 }
 
@@ -511,8 +517,15 @@ impl HttpSubject {
             ));
         };
         let resolved = resolved.to_owned();
+        let answers = parse_response_answers(set, &parsed)?;
+        crate::run::validate_set_answer_row(set, &answers).map_err(|message| {
+            EvalError::InvalidAnswer {
+                question_id: "response".to_owned(),
+                message,
+            }
+        })?;
         *self.resolved.write() = Some(resolved.clone());
-        Ok((parse_response_answers(set, &parsed)?, resolved))
+        Ok((answers, resolved))
     }
 }
 
@@ -1180,6 +1193,27 @@ questions:
                         "location {location} must fail input validation before HTTP: {error:?}"
                     );
                 }
+            }
+        }
+    }
+    #[test]
+    fn wire_probability_bounds_are_checked_before_f32_rounding() {
+        let set = fixture();
+        for probability in [-1e-50f64, 1.00000001, 0.0, 1.0] {
+            let valid = (0.0..=1.0).contains(&probability);
+            let remainder = (1.0 - probability).clamp(0.0, 1.0);
+            let answers = [
+                serde_json::json!({"type":"noul", "noul":probability}),
+                serde_json::json!({"type":"choice", "probabilities":{"angry":probability,"calm":remainder}}),
+                serde_json::json!({"type":"score", "probabilities":{"0":probability,"1":remainder,"2":0.0}}),
+            ];
+            for (question, answer) in set.questions.iter().zip(answers) {
+                assert_eq!(
+                    parse_answer(question, &answer).is_ok(),
+                    valid,
+                    "{} must check original {probability} before narrowing",
+                    question.id
+                );
             }
         }
     }
