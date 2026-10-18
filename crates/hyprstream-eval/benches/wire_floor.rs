@@ -4,7 +4,7 @@
 //! - request serialization bytes (`{state, model, questions}` envelope),
 //! - response bytes for the same envelope rendered from deterministic
 //!   distributions (the P0.7 mock answers, so sizes are byte-reproducible),
-//! - encode/decode CPU per request.
+//! - request encoding/parsing and full client response decoding/validation CPU.
 //!
 //! Actual byte counts are JSON sidecars under the active Cargo target's
 //! `criterion/wire_floor/byte-counts/`, written outside timed closures.
@@ -20,7 +20,7 @@ use hyprstream_decision::author;
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision_stub::mock::MockDecisionModel;
 use hyprstream_decision_stub::render;
-use hyprstream_eval::subject::request_body;
+use hyprstream_eval::subject::{decode_response, request_body};
 
 /// A question set of `n` questions cycling through the three primitives, with
 /// choice cardinality `k`.
@@ -50,6 +50,15 @@ fn question_set(n: usize, k: usize) -> hyprstream_decision::QuestionSet {
     author::parse_yaml(&doc).unwrap_or_else(|error| panic!("generated doc parses: {error}"))
 }
 
+fn response_body(set: &hyprstream_decision::QuestionSet) -> serde_json::Value {
+    let row = MockDecisionModel.answer_row(set, "The crate arrived damaged.", 0);
+    serde_json::json!({
+        "model": "jev-stub-1.0.0",
+        "answers": render::render_answers(set, &row),
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })
+}
+
 fn wire_bytes(set: &hyprstream_decision::QuestionSet) -> (usize, usize) {
     let request = request_body(
         set,
@@ -59,12 +68,7 @@ fn wire_bytes(set: &hyprstream_decision::QuestionSet) -> (usize, usize) {
     let request_bytes = serde_json::to_vec(&request)
         .unwrap_or_else(|e| panic!("json: {e}"))
         .len();
-    let row = MockDecisionModel.answer_row(set, "The crate arrived damaged.", 0);
-    let response = serde_json::json!({
-        "model": "jev-stub-1.0.0",
-        "answers": render::render_answers(set, &row),
-        "usage": {"input_tokens": 0, "output_tokens": 0},
-    });
+    let response = response_body(set);
     let response_bytes = serde_json::to_vec(&response)
         .unwrap_or_else(|e| panic!("json: {e}"))
         .len();
@@ -120,6 +124,21 @@ fn bench_wire_sizes(c: &mut Criterion) {
                     let row = MockDecisionModel.answer_row(set, "The crate arrived damaged.", 0);
                     black_box(serde_json::to_vec(&render::render_answers(set, &row)))
                 });
+            },
+        );
+        let response_text = serde_json::to_string(&response_body(&set)).unwrap();
+        let (decoded, resolved) = decode_response(&set, &response_text).unwrap();
+        assert_eq!(decoded.answers.len(), questions);
+        assert_eq!(resolved, "jev-stub-1.0.0");
+        assert_eq!(response_text.len(), response_bytes);
+        group.bench_with_input(
+            BenchmarkId::new(
+                "full_response_decode",
+                format!("q{questions}-k{cardinality}"),
+            ),
+            &(&set, &response_text),
+            |b, (set, response)| {
+                b.iter(|| black_box(decode_response(black_box(set), black_box(response)).unwrap()));
             },
         );
         group.bench_with_input(

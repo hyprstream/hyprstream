@@ -392,7 +392,8 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
 /// Parse the full response envelope into an [`AnswerRow`].
 pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerRow, EvalError> {
     // This public parser also accepts programmatic inputs without HTTP
-    // preflight. Exact key-set admission requires unique declared labels.
+    // preflight. Exact key-set admission requires unique IDs and labels.
+    let ids = crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
     for question in &set.questions {
         crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
     }
@@ -404,7 +405,7 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     // otherwise be silently discarded, hiding a response/request schema
     // mismatch behind a row that passes all per-question checks.
     for key in answers.keys() {
-        if set.question(key).is_none() {
+        if !ids.contains(key.as_str()) {
             return Err(EvalError::InvalidAnswer {
                 question_id: key.clone(),
                 message: "response answers an undeclared question".to_owned(),
@@ -422,6 +423,32 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
         row.insert(question.id.clone(), parse_answer(question, value)?);
     }
     Ok(AnswerRow { answers: row })
+}
+
+/// Decode and validate the complete HTTP response envelope. This is the same
+/// client work used by [`HttpSubject`] and the wire-floor response benchmark.
+pub fn decode_response(set: &QuestionSet, text: &str) -> Result<(AnswerRow, String), EvalError> {
+    let parsed: Value = serde_json::from_str(text)
+        .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
+    let Some(resolved) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    else {
+        return Err(EvalError::Http(
+            "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
+                .to_owned(),
+        ));
+    };
+    let resolved = resolved.to_owned();
+    let answers = parse_response_answers(set, &parsed)?;
+    crate::run::validate_set_answer_row(set, &answers).map_err(|message| {
+        EvalError::InvalidAnswer {
+            question_id: "response".to_owned(),
+            message,
+        }
+    })?;
+    Ok((answers, resolved))
 }
 
 /// Operational bounds for remote evaluation, not inference latency targets.
@@ -606,26 +633,7 @@ impl HttpSubject {
         }
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| EvalError::Http("HTTP response is not UTF-8".to_owned()))?;
-        let parsed: Value = serde_json::from_str(text)
-            .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
-        let Some(resolved) = parsed
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-        else {
-            return Err(EvalError::Http(
-                "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
-                    .to_owned(),
-            ));
-        };
-        let resolved = resolved.to_owned();
-        let answers = parse_response_answers(set, &parsed)?;
-        crate::run::validate_set_answer_row(set, &answers).map_err(|message| {
-            EvalError::InvalidAnswer {
-                question_id: "response".to_owned(),
-                message,
-            }
-        })?;
+        let (answers, resolved) = decode_response(set, text)?;
         *self.resolved.write() = Some(resolved.clone());
         Ok((answers, resolved))
     }
@@ -634,8 +642,9 @@ impl HttpSubject {
 #[async_trait]
 impl Subject for HttpSubject {
     fn preflight(&self, set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
-        // Direct callers also require unique declared labels for exact response
-        // key admission; do not rely solely on Harness/teacher validation.
+        // Direct callers also require unique question IDs and declared labels
+        // before any network call; do not rely on Harness/teacher validation.
+        crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
         for question in &set.questions {
             crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
         }
