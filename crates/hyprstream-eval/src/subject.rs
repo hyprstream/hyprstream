@@ -255,10 +255,7 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     #[allow(clippy::cast_precision_loss)]
     let mut share = residual / probabilities.len().max(1) as f32;
     if share < 0.0 {
-        let min_component = probabilities
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min);
+        let min_component = probabilities.iter().copied().fold(f32::INFINITY, f32::min);
         share = share.max(-min_component);
     }
     if share != 0.0 {
@@ -284,9 +281,7 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     // gap 1.9e-9 — would flip the argmax to the runner-up).
     for _ in 0..probabilities.len().saturating_add(8) {
         let residual = 1.0 - probabilities.iter().sum::<f32>();
-        if residual == 0.0
-            || check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok()
-        {
+        if residual == 0.0 || check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
             return;
         }
         let max = probabilities
@@ -385,7 +380,8 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             Some(number) => {
                 let p_true = number
                     .as_f64()
-                    .ok_or_else(|| invalid("`noul` is not a number".to_owned()))? as f32;
+                    .ok_or_else(|| invalid("`noul` is not a number".to_owned()))?
+                    as f32;
                 if !(0.0..=1.0).contains(&p_true) {
                     return Err(invalid(format!("`noul` out of range: {p_true}")));
                 }
@@ -394,9 +390,7 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
         },
         QuestionBody::Choice { .. } => Ok(match probabilities_from("probabilities")? {
             None => QuestionAnswer::abstained(),
-            Some(probabilities) => {
-                QuestionAnswer::answered(AnswerValue::Choice { probabilities })
-            }
+            Some(probabilities) => QuestionAnswer::answered(AnswerValue::Choice { probabilities }),
         }),
         QuestionBody::Score { .. } => Ok(match probabilities_from("probabilities")? {
             None => QuestionAnswer::abstained(),
@@ -406,10 +400,7 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
 }
 
 /// Parse the full response envelope into an [`AnswerRow`].
-pub fn parse_response_answers(
-    set: &QuestionSet,
-    body: &Value,
-) -> Result<AnswerRow, EvalError> {
+pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerRow, EvalError> {
     let answers = body
         .get("answers")
         .and_then(Value::as_object)
@@ -602,11 +593,7 @@ fn draw(key: &[u8], index: u64) -> f64 {
     hasher.update(key);
     hasher.update(&index.to_le_bytes());
     let output = hasher.finalize();
-    let bits = u64::from_le_bytes(
-        output.as_bytes()[..8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    );
+    let bits = u64::from_le_bytes(output.as_bytes()[..8].try_into().unwrap_or([0; 8]));
     (bits as f64 + 0.5) / (u64::MAX as f64 + 1.0)
 }
 
@@ -696,7 +683,12 @@ impl TruthSubject {
     /// run (the `row` argument of `decide`). Without this, every row gets
     /// the question-level entry — the "perfectly accurate" anchor would
     /// score at chance on a set whose rows have different truths.
-    pub fn with_row_truth(mut self, row: usize, question_id: impl Into<String>, index: usize) -> Self {
+    pub fn with_row_truth(
+        mut self,
+        row: usize,
+        question_id: impl Into<String>,
+        index: usize,
+    ) -> Self {
         self.row_truth.insert((row, question_id.into()), index);
         self
     }
@@ -816,14 +808,13 @@ questions:
         let zeta = text.find("zeta").unwrap();
         let alpha = text.find("alpha").unwrap();
         let mid = text.find("mid").unwrap();
-        assert!(zeta < alpha && alpha < mid, "declared order on the wire: {text}");
+        assert!(
+            zeta < alpha && alpha < mid,
+            "declared order on the wire: {text}"
+        );
         // …and question order (is_refund before tone before severity) too.
-        let body = serde_json::to_string(&request_body(
-            &fixture(),
-            &Entry::Str("s".into()),
-            "m",
-        ))
-        .unwrap();
+        let body =
+            serde_json::to_string(&request_body(&fixture(), &Entry::Str("s".into()), "m")).unwrap();
         assert!(
             body.find("is_refund").unwrap() < body.find("tone").unwrap()
                 && body.find("tone").unwrap() < body.find("severity").unwrap()
@@ -857,13 +848,18 @@ questions:
             .with_truth("is_refund", 1)
             .with_truth("tone", 0)
             .with_truth("severity", 2);
-        let row = subject
-            .decide(&set, &Entry::Null, 0)
-            .await
-            .unwrap();
-        let p = row.answers["severity"].value.as_ref().unwrap().probabilities();
+        let row = subject.decide(&set, &Entry::Null, 0).await.unwrap();
+        let p = row.answers["severity"]
+            .value
+            .as_ref()
+            .unwrap()
+            .probabilities();
         assert_eq!(p, vec![0.0, 0.0, 1.0]);
-        let noul = row.answers["is_refund"].value.as_ref().unwrap().probabilities();
+        let noul = row.answers["is_refund"]
+            .value
+            .as_ref()
+            .unwrap()
+            .probabilities();
         assert_eq!(noul, vec![0.0, 1.0]);
     }
 
@@ -914,8 +910,7 @@ questions:
         )
         .unwrap();
         let probabilities = parsed.value.as_ref().unwrap().probabilities();
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
-            .unwrap();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         assert!(
             probabilities.windows(2).all(|w| w[0] == w[1]),
             "the tie must survive normalization: {probabilities:?}"
@@ -950,15 +945,17 @@ questions:
         let subject = TruthSubject::new("truth"); // no truth configured
         let row = subject.decide(&set, &Entry::Null, 0).await.unwrap();
         let probabilities = row.answers["wide"].value.as_ref().unwrap().probabilities();
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
-            .unwrap();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         // No f32 vector of 78 exactly-equal components can meet the producer
         // tolerance (best achievable error ~1.07e-6), so the fallback is as
         // uniform as f32 allows: one component carries the residual, spread
         // stays within a few ulps, and the D6 argmax is still the earliest
         // index (the tie-break outcome).
         let min = probabilities.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = probabilities.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max = probabilities
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
         assert!(
             (max - min) / max < 1e-3,
             "near-uniform: min {min}, max {max}"
@@ -1001,8 +998,7 @@ questions:
         )
         .unwrap();
         let probabilities = parsed.value.as_ref().unwrap().probabilities();
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
-            .unwrap();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         assert!(
             probabilities[0] > probabilities[1],
             "the leader gap must survive normalization: {:?}",
@@ -1065,8 +1061,7 @@ questions:
         )
         .unwrap();
         let probabilities = parsed.value.as_ref().unwrap().probabilities();
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
-            .unwrap();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         // Renormalization must not reorder or skew: both components ~1/2.
         assert!(probabilities.iter().all(|p| (*p - 0.5).abs() < 1e-3));
     }
@@ -1100,8 +1095,7 @@ questions:
         .unwrap();
         let probabilities = parsed.value.as_ref().unwrap().probabilities();
         assert_eq!(probabilities.len(), 49);
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
-            .unwrap();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         assert!(
             probabilities.iter().all(|p| (0.0..=1.0).contains(p)),
             "no component may leave [0, 1]: {probabilities:?}"
@@ -1127,8 +1121,7 @@ questions:
         let mut probabilities = vec![0.0167830512f32; 59];
         probabilities[0] = 0.0167830531f32;
         normalize_distribution(&mut probabilities);
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
-            .unwrap();
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         assert!(
             probabilities.iter().all(|p| (0.0..=1.0).contains(p)),
             "no component may leave [0, 1]: {probabilities:?}"
@@ -1149,8 +1142,9 @@ questions:
         for cardinality in [2usize, 3, 17, 59, 78] {
             for seed in 0..200u64 {
                 let key = format!("argmax-invariant\x00{cardinality}\x00{seed}");
-                let draws: Vec<f64> =
-                    (0..cardinality as u64).map(|i| draw(key.as_bytes(), i)).collect();
+                let draws: Vec<f64> = (0..cardinality as u64)
+                    .map(|i| draw(key.as_bytes(), i))
+                    .collect();
                 let total: f64 = draws.iter().sum();
                 let raw: Vec<f32> = draws.iter().map(|d| (d / total) as f32).collect();
                 // Raw draws are continuous — ties have measure zero — so a
@@ -1161,11 +1155,8 @@ questions:
                     .max_by(|(_, a), (_, b)| a.total_cmp(b))
                     .map(|(index, _)| index);
                 let normalized = hash_distribution(key.as_bytes(), cardinality);
-                confidence::check_distribution(
-                    &normalized,
-                    confidence::PRODUCER_SUM_TOLERANCE,
-                )
-                .unwrap();
+                confidence::check_distribution(&normalized, confidence::PRODUCER_SUM_TOLERANCE)
+                    .unwrap();
                 assert_eq!(
                     confidence::argmax_index(&normalized),
                     raw_argmax,
