@@ -48,6 +48,18 @@ The ignored test compares exact encoding and committed expected vectors, exports
 native tensors and per-question metrics, and uses limits fixed BEFORE comparison:
 logit absolute error <=1e-4; probability absolute error <=1e-5; relative tolerance0.
 Use compare_native.py with matching explicit bounds for a separate hashed report.
+Full-port comparisons require --native-records: exact token/span/question/label
+and truncation evidence cannot be omitted, even with explicit numeric bounds.
+--head-only explicitly selects a head-mode reference and excludes --include-hidden;
+it cannot bypass record admission for a full-mode reference. --backbone-only
+remains a separate original-Float32 backbone gate with no head claim.
+Reports include every logits/probabilities winner in model and canonical label
+coordinates, with per-tensor and per-question disagreement counts. Argmax changes
+are reported independently of the unchanged original full-port numeric tolerances;
+they do not silently create a new stronger label-stability acceptance gate.
+Tiny comparison/CLI regressions require only Python stdlib (no Torch/model):
+  python3 -S -m unittest discover -s tests/fixtures/official-clef-oracle -p test_compare_native.py
+Run that command from crates/hyprstream-decision-head.
 
 Observed first comparison: all exact token/span/order/accounting checks passed;
 max logit error2.384185791015625e-7, probability error5.960464477539063e-8,
