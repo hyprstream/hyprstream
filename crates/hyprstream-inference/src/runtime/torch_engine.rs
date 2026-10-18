@@ -721,7 +721,7 @@ impl TorchEngine {
         }
 
         // Get context window from model info that was populated from config
-        let context_window = self.model_info.lock().context_length as usize;
+        let context_window = self.effective_context_limit()?;
 
         // Initialize context state
         {
@@ -2335,6 +2335,17 @@ impl TorchEngine {
         Ok(logits)
     }
 
+    /// Authoritative context capacity of the loaded model. ModelInfo is populated
+    /// from the checkpoint configuration and optional max_context override during
+    /// loading; RuntimeConfig.context_length is only a constructor default.
+    /// Serving encoders and native decision admission must use this same limit.
+    pub fn effective_context_limit(&self) -> Result<usize> {
+        anyhow::ensure!(self.persistent_model.is_some(), "Model not loaded");
+        let limit = self.model_info.lock().context_length as usize;
+        anyhow::ensure!(limit > 0, "loaded model has an invalid context limit");
+        Ok(limit)
+    }
+
     /// Execute a decision head against fresh full-sequence hidden states while
     /// holding the backbone lock. The supplied gather reads original LM-head
     /// rows without allocating token-by-vocabulary logits. No cache is reused.
@@ -2358,11 +2369,7 @@ impl TorchEngine {
     ) -> Result<T> {
         check()?;
         anyhow::ensure!(!token_ids.is_empty(), "decision token sequence is empty");
-        let limit = self
-            .config
-            .max_context
-            .map(|v| v as usize)
-            .unwrap_or(self.config.context_length);
+        let limit = self.effective_context_limit()?;
         anyhow::ensure!(
             token_ids.len() <= limit,
             "decision input exceeds context limit"
@@ -2841,6 +2848,85 @@ mod tests {
     use parking_lot::Mutex;
     use std::io::Write;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn decision_context_uses_actual_loaded_config_and_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let shapes = [
+            ("model.embed_tokens.weight", vec![8, 4]),
+            ("model.norm.weight", vec![4]),
+            ("model.layers.0.input_layernorm.weight", vec![4]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![4]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![4, 4]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.up_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.down_proj.weight", vec![4, 8]),
+        ];
+        let weights: Vec<_> = shapes
+            .into_iter()
+            .map(|(key, shape)| {
+                (
+                    key.to_owned(),
+                    Tensor::ones(shape.as_slice(), (tch::Kind::Float, Device::Cpu)),
+                )
+            })
+            .collect();
+        Tensor::write_safetensors(&weights, &path).unwrap();
+        for (model_limit, override_limit, expected_limit, admitted_tokens) in [
+            (64usize, None, 64usize, 64usize),
+            (8192, None, 8192, 4097),
+            (8192, Some(32), 32, 32),
+        ] {
+            let config = serde_json::json!({
+                "model_type":"llama","architectures":["LlamaForCausalLM"],
+                "hidden_size":4,"intermediate_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":2,"head_dim":2,
+                "vocab_size":8,"max_position_embeddings":model_limit,
+                "rms_norm_eps":1e-5,"rope_theta":10000.0,"tie_word_embeddings":true
+            });
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let mut engine = TorchEngine::new(RuntimeConfig {
+                use_gpu: false,
+                context_length: 4096,
+                max_context: override_limit,
+                precision_mode: Some("fp32".to_owned()),
+                speculative_decoding: false,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(engine.effective_context_limit().is_err());
+            engine.load_model_file(&path).await.unwrap();
+            assert_eq!(engine.effective_context_limit().unwrap(), expected_limit);
+            assert_eq!(
+                engine.context_state.lock().as_ref().unwrap().context_window,
+                expected_limit
+            );
+            let overflow = vec![0i64; expected_limit + 1];
+            let rejected = engine
+                .with_decision_backbone_checked(&overflow, &|| Ok(()), |_, _| Ok(()))
+                .unwrap_err();
+            assert!(rejected.to_string().contains("exceeds context limit"));
+            // Llama deliberately lacks decision hidden states. Reaching that
+            // downstream error proves valid context was admitted without doing
+            // a long forward. The8192case causally admits4097tokens, which the
+            // previous RuntimeConfig default4096 incorrectly rejected.
+            let admitted = vec![0i64; admitted_tokens];
+            let downstream = engine
+                .with_decision_backbone_checked(&admitted, &|| Ok(()), |_, _| Ok(()))
+                .unwrap_err();
+            assert!(downstream
+                .to_string()
+                .contains("decision hidden states unsupported"));
+        }
+    }
 
     #[test]
     fn mtp_bonus_sampling_matches_serial_repetition_window() {
