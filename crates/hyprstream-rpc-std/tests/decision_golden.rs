@@ -116,11 +116,14 @@ questions:
             // and contains the argmax label, as conformal sets do.
             rows: vec![
                 row(vec![("tone", answered_choice(&[0.08, 0.92, 0.0]))]),
-                row(vec![("tone", {
-                    let mut answer = answered_choice(&[0.5, 0.3, 0.2]);
-                    answer.conformal_set = Some(vec!["formal".into(), "casual".into()]);
-                    answer
-                })]),
+                row(vec![(
+                    "tone",
+                    {
+                        let mut answer = answered_choice(&[0.5, 0.3, 0.2]);
+                        answer.conformal_set = Some(vec!["formal".into(), "casual".into()]);
+                        answer
+                    },
+                )]),
             ],
         },
         // primitives/score — docs worked example 0×0.0 + 1×0.70 + 2×0.30 = 1.30,
@@ -171,7 +174,9 @@ questions:
 
 /// Serialize + reparse a capnp message, proving the wire form (not just the
 /// in-memory builder) round-trips.
-fn wire_roundtrip(message: &capnp::message::Builder<capnp::message::HeapAllocator>) -> Vec<u8> {
+fn wire_roundtrip(
+    message: &capnp::message::Builder<capnp::message::HeapAllocator>,
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, message).expect("serialize");
     bytes
@@ -234,11 +239,7 @@ fn arrow_conformal_set(
         .as_any()
         .downcast_ref::<arrow_array::StringArray>()
         .expect("conformal_set elements are Utf8");
-    Some(
-        (0..values.len())
-            .map(|i| values.value(i).to_owned())
-            .collect(),
-    )
+    Some((0..values.len()).map(|i| values.value(i).to_owned()).collect())
 }
 
 fn utf8_column(batch: &arrow_array::RecordBatch, name: &str, row: usize) -> Option<String> {
@@ -262,9 +263,11 @@ fn check_golden_vector(vector: &GoldenVector) {
 
     // --- capnp question-set round-trip (spec emission) ---
     let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encode"));
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("capnp question-set message parses");
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("capnp question-set message parses");
     let decoded_set = decision::question_set_from_reader(
         message
             .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
@@ -278,11 +281,12 @@ fn check_golden_vector(vector: &GoldenVector) {
     );
 
     // --- capnp batch round-trip (answer emission) ---
-    let bytes =
-        wire_roundtrip(&decision::batch_to_message(&vector.version, &vector.rows).expect("encode"));
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("capnp batch message parses");
+    let bytes = wire_roundtrip(&decision::batch_to_message(&vector.version, &vector.rows).expect("encode"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("capnp batch message parses");
     let (decoded_version, decoded_rows) = decision::batch_from_reader(
         message
             .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
@@ -362,10 +366,7 @@ fn check_golden_vector(vector: &GoldenVector) {
                 "{}: capnp-decoded conformal set ≡ Arrow conformal column (row {row_index})",
                 vector.name
             );
-            match (
-                &decoded_answer.value,
-                &source_row.answers[&question.id].value,
-            ) {
+            match (&decoded_answer.value, &source_row.answers[&question.id].value) {
                 (None, None) => {
                     assert_eq!(
                         arrow_probs, None,
@@ -381,10 +382,7 @@ fn check_golden_vector(vector: &GoldenVector) {
                 (Some(value), Some(_)) => {
                     let distribution = value.probabilities();
                     let arrow_probs = arrow_probs.unwrap_or_else(|| {
-                        panic!(
-                            "{}: answered row {row_index} must have probabilities",
-                            vector.name
-                        )
+                        panic!("{}: answered row {row_index} must have probabilities", vector.name)
                     });
                     assert_eq!(
                         arrow_probs.len(),
@@ -506,7 +504,9 @@ fn decode_rejects_kind_body_mismatch_and_reserved_types() {
     use hyprstream_rpc_std::decision_capnp;
 
     let build_set = |kind: decision_capnp::QuestionKind,
-                     body: &dyn Fn(decision_capnp::question_spec::body::Builder<'_>)|
+                     body: &dyn Fn(
+        decision_capnp::question_spec::body::Builder<'_>,
+    )|
      -> Vec<u8> {
         let mut message = capnp::message::Builder::new_default();
         {
@@ -602,7 +602,8 @@ fn decode_rejects_invalid_wire_specs() {
     .expect_err("empty question set rejected");
     assert_eq!(error, decision::DecodeError::EmptyQuestionSet);
 
-    let choice_question = |mut q: decision_capnp::question_spec::Builder<'_>, names: &[&str]| {
+    let choice_question = |mut q: decision_capnp::question_spec::Builder<'_>,
+                           names: &[&str]| {
         q.set_id("c");
         q.set_kind(decision_capnp::QuestionKind::Choice);
         q.reborrow().init_instructions().set_none(());
@@ -692,9 +693,11 @@ fn calib_none_is_distinct_from_empty_string() {
             QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
         )])];
         let bytes = wire_roundtrip(&decision::batch_to_message(&version, &rows).expect("encode"));
-        let message =
-            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-                .expect("parses");
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
         let (decoded, _) = decision::batch_from_reader(
             message
                 .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
@@ -823,10 +826,7 @@ fn encode_rejects_empty_ids_and_bad_choice_option_names() {
         },
     };
 
-    let mut set = QuestionSet {
-        state: None,
-        questions: vec![noul("")],
-    };
+    let mut set = QuestionSet { state: None, questions: vec![noul("")] };
     let error = decision::question_set_to_message(&set)
         .err()
         .expect("empty question id rejected at encode");
@@ -836,10 +836,7 @@ fn encode_rejects_empty_ids_and_bad_choice_option_names() {
     let error = decision::question_set_to_message(&set)
         .err()
         .expect("empty choice option name rejected at encode");
-    assert_eq!(
-        error,
-        decision::EncodeError::EmptyChoiceOptionName("q".into())
-    );
+    assert_eq!(error, decision::EncodeError::EmptyChoiceOptionName("q".into()));
 
     set.questions = vec![choice("q", &["a", "b", "a"])];
     let error = decision::question_set_to_message(&set)
@@ -853,9 +850,11 @@ fn encode_rejects_empty_ids_and_bad_choice_option_names() {
     // The well-formed counterpart still encodes and decodes cleanly.
     set.questions = vec![choice("q", &["a", "b"])];
     let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encodes"));
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("parses");
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
     let decoded = decision::question_set_from_reader(
         message
             .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
@@ -863,17 +862,12 @@ fn encode_rejects_empty_ids_and_bad_choice_option_names() {
     )
     .expect("decodes");
     assert_eq!(
-        decoded.questions[0].body,
+        decoded.questions[0]
+            .body,
         hyprstream_decision::QuestionBody::Choice {
             options: vec![
-                hyprstream_decision::ChoiceOption {
-                    name: "a".into(),
-                    rubric: None
-                },
-                hyprstream_decision::ChoiceOption {
-                    name: "b".into(),
-                    rubric: None
-                },
+                hyprstream_decision::ChoiceOption { name: "a".into(), rubric: None },
+                hyprstream_decision::ChoiceOption { name: "b".into(), rubric: None },
             ]
         },
     );
@@ -991,7 +985,9 @@ fn encode_decode_reject_round6_contract_violations() {
     };
     assert!(matches!(
         decision::question_set_to_message(&set),
-        Err(decision::EncodeError::NonFiniteEntryNumber { question: Some(_) })
+        Err(decision::EncodeError::NonFiniteEntryNumber {
+            question: Some(_)
+        })
     ));
 
     // A well-formed set still round-trips exactly (all validations pass).
@@ -1000,9 +996,11 @@ fn encode_decode_reject_round6_contract_violations() {
         questions: vec![choice("q", &["a", "b"]), score("s", 3)],
     };
     let bytes = wire_roundtrip(&decision::question_set_to_message(&set).expect("encodes"));
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("parses");
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
     let decoded = decision::question_set_from_reader(
         message
             .get_root::<hyprstream_rpc_std::decision_capnp::question_set::Reader<'_>>()
@@ -1029,7 +1027,11 @@ fn conformal_labels_are_validated_against_the_answer_kind() {
         "q",
         QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.8 }),
     )]);
-    invalid.answers.get_mut("q").expect("answer").conformal_set = Some(vec!["maybe".into()]);
+    invalid
+        .answers
+        .get_mut("q")
+        .expect("answer")
+        .conformal_set = Some(vec!["maybe".into()]);
     assert!(matches!(
         decision::batch_to_message(&version, &[invalid]),
         Err(decision::EncodeError::ConformalLabelImpossible(_))
@@ -1040,7 +1042,8 @@ fn conformal_labels_are_validated_against_the_answer_kind() {
         "q",
         QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.8 }),
     )]);
-    valid.answers.get_mut("q").expect("answer").conformal_set = Some(vec!["true".into()]);
+    valid.answers.get_mut("q").expect("answer").conformal_set =
+        Some(vec!["true".into()]);
     assert!(decision::batch_to_message(&version, &[valid]).is_ok());
 
     // Decode: a score answer cannot carry an out-of-range decimal index.
@@ -1069,9 +1072,11 @@ fn conformal_labels_are_validated_against_the_answer_kind() {
         wire_roundtrip(&message)
     };
     let decode = |bytes: &[u8]| {
-        let message =
-            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-                .expect("parses");
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
         let reader = message
             .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
             .expect("root");
@@ -1143,9 +1148,11 @@ fn empty_rows_and_noncanonical_score_labels_are_rejected() {
         wire_roundtrip(&message)
     };
     let bytes = raw_batch(0);
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("parses");
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
     let reader = message
         .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
         .expect("root");
@@ -1217,9 +1224,11 @@ fn score_conformal_labels_require_canonical_in_range_indices() {
             answer.init_conformal_set().init_some(1).set(0, label);
         }
         let bytes = wire_roundtrip(&message);
-        let message =
-            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-                .expect("parses");
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
         let reader = message
             .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
             .expect("root");
@@ -1247,10 +1256,7 @@ fn encode_rejects_unbindable_answers() {
     };
 
     // Empty answer key.
-    let answer_row = row(vec![(
-        "",
-        QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
-    )]);
+    let answer_row = row(vec![("", QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }))]);
     assert!(matches!(
         decision::batch_to_message(&version, &[answer_row]),
         Err(decision::EncodeError::EmptyAnswerQuestionId)
@@ -1320,9 +1326,11 @@ fn decode_rejects_unbindable_answers() {
         wire_roundtrip(&message)
     };
     let decode = |bytes: &[u8]| {
-        let message =
-            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-                .expect("parses");
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
         let reader = message
             .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
             .expect("root");
@@ -1379,10 +1387,13 @@ fn conformal_set_none_and_present_empty_stay_distinct() {
         "q",
         QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.75 }),
     )]);
-    let bytes = wire_roundtrip(&decision::batch_to_message(&version, &[absent]).expect("encodes"));
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("parses");
+    let bytes =
+        wire_roundtrip(&decision::batch_to_message(&version, &[absent]).expect("encodes"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
     let reader = message
         .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
         .expect("root");
@@ -1395,8 +1406,8 @@ fn conformal_set_none_and_present_empty_stay_distinct() {
     // present-empty under the old schema).
     let mut rebuilt = capnp::message::Builder::new_default();
     {
-        let mut root =
-            rebuilt.init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
+        let mut root = rebuilt
+            .init_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Builder<'_>>();
         root.set_version(reader.get_version().expect("version"))
             .expect("copies");
         let rows_builder = root.init_rows(1);
@@ -1416,7 +1427,8 @@ fn conformal_set_none_and_present_empty_stay_distinct() {
         .expect("root");
     let (_, rows) = decision::batch_from_reader(reader).expect("decodes");
     assert_eq!(
-        rows[0].answers["q"].conformal_set, None,
+        rows[0].answers["q"].conformal_set,
+        None,
         "rebuild keeps the set absent"
     );
 
@@ -1425,11 +1437,18 @@ fn conformal_set_none_and_present_empty_stay_distinct() {
         "q",
         QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.75 }),
     )]);
-    present.answers.get_mut("q").expect("answer").conformal_set = Some(Vec::new());
-    let bytes = wire_roundtrip(&decision::batch_to_message(&version, &[present]).expect("encodes"));
-    let message =
-        capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-            .expect("parses");
+    present
+        .answers
+        .get_mut("q")
+        .expect("answer")
+        .conformal_set = Some(Vec::new());
+    let bytes =
+        wire_roundtrip(&decision::batch_to_message(&version, &[present]).expect("encodes"));
+    let message = capnp::serialize::read_message(
+        &mut &bytes[..],
+        capnp::message::ReaderOptions::new(),
+    )
+    .expect("parses");
     let reader = message
         .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
         .expect("root");
@@ -1473,9 +1492,11 @@ fn decode_applies_consumer_tolerance_to_distributions() {
         wire_roundtrip(&message)
     };
     let decode = |bytes: &[u8]| {
-        let message =
-            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
-                .expect("parses");
+        let message = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("parses");
         let reader = message
             .get_root::<hyprstream_rpc_std::decision_capnp::decision_batch::Reader<'_>>()
             .expect("root");
@@ -1484,11 +1505,9 @@ fn decode_applies_consumer_tolerance_to_distributions() {
 
     // Grossly invalid: rejected at decode.
     let bytes = raw_batch_bytes(&[0.9, 0.9]);
-    let error = decode(&bytes).expect_err("sum 1.8 rejected at decode");
-    assert!(matches!(
-        error,
-        decision::DecodeError::InvalidDistribution(_, _)
-    ));
+    let error = decode(&bytes)
+        .expect_err("sum 1.8 rejected at decode");
+    assert!(matches!(error, decision::DecodeError::InvalidDistribution(_, _)));
 
     // Sum 1.001: outside the producer tolerance (1e-6) — batch_to_message
     // rejects the same IR — but inside the consumer tolerance (1e-2), so the
