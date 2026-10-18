@@ -1,5 +1,5 @@
 //! One synthesized item: a jev-1 question spec plus its state, augmentation
-//! coordinates, and the canonical byte form the dedup/firewall hash covers.
+//! coordinates, and the frozen canonical byte form for artifact provenance.
 
 use std::fmt::Write as _;
 
@@ -107,8 +107,8 @@ impl SynthItem {
         hyprstream_bench::content::content_fingerprint(&self.state, &self.question)
     }
 
-    /// Canonical byte form — the exact input the dedup and item-level
-    /// contamination firewall hashes.
+    /// Canonical byte form for artifact provenance; content deduplication and
+    /// contamination checks use [`Self::content_fingerprint`] instead.
     ///
     /// `FROZEN (syn-item/1)`: immutable source/augmentation artifact identity.
     /// Its domain intentionally differs from benchmark artifact identity;
@@ -167,7 +167,7 @@ impl SynthItem {
         out.into_bytes()
     }
 
-    /// blake3 hex digest of [`Self::canonical_bytes`] — artifact/dedup identity.
+    /// blake3 hex digest of [`Self::canonical_bytes`] — frozen artifact identity.
     pub fn hash(&self) -> String {
         blake3::hash(&self.canonical_bytes()).to_hex().to_string()
     }

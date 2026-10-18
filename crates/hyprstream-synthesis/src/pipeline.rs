@@ -11,6 +11,7 @@ use crate::ensemble::{argmax_label, corrected_average, valid_probabilities};
 use crate::family::SynthFamily;
 use crate::firewall::{Firewall, FirewallViolation};
 use crate::gen::{generate, item_seed, PARAPHRASES};
+use crate::item::SynthItem;
 use crate::labelctl::{LabelController, LabelPolicy};
 use crate::teacher::Teacher;
 
@@ -133,6 +134,15 @@ pub(crate) fn answer_checked_item(
     Ok(answers)
 }
 
+/// First-seen exact typed request content wins, independently of artifact
+/// coordinates. Artifact hashes remain unchanged for provenance.
+fn admit_unique_content(seen: &mut HashSet<String>, item: &SynthItem) -> Result<bool, SynthError> {
+    let fingerprint = item.content_fingerprint().map_err(|error| {
+        SynthError::Firewall(FirewallViolation::InvalidContent(error.to_string()))
+    })?;
+    Ok(seen.insert(fingerprint))
+}
+
 /// Run the pipeline. `teachers` is the roster order; every item is answered
 /// by every teacher and all raw vectors are persisted. `temperatures` is the
 /// fitted P0.5 correction map (roster id → temperature): label control must
@@ -214,7 +224,7 @@ pub fn run(
                     for item in variants {
                         stats.generated += 1;
                         firewall.check_item(&item).map_err(SynthError::Firewall)?;
-                        if !seen.insert(item.hash()) {
+                        if !admit_unique_content(&mut seen, &item)? {
                             stats.dedup_dropped += 1;
                             continue;
                         }
@@ -254,4 +264,144 @@ pub fn run(
         .collect();
     corpus.stats = stats;
     Ok(corpus)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod content_dedup_tests {
+    use super::*;
+    use hyprstream_decision::{ChoiceOption, Entry, QuestionBody};
+
+    fn item() -> SynthItem {
+        SynthItem::new(
+            SynthFamily::Triage,
+            7,
+            0,
+            0,
+            Entry::Map(vec![
+                ("first".into(), Entry::Number(1.0)),
+                ("second".into(), Entry::Number(2.0)),
+            ]),
+            Some("Choose the owner.".into()),
+            QuestionBody::Choice {
+                options: vec![
+                    ChoiceOption {
+                        name: "zebra".into(),
+                        rubric: None,
+                    },
+                    ChoiceOption {
+                        name: "alpha".into(),
+                        rubric: Some(Entry::Str("Escalation".into())),
+                    },
+                ],
+            },
+        )
+    }
+
+    #[test]
+    fn content_dedup_ignores_artifact_coordinates() {
+        let original = item();
+        let mut duplicate = original.clone();
+        duplicate.id = "other_artifact".into();
+        duplicate.question.id = "other_question".into();
+        duplicate.group = "other_group".into();
+        duplicate.seed += 1;
+        duplicate.rotation = 1;
+        duplicate.paraphrase = 1;
+        assert_ne!(original.hash(), duplicate.hash());
+        let mut seen = HashSet::new();
+        assert!(admit_unique_content(&mut seen, &original).unwrap());
+        assert!(!admit_unique_content(&mut seen, &duplicate).unwrap());
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn content_dedup_preserves_typed_request_distinctions() {
+        let original = item();
+        let mut seen = HashSet::new();
+        assert!(admit_unique_content(&mut seen, &original).unwrap());
+        for change in [
+            "state-value",
+            "state-order",
+            "instructions",
+            "absent-instructions",
+            "null-instructions",
+            "option-order",
+            "rubric",
+            "null-rubric",
+        ] {
+            let mut changed = original.clone();
+            match change {
+                "state-value" => changed.state = Entry::Str("different state".into()),
+                "state-order" => {
+                    let Entry::Map(entries) = &mut changed.state else {
+                        unreachable!()
+                    };
+                    entries.reverse();
+                }
+                "instructions" => {
+                    changed.question.instructions =
+                        Some(Entry::Str("Reworded instructions.".into()));
+                }
+                "absent-instructions" => changed.question.instructions = None,
+                "null-instructions" => changed.question.instructions = Some(Entry::Null),
+                "option-order" | "rubric" | "null-rubric" => {
+                    let QuestionBody::Choice { options } = &mut changed.question.body else {
+                        unreachable!()
+                    };
+                    match change {
+                        "option-order" => options.reverse(),
+                        "rubric" => options[1].rubric = Some(Entry::Str("Changed rubric".into())),
+                        "null-rubric" => options[0].rubric = Some(Entry::Null),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                admit_unique_content(&mut seen, &changed).unwrap(),
+                "{change}"
+            );
+        }
+        let mut score = original;
+        score.question.kind = QuestionKind::Score;
+        score.question.body = QuestionBody::Score {
+            levels: vec![None, Some(Entry::Str("High".into()))],
+        };
+        assert!(admit_unique_content(&mut seen, &score).unwrap());
+        for change in ["null-level", "level-order", "level-rubric"] {
+            let mut changed = score.clone();
+            let QuestionBody::Score { levels } = &mut changed.question.body else {
+                unreachable!()
+            };
+            match change {
+                "null-level" => levels[0] = Some(Entry::Null),
+                "level-order" => levels.reverse(),
+                "level-rubric" => levels[1] = Some(Entry::Str("Changed level".into())),
+                _ => unreachable!(),
+            }
+            assert!(
+                admit_unique_content(&mut seen, &changed).unwrap(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_dedup_fails_closed_on_invalid_typed_content() {
+        let mut seen = HashSet::new();
+        let mut invalid = item();
+        invalid.state = Entry::Number(f64::NAN);
+        assert!(matches!(
+            admit_unique_content(&mut seen, &invalid),
+            Err(SynthError::Firewall(FirewallViolation::InvalidContent(_)))
+        ));
+        let mut invalid = item();
+        invalid.question.kind = QuestionKind::Noul;
+        assert!(matches!(
+            admit_unique_content(&mut seen, &invalid),
+            Err(SynthError::Firewall(FirewallViolation::InvalidContent(_)))
+        ));
+        assert!(seen.is_empty());
+    }
 }

@@ -34,7 +34,7 @@
 //!   DISCLOSURE text) and the pipeline rejects any synthesized item that
 //!   hits a gate family or collides with a frozen item hash.
 //! - **Label-distribution control + dedup** ([`labelctl`]) — optional
-//!   balancing over ensemble-argmax labels, and canonical-hash dedup of
+//!   balancing over ensemble-argmax labels, and typed-content dedup of
 //!   emitted rows.
 //!
 //! ## No human labeling

@@ -9,7 +9,7 @@
 //!   against the manifest's `gate` designations at run time.
 //! - **Item-level**: synthesized state/question content must not match the
 //!   shared typed fingerprint of any completely attested frozen benchmark
-//!   item. Source-specific artifact/dedup hashes remain distinct and unchanged.
+//!   item. Source-specific artifact hashes remain distinct and unchanged.
 //!
 //! The loader **verifies the pins** before any check: the manifest file's
 //! blake3, the embedded release id, and the embedded DISCLOSURE digest must

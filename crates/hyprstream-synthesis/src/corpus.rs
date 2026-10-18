@@ -52,7 +52,7 @@ pub struct CorpusRow {
     pub group: String,
     /// Question kind (`noul` / `choice` / `score`).
     pub kind: String,
-    /// blake3 of the item's canonical bytes (dedup + firewall handle).
+    /// blake3 of the item's frozen canonical artifact bytes (provenance handle).
     pub blake3: String,
     /// Generation seed.
     pub seed: u64,
@@ -262,7 +262,7 @@ pub struct SynthStats {
     pub generated: usize,
     /// Rows accepted into the corpus.
     pub accepted: usize,
-    /// Items dropped as exact canonical-hash duplicates.
+    /// Items dropped as exact typed-content duplicates, excluding opaque IDs/coordinates.
     pub dedup_dropped: usize,
     /// Items deferred by label-distribution control.
     pub label_deferred: usize,
