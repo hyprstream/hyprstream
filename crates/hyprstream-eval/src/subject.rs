@@ -472,6 +472,15 @@ impl HttpSubject {
         format!("{}/v1/systemone", self.base_url)
     }
 
+    // Shared with side-effect-free preflight so request construction cannot
+    // fail deterministically after an earlier ensemble teacher was queried.
+    fn request_builder(&self) -> reqwest::RequestBuilder {
+        self.client
+            .post(self.endpoint())
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+    }
+
     /// The requested model string (possibly an alias), as configured.
     pub fn requested_model(&self) -> &str {
         &self.model
@@ -494,10 +503,7 @@ impl HttpSubject {
         let body = serde_json::to_vec(&request_body(set, state, &self.model))
             .map_err(|error| EvalError::InvalidInput(format!("invalid request entry: {error}")))?;
         let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .request_builder()
             .body(body)
             .send()
             .await
@@ -557,6 +563,21 @@ impl Subject for HttpSubject {
                 "the legacy /v1/systemone HTTP endpoint requires a non-null state".to_owned(),
             ));
         }
+        let endpoint = reqwest::Url::parse(&self.endpoint()).map_err(|_| {
+            EvalError::InvalidInput(
+                "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
+            )
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
+            ));
+        }
+        self.request_builder().build().map_err(|_| {
+            // Request/headers/URL may contain credentials. Never include the
+            // underlying error or Debug representation in this public error.
+            EvalError::InvalidInput("invalid HTTP subject request configuration".to_owned())
+        })?;
         Ok(())
     }
 

@@ -604,12 +604,32 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let set = fixture();
     let state = Entry::Str("valid non-null state".into());
-    for (model, token) in [("", "token"), ("alias", ""), ("alias", " \t ")] {
-        let http = HttpSubject::new(&endpoint, model, token);
+    for base_url in [endpoint.as_str(), "https://example.invalid"] {
+        assert!(HttpSubject::new(base_url, "alias", "valid-token")
+            .preflight(&set, &state)
+            .is_ok());
+    }
+    let unsupported = endpoint.replacen("http://", "ftp://", 1);
+    for (base_url, model, token) in [
+        (endpoint.as_str(), "", "token"),
+        (endpoint.as_str(), "alias", ""),
+        (endpoint.as_str(), "alias", " \t "),
+        ("", "alias", "token"),
+        (":invalid-url", "alias", "token"),
+        (unsupported.as_str(), "alias", "token"),
+        (endpoint.as_str(), "alias", "secret\r\ninvalid-token"),
+        (endpoint.as_str(), "alias", "secret\0invalid-token"),
+    ] {
+        let http = HttpSubject::new(base_url, model, token);
         let direct = tokio::time::timeout(Duration::from_secs(1), http.decide(&set, &state, 0))
             .await
             .unwrap();
-        assert!(matches!(direct, Err(EvalError::InvalidInput(_))));
+        let error = direct.unwrap_err();
+        assert!(matches!(error, EvalError::InvalidInput(_)));
+        assert!(
+            !error.to_string().contains("secret"),
+            "preflight must redact credential errors"
+        );
         let item = EvalItem {
             id: "configuration".into(),
             question: set.questions[0].clone(),
@@ -633,7 +653,7 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
             Teacher {
                 id: "http-later".into(),
                 tos_class: TosClass::Unknown,
-                subject: Box::new(HttpSubject::new(&endpoint, model, token)),
+                subject: Box::new(HttpSubject::new(base_url, model, token)),
             },
         ])
         .unwrap();
