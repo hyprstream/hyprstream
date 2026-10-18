@@ -673,4 +673,248 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
+    for budget in [
+        hyprstream_eval::HttpBudget {
+            connect_timeout: Duration::ZERO,
+            ..Default::default()
+        },
+        hyprstream_eval::HttpBudget {
+            request_timeout: Duration::ZERO,
+            ..Default::default()
+        },
+        hyprstream_eval::HttpBudget {
+            max_response_bytes: 0,
+            ..Default::default()
+        },
+        hyprstream_eval::HttpBudget {
+            connect_timeout: Duration::MAX,
+            ..Default::default()
+        },
+        hyprstream_eval::HttpBudget {
+            request_timeout: Duration::MAX,
+            ..Default::default()
+        },
+    ] {
+        let http = HttpSubject::new_with_budget(&endpoint, "alias", "secret-token", budget);
+        assert!(matches!(
+            http.preflight(&set, &state),
+            Err(EvalError::InvalidInput(_))
+        ));
+        let direct = tokio::time::timeout(Duration::from_secs(1), http.decide(&set, &state, 0))
+            .await
+            .unwrap();
+        assert!(matches!(direct, Err(EvalError::InvalidInput(_))));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let teachers = TeacherEnsemble::new(vec![
+            Teacher {
+                id: "native-first".into(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(CountNative(calls.clone())),
+            },
+            Teacher {
+                id: "http-later".into(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(http),
+            },
+        ])
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            teachers.decide(&set, &state, 0, "invalid-budget"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+}
+
+async fn serve_budget_reply(
+    reply: Vec<u8>,
+    hold_open: bool,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted, witness) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 8192];
+        let mut filled = 0;
+        while !request[..filled]
+            .windows(4)
+            .any(|bytes| bytes == b"\r\n\r\n")
+        {
+            assert!(filled < request.len());
+            let count = socket.read(&mut request[filled..]).await.unwrap();
+            assert!(count > 0);
+            filled += count;
+        }
+        accepted.send(()).unwrap();
+        socket.write_all(&reply).await.unwrap();
+        if hold_open {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+    (address, task, witness)
+}
+
+fn tiny_http_budget() -> hyprstream_eval::HttpBudget {
+    hyprstream_eval::HttpBudget {
+        connect_timeout: std::time::Duration::from_millis(100),
+        request_timeout: std::time::Duration::from_millis(100),
+        max_response_bytes: 16,
+    }
+}
+
+#[tokio::test]
+async fn http_budget_bounds_stalled_headers_and_incomplete_body() {
+    for reply in [
+        Vec::new(),
+        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\n{".to_vec(),
+    ] {
+        let (address, server, witnessed) = serve_budget_reply(reply, true).await;
+        let subject = HttpSubject::new_with_budget(
+            format!("http://{address}"),
+            "alias",
+            "secret-token",
+            tiny_http_budget(),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subject.decide(&fixture(), &Entry::Str("valid state".into()), 0),
+        )
+        .await
+        .unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, hyprstream_eval::EvalError::Http(ref text) if text.contains("timed out"))
+        );
+        assert!(!error.to_string().contains("secret"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), witnessed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(subject.resolved_model_id(), "alias");
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn http_budget_counts_chunked_bodies_without_trusting_content_length() {
+    for status in ["200 OK", "401 Unauthorized"] {
+        for content_length in ["", "content-length: 1\r\n"] {
+            let reply = format!("HTTP/1.1 {status}\r\ntransfer-encoding: chunked\r\n{content_length}connection: close\r\n\r\nc\r\nsecretsecret\r\nc\r\nsecretsecret\r\n0\r\n\r\n");
+            let (address, server, witnessed) = serve_budget_reply(reply.into_bytes(), false).await;
+            let subject = HttpSubject::new_with_budget(
+                format!("http://{address}"),
+                "alias",
+                "secret-token",
+                tiny_http_budget(),
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                subject.decide(&fixture(), &Entry::Str("valid state".into()), 0),
+            )
+            .await
+            .unwrap();
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, hyprstream_eval::EvalError::Http(ref text) if text.contains("byte budget")),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("secret"));
+            tokio::time::timeout(std::time::Duration::from_secs(1), witnessed)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(subject.resolved_model_id(), "alias");
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_budget_rejects_oversized_content_length_without_waiting_for_body() {
+    let (address, server, witnessed) = serve_budget_reply(
+        b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n".to_vec(),
+        true,
+    )
+    .await;
+    let subject = HttpSubject::new_with_budget(
+        format!("http://{address}"),
+        "alias",
+        "secret-token",
+        tiny_http_budget(),
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        subject.decide(&fixture(), &Entry::Str("valid state".into()), 0),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(hyprstream_eval::EvalError::Http(ref text)) if text.contains("byte budget"))
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), witnessed)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn http_budget_accepts_valid_response_and_redacts_provider_error_body() {
+    let budget = hyprstream_eval::HttpBudget {
+        connect_timeout: std::time::Duration::from_secs(1),
+        request_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let (address, server) = serve_stub().await;
+    let subject =
+        HttpSubject::new_with_budget(format!("http://{address}"), "alias", "secret-token", budget);
+    let answers = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        subject.decide(&fixture(), &Entry::Str("valid state".into()), 0),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(answers.answers.len(), fixture().questions.len());
+    assert_eq!(
+        subject.resolved_model_id(),
+        hyprstream_decision_stub::mock::STUB_MODEL_VERSION
+    );
+    server.abort();
+    let (address, server, witnessed) = serve_budget_reply(
+        b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecret"
+            .to_vec(),
+        false,
+    )
+    .await;
+    let subject =
+        HttpSubject::new_with_budget(format!("http://{address}"), "alias", "secret-token", budget);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        subject.decide(&fixture(), &Entry::Str("valid state".into()), 0),
+    )
+    .await
+    .unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::Http(ref message) if message == "status 401")
+    );
+    assert!(!error.to_string().contains("secret"));
+    tokio::time::timeout(std::time::Duration::from_secs(1), witnessed)
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
 }
