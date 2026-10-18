@@ -178,6 +178,12 @@ pub(crate) mod sealed {
 ///
 /// (Name retained from the iroh-only era to avoid churn in callers.)
 pub trait IrohRequestProcessor: sealed::Sealed + Send + Sync + 'static {
+    /// Native-only concrete canonical bridge capability. Generic adapters and
+    /// remote processors cannot manufacture delivery-completion witnesses.
+    fn controlled_local_sender(&self) -> Option<super::iroh_rpc::ControlledLocalSender> {
+        None
+    }
+
     /// Close service admission before removing an in-process endpoint. The
     /// owning bridge performs the bounded drain and join separately.
     fn close_admission(&self) {

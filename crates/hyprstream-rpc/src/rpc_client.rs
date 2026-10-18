@@ -25,6 +25,312 @@ use crate::transport_traits::{Signer, Transport};
 
 type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use retained_local::{RetainedLocalOutcome, RetainedLocalResponse, VerifiedLocalReply};
+#[cfg(not(target_arch = "wasm32"))]
+mod retained_local {
+    use super::*;
+    use crate::transport::iroh_rpc::{
+        CompletedLocalDispatch, LocalCompletion, NeverEnqueuedLocalDispatch, ObservedLocalDelivery,
+    };
+    use sha2::Digest;
+
+    /// Cryptographically verified bytes for ONE exact canonical local call.
+    /// No public constructor, Clone, Deserialize or payload-bearing Debug.
+    pub struct VerifiedLocalReply {
+        request_id: u64,
+        body: Vec<u8>,
+        request_sha256: [u8; 32],
+        body_sha256: [u8; 32],
+        server: [u8; 32],
+        service: String,
+        method: u16,
+    }
+    impl VerifiedLocalReply {
+        pub fn payload(&self) -> &[u8] {
+            &self.body
+        }
+        pub fn request_id(&self) -> u64 {
+            self.request_id
+        }
+        /// Association hashes are request-local: never log/persist them.
+        pub fn request_sha256(&self) -> [u8; 32] {
+            self.request_sha256
+        }
+        pub fn original_body_sha256(&self) -> [u8; 32] {
+            self.body_sha256
+        }
+        pub fn server_key(&self) -> [u8; 32] {
+            self.server
+        }
+        pub fn service(&self) -> &str {
+            &self.service
+        }
+        pub fn method_discriminator(&self) -> u16 {
+            self.method
+        }
+    }
+    /// Non-verified delivery observations MUST NOT release native permits.
+    /// Opaque local receipts retain their distinct evidence, not guessed codes.
+    pub enum RetainedLocalOutcome {
+        Verified(VerifiedLocalReply),
+        NeverEnqueued(Arc<NeverEnqueuedLocalDispatch>),
+        DeliveryUnknown,
+        UnverifiedDispatch(Arc<CompletedLocalDispatch>),
+    }
+    #[cfg_attr(test, derive(Clone))]
+    struct Expected {
+        request_id: u64,
+        frame_sha256: [u8; 32],
+        body_sha256: [u8; 32],
+        server: VerifyingKey,
+        trust: Arc<envelope::KeyedPqTrustStore>,
+        service: String,
+        method: u16,
+    }
+    impl Expected {
+        fn verify_bytes(&self, raw: &[u8]) -> Result<Vec<u8>> {
+            anyhow::ensure!(
+                raw.len() <= crate::transport::rpc_session::MAX_FRAME_BYTES,
+                "retained signed response exceeds canonical frame bound"
+            );
+            // This is the SAME canonical verifier used by the ordinary local
+            // unwrap_response path. No new signature/profile/decode shortcut.
+            let (id, body) = envelope::unwrap_response_with(
+                raw,
+                Some(&self.server),
+                Some(self.trust.as_ref()),
+                crate::crypto::CryptoPolicy::Hybrid,
+            )?;
+            anyhow::ensure!(
+                id == self.request_id,
+                "retained response does not match actual pending request ID"
+            );
+            anyhow::ensure!(
+                body.len() <= 1024 * 1024,
+                "retained response payload exceeds controlled row bound"
+            );
+            Ok(body)
+        }
+        fn verify_complete(
+            self,
+            complete: Arc<CompletedLocalDispatch>,
+        ) -> Result<RetainedLocalOutcome> {
+            anyhow::ensure!(
+                complete.request_sha256() == self.frame_sha256,
+                "retained completion is not the canonical sealed request"
+            );
+            anyhow::ensure!(
+                complete.server_key() == self.server.to_bytes(),
+                "retained completion server differs from pinned client identity"
+            );
+            if complete.capture_failure().is_some() || complete.signed_response().is_none() {
+                // Processor/capture failure is evidence of actual local dispatch,
+                // not a guessed prestart auth rejection or stopped worker.
+                return Ok(RetainedLocalOutcome::UnverifiedDispatch(complete));
+            }
+            let raw = complete
+                .signed_response()
+                .ok_or_else(|| anyhow::anyhow!("retained signed response absent"))?;
+            let body = self.verify_bytes(raw)?;
+            Ok(RetainedLocalOutcome::Verified(VerifiedLocalReply {
+                request_id: self.request_id,
+                body,
+                request_sha256: self.frame_sha256,
+                body_sha256: self.body_sha256,
+                server: self.server.to_bytes(),
+                service: self.service,
+                method: self.method,
+            }))
+        }
+    }
+    enum Phase {
+        Unclaimed,
+        Sealing,
+        Sealed(Option<Box<Expected>>),
+        Aborted,
+    }
+    pub(super) struct Publication {
+        state: parking_lot::Mutex<Phase>,
+        changed: tokio::sync::Notify,
+        completion: LocalCompletion,
+    }
+    impl Publication {
+        pub(super) fn allocate(completion: LocalCompletion) -> Arc<Self> {
+            Arc::new(Self {
+                state: parking_lot::Mutex::new(Phase::Unclaimed),
+                changed: tokio::sync::Notify::new(),
+                completion,
+            })
+        }
+        pub(super) fn claim(self: &Arc<Self>) -> Result<SealGuard> {
+            let mut state = self.state.lock();
+            anyhow::ensure!(
+                matches!(*state, Phase::Unclaimed),
+                "retained controlled client can seal only once"
+            );
+            *state = Phase::Sealing;
+            drop(state);
+            Ok(SealGuard {
+                publication: Arc::clone(self),
+                published: false,
+            })
+        }
+        async fn take(&self) -> Result<Expected> {
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let mut state = self.state.lock();
+                    match &mut *state {
+                        Phase::Sealed(expected) => {
+                            return expected.take().map(|expected| *expected).ok_or_else(|| {
+                                anyhow::anyhow!("retained verifier already consumed")
+                            })
+                        }
+                        Phase::Aborted => anyhow::bail!(
+                            "controlled call sealing aborted; no verified worker outcome"
+                        ),
+                        Phase::Unclaimed | Phase::Sealing => {}
+                    }
+                }
+                notified.await;
+            }
+        }
+    }
+    // Private to canonical client sealing; never a user/main-supplied verifier.
+    pub(super) struct SealDescription<'a> {
+        pub(super) request_id: u64,
+        pub(super) bytes: &'a [u8],
+        pub(super) body_sha256: [u8; 32],
+        pub(super) server: VerifyingKey,
+        pub(super) store: &'a dyn envelope::PqTrustStore,
+        pub(super) service: &'a str,
+        pub(super) method: u16,
+    }
+    pub(super) struct SealGuard {
+        publication: Arc<Publication>,
+        published: bool,
+    }
+    impl SealGuard {
+        pub(super) fn publish(mut self, description: SealDescription<'_>) -> Result<()> {
+            let SealDescription {
+                request_id,
+                bytes,
+                body_sha256,
+                server,
+                store,
+                service,
+                method,
+            } = description;
+            envelope::validate_service_domain(service)?;
+            anyhow::ensure!(
+                bytes.len() <= crate::transport::rpc_session::MAX_FRAME_BYTES,
+                "retained signed request exceeds canonical frame bound"
+            );
+            let pq = store.ml_dsa_key_for(&server.to_bytes()).ok_or_else(|| {
+                anyhow::anyhow!("retained response server lacks anchored ML-DSA key")
+            })?;
+            // Freeze actual anchored key at the real seal, not a mutable
+            // process-global identity lookup at eventual response arrival.
+            let mut trust = envelope::KeyedPqTrustStore::new();
+            trust.bind(server.to_bytes(), &pq);
+            let expected = Box::new(Expected {
+                request_id,
+                frame_sha256: sha2::Sha256::digest(bytes).into(),
+                body_sha256,
+                server,
+                trust: Arc::new(trust),
+                service: service.to_owned(),
+                method,
+            });
+            {
+                let mut state = self.publication.state.lock();
+                anyhow::ensure!(
+                    matches!(*state, Phase::Sealing),
+                    "retained seal publication state changed"
+                );
+                *state = Phase::Sealed(Some(expected));
+            }
+            self.published = true;
+            self.publication.changed.notify_waiters();
+            Ok(())
+        }
+    }
+    impl Drop for SealGuard {
+        fn drop(&mut self) {
+            if self.published {
+                return;
+            }
+            {
+                let mut state = self.publication.state.lock();
+                if matches!(*state, Phase::Sealing) {
+                    *state = Phase::Aborted;
+                }
+            }
+            self.publication.changed.notify_waiters();
+        }
+    }
+    /// Held by Model's retained supervisor independently of Flight/client waiter.
+    /// No public constructor or Clone: exactly one eventual verification attempt.
+    pub struct RetainedLocalResponse {
+        publication: Arc<Publication>,
+    }
+    impl RetainedLocalResponse {
+        pub(super) fn new(publication: Arc<Publication>) -> Self {
+            Self { publication }
+        }
+        pub async fn verify(self) -> Result<RetainedLocalOutcome> {
+            let expected = self.publication.take().await?;
+            match self.publication.completion.wait_outcome().await {
+                ObservedLocalDelivery::Completed(complete) => expected.verify_complete(complete),
+                ObservedLocalDelivery::NeverEnqueued(proof) => {
+                    anyhow::ensure!(
+                        proof.request_sha256() == expected.frame_sha256,
+                        "retained no-enqueue receipt belongs to another sealed request"
+                    );
+                    Ok(RetainedLocalOutcome::NeverEnqueued(proof))
+                }
+                ObservedLocalDelivery::DeliveryUnknown => Ok(RetainedLocalOutcome::DeliveryUnknown),
+            }
+        }
+        // Negative crypto tests only: expected state is from actual client
+        // sealing; production has NO arbitrary-byte/ID/verifier entry point.
+        #[cfg(test)]
+        pub(crate) fn verify_candidate_bytes_for_test(&self, raw: &[u8]) -> Result<Vec<u8>> {
+            let expected = {
+                let state = self.publication.state.lock();
+                match &*state {
+                    Phase::Sealed(Some(expected)) => expected.as_ref().clone(),
+                    _ => anyhow::bail!("actual retained seal absent"),
+                }
+            };
+            expected.verify_bytes(raw)
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl<S: Signer> RpcClientImpl<S, crate::transport::iroh_rpc::ControlledLocalTransport> {
+    /// Opt in this concrete ONE-SHOT LOCAL client; generated clients can still
+    /// consume it through Arc<dyn RpcClient>. No caller-supplied pending ID/key.
+    pub fn retain_local_response(mut self) -> Result<(Self, RetainedLocalResponse)> {
+        anyhow::ensure!(
+            self.retained_local.is_none(),
+            "retained local observer already installed"
+        );
+        anyhow::ensure!(
+            self.server_verifying_key.is_some(),
+            "retained local response requires pinned server identity"
+        );
+        let publication =
+            retained_local::Publication::allocate(self.transport.completion_observer());
+        let response = RetainedLocalResponse::new(Arc::clone(&publication));
+        self.retained_local = Some(publication);
+        Ok((self, response))
+    }
+}
+
 /// Revalidates external resolution authority immediately before envelope
 /// construction and sealing.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -267,6 +573,8 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pre_seal_guard: Option<Arc<dyn PreSealGuard>>,
     browser_provisioning_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
     federate_proof_provider: Option<Arc<dyn FederateProofProvider>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    retained_local: Option<Arc<retained_local::Publication>>,
     #[cfg(test)]
     response_secret_drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -289,6 +597,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             pre_seal_guard: None,
             browser_provisioning_binding: None,
             federate_proof_provider: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            retained_local: None,
             #[cfg(test)]
             response_secret_drop_probe: None,
         }
@@ -821,6 +1131,31 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
+        // Only an explicitly configured concrete one-shot local client has
+        // this publication. Original callers retain exactly their old path.
+        #[cfg(not(target_arch = "wasm32"))]
+        let retained_seal = match &self.retained_local {
+            Some(publication) => Some(publication.claim()?),
+            None => None,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let retained_body_sha256 = retained_seal.as_ref().map(|_| {
+            use sha2::Digest;
+            <[u8; 32]>::from(sha2::Sha256::digest(&payload))
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        if retained_seal.is_some() {
+            anyhow::ensure!(
+                payload.len() <= crate::transport::rpc_session::MAX_FRAME_BYTES,
+                "controlled local request body exceeds canonical frame bound"
+            );
+            anyhow::ensure!(
+                !self.transport.forbids_cleartext_envelope()
+                    && ephemeral_pubkey.is_none()
+                    && stream_kem_recipient.is_none(),
+                "retained verifier supports controlled local unary calls only"
+            );
+        }
         // Centralize the guard at sealing so every call variant uses exactly
         // one fresh fetch and keeps its binding local (including concurrent calls).
         let refreshed = match &self.pre_seal_guard {
@@ -1053,6 +1388,49 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 current.expires_at_unix_ms > chrono::Utc::now().timestamp_millis(),
                 "fresh browser binding expired during seal"
             );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(retained_seal) = retained_seal {
+            anyhow::ensure!(
+                pending.is_none(),
+                "controlled local retained verifier cannot retain a network session"
+            );
+            let policy = self
+                .response_verify_policy
+                .unwrap_or_else(envelope::global_response_verify_policy);
+            anyhow::ensure!(
+                policy == crate::crypto::CryptoPolicy::Hybrid,
+                "controlled retained verifier requires Hybrid response policy"
+            );
+            let server = self
+                .server_verifying_key
+                .as_ref()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("retained client has no pinned server"))?;
+            let store = self
+                .response_pq_store
+                .clone()
+                .or_else(envelope::global_response_pq_store)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("retained client has no anchored response PQ trust")
+                })?;
+            let service = service_domain.ok_or_else(|| {
+                anyhow::anyhow!("retained call needs canonical generated service destination")
+            })?;
+            let method = method_discriminator.ok_or_else(|| {
+                anyhow::anyhow!("retained call needs actual generated method discriminator")
+            })?;
+            let body = retained_body_sha256
+                .ok_or_else(|| anyhow::anyhow!("retained call body binding absent"))?;
+            retained_seal.publish(retained_local::SealDescription {
+                request_id,
+                bytes: &bytes,
+                body_sha256: body,
+                server,
+                store: store.as_ref(),
+                service,
+                method,
+            })?;
         }
         Ok((bytes, pending))
     }

@@ -268,6 +268,268 @@ struct BridgeMessage {
     /// verbatim to the dispatch pipeline's cleartext policy.
     carrier: crate::transport::carrier::CarrierContext,
     respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
+    completion: Option<BridgeCompletionWriter>,
+}
+
+/// Opaque native-only capability for one canonical same-process delivery.
+/// Constructed only by LocalServiceBridge, never from a network envelope.
+pub struct ControlledLocalSender {
+    tx: tokio::sync::mpsc::Sender<BridgeMessage>,
+    shutdown: CancellationToken,
+    admission: Arc<parking_lot::Mutex<Option<tokio::time::Instant>>>,
+}
+/// Diagnostic stage only: these values are NOT terminal/authority proofs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalCompletionStage {
+    NotStarted,
+    Queueing,
+    Enqueued,
+    Finished,
+    NeverEnqueued,
+    DeliveryUnknown,
+}
+/// Actual local process_request completion. No public constructor, deserializer,
+/// callback or Debug that could expose a signed response/body/credential.
+pub struct CompletedLocalDispatch {
+    request_sha256: [u8; 32],
+    server_key: [u8; 32],
+    response: Option<Bytes>,
+    failure: Option<LocalCaptureFailure>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalCaptureFailure {
+    ProcessorReturnedError,
+    ResponseExceedsCaptureBound,
+}
+impl CompletedLocalDispatch {
+    pub fn request_sha256(&self) -> [u8; 32] {
+        self.request_sha256
+    }
+    pub fn server_key(&self) -> [u8; 32] {
+        self.server_key
+    }
+    /// Still requires normal pinned Hybrid response verification and pending
+    /// request-id binding before any decoded data/typed denial is admitted.
+    pub fn signed_response(&self) -> Option<&[u8]> {
+        self.response.as_deref()
+    }
+    pub fn capture_failure(&self) -> Option<LocalCaptureFailure> {
+        self.failure
+    }
+}
+/// Unique consumed send future ended BEFORE enqueue. This cannot be made by
+/// interpreting a transport timeout, arbitrary Error, or NotStarted stage.
+pub struct NeverEnqueuedLocalDispatch {
+    request_sha256: [u8; 32],
+}
+impl NeverEnqueuedLocalDispatch {
+    pub fn request_sha256(&self) -> [u8; 32] {
+        self.request_sha256
+    }
+}
+#[derive(Clone)]
+pub enum ObservedLocalDelivery {
+    Completed(Arc<CompletedLocalDispatch>),
+    NeverEnqueued(Arc<NeverEnqueuedLocalDispatch>),
+    DeliveryUnknown,
+}
+struct LocalCompletionState {
+    stage: LocalCompletionStage,
+    outcome: Option<ObservedLocalDelivery>,
+}
+struct LocalCompletionCell {
+    state: parking_lot::Mutex<LocalCompletionState>,
+    changed: tokio::sync::Notify,
+    capture_bytes: usize,
+}
+/// Passive retained observation only. It holds no registry, worker permit,
+/// RequestService, bridge thread or callback. Drop does not cancel execution.
+#[derive(Clone)]
+pub struct LocalCompletion {
+    inner: Arc<LocalCompletionCell>,
+}
+impl LocalCompletion {
+    pub fn stage(&self) -> LocalCompletionStage {
+        self.inner.state.lock().stage
+    }
+    pub fn outcome(&self) -> Option<ObservedLocalDelivery> {
+        self.inner.state.lock().outcome.clone()
+    }
+    pub async fn wait_outcome(&self) -> ObservedLocalDelivery {
+        loop {
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(outcome) = self.outcome() {
+                return outcome;
+            }
+            notified.await;
+        }
+    }
+}
+struct BridgeCompletionWriter {
+    inner: Arc<LocalCompletionCell>,
+    request_sha256: [u8; 32],
+    enqueued: bool,
+    finished: bool,
+}
+impl BridgeCompletionWriter {
+    fn enqueued(&mut self) {
+        self.enqueued = true;
+        self.inner.state.lock().stage = LocalCompletionStage::Enqueued;
+        self.inner.changed.notify_waiters();
+    }
+    fn complete(&mut self, result: &Result<Bytes>, server_key: [u8; 32]) {
+        let (response, failure) = match result {
+            Ok(bytes) if bytes.len() <= self.inner.capture_bytes => (Some(bytes.clone()), None),
+            Ok(_) => (None, Some(LocalCaptureFailure::ResponseExceedsCaptureBound)),
+            Err(_) => (None, Some(LocalCaptureFailure::ProcessorReturnedError)),
+        };
+        let completion = Arc::new(CompletedLocalDispatch {
+            request_sha256: self.request_sha256,
+            server_key,
+            response,
+            failure,
+        });
+        {
+            let mut state = self.inner.state.lock();
+            state.stage = LocalCompletionStage::Finished;
+            state.outcome = Some(ObservedLocalDelivery::Completed(completion));
+        }
+        self.finished = true;
+        self.inner.changed.notify_waiters();
+    }
+}
+impl Drop for BridgeCompletionWriter {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut state = self.inner.state.lock();
+        if self.enqueued {
+            state.stage = LocalCompletionStage::DeliveryUnknown;
+            state.outcome = Some(ObservedLocalDelivery::DeliveryUnknown);
+        } else {
+            state.stage = LocalCompletionStage::NeverEnqueued;
+            state.outcome = Some(ObservedLocalDelivery::NeverEnqueued(Arc::new(
+                NeverEnqueuedLocalDispatch {
+                    request_sha256: self.request_sha256,
+                },
+            )));
+        }
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+}
+/// One native transport send, through real canonical RpcClientImpl. Never pool
+/// or retry this transport across attempts. Existing30s response timeout stays.
+pub struct ControlledLocalTransport {
+    sender: ControlledLocalSender,
+    completion: Arc<LocalCompletionCell>,
+    used: std::sync::atomic::AtomicBool,
+}
+impl ControlledLocalTransport {
+    // Only actual RpcClient sealing can obtain the matching observer. A
+    // retained verifier cannot be paired with caller-selected completion bytes.
+    pub(crate) fn completion_observer(&self) -> LocalCompletion {
+        LocalCompletion {
+            inner: Arc::clone(&self.completion),
+        }
+    }
+}
+impl ControlledLocalSender {
+    pub fn one_shot(
+        self,
+        capture_bytes: usize,
+    ) -> Result<(ControlledLocalTransport, LocalCompletion)> {
+        anyhow::ensure!(
+            capture_bytes > 0 && capture_bytes <= MAX_FRAME_BYTES,
+            "controlled local signed-frame capture bound is invalid"
+        );
+        let inner = Arc::new(LocalCompletionCell {
+            state: parking_lot::Mutex::new(LocalCompletionState {
+                stage: LocalCompletionStage::NotStarted,
+                outcome: None,
+            }),
+            changed: tokio::sync::Notify::new(),
+            capture_bytes,
+        });
+        Ok((
+            ControlledLocalTransport {
+                sender: self,
+                completion: Arc::clone(&inner),
+                used: std::sync::atomic::AtomicBool::new(false),
+            },
+            LocalCompletion { inner },
+        ))
+    }
+}
+#[async_trait::async_trait]
+impl crate::transport_traits::Transport for ControlledLocalTransport {
+    type Sub = super::rpc_session::RpcPendingStream;
+    type Pub = super::rpc_session::RpcPublishStub;
+    fn forbids_cleartext_envelope(&self) -> bool {
+        false
+    }
+    async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+        use sha2::Digest;
+        anyhow::ensure!(
+            !self.used.swap(true, std::sync::atomic::Ordering::AcqRel),
+            "controlled local transport is one-shot"
+        );
+        // Reuse canonical full-frame bound. No raw request/body is retained in
+        // observer; the queued message owns the original single Vec allocation.
+        let hash: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        let mut writer = BridgeCompletionWriter {
+            inner: Arc::clone(&self.completion),
+            request_sha256: hash,
+            enqueued: false,
+            finished: false,
+        };
+        self.completion.state.lock().stage = LocalCompletionStage::Queueing;
+        anyhow::ensure!(
+            payload.len() <= MAX_FRAME_BYTES,
+            "controlled local request exceeds canonical frame bound"
+        );
+        let timeout = timeout_ms
+            .map(|ms| std::time::Duration::from_millis(ms.max(0) as u64))
+            .unwrap_or(std::time::Duration::from_secs(30));
+        let delivered = async {
+            let (respond, receive) = tokio::sync::oneshot::channel();
+            let permit = tokio::select! {
+                biased;
+                _=self.sender.shutdown.cancelled()=>anyhow::bail!("controlled local admission closed"),
+                permit=self.sender.tx.reserve()=>permit.map_err(|_|anyhow::anyhow!("controlled local channel closed"))?,
+            };
+            {
+                let _admission = self.sender.admission.lock();
+                anyhow::ensure!(
+                    !self.sender.shutdown.is_cancelled(),
+                    "controlled local admission closed"
+                );
+                writer.enqueued();
+                permit.send(BridgeMessage {
+                    request: Bytes::from(payload),
+                    carrier: crate::transport::carrier::CarrierContext::inproc(),
+                    respond,
+                    completion: Some(writer),
+                });
+            }
+            receive
+                .await
+                .map_err(|_| anyhow::anyhow!("controlled local response dropped"))?
+        };
+        let response = tokio::time::timeout(timeout, delivered)
+            .await
+            .map_err(|_| anyhow::anyhow!("controlled local response timeout"))??;
+        Ok(response.to_vec())
+    }
+    async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
+        anyhow::bail!("controlled local transport is RPC-only")
+    }
+    async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
+        anyhow::bail!("controlled local transport is RPC-only")
+    }
 }
 
 /// Shared dispatch loop body: relay `BridgeMessage`s from `rx` to `service`,
@@ -307,6 +569,7 @@ where
         let service = std::rc::Rc::clone(&service);
         let nonce_cache = Arc::clone(&nonce_cache);
         requests.spawn_local(async move {
+            let mut msg = msg;
             let signing_key = service.signing_key();
             let result = crate::service::dispatch::process_request(
                 msg.request.as_ref(),
@@ -318,6 +581,11 @@ where
             )
             .await
             .map(Bytes::from);
+            // Observe the genuine completed canonical dispatcher BEFORE the
+            // best-effort response oneshot. No callback can mutate the result.
+            if let Some(completion) = msg.completion.as_mut() {
+                completion.complete(&result, signing_key.verifying_key().to_bytes());
+            }
             let _ = msg.respond.send(result);
         });
     }
@@ -640,6 +908,13 @@ impl Drop for LocalServiceBridge {
 }
 
 impl IrohRequestProcessor for LocalServiceBridge {
+    fn controlled_local_sender(&self) -> Option<ControlledLocalSender> {
+        Some(ControlledLocalSender {
+            tx: self.tx.clone(),
+            shutdown: self.shutdown.clone(),
+            admission: Arc::clone(&self.admission),
+        })
+    }
     fn close_admission(&self) {
         LocalServiceBridge::close_admission(self);
     }
@@ -675,6 +950,7 @@ impl IrohRequestProcessor for LocalServiceBridge {
                     request,
                     carrier,
                     respond: respond_tx,
+                    completion: None,
                 });
             }
             respond_rx
@@ -722,6 +998,7 @@ mod tests {
         signing_key: SigningKey,
         drop_probe: Option<BridgeDropProbe>,
         request_gate: Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
+        handler_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     struct BridgeDropProbe {
@@ -744,6 +1021,7 @@ mod tests {
             Self {
                 drop_probe: None,
                 request_gate: None,
+                handler_calls: None,
                 name: "bridge-echo".to_owned(),
                 transport: crate::transport::TransportConfig::inproc("bridge-echo-unused"),
                 signing_key,
@@ -757,6 +1035,9 @@ mod tests {
             _ctx: &crate::service::EnvelopeContext,
             body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<crate::service::Continuation>)> {
+            if let Some(count) = &self.handler_calls {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let mut out = vec![0xBE];
             out.extend_from_slice(body.bytes());
             Ok((out, None))
@@ -982,6 +1263,7 @@ mod tests {
                 request: Bytes::from(wire),
                 carrier: crate::transport::carrier::CarrierContext::inproc(),
                 respond,
+                completion: None,
             })
             .map_err(|_| anyhow::anyhow!("queue admission failed"))?;
             responses.push(response);
@@ -1087,6 +1369,7 @@ mod tests {
             request: Bytes::from(wire),
             carrier: crate::transport::carrier::CarrierContext::inproc(),
             respond,
+            completion: None,
         })
         .map_err(|_| anyhow::anyhow!("queue admission failed"))?;
         let stopped = CancellationToken::new();
@@ -1797,5 +2080,1004 @@ mod tests {
 
         client.shutdown().await?;
         Ok(())
+    }
+    // Isolate process-global Hybrid trust configuration exactly as production
+    // protocol fixtures do; no sibling test can weaken/replace this policy.
+    fn controlled_completion_child(
+        name: &str,
+        test: impl Future<Output = Result<()>>,
+    ) -> Result<()> {
+        if std::env::var("HYPRSTREAM_B1_TEST_CHILD").ok().as_deref() != Some(name) {
+            let executable = std::env::current_exe()?;
+            let exact_name = format!("transport::iroh_rpc::tests::{name}");
+            let listing = std::process::Command::new(&executable)
+                .args(["--list", "--exact", &exact_name])
+                .output()?;
+            let listed = String::from_utf8(listing.stdout)?;
+            let expected_line = format!("{exact_name}: test");
+            anyhow::ensure!(
+                listing.status.success()
+                    && listed
+                        .lines()
+                        .filter(|line| line.ends_with(": test"))
+                        .count()
+                        == 1
+                    && listed.lines().any(|line| line == expected_line),
+                "isolated bridge fixture exact child test was not listed"
+            );
+            // libtest exits successfully even when an exact filter matches
+            // zero tests. Listing first prevents a stale filter from turning
+            // this process-isolated causal fixture into a false green.
+            let status = std::process::Command::new(executable)
+                .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
+                .env("HYPRSTREAM_B1_TEST_CHILD", name)
+                .status()?;
+            anyhow::ensure!(status.success(), "isolated actual bridge fixture failed");
+            return Ok(());
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+    #[test]
+    fn controlled_completion_rejects_unlisted_child_test() -> Result<()> {
+        let result = controlled_completion_child("missing_controlled_completion_fixture", async {
+            anyhow::bail!("an unlisted fixture must not execute")
+        });
+        anyhow::ensure!(
+            matches!(result, Err(ref error) if error.to_string().contains("exact child test was not listed")),
+            "a zero-match child filter must fail before execution"
+        );
+        Ok(())
+    }
+    fn controlled_response_trust(key: &SigningKey) -> Arc<crate::envelope::KeyedPqTrustStore> {
+        let mut trust = crate::envelope::KeyedPqTrustStore::new();
+        trust.bind(
+            key.verifying_key().to_bytes(),
+            &crate::crypto::pq::ml_dsa_sk_to_vk(&crate::node_identity::derive_mesh_mldsa_key(key)),
+        );
+        Arc::new(trust)
+    }
+    #[test]
+    fn controlled_completion_real_prehandler_denial_survives_response_drop() -> Result<()> {
+        controlled_completion_child(
+            "controlled_completion_real_prehandler_denial_survives_response_drop",
+            async {
+                let key = deadline_test_identity()?;
+                let trust = controlled_response_trust(&key);
+                for drop_response in [true, false] {
+                    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                    let release = Arc::new(tokio::sync::Semaphore::new(0));
+                    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let mut service = BridgeEcho::new(key.clone());
+                    service.request_gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+                    service.handler_calls = Some(Arc::clone(&calls));
+                    let bridge = Arc::new(LocalServiceBridge::spawn(
+                        service,
+                        Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                        1,
+                    )?);
+                    let (transport, observation) = bridge
+                        .controlled_local_sender()
+                        .context("real canonical bridge capability")?
+                        .one_shot(1024 * 1024)?;
+                    assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                    assert!(observation.outcome().is_none());
+                    let client = Arc::new(
+                        crate::rpc_client::RpcClientImpl::new(
+                            crate::signer::LocalSigner::new(key.clone()),
+                            transport,
+                            Some(key.verifying_key()),
+                        )
+                        .with_response_pq_store(trust.clone()),
+                    );
+                    let caller = Arc::clone(&client);
+                    let reply = tokio::spawn(async move {
+                        caller
+                            .call_for_service("bridge-echo", b"denied".to_vec())
+                            .await
+                    });
+                    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                        .await??
+                        .forget();
+                    assert_eq!(observation.stage(), LocalCompletionStage::Enqueued);
+                    assert!(observation.outcome().is_none());
+                    if drop_response {
+                        reply.abort();
+                    } // drops real transport response receiver, not server work
+                    release.add_permits(1);
+                    let actual =
+                        tokio::time::timeout(Duration::from_secs(5), observation.wait_outcome())
+                            .await?;
+                    let ObservedLocalDelivery::Completed(actual) = actual else {
+                        anyhow::bail!("actual canonical denial completion missing")
+                    };
+                    assert_eq!(actual.server_key(), key.verifying_key().to_bytes());
+                    assert_eq!(actual.capture_failure(), None);
+                    let (_id, payload) = crate::envelope::unwrap_response_with(
+                        actual
+                            .signed_response()
+                            .context("retained signed response")?,
+                        Some(&key.verifying_key()),
+                        Some(trust.as_ref()),
+                        crate::crypto::CryptoPolicy::Hybrid,
+                    )?;
+                    assert_eq!(
+                        payload,
+                        crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                    );
+                    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    if drop_response {
+                        assert!(reply
+                            .await
+                            .err()
+                            .context("expected cancelled original response waiter")?
+                            .is_cancelled());
+                    } else {
+                        assert_eq!(reply.await??, payload);
+                    } // real RpcClient verifies original pending request ID
+                      // Original receiver Drop never changes retained completed witness.
+                    assert_eq!(observation.stage(), LocalCompletionStage::Finished);
+                    bridge.shutdown().await?;
+                }
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn controlled_completion_queue_drop_is_unique_never_enqueued() -> Result<()> {
+        controlled_completion_child(
+            "controlled_completion_queue_drop_is_unique_never_enqueued",
+            async {
+                use crate::transport_traits::Transport;
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024)?;
+                let transport = Arc::new(transport);
+                // Hold the REAL bounded queue's sole reservation, not a boolean/mock
+                // processor. No request can enqueue until this permit is released.
+                let held = bridge.tx.reserve().await?;
+                let caller = Arc::clone(&transport);
+                let send = tokio::spawn(async move {
+                    caller
+                        .send(b"never-dispatched".to_vec(), Some(30_000))
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while observation.stage() == LocalCompletionStage::NotStarted {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await?;
+                assert_eq!(observation.stage(), LocalCompletionStage::Queueing);
+                send.abort();
+                assert!(send
+                    .await
+                    .err()
+                    .context("expected cancelled queued send waiter")?
+                    .is_cancelled());
+                assert!(matches!(
+                    observation.wait_outcome().await,
+                    ObservedLocalDelivery::NeverEnqueued(_)
+                ));
+                drop(held);
+                assert!(transport.send(b"no-retry".to_vec(), None).await.is_err());
+                assert_eq!(observation.stage(), LocalCompletionStage::NeverEnqueued);
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn controlled_completion_forced_dispatch_drop_is_unknown_not_terminal() -> Result<()> {
+        controlled_completion_child(
+            "controlled_completion_forced_dispatch_drop_is_unknown_not_terminal",
+            async {
+                let key = deadline_test_identity()?;
+                let trust = controlled_response_trust(&key);
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let mut service = BridgeEcho::new(key.clone());
+                service.request_gate = Some((Arc::clone(&entered), release));
+                let bridge = Arc::new(LocalServiceBridge::spawn(
+                    service,
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?);
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024 * 1024)?;
+                let client = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(trust);
+                let caller = tokio::spawn(async move {
+                    client
+                        .call_for_service("bridge-echo", b"held".to_vec())
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                    .await??
+                    .forget();
+                assert_eq!(observation.stage(), LocalCompletionStage::Enqueued);
+                bridge.begin_shutdown(tokio::time::Instant::now() + Duration::from_millis(50));
+                assert_eq!(
+                    bridge.shutdown().await,
+                    Err(BridgeShutdownError::DrainTimedOut)
+                );
+                assert!(matches!(
+                    observation.wait_outcome().await,
+                    ObservedLocalDelivery::DeliveryUnknown
+                ));
+                assert!(caller.await?.is_err());
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn controlled_completion_capture_bounds_do_not_forge_signed_rejection() -> Result<()> {
+        controlled_completion_child(
+            "controlled_completion_capture_bounds_do_not_forge_signed_rejection",
+            async {
+                use crate::transport_traits::Transport;
+                let key = deadline_test_identity()?;
+                let trust = controlled_response_trust(&key);
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let sender = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?;
+                assert!(sender.one_shot(MAX_FRAME_BYTES + 1).is_err());
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1)?;
+                let client = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(trust);
+                assert_eq!(
+                    client
+                        .call_for_service("bridge-echo", b"deny".to_vec())
+                        .await?,
+                    crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                );
+                let ObservedLocalDelivery::Completed(result) = observation.wait_outcome().await
+                else {
+                    anyhow::bail!("real completion missing")
+                };
+                assert_eq!(
+                    result.capture_failure(),
+                    Some(LocalCaptureFailure::ResponseExceedsCaptureBound)
+                );
+                assert!(result.signed_response().is_none());
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024)?;
+                assert!(transport
+                    .send(b"malformed envelope".to_vec(), None)
+                    .await
+                    .is_err());
+                let ObservedLocalDelivery::Completed(result) = observation.wait_outcome().await
+                else {
+                    anyhow::bail!("real parser failure completion missing")
+                };
+                assert_eq!(
+                    result.capture_failure(),
+                    Some(LocalCaptureFailure::ProcessorReturnedError)
+                );
+                assert!(result.signed_response().is_none());
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn controlled_completion_response_drop_races_real_dispatch() -> Result<()> {
+        controlled_completion_child(
+            "controlled_completion_response_drop_races_real_dispatch",
+            async {
+                let key = deadline_test_identity()?;
+                let trust = controlled_response_trust(&key);
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut service = BridgeEcho::new(key.clone());
+                service.request_gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+                service.handler_calls = Some(Arc::clone(&calls));
+                let bridge = LocalServiceBridge::spawn(
+                    service,
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let mut seen = std::collections::HashSet::new();
+                for _ in 0..8 {
+                    let (transport, observation) = bridge
+                        .controlled_local_sender()
+                        .context("canonical bridge")?
+                        .one_shot(1024 * 1024)?;
+                    let client = crate::rpc_client::RpcClientImpl::new(
+                        crate::signer::LocalSigner::new(key.clone()),
+                        transport,
+                        Some(key.verifying_key()),
+                    )
+                    .with_response_pq_store(trust.clone());
+                    let reply = tokio::spawn(async move {
+                        client
+                            .call_for_service("bridge-echo", b"race".to_vec())
+                            .await
+                    });
+                    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                        .await??
+                        .forget();
+                    // Real dispatcher runs on its INDEPENDENT LocalSet OS thread;
+                    // release and caller abort therefore race actual completion.
+                    release.add_permits(1);
+                    reply.abort();
+                    let actual =
+                        tokio::time::timeout(Duration::from_secs(5), observation.wait_outcome())
+                            .await?;
+                    let ObservedLocalDelivery::Completed(actual) = actual else {
+                        anyhow::bail!("response-drop race lost genuine completed denial")
+                    };
+                    assert!(seen.insert(actual.request_sha256()));
+                    let (_id, payload) = crate::envelope::unwrap_response_with(
+                        actual.signed_response().context("signed denial")?,
+                        Some(&key.verifying_key()),
+                        Some(trust.as_ref()),
+                        crate::crypto::CryptoPolicy::Hybrid,
+                    )?;
+                    assert_eq!(
+                        payload,
+                        crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                    );
+                    match reply.await {
+                        Ok(result) => assert_eq!(result?, payload),
+                        Err(error) => assert!(error.is_cancelled()),
+                    }
+                }
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    async fn retained_actual_exchange(
+        bridge: &LocalServiceBridge,
+        signer: &SigningKey,
+        server: &SigningKey,
+        advance: bool,
+        body: &[u8],
+    ) -> Result<(crate::rpc_client::RetainedLocalResponse, Vec<u8>, Vec<u8>)> {
+        let (transport, observation) = bridge
+            .controlled_local_sender()
+            .context("real canonical bridge")?
+            .one_shot(1024 * 1024)?;
+        let client = crate::rpc_client::RpcClientImpl::new(
+            crate::signer::LocalSigner::new(signer.clone()),
+            transport,
+            Some(server.verifying_key()),
+        )
+        .with_response_pq_store(controlled_response_trust(server));
+        if advance {
+            let _ = client.next_id();
+        }
+        let (client, retained) = client.retain_local_response()?;
+        let reply = client
+            .call_for_service_with_method("bridge-echo", 7, body.to_vec())
+            .await?;
+        let ObservedLocalDelivery::Completed(completed) = observation.wait_outcome().await else {
+            anyhow::bail!("actual completed canonical call absent")
+        };
+        let raw = completed
+            .signed_response()
+            .context("actual signed response")?
+            .to_vec();
+        Ok((retained, raw, reply))
+    }
+    #[test]
+    fn retained_client_verifies_actual_denial_after_original_waiter_drop() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_verifies_actual_denial_after_original_waiter_drop",
+            async {
+                use sha2::Digest;
+                let key = deadline_test_identity()?;
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let mut service = BridgeEcho::new(key.clone());
+                service.request_gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+                let bridge = LocalServiceBridge::spawn(
+                    service,
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024 * 1024)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(controlled_response_trust(&key))
+                .retain_local_response()?;
+                let caller = tokio::spawn(async move {
+                    client
+                        .call_for_service_with_method(
+                            "bridge-echo",
+                            7,
+                            b"original immutable body".to_vec(),
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                    .await??
+                    .forget();
+                assert_eq!(observation.stage(), LocalCompletionStage::Enqueued);
+                caller.abort();
+                assert!(caller
+                    .await
+                    .err()
+                    .context("expected cancelled original client future")?
+                    .is_cancelled());
+                release.add_permits(1);
+                let verified =
+                    tokio::time::timeout(Duration::from_secs(5), retained.verify()).await??;
+                let crate::rpc_client::RetainedLocalOutcome::Verified(verified) = verified else {
+                    anyhow::bail!("actual retained denial did not verify")
+                };
+                assert_eq!(
+                    verified.payload(),
+                    crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                );
+                assert_eq!(verified.request_id(), 1);
+                assert_eq!(verified.server_key(), key.verifying_key().to_bytes());
+                assert_eq!(verified.service(), "bridge-echo");
+                assert_eq!(verified.method_discriminator(), 7);
+                assert_eq!(
+                    verified.original_body_sha256(),
+                    <[u8; 32]>::from(sha2::Sha256::digest(b"original immutable body"))
+                );
+                let ObservedLocalDelivery::Completed(actual) = observation.wait_outcome().await
+                else {
+                    anyhow::bail!("actual completion lost")
+                };
+                assert_eq!(verified.request_sha256(), actual.request_sha256());
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_rejects_other_real_request_server_and_tampered_body() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_rejects_other_real_request_server_and_tampered_body",
+            async {
+                let key = deadline_test_identity()?;
+                let foreign = fresh_signing_key();
+                let a = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let b = LocalServiceBridge::spawn(
+                    BridgeEcho::new(foreign.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (original, raw_a, payload) =
+                    retained_actual_exchange(&a, &key, &key, false, b"first").await?;
+                let (_other, raw_b, _) =
+                    retained_actual_exchange(&a, &key, &key, true, b"second").await?;
+                let wrong_id = original
+                    .verify_candidate_bytes_for_test(&raw_b)
+                    .err()
+                    .context("another actual request ID must reject")?;
+                assert!(wrong_id.to_string().contains("actual pending request ID"));
+                let (_foreign, raw_c, _) =
+                    retained_actual_exchange(&b, &key, &foreign, false, b"third").await?;
+                assert!(original.verify_candidate_bytes_for_test(&raw_c).is_err());
+                let mut tampered = raw_a.clone();
+                let index = tampered
+                    .windows(payload.len())
+                    .position(|value| value == payload)
+                    .context("actual local plaintext payload")?;
+                tampered[index] ^= 1;
+                assert!(original.verify_candidate_bytes_for_test(&tampered).is_err());
+                assert_eq!(original.verify_candidate_bytes_for_test(&raw_a)?, payload);
+                let crate::rpc_client::RetainedLocalOutcome::Verified(verified) =
+                    original.verify().await?
+                else {
+                    anyhow::bail!("original opaque capability did not verify its own actual call")
+                };
+                assert_eq!(verified.payload(), payload);
+                a.shutdown().await?;
+                b.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_second_seal_cannot_replace_first_pending_identity() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_second_seal_cannot_replace_first_pending_identity",
+            async {
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024 * 1024)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(controlled_response_trust(&key))
+                .retain_local_response()?;
+                let first = client
+                    .call_for_service_with_method("bridge-echo", 7, b"first".to_vec())
+                    .await?;
+                assert!(client
+                    .call_for_service_with_method("bridge-echo", 8, b"second".to_vec())
+                    .await
+                    .is_err());
+                let crate::rpc_client::RetainedLocalOutcome::Verified(verified) =
+                    retained.verify().await?
+                else {
+                    anyhow::bail!("second seal replaced original verifier")
+                };
+                assert_eq!(verified.request_id(), 1);
+                assert_eq!(verified.method_discriminator(), 7);
+                assert_eq!(verified.payload(), first);
+                assert_eq!(observation.stage(), LocalCompletionStage::Finished);
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_requires_pins_hybrid_and_anchored_pq_before_send() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_requires_pins_hybrid_and_anchored_pq_before_send",
+            async {
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024)?;
+                assert!(crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    None
+                )
+                .retain_local_response()
+                .is_err());
+                assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                for weak_policy in [true, false] {
+                    let (transport, observation) = bridge
+                        .controlled_local_sender()
+                        .context("canonical bridge")?
+                        .one_shot(1024)?;
+                    let mut client = crate::rpc_client::RpcClientImpl::new(
+                        crate::signer::LocalSigner::new(key.clone()),
+                        transport,
+                        Some(key.verifying_key()),
+                    );
+                    if weak_policy {
+                        client = client
+                            .with_response_pq_store(controlled_response_trust(&key))
+                            .with_response_verify_policy(crate::crypto::CryptoPolicy::Classical);
+                    } else {
+                        client = client.with_response_pq_store(Arc::new(
+                            crate::envelope::KeyedPqTrustStore::new(),
+                        ));
+                    }
+                    let (client, retained) = client.retain_local_response()?;
+                    assert!(client
+                        .call_for_service_with_method("bridge-echo", 7, b"must not send".to_vec())
+                        .await
+                        .is_err());
+                    assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                    assert!(retained.verify().await.is_err());
+                }
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_capture_failure_remains_unverified() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_capture_failure_remains_unverified",
+            async {
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, _observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(controlled_response_trust(&key))
+                .retain_local_response()?;
+                assert_eq!(
+                    client
+                        .call_for_service_with_method("bridge-echo", 7, b"actual denial".to_vec())
+                        .await?,
+                    crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                );
+                let crate::rpc_client::RetainedLocalOutcome::UnverifiedDispatch(actual) =
+                    retained.verify().await?
+                else {
+                    anyhow::bail!("uncaptured raw response became trusted outcome")
+                };
+                assert_eq!(
+                    actual.capture_failure(),
+                    Some(LocalCaptureFailure::ResponseExceedsCaptureBound)
+                );
+                assert!(actual.signed_response().is_none());
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_abort_during_real_preseal_guard_has_no_verified_outcome() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_abort_during_real_preseal_guard_has_no_verified_outcome",
+            async {
+                struct Gate {
+                    entered: Arc<tokio::sync::Semaphore>,
+                    release: Arc<tokio::sync::Semaphore>,
+                }
+                #[async_trait::async_trait]
+                impl crate::rpc_client::PreSealGuard for Gate {
+                    async fn ensure_current(&self) -> Result<()> {
+                        self.entered.add_permits(1);
+                        self.release.acquire().await?.forget();
+                        Ok(())
+                    }
+                }
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                let gate = Arc::new(Gate {
+                    entered: Arc::clone(&entered),
+                    release: Arc::new(tokio::sync::Semaphore::new(0)),
+                });
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(controlled_response_trust(&key))
+                .with_pre_seal_guard(gate)
+                .retain_local_response()?;
+                let caller = tokio::spawn(async move {
+                    client
+                        .call_for_service_with_method("bridge-echo", 7, b"unsealed".to_vec())
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                    .await??
+                    .forget();
+                caller.abort();
+                assert!(caller
+                    .await
+                    .err()
+                    .context("expected cancelled sealing caller")?
+                    .is_cancelled());
+                assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                assert!(observation.outcome().is_none());
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), retained.verify())
+                        .await?
+                        .is_err()
+                );
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_freezes_actual_anchor_before_mutable_store_rotation() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_freezes_actual_anchor_before_mutable_store_rotation",
+            async {
+                struct RotatingTrust(parking_lot::RwLock<crate::envelope::KeyedPqTrustStore>);
+                impl crate::envelope::PqTrustStore for RotatingTrust {
+                    fn ml_dsa_key_for(
+                        &self,
+                        key: &[u8; 32],
+                    ) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
+                        crate::envelope::PqTrustStore::ml_dsa_key_for(&*self.0.read(), key)
+                    }
+                }
+                let key = deadline_test_identity()?;
+                let mut initial = crate::envelope::KeyedPqTrustStore::new();
+                let initial_pq = crate::node_identity::derive_mesh_mldsa_key(&key);
+                initial.bind(
+                    key.verifying_key().to_bytes(),
+                    &crate::crypto::pq::ml_dsa_sk_to_vk(&initial_pq),
+                );
+                let trust = Arc::new(RotatingTrust(parking_lot::RwLock::new(initial)));
+                let entered = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let mut service = BridgeEcho::new(key.clone());
+                service.request_gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+                let bridge = LocalServiceBridge::spawn(
+                    service,
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024 * 1024)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(trust.clone())
+                .retain_local_response()?;
+                let caller = tokio::spawn(async move {
+                    client
+                        .call_for_service_with_method(
+                            "bridge-echo",
+                            7,
+                            b"sealed before rotation".to_vec(),
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+                    .await??
+                    .forget();
+                // Real process_request has verified the original sealed frame, but
+                // has not emitted its response. Replace the per-client provider's
+                // entire store; KeyedPqTrustStore itself remains conflict-resistant.
+                assert_eq!(observation.stage(), LocalCompletionStage::Enqueued);
+                let foreign_pq = crate::node_identity::derive_mesh_mldsa_key(&fresh_signing_key());
+                let mut replacement = crate::envelope::KeyedPqTrustStore::new();
+                replacement.bind(
+                    key.verifying_key().to_bytes(),
+                    &crate::crypto::pq::ml_dsa_sk_to_vk(&foreign_pq),
+                );
+                *trust.0.write() = replacement;
+                release.add_permits(1);
+                assert!(tokio::time::timeout(Duration::from_secs(5), caller)
+                    .await??
+                    .is_err());
+                let ObservedLocalDelivery::Completed(completed) = observation.wait_outcome().await
+                else {
+                    anyhow::bail!("real rotated-store response missing")
+                };
+                assert!(crate::envelope::unwrap_response_with(
+                    completed
+                        .signed_response()
+                        .context("actual signed denial")?,
+                    Some(&key.verifying_key()),
+                    Some(trust.as_ref()),
+                    crate::crypto::CryptoPolicy::Hybrid,
+                )
+                .is_err());
+                let crate::rpc_client::RetainedLocalOutcome::Verified(verified) =
+                    tokio::time::timeout(Duration::from_secs(5), retained.verify()).await??
+                else {
+                    anyhow::bail!("frozen original anchor failed after mutable provider rotation")
+                };
+                assert_eq!(verified.request_id(), 1);
+                assert_eq!(verified.request_sha256(), completed.request_sha256());
+                assert_eq!(
+                    verified.payload(),
+                    crate::service::dispatch::DISPATCH_DENIED.as_bytes()
+                );
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_concurrent_seal_rejects_before_preseal_and_enqueue() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_concurrent_seal_rejects_before_preseal_and_enqueue",
+            async {
+                use sha2::Digest;
+                struct Gate {
+                    entered: tokio::sync::Semaphore,
+                    release: tokio::sync::Semaphore,
+                    calls: std::sync::atomic::AtomicUsize,
+                }
+                #[async_trait::async_trait]
+                impl crate::rpc_client::PreSealGuard for Gate {
+                    async fn ensure_current(&self) -> Result<()> {
+                        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        self.entered.add_permits(1);
+                        self.release.acquire().await?.forget();
+                        Ok(())
+                    }
+                }
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let gate = Arc::new(Gate {
+                    entered: tokio::sync::Semaphore::new(0),
+                    release: tokio::sync::Semaphore::new(0),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024 * 1024)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(controlled_response_trust(&key))
+                .with_pre_seal_guard(gate.clone())
+                .retain_local_response()?;
+                let client = Arc::new(client);
+                let first_client = Arc::clone(&client);
+                let first = tokio::spawn(async move {
+                    first_client
+                        .call_for_service_with_method(
+                            "bridge-echo",
+                            7,
+                            b"first parallel body".to_vec(),
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(5), gate.entered.acquire())
+                    .await??
+                    .forget();
+                assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                let second_error = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.call_for_service_with_method(
+                        "bridge-echo",
+                        8,
+                        b"second parallel body".to_vec(),
+                    ),
+                )
+                .await?
+                .err()
+                .context("concurrent second seal must reject")?;
+                assert!(second_error.to_string().contains("seal only once"));
+                assert_eq!(gate.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                assert!(observation.outcome().is_none());
+                gate.release.add_permits(1);
+                let payload = tokio::time::timeout(Duration::from_secs(5), first).await???;
+                let crate::rpc_client::RetainedLocalOutcome::Verified(verified) =
+                    tokio::time::timeout(Duration::from_secs(5), retained.verify()).await??
+                else {
+                    anyhow::bail!("concurrent second seal replaced first request identity")
+                };
+                assert_eq!(verified.request_id(), 1);
+                assert_eq!(verified.method_discriminator(), 7);
+                assert_eq!(
+                    verified.original_body_sha256(),
+                    <[u8; 32]>::from(sha2::Sha256::digest(b"first parallel body"))
+                );
+                assert_eq!(verified.payload(), payload);
+                let ObservedLocalDelivery::Completed(actual) = observation.wait_outcome().await
+                else {
+                    anyhow::bail!("actual first completion missing")
+                };
+                assert_eq!(verified.request_sha256(), actual.request_sha256());
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn retained_client_unpolled_call_has_no_no_send_or_terminal_proof() -> Result<()> {
+        controlled_completion_child(
+            "retained_client_unpolled_call_has_no_no_send_or_terminal_proof",
+            async {
+                let key = deadline_test_identity()?;
+                let bridge = LocalServiceBridge::spawn(
+                    BridgeEcho::new(key.clone()),
+                    Arc::new(crate::envelope::InMemoryNonceCache::new()),
+                    1,
+                )?;
+                let (transport, observation) = bridge
+                    .controlled_local_sender()
+                    .context("canonical bridge")?
+                    .one_shot(1024 * 1024)?;
+                let (client, retained) = crate::rpc_client::RpcClientImpl::new(
+                    crate::signer::LocalSigner::new(key.clone()),
+                    transport,
+                    Some(key.verifying_key()),
+                )
+                .with_response_pq_store(controlled_response_trust(&key))
+                .retain_local_response()?;
+                // Construct and drop the actual canonical async call without ever
+                // polling it. No seal guard or transport claim has existed yet.
+                drop(client.call_for_service_with_method(
+                    "bridge-echo",
+                    8,
+                    b"never polled".to_vec(),
+                ));
+                assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                assert!(observation.outcome().is_none());
+                let verification = retained.verify();
+                tokio::pin!(verification);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut verification)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(observation.stage(), LocalCompletionStage::NotStarted);
+                assert!(observation.outcome().is_none());
+                // The same capability remains usable by the first actually
+                // polled call: waiting did not fabricate a terminal/no-send proof.
+                let payload = client
+                    .call_for_service_with_method(
+                        "bridge-echo",
+                        7,
+                        b"first actually polled".to_vec(),
+                    )
+                    .await?;
+                let crate::rpc_client::RetainedLocalOutcome::Verified(verified) =
+                    tokio::time::timeout(Duration::from_secs(5), &mut verification).await??
+                else {
+                    anyhow::bail!("unpolled call consumed or forged retained completion")
+                };
+                assert_eq!(verified.request_id(), 1);
+                assert_eq!(verified.method_discriminator(), 7);
+                assert_eq!(verified.payload(), payload);
+                bridge.shutdown().await?;
+                Ok(())
+            },
+        )
     }
 }
