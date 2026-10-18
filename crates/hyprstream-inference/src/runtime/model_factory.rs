@@ -25,6 +25,50 @@ use hyprstream_rpc_std::registry_client::WorktreeClient;
 /// model families and can silently drop/duplicate shards).
 const STRICT_LOADER_ENV: &str = "HYPRSTREAM_STRICT_LOADER";
 
+/// Clef's native Qwen3.5 path rejects nonfinite admitted checkpoint payloads.
+/// Keep this architecture policy explicit: other loaders retain their behavior.
+fn native_finite_policy(model_path: &Path) -> Result<bool> {
+    let path = model_path.join("config.json");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let config: serde_json::Value = serde_json::from_reader(file)?;
+    let model_type = config["model_type"]
+        .as_str()
+        .or_else(|| config["text_config"]["model_type"].as_str());
+    Ok(matches!(model_type, Some("qwen3_5" | "qwen3_5_text")))
+}
+
+/// Scan raw little-endian values with constant auxiliary memory, before the
+/// corresponding tensor blob/copy/cast. This is per admitted tensor, not an
+/// all-shard preflight before ANY allocation. A failure aborts the whole load
+/// before a model is returned for inference. Packed FP8 remains packed.
+fn validate_finite_payload(name: &str, dtype: safetensors::Dtype, data: &[u8]) -> Result<()> {
+    use safetensors::Dtype;
+    let invalid = match dtype {
+        Dtype::BF16 => data
+            .chunks_exact(2)
+            .position(|b| u16::from_le_bytes([b[0], b[1]]) & 0x7f80 == 0x7f80),
+        Dtype::F16 => data
+            .chunks_exact(2)
+            .position(|b| u16::from_le_bytes([b[0], b[1]]) & 0x7c00 == 0x7c00),
+        Dtype::F32 => data.chunks_exact(4).position(|b| {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f80_0000 == 0x7f80_0000
+        }),
+        Dtype::F8_E4M3 => data.iter().position(|b| b & 0x7f == 0x7f),
+        Dtype::F8_E5M2 => data.iter().position(|b| b & 0x7c == 0x7c),
+        // Unsupported materialization dtypes still fail at the existing loader
+        // boundary below; this policy does not admit another tensor format.
+        _ => None,
+    };
+    if let Some(index) = invalid {
+        bail!("nonfinite native Qwen3.5 checkpoint tensor `{name}` ({dtype:?}) at element {index}");
+    }
+    Ok(())
+}
+
 fn strict_loader_enabled() -> bool {
     std::env::var(STRICT_LOADER_ENV)
         .map(|v| {
@@ -534,9 +578,14 @@ impl ModelFactory {
         )?;
         let metadata = Self::stage_tensor_metadata(&plan).await?;
         Self::validate_stage_tensor_schema(&config, &request.layer_range, &metadata)?;
-        let mut weights =
-            Self::load_weights_for_stage_plan(plan, request.layer_range.clone(), device, dtype)
-                .await?;
+        let mut weights = Self::load_weights_for_stage_plan(
+            plan,
+            request.layer_range.clone(),
+            device,
+            dtype,
+            native_finite_policy(model_path)?,
+        )
+        .await?;
         maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
 
         Self::create_llama_model(
@@ -1112,7 +1161,14 @@ impl ModelFactory {
         dtype: DType,
     ) -> Result<HashMap<String, Tensor>> {
         let plan = Self::stage_weight_plan(model_path, num_layers, layer_range.clone())?;
-        Self::load_weights_for_stage_plan(plan, layer_range, device, dtype).await
+        Self::load_weights_for_stage_plan(
+            plan,
+            layer_range,
+            device,
+            dtype,
+            native_finite_policy(model_path)?,
+        )
+        .await
     }
 
     async fn load_weights_for_stage_plan(
@@ -1120,6 +1176,7 @@ impl ModelFactory {
         layer_range: Range<usize>,
         device: &Device,
         dtype: DType,
+        native_finite: bool,
     ) -> Result<HashMap<String, Tensor>> {
         let planned_tensors: usize = plan.values().map(BTreeSet::len).sum();
         info!(
@@ -1131,8 +1188,15 @@ impl ModelFactory {
 
         let mut weights = HashMap::with_capacity(planned_tensors);
         for (shard, names) in plan {
-            Self::load_safetensors_file_selected(&shard, &names, &mut weights, device, dtype)
-                .await?;
+            Self::load_safetensors_file_selected(
+                &shard,
+                &names,
+                &mut weights,
+                device,
+                dtype,
+                native_finite,
+            )
+            .await?;
         }
 
         if weights.len() != planned_tensors {
@@ -1240,6 +1304,7 @@ impl ModelFactory {
         // by processing shards sequentially and immediately transferring to GPU
         info!("Loading {} weight shards", shard_files.len());
 
+        let native_finite = native_finite_policy(model_path)?;
         let mut all_weights = HashMap::new();
 
         for (idx, shard_file) in shard_files.iter().enumerate() {
@@ -1252,6 +1317,7 @@ impl ModelFactory {
                 device,
                 dtype,
                 speculative_decoding,
+                native_finite,
             )
             .await?;
 
@@ -1288,6 +1354,7 @@ impl ModelFactory {
         dtype: DType,
         speculative_decoding: bool,
     ) -> Result<HashMap<String, Tensor>> {
+        let native_finite = native_finite_policy(model_path)?;
         let mut all_weights = HashMap::new();
 
         let single_file = model_path.join("model.safetensors");
@@ -1299,6 +1366,7 @@ impl ModelFactory {
                 device,
                 dtype,
                 speculative_decoding,
+                native_finite,
             )
             .await?;
             return Ok(all_weights);
@@ -1328,6 +1396,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
                 .await?;
             }
@@ -1348,9 +1417,18 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<()> {
-        Self::load_safetensors_file_inner(path, None, weights, device, dtype, speculative_decoding)
-            .await
+        Self::load_safetensors_file_inner(
+            path,
+            None,
+            weights,
+            device,
+            dtype,
+            speculative_decoding,
+            native_finite,
+        )
+        .await
     }
 
     /// Load only `selected` tensor names from one safetensors shard.
@@ -1364,8 +1442,18 @@ impl ModelFactory {
         weights: &mut HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
+        native_finite: bool,
     ) -> Result<()> {
-        Self::load_safetensors_file_inner(path, Some(selected), weights, device, dtype, false).await
+        Self::load_safetensors_file_inner(
+            path,
+            Some(selected),
+            weights,
+            device,
+            dtype,
+            false,
+            native_finite,
+        )
+        .await
     }
 
     async fn load_safetensors_file_inner(
@@ -1375,6 +1463,7 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<()> {
         // Stage selection always uses mmap: only selected tensor pages are copied
         // into owned CPU/device storage, so unrelated bytes in a shared shard do
@@ -1420,6 +1509,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
             }
             ResolvedWeight::File(_) => {
@@ -1432,6 +1522,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
             }
             ResolvedWeight::Owned(tensor_data) => {
@@ -1443,6 +1534,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
             }
         }
@@ -1542,6 +1634,7 @@ impl ModelFactory {
     }
 
     /// Create tensors from deserialized safetensors
+    #[cfg(test)]
     fn create_tensors_from_safetensors(
         tensors: safetensors::SafeTensors,
         weights: &mut HashMap<String, Tensor>,
@@ -1556,6 +1649,7 @@ impl ModelFactory {
             device,
             dtype,
             speculative_decoding,
+            false,
         )
     }
 
@@ -1566,6 +1660,7 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<()> {
         let mut total_size_mb = 0.0;
         let tensors_list = if let Some(selected) = selected {
@@ -1599,6 +1694,13 @@ impl ModelFactory {
             }
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
+            if native_finite {
+                // All admitted payloads are scanned, including scales and any
+                // vision bytes already loaded by this architecture. This is byte
+                // validation, not a claim of vision inference support. Selection
+                // and disabled-MTP exclusion have already happened above.
+                validate_finite_payload(&name, tensor_view.dtype(), data)?;
+            }
 
             // Map safetensors dtype to tch::Kind for size estimation
             let tensor_kind = match tensor_view.dtype() {
@@ -2272,8 +2374,15 @@ impl ModelFactory {
             info!("Loading {} weight shards via FsOps", shard_names.len());
         }
 
-        let weights =
-            Self::load_weights_fs(fs, &shard_names, device, dtype, speculative_decoding).await?;
+        let weights = Self::load_weights_fs(
+            fs,
+            &shard_names,
+            device,
+            dtype,
+            speculative_decoding,
+            native_finite_policy(model_path)?,
+        )
+        .await?;
         let config = ModelConfig::load(model_path, &weights)?;
         let model = Self::create_model_from_config(
             config,
@@ -2362,6 +2471,7 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<HashMap<String, Tensor>> {
         let mut all_weights = HashMap::new();
 
@@ -2381,12 +2491,14 @@ impl ModelFactory {
 
             let data = fs.read_file_chunked(name).await?;
             let tensors = safetensors::SafeTensors::deserialize(&data)?;
-            Self::create_tensors_from_safetensors(
+            Self::create_tensors_from_safetensors_selected(
                 tensors,
+                None,
                 &mut all_weights,
                 device,
                 dtype,
                 speculative_decoding,
+                native_finite,
             )?;
         }
 
@@ -2464,6 +2576,407 @@ mod stage_subset_tests {
             serde_json::to_vec(&index).unwrap(),
         )
         .unwrap();
+    }
+
+    fn finite_fixture(name: &str, dtype: Dtype, data: Vec<u8>) -> FixtureTensor {
+        let elements = data.len() / dtype.size();
+        FixtureTensor {
+            name: name.to_owned(),
+            dtype,
+            shape: vec![elements],
+            data,
+        }
+    }
+
+    fn finite_config(dir: &Path, config: serde_json::Value) {
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_finite_path_rejects_nonfinite_float_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let path = dir.path().join("weights.safetensors");
+        let cases = [
+            (Dtype::BF16, vec![0x7f80u32, 0xff80, 0x7fc1, 0xffc1]),
+            (Dtype::F16, vec![0x7c00, 0xfc00, 0x7e01, 0xfe01]),
+            (
+                Dtype::F32,
+                vec![0x7f80_0000, 0xff80_0000, 0x7fc0_0001, 0xffc0_0001],
+            ),
+        ];
+        for (dtype, patterns) in cases {
+            for (index, bits) in patterns.into_iter().enumerate() {
+                let name = [
+                    "model.embed_tokens.weight",
+                    "model.norm.weight",
+                    "model.layers.0.linear_attn.A_log",
+                    "model.layers.0.self_attn.q_proj.weight_scale",
+                ][index];
+                // A finite element before the poison verifies the reported
+                // element offset; no request tensor reaches a forward pass.
+                let data = if dtype == Dtype::F32 {
+                    [0u32.to_le_bytes(), bits.to_le_bytes()].concat()
+                } else {
+                    [0u16.to_le_bytes(), (bits as u16).to_le_bytes()].concat()
+                };
+                write_shard(
+                    dir.path(),
+                    "weights.safetensors",
+                    &[finite_fixture(name, dtype, data)],
+                );
+                let mut weights = HashMap::new();
+                let error = ModelFactory::load_safetensors_file(
+                    &path,
+                    &mut weights,
+                    &Device::Cpu,
+                    DType::Float,
+                    false,
+                    native_finite_policy(dir.path()).unwrap(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("nonfinite native Qwen3.5"), "{error}");
+                assert!(
+                    error.contains(name) && error.contains("element 1"),
+                    "{error}"
+                );
+                assert!(weights.is_empty(), "offending tensor was inserted");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_floating_boundaries_preserve_stored_values() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let path = dir.path().join("weights.safetensors");
+        let cases = [
+            (
+                Dtype::BF16,
+                DType::BFloat16,
+                [0u16, 0x8000, 1, 0x8001, 0x7f7f, 0xff7f]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                Dtype::F16,
+                DType::Half,
+                [0u16, 0x8000, 1, 0x8001, 0x7bff, 0xfbff]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            ),
+            (
+                Dtype::F32,
+                DType::Float,
+                [0u32, 0x8000_0000, 1, 0x8000_0001, 0x7f7f_ffff, 0xff7f_ffff]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ),
+        ];
+        for (dtype, compute, data) in cases {
+            write_shard(
+                dir.path(),
+                "weights.safetensors",
+                &[finite_fixture("model.norm.weight", dtype, data.clone())],
+            );
+            let mut weights = HashMap::new();
+            ModelFactory::load_safetensors_file(
+                &path,
+                &mut weights,
+                &Device::Cpu,
+                compute,
+                false,
+                native_finite_policy(dir.path()).unwrap(),
+            )
+            .await
+            .unwrap();
+            let tensor = &weights["model.norm.weight"];
+            assert_eq!(tensor.kind(), compute);
+            let mut actual = vec![0u8; data.len()];
+            tensor.copy_data_u8(&mut actual, tensor.numel());
+            assert_eq!(actual, data, "finite boundary bytes changed for{dtype:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_fp8_path_preserves_finite_codes_rejects_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5_text"}));
+        let path = dir.path().join("weights.safetensors");
+        let finite_codes = vec![0x00, 0x80, 0x01, 0x81, 0x7e, 0xfe];
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[finite_fixture(
+                "p.weight",
+                Dtype::F8_E4M3,
+                finite_codes.clone(),
+            )],
+        );
+        let mut weights = HashMap::new();
+        ModelFactory::load_safetensors_file(
+            &path,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            false,
+            native_finite_policy(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let tensor = &weights["p.weight"];
+        assert_eq!(tensor.kind(), DType::Float8e4m3fn);
+        let mut actual = vec![0u8; finite_codes.len()];
+        tensor.copy_data_u8(&mut actual, tensor.numel());
+        assert_eq!(actual, finite_codes); // includes signed zero and subnormals
+        let floating = tensor.to_kind(DType::Float);
+        assert_eq!(floating.double_value(&[4]), 448.0);
+        assert_eq!(floating.double_value(&[5]), -448.0);
+        for code in [0x7f, 0xff] {
+            write_shard(
+                dir.path(),
+                "weights.safetensors",
+                &[finite_fixture("p.weight", Dtype::F8_E4M3, vec![code])],
+            );
+            let mut rejected = HashMap::new();
+            let error = ModelFactory::load_safetensors_file(
+                &path,
+                &mut rejected,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                native_finite_policy(dir.path()).unwrap(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("nonfinite") && error.contains("p.weight"));
+            assert!(rejected.is_empty());
+        }
+        // Finite validation does not reinterpret or admit E5M2 as the separate
+        // compressed FP8_DYNAMIC profile; this is the existing loader format.
+        for code in [0x7c, 0xfc, 0x7d, 0xfd] {
+            assert!(validate_finite_payload("p.weight", Dtype::F8_E5M2, &[code]).is_err());
+        }
+        validate_finite_payload(
+            "p.weight",
+            Dtype::F8_E5M2,
+            &[0x00, 0x80, 1, 0x81, 0x7b, 0xfb],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_finite_selection_and_mtp_exclusion_precede_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let path = dir.path().join("weights.safetensors");
+        let poison = || {
+            finite_fixture(
+                "model.embed_tokens.weight",
+                Dtype::F32,
+                f32::NAN.to_le_bytes().to_vec(),
+            )
+        };
+        let mtp_poison = || {
+            finite_fixture(
+                "mtp.norm.weight",
+                Dtype::F32,
+                f32::INFINITY.to_le_bytes().to_vec(),
+            )
+        };
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[
+                FixtureTensor::f32("model.norm.weight", &[1], 1.0),
+                poison(),
+                mtp_poison(),
+            ],
+        );
+        let selected =
+            BTreeSet::from(["model.norm.weight".to_owned(), "mtp.norm.weight".to_owned()]);
+        let mut weights = HashMap::new();
+        // Actual selected path forces mmap; neither unselected text nor an
+        // explicitly selected but disabled MTP tensor is scanned/materialized.
+        ModelFactory::load_safetensors_file_selected(
+            &path,
+            &selected,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            native_finite_policy(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(weights.len(), 1);
+        assert!(weights.contains_key("model.norm.weight"));
+        let mut rejected = HashMap::new();
+        let selected = BTreeSet::from(["model.embed_tokens.weight".to_owned()]);
+        assert!(ModelFactory::load_safetensors_file_selected(
+            &path,
+            &selected,
+            &mut rejected,
+            &Device::Cpu,
+            DType::Float,
+            native_finite_policy(dir.path()).unwrap()
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("model.embed_tokens.weight"));
+        assert!(rejected.is_empty());
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[
+                FixtureTensor::f32("model.norm.weight", &[1], 1.0),
+                mtp_poison(),
+            ],
+        );
+        for enabled in [false, true] {
+            let mut weights = HashMap::new();
+            let result = ModelFactory::load_safetensors_file(
+                &path,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                enabled,
+                native_finite_policy(dir.path()).unwrap(),
+            )
+            .await;
+            if enabled {
+                assert!(result.unwrap_err().to_string().contains("mtp.norm.weight"));
+            } else {
+                result.unwrap();
+                assert_eq!(weights.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_gate_preserves_other_architecture_and_default_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.safetensors");
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[finite_fixture(
+                "model.norm.weight",
+                Dtype::F32,
+                f32::NAN.to_le_bytes().to_vec(),
+            )],
+        );
+        for (config, strict) in [
+            (None, false),
+            (Some(serde_json::json!({"model_type":"llama"})), false),
+            (
+                Some(
+                    serde_json::json!({"model_type":"llama","text_config":{"model_type":"qwen3_5_text"}}),
+                ),
+                false,
+            ),
+            (
+                Some(serde_json::json!({"text_config":{"model_type":"qwen3_5_text"}})),
+                true,
+            ),
+        ] {
+            if let Some(config) = config {
+                finite_config(dir.path(), config);
+            }
+            assert_eq!(native_finite_policy(dir.path()).unwrap(), strict);
+            let mut weights = HashMap::new();
+            let result = ModelFactory::load_safetensors_file(
+                &path,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                native_finite_policy(dir.path()).unwrap(),
+            )
+            .await;
+            if strict {
+                assert!(result.unwrap_err().to_string().contains("nonfinite"));
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    weights["model.norm.weight"]
+                        .isfinite()
+                        .all()
+                        .int64_value(&[]),
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_nested_shard_retains_model_root_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let nested = dir.path().join("weights");
+        std::fs::create_dir(&nested).unwrap();
+        // A shard-local config cannot override the authoritative model root.
+        finite_config(&nested, serde_json::json!({"model_type":"llama"}));
+        write_shard(
+            &nested,
+            "shard.safetensors",
+            &[finite_fixture(
+                "model.norm.weight",
+                Dtype::BF16,
+                0x7fc1u16.to_le_bytes().to_vec(),
+            )],
+        );
+        write_index(
+            dir.path(),
+            &[("model.norm.weight", "weights/shard.safetensors")],
+        );
+        let error = ModelFactory::load_weights(dir.path(), &Device::Cpu, DType::Float, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nonfinite") && error.contains("model.norm.weight"));
+    }
+
+    #[test]
+    fn native_finite_fsops_materialization_seam_rejects_nonfinite() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[finite_fixture(
+                "model.layers.0.linear_attn.dt_bias",
+                Dtype::F32,
+                f32::NEG_INFINITY.to_le_bytes().to_vec(),
+            )],
+        );
+        let bytes = std::fs::read(dir.path().join("weights.safetensors")).unwrap();
+        let mut weights = HashMap::new();
+        // Same policy and materializer called after FsOps::read_file_chunked;
+        // byte acquisition is local here, no fake RPC integration claim.
+        let error = ModelFactory::create_tensors_from_safetensors_selected(
+            safetensors::SafeTensors::deserialize(&bytes).unwrap(),
+            None,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            false,
+            native_finite_policy(dir.path()).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nonfinite") && error.contains("dt_bias"));
+        assert!(weights.is_empty());
     }
 
     fn loaded_bytes(weights: &HashMap<String, Tensor>) -> usize {
@@ -3072,10 +3585,15 @@ size 4096\n",
             .unwrap_err();
         assert_pointer_resolution_error(preflight_error);
 
-        let selected_error =
-            ModelFactory::load_weights_for_stage_plan(plan, 0..1, &Device::Cpu, DType::Float)
-                .await
-                .unwrap_err();
+        let selected_error = ModelFactory::load_weights_for_stage_plan(
+            plan,
+            0..1,
+            &Device::Cpu,
+            DType::Float,
+            native_finite_policy(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert_pointer_resolution_error(selected_error);
     }
 
