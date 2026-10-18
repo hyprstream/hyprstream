@@ -3886,101 +3886,223 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
-    async fn real_model_scoped_dispatch_carries_typed_decision_code() {
-        // REAL generated scoped dispatch (decode -> authorize -> handler ->
-        // error serialization) against a REAL permissive PolicyService: an
-        // invalid decide body must surface ErrorInfo code DECISION_INPUT on
-        // the wire, not INTERNAL.
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // authenticated wire fixture assertions
+    async fn real_model_scoped_dispatch_carries_typed_decision_code() -> Result<()> {
+        use hyprstream_rpc::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+        use hyprstream_service::ServiceManager as _;
+
+        // A real holder-authenticated Model request, followed by real delegated
+        // Policy admission. This test requires its own process (nextest default),
+        // because envelope verification/replay/session stores are first-write.
+        let policy_key = SigningKey::from_bytes(&[0x77; 32]);
+        let model_key = SigningKey::from_bytes(&[0x41; 32]);
+        let alice_key = SigningKey::from_bytes(&[0x43; 32]);
+        install_restart_fixture_auth(&[policy_key.clone(), model_key.clone(), alice_key.clone()])?;
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ))?;
+        }
         let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
             hyprstream_rpc::moq_event::MoqEventOrigin::new(),
         );
-        let policy_key = SigningKey::from_bytes(&[0x77; 32]);
-        let policy_manager = Arc::new(crate::auth::PolicyManager::permissive().await.unwrap());
+        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
+        let tag = hex::encode(hyprstream_rpc::envelope::generate_nonce());
+        let ca =
+            hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let oauth = SigningKey::from_bytes(&[0x76; 32]);
+        let oauth_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&oauth);
+        let oauth_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&oauth_pq);
+        let keys = Arc::new(CompositeKeySet::default());
+        keys.publish(
+            1,
+            format!("decide-typed-{tag}"),
+            vec![CompositeKeyPair::verifying(
+                hyprstream_rpc::auth::composite_kid(&oauth_vk, &oauth.verifying_key()),
+                oauth_vk,
+                oauth.verifying_key(),
+                CompositePairRole::OAuth,
+                CompositePairState::Active,
+                0,
+                i64::MAX,
+            )],
+        )?;
+        let jwt_source = Arc::new(
+            hyprstream_rpc::auth::ClusterKeySource::new(
+                ca.verifying_key(),
+                RESTART_FIXTURE_ISSUER.to_owned(),
+            )
+            .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq))
+            .with_composite_key_set(keys),
+        );
+        let credentials = tempfile::TempDir::new()?;
+        let model_token = restart_fixture_service_jwt(&credentials, "model", &ca, &model_key)?;
+        hyprstream_service::global_trust_store().insert(
+            model_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: ["model".to_owned()].into_iter().collect(),
+                subject: Some("service:model".to_owned()),
+                jwt: Some(model_token.clone()),
+                expires_at: chrono::Utc::now().timestamp() + 300,
+                attested_by: Some(ca.verifying_key().to_bytes()),
+            },
+        );
+
+        struct AlicePrimary(SigningKey);
+        impl crate::services::policy::PrimaryEnrollmentResolver for AlicePrimary {
+            fn primary_group(
+                &self,
+                principal: &str,
+                tenant: &str,
+            ) -> Option<crate::services::policy::PrimaryGroup> {
+                if principal != "alice" || tenant != "fixture-tenant" {
+                    return None;
+                }
+                let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&self.0);
+                Some(crate::services::policy::PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65.to_owned(),
+                    ordered_component_keys: vec![
+                        self.0.verifying_key().to_bytes().to_vec(),
+                        hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+                    ],
+                })
+            }
+        }
+        let policy_manager = Arc::new(crate::auth::PolicyManager::new_in_memory().await?);
+        // No permissive policy: admission proves the ORIGINAL delegated user,
+        // exact tenant/resource/action. No rule grants service:model infer.
+        policy_manager
+            .add_policy_with_domain(
+                "alice",
+                "fixture-tenant",
+                "model:nonexistent-model:main",
+                "infer",
+                "allow",
+            )
+            .await?;
+        let policy_base = tempfile::TempDir::new()?;
         let (policy_transport, policy_endpoint) =
-            restart_acceptance_inproc_endpoint("policy", "decide-typed");
+            restart_acceptance_inproc_endpoint("policy", &format!("decide-typed-{tag}"));
         let policy_service = crate::services::PolicyService::new(
             policy_manager,
             Arc::new(policy_key.clone()),
             crate::config::TokenConfig::default(),
-            Arc::new(RwLock::new(
-                git2db::Git2DB::open(tempfile::tempdir().unwrap().path())
-                    .await
-                    .unwrap(),
-            )),
+            Arc::new(RwLock::new(git2db::Git2DB::open(policy_base.path()).await?)),
             policy_transport.clone(),
-        );
-        use hyprstream_service::ServiceManager as _;
+        )
+        .with_default_audience(RESTART_FIXTURE_ISSUER.to_owned())
+        .with_jwt_key_source(jwt_source.clone())
+        .with_primary_enrollment_resolver(Arc::new(AlicePrimary(alice_key.clone())));
         let manager = hyprstream_service::InprocManager::new();
-        let _policy_handle = manager.spawn(Box::new(policy_service)).await.unwrap();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await?;
         let policy_client = PolicyClient::for_local_endpoint_bootstrap(
             &policy_endpoint,
-            policy_key.clone(),
+            model_key.clone(),
             policy_key.verifying_key(),
-            None,
-        )
-        .unwrap();
-
-        let model_key = SigningKey::from_bytes(&[0x41; 32]);
+            Some(model_token),
+        )?;
         let infrastructure = Arc::new(BoundaryRpcClient::new(
-            TransportConfig::inproc("decide-typed-registry"),
+            TransportConfig::inproc(format!("decide-typed-registry-{tag}")),
             Arc::new(BoundaryDialState::default()),
         ));
+        let (model_transport, model_endpoint) =
+            restart_acceptance_inproc_endpoint("model", &format!("decide-typed-{tag}"));
         let service = ModelService::new(
             ModelServiceConfig::default(),
-            model_key,
+            model_key.clone(),
             policy_client,
             RegistryClient::new(infrastructure),
-            TransportConfig::inproc("decide-typed-model"),
-            TransportConfig::inproc("decide-typed-policy"),
+            model_transport,
+            policy_transport,
+        )
+        .await?
+        .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
+        .with_jwt_key_source(jwt_source);
+        // Historical synthetic claims without the original token MUST deny.
+        assert!(ModelHandler::authorize(
+            &service,
+            &boundary_caller_ctx(chrono::Utc::now().timestamp() + 300),
+            "model:nonexistent-model:main",
+            "infer"
         )
         .await
-        .unwrap();
+        .is_err());
+        let _model_handle = manager.spawn(Box::new(service.clone())).await?;
 
-        let ctx = boundary_caller_ctx(3600);
-        let bytes = hyprstream_rpc::serialize_message(|message| {
-            let mut request =
-                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
-            request.set_id(11);
-            let mut infer = request.init_infer();
-            infer.set_model_ref("nonexistent-model:main");
-            let mut decide = infer.init_decide();
-            decide.set_clef_json(
-                r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
-            );
-        })
-        .unwrap();
-        let body =
-            crate::services::generated::model_client::decode_model_request_body(&bytes).unwrap();
-        // The REAL generated scoped dispatch: authorize (real policy admit)
-        // then the handler's typed preflight failure, serialized by the
-        // generated error wrapper (not the direct builder).
-        let (response, _cont) = dispatch_model(&service, &ctx, &body)
+        let now = chrono::Utc::now().timestamp();
+        let sid = format!("decide-typed-{tag}");
+        hyprstream_rpc::auth::global_session_registry()
+            .expect("session store installed")
+            .register_session(
+                hyprstream_rpc::auth::SessionKey::oidc(RESTART_FIXTURE_ISSUER, &sid),
+                hyprstream_rpc::auth::SessionState {
+                    subject: "alice".to_owned(),
+                    tenant: "fixture-tenant".to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                    created_at: now,
+                    expires_at: now + 300,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                },
+            )
+            .await?;
+        let alice_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&alice_key);
+        let alice_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&alice_pq);
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+            .with_issuer(RESTART_FIXTURE_ISSUER.to_owned())
+            .with_audience(Some(RESTART_FIXTURE_ISSUER.to_owned()))
+            .with_tenant("fixture-tenant".to_owned())
+            .with_sid(&sid)
+            .with_client_id("decide-typed-native-test")
+            .with_scope(Some("read write".to_owned()))
+            .with_jti()
+            .with_cnf_jwk(&alice_key.verifying_key().to_bytes())
+            .with_cnf_hs_signer_suite(hyprstream_rpc::auth::service_signer_suite_b64(
+                &alice_key.verifying_key().to_bytes(),
+                Some(&alice_pq_vk),
+            ))
+            .with_clearance(crate::services::inference::inference_object_label());
+        let token =
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &oauth_pq, &oauth);
+        let request = wire_decide_request(
+            r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+        );
+        let missing = hyprstream_rpc_std::model_client::ModelClient::for_local_endpoint_bootstrap(
+            &model_endpoint,
+            alice_key.clone(),
+            model_key.verifying_key(),
+            None,
+        )?;
+        assert_restart_dispatch_denied(
+            missing
+                .infer("nonexistent-model:main")
+                .decide(&request)
+                .await,
+            "missing original user credential",
+        )?;
+        let alice = hyprstream_rpc_std::model_client::ModelClient::for_local_endpoint_bootstrap(
+            &model_endpoint,
+            alice_key,
+            model_key.verifying_key(),
+            Some(token),
+        )?;
+        let error = alice
+            .infer("nonexistent-model:main")
+            .decide(&request)
             .await
-            .expect("scoped dispatch returns a typed error RESPONSE, not Err");
-        let parsed =
-            hyprstream_rpc_std::model_client::ModelClient::parse_response(&response).unwrap();
-        match parsed {
-            ModelResponseVariant::InferResult(infer) => match infer {
-                hyprstream_rpc_std::model_client::InferResponse::Error(info) => {
-                    assert_eq!(info.code, "DECISION_INPUT", "message: {}", info.message);
-                    assert!(
-                        info.message.contains("clef-decision-input"),
-                        "{}",
-                        info.message
-                    );
-                }
-                other => panic!("expected typed error, got {other:?}"),
-            },
-            ModelResponseVariant::Error(info) => {
-                // authorize failures land here; a typed dispatch failure must not
-                panic!(
-                    "error escaped to outer variant with code {}: {}",
-                    info.code, info.message
-                );
-            }
-            other => panic!("expected infer error, got {other:?}"),
-        }
+            .expect_err("authenticated invalid input must produce typed preflight failure");
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<hyprstream_rpc::TypedRpcError>())
+            .expect("real generated Model client preserves typed ErrorInfo");
+        assert_eq!(typed.code, "DECISION_INPUT");
+        assert!(typed.message.contains("clef-decision-input"));
+        assert!(service.loaded_models.read().await.is_empty());
+        assert!(service.take_test_work_order().await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
