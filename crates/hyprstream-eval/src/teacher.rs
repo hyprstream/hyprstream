@@ -152,7 +152,7 @@ impl TeacherEnsemble {
         // Check every teacher before querying the first one: a stricter
         // later transport must not reject input after earlier billed calls.
         for teacher in &self.teachers {
-            teacher.subject.preflight(set, state)?;
+            teacher.subject.preflight_row(set, state, row)?;
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
@@ -291,6 +291,56 @@ questions:
             tos_class: TosClass::Distributable,
             subject: Box::new(TruthSubject::new(id).with_truth("tone", truth)),
         }
+    }
+
+    struct CountCalls(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Subject for CountCalls {
+        fn model_id(&self) -> &str {
+            "count-calls"
+        }
+
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            state: &Entry,
+            row: usize,
+        ) -> Result<AnswerRow, EvalError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            TruthSubject::new("count-calls")
+                .decide(set, state, row)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_later_truth_is_rejected_before_any_teacher_query() {
+        let set = fixture();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ensemble = TeacherEnsemble::new(vec![
+            Teacher {
+                id: "remote-first".to_owned(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(CountCalls(calls.clone())),
+            },
+            teacher("invalid-truth-second", 7),
+        ])
+        .unwrap();
+
+        let error = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "invalid configured truth must fail preflight, got {error:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the first teacher must not be queried before later preflight fails"
+        );
     }
 
     #[tokio::test]

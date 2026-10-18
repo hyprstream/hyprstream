@@ -218,6 +218,11 @@ impl Harness {
         let mut row_ids = std::collections::HashSet::with_capacity(set.rows.len());
         for row in &set.rows {
             validate_entry(&row.state).map_err(EvalError::InvalidInput)?;
+            if row.id.is_empty() {
+                return Err(EvalError::InvalidInput(
+                    "eval row id must be nonempty".to_owned(),
+                ));
+            }
             if !row_ids.insert(&row.id) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate eval row id `{}`",
@@ -242,8 +247,8 @@ impl Harness {
         }
         // Subject-specific checks must also complete for ALL requests before
         // any decide call (e.g. the legacy HTTP endpoint rejects null state).
-        for row in &set.rows {
-            subject.preflight(&question_set, &row.state)?;
+        for (row_index, row) in set.rows.iter().enumerate() {
+            subject.preflight_row(&question_set, &row.state, row_index)?;
         }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
@@ -347,6 +352,11 @@ impl Harness {
         let mut identities = std::collections::HashSet::with_capacity(items.len());
         for item in items {
             validate_entry(&item.state).map_err(EvalError::InvalidInput)?;
+            if item.id.is_empty() {
+                return Err(EvalError::InvalidInput(
+                    "eval item id must be nonempty".to_owned(),
+                ));
+            }
             if !identities.insert((&item.id, &item.question.id)) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate eval item identity ({:?}, {:?})",
@@ -365,12 +375,12 @@ impl Harness {
                 }
             }
         }
-        for item in items {
+        for (row_index, item) in items.iter().enumerate() {
             let set = QuestionSet {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
             };
-            subject.preflight(&set, &item.state)?;
+            subject.preflight_row(&set, &item.state, row_index)?;
         }
         let mut observations = Vec::with_capacity(items.len());
         let mut pinned_model: Option<String> = None;

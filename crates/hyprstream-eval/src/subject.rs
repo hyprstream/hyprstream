@@ -30,13 +30,27 @@ pub trait Subject: Send + Sync {
     /// as already resolved.
     fn model_id(&self) -> &str;
 
-    /// Check subject-specific input constraints without I/O, model queries,
-    /// mutable state, or other side effects. Harnesses call this for every
-    /// request before deciding any row; ensembles check every teacher first.
-    /// The default accepts inputs, including explicit null states supported
-    /// by native/in-process subjects. Transport adapters may be stricter.
+    /// Check subject-wide input constraints without I/O, model queries,
+    /// mutable state, or other side effects. The default accepts inputs,
+    /// including explicit null states supported by native/in-process
+    /// subjects. Transport adapters may be stricter. Harness execution uses
+    /// [`Subject::preflight_row`] so row-dependent subjects can check the
+    /// exact request before any row is decided.
     fn preflight(&self, _set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
         Ok(())
+    }
+
+    /// Check subject-specific constraints for one concrete request row.
+    /// Subjects with row-dependent behavior can validate the same selection
+    /// that `decide` will use. The default preserves compatibility for
+    /// subjects whose preflight does not depend on the row index.
+    fn preflight_row(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        _row: usize,
+    ) -> Result<(), EvalError> {
+        self.preflight(set, state)
     }
 
     /// Answer every question in `set` for one state row. `row` is the batch
@@ -868,6 +882,35 @@ impl Subject for TruthSubject {
         &self.model_id
     }
 
+    fn preflight(&self, set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+        for question in &set.questions {
+            let cardinality = question.cardinality();
+            if let Some(&index) = self.truth.get(&question.id) {
+                validate_truth_index(&question.id, index, cardinality)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_row(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        row: usize,
+    ) -> Result<(), EvalError> {
+        for question in &set.questions {
+            let cardinality = question.cardinality();
+            let configured = self
+                .row_truth
+                .get(&(row, question.id.clone()))
+                .or_else(|| self.truth.get(&question.id));
+            if let Some(&index) = configured {
+                validate_truth_index(&question.id, index, cardinality)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn decide(
         &self,
         set: &QuestionSet,
@@ -888,12 +931,7 @@ impl Subject for TruthSubject {
                 // truth: silently degrading the documented perfectly
                 // accurate anchor into a uniform subject corrupts
                 // sanity-check results.
-                Some(&index) => {
-                    return Err(EvalError::InvalidInput(format!(
-                        "truth index {index} configured for question `{}` is outside its cardinality {cardinality}",
-                        question.id
-                    )));
-                }
+                Some(&index) => return Err(truth_index_error(&question.id, index, cardinality)),
                 // Uniform fallback: the rounded f32 reciprocal can violate
                 // the producer sum tolerance at high cardinalities (78
                 // options sum to ~1.0000011), so renormalize. The D6-safe
@@ -916,6 +954,24 @@ impl Subject for TruthSubject {
         }
         Ok(AnswerRow { answers })
     }
+}
+
+fn validate_truth_index(
+    question_id: &str,
+    index: usize,
+    cardinality: usize,
+) -> Result<(), EvalError> {
+    if index >= cardinality {
+        Err(truth_index_error(question_id, index, cardinality))
+    } else {
+        Ok(())
+    }
+}
+
+fn truth_index_error(question_id: &str, index: usize, cardinality: usize) -> EvalError {
+    EvalError::InvalidInput(format!(
+        "truth index {index} configured for question `{question_id}` is outside its cardinality {cardinality}"
+    ))
 }
 
 #[cfg(test)]
