@@ -117,9 +117,11 @@ pub trait MetricsStorage: Send + Sync + 'static {
     /// Get the underlying storage backend
     fn backend(&self) -> &dyn StorageBackend;
 
-    /// Initialize metrics storage (create schema-v2 tables, migrate pre-v2 `metrics`).
+    /// Initialize metrics storage (create schema-v2 tables, migrate pre-v2
+    /// `metrics`, and create the R6 decision/outcome tables).
     async fn init(&self) -> Result<(), Status> {
-        crate::metrics::create_schema_v2_tables(self.backend()).await
+        crate::metrics::create_schema_v2_tables(self.backend()).await?;
+        crate::metrics::decision_outcome::create_decision_outcome_tables(self.backend()).await
     }
 
     /// Insert metrics into storage

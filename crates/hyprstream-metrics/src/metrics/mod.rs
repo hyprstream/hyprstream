@@ -12,6 +12,8 @@ pub mod storage;
 
 #[cfg(test)]
 mod api_store_tests;
+#[cfg(test)]
+mod decision_outcome_tests;
 
 pub use hyprstream_metrics_api::metrics::*;
 pub use storage::{MetricsStorage, MetricsStorageImpl};

@@ -16,6 +16,12 @@ path = "src/lib.rs"
 # api/engine boundary by type identity.
 arrow = "56.2.0"
 
+# jev-1 decision/question schema contract: canonical `jev.kind`/`jev.labels`
+# Arrow field-metadata keys, `QuestionKind`, and profile limits for the R6
+# decision/outcome stores. Apache-2.0 leaf (acyclic; arrow 56.2.0 matches the
+# boundary version above, so Arrow types unify by identity).
+hyprstream-decision = { path = "../hyprstream-decision", version = "0.1.0" }
+
 # Server/RPC
 tonic = { version = "0.13", features = ["transport"] }
 

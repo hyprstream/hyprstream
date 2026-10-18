@@ -7406,6 +7406,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "hyprstream-decision",
  "serde",
  "serde_json",
  "tonic 0.13.1",

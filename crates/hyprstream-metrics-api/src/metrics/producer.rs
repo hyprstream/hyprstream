@@ -11,6 +11,7 @@
 
 use super::calibration::CalibrationStore;
 use super::decision_batch::DecisionBatchStore;
+use super::decision_outcome::{DecisionRowStore, OutcomeStore};
 use super::{create_record_batch, MetricRecord, METRICS_TABLE};
 use crate::storage::StorageBackend;
 use std::collections::BTreeMap;
@@ -134,5 +135,15 @@ impl<B: StorageBackend> MetricsProducer<B> {
     /// Arrow-native decision-batch store on the same backend.
     pub fn decision_batches(&self) -> DecisionBatchStore<B> {
         DecisionBatchStore::new(Arc::clone(&self.backend))
+    }
+
+    /// Durable decision-row store on the same backend (R6 outcome linkage).
+    pub fn decision_rows(&self) -> DecisionRowStore<B> {
+        DecisionRowStore::new(Arc::clone(&self.backend))
+    }
+
+    /// Realized-outcome store on the same backend (R6 outcome linkage).
+    pub fn outcomes(&self) -> OutcomeStore<B> {
+        OutcomeStore::new(Arc::clone(&self.backend))
     }
 }
