@@ -1,0 +1,16 @@
+{
+  "observed_at": "2026-10-18T16:02:08.916372+00:00",
+  "root_build_reviewed": true,
+  "build_manifest_sha256": "5a43593f1334e51f4c83330a1fae8c11882eee98c72579e9cea7f7b05a5234e9",
+  "composition_identity": "f2a82911ea8b6344db43ee1587760376a795832d74728edca0341ae3deb42a0b",
+  "executable_sha256": "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5",
+  "executable_bytes": 230875200,
+  "source_files_checked": 1553,
+  "actual_release_gate_commands": 5,
+  "runtime_library_hashes_checked": 13,
+  "actual_compile_only": true,
+  "scope": "ExactreleaseCPU source/prepost/build/testlist/librarymanifest bound. Fresh remote prepare/run resources/sharedlock checks and publicreceipt audit required; no fullmodel/nativebrowser/lab PASS claimed.",
+  "source_files_verified": 1553,
+  "source_snapshot": "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-source-frozen-f2a82911",
+  "source_snapshot_sha256_map_verified": true
+}

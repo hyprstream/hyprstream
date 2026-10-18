@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Reproduce archived DEVELOPMENT native head finite-load binding; no tensor IO.
-Supply the retained public evidence directory and exact frozen native source.
+Defaults resolve to the bundled public receipts and exact historical source.
 This is not a new head scan, current release validation, or private-log reader.
 """
 import argparse
@@ -13,6 +13,7 @@ SOURCE_PINS = {'crates/hyprstream-decision-head/src/clef/head.rs': 'bd0044962986
 EXECUTABLE = "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5"
 COMPOSITION = "f2a82911ea8b6344db43ee1587760376a795832d74728edca0341ae3deb42a0b"
 HEAD = "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0"
+BUNDLE = Path(__file__).resolve().parents[3] / "docs/evidence/clef-head-finite-load-20261018"
 
 def require(ok, message):
     if not ok: raise ValueError(message)
@@ -83,8 +84,8 @@ def derive(evidence_root, source_root):
 
 if __name__ == '__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--evidence-root',type=Path,required=True)
-    p.add_argument('--source-root',type=Path,required=True)
+    p.add_argument('--evidence-root',type=Path,default=BUNDLE / 'public-receipts')
+    p.add_argument('--source-root',type=Path,default=BUNDLE / 'source-snapshot')
     p.add_argument('--output',type=Path,required=True)
     a=p.parse_args()
     result=derive(a.evidence_root,a.source_root)

@@ -155,6 +155,8 @@ content hashes establish artifact identity, not finiteness. Separate archived
 development load-time evidence now binds the checked native constructor,
 executed source/artifact receipts, and all 122 tensors of the pinned head:
 [`native-head-finite-load-receipt.json`](../../crates/hyprstream-decision-head/fixtures/native-head-finite-load-receipt.json).
+All nine pinned inputs and a fresh-checkout command are included in the
+[archived evidence bundle](../evidence/clef-head-finite-load-20261018/README.md).
 Its reproducible public-receipt derivation performs no tensor execution. This is
 not a standalone head scan or current-main/new-candidate qualification;
 whole-backbone weight finite-load verification and an implementation PASS are
