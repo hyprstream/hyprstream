@@ -171,6 +171,11 @@ impl Harness {
         set: &EvalSet,
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
+        if set.schema_version.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "an eval set requires a nonempty schema version".to_owned(),
+            ));
+        }
         let question_set = set.question_set();
         // Validate the decision schema BEFORE any row reaches the subject:
         // with an HTTP-backed model every row is a billed call, and a schema

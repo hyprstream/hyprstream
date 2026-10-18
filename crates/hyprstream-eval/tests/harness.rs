@@ -1400,3 +1400,37 @@ async fn nonfinite_request_entries_fail_before_any_subject_or_teacher_call() {
         }
     }
 }
+
+#[tokio::test]
+async fn empty_schema_versions_fail_preflight_even_for_empty_runs() {
+    let item = noul_item();
+    let row = hyprstream_eval::EvalRow {
+        id: "row".into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        truth: std::collections::BTreeMap::new(),
+    };
+    for rows in [vec![], vec![row]] {
+        let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+        let mut set = hyprstream_eval::EvalSet {
+            name: "versioned".into(),
+            schema_version: String::new(),
+            questions: vec![item.question.clone()],
+            rows,
+        };
+        assert!(matches!(
+            Harness.run_set(&set, &subject).await,
+            Err(hyprstream_eval::EvalError::InvalidInput(_))
+        ));
+        assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        set.schema_version = "schema@revision".into();
+        let output = Harness.run_set(&set, &subject).await.unwrap();
+        assert_eq!(output.version.schema, "schema@revision");
+        assert_eq!(
+            subject.0.load(std::sync::atomic::Ordering::SeqCst),
+            set.rows.len()
+        );
+    }
+}
