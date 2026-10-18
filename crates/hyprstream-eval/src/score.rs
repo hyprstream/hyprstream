@@ -41,7 +41,9 @@ pub struct ScoreConfig {
     /// with a declared fit family are excluded from the gate's field rows
     /// entirely — they are training data, and silently macro-averaging them
     /// into a purported held-out gate would corrupt the measurement. Defaults
-    /// to none — a pure-eval report.
+    /// to none — a pure-eval report. Inputs are raw family tags; missing
+    /// families never match a declared string. Report identities use the
+    /// injective encoding documented on [`ScoreReport::by_family`].
     pub fit_families: Vec<String>,
 }
 
@@ -127,9 +129,12 @@ pub struct ItemScore {
 #[derive(Debug)]
 pub struct ScoreReport {
     /// The gate-protocol report (per-field metrics + macro CIs). `None` when
-    /// no labeled, answered observations exist.
+    /// no held-out labeled, answered observations exist.
     pub gate: Option<GateReport>,
-    /// Per-family breakdown.
+    /// Per-family breakdown. Missing family is `~untagged`; a raw tag
+    /// starting `~` gains one leading `~`. The same injective identities
+    /// appear in gate fields, NLL keys and the fit/eval split. Ordinary
+    /// family strings (including literal `unknown`) are unchanged.
     pub by_family: Vec<BreakdownMetrics>,
     /// Per-stratum breakdown.
     pub by_stratum: Vec<BreakdownMetrics>,
@@ -155,35 +160,56 @@ pub struct ScoreReport {
     pub items: Vec<ItemScore>,
 }
 
-/// Field key for an observation. Set runs key by question id (ids are shared
-/// across rows), prefixing the family when the run spans more than one family
-/// so families are never pooled into one field (the macro rule averages
-/// fields with equal weight — pooling would dilute a miscalibrated rare
-/// family). Item runs key by family × kind × cardinality, since every item
-/// carries its own question id. The caller picks the mode; [`score_run`] uses
-/// the item-group mode when the run has no batch (loose items) and the
-/// question-id mode otherwise.
-fn field_key(obs: &crate::run::Observation, by_question: bool, multi_family: bool) -> String {
-    let family = obs.family.as_deref().unwrap_or("unknown");
-    if by_question {
-        if multi_family {
-            return format!("{family}/{}", obs.question_id);
-        }
-        return obs.question_id.clone();
-    }
-    let cardinality = obs.probabilities.as_ref().map_or(0, std::vec::Vec::len);
-    format!("{family}/{}:{cardinality}", obs.kind)
+/// Preserve the actual optional family in grouping keys. A missing tag is
+/// not the caller's literal `"unknown"` family (or any other string).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FieldKey {
+    family: Option<String>,
+    field: String,
 }
 
-/// Number of distinct family tags in the run (`None` family counts as one).
+/// Injective report identity: ordinary family tags remain unchanged; missing
+/// is `~untagged`, and raw tags starting `~` gain one leading `~`.
+fn family_identity(family: Option<&str>) -> String {
+    match family {
+        None => "~untagged".to_owned(),
+        Some(tag) if tag.starts_with('~') => format!("~{tag}"),
+        Some(tag) => tag.to_owned(),
+    }
+}
+
+fn field_key(obs: &crate::run::Observation, by_question: bool) -> FieldKey {
+    let field = if by_question {
+        obs.question_id.clone()
+    } else {
+        let cardinality = obs.probabilities.as_ref().map_or(0, std::vec::Vec::len);
+        format!("{}:{cardinality}", obs.kind)
+    };
+    FieldKey {
+        family: obs.family.clone(),
+        field,
+    }
+}
+
+fn field_identity(key: &FieldKey, by_question: bool, multi_family: bool) -> String {
+    if by_question && !multi_family {
+        key.field.clone()
+    } else {
+        format!("{}/{}", family_identity(key.family.as_deref()), key.field)
+    }
+}
+
+fn is_fit_family(family: Option<&str>, config: &ScoreConfig) -> bool {
+    family.is_some_and(|tag| config.fit_families.iter().any(|fit| fit == tag))
+}
+
+/// Number of distinct family tags, retaining None separately from Some.
 fn family_count(observations: &[crate::run::Observation]) -> usize {
-    let mut families: Vec<&str> = observations
+    observations
         .iter()
-        .map(|obs| obs.family.as_deref().unwrap_or("unknown"))
-        .collect();
-    families.sort_unstable();
-    families.dedup();
-    families.len()
+        .map(|obs| obs.family.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 /// Per-field metrics plus the field's NLL (returned separately because
@@ -224,8 +250,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     let by_question = output.batch.is_some();
     let multi_family = family_count(&output.observations) > 1;
     // Group labeled, answered observations into fields.
-    let mut fields: BTreeMap<String, (QuestionKind, String, Vec<Vec<f64>>, Vec<usize>)> =
-        BTreeMap::new();
+    let mut fields: BTreeMap<FieldKey, (QuestionKind, Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
     let mut items = Vec::with_capacity(output.observations.len());
     let mut abstained = 0usize;
     let mut correct = 0usize;
@@ -235,13 +260,12 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
             (Some(probs), Some(truth)) => {
                 let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
                 let hit = metrics::argmax(&probs64) == truth;
-                let key = field_key(obs, by_question, multi_family);
-                let family = obs.family.clone().unwrap_or_else(|| "unknown".to_owned());
+                let key = field_key(obs, by_question);
                 let entry = fields
                     .entry(key)
-                    .or_insert_with(|| (obs.kind, family, Vec::new(), Vec::new()));
-                entry.2.push(probs64);
-                entry.3.push(truth);
+                    .or_insert_with(|| (obs.kind, Vec::new(), Vec::new()));
+                entry.1.push(probs64);
+                entry.2.push(truth);
                 labeled_answered += 1;
                 if hit {
                     correct += 1;
@@ -264,40 +288,44 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
 
     let mut field_rows = Vec::with_capacity(fields.len());
     let mut nll_by_field = Vec::with_capacity(fields.len());
-    for (key, (kind, family, probs, labels)) in &fields {
+    for (key, (kind, probs, labels)) in &fields {
         // Declared fit families are training data: their observations must
         // not enter the held-out gate's macro average (the split metadata
         // alone does not exclude them).
-        if config.fit_families.contains(family) {
+        if is_fit_family(key.family.as_deref(), config) {
             continue;
         }
         let refs: Vec<&[f64]> = probs.iter().map(std::vec::Vec::as_slice).collect();
-        let (metrics_row, nll) = field_metrics(key, family, *kind, &refs, labels)?;
+        let field = field_identity(key, by_question, multi_family);
+        let family = family_identity(key.family.as_deref());
+        let (metrics_row, nll) = field_metrics(&field, &family, *kind, &refs, labels)?;
         field_rows.push(metrics_row);
-        nll_by_field.push((key.clone(), nll));
+        nll_by_field.push((field, nll));
     }
 
-    // Held-out eval families = observed families minus declared fit families.
-    // Untagged observations score under the same "unknown" sentinel the field
-    // construction uses, so the split always names every family in the gate.
-    let eval_families: Vec<String> = {
-        let mut families: Vec<String> = output
-            .observations
-            .iter()
-            .map(|obs| obs.family.clone().unwrap_or_else(|| "unknown".to_owned()))
-            .filter(|family| !config.fit_families.contains(family))
-            .collect();
-        families.sort();
-        families.dedup();
-        families
-    };
+    // Match fit tags against actual Some(rawtag), then encode identities
+    // consistently for both sides of the reported split.
+    let eval_families: Vec<String> = output
+        .observations
+        .iter()
+        .map(|obs| obs.family.as_deref())
+        .filter(|family| !is_fit_family(*family, config))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(family_identity)
+        .collect();
+    let fit_families: Vec<String> = config
+        .fit_families
+        .iter()
+        .map(|family| family_identity(Some(family)))
+        .collect();
     let gate = if field_rows.is_empty() {
         None
     } else {
         Some(GateReport::assemble(
             output.model_id.clone(),
             config.split_name,
-            ShiftSplit::new(config.fit_families.clone(), eval_families)?,
+            ShiftSplit::new(fit_families, eval_families)?,
             field_rows,
             config.bootstrap_seed,
         )?)
@@ -315,15 +343,10 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
 
     Ok(ScoreReport {
         gate,
-        by_family: breakdown(&output.observations, by_question, multi_family, |obs| {
-            // Untagged rows score under the same "unknown" sentinel the gate
-            // and shift split use — omitting them would leave the family
-            // breakdown irreconcilable with the gate.
-            Some(obs.family.clone().unwrap_or_else(|| "unknown".to_owned()))
+        by_family: breakdown(&output.observations, by_question, |obs| {
+            Some(family_identity(obs.family.as_deref()))
         }),
-        by_stratum: breakdown(&output.observations, by_question, multi_family, |obs| {
-            obs.stratum.clone()
-        }),
+        by_stratum: breakdown(&output.observations, by_question, |obs| obs.stratum.clone()),
         flip_rate: None,
         abstention_rate,
         accuracy,
@@ -339,7 +362,6 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
 fn breakdown(
     observations: &[crate::run::Observation],
     by_question: bool,
-    multi_family: bool,
     key_of: impl Fn(&crate::run::Observation) -> Option<String>,
 ) -> Vec<BreakdownMetrics> {
     let mut buckets: BTreeMap<String, Vec<&crate::run::Observation>> = BTreeMap::new();
@@ -351,7 +373,7 @@ fn breakdown(
     buckets
         .into_iter()
         .map(|(key, bucket)| {
-            let mut fields: BTreeMap<String, (Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
+            let mut fields: BTreeMap<FieldKey, (Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
             let mut correct = 0usize;
             let mut labeled = 0usize;
             let mut abstained = 0usize;
@@ -363,7 +385,7 @@ fn breakdown(
                             correct += 1;
                         }
                         labeled += 1;
-                        let field = field_key(obs, by_question, multi_family);
+                        let field = field_key(obs, by_question);
                         let entry = fields.entry(field).or_default();
                         entry.0.push(probs64);
                         entry.1.push(truth);
@@ -413,6 +435,13 @@ pub fn flip_rate_with_labels(
     observations: &[crate::run::Observation],
     labels_of: impl Fn(&str) -> Option<Vec<String>>,
 ) -> FlipRate {
+    flip_rate_with_observation_labels(observations, |obs| labels_of(&obs.question_id))
+}
+
+fn flip_rate_with_observation_labels(
+    observations: &[crate::run::Observation],
+    labels_of: impl Fn(&crate::run::Observation) -> Option<Vec<String>>,
+) -> FlipRate {
     let mut groups: BTreeMap<&str, Vec<&crate::run::Observation>> = BTreeMap::new();
     // Run shape per group, over ALL observations (abstained included):
     // bench-shaped groups (cyclic rotations of one choice item) give every
@@ -433,7 +462,7 @@ pub fn flip_rate_with_labels(
         }
     }
     let label_of = |obs: &crate::run::Observation| -> Option<String> {
-        let labels = labels_of(&obs.question_id)?;
+        let labels = labels_of(obs)?;
         let index = obs.argmax_label_index()?;
         labels.get(index).cloned()
     };
@@ -520,11 +549,27 @@ pub fn score_bench_run(
     items: &[crate::run::EvalItem],
     config: &ScoreConfig,
 ) -> Result<ScoreReport, EvalError> {
+    let mut by_identity = BTreeMap::new();
+    for item in items {
+        let identity = (item.id.as_str(), item.question.id.as_str());
+        if by_identity.insert(identity, item).is_some() {
+            return Err(EvalError::InvalidInput(format!(
+                "duplicate eval item identity {identity:?}"
+            )));
+        }
+    }
+    for obs in &output.observations {
+        if !by_identity.contains_key(&(obs.id.as_str(), obs.question_id.as_str())) {
+            return Err(EvalError::InvalidInput(format!(
+                "observation identity ({:?}, {:?}) has no matching eval item",
+                obs.id, obs.question_id
+            )));
+        }
+    }
     let mut report = score_run(output, config)?;
-    let flip = flip_rate_with_labels(&output.observations, |question_id| {
-        items
-            .iter()
-            .find(|item| item.question.id == question_id)
+    let flip = flip_rate_with_observation_labels(&output.observations, |obs| {
+        by_identity
+            .get(&(obs.id.as_str(), obs.question_id.as_str()))
             .map(|item| item.question.labels())
     });
     report.flip_rate = (flip.groups > 0).then_some(flip);

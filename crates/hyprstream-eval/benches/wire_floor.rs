@@ -6,6 +6,9 @@
 //!   distributions (the P0.7 mock answers, so sizes are byte-reproducible),
 //! - encode/decode CPU per request.
 //!
+//! Actual byte counts are JSON sidecars under the active Cargo target's
+//! `criterion/wire_floor/byte-counts/`, written outside timed closures.
+//!
 //! These floors are the "you cannot do better than this" numbers P3.7's
 //! latency budget subtracts before blaming serving overhead. Run:
 //! `cargo bench -p hyprstream-eval --bench wire_floor`.
@@ -70,10 +73,27 @@ fn wire_bytes(set: &hyprstream_decision::QuestionSet) -> (usize, usize) {
 
 fn bench_wire_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("wire_floor");
+    let counts_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"))
+        .join("criterion/wire_floor/byte-counts");
+    std::fs::create_dir_all(&counts_dir).unwrap();
     for (questions, cardinality) in [(1, 4), (5, 4), (10, 8), (25, 8)] {
         let set = question_set(questions, cardinality);
-        // The byte floors themselves, as a benchmarked value (the numbers P3.7
-        // subtracts before blaming serving overhead).
+        let (request_bytes, response_bytes) = wire_bytes(&set);
+        // Store actual sizes once, outside the timed closure. Criterion's
+        // closure return values are black-boxed, not reported as measurements.
+        let counts = serde_json::json!({
+                "questions": questions,
+                "cardinality": cardinality,
+                "request_bytes": request_bytes,
+                "response_bytes": response_bytes,
+        });
+        std::fs::write(
+            counts_dir.join(format!("q{questions}-k{cardinality}.json")),
+            serde_json::to_vec_pretty(&counts).unwrap(),
+        )
+        .unwrap();
         group.bench_with_input(
             BenchmarkId::new("wire_bytes", format!("q{questions}-k{cardinality}")),
             &set,
