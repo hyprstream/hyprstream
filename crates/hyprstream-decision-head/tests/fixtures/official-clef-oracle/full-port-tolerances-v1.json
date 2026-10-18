@@ -2,6 +2,7 @@
   "schema_version": 1,
   "declared_before_full_port_comparison": true,
   "profile": "native-original-f32-cpu-vs-official-original-f32-cpu",
+  "source_revision": "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
   "corpus_sha256": "ebba1c6f29e8f10e243be6353d3665470ffb41681a430f29fea81e2f19ef0972",
   "encoding": "exact token IDs, spans, question types, option IDs/order and truncation accounting",
   "hidden": {"atol": 0.001, "rtol": 0.0001},

@@ -5,7 +5,6 @@ Full mode is opt-in and must be scheduled separately by the coordinator.
 """
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,10 +12,19 @@ import platform
 import resource
 import sys
 import time
+import types
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
+# Compile the invocation's helper source directly: timestamp-valid cached bytecode
+# must not substitute a different verifier. The same exact bytes are recorded.
+_verifier_path = Path(__file__).with_name("verify_artifacts.py")
+_verifier_source = _verifier_path.read_bytes()
+_verifier = types.ModuleType("clef_source_verifier")
+_verifier.__file__ = str(_verifier_path)
+exec(compile(_verifier_source, str(_verifier_path), "exec"), _verifier.__dict__)
+verify_artifacts = _verifier.verify_artifacts
 
 REVISION = "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
 
@@ -68,21 +76,22 @@ def main():
     assert artifact["revision"] == REVISION
     entries = {f["path"]: f for f in artifact["files"]}
     assert len(entries) == 17 and all(f["verified"] for f in entries.values())
-    # Rehash every small/source/head dependency here; previously verified full
-    # backbone shard identities are attested by the original manifest. Full mode
-    # must use a separately hash-verified destination if artifacts were moved.
-    checked = {}
-    for name in ["joint_schema_model.py", "joint_head_config.json", "joint_head.safetensors", "tokenizer.json", "tokenizer_config.json", "config.json", "model.safetensors.index.json"]:
-        path = args.model_dir / name
-        assert path.stat().st_size == entries[name]["bytes"], name
-        actual = sha256(path)
-        assert actual == entries[name]["sha256"], name
-        checked[name] = actual
+    # Verify ALL seventeen inputs, including every backbone shard, in this
+    # invocation before importing model code, reading LM rows or loading weights.
+    # Earlier manifest verification is not evidence about restored/copied bytes.
+    verified_source = {}
+    checked = verify_artifacts(args.model_dir, artifact, source_bytes=verified_source)
+    index = json.loads((args.model_dir / "model.safetensors.index.json").read_text())
+    model_shards = sorted(set(index["weight_map"].values()))
+    if any(name not in checked for name in model_shards):
+        raise ValueError("model index references an unverified shard")
     source = args.model_dir / "joint_schema_model.py"
-    spec = importlib.util.spec_from_file_location("official_pinned_clef", source)
-    official = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = official
-    spec.loader.exec_module(official)
+    official = types.ModuleType("official_pinned_clef")
+    official.__file__ = str(source)
+    sys.modules[official.__name__] = official
+    # Execute precisely the buffer whose type, size, stability and hash were
+    # checked above; neither a second source read nor a .pyc loader is involved.
+    exec(compile(verified_source[source.name], str(source), "exec"), official.__dict__)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=False)
     corpus = json.loads(args.corpus.read_text())
     encoded = []
@@ -103,7 +112,6 @@ def main():
         admitted_state = len(record.input_ids) - len(no_state.input_ids)
         fixture_records.append({"id": item["id"], "request": request, "max_length": item["max_length"], "max_state_tokens": item.get("max_state_tokens"), "input_ids": list(record.input_ids), "questions": [{"question_id": q.question_id, "question_type": q.question_type, "question_span": list(q.question_span), "option_spans": [list(s) for s in q.option_spans], "option_ids": list(q.option_ids)} for q in record.questions], "state_tokens_before_truncation": original_state, "state_tokens_admitted": admitted_state, "state_truncated": admitted_state < original_state})
     selected = sorted(selected)
-    index = json.loads((args.model_dir / "model.safetensors.index.json").read_text())
     embedding_key = "lm_head.weight"
     shard = index["weight_map"][embedding_key]
     assert (args.model_dir / shard).stat().st_size == entries[shard]["bytes"]
@@ -167,7 +175,7 @@ def main():
         hook.remove()
     save_file(tensors, args.output / "tensors.safetensors", metadata={"mode": args.mode, "source_revision": REVISION, "dtype": args.dtype})
     canonical_write(args.output / "records.json", {"corpus_version": corpus["corpus_version"], "mode": args.mode, "records": fixture_records})
-    provenance = {"source_repo": "Cloudflare/clef-flash", "source_revision": REVISION, "mode": args.mode, "input_kind": "synthetic_hidden_original_embedding_rows" if args.mode == "head" else "original_bf16_backbone_hidden", "device": args.device, "compute_dtype": args.dtype, "source_head_dtype": "bfloat16", "threads": torch.get_num_threads(), "interop_threads": torch.get_num_interop_threads(), "torch": torch.__version__, "transformers": __import__("transformers").__version__, "tokenizers": __import__("tokenizers").__version__, "safetensors": __import__("safetensors").__version__, "python": sys.version, "platform": platform.platform(), "hostname": platform.node(), "cuda_runtime": torch.version.cuda, "hip_runtime": torch.version.hip, "gpu": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None, "observed_attention_implementation": observed_attention, "elapsed_seconds": time.monotonic() - started, "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, "artifact_manifest_sha256": sha256(args.artifact_manifest), "corpus_sha256": sha256(args.corpus), "generator_sha256": sha256(__file__), "rehashed_files": checked, "embedding_shard": shard, "embedding_shard_attested_sha256": entries[shard]["sha256"], "embedding_shape": embedding_shape, "selected_embedding_rows": len(selected), "files": {name: sha256(args.output / name) for name in ["records.json", "tensors.safetensors"]}, "argv": sys.argv, "limitation": "Head mode proves official-head math on saved synthetic hidden input, not backbone correctness/calibration/full-model CPU acceptance."}
+    provenance = {"source_repo": "Cloudflare/clef-flash", "source_revision": REVISION, "mode": args.mode, "input_kind": "synthetic_hidden_original_embedding_rows" if args.mode == "head" else "original_bf16_backbone_hidden", "device": args.device, "compute_dtype": args.dtype, "source_head_dtype": "bfloat16", "threads": torch.get_num_threads(), "interop_threads": torch.get_num_interop_threads(), "torch": torch.__version__, "transformers": __import__("transformers").__version__, "tokenizers": __import__("tokenizers").__version__, "safetensors": __import__("safetensors").__version__, "python": sys.version, "platform": platform.platform(), "hostname": platform.node(), "cuda_runtime": torch.version.cuda, "hip_runtime": torch.version.hip, "gpu": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None, "observed_attention_implementation": observed_attention, "elapsed_seconds": time.monotonic() - started, "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, "artifact_manifest_sha256": sha256(args.artifact_manifest), "corpus_sha256": sha256(args.corpus), "generator_sha256": sha256(__file__), "rehashed_files": checked, "artifact_verifier_sha256": hashlib.sha256(_verifier_source).hexdigest(), "verified_model_shards": model_shards, "embedding_shard": shard, "embedding_shard_attested_sha256": entries[shard]["sha256"], "embedding_shape": embedding_shape, "selected_embedding_rows": len(selected), "files": {name: sha256(args.output / name) for name in ["records.json", "tensors.safetensors"]}, "argv": sys.argv, "limitation": "Head mode proves official-head math on saved synthetic hidden input, not backbone correctness/calibration/full-model CPU acceptance."}
     canonical_write(args.output / "provenance.json", provenance)
     print(json.dumps({"output": str(args.output), "records": len(encoded), "selected_rows": len(selected), "mode": args.mode, "peak_rss_kib": provenance["peak_rss_kib"], "elapsed_seconds": provenance["elapsed_seconds"]}))
 

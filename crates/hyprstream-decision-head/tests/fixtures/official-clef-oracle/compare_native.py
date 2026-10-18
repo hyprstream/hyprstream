@@ -38,6 +38,16 @@ def admit_original_f32_cpu_profile(provenance, *, backbone_only, tolerance_profi
                 or provenance.get("device") != "cpu"):
             raise ValueError("original-Float32 CPU gate requires a full Float32 CPU official oracle")
 
+def admit_tolerance_source(provenance, tolerance_profile):
+    """The declared full-port gate compares the pinned original Clef release."""
+    if tolerance_profile is None:
+        return
+    expected = tolerance_profile.get("source_revision")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}", expected):
+        raise ValueError("tolerance profile must declare a lowercase 40-hex source_revision")
+    if provenance.get("source_revision") != expected:
+        raise ValueError("reference source_revision does not match tolerance profile")
+
 def ordered_json(value):
     """Serialize JSON while retaining object order for source-order checks."""
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -215,14 +225,22 @@ def main():
     except ValueError as error:
         raise SystemExit(str(error)) from error
     try:
+        admit_tolerance_source(provenance, tolerance_profile)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    try:
         records = admit_tolerance_corpus(a.reference, provenance, tolerance_profile)
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if records is None:
         records = json.loads((a.reference / "records.json").read_text())
     record_match = None
+    native_records_sha256 = None
     if a.native_records:
-        native_records = json.loads(a.native_records.read_text())
+        # Hash exactly the same captured bytes that establish encoding equality.
+        native_records_bytes = a.native_records.read_bytes()
+        native_records = json.loads(native_records_bytes)
+        native_records_sha256 = hashlib.sha256(native_records_bytes).hexdigest()
         record_match = encoded_records_match(records, native_records)
     # CLI/mode/record admission precedes even tensor-library imports. Tiny
     # regression tests can exercise the fail-closed boundary without Torch.
@@ -270,7 +288,7 @@ def main():
             winners.append(winner)
         entries[key] = entry
         passed = passed and entry["pass"]
-    report = {"pass": passed, "scope": "backbone-only-original-f32" if a.backbone_only else provenance["mode"], "tolerance_profile": tolerance_profile, "tolerance_profile_sha256": digest(a.tolerance_file) if a.tolerance_file else None, "source_revision": provenance["source_revision"], "reference_provenance_sha256": digest(a.reference / "provenance.json"), "native_tensors_sha256": digest(a.native_tensors), "atol": a.atol, "rtol": a.rtol, "probability_atol": a.probability_atol, "exact_encoded_record_match": record_match, "tensors": entries, "limitation": "Head-only parity is not full backbone/FP8/calibration/CPU serving qualification."}
+    report = {"pass": passed, "scope": "backbone-only-original-f32" if a.backbone_only else provenance["mode"], "tolerance_profile": tolerance_profile, "tolerance_profile_sha256": digest(a.tolerance_file) if a.tolerance_file else None, "source_revision": provenance["source_revision"], "reference_provenance_sha256": digest(a.reference / "provenance.json"), "native_tensors_sha256": digest(a.native_tensors), "native_records_sha256": native_records_sha256, "atol": a.atol, "rtol": a.rtol, "probability_atol": a.probability_atol, "exact_encoded_record_match": record_match, "tensors": entries, "limitation": "Head-only parity is not full backbone/FP8/calibration/CPU serving qualification."}
     report["argmax"] = summarize_winners(winners)
     a.report.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(json.dumps({"pass": passed, "tensor_count": len(entries), "exact_encoded_record_match": record_match, "report": str(a.report)}))

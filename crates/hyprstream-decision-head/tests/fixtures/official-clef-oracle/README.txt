@@ -59,8 +59,22 @@ Reports include every logits/probabilities winner in model and canonical label
 coordinates, with per-tensor and per-question disagreement counts. Argmax changes
 are reported independently of the unchanged original full-port numeric tolerances;
 they do not silently create a new stronger label-stability acceptance gate.
-Tiny comparison/CLI regressions require only Python stdlib (no Torch/model):
-  python3 -S -m unittest discover -s tests/fixtures/official-clef-oracle -p test_compare_native.py
+The full-port profile also fixes the original source revision; source and corpus
+admission precede tensor imports. Reports bind the exact native-record file bytes
+with native_records_sha256, including encoding-mismatch reports. Numerical limits
+remain unchanged.
+
+The successor generate.py freshly verifies all seventeen manifest inputs, including
+all four backbone shards, before importing pinned model code or loading tensors in
+either mode. It records every checked hash, the verifier source hash and the shard
+list in provenance. The manifest must cover the exact seventeen pinned paths.
+The helper is compiled from source directly; the joint model is compiled from
+the exact source byte buffer checked during verification. Neither uses a cached
+.pyc loader, and the model source is not reopened for execution. verify_artifacts.py provides the same reusable check and its
+standalone CLI. Historical generate_head_v1.py and its evidence remain unchanged.
+
+Tiny comparison/CLI and artifact regressions require only Python stdlib (no Torch/model):
+  python3 -S -m unittest discover -s tests/fixtures/official-clef-oracle -p 'test_*.py'
 Run that command from crates/hyprstream-decision-head.
 
 Observed first comparison: all exact token/span/order/accounting checks passed;

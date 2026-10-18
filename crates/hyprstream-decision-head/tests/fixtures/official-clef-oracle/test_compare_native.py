@@ -54,6 +54,7 @@ class ComparatorAdmissionTests(unittest.TestCase):
             root = Path(directory)
             (root / "provenance.json").write_text(json.dumps({
                 "mode": "full", "compute_dtype": "float32", "device": "cpu",
+                "source_revision": "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
                 "corpus_sha256": "0" * 64,
                 "files": {},
             }))
@@ -83,6 +84,7 @@ class ComparatorAdmissionTests(unittest.TestCase):
                 tensors_path.write_bytes(b"not imported before admission")
                 provenance = {
                     "mode": "full", "compute_dtype": "float32", "device": "cpu",
+                "source_revision": "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
                     "corpus_sha256": hashlib.sha256((HERE / "corpus.json").read_bytes()).hexdigest(),
                     "files": {
                         "records.json": hashlib.sha256(records_path.read_bytes()).hexdigest(),
@@ -309,7 +311,7 @@ class SingleValueTensor:
 
 
 class FiniteReportAndProfileTests(unittest.TestCase):
-    def run_small_report(self, reference_value, native_value):
+    def run_small_report(self, reference_value, native_value, *, native_marker=None, mismatched_records=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             reference = root / "reference"
@@ -337,13 +339,37 @@ class FiniteReportAndProfileTests(unittest.TestCase):
             report = root / "report.json"
             argv = ["compare_native.py", "--reference", str(reference), "--native-tensors", str(native_path),
                     "--atol", "0", "--rtol", "0", "--report", str(report), "--head-only"]
+            native_record_sha256 = None
+            if native_marker is not None:
+                native_records = copy.deepcopy(records)
+                native_records["run_marker"] = native_marker
+                if mismatched_records:
+                    native_records["records"][0]["input_ids"] = [99]
+                native_record_bytes = json.dumps(native_records).encode()
+                native_record_path = root / "native-records.json"
+                native_record_path.write_bytes(native_record_bytes)
+                native_record_sha256 = hashlib.sha256(native_record_bytes).hexdigest()
+                argv += ["--native-records", str(native_record_path)]
             with mock.patch.dict(sys.modules, {"safetensors":safe, "safetensors.torch":loader, "torch":torch}), \
                  mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit) as exited: compare.main()
             data = json.loads(report.read_text(), parse_constant=lambda value: self.fail("nonstandard JSON " + value))
             self.assertEqual(data["native_tensors_sha256"], hashlib.sha256(native_path.read_bytes()).hexdigest())
             self.assertEqual(data["reference_provenance_sha256"], hashlib.sha256((reference / "provenance.json").read_bytes()).hexdigest())
+            self.assertEqual(data["native_records_sha256"], native_record_sha256)
             return exited.exception.code, data
+
+    def test_report_binds_exact_native_record_artifact_for_match_and_mismatch(self):
+        first_code, first = self.run_small_report(1.0, 1.0, native_marker="run-a")
+        second_code, second = self.run_small_report(1.0, 1.0, native_marker="run-b")
+        self.assertEqual((first_code, second_code), (0, 0))
+        self.assertTrue(first["exact_encoded_record_match"])
+        self.assertTrue(second["exact_encoded_record_match"])
+        self.assertNotEqual(first["native_records_sha256"], second["native_records_sha256"])
+        code, mismatch = self.run_small_report(1.0, 1.0, native_marker="run-a", mismatched_records=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(mismatch["exact_encoded_record_match"])
+        self.assertNotEqual(first["native_records_sha256"], mismatch["native_records_sha256"])
 
     def test_nonfinite_required_tensor_writes_hashed_failed_json_not_exception(self):
         for left, right in ((1.0, float("nan")), (1.0, float("inf")),
@@ -380,6 +406,29 @@ class FiniteReportAndProfileTests(unittest.TestCase):
                     capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("requires a full Float32 CPU official oracle", result.stderr)
+                self.assertNotIn("ModuleNotFoundError", result.stderr)
+                self.assertFalse((root/"report").exists())
+
+    def test_full_original_profile_rejects_wrong_source_before_record_or_tensor_reads(self):
+        revision = "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+        profile = json.loads((HERE / "full-port-tolerances-v1.json").read_text())
+        self.assertEqual(profile["source_revision"], revision)
+        compare.admit_tolerance_source({"source_revision": revision}, profile)
+        compare.admit_tolerance_source({"source_revision": "other-head-profile"}, None)
+        for invalid in (None, "", "A" * 40, "0" * 39):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "must declare"):
+                compare.admit_tolerance_source({"source_revision": revision}, {"source_revision": invalid})
+        for supplied in (None, "0" * 40):
+            with self.subTest(supplied=supplied), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "provenance.json").write_text(json.dumps({"mode":"full", "compute_dtype":"float32", "device":"cpu", "source_revision":supplied, "files":{}}))
+                result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                    "--reference", str(root), "--native-tensors", str(root/"unused"),
+                    "--native-records", str(root/"unread-records"), "--include-hidden",
+                    "--tolerance-file", str(HERE/"full-port-tolerances-v1.json"), "--report", str(root/"report")],
+                    capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("source_revision does not match tolerance profile", result.stderr)
                 self.assertNotIn("ModuleNotFoundError", result.stderr)
                 self.assertFalse((root/"report").exists())
 
