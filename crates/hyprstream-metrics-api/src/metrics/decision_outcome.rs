@@ -519,8 +519,13 @@ fn validate_declared_labels(
             }
         }
         QuestionKind::Score => {
+            if labels.len() < 2 {
+                return Err(invalid(format!(
+                    "question {question_id:?}: score needs >= 2 levels"
+                )));
+            }
             let canonical: Vec<String> = (0..labels.len()).map(|level| level.to_string()).collect();
-            if labels.len() < 2 || labels != canonical {
+            if labels != canonical {
                 return Err(invalid(format!(
                     "question {question_id:?}: score labels must be the canonical levels 0..{}",
                     labels.len() - 1
@@ -1836,6 +1841,49 @@ mod tests {
             )
             .with_metadata(meta),
         )
+    }
+
+    #[test]
+    fn score_domain_cardinality_rejects_before_range_formatting() {
+        // Zero-width FixedSizeList and empty label metadata are structurally
+        // valid Arrow schema input. Domain admission must return an error
+        // without evaluating an underflowing last-level range expression.
+        for (labels, width) in [("[]", 0), (r#"["0"]"#, 1)] {
+            let schema = Schema::new(vec![question_field(
+                "score.probabilities",
+                "score",
+                labels,
+                width,
+            )]);
+            let Err(error) = validate_payload_schema(&schema) else {
+                panic!("score domains require at least two levels");
+            };
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(
+                error.message(),
+                r#"question "score": score needs >= 2 levels"#
+            );
+        }
+        // The minimum valid canonical domain and non-canonical rejection
+        // retain their existing behavior at the same schema boundary.
+        let valid = Schema::new(vec![question_field(
+            "score.probabilities",
+            "score",
+            r#"["0","1"]"#,
+            2,
+        )]);
+        assert!(validate_payload_schema(&valid).is_ok());
+        let malformed = Schema::new(vec![question_field(
+            "score.probabilities",
+            "score",
+            r#"["0","01"]"#,
+            2,
+        )]);
+        let Err(error) = validate_payload_schema(&malformed) else {
+            panic!("score labels must remain canonical");
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("canonical levels 0..1"));
     }
 
     #[test]
