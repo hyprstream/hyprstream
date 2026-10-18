@@ -419,9 +419,11 @@ unsafe impl Sync for RMSNormGated {}
 /// L2 normalization along last dim (used on Q and K before delta rule)
 #[inline]
 fn l2_normalize(x: &Tensor) -> Tensor {
-    // norm_scalaropt_dim = 2 GPU ops (vs 5 with manual x*x+sum+sqrt+div)
-    let norm = x.norm_scalaropt_dim(2.0, &[-1i64][..], true);
-    x / norm.clamp_min(1e-3)
+    // Match transformers 5.10.2 Qwen3.5 l2norm: epsilon is additive
+    // inside rsqrt, not a lower bound on the norm. The distinction matters
+    // for small query/key vectors and propagates through recurrent state.
+    let sum_sq = (x * x).sum_dim_intlist(&[-1i64][..], true, Kind::Float);
+    x * (sum_sq + 1e-6f64).rsqrt()
 }
 
 /// Chunked GatedDeltaNet prefill (translation of `torch_chunk_gated_delta_rule`).
@@ -3071,6 +3073,56 @@ mod pipeline_tests {
     //! state threading were wrong, the two-stage result would diverge.
     use super::*;
     use crate::runtime::device_pool::LayerDeviceMap;
+
+    // Pinned reference: transformers 5.10.2 models/qwen3_5/modeling_qwen3_5.py
+    // l2norm computes x * rsqrt(sum(x*x) + 1e-6). Scalar f64 evaluation supplies
+    // an independent numerical reference; these are not model outputs.
+    #[test]
+    fn gdn_l2_normalize_matches_additive_epsilon_reference() {
+        let input = Tensor::from_slice(&[3.0f32, 4.0, -2.0, 1.0]).reshape([2, 2]);
+        let expected = Tensor::from_slice(&[
+            (3.0f64 / (25.0f64 + 1e-6).sqrt()) as f32,
+            (4.0f64 / (25.0f64 + 1e-6).sqrt()) as f32,
+            (-2.0f64 / (5.0f64 + 1e-6).sqrt()) as f32,
+            (1.0f64 / (5.0f64 + 1e-6).sqrt()) as f32,
+        ])
+        .reshape([2, 2]);
+        assert!(l2_normalize(&input).allclose(&expected, 1e-7, 1e-7, false));
+    }
+
+    #[test]
+    fn gdn_l2_normalize_small_vectors_do_not_clamp_norm() {
+        let input = Tensor::from_slice(&[3e-4f32, 4e-4, 1e-3, 0.0]).reshape([1, 2, 2]);
+        let a = 3e-4f32 as f64;
+        let b = 4e-4f32 as f64;
+        let c = 1e-3f32 as f64;
+        let denominator = (a * a + b * b + 1e-6).sqrt();
+        let expected = Tensor::from_slice(&[
+            (a / denominator) as f32,
+            (b / denominator) as f32,
+            (c / (c * c + 1e-6).sqrt()) as f32,
+            0.0,
+        ])
+        .reshape([1, 2, 2]);
+        let output = l2_normalize(&input);
+        assert_eq!(output.size(), input.size());
+        assert!(output.allclose(&expected, 1e-7, 1e-7, false));
+        let old_clamped = &input
+            / input
+                .norm_scalaropt_dim(2.0, &[-1i64][..], true)
+                .clamp_min(1e-3);
+        assert!((&output - old_clamped).abs().max().double_value(&[]) > 0.1);
+    }
+
+    #[test]
+    fn gdn_l2_normalize_zero_vectors_remain_finite_zero() {
+        let input = Tensor::zeros([2, 3, 4], (Kind::Float, Device::Cpu));
+        let output = l2_normalize(&input);
+        assert_eq!(output.size(), input.size());
+        assert_eq!(output.kind(), Kind::Float);
+        assert_ne!(output.isfinite().all().int64_value(&[]), 0);
+        assert_eq!(output.abs().max().double_value(&[]), 0.0);
+    }
 
     pub(super) const HIDDEN: i64 = 16;
     pub(super) const HEADS: i64 = 2;
