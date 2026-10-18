@@ -467,8 +467,14 @@ impl MetricsHandler for MetricsService {
             compute_profile: non_empty_pin(&data.compute_profile, "computeProfile")?,
             calib_version: optional_pin(&data.calib_version, "calibVersion")?,
         };
-        let batch = hyprstream_metrics::metrics::decision_batch::decode_batch_ipc(&data.payload)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Bounded decode: framing + declared (decompressed) buffer sizes are
+        // verified within MAX_PAYLOAD_BYTES BEFORE the decoder allocates;
+        // valid compression is preserved.
+        let batch = hyprstream_metrics::metrics::decision_batch::decode_batch_ipc_bounded(
+            &data.payload,
+            MAX_PAYLOAD_BYTES,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         let stored = rows
             .put(&tenant, &pins, &batch)
             .await
@@ -571,13 +577,26 @@ impl MetricsHandler for MetricsService {
             include_superseded: data.include_superseded,
             limit: data.limit,
         };
-        let joined = outcomes
-            .join_outcomes(&tenant, &query)
+        let cursor = hyprstream_metrics::metrics::decision_outcome::OutcomeCursor::from_wire(
+            data.after_created_at,
+            &data.after_outcome_id,
+        )?;
+        let page = outcomes
+            .join_outcomes_page(&tenant, &query, cursor.as_ref())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let rows = join_rows(&joined)?;
+        let rows = join_rows(&page.rows)?;
+        let (has_more, next_created_at, next_outcome_id) = match page.next_cursor {
+            Some(cursor) => (true, cursor.created_at(), cursor.outcome_id().to_owned()),
+            None => (false, 0, String::new()),
+        };
         Ok(MetricsResponseVariant::QueryOutcomesResult(
-            DecisionOutcomeQueryResult { rows },
+            DecisionOutcomeQueryResult {
+                rows,
+                has_more,
+                next_created_at,
+                next_outcome_id,
+            },
         ))
     }
 
@@ -1025,6 +1044,7 @@ impl RequestService for MetricsService {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use hyprstream_metrics::arrow::array::RecordBatch;
     use std::sync::Arc;
 
     use hyprstream_metrics::query::QueryOrchestrator;
@@ -2403,15 +2423,15 @@ mod tests {
             calib_version: String::new(),
             include_superseded: false,
             limit: 0,
+            after_created_at: 0,
+            after_outcome_id: String::new(),
         }
     }
 
-    /// Minimal VALID decision payload: one float32 fixed-size-list question
-    /// column with jev metadata + version-triple columns.
-    fn minimal_decision_payload() -> Vec<u8> {
-        use hyprstream_metrics::arrow::array::{
-            ArrayRef, FixedSizeListArray, RecordBatch, StringArray,
-        };
+    /// Minimal VALID decision batch: one float32 fixed-size-list question
+    /// column with jev metadata + version-triple columns, `rows` input rows.
+    fn minimal_decision_batch(rows: usize) -> RecordBatch {
+        use hyprstream_metrics::arrow::array::{ArrayRef, FixedSizeListArray, StringArray};
         use hyprstream_metrics::arrow::datatypes::{DataType, Field, Float32Type, Schema};
         let mut meta = std::collections::HashMap::new();
         meta.insert(
@@ -2422,7 +2442,9 @@ mod tests {
             hyprstream_metrics::metrics::decision_outcome::FIELD_META_LABELS.to_owned(),
             "[\"alpha\",\"beta\"]".to_owned(),
         );
-        let values: Vec<Option<Vec<Option<f32>>>> = vec![Some(vec![Some(0.25), Some(0.75)])];
+        let row_values = vec![Some(0.25_f32), Some(0.75)];
+        let values: Vec<Option<Vec<Option<f32>>>> =
+            (0..rows).map(|_| Some(row_values.clone())).collect();
         let route = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(values, 2);
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -2435,17 +2457,98 @@ mod tests {
             Field::new("model_version", DataType::Utf8, false),
             Field::new("calib_version", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::try_new(
+        RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(route) as ArrayRef,
-                Arc::new(StringArray::from(vec!["v3"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["clef-flash@8b2e5fd1"])) as ArrayRef,
-                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["v3"; rows])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["clef-flash@8b2e5fd1"; rows])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef,
             ],
         )
-        .unwrap();
-        hyprstream_metrics::metrics::decision_batch::encode_batch_ipc(&batch).unwrap()
+        .unwrap()
+    }
+
+    fn minimal_decision_payload() -> Vec<u8> {
+        hyprstream_metrics::metrics::decision_batch::encode_batch_ipc(&minimal_decision_batch(1))
+            .unwrap()
+    }
+
+    /// COMPRESSION BOMB: a genuinely lz4-compressed decision payload whose
+    /// first data buffer claims an 8-byte advertised prefix while the lz4
+    /// stream actually expands to the full row data — the exact shape
+    /// arrow-ipc's unbounded read_to_end would over-allocate on.
+    fn compression_bomb_payload() -> Vec<u8> {
+        use hyprstream_metrics::arrow::ipc::writer::IpcWriteOptions;
+        use hyprstream_metrics::arrow::ipc::CompressionType;
+        // Repetition ensures a genuine codec frame, not Arrow's -1/raw
+        // representation for small incompressible buffers;256 rows stays
+        // well inside the existing4096row/16MiB admission bounds.
+        let batch = minimal_decision_batch(256);
+        let options = IpcWriteOptions::default()
+            .try_with_compression(Some(CompressionType::LZ4_FRAME))
+            .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                hyprstream_metrics::arrow::ipc::writer::StreamWriter::try_new_with_options(
+                    &mut buf,
+                    &batch.schema(),
+                    options,
+                )
+                .unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        // Locate the record-batch message, then the largest compressed
+        // buffer's advertised prefix, and shrink the claim to 8 bytes.
+        let bytes = buf;
+        assert_eq!(
+            hyprstream_metrics::metrics::decision_batch::decode_batch_ipc(&bytes).unwrap(),
+            batch,
+            "unmodified compression-bomb control must decode canonically"
+        );
+        // StreamWriter framing starts at byte 0 (no magic).
+        let mut pos = 0usize;
+        let (meta_start, meta_end, body_start) = loop {
+            let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let meta_start = pos + 8;
+            let meta_end = meta_start + size;
+            let body_start = meta_end;
+            let message =
+                hyprstream_metrics::arrow::ipc::root_as_message(&bytes[meta_start..meta_end])
+                    .unwrap();
+            if message.header_as_record_batch().is_some() {
+                break (meta_start, meta_end, body_start);
+            }
+            pos = body_start + message.bodyLength() as usize;
+        };
+        let message =
+            hyprstream_metrics::arrow::ipc::root_as_message(&bytes[meta_start..meta_end]).unwrap();
+        let rb = message.header_as_record_batch().unwrap();
+        let buffers = rb.buffers().unwrap();
+        let mut chosen: Option<(usize, i64)> = None;
+        for i in 0..buffers.len() {
+            let b = buffers.get(i);
+            if b.length() < 12 {
+                continue;
+            }
+            let prefix = body_start + usize::try_from(b.offset()).unwrap();
+            let advertised = i64::from_le_bytes(bytes[prefix..prefix + 8].try_into().unwrap());
+            if advertised > 8 && chosen.is_none_or(|(_, prior)| advertised > prior) {
+                chosen = Some((prefix, advertised));
+            }
+        }
+        let (prefix_pos, advertised) = chosen.expect("a genuine compressed buffer, not0/-1");
+        assert!(advertised > 8, "negative must shrink actual decoded bytes");
+        assert_eq!(
+            &bytes[prefix_pos + 8..prefix_pos + 12],
+            &[0x04, 0x22, 0x4D, 0x18],
+            "selected positive prefix must precede a real LZ4 frame"
+        );
+        let mut bytes = bytes;
+        bytes[prefix_pos..prefix_pos + 8].copy_from_slice(&8i64.to_le_bytes());
+        bytes
     }
 
     /// NARROW scope: direct handler calls with a for_test tenant context.
@@ -2964,5 +3067,509 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(n, 0, "rejected recordDecision must insert nothing");
+    }
+    /// WIRE P1 regression: a compression-bomb recordDecision (tiny advertised
+    /// prefix, LZ4 stream expanding far beyond it) is rejected by the bounded
+    /// verifier and inserts NOTHING — Arrow's unbounded read_to_end decoder
+    /// is never reached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_record_decision_wire_rejects_expansion_bomb_with_zero_inserts() {
+        let me = PolicyManager::new_in_memory().await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
+        me.add_policy_with_domain(
+            "alice",
+            "tenant-a",
+            "metrics:RecordDecision",
+            "write",
+            "allow",
+        )
+        .await
+        .unwrap();
+        let fixture = decision_store_fixture("ds-wire-bomb", me).await;
+        let manager = InprocManager::new();
+        manager.spawn(Box::new(fixture.service)).await.unwrap();
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
+
+        let err = client
+            .record_decision(&decision_request(compression_bomb_payload()))
+            .await
+            .expect_err("compression bomb must be rejected at the wire");
+        assert!(
+            err.to_string().contains("advertised") || err.to_string().contains("beyond"),
+            "{err}"
+        );
+
+        // Zero inserts.
+        let handle = fixture
+            .backend
+            .prepare_sql("SELECT COUNT(*) AS n FROM decision_rows")
+            .await
+            .unwrap();
+        let count = fixture.backend.query_sql(&handle).await.unwrap();
+        let n = count
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 0, "rejected compression bomb must insert nothing");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_record_decision_wire_rejects_dictionary_representation_with_zero_inserts() {
+        use hyprstream_metrics::arrow::array::{
+            ArrayRef, DictionaryArray, Int32Array, RecordBatch, UInt8Array,
+        };
+        use hyprstream_metrics::arrow::datatypes::{DataType, Field, Int32Type, Schema};
+        use hyprstream_metrics::arrow::ipc::writer::{
+            DictionaryHandling, IpcWriteOptions, StreamWriter,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "extra",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::UInt8)),
+            false,
+        )]));
+        const BASE_VALUES: usize = 192 * 1024;
+        const EPOCHS: usize = 96;
+        // Every interleaved record retains its distinct cumulative generation.
+        let retained_values = EPOCHS * BASE_VALUES + EPOCHS * (EPOCHS - 1) / 2;
+        assert_eq!(retained_values, 18_878_928);
+        assert!(retained_values > MAX_PAYLOAD_BYTES);
+        let mut payload = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new_with_options(
+                &mut payload,
+                &schema,
+                IpcWriteOptions::default().with_dictionary_handling(DictionaryHandling::Delta),
+            )
+            .unwrap();
+            // Pinned Arrow56 writer measurement: 282696 encoded bytes, including
+            // validity, padding and framing; 1 full dictionary, 95 deltas, 96 records.
+            // Without admission retained values total ~18MiB, never GiB.
+            for n in 0..EPOCHS {
+                let values = Arc::new(UInt8Array::from(vec![0u8; BASE_VALUES + n])) as ArrayRef;
+                let array = Arc::new(DictionaryArray::<Int32Type>::new(
+                    Int32Array::from(vec![0]),
+                    values,
+                )) as ArrayRef;
+                let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+                writer.write(&batch).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        assert!(
+            payload.len() < 300 * 1024,
+            "actual encoded fixture bytes: {}",
+            payload.len()
+        );
+        let me = PolicyManager::new_in_memory().await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
+        me.add_policy_with_domain(
+            "alice",
+            "tenant-a",
+            "metrics:RecordDecision",
+            "write",
+            "allow",
+        )
+        .await
+        .unwrap();
+        let fixture = decision_store_fixture("ds-wire-representation", me).await;
+        let manager = InprocManager::new();
+        manager.spawn(Box::new(fixture.service)).await.unwrap();
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
+        let error = client
+            .record_decision(&decision_request(payload))
+            .await
+            .expect_err("representation amplification must reject before Arrow");
+        assert!(
+            error
+                .to_string()
+                .contains("IPC representation: materialized buffer budget exceeded"),
+            "{error}"
+        );
+        let query = fixture
+            .backend
+            .prepare_sql("SELECT COUNT(*) AS n FROM decision_rows")
+            .await
+            .unwrap();
+        let count = fixture.backend.query_sql(&query).await.unwrap();
+        let n = count
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            n, 0,
+            "predecode representation rejection must insert no durable rows"
+        );
+    }
+
+    /// Typed generated FB fixtures only: no raw table-offset/header parser.
+    /// A missing preflight would at most allocate small tens of MiB, never GiB.
+    fn metadata_budget_wire_payload(case: &str) -> Vec<u8> {
+        use flatbuffers::FlatBufferBuilder;
+        use hyprstream_metrics::arrow::ipc::{
+            self,
+            gen::Message::{DictionaryBatchArgs, FieldNode, Message, MessageArgs, RecordBatchArgs},
+        };
+        fn append_message(out: &mut Vec<u8>, bytes: &[u8]) {
+            use hyprstream_metrics::arrow::ipc::writer::{
+                write_message, EncodedData, IpcWriteOptions,
+            };
+            write_message(
+                out,
+                EncodedData {
+                    ipc_message: bytes.to_vec(),
+                    arrow_data: Vec::new(),
+                },
+                &IpcWriteOptions::default(),
+            )
+            .expect("canonical IPC fixture framing");
+        }
+        let mut out = Vec::new();
+        let mut b = FlatBufferBuilder::new();
+        let null = ipc::Null::create(&mut b, &ipc::NullArgs {});
+        let name = b.create_string(if case == "schema" { "" } else { "child" });
+        let long_name = if case == "schema" {
+            Some(b.create_string(&"n".repeat(16 * 1024)))
+        } else {
+            None
+        };
+        let child = ipc::Field::create(
+            &mut b,
+            &ipc::FieldArgs {
+                name: long_name.or(Some(name)),
+                nullable: false,
+                type_type: ipc::Type::Null,
+                type_: Some(null.as_union_value()),
+                ..Default::default()
+            },
+        );
+        let field = if case == "schema" {
+            child
+        } else {
+            let children = b.create_vector(&[child]);
+            let structure = ipc::Struct_::create(&mut b, &ipc::Struct_Args {});
+            let index = ipc::Int::create(
+                &mut b,
+                &ipc::IntArgs {
+                    bitWidth: 8,
+                    is_signed: true,
+                },
+            );
+            let dictionary = ipc::DictionaryEncoding::create(
+                &mut b,
+                &ipc::DictionaryEncodingArgs {
+                    id: 1,
+                    indexType: Some(index),
+                    ..Default::default()
+                },
+            );
+            let name = b.create_string("dictionary");
+            ipc::Field::create(
+                &mut b,
+                &ipc::FieldArgs {
+                    name: Some(name),
+                    nullable: true,
+                    type_type: ipc::Type::Struct_,
+                    type_: Some(structure.as_union_value()),
+                    dictionary: Some(dictionary),
+                    children: Some(children),
+                    ..Default::default()
+                },
+            )
+        };
+        let fields = b.create_vector(&vec![field; if case == "schema" { 1024 } else { 1 }]);
+        let schema = ipc::Schema::create(
+            &mut b,
+            &ipc::SchemaArgs {
+                fields: Some(fields),
+                ..Default::default()
+            },
+        );
+        let msg = Message::create(
+            &mut b,
+            &MessageArgs {
+                version: ipc::MetadataVersion::V5,
+                header_type: ipc::MessageHeader::Schema,
+                header: Some(schema.as_union_value()),
+                ..Default::default()
+            },
+        );
+        b.finish(msg, None);
+        append_message(&mut out, b.finished_data());
+        if case != "schema" {
+            let mut b = FlatBufferBuilder::new();
+            let n = (hyprstream_metrics::metrics::decision_batch::MAX_PAYLOAD_BYTES as i64) * 8 + 1;
+            let nodes = if case == "node" {
+                vec![FieldNode::new(-1, 0)]
+            } else {
+                vec![FieldNode::new(n, 0), FieldNode::new(n, n)]
+            };
+            let nodes = b.create_vector(&nodes);
+            let buffers = b.create_vector(&[ipc::Buffer::new(0, 0)]);
+            let data = ipc::RecordBatch::create(
+                &mut b,
+                &RecordBatchArgs {
+                    length: if case == "node" { 1 } else { n },
+                    nodes: Some(nodes),
+                    buffers: Some(buffers),
+                    ..Default::default()
+                },
+            );
+            let dictionary = ipc::DictionaryBatch::create(
+                &mut b,
+                &DictionaryBatchArgs {
+                    id: 1,
+                    data: Some(data),
+                    isDelta: false,
+                },
+            );
+            let msg = Message::create(
+                &mut b,
+                &MessageArgs {
+                    version: ipc::MetadataVersion::V5,
+                    header_type: ipc::MessageHeader::DictionaryBatch,
+                    header: Some(dictionary.as_union_value()),
+                    ..Default::default()
+                },
+            );
+            b.finish(msg, None);
+            append_message(&mut out, b.finished_data());
+        }
+        out
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_record_decision_wire_rejects_metadata_allocations_with_zero_inserts() {
+        let me = PolicyManager::new_in_memory().await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
+        me.add_policy_with_domain(
+            "alice",
+            "tenant-a",
+            "metrics:RecordDecision",
+            "write",
+            "allow",
+        )
+        .await
+        .unwrap();
+        let fixture = decision_store_fixture("ds-wire-metadata", me).await;
+        let manager = InprocManager::new();
+        manager.spawn(Box::new(fixture.service)).await.unwrap();
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
+        // This existing fixture uses real signed original-user JWT, generated
+        // MetricsClient, real dispatch+Policy and actual durable DuckDB store.
+        for (case, cause) in [
+            ("schema", "owned schema"),
+            ("bitmap", "logical bitmap"),
+            ("node", "negative field node"),
+        ] {
+            let payload = metadata_budget_wire_payload(case);
+            assert!(
+                payload.len() < 128 * 1024,
+                "tiny encoded allocation fixture"
+            );
+            let Err(err) = client.record_decision(&decision_request(payload)).await else {
+                panic!("metadata allocation must reject");
+            };
+            assert!(err.to_string().contains(cause), "{case}: {err}");
+            // A generic Arrow/column/schema failure does not satisfy this test:
+            // it must be the BEFORE-decoder admission guard's specific cause.
+            assert!(err.to_string().contains("IPC metadata"), "{err}");
+            let query = fixture
+                .backend
+                .prepare_sql("SELECT COUNT(*) AS n FROM decision_rows")
+                .await
+                .unwrap();
+            let count = fixture.backend.query_sql(&query).await.unwrap();
+            let n = count
+                .column_by_name("n")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<hyprstream_metrics::arrow::array::Int64Array>()
+                .unwrap()
+                .value(0);
+            assert_eq!(
+                n, 0,
+                "{case}: rejected metadata must insert no durable rows"
+            );
+        }
+    }
+    /// Actual generated signed-JWT dispatch with real owned PolicyService and
+    /// DuckDB stores. Cursor fields position rows; they never confer tenancy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_decision_outcome_wire_keyset_pages_and_controls() {
+        let me = PolicyManager::new_in_memory().await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
+        for (res, op) in [
+            ("metrics:RecordDecision", "write"),
+            ("metrics:RecordOutcome", "write"),
+            ("metrics:QueryOutcomes", "query"),
+        ] {
+            for (subject, tenant) in [("alice", "tenant-a"), ("bob", "tenant-b")] {
+                me.add_policy_with_domain(subject, tenant, res, op, "allow")
+                    .await
+                    .unwrap();
+            }
+        }
+        let fixture = decision_store_fixture("ds-wire-pages", me).await;
+        let manager = InprocManager::new();
+        manager.spawn(Box::new(fixture.service)).await.unwrap();
+        let client_a = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
+        let client_b = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_b.clone()),
+        );
+        let stored = client_a
+            .record_decision(&decision_request(minimal_decision_payload()))
+            .await
+            .unwrap();
+        let mut recorded = Vec::new();
+        for _ in 0..3 {
+            recorded.push(
+                client_a
+                    .record_outcome(&outcome_request(&stored.decision_id, &stored.row_ids[0]))
+                    .await
+                    .unwrap()
+                    .outcome_id,
+            );
+        }
+        let mut correction = outcome_request(&stored.decision_id, &stored.row_ids[0]);
+        correction.supersedes_outcome_id = recorded[0].clone();
+        let correction = client_a
+            .record_outcome(&correction)
+            .await
+            .unwrap()
+            .outcome_id;
+        let foreign = client_b
+            .record_decision(&decision_request(minimal_decision_payload()))
+            .await
+            .unwrap();
+        client_b
+            .record_outcome(&outcome_request(&foreign.decision_id, &foreign.row_ids[0]))
+            .await
+            .unwrap();
+        let mut query = all_outcome_query();
+        query.limit = 1;
+        query.schema_fingerprint = "jev1:route:v3".to_owned();
+        query.model_id = "clef-flash@8b2e5fd1".to_owned();
+        query.question_id = "route".to_owned();
+        query.calib_filter = ExpectedCalib::Raw;
+        let mut seen = std::collections::HashSet::new();
+        let mut previous = None;
+        let mut first_cursor = None;
+        loop {
+            let page = client_a
+                .query_outcomes(&query)
+                .await
+                .expect("real signed RPC page");
+            assert_eq!(page.rows.len(), 1);
+            let row = &page.rows[0];
+            assert_eq!(row.tenant_id, "tenant-a");
+            assert!(row.calib_version.is_empty());
+            let key = (row.created_at, row.outcome_id.clone());
+            if let Some(previous) = previous {
+                assert!(previous < key);
+            }
+            previous = Some(key);
+            assert!(seen.insert(row.outcome_id.clone()));
+            if !page.has_more {
+                assert_eq!(page.next_created_at, 0);
+                assert!(page.next_outcome_id.is_empty());
+                break;
+            }
+            assert_eq!(page.next_created_at, row.created_at);
+            assert_eq!(page.next_outcome_id, row.outcome_id);
+            first_cursor
+                .get_or_insert_with(|| (page.next_created_at, page.next_outcome_id.clone()));
+            query.after_created_at = page.next_created_at;
+            query.after_outcome_id = page.next_outcome_id;
+            assert!(seen.len() < 5);
+        }
+        assert_eq!(seen.len(), 3);
+        assert!(
+            !seen.contains(&recorded[0]),
+            "correction predicate retained on every page"
+        );
+        assert!(seen.contains(&correction));
+        let (after_created_at, after_outcome_id) = first_cursor.unwrap();
+        query.after_created_at = after_created_at;
+        query.after_outcome_id = after_outcome_id;
+        // Reusing tenant-a's values does not authorize tenant-a's data.
+        let foreign_page = client_b.query_outcomes(&query).await.unwrap();
+        assert!(foreign_page
+            .rows
+            .iter()
+            .all(|row| row.tenant_id == "tenant-b"));
+        for filter in ["schema", "model", "question", "calib"] {
+            let mut filtered = query.clone();
+            match filter {
+                "schema" => filtered.schema_fingerprint = "other-schema".to_owned(),
+                "model" => filtered.model_id = "other-model".to_owned(),
+                "question" => filtered.question_id = "other_question".to_owned(),
+                _ => {
+                    filtered.calib_filter = ExpectedCalib::Version;
+                    filtered.calib_version = "cal-1".to_owned();
+                }
+            }
+            let page = client_a.query_outcomes(&filtered).await.unwrap();
+            assert!(page.rows.is_empty(), "every-page filter {filter}");
+            assert!(!page.has_more);
+            assert_eq!(page.next_created_at, 0);
+            assert!(page.next_outcome_id.is_empty());
+        }
+        for (time, id) in [(1, ""), (-1, "outc-x"), (0, "bad' OR 1=1")] {
+            let mut invalid = all_outcome_query();
+            invalid.after_created_at = time;
+            invalid.after_outcome_id = id.to_owned();
+            assert!(
+                client_a.query_outcomes(&invalid).await.is_err(),
+                "invalid cursor must fail generated dispatch"
+            );
+        }
+        let mut overlong = all_outcome_query();
+        overlong.after_outcome_id = "x".repeat(65);
+        assert!(client_a.query_outcomes(&overlong).await.is_err());
+        let mut capped = all_outcome_query();
+        capped.limit = u32::MAX;
+        let page = client_a.query_outcomes(&capped).await.unwrap();
+        assert_eq!(page.rows.len(), 3);
+        assert!(!page.has_more);
+        capped.include_superseded = true;
+        assert_eq!(
+            client_a.query_outcomes(&capped).await.unwrap().rows.len(),
+            4
+        );
     }
 }

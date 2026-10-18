@@ -36,7 +36,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tonic::Status;
 
-use super::decision_batch::{decode_batch_ipc, encode_batch_ipc, PAYLOAD_FORMAT_IPC_STREAM};
+use super::decision_batch::{
+    decode_batch_ipc_bounded, encode_batch_ipc, PAYLOAD_FORMAT_IPC_STREAM,
+};
 
 /// Decision-row table name (append-only; one row per stored decision batch).
 pub const DECISION_ROWS_TABLE: &str = "decision_rows";
@@ -64,8 +66,9 @@ pub const PROBABILITIES_COLUMN_SUFFIX: &str = ".probabilities";
 /// Maximum input rows carried by one `decision_rows` payload.
 pub const MAX_DECISION_ROWS_PER_BATCH: usize = 4096;
 
-/// Maximum encoded payload size accepted for durable storage (bytes).
-pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum encoded payload size accepted for durable storage and bounded IPC
+/// decode (bytes). Single source of truth lives in `decision_batch`.
+pub use super::decision_batch::MAX_PAYLOAD_BYTES;
 
 /// Default row cap applied to join/list queries when the caller passes 0.
 pub const DEFAULT_QUERY_LIMIT: i64 = 1000;
@@ -1076,8 +1079,11 @@ impl<B: StorageBackend + ?Sized> DecisionRowStore<B> {
     /// distribution values (finite, [0, 1], sum within the D5 consumer
     /// tolerance — ingest is a READER boundary; native producers stay bound
     /// by the tighter 1e-6 producer tolerance upstream; whole-list null is
-    /// the only abstention form). Invalid input is rejected — nothing is
-    /// normalized and nothing is inserted.
+    /// the only abstention form). The IPC payload itself is decoded
+    /// BOUNDED: framing, declared row counts, and the ACTUAL decompressed
+    /// expansion of every compressed buffer are verified within
+    /// MAX_PAYLOAD_BYTES before the Arrow decoder allocates. Invalid input is
+    /// rejected — nothing is normalized and nothing is inserted.
     ///
     /// Idempotency/retry semantics: each call appends a NEW decision record.
     /// This is explicitly NOT an atomic or concurrency-safe exactly-once
@@ -1192,6 +1198,9 @@ impl<B: StorageBackend + ?Sized> DecisionRowStore<B> {
             sql.push_str(&format!(" AND model_id = '{}'", escape_sql(model)));
         }
         sql.push_str(&query.calib.sql_predicate("calib_version")?);
+        // Deterministic oldest-first order with a total tie-break: created_at
+        // is millisecond wall time (ties happen), decision_id is unique.
+        sql.push_str(" ORDER BY created_at ASC, decision_id ASC");
         sql.push_str(&limit_clause(query.limit)?);
         let batch = self.query(&sql).await?;
         (0..batch.num_rows())
@@ -1292,23 +1301,28 @@ fn payload_row_id_column(batch: &RecordBatch) -> Result<&StringArray, Status> {
         })
 }
 
-/// Decode an IPC payload with the same byte bound enforced at write time.
+/// Decode an IPC payload with bounds enforced BEFORE decoder allocation: the
+/// encoded size and every declared (decompressed) buffer length are verified
+/// within MAX_PAYLOAD_BYTES first; valid compression is preserved.
 fn decode_payload_bounded(bytes: &[u8]) -> Result<RecordBatch, Status> {
     if bytes.len() > MAX_PAYLOAD_BYTES {
         return Err(Status::internal(
             "stored decision payload exceeds the durable size bound",
         ));
     }
-    decode_batch_ipc(bytes)
+    decode_batch_ipc_bounded(bytes, MAX_PAYLOAD_BYTES)
 }
 
-fn limit_clause(limit: u32) -> Result<String, Status> {
-    let limit = if limit == 0 {
+fn effective_query_limit(limit: u32) -> i64 {
+    if limit == 0 {
         DEFAULT_QUERY_LIMIT
     } else {
         i64::from(limit).min(MAX_QUERY_LIMIT)
-    };
-    Ok(format!(" LIMIT {limit}"))
+    }
+}
+
+fn limit_clause(limit: u32) -> Result<String, Status> {
+    Ok(format!(" LIMIT {}", effective_query_limit(limit)))
 }
 
 /// Realized-outcome store over any [`StorageBackend`] (`B` may be unsized).
@@ -1327,6 +1341,50 @@ pub struct DecisionOutcomeQuery {
     pub include_superseded: bool,
     /// 0 = [`DEFAULT_QUERY_LIMIT`]; hard-capped at [`MAX_QUERY_LIMIT`].
     pub limit: u32,
+}
+
+/// Validated ASC `(created_at, outcome_id)` continuation key.
+///
+/// A cursor is a position, never tenant authority or a snapshot guarantee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeCursor {
+    created_at: i64,
+    outcome_id: String,
+}
+
+impl OutcomeCursor {
+    pub fn new(created_at: i64, outcome_id: String) -> Result<Self, Status> {
+        if created_at < 0 {
+            return Err(invalid("afterCreatedAt must not be negative"));
+        }
+        validate_stored_id("afterOutcomeId", &outcome_id)?;
+        Ok(Self {
+            created_at,
+            outcome_id,
+        })
+    }
+
+    /// Decode the append-only wire fields, including the legacy first page.
+    pub fn from_wire(created_at: i64, outcome_id: &str) -> Result<Option<Self>, Status> {
+        if created_at == 0 && outcome_id.is_empty() {
+            return Ok(None);
+        }
+        Self::new(created_at, outcome_id.to_owned()).map(Some)
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+    pub fn outcome_id(&self) -> &str {
+        &self.outcome_id
+    }
+}
+
+/// One bounded page; a continuation exists only when a later row was seen.
+#[derive(Debug)]
+pub struct OutcomePage {
+    pub rows: RecordBatch,
+    pub next_cursor: Option<OutcomeCursor>,
 }
 
 impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
@@ -1538,6 +1596,18 @@ impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
         tenant: &TrustedTenant,
         query: &DecisionOutcomeQuery,
     ) -> Result<RecordBatch, Status> {
+        Ok(self.join_outcomes_page(tenant, query, None).await?.rows)
+    }
+
+    /// Continue the existing ascending join with a strict keyset cursor.
+    /// Every page re-applies all tenant/filter predicates. This is not a
+    /// snapshot across concurrent appends, corrections or clock changes.
+    pub async fn join_outcomes_page(
+        &self,
+        tenant: &TrustedTenant,
+        query: &DecisionOutcomeQuery,
+        cursor: Option<&OutcomeCursor>,
+    ) -> Result<OutcomePage, Status> {
         let mut sql = format!(
             "SELECT o.outcome_id, o.tenant_id, o.decision_id, o.decision_row_id, o.question_id, \
              o.outcome_label, o.outcome_value, o.outcome_source, o.supersedes_outcome_id, \
@@ -1571,10 +1641,46 @@ impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
                  WHERE s.tenant_id = o.tenant_id AND s.supersedes_outcome_id = o.outcome_id)"
             ));
         }
+        if let Some(cursor) = cursor {
+            sql.push_str(&format!(
+                " AND (o.created_at > {} OR (o.created_at = {} AND o.outcome_id > '{}'))",
+                cursor.created_at,
+                cursor.created_at,
+                escape_sql(&cursor.outcome_id)
+            ));
+        }
         sql.push_str(" ORDER BY o.created_at ASC, o.outcome_id ASC");
-        sql.push_str(&limit_clause(query.limit)?);
+        let limit = usize::try_from(effective_query_limit(query.limit))
+            .map_err(|_| Status::internal("invalid effective outcome query limit"))?;
+        // The one look-ahead row is internal, never an increased public cap.
+        sql.push_str(&format!(" LIMIT {}", limit + 1));
         let handle = self.backend.prepare_sql(&sql).await?;
-        self.backend.query_sql(&handle).await
+        let batch = self.backend.query_sql(&handle).await?;
+        let next_cursor = if batch.num_rows() > limit {
+            let ids = batch
+                .column_by_name("outcome_id")
+                .and_then(|v| v.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| Status::internal("outcome page missing typed outcome_id"))?;
+            let times = batch
+                .column_by_name("created_at")
+                .and_then(|v| v.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| Status::internal("outcome page missing typed created_at"))?;
+            let last = limit - 1;
+            if ids.is_null(last) || times.is_null(last) {
+                return Err(Status::internal("outcome page has null continuation key"));
+            }
+            Some(
+                OutcomeCursor::new(times.value(last), ids.value(last).to_owned()).map_err(
+                    |_| Status::internal("outcome page has invalid stored continuation key"),
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok(OutcomePage {
+            rows: batch.slice(0, batch.num_rows().min(limit)),
+            next_cursor,
+        })
     }
 }
 
@@ -1998,5 +2104,28 @@ mod tests {
         // proves the stored bytes are the caller's.
         validate_payload_values(&build(vec![Some(vec![Some(0.5), Some(0.495)])])?)?;
         Ok(())
+    }
+    #[test]
+    fn outcome_cursor_validates_pair_epoch_and_bounded_stored_id() {
+        assert_eq!(OutcomeCursor::from_wire(0, "").unwrap(), None);
+        assert_eq!(
+            OutcomeCursor::from_wire(0, "outc-zero")
+                .unwrap()
+                .unwrap()
+                .created_at(),
+            0
+        );
+        for (time, id) in [(1, ""), (-1, ""), (-1, "outc-x"), (0, "bad' OR 1=1")] {
+            assert_eq!(
+                OutcomeCursor::from_wire(time, id).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        assert!(OutcomeCursor::from_wire(0, &"x".repeat(MAX_STORED_ID_LEN)).is_ok());
+        assert!(OutcomeCursor::from_wire(0, &"x".repeat(MAX_STORED_ID_LEN + 1)).is_err());
+        assert_eq!(effective_query_limit(0), 1000);
+        assert_eq!(effective_query_limit(1), 1);
+        assert_eq!(effective_query_limit(10000), 10000);
+        assert_eq!(effective_query_limit(u32::MAX), 10000);
     }
 }

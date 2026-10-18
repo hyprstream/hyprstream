@@ -16,6 +16,7 @@ use crate::metrics::decision_outcome::{
     NewOutcome, OutcomeStore, TrustedTenant, DECISION_ROWS_TABLE, DECISION_ROW_ID_COLUMN,
     FIELD_META_KIND, FIELD_META_LABELS, MAX_DECISION_ROWS_PER_BATCH,
 };
+use crate::metrics::producer::MetricsProducer;
 use crate::storage::duckdb::DuckDbBackend;
 use duckdb::arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
@@ -1149,4 +1150,294 @@ async fn test_put_rejects_pin_provenance_mismatch() {
         .await
         .expect("consistent calibrated pair");
     assert_eq!(stored.row_ids.len(), 3);
+}
+
+#[tokio::test]
+async fn test_producer_init_creates_decision_tables_for_accessors() {
+    // Lifecycle-faithful callers: producer.init() must leave the store usable
+    // through the new accessors with NO separate table creation.
+    let backend = Arc::new(DuckDbBackend::new_in_memory().expect("backend"));
+    let producer = MetricsProducer::new(backend);
+    producer.init().await.expect("producer init");
+
+    let stored = producer
+        .decision_rows()
+        .put(&tenant(TENANT_A), &pins(None), &decision_payload())
+        .await
+        .expect("put right after producer init");
+    assert_eq!(stored.row_ids.len(), 3);
+    let outcome = producer
+        .outcomes()
+        .record(
+            &tenant(TENANT_A),
+            &NewOutcome {
+                decision_id: stored.decision_id.clone(),
+                decision_row_id: stored.row_ids[0].clone(),
+                question_id: "route".to_owned(),
+                expected_pins: None,
+                expected_calib: CalibExpectation::Any,
+                outcome_label: Some("alpha".to_owned()),
+                outcome_value: None,
+                outcome_source: "ground-truth".to_owned(),
+                supersedes_outcome_id: None,
+            },
+        )
+        .await
+        .expect("record outcome right after producer init");
+    assert!(!outcome.outcome_id.is_empty());
+}
+
+#[tokio::test]
+async fn test_fetch_meta_is_deterministic_oldest_first() {
+    let backend = Arc::new(DuckDbBackend::new_in_memory().expect("backend"));
+    let (rows, _outcomes) = stores_on_backend(backend).await;
+    let batch = decision_payload();
+    let mut insertion = Vec::new();
+    for _ in 0..4 {
+        let stored = rows
+            .put(&tenant(TENANT_A), &pins(None), &batch)
+            .await
+            .expect("put");
+        insertion.push(stored.decision_id);
+    }
+    let metas = rows
+        .fetch_meta(&tenant(TENANT_A), &DecisionRowQuery::default())
+        .await
+        .expect("meta");
+    assert_eq!(metas.len(), 4);
+    // Total deterministic order: (created_at ASC, decision_id ASC) with a
+    // stable tie-break, identical across repeated reads.
+    let ordered_ids: Vec<String> = {
+        let mut v = metas.clone();
+        v.sort_by_key(|m| (m.created_at, m.decision_id.clone()));
+        v.into_iter().map(|m| m.decision_id).collect()
+    };
+    assert_eq!(
+        metas
+            .iter()
+            .map(|m| m.decision_id.clone())
+            .collect::<Vec<_>>(),
+        ordered_ids,
+        "fetch_meta must return rows in (created_at, decision_id) order"
+    );
+    assert_eq!(
+        metas[0].decision_id, insertion[0],
+        "monotonic clock keeps insertion order"
+    );
+    let again = rows
+        .fetch_meta(&tenant(TENANT_A), &DecisionRowQuery::default())
+        .await
+        .expect("meta again");
+    assert_eq!(metas, again, "repeat reads are identical");
+}
+
+/// Bulk seed uses the real backend and actual store-admitted immutable decision
+/// rows. Direct insertion avoids 10k individually parsed payload writes; it is
+/// not a substitute for the separate signed-RPC admission fixtures.
+#[tokio::test]
+async fn test_outcome_keyset_pages_cross_ten_thousand_with_ties_and_filters() {
+    use crate::metrics::decision_outcome::OutcomeCursor;
+    let backend = Arc::new(DuckDbBackend::new_in_memory().expect("backend"));
+    let (rows, outcomes) = stores_on_backend(Arc::clone(&backend)).await;
+    let (raw, raw_rows, calibrated, calibrated_rows) = seed_two_decisions(&rows).await;
+    let foreign = rows
+        .put(&tenant(TENANT_B), &pins(None), &decision_payload())
+        .await
+        .expect("foreign admitted decision");
+    backend.execute_ddl(&format!(
+        "INSERT INTO decision_outcomes (outcome_id, tenant_id, decision_id, decision_row_id, question_id, outcome_label, outcome_value, outcome_source, supersedes_outcome_id, created_at) \
+         SELECT 'outc-' || lpad(CAST(i AS VARCHAR), 6, '0'), 'tenant-a', '{}', '{}', 'route', 'beta', NULL, 'bulk-fixture', NULL, CAST(floor(i / 7) AS BIGINT) FROM range(10037) AS seeded(i)",
+        raw, raw_rows[0],
+    )).await.expect("bulk actual DuckDB outcomes with tied ascending keys");
+    for sql in [
+        format!("INSERT INTO decision_outcomes VALUES ('outc-calibrated','tenant-a','{}','{}','route','beta',NULL,'fixture',NULL,0)", calibrated, calibrated_rows[0]),
+        format!("INSERT INTO decision_outcomes VALUES ('outc-score','tenant-a','{}','{}','score_level',NULL,1,'fixture',NULL,0)", raw, raw_rows[0]),
+        format!("INSERT INTO decision_outcomes VALUES ('outc-foreign','tenant-b','{}','{}','route','beta',NULL,'fixture',NULL,0)", foreign.decision_id, foreign.row_ids[0]),
+        format!("INSERT INTO decision_outcomes VALUES ('outc-fixed','tenant-a','{}','{}','route','alpha',NULL,'correction','outc-010036',2000)", raw, raw_rows[0]),
+    ] {
+        backend.execute_ddl(&sql).await.expect("bounded control rows");
+    }
+    let query = DecisionOutcomeQuery {
+        schema_fingerprint: Some(pins(None).schema_fingerprint),
+        model_id: Some(pins(None).model_id),
+        question_id: Some("route".to_owned()),
+        calib: CalibFilter::RawOnly,
+        include_superseded: false,
+        limit: 1000,
+    };
+    let first_legacy = outcomes
+        .join_outcomes(&tenant(TENANT_A), &query)
+        .await
+        .expect("legacy first page");
+    assert_eq!(first_legacy.num_rows(), 1000);
+    let mut cursor = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut keys = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = outcomes
+            .join_outcomes_page(&tenant(TENANT_A), &query, cursor.as_ref())
+            .await
+            .expect("actual bounded page");
+        assert!(page.rows.num_rows() <= 1000);
+        let ids = page
+            .rows
+            .column_by_name("outcome_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let times = page
+            .rows
+            .column_by_name("created_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let tenants = page
+            .rows
+            .column_by_name("tenant_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..page.rows.num_rows() {
+            assert!(
+                seen.insert(ids.value(i).to_owned()),
+                "no outcome repeats across tied boundary"
+            );
+            assert_eq!(tenants.value(i), TENANT_A);
+            keys.push((times.value(i), ids.value(i).to_owned()));
+        }
+        if pages == 0 {
+            assert_eq!(
+                page.rows, first_legacy,
+                "legacy shape and ASC first-page order remain unchanged"
+            );
+        }
+        pages += 1;
+        match page.next_cursor {
+            Some(next) => {
+                assert_eq!(
+                    (next.created_at(), next.outcome_id()),
+                    (
+                        times.value(page.rows.num_rows() - 1),
+                        ids.value(page.rows.num_rows() - 1)
+                    )
+                );
+                cursor = Some(next);
+            }
+            None => break,
+        }
+        assert!(pages < 20, "finite continuation");
+    }
+    assert_eq!(pages, 11);
+    assert_eq!(seen.len(), 10037);
+    assert!(
+        !seen.contains("outc-010036"),
+        "superseded original excluded on every page"
+    );
+    assert!(seen.contains("outc-fixed"));
+    assert!(
+        keys.windows(2).all(|v| v[0] < v[1]),
+        "strict ASC total order including ties"
+    );
+    for i in 0..10036 {
+        assert!(
+            seen.contains(&format!("outc-{i:06}")),
+            "no matching outcome is unreachable"
+        );
+    }
+    let final_key = keys.last().unwrap();
+    let final_cursor = OutcomeCursor::new(final_key.0, final_key.1.clone()).unwrap();
+    let empty = outcomes
+        .join_outcomes_page(&tenant(TENANT_A), &query, Some(&final_cursor))
+        .await
+        .unwrap();
+    assert_eq!(empty.rows.num_rows(), 0);
+    assert!(empty.next_cursor.is_none());
+    let mut cap_query = query.clone();
+    cap_query.limit = u32::MAX;
+    let capped = outcomes
+        .join_outcomes_page(&tenant(TENANT_A), &cap_query, None)
+        .await
+        .unwrap();
+    assert_eq!(capped.rows.num_rows(), 10000);
+    assert!(capped.next_cursor.is_some());
+    cap_query.limit = 0;
+    assert_eq!(
+        outcomes
+            .join_outcomes_page(&tenant(TENANT_A), &cap_query, None)
+            .await
+            .unwrap()
+            .rows
+            .num_rows(),
+        1000
+    );
+    let mut all_query = query.clone();
+    all_query.include_superseded = true;
+    all_query.limit = u32::MAX;
+    let inclusive_first = outcomes
+        .join_outcomes_page(&tenant(TENANT_A), &all_query, None)
+        .await
+        .unwrap();
+    let inclusive_last = outcomes
+        .join_outcomes_page(
+            &tenant(TENANT_A),
+            &all_query,
+            inclusive_first.next_cursor.as_ref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        inclusive_first.rows.num_rows() + inclusive_last.rows.num_rows(),
+        10038
+    );
+    assert!(inclusive_last.next_cursor.is_none());
+    let start = OutcomeCursor::new(0, "outc-000000".to_owned()).unwrap();
+    // A cursor copied across tenants can only position the caller's own rows.
+    let foreign_page = outcomes
+        .join_outcomes_page(&tenant(TENANT_B), &query, Some(&start))
+        .await
+        .unwrap();
+    assert_eq!(foreign_page.rows.num_rows(), 1);
+    let mut calibrated_query = query.clone();
+    calibrated_query.calib = CalibFilter::Version("cal-1".to_owned());
+    assert_eq!(
+        outcomes
+            .join_outcomes_page(&tenant(TENANT_A), &calibrated_query, Some(&start))
+            .await
+            .unwrap()
+            .rows
+            .num_rows(),
+        1
+    );
+    let mut score_query = query.clone();
+    score_query.question_id = Some("score_level".to_owned());
+    assert_eq!(
+        outcomes
+            .join_outcomes_page(&tenant(TENANT_A), &score_query, Some(&start))
+            .await
+            .unwrap()
+            .rows
+            .num_rows(),
+        1
+    );
+    for bad in ["schema", "model"] {
+        let mut filtered = query.clone();
+        if bad == "schema" {
+            filtered.schema_fingerprint = Some("other-schema".to_owned());
+        } else {
+            filtered.model_id = Some("other-model".to_owned());
+        }
+        assert_eq!(
+            outcomes
+                .join_outcomes_page(&tenant(TENANT_A), &filtered, Some(&start))
+                .await
+                .unwrap()
+                .rows
+                .num_rows(),
+            0
+        );
+    }
 }

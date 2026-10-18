@@ -60,9 +60,13 @@ impl<B: StorageBackend> MetricsProducer<B> {
     }
 
     /// Create all schema-v2 tables (`metrics`, `calibration_params`,
-    /// `decision_batches`) and migrate pre-v2 `metrics` tables in place.
+    /// `decision_batches`), migrate pre-v2 `metrics` tables in place, and
+    /// create the R6 decision/outcome tables — so lifecycle-faithful callers
+    /// can use [`Self::decision_rows`] / [`Self::outcomes`] right after
+    /// [`Self::init`].
     pub async fn init(&self) -> Result<(), Status> {
-        super::create_schema_v2_tables(&*self.backend).await
+        super::create_schema_v2_tables(&*self.backend).await?;
+        super::decision_outcome::create_decision_outcome_tables(&*self.backend).await
     }
 
     /// Build a point-sample record (window of one: sum == avg == value) with

@@ -204,6 +204,8 @@ struct DecisionOutcomeQuery {
   calibVersion      @4 :Text;   # only for calibFilter = version
   includeSuperseded @5 :Bool;
   limit             @6 :UInt32; # 0 = server default; hard-capped server-side
+  afterCreatedAt    @7 :Int64;  # ASC keyset; zero + empty id = first page
+  afterOutcomeId    @8 :Text;   # bounded stored id; cursor is not authority
 }
 
 struct DecisionOutcomeJoinRow {
@@ -229,4 +231,7 @@ struct DecisionOutcomeJoinRow {
 
 struct DecisionOutcomeQueryResult {
   rows @0 :List(DecisionOutcomeJoinRow);
+  hasMore @1 :Bool;
+  nextCreatedAt @2 :Int64;     # zero when hasMore = false
+  nextOutcomeId @3 :Text;     # empty when hasMore = false
 }
