@@ -9,7 +9,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use hyprstream_bench::{generate_all, BenchConfig};
 use hyprstream_eval::score::ScoreConfig;
-use hyprstream_eval::{score_bench_run, EvalItem, HashSubject, Harness};
+use hyprstream_eval::{score_bench_run, EvalItem, Harness, HashSubject};
 
 fn items(seeds: u32) -> Vec<EvalItem> {
     generate_all(&BenchConfig {
@@ -50,7 +50,11 @@ fn bench_run_and_score(c: &mut Criterion) {
             &output,
             |b, output| {
                 b.iter(|| {
-                    black_box(score_bench_run(output, &eval_items, &ScoreConfig::default()))
+                    black_box(score_bench_run(
+                        output,
+                        &eval_items,
+                        &ScoreConfig::default(),
+                    ))
                 });
             },
         );
