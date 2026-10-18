@@ -54,6 +54,7 @@ use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
@@ -188,6 +189,22 @@ pub struct InferenceServiceInner {
     /// Verified key of the ModelService controller allowed to bridge a local
     /// request into this tenant-bound instance.
     controller_pubkey: VerifyingKey,
+    /// Admitted model reference binding for this instance (Option until a
+    /// pinned worker binds one). Decision serving compares the raw Clef
+    /// request `model` against it.
+    model_ref: Option<String>,
+    /// Engine precision mode captured at admission: feeds the head-dtype
+    /// policy so the cached head matches the engine's ACTUAL compute kind.
+    precision_mode: Option<String>,
+    /// Lazily built Clef decision runtime (strict head load from the
+    /// admitted immutable model tree). tch::Tensor is Send but NOT Sync, so
+    /// the runtime is shared as Arc<Mutex<..>> and its guard is held across
+    /// every head access; the cache RwLock only guards the Option slot and
+    /// is released before use (no unsynchronized Tensor sharing under the
+    /// blanket unsafe Send+Sync on Inner).
+    clef_runtime: parking_lot::RwLock<
+        Option<Arc<parking_lot::Mutex<crate::runtime::clef_decision::ClefDecisionRuntime>>>,
+    >,
     /// True only while the network stream plane is bound and accepting.
     network_ready: Arc<AtomicBool>,
     /// Rejects new generation streams once lifecycle drain begins.
@@ -490,6 +507,7 @@ impl InferenceService {
     async fn initialize(
         model_path: PathBuf,
         state_path: PathBuf,
+        model_ref: Option<String>,
         pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
@@ -573,6 +591,20 @@ impl InferenceService {
             } else {
                 (None, None)
             };
+
+        // Clef decision bundles always need their tokenizer (R4 serving),
+        // even when TTT is disabled: the typed decision path tokenizes the
+        // raw record through the bundle's own tokenizer.
+        let (ttt_trainer, tokenizer) = match (ttt_trainer, tokenizer) {
+            (trainer, Some(tokenizer)) => (trainer, Some(tokenizer)),
+            (trainer, None)
+                if crate::runtime::clef_decision::ClefDecisionRuntime::detect(&model_path)
+                    .is_some() =>
+            {
+                (trainer, engine.get_tokenizer().ok().map(Arc::new))
+            }
+            (trainer, None) => (trainer, None),
+        };
 
         // Initialize delta pool if TTT is enabled
         let delta_pool = if ttt_trainer.is_some() {
@@ -686,6 +718,9 @@ impl InferenceService {
                 lora_generation: Arc::new(AtomicU64::new(0)),
                 tenant_domain,
                 controller_pubkey,
+                model_ref,
+                precision_mode: config.precision_mode.clone(),
+                clef_runtime: parking_lot::RwLock::new(None),
                 network_ready,
                 draining,
                 shutdown,
@@ -694,6 +729,142 @@ impl InferenceService {
                 object_label,
             }),
         })
+    }
+
+    async fn decide_inner(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &hyprstream_rpc_std::inference_client::DecisionRequest,
+    ) -> Result<InferenceResponseVariant> {
+        // Shared cheap preflight (the same helper Model ingress ran BEFORE
+        // the model was loaded): byte bound, ordered parse, cardinalities,
+        // aggregate budgets, deadline clamp. One parse, reused below.
+        let parsed = crate::services::decision::preflight_parsed(data)?;
+
+        // Cancellation/deadline/drain check FIRST (cheapest gate): drained or
+        // expired requests never start ANY decision work — not the pinned
+        // lookup, not the tokenizer admission, not the head cache.
+        let cancel = crate::services::decision::worker_cancel(
+            Arc::clone(&self.draining),
+            crate::services::decision::resolve_deadline(data, Instant::now()),
+        );
+        cancel.check()?;
+
+        // Decision serving requires the retained immutable pinned artifact —
+        // a mutable branch worktree is not an immutable model identity.
+        let artifact = self._pinned_artifact.as_ref().ok_or_else(|| {
+            anyhow!("decision-not-pinned: decision serving requires a retained pinned artifact")
+        })?;
+        artifact.ensure_current_process()?;
+
+        // Revalidate the raw request model against the ADMITTED model
+        // reference. Fails closed when no binding exists.
+        crate::services::decision::ensure_model_matches(&parsed.model, self.model_ref.as_deref())?;
+
+        // Server-controlled budgets. Authoritative effective context limit
+        // from the loaded engine (fp8 runtime follow-up: replaces the stale
+        // model_info.context_length source and the checked-forward default).
+        let engine_guard = self.engine.read();
+        let engine_hidden = RuntimeEngine::model_info(&*engine_guard).hidden_size;
+        let effective_context = engine_guard
+            .effective_context_limit()
+            .map_err(|e| anyhow!("clef-decision-runtime: effective context limit: {e:#}"))?;
+        let max_length = crate::services::decision::resolve_max_length(
+            u32::try_from(effective_context).map_err(|e| {
+                anyhow!("clef-decision-runtime: effective context limit overflow: {e}")
+            })?,
+        );
+        let state_cap = crate::services::decision::resolve_state_cap(data);
+
+        // TOKENIZER-ONLY ADMISSION FIRST: schema-token overflow and state
+        // truncation are decided (and rejected) here — BEFORE the head is
+        // lazily materialized or any backbone forward starts.
+        let tokenizer = self.tokenizer.as_deref().ok_or_else(|| {
+            anyhow!("decision-no-tokenizer: decision serving requires the bundle tokenizer")
+        })?;
+        let (encoded, accounting) = crate::runtime::clef_decision::encode_request(
+            tokenizer, &parsed, state_cap, max_length, &cancel,
+        )?;
+
+        // Clef v1 serving profile admission (R0 section 5): CPU device and
+        // Float32 compute (packed FP8 + dynamic activation QDQ for channel
+        // artifacts). Rejected BEFORE lazy head materialization or forward;
+        // no silent promotion of an unqualified kind, no GPU work (R5 gate).
+        if !engine_guard.is_cpu_device() {
+            return Err(anyhow!(
+                "clef-decision-profile: clef v1 serving is CPU-only; the admitted engine device is not CPU"
+            ));
+        }
+        crate::runtime::clef_decision::resolve_serving_kind(
+            &self.model_path,
+            self.precision_mode.as_deref(),
+        )
+        .map_err(anyhow::Error::from)?;
+        drop(engine_guard);
+
+        // One cached strict head runtime per admitted instance
+        // (double-checked build under the write lock; identity digests bind
+        // the immutable tree). The cancel state is RECHECKED after the
+        // blocking cache lock, before materialization.
+        let runtime = {
+            let cached = self.clef_runtime.read();
+            if let Some(rt) = cached.as_ref() {
+                Arc::clone(rt)
+            } else {
+                drop(cached);
+                let mut guard = self.clef_runtime.write();
+                cancel.check()?;
+                if let Some(rt) = guard.as_ref() {
+                    Arc::clone(rt)
+                } else {
+                    let rt = Arc::new(parking_lot::Mutex::new(
+                        crate::runtime::clef_decision::ClefDecisionRuntime::load(
+                            &self.model_path,
+                            Some(engine_hidden),
+                            None,
+                            self.precision_mode.as_deref(),
+                        )?,
+                    ));
+                    *guard = Some(Arc::clone(&rt));
+                    Arc::clone(&rt)
+                }
+            }
+        };
+        cancel.check()?;
+
+        // Lock order: head mutex THEN engine read (single site; the cache
+        // lock is already released). The guard serializes ALL head tensor
+        // access for the duration of the forward.
+        let runtime_guard = runtime.lock();
+        let engine = self.engine.read();
+        let (distributions, observed_kind) = crate::runtime::clef_decision::decide_encoded(
+            &runtime_guard,
+            &engine,
+            &parsed,
+            &encoded,
+            &cancel,
+        )?;
+        drop(engine);
+
+        let artifact_commit = artifact.commit().to_string();
+        let model_ref = self
+            .model_ref
+            .as_deref()
+            .ok_or_else(|| anyhow!("decision-model-unbound: no admitted model binding"))?;
+        let version =
+            crate::services::decision::version_triple(&parsed, model_ref, &artifact_commit);
+        let row = crate::services::decision::build_answer_row(&distributions);
+        let batch = crate::services::decision::marshal_batch(&version, std::slice::from_ref(&row))?;
+        let response = crate::services::decision::build_response(
+            &runtime_guard,
+            model_ref,
+            &artifact_commit,
+            &accounting,
+            observed_kind,
+            batch,
+        );
+        Ok(InferenceResponseVariant::DecideResult(response))
     }
 
     /// Resolve the authorization domain for this tenant-bound engine.
@@ -3358,6 +3529,36 @@ impl InferenceHandler for InferenceService {
             dimensions,
         }))
     }
+
+    /// Native typed Clef decision inference (R4). Runs AFTER the generated
+    /// dispatch PEP (exact internal-work coordinate `inference:Decide` /
+    /// `infer`, or the direct-caller policy + MAC floor) and the bounded
+    /// generic body decode. Everything Clef-specific starts here: shared
+    /// preflight revalidation (single parse, reused), pinned-artifact
+    /// requirement, fail-closed model match, budget resolution and a
+    /// cancellation check BEFORE the head cache is locked or materialized,
+    /// then one fresh-state cooperative-cancellable CPU forward.
+    async fn handle_decide(
+        &self,
+        ctx: &EnvelopeContext,
+        request_id: u64,
+        data: &hyprstream_rpc_std::inference_client::DecisionRequest,
+    ) -> Result<InferenceResponseVariant> {
+        // Typed error tunnel at the worker boundary: decision-serving
+        // failures carry their pinned wire code through the generated
+        // dispatcher's serialization (prefix table is shared with the Model
+        // gateway mapping); unknown errors pass through unchanged.
+        self.decide_inner(ctx, request_id, data).await.map_err(|e| {
+            let message = e.to_string();
+            match crate::services::decision::error_code_for(&message) {
+                Some(code) => anyhow::Error::new(hyprstream_rpc::TypedRpcError {
+                    code: code.to_owned(),
+                    message,
+                }),
+                None => e,
+            }
+        })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3495,9 +3696,12 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        // Typed decision-serving failures carry their pinned code; every
+        // other error keeps the generic INTERNAL code.
+        let code = crate::services::decision::error_code_for(error).unwrap_or("INTERNAL");
         let variant = InferenceResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_owned(),
+            code: code.to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_else(|e| {
@@ -3677,6 +3881,10 @@ impl InferenceServiceConfig {
     /// they are never admitted (standalone direct-caller service).
     #[must_use]
     pub fn with_model_ref(mut self, model_ref: impl Into<String>) -> Self {
+        // Decision serving compares the raw Clef request model against this
+        // binding; empty/whitespace bindings are rejected at USE time by
+        // services::decision::ensure_model_matches (T7) — the builder keeps
+        // its infallible Self API.
         self.model_ref = Some(model_ref.into());
         self
     }
@@ -4230,6 +4438,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     let service = InferenceService::initialize(
                         model_path,
                         state_path,
+                        model_ref_binding.clone(),
                         pinned_artifact,
                         config,
                         server_pubkey,
@@ -5803,6 +6012,9 @@ mod single_service_boundary_tests {
                 lora_generation: Arc::new(AtomicU64::new(0)),
                 tenant_domain: tenant.to_owned(),
                 controller_pubkey: controller.verifying_key(),
+                model_ref: with_model_binding.then(|| model.to_owned()),
+                precision_mode: None,
+                clef_runtime: parking_lot::RwLock::new(None),
                 network_ready: Arc::new(AtomicBool::new(true)),
                 draining: Arc::new(AtomicBool::new(false)),
                 shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -6290,6 +6502,247 @@ mod single_service_boundary_tests {
             !error.to_string().contains("does not authorize"),
             "the PEP must not deny a correctly-scoped work order"
         );
+    }
+
+    // ── R4 decide: causal dispatcher tests through the REAL chain ──────────
+
+    const VALID_CLEF_BODY: &str =
+        r#"{"model":"fixture-model:main","state":"s","questions":{"q":{"type":"noul"}}}"#;
+
+    fn decide_request_body(clef_json: &str) -> Result<Vec<u8>> {
+        encoded_request(|request| {
+            let mut decide = request.reborrow().init_decide();
+            decide.set_clef_json(clef_json);
+        })
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn real_dispatch_decide_reaches_handler_after_pep_and_fails_typed_not_pinned() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("decide"),
+            "infer",
+        )
+        .await
+        .expect("work order must pass the real verify_claims routing");
+
+        let payload = decide_request_body(VALID_CLEF_BODY).expect("encode decide");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode decide");
+        // Non-streaming handler failures serialize as the response's Error
+        // variant (the dispatch-level typed-code boundary).
+        let (response, _cont) = dispatch_inference(&adapter.service, &ctx, &decoded)
+            .await
+            .expect("non-streaming dispatch returns a typed error response");
+        let parsed =
+            hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+                .expect("parse decide response");
+        match parsed {
+            InferenceResponseVariant::Error(info) => {
+                assert_eq!(
+                    info.code, "DECISION_NOT_PINNED",
+                    "message: {}",
+                    info.message
+                );
+                assert!(
+                    info.message.contains("decision-not-pinned"),
+                    "{}",
+                    info.message
+                );
+                assert!(
+                    !info.message.contains("does not authorize"),
+                    "the PEP must not deny a correctly-scoped work order"
+                );
+            }
+            other => panic!("expected typed error variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn real_dispatch_decide_invalid_body_fails_input_before_any_model_state() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("decide"),
+            "infer",
+        )
+        .await
+        .expect("admission");
+        let payload = decide_request_body(
+            r#"{"model":"m","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+        )
+        .expect("encode decide");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode decide");
+        let (response, _cont) = dispatch_inference(&adapter.service, &ctx, &decoded)
+            .await
+            .expect("typed error response");
+        let parsed =
+            hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+                .expect("parse");
+        match parsed {
+            InferenceResponseVariant::Error(info) => {
+                assert_eq!(info.code, "DECISION_INPUT", "message: {}", info.message);
+                assert!(
+                    info.message.contains("clef-decision-input"),
+                    "{}",
+                    info.message
+                );
+            }
+            other => panic!("expected typed input error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn real_dispatch_decide_denies_wrong_coordinate_and_wrong_model() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        // Wrong resource coordinate (stale grammar): PEP denial.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            "inference:hasLora".to_owned(),
+            "infer",
+        )
+        .await
+        .expect("admission is coordinate-agnostic; the PEP compares");
+        let payload = decide_request_body(VALID_CLEF_BODY).expect("encode decide");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode decide");
+        let error = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(_) => panic!("mismatched work-order coordinate must deny"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "expected exact-match PEP denial, got: {error:#}"
+        );
+
+        // Wrong MODEL binding: the internal-work verifier denies before the
+        // handler runs.
+        let other_instance =
+            InferenceInstanceId::new(TENANT, "other-model:main", 0).expect("fixture instance");
+        let adapter = boundary_adapter(
+            &controller,
+            &other_instance.service_name(),
+            TENANT,
+            "other-model:main",
+            true,
+        );
+        // Claims carry MODEL (fixture constant) while the instance binds
+        // other-model:main — admission itself must fail (the helper already
+        // runs the real verify_claims routing; assert the Err directly).
+        let denied = admitted_ctx(
+            &adapter,
+            &controller,
+            &other_instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("decide"),
+            "infer",
+        )
+        .await
+        .expect_err("foreign-model work order must fail admission");
+        assert!(
+            denied.to_string().contains("model"),
+            "expected the model-binding denial, got: {denied:#}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn real_dispatch_decide_service_drain_cancels_before_work() {
+        // Service-drain witness through the REAL dispatch: the worker's
+        // cancel checker (drain flag) trips the typed cancelled error before
+        // any head/backbone work. (Engine-level between-layer cancellation is
+        // the runtime lane's dedicated fixture; disconnect semantics are
+        // deadline-bound, documented honestly.)
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        adapter
+            .service
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("decide"),
+            "infer",
+        )
+        .await
+        .expect("work order admission");
+        let payload = decide_request_body(VALID_CLEF_BODY).expect("encode decide");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode decide");
+        let (response, _cont) = dispatch_inference(&adapter.service, &ctx, &decoded)
+            .await
+            .expect("typed error response");
+        let parsed =
+            hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+                .expect("parse");
+        match parsed {
+            InferenceResponseVariant::Error(info) => {
+                assert_eq!(info.code, "DECISION_CANCELLED", "message: {}", info.message);
+                assert!(
+                    info.message.contains("clef-decision-cancelled"),
+                    "{}",
+                    info.message
+                );
+            }
+            other => panic!("expected typed cancelled error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_typed_error_codes_reach_wire_error_info() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        for (message, code) in [
+            ("decision-not-pinned: x", "DECISION_NOT_PINNED"),
+            ("clef-decision-input: y", "DECISION_INPUT"),
+            ("clef-decision-cancelled: z", "DECISION_CANCELLED"),
+        ] {
+            let payload = adapter.build_error_payload(7, message);
+            let parsed =
+                hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&payload)
+                    .expect("parse error payload");
+            match parsed {
+                InferenceResponseVariant::Error(info) => {
+                    assert_eq!(info.code, code, "message {message}");
+                    assert_eq!(info.message, message);
+                }
+                other => panic!("expected Error variant, got {other:?}"),
+            }
+        }
+        // Unrelated failures keep the generic code.
+        let payload = adapter.build_error_payload(7, "unrelated failure");
+        let parsed =
+            hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&payload)
+                .expect("parse");
+        match parsed {
+            InferenceResponseVariant::Error(info) => assert_eq!(info.code, "INTERNAL"),
+            other => panic!("expected Error variant, got {other:?}"),
+        }
     }
 
     #[tokio::test]

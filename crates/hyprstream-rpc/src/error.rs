@@ -95,3 +95,17 @@ pub enum RpcError {
 
 /// Result type alias for RPC operations.
 pub type Result<T> = std::result::Result<T, RpcError>;
+
+/// Typed RPC error tunnel: carries a wire `ErrorInfo` code through an
+/// `anyhow` chain without changing the displayed message. Generated clients
+/// wrap `ErrorInfo` responses into this type; generated (scoped) server
+/// wrappers re-emit the code instead of collapsing to INTERNAL. Display is
+/// message-only so existing error-string matching is unchanged.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct TypedRpcError {
+    /// Wire error code (e.g. `DECISION_INPUT`, `UNAUTHORIZED`, `INTERNAL`).
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+}

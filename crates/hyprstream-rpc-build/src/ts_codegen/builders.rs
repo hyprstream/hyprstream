@@ -1192,6 +1192,7 @@ struct EmbedImagesResponse {
             discriminant_value: 0xFFFF,
             serde_rename: None,
             domain_type: None,
+            named_group: None,
         };
         let sd = StructDef {
             name: "Haunted".to_owned(),

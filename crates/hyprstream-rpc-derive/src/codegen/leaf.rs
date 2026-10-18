@@ -769,6 +769,7 @@ mod tests {
             discriminant_value: disc,
             serde_rename: None,
             domain_type: None,
+            named_group: None,
         }
     }
 

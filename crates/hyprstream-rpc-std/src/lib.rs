@@ -129,7 +129,11 @@ pub mod oauth_capnp {
 pub mod decision_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/decision_capnp.rs"));
 }
 
@@ -241,6 +245,19 @@ pub mod oauth_client {
     #![allow(clippy::all)]
     extern crate self as hyprstream_rpc_std;
     hyprstream_rpc_derive::generate_rpc_client!("oauth");
+}
+
+/// Data-only decision contract types (E2 `decision.capnp`) — the single
+/// canonical owned representation of `DecisionBatch` and friends. Service
+/// schemas that nest `Decision.DecisionBatch` (inference, model) alias these
+/// types via the derive crate's SERVICE_MODULES list instead of regenerating
+/// structurally identical copies per module. The IR<->capnp marshalling lives
+/// in [`crate::decision`]; this module is the generated wire-type surface.
+pub mod decision_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc_std;
+    hyprstream_rpc_derive::generate_rpc_client!("decision");
 }
 
 pub mod worker_client {

@@ -359,7 +359,7 @@ pub use envelope::{
     KeyedPqTrustStore, NonceCache, PqTrustStore, RequestEnvelope, ResponseEnvelope, SignedEnvelope,
     Subject, TokenClaims, UnwrapOptions, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
-pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
+pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError, TypedRpcError};
 
 // ============================================================================
 // Native-only re-exports

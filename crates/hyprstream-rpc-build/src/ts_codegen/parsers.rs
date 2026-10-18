@@ -2044,6 +2044,7 @@ struct EmbedImagesResponse {
                 discriminant_value: 0,
                 serde_rename: None,
                 domain_type: None,
+                named_group: None,
             }],
             has_union: true,
             domain_type: None,

@@ -227,6 +227,7 @@ mod tests {
                     discriminant_value: 0xFFFF,
                     serde_rename: None,
                     domain_type: None,
+                    named_group: None,
                 },
                 FieldDef {
                     name: "size".into(),
@@ -240,6 +241,7 @@ mod tests {
                     discriminant_value: 0xFFFF,
                     serde_rename: None,
                     domain_type: None,
+                    named_group: None,
                 },
             ],
             has_union: false,
