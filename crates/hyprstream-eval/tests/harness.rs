@@ -742,6 +742,11 @@ fn flip_rate_compares_each_question_against_its_own_base() {
         id: id.into(),
         question_id: question_id.into(),
         kind: hyprstream_decision::QuestionKind::Choice,
+        labels: match question_id {
+            "q1" => vec!["a".into(), "b".into(), "c".into()],
+            "q2" => vec!["x".into(), "y".into(), "z".into()],
+            _ => unreachable!(),
+        },
         family: None,
         stratum: None,
         group: Some("g".into()),
@@ -906,6 +911,11 @@ fn flip_rate_skips_members_whose_question_the_base_row_abstained_on() {
         id: id.into(),
         question_id: question_id.into(),
         kind: hyprstream_decision::QuestionKind::Choice,
+        labels: match question_id {
+            "q1" => vec!["a".into(), "b".into(), "c".into()],
+            "q2" => vec!["x".into(), "y".into(), "z".into()],
+            _ => unreachable!(),
+        },
         family: None,
         stratum: None,
         group: Some("g".into()),
@@ -994,6 +1004,11 @@ fn flip_rate_never_compares_across_questions_in_partial_set_groups() {
         id: id.into(),
         question_id: question_id.into(),
         kind: hyprstream_decision::QuestionKind::Choice,
+        labels: match question_id {
+            "q1" => vec!["a".into(), "b".into(), "c".into()],
+            "q2" => vec!["x".into(), "y".into(), "z".into()],
+            _ => unreachable!(),
+        },
         family: None,
         stratum: None,
         group: Some("g".into()),
@@ -1586,4 +1601,203 @@ async fn item_scoring_preserves_resolved_alias_identity_and_rejects_mutated_prov
         score_bench_run(&output, &items, &ScoreConfig::default()),
         Err(hyprstream_eval::EvalError::InvalidInput(_))
     ));
+}
+
+#[tokio::test]
+async fn scoring_validates_every_observation_before_fit_or_breakdown_aggregation() {
+    let items = vec![noul_item()];
+    for fit in [false, true] {
+        let config = if fit {
+            ScoreConfig::default().with_fit_families(["validation"])
+        } else {
+            ScoreConfig::default()
+        };
+        let valid = Harness.run_items(&items, &UniformSubject).await.unwrap();
+        score_run(&valid, &config).unwrap();
+        for mutation in ["nan", "sum", "range", "width", "truth", "abstained-truth"] {
+            let mut output = Harness.run_items(&items, &UniformSubject).await.unwrap();
+            let obs = &mut output.observations[0];
+            match mutation {
+                "nan" => obs.probabilities = Some(vec![f32::NAN, 0.5]),
+                "sum" => obs.probabilities = Some(vec![0.2, 0.2]),
+                "range" => obs.probabilities = Some(vec![-0.1, 1.1]),
+                "width" => obs.probabilities = Some(vec![1.0]),
+                "truth" => obs.truth = Some(2),
+                "abstained-truth" => {
+                    obs.probabilities = None;
+                    obs.truth = Some(2);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    score_run(&output, &config),
+                    Err(hyprstream_eval::EvalError::InvalidInput(_))
+                ),
+                "fit={fit} {mutation}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn set_scoring_rejects_observation_batch_divergence() {
+    let set = hyprstream_eval::EvalSet {
+        name: "batch-consistency".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: (0..2)
+            .map(|i| hyprstream_eval::EvalRow {
+                id: format!("row{i}"),
+                family: None,
+                stratum: None,
+                group: None,
+                state: Entry::Null,
+                truth: std::collections::BTreeMap::from([("val_q".into(), 1)]),
+            })
+            .collect(),
+    };
+    let control = Harness.run_set(&set, &UniformSubject).await.unwrap();
+    score_run(&control, &ScoreConfig::default()).unwrap();
+    for mutation in [
+        "valid-different-probabilities",
+        "abstained-observation",
+        "missing",
+        "profile-order",
+    ] {
+        let mut output = Harness.run_set(&set, &UniformSubject).await.unwrap();
+        match mutation {
+            "valid-different-probabilities" => {
+                output.observations[0].probabilities = Some(vec![0.2, 0.8]);
+            }
+            "abstained-observation" => output.observations[0].probabilities = None,
+            "missing" => {
+                output.observations.pop();
+            }
+            "profile-order" => output.observations[0].question_id = "other".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                score_run(&output, &ScoreConfig::default()),
+                Err(hyprstream_eval::EvalError::InvalidInput(_))
+            ),
+            "{mutation}"
+        );
+    }
+    let mut abstained = Harness.run_set(&set, &AbstainSubject).await.unwrap();
+    score_run(&abstained, &ScoreConfig::default()).unwrap();
+    abstained.observations[0].probabilities = Some(vec![0.5, 0.5]);
+    assert!(matches!(
+        score_run(&abstained, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn bench_scoring_requires_matching_metadata_not_only_reused_ids() {
+    let question = hyprstream_decision::author::parse_yaml(
+        "questions:\n  route: {type: choice, criteria: {zebra: null, alpha: null, omega: null}}\n",
+    )
+    .unwrap()
+    .questions
+    .remove(0);
+    let item = EvalItem {
+        id: "same-id".into(),
+        family: Some("metadata".into()),
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        question,
+        truth: Some(1),
+    };
+    let output = Harness
+        .run_items(std::slice::from_ref(&item), &UniformSubject)
+        .await
+        .unwrap();
+    score_bench_run(
+        &output,
+        std::slice::from_ref(&item),
+        &ScoreConfig::default(),
+    )
+    .unwrap();
+    for mutation in ["truth", "kind", "label-order", "cardinality", "family"] {
+        let mut changed = item.clone();
+        match mutation {
+            "truth" => changed.truth = Some(2),
+            "kind" => {
+                changed.question.kind = hyprstream_decision::QuestionKind::Score;
+                changed.question.body = hyprstream_decision::QuestionBody::Score {
+                    levels: vec![None; 3],
+                };
+            }
+            "label-order" | "cardinality" => {
+                let hyprstream_decision::QuestionBody::Choice { options } =
+                    &mut changed.question.body
+                else {
+                    unreachable!()
+                };
+                if mutation == "label-order" {
+                    options.reverse();
+                } else {
+                    options.pop();
+                }
+            }
+            "family" => changed.family = Some("other-family".into()),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                score_bench_run(&output, &[changed], &ScoreConfig::default()),
+                Err(hyprstream_eval::EvalError::InvalidInput(_))
+            ),
+            "{mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wide_set_truth_index_preserves_all_input_preflight() {
+    let questions = (0..64)
+        .map(|i| {
+            let mut q = noul_item().question;
+            q.id = format!("q{i}");
+            q
+        })
+        .collect::<Vec<_>>();
+    let mut set = hyprstream_eval::EvalSet {
+        name: "indexed-truth".into(),
+        schema_version: "v1".into(),
+        questions,
+        rows: (0..3)
+            .map(|i| hyprstream_eval::EvalRow {
+                id: format!("row{i}"),
+                family: None,
+                stratum: None,
+                group: None,
+                state: Entry::Null,
+                truth: (0..64).map(|q| (format!("q{q}"), q % 2)).collect(),
+            })
+            .collect(),
+    };
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let output = Harness.run_set(&set, &subject).await.unwrap();
+    assert_eq!(output.observations.len(), 192);
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    for (key, truth) in [("outside", 0), ("q63", 2)] {
+        let mut invalid = set.clone();
+        invalid.rows[2].truth.insert(key.into(), truth);
+        let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+        assert!(matches!(
+            Harness.run_set(&invalid, &subject).await,
+            Err(hyprstream_eval::EvalError::InvalidInput(_))
+        ));
+        assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    set.rows.clear();
+    let empty = Harness.run_set(&set, &UniformSubject).await.unwrap();
+    assert!(score_run(&empty, &ScoreConfig::default())
+        .unwrap()
+        .items
+        .is_empty());
 }

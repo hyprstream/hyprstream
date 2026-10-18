@@ -12,7 +12,7 @@ use hyprstream_decision::arrow::{
     SCHEMA_VERSION_COLUMN,
 };
 use hyprstream_decision::confidence::{self, PRODUCER_SUM_TOLERANCE};
-use hyprstream_decision::spec::{ChoiceOption, QuestionBody, QuestionKind, QuestionSpec};
+use hyprstream_decision::spec::QuestionKind;
 use hyprstream_metrics_api::arrow::array::{
     Array, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
 };
@@ -88,11 +88,11 @@ impl<B: StorageBackend> BatchSink<B> {
 
 /// RunOutput is public and mutable. Reconstruct the canonical emission schema
 /// from the payload itself before trusting any detached persistence metadata.
-fn validate_provenance(
+pub(crate) fn validate_provenance(
     output: &RunOutput,
     batch: &RecordBatch,
     fingerprint: &str,
-) -> Result<(), EvalError> {
+) -> Result<DecisionSchema, EvalError> {
     let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
     let arrow_schema = batch.schema();
     let mut questions = Vec::new();
@@ -117,32 +117,7 @@ fn validate_provenance(
                 .ok_or_else(|| invalid("batch has no question labels metadata"))?,
         )
         .map_err(|_| invalid("batch has invalid question labels metadata"))?;
-        let body = match kind {
-            QuestionKind::Noul => QuestionBody::Noul { criteria: None },
-            QuestionKind::Choice => QuestionBody::Choice {
-                options: labels
-                    .iter()
-                    .map(|name| ChoiceOption {
-                        name: name.clone(),
-                        rubric: None,
-                    })
-                    .collect(),
-            },
-            QuestionKind::Score => QuestionBody::Score {
-                levels: vec![None; labels.len()],
-            },
-            _ => return Err(invalid("batch question kind is not supported in v1")),
-        };
-        let question = QuestionSpec {
-            id: id.to_owned(),
-            kind,
-            instructions: None,
-            body,
-        };
-        crate::run::validate_question_profile(&question).map_err(EvalError::InvalidInput)?;
-        if question.labels() != labels {
-            return Err(invalid("batch question labels disagree with its kind"));
-        }
+        let question = crate::run::question_from_labels(id, kind, &labels)?;
         questions.push(question);
     }
     let schema = DecisionSchema::new(questions)?;
@@ -187,7 +162,7 @@ fn validate_provenance(
             }
         }
     }
-    Ok(())
+    Ok(schema)
 }
 
 /// Inspect actual Arrow values: public RunOutput callers can replace columns
