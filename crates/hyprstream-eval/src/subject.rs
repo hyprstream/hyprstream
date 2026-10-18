@@ -30,6 +30,15 @@ pub trait Subject: Send + Sync {
     /// as already resolved.
     fn model_id(&self) -> &str;
 
+    /// Check subject-specific input constraints without I/O, model queries,
+    /// mutable state, or other side effects. Harnesses call this for every
+    /// request before deciding any row; ensembles check every teacher first.
+    /// The default accepts inputs, including explicit null states supported
+    /// by native/in-process subjects. Transport adapters may be stricter.
+    fn preflight(&self, _set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+        Ok(())
+    }
+
     /// Answer every question in `set` for one state row. `row` is the batch
     /// row index, passed through so deterministic subjects can vary by row
     /// exactly the way the P0.7 mock does. Every declared question must be
@@ -85,7 +94,7 @@ pub enum WireJson {
     Null,
     /// JSON bool.
     Bool(bool),
-    /// JSON number (non-finite values serialize as null, matching serde_json).
+    /// JSON number (non-finite values fail serialization).
     Number(f64),
     /// JSON string.
     Str(String),
@@ -103,7 +112,7 @@ impl serde::Serialize for WireJson {
             Self::Bool(value) => serializer.serialize_bool(*value),
             Self::Number(value) => match serde_json::Number::from_f64(*value) {
                 Some(number) => number.serialize(serializer),
-                None => serializer.serialize_unit(),
+                None => Err(serde::ser::Error::custom("non-finite Entry::Number")),
             },
             Self::Str(text) => serializer.serialize_str(text),
             Self::Array(items) => {
@@ -207,29 +216,21 @@ pub fn request_body(set: &QuestionSet, state: &Entry, model: &str) -> WireJson {
 }
 
 /// Renormalize an accepted distribution to producer tolerance, in stages:
-/// (0) if the input ALREADY passes producer tolerance, return untouched —
-/// dividing a valid vector by its sum can push it out of tolerance again
-/// (f32 division rounding, e.g. a 49-way vector whose sequential sum is
-/// 0.9999996 divides up to 1.0000012, after which the uniform-share
-/// correction would drive a zero component NEGATIVE); (1) divide through;
-/// (2) an order-preserving uniform-share correction (monotone in f32, so
-/// ties and leader gaps survive), with the share bounded below by
-/// `-min_component` so no component ever leaves [0, 1]; (3) as a last
-/// resort for vectors no uniform correction can reach (f32 sequential-sum
-/// granularity, e.g. near-uniform high-cardinality ones), a top-level
-/// correction that never changes the D6 argmax: a shortfall bumps the
-/// EARLIEST maximal component; an overage water-fills the maximal levels
-/// downward (equal shrinkage keeps them exactly tied, so the
-/// earliest-index tie-break keeps the winner — and no runner-up is ever
-/// crossed). Wire distributions are accepted at consumer
-/// tolerance; the producer-side IR and batch validators require the
-/// tighter producer tolerance, so the boundary normalizes on the way in.
-/// Also used for locally constructed distributions (TruthSubject's
-/// uniform fallback, teacher ensemble averages) that must satisfy the
-/// same producer tolerance.
+/// Producer-valid vectors remain untouched. Otherwise divide through and
+/// apply a uniform correction first, preserving ties where f32 permits it.
+/// If rounding merges a later-index winner with an earlier runner-up, lift
+/// that original D6 winner by one representable step. Residual shortfalls go
+/// to the winner; overages are removed from another component. The winner
+/// is never lowered to a runner-up level, so normalization cannot change
+/// the predicted label. Very wide uniform vectors may require breaking a
+/// tie to meet producer tolerance; their earliest-index winner is retained.
+/// Also used by TruthSubject's uniform fallback and teacher averages.
 pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
+    let Some(winner) = hyprstream_decision::confidence::argmax_index(probabilities) else {
+        return;
+    };
     // Stage 0: a producer-valid input is already fine — normalizing it
     // further can push it out of tolerance AND below zero (see the doc
     // comment's 49-way example).
@@ -241,6 +242,10 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
         for p in probabilities.iter_mut() {
             *p /= sum;
         }
+    }
+    if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
+        let max = probabilities.iter().copied().fold(0.0f32, f32::max);
+        probabilities[winner] = max.next_up().min(1.0);
     }
     if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
         return;
@@ -263,59 +268,38 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
             *p += share;
         }
     }
+    if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
+        let max = probabilities.iter().copied().fold(0.0f32, f32::max);
+        probabilities[winner] = max.next_up().min(1.0);
+    }
     if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
         return;
     }
-    // Last resort (f32 sequential-sum granularity makes some vectors,
-    // e.g. near-uniform high-cardinality ones, unreachable by uniform
-    // correction): correct the top without crossing probability levels,
-    // re-evaluating the residual after every round (per-component f32
-    // rounding can overshoot a removal into a shortfall and vice versa).
-    // A shortfall bumps the EARLIEST maximal component (extending its
-    // lead can only keep its win). An overage WATER-FILLS the top levels
-    // downward: every maximal component shrinks by the same amount, so
-    // they stay exactly tied and never cross the next level. A merge can
-    // make an earlier-index runner-up the D6 argmax (a single-component
-    // subtraction larger than the max/runner-up gap — observed on a
-    // consumer-valid 59-way near-uniform vector, residual −1.19e-6 vs
-    // gap 1.9e-9 — would flip the argmax to the runner-up).
+    // Correct remaining f32 summation error without lowering the original
+    // winner. Correcting another component may change loser ordering by a
+    // few ulps; it cannot change D6's selected label.
     for _ in 0..probabilities.len().saturating_add(8) {
-        let residual = 1.0 - probabilities.iter().sum::<f32>();
-        if residual == 0.0 || check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
+        if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
             return;
         }
-        let max = probabilities
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        if max <= 0.0 {
-            break;
-        }
+        let residual = 1.0 - probabilities.iter().sum::<f32>();
         if residual > 0.0 {
-            #[allow(clippy::float_cmp)]
-            if let Some(index) = probabilities.iter().position(|p| *p == max) {
-                probabilities[index] = (probabilities[index] + residual).clamp(0.0, 1.0);
-            }
-            continue;
-        }
-        // The highest level strictly below `max` (0.0 when none): the
-        // top group may sink to it but never below, so no runner-up is
-        // ever crossed.
-        let next = probabilities
+            probabilities[winner] = (probabilities[winner] + residual).min(1.0);
+        } else if let Some((index, _)) = probabilities
             .iter()
-            .copied()
-            .filter(|p| *p < max)
-            .fold(0.0f32, f32::max);
-        #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
-        let count = probabilities.iter().filter(|p| **p == max).count() as f32;
-        let remove = (-residual).min((max - next) * count);
-        if remove <= 0.0 {
+            .enumerate()
+            .filter(|(index, value)| *index != winner && **value > 0.0)
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        {
+            let previous = probabilities[index];
+            let corrected = (previous + residual).max(0.0);
+            probabilities[index] = if corrected < previous {
+                corrected
+            } else {
+                previous.next_down().max(0.0)
+            };
+        } else {
             break;
-        }
-        let per = remove / count;
-        #[allow(clippy::float_cmp)]
-        for p in probabilities.iter_mut().filter(|p| **p == max) {
-            *p -= per;
         }
     }
 }
@@ -344,15 +328,15 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             None => Err(invalid(format!("answer object is missing `{key}`"))),
             Some(Value::Null) => Ok(None),
             Some(Value::Object(map)) => {
-                // The key set must be exactly the declared labels: extra keys
-                // would be silently dropped from a distribution that still
-                // sums within tolerance, hiding a schema mismatch.
-                for key in map.keys() {
-                    if !labels.contains(key) {
-                        return Err(invalid(format!(
-                            "probabilities carry undeclared label `{key}`"
-                        )));
-                    }
+                // Equal cardinality plus the per-declared-label lookups below
+                // establishes exact key equality without scanning all labels
+                // for every response key (Score cardinality is unbounded).
+                if map.len() != labels.len() {
+                    return Err(invalid(format!(
+                        "probabilities carry {} labels; expected {}",
+                        map.len(),
+                        labels.len()
+                    )));
                 }
                 let mut probabilities = Vec::with_capacity(labels.len());
                 for label in &labels {
@@ -360,6 +344,11 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                         .get(label)
                         .and_then(Value::as_f64)
                         .ok_or_else(|| invalid(format!("probabilities missing label `{label}`")))?;
+                    if !(0.0..=1.0).contains(&p) {
+                        return Err(invalid(format!(
+                            "probability for `{label}` out of range: {p}"
+                        )));
+                    }
                     probabilities.push(p as f32);
                 }
                 confidence::check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE)
@@ -380,12 +369,13 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             Some(number) => {
                 let p_true = number
                     .as_f64()
-                    .ok_or_else(|| invalid("`noul` is not a number".to_owned()))?
-                    as f32;
+                    .ok_or_else(|| invalid("`noul` is not a number".to_owned()))?;
                 if !(0.0..=1.0).contains(&p_true) {
                     return Err(invalid(format!("`noul` out of range: {p_true}")));
                 }
-                Ok(QuestionAnswer::answered(AnswerValue::Noul { p_true }))
+                Ok(QuestionAnswer::answered(AnswerValue::Noul {
+                    p_true: p_true as f32,
+                }))
             }
         },
         QuestionBody::Choice { .. } => Ok(match probabilities_from("probabilities")? {
@@ -401,6 +391,12 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
 
 /// Parse the full response envelope into an [`AnswerRow`].
 pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerRow, EvalError> {
+    // This public parser also accepts programmatic inputs without HTTP
+    // preflight. Exact key-set admission requires unique IDs and labels.
+    let ids = crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
+    for question in &set.questions {
+        crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+    }
     let answers = body
         .get("answers")
         .and_then(Value::as_object)
@@ -409,7 +405,7 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     // otherwise be silently discarded, hiding a response/request schema
     // mismatch behind a row that passes all per-question checks.
     for key in answers.keys() {
-        if set.question(key).is_none() {
+        if !ids.contains(key.as_str()) {
             return Err(EvalError::InvalidAnswer {
                 question_id: key.clone(),
                 message: "response answers an undeclared question".to_owned(),
@@ -429,6 +425,70 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     Ok(AnswerRow { answers: row })
 }
 
+/// Decode and validate the complete HTTP response envelope. This is the same
+/// client work used by [`HttpSubject`] and the wire-floor response benchmark.
+pub fn decode_response(set: &QuestionSet, text: &str) -> Result<(AnswerRow, String), EvalError> {
+    let parsed: Value = serde_json::from_str(text)
+        .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
+    let Some(resolved) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    else {
+        return Err(EvalError::Http(
+            "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
+                .to_owned(),
+        ));
+    };
+    let resolved = resolved.to_owned();
+    let answers = parse_response_answers(set, &parsed)?;
+    crate::run::validate_set_answer_row(set, &answers).map_err(|message| {
+        EvalError::InvalidAnswer {
+            question_id: "response".to_owned(),
+            message,
+        }
+    })?;
+    Ok((answers, resolved))
+}
+
+/// Operational bounds for remote evaluation, not inference latency targets.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpBudget {
+    /// Maximum connection-establishment time.
+    pub connect_timeout: std::time::Duration,
+    /// Whole HTTP query deadline, including response-body consumption.
+    pub request_timeout: std::time::Duration,
+    /// Maximum response-body bytes, for successful and error responses alike.
+    pub max_response_bytes: usize,
+}
+
+impl Default for HttpBudget {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(10),
+            request_timeout: std::time::Duration::from_secs(120),
+            max_response_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl HttpBudget {
+    fn validate(self) -> Result<(), &'static str> {
+        let now = std::time::Instant::now();
+        if self.connect_timeout.is_zero()
+            || self.request_timeout.is_zero()
+            || now.checked_add(self.connect_timeout).is_none()
+            || now.checked_add(self.request_timeout).is_none()
+            || self.max_response_bytes == 0
+        {
+            return Err(
+                "HTTP budgets require positive, representable deadlines and a positive body cap",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A subject reached over the jev-1 JSON/HTTPS wire (`POST /v1/systemone`).
 ///
 /// This is the reference client for every remote arm: the P0.7 stub, the
@@ -439,9 +499,10 @@ pub struct HttpSubject {
     base_url: String,
     model: String,
     token: String,
-    client: reqwest::Client,
-    /// The server's resolved id (`response.model`), set on the first
-    /// successful decide. `Arc` so clones observe the same resolution.
+    client: Result<reqwest::Client, &'static str>,
+    budget: HttpBudget,
+    /// The latest fully accepted response's resolved id. `Arc` so clones
+    /// share the cache; version-bound results never depend on this slot.
     resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
 }
 
@@ -450,10 +511,11 @@ impl std::fmt::Debug for HttpSubject {
         // Never print the bearer token: Debug output lands in logs and panic
         // diagnostics, and the token is a provider credential.
         f.debug_struct("HttpSubject")
-            .field("base_url", &self.base_url)
+            .field("base_url", &"<redacted>")
             .field("model", &self.model)
             .field("token", &"<redacted>")
-            .field("client", &self.client)
+            .field("client_ready", &self.client.is_ok())
+            .field("budget", &self.budget)
             .field("resolved", &self.resolved)
             .finish()
     }
@@ -468,11 +530,31 @@ impl HttpSubject {
         model: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
+        Self::new_with_budget(base_url, model, token, HttpBudget::default())
+    }
+
+    /// Configure finite evaluation safeguards. Invalid budgets or client
+    /// initialization are rejected by pure preflight before any teacher call;
+    /// construction never falls back to an unbounded client or panics.
+    pub fn new_with_budget(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        token: impl Into<String>,
+        budget: HttpBudget,
+    ) -> Self {
+        let client = budget.validate().and_then(|()| {
+            reqwest::Client::builder()
+                .connect_timeout(budget.connect_timeout)
+                .timeout(budget.request_timeout)
+                .build()
+                .map_err(|_| "HTTP client initialization failed")
+        });
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client,
+            budget,
             resolved: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
@@ -480,6 +562,19 @@ impl HttpSubject {
     /// The full decide-endpoint URL.
     pub fn endpoint(&self) -> String {
         format!("{}/v1/systemone", self.base_url)
+    }
+
+    // Shared with side-effect-free preflight so request construction cannot
+    // fail deterministically after an earlier ensemble teacher was queried.
+    fn request_builder(&self) -> Result<reqwest::RequestBuilder, EvalError> {
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|message| EvalError::InvalidInput((*message).to_owned()))?;
+        Ok(client
+            .post(self.endpoint())
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json"))
     }
 
     /// The requested model string (possibly an alias), as configured.
@@ -498,47 +593,97 @@ impl HttpSubject {
         set: &QuestionSet,
         state: &Entry,
     ) -> Result<(AnswerRow, String), EvalError> {
-        let body = request_body(set, state, &self.model);
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.token)
-            .json(&body)
+        self.preflight(set, state)?;
+        // Encode before opening a connection: serde_json otherwise turns a
+        // directly-constructed non-finite IR number into JSON null.
+        let body = serde_json::to_vec(&request_body(set, state, &self.model))
+            .map_err(|error| EvalError::InvalidInput(format!("invalid request entry: {error}")))?;
+        let mut response = self
+            .request_builder()?
+            .body(body)
             .send()
             .await
-            .map_err(|error| EvalError::Http(format!("request failed: {error}")))?;
+            .map_err(|_| EvalError::Http("HTTP request failed or timed out".to_owned()))?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| EvalError::Http(format!("reading body: {error}")))?;
-        if !status.is_success() {
-            return Err(EvalError::Http(format!(
-                "status {}: {}",
-                status.as_u16(),
-                text
-            )));
-        }
-        let parsed: Value = serde_json::from_str(&text)
-            .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
-        let Some(resolved) = parsed
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-        else {
+        let limit = self.budget.max_response_bytes;
+        if response
+            .content_length()
+            .is_some_and(|length| !usize::try_from(length).is_ok_and(|length| length <= limit))
+        {
             return Err(EvalError::Http(
-                "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
-                    .to_owned(),
+                "HTTP response exceeds the byte budget".to_owned(),
             ));
-        };
-        let resolved = resolved.to_owned();
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| EvalError::Http("reading HTTP response failed or timed out".to_owned()))?
+        {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(EvalError::Http(
+                    "HTTP response exceeds the byte budget".to_owned(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            // Providers may echo credentials in their bodies. Keep only status.
+            return Err(EvalError::Http(format!("status {}", status.as_u16())));
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| EvalError::Http("HTTP response is not UTF-8".to_owned()))?;
+        let (answers, resolved) = decode_response(set, text)?;
         *self.resolved.write() = Some(resolved.clone());
-        Ok((parse_response_answers(set, &parsed)?, resolved))
+        Ok((answers, resolved))
     }
 }
 
 #[async_trait]
 impl Subject for HttpSubject {
+    fn preflight(&self, set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+        // Direct callers also require unique question IDs and declared labels
+        // before any network call; do not rely on Harness/teacher validation.
+        crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
+        for question in &set.questions {
+            crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
+        self.budget
+            .validate()
+            .map_err(|message| EvalError::InvalidInput(message.to_owned()))?;
+        if self.model.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires a non-empty model".to_owned(),
+            ));
+        }
+        if self.token.trim().is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires a non-empty bearer token".to_owned(),
+            ));
+        }
+        if matches!(state, Entry::Null) {
+            return Err(EvalError::InvalidInput(
+                "the legacy /v1/systemone HTTP endpoint requires a non-null state".to_owned(),
+            ));
+        }
+        let endpoint = reqwest::Url::parse(&self.endpoint()).map_err(|_| {
+            EvalError::InvalidInput(
+                "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
+            )
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
+            ));
+        }
+        self.request_builder()?.build().map_err(|_| {
+            // Request/headers/URL may contain credentials. Never include the
+            // underlying error or Debug representation in this public error.
+            EvalError::InvalidInput("invalid HTTP subject request configuration".to_owned())
+        })?;
+        Ok(())
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -887,6 +1032,87 @@ questions:
     }
 
     #[test]
+    fn wire_probability_keys_require_exact_declared_set() {
+        let set = fixture();
+        for id in ["tone", "severity"] {
+            let question = set.question(id).unwrap();
+            let labels = question.labels();
+            let mut exact = serde_json::Map::new();
+            // Opposite insertion order to the declared labels; the numeric
+            // vector must still follow the question, not response ordering.
+            for (index, label) in labels.iter().enumerate().rev() {
+                exact.insert(
+                    label.clone(),
+                    serde_json::json!(if index == labels.len() - 1 { 1.0 } else { 0.0 }),
+                );
+            }
+            let response = |probabilities: serde_json::Map<String, Value>| serde_json::json!({"type": question.kind.as_str(), "probabilities": probabilities});
+            let parsed = parse_answer(question, &response(exact.clone())).unwrap();
+            let probabilities = parsed.value.unwrap().probabilities();
+            assert_eq!(probabilities.len(), labels.len());
+            assert_eq!(probabilities[labels.len() - 1], 1.0);
+            assert!(probabilities[..labels.len() - 1].iter().all(|p| *p == 0.0));
+
+            let mut extra = exact.clone();
+            extra.insert("undeclared".to_owned(), serde_json::json!(0.0));
+            let mut missing = exact.clone();
+            missing.remove(&labels[0]);
+            let mut substituted = missing.clone();
+            substituted.insert("undeclared".to_owned(), serde_json::json!(0.0));
+            // All three retain a valid sum of one. The substitution also has
+            // equal cardinality, so only exact key membership can reject it.
+            for malformed in [extra, missing, substituted] {
+                let error = parse_answer(question, &response(malformed)).unwrap_err();
+                assert!(
+                    matches!(error, EvalError::InvalidAnswer { question_id, .. } if question_id == id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_score_wire_preserves_numeric_level_order() {
+        const LEVELS: usize = 4096;
+        const WINNER: usize = 3073;
+        let question = QuestionSpec {
+            id: "wide_score".to_owned(),
+            kind: hyprstream_decision::QuestionKind::Score,
+            instructions: None,
+            body: QuestionBody::Score {
+                levels: vec![None; LEVELS],
+            },
+        };
+        let wire: serde_json::Map<String, Value> = (0..LEVELS)
+            .rev()
+            .map(|level| {
+                (
+                    level.to_string(),
+                    serde_json::json!(if level == WINNER { 1.0 } else { 0.0 }),
+                )
+            })
+            .collect();
+        let parsed = parse_answer(
+            &question,
+            &serde_json::json!({"type": "score", "probabilities": wire}),
+        )
+        .unwrap();
+        let Some(AnswerValue::Score { probabilities }) = parsed.value else {
+            panic!("valid score must remain answered")
+        };
+        assert_eq!(probabilities.len(), LEVELS);
+        for (level, probability) in probabilities.iter().enumerate() {
+            assert_eq!(
+                probability.to_bits(),
+                if level == WINNER {
+                    1.0_f32.to_bits()
+                } else {
+                    0.0_f32.to_bits()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn wire_normalization_preserves_ties() {
         // Seven options rounded to 0.1429 each (sum 1.0003, legal at
         // consumer tolerance): normalization must not turn the tie into a
@@ -1110,27 +1336,21 @@ questions:
     // to the exact bit patterns at issue, so keep the full decimals.
     #[allow(clippy::excessive_precision)]
     fn normalization_overage_never_flips_the_argmax() {
-        // Consumer-valid 59-way near-uniform vector (sequential sum
-        // 0.9902): after division and the uniform-share step a residual of
-        // about −1.19e-6 remains — dwarfing the 1.9e-9 gap between the
-        // unique maximum (index 0) and the runner-up. Subtracting that
-        // residual from the maximum (the old fallback) flipped the argmax
-        // to index 1; the water-filling correction sinks the top levels
-        // together, keeping index 0 ahead (or exactly tied, which the
-        // earliest-index tie-break still awards to index 0).
-        let mut probabilities = vec![0.0167830512f32; 59];
-        probabilities[0] = 0.0167830531f32;
-        normalize_distribution(&mut probabilities);
-        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
-        assert!(
-            probabilities.iter().all(|p| (0.0..=1.0).contains(p)),
-            "no component may leave [0, 1]: {probabilities:?}"
-        );
-        assert_eq!(
-            confidence::argmax_index(&probabilities),
-            Some(0),
-            "normalization must not change the predicted label: {probabilities:?}"
-        );
+        // Rotate the unique winner through every index: merging its level
+        // with an earlier runner-up must not change D6's selected label.
+        for winner in 0..59 {
+            let mut probabilities = vec![0.0167830512f32; 59];
+            probabilities[winner] = 0.0167830531f32;
+            normalize_distribution(&mut probabilities);
+            confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE)
+                .unwrap();
+            assert!(probabilities.iter().all(|p| (0.0..=1.0).contains(p)));
+            assert_eq!(
+                confidence::argmax_index(&probabilities),
+                Some(winner),
+                "normalization changed winner {winner}: {probabilities:?}"
+            );
+        }
     }
 
     #[test]
@@ -1161,6 +1381,72 @@ questions:
                     confidence::argmax_index(&normalized),
                     raw_argmax,
                     "cardinality {cardinality} seed {seed}: normalization changed the label"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn http_rejects_nonfinite_nested_entries_before_connecting() {
+        let subject = HttpSubject::new("http://127.0.0.1:1", "model", "token");
+        for location in 0..6 {
+            for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.25] {
+                let mut set = fixture();
+                let mut state = Entry::Str("valid state".into());
+                let entry = Entry::Seq(vec![Entry::Map(vec![(
+                    "nested".into(),
+                    Entry::Number(number),
+                )])]);
+                match location {
+                    0 => state = entry,
+                    1 => set.questions[0].instructions = Some(entry),
+                    2 | 3 => {
+                        set.questions[0].body = QuestionBody::Noul {
+                            criteria: Some(hyprstream_decision::NoulCriteria {
+                                on_false: (location == 2).then(|| entry.clone()),
+                                on_true: (location == 3).then_some(entry),
+                            }),
+                        }
+                    }
+                    4 => {
+                        if let QuestionBody::Choice { options } = &mut set.questions[1].body {
+                            options[0].rubric = Some(entry);
+                        }
+                    }
+                    _ => {
+                        if let QuestionBody::Score { levels } = &mut set.questions[2].body {
+                            levels[0] = Some(entry);
+                        }
+                    }
+                }
+                if number.is_finite() {
+                    assert!(serde_json::to_vec(&request_body(&set, &state, "model")).is_ok());
+                } else {
+                    let error = subject.post(&set, &state).await.unwrap_err();
+                    assert!(
+                        matches!(error, EvalError::InvalidInput(_)),
+                        "location {location} must fail input validation before HTTP: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn wire_probability_bounds_are_checked_before_f32_rounding() {
+        let set = fixture();
+        for probability in [-1e-50f64, 1.00000001, 0.0, 1.0] {
+            let valid = (0.0..=1.0).contains(&probability);
+            let remainder = (1.0 - probability).clamp(0.0, 1.0);
+            let answers = [
+                serde_json::json!({"type":"noul", "noul":probability}),
+                serde_json::json!({"type":"choice", "probabilities":{"angry":probability,"calm":remainder}}),
+                serde_json::json!({"type":"score", "probabilities":{"0":probability,"1":remainder,"2":0.0}}),
+            ];
+            for (question, answer) in set.questions.iter().zip(answers) {
+                assert_eq!(
+                    parse_answer(question, &answer).is_ok(),
+                    valid,
+                    "{} must check original {probability} before narrowing",
+                    question.id
                 );
             }
         }

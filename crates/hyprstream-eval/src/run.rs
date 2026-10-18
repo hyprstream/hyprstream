@@ -68,7 +68,8 @@ impl EvalSet {
 /// A one-question eval item: question, state, verifiable truth. This is the
 /// shape [`hyprstream_bench::Item`] converts into; runs over items produce
 /// observations (scoring input) but no single shared-schema batch — items
-/// carry distinct question ids, and the Arrow contract keys columns to them.
+/// can carry different label sets, so metadata binds to each (item id,
+/// question id) pair rather than a single shared schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalItem {
     /// Stable item id.
@@ -170,6 +171,11 @@ impl Harness {
         set: &EvalSet,
         subject: &dyn Subject,
     ) -> Result<RunOutput, EvalError> {
+        if set.schema_version.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "an eval set requires a nonempty schema version".to_owned(),
+            ));
+        }
         let question_set = set.question_set();
         // Validate the decision schema BEFORE any row reaches the subject:
         // with an HTTP-backed model every row is a billed call, and a schema
@@ -188,7 +194,15 @@ impl Harness {
         // labeled denominator — fail loudly instead. A truth index outside
         // the question's cardinality is likewise an input error, caught here
         // rather than at scoring time (after every billed call).
+        let mut row_ids = std::collections::HashSet::with_capacity(set.rows.len());
         for row in &set.rows {
+            validate_entry(&row.state).map_err(EvalError::InvalidInput)?;
+            if !row_ids.insert(&row.id) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate eval row id `{}`",
+                    row.id
+                )));
+            }
             for (question_id, &label) in &row.truth {
                 let Some(question) = question_set.question(question_id) else {
                     return Err(EvalError::InvalidInput(format!(
@@ -204,6 +218,11 @@ impl Harness {
                     )));
                 }
             }
+        }
+        // Subject-specific checks must also complete for ALL requests before
+        // any decide call (e.g. the legacy HTTP endpoint rejects null state).
+        for row in &set.rows {
+            subject.preflight(&question_set, &row.state)?;
         }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
@@ -275,7 +294,7 @@ impl Harness {
         }
         let version = VersionTriple {
             schema: set.schema_version.clone(),
-            model: pinned_model.unwrap_or_else(|| subject.resolved_model_id()),
+            model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
         let batch = schema.build_batch(&version, &rows)?;
@@ -303,7 +322,15 @@ impl Harness {
         // Preflight EVERY item's truth index before the first subject call:
         // item N's invalid truth must not surface only after the preceding
         // N−1 items have invoked (and possibly billed) the subject.
+        let mut identities = std::collections::HashSet::with_capacity(items.len());
         for item in items {
+            validate_entry(&item.state).map_err(EvalError::InvalidInput)?;
+            if !identities.insert((&item.id, &item.question.id)) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate eval item identity ({:?}, {:?})",
+                    item.id, item.question.id
+                )));
+            }
             validate_question_profile(&item.question).map_err(EvalError::InvalidInput)?;
             if let Some(truth) = item.truth {
                 if truth >= item.question.cardinality() {
@@ -315,6 +342,13 @@ impl Harness {
                     )));
                 }
             }
+        }
+        for item in items {
+            let set = QuestionSet {
+                state: Some(item.state.clone()),
+                questions: vec![item.question.clone()],
+            };
+            subject.preflight(&set, &item.state)?;
         }
         let mut observations = Vec::with_capacity(items.len());
         let mut pinned_model: Option<String> = None;
@@ -371,7 +405,7 @@ impl Harness {
         }
         let version = VersionTriple {
             schema: "items".to_owned(),
-            model: pinned_model.unwrap_or_else(|| subject.resolved_model_id()),
+            model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
         Ok(RunOutput {
@@ -384,6 +418,33 @@ impl Harness {
     }
 }
 
+/// Empty runs have no response capture, but still require usable provenance.
+fn final_model_id(pinned: Option<String>, subject: &dyn Subject) -> Result<String, EvalError> {
+    let model = pinned.unwrap_or_else(|| subject.resolved_model_id());
+    if model.is_empty() {
+        return Err(EvalError::InvalidInput(format!(
+            "subject `{}` resolved an empty model id — a run requires model provenance",
+            subject.model_id()
+        )));
+    }
+    Ok(model)
+}
+
+/// Programmatic entries bypass the parser's finite-number invariant. Check
+/// recursively during all-input preflight, before any subject can be billed.
+pub(crate) fn validate_entry(entry: &Entry) -> Result<(), String> {
+    match entry {
+        Entry::Number(value) if !value.is_finite() => {
+            Err("non-finite Entry::Number in eval input".to_owned())
+        }
+        Entry::Seq(entries) => entries.iter().try_for_each(validate_entry),
+        Entry::Map(entries) => entries
+            .iter()
+            .try_for_each(|(_, value)| validate_entry(value)),
+        _ => Ok(()),
+    }
+}
+
 /// The jev-1 v1 question-profile rules the authoring layer enforces at
 /// parse time, applied to programmatically constructed questions (which
 /// bypass parsing): v1 kinds only, kind/body agreement, choice cardinality
@@ -393,6 +454,9 @@ impl Harness {
 pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), String> {
     use hyprstream_decision::spec::{QuestionBody, QuestionKind};
 
+    if let Some(instructions) = &question.instructions {
+        validate_entry(instructions)?;
+    }
     let id = &question.id;
     if question.id.is_empty() {
         return Err("a question id must be nonempty".to_owned());
@@ -431,6 +495,9 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
             }
             let mut names = std::collections::HashSet::with_capacity(options.len());
             for option in options {
+                if let Some(rubric) = &option.rubric {
+                    validate_entry(rubric)?;
+                }
                 if option.name.is_empty() {
                     return Err(format!("choice question `{id}` has an empty option name"));
                 }
@@ -443,6 +510,9 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
             }
         }
         QuestionBody::Score { levels } => {
+            for rubric in levels.iter().flatten() {
+                validate_entry(rubric)?;
+            }
             if levels.len() < 2 {
                 return Err(format!(
                     "score question `{id}` needs at least 2 levels, got {}",
@@ -450,7 +520,16 @@ pub(crate) fn validate_question_profile(question: &QuestionSpec) -> Result<(), S
                 ));
             }
         }
-        QuestionBody::Noul { .. } => {}
+        QuestionBody::Noul { criteria } => {
+            if let Some(criteria) = criteria {
+                for rubric in [&criteria.on_true, &criteria.on_false]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_entry(rubric)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -471,6 +550,18 @@ pub(crate) fn validate_answer_row(
     validate_one_answer(question, row)
 }
 
+/// Index declared IDs once without changing their original order. Direct
+/// programmatic inputs must not collapse duplicate declarations into one map key.
+pub(crate) fn question_ids(set: &QuestionSet) -> Result<std::collections::HashSet<&str>, String> {
+    let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
+    for question in &set.questions {
+        if !ids.insert(question.id.as_str()) {
+            return Err(format!("duplicate question id `{}`", question.id));
+        }
+    }
+    Ok(ids)
+}
+
 /// The same rules for a full row over a question set (the teacher ensemble's
 /// shape): every answered key must be declared, and every declared question
 /// must be answered per the per-answer rules.
@@ -478,8 +569,9 @@ pub(crate) fn validate_set_answer_row(
     set: &hyprstream_decision::spec::QuestionSet,
     row: &hyprstream_decision::arrow::AnswerRow,
 ) -> Result<(), String> {
+    let ids = question_ids(set)?;
     for answered_id in row.answers.keys() {
-        if set.question(answered_id).is_none() {
+        if !ids.contains(answered_id.as_str()) {
             return Err(format!("row answers unknown question `{answered_id}`"));
         }
     }
@@ -545,4 +637,49 @@ fn validate_one_answer(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod row_identity_tests {
+    use super::*;
+    use hyprstream_decision::answer::QuestionAnswer;
+    use hyprstream_decision::arrow::AnswerRow;
+    use hyprstream_decision::author;
+
+    #[test]
+    fn row_validation_rejects_duplicate_declarations_and_exact_key_substitution(
+    ) -> Result<(), String> {
+        let set = author::parse_yaml("questions:\n  left: {type: noul}\n  right: {type: noul}\n")
+            .map_err(|error| error.to_string())?;
+        let valid = AnswerRow {
+            answers: set
+                .questions
+                .iter()
+                .map(|question| (question.id.clone(), QuestionAnswer::abstained()))
+                .collect(),
+        };
+        validate_set_answer_row(&set, &valid)?;
+        let mut duplicate = set.clone();
+        duplicate.questions[1] = duplicate.questions[0].clone();
+        let collapsed = AnswerRow {
+            answers: [("left".to_owned(), QuestionAnswer::abstained())].into(),
+        };
+        assert!(
+            matches!(validate_set_answer_row(&duplicate, &collapsed), Err(ref message) if message.contains("duplicate question id"))
+        );
+        let mut replaced = valid.clone();
+        replaced.answers.remove("right");
+        replaced
+            .answers
+            .insert("outside".into(), QuestionAnswer::abstained());
+        assert!(
+            matches!(validate_set_answer_row(&set, &replaced), Err(ref message) if message == "row answers unknown question `outside`")
+        );
+        let mut missing = valid;
+        missing.answers.remove("right");
+        assert!(
+            matches!(validate_set_answer_row(&set, &missing), Err(ref message) if message.contains("missing an answer for question `right`"))
+        );
+        Ok(())
+    }
 }

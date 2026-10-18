@@ -1,0 +1,48 @@
+OFFLINE OFFICIAL REFERENCE ONLY — no Python serving dependency.
+Coordinator owns Jensen access/resource scheduling and all artifact transfers.
+Do not replace global torch, drivers, mesh identities or trust stores.
+
+Move these task-owned inputs (exclude .venv and generated local output):
+- reference-oracle/{generate.py,compare_native.py,verify_artifacts.py,bootstrap_cpu.sh,requirements-cpu.lock,corpus.json}
+- bf16-artifact-manifest.json
+- the exact 17 pinned original files under Cloudflare/clef-flash revision
+  8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3 (19.08GB). Preserve pathnames.
+Verify every transferred file against the manifest SHA256 before full execution.
+Do not copy the local CPU venv: bootstrap a scoped Jensen Python3.11 venv.
+
+Task-local package pins: torch2.11.0+cpu, transformers5.10.2, tokenizers0.22.2,
+safetensors0.7.0, accelerate1.15.0, pillow12.3.0, torchvision0.26.0+cpu. Full transitive pins in
+requirements-cpu.lock. bootstrap_cpu.sh first installs official CPU torch wheel,
+and matching CPU torchvision (required by official AutoProcessor even for text),
+then pinned remaining wheels without dependency mutation; uv pip check required.
+This does not touch Jensen's global incorrect CUDA torch build.
+
+Full CPU FP32 command, AFTER coordinator confirms no other full-model process:
+ORACLE_TASK_DIR=/absolute/task-owned/reference-oracle
+ORACLE_MODEL_DIR=/absolute/task-owned/original-model
+bash "${ORACLE_TASK_DIR}/bootstrap_cpu.sh"
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  "${ORACLE_TASK_DIR}/.venv/bin/python" "${ORACLE_TASK_DIR}/generate.py" \
+  --model-dir "${ORACLE_MODEL_DIR}" \
+  --artifact-manifest /absolute/task-owned/bf16-artifact-manifest.json \
+  --output "${ORACLE_TASK_DIR}/full-f32-cpu-v1" \
+  --mode full --allow-full-model --dtype float32 --device cpu --threads 8
+
+The full loader is the unmodified official load_release_model, followed by the
+unmodified ClefModel.forward under inference_mode. Hooks ONLY observe hidden /
+hidden_norm outputs; they do not change model operations. No kernel/attention
+implementation override is injected; observed implementation is recorded.
+
+Outputs: records.json (all original encoded tokens/spans/types/options/accounting),
+tensors.safetensors (selected original LM embedding rows, actual backbone hidden,
+head-normalized hidden, logits and Float32 probabilities), provenance.json
+(source/artifact/corpus/generator and output hashes, versions, device/dtype,
+threads, host, elapsed time and measured peak RSS). Log stdout/stderr separately.
+Keys: embedding_token_ids,embedding_rows,r{i}.hidden,r{i}.normalized_hidden,
+r{i}.q{j}.logits,r{i}.q{j}.probabilities. Full corpus has five records.
+
+Compare native original-FP32 baseline outputs to full-f32 CPU oracle; FP8 drift
+is a separate profile/gate. compare_native.py requires explicit --atol/--rtol;
+no accepted tolerances are invented by the fixture generator. Include exact
+encoder JSON comparison and --include-hidden for whole-port comparisons.
+Head-only synthetic fixtures cannot establish backbone correctness or R5 PASS.

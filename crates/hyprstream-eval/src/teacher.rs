@@ -138,6 +138,7 @@ impl TeacherEnsemble {
                 "a teacher ensemble cannot answer an empty question set".to_owned(),
             ));
         }
+        crate::run::validate_entry(state).map_err(EvalError::InvalidInput)?;
         let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
         for question in &set.questions {
             if !ids.insert(&question.id) {
@@ -147,6 +148,11 @@ impl TeacherEnsemble {
                 )));
             }
             crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
+        // Check every teacher before querying the first one: a stricter
+        // later transport must not reject input after earlier billed calls.
+        for teacher in &self.teachers {
+            teacher.subject.preflight(set, state)?;
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
@@ -163,6 +169,12 @@ impl TeacherEnsemble {
                     item_id: item_id.to_owned(),
                     message: error.to_string(),
                 })?;
+            if resolved.is_empty() {
+                return Err(EvalError::InvalidInput(format!(
+                    "teacher `{}` returned an empty resolved model id",
+                    teacher.id
+                )));
+            }
             // Teacher rows are averaged raw: a malformed row (missing answer,
             // wrong cardinality, non-normalized distribution) would silently
             // corrupt the ensemble, so apply the same ingest rules as runs.
@@ -499,5 +511,19 @@ questions:
             matches!(error, EvalError::InvalidAnswer { .. }),
             "wrong cardinality must be InvalidAnswer, got {error:?}"
         );
+    }
+    #[tokio::test]
+    async fn teacher_rejects_empty_resolved_model_provenance() {
+        let ensemble = TeacherEnsemble::new(vec![Teacher {
+            id: "teacher".into(),
+            tos_class: TosClass::Distributable,
+            subject: Box::new(TruthSubject::new("")),
+        }])
+        .unwrap();
+        let error = ensemble
+            .decide(&fixture(), &Entry::Null, 0, "item")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EvalError::InvalidInput(_)), "{error:?}");
     }
 }
