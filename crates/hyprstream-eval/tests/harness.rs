@@ -461,6 +461,29 @@ async fn run_set_validates_the_schema_before_calling_the_subject() {
 }
 
 #[tokio::test]
+async fn run_set_rejects_empty_row_identity_before_calling_the_subject() {
+    let set = hyprstream_eval::EvalSet {
+        name: "empty-row-id".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: String::new(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::new(),
+        }],
+    };
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    assert!(matches!(
+        Harness.run_set(&set, &subject).await,
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn run_set_rejects_out_of_cardinality_truth_before_calling_the_subject() {
     let set = hyprstream_eval::EvalSet {
         name: "t".into(),

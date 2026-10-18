@@ -4,8 +4,8 @@
 //!
 //! - [`EvalSet`] — the **workflow** shape: one declared question set applied
 //!   to many state rows. This is what P0.5/P1.4 run; the run's Arrow batch is
-//!   a single `hyprstream-decision` `DecisionSchema` batch, persistable as one
-//!   P0.3 `decision_batches` row.
+//!   an eval-owned v2 payload that binds row provenance and truth to the
+//!   unchanged decision/serving v1 answer columns.
 //! - [`EvalItem`] — the **one-question** shape: a question, its state, and its
 //!   verifiable truth. [`hyprstream_bench::Item`] converts into this; scoring
 //!   groups the resulting observations into fields (family × kind ×
@@ -19,10 +19,12 @@ use hyprstream_decision::spec::{QuestionKind, QuestionSet, QuestionSpec};
 use hyprstream_metrics_api::arrow::array::RecordBatch;
 
 use crate::error::EvalError;
+use crate::eval_batch::EvalBatchSchema;
 use crate::subject::Subject;
 
 /// One row of an [`EvalSet`]: a state plus per-question truth (label index in
-/// canonical order) where the outcome is verifiable.
+/// canonical order) where the outcome is verifiable. The stable row ID must
+/// be nonempty and unique within the set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalRow {
     /// Stable row id (flows into observations and reports).
@@ -39,6 +41,19 @@ pub struct EvalRow {
     pub state: Entry,
     /// Verifiable truth per question id (label index); absent = unlabeled row.
     pub truth: std::collections::BTreeMap<String, usize>,
+}
+
+/// One row in the persisted eval-v2 batch. Answers and provenance travel as one
+/// value so row metadata cannot drift from the answer row during batch assembly.
+#[derive(Debug, Clone)]
+pub(crate) struct EvalBatchRow {
+    pub(crate) id: String,
+    pub(crate) family: Option<String>,
+    pub(crate) stratum: Option<String>,
+    pub(crate) group: Option<String>,
+    pub(crate) answers:
+        std::collections::BTreeMap<String, hyprstream_decision::answer::QuestionAnswer>,
+    pub(crate) truth: std::collections::BTreeMap<String, usize>,
 }
 
 /// A declared question set evaluated over many rows — one persisted batch.
@@ -137,8 +152,8 @@ impl Observation {
     }
 }
 
-/// What a run produced: the observation stream, the version triple, and — for
-/// [`EvalSet`] runs — the Arrow batch under the set's decision schema.
+/// What a run produced: the observation stream, version triple, and — for
+/// [`EvalSet`] runs — the eval-v2 Arrow batch bound to its observation provenance.
 #[derive(Debug)]
 pub struct RunOutput {
     /// The subject's resolved model id.
@@ -149,11 +164,43 @@ pub struct RunOutput {
     pub observations: Vec<Observation>,
     /// The emitted batch (`None` for loose item runs).
     pub batch: Option<RecordBatch>,
-    /// The decision-schema fingerprint of the batch, when present.
+    /// The physical eval-v2 fingerprint of a set batch, when present. Loose item
+    /// runs have no shared batch contract and leave it absent.
     pub schema_fingerprint: Option<String>,
+    // Keep the origin shape independent of the mutable public batch fields so
+    // a set run cannot be downgraded into loose-item scoring by clearing them.
+    shape: RunShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunShape {
+    Set,
+    Items,
 }
 
 impl RunOutput {
+    /// Construct a loose-item run for callers that assemble observations
+    /// without using [`Harness::run_items`]. Item runs have no shared Arrow
+    /// contract and remain scoreable through [`crate::score::score_run`].
+    pub fn from_items(
+        model_id: String,
+        version: VersionTriple,
+        observations: Vec<Observation>,
+    ) -> Self {
+        Self {
+            model_id,
+            version,
+            observations,
+            batch: None,
+            schema_fingerprint: None,
+            shape: RunShape::Items,
+        }
+    }
+
+    pub(crate) fn is_set_run(&self) -> bool {
+        self.shape == RunShape::Set
+    }
+
     /// Both public model coordinates name the same resolved producer. Check
     /// them again at consuming boundaries because callers may mutate a run.
     pub(crate) fn validate_model_provenance(&self) -> Result<(), EvalError> {
@@ -218,6 +265,11 @@ impl Harness {
         let mut row_ids = std::collections::HashSet::with_capacity(set.rows.len());
         for row in &set.rows {
             validate_entry(&row.state).map_err(EvalError::InvalidInput)?;
+            if row.id.is_empty() {
+                return Err(EvalError::InvalidInput(
+                    "evaluation row ID must be nonempty".to_owned(),
+                ));
+            }
             if !row_ids.insert(&row.id) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate eval row id `{}`",
@@ -312,13 +364,21 @@ impl Harness {
                     truth: row.truth.get(&question.id).copied(),
                 });
             }
-            rows.push(answers);
+            rows.push(EvalBatchRow {
+                id: row.id.clone(),
+                family: row.family.clone(),
+                stratum: row.stratum.clone(),
+                group: row.group.clone(),
+                answers: answers.answers,
+                truth: row.truth.clone(),
+            });
         }
         let version = VersionTriple {
             schema: set.schema_version.clone(),
             model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
+        let schema = EvalBatchSchema::new(schema)?;
         let batch = schema.build_batch(&version, &rows)?;
         Ok(RunOutput {
             model_id: version.model.clone(),
@@ -326,6 +386,7 @@ impl Harness {
             batch: Some(batch),
             version,
             observations,
+            shape: RunShape::Set,
         })
     }
 
@@ -431,13 +492,11 @@ impl Harness {
             model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
-        Ok(RunOutput {
-            model_id: version.model.clone(),
+        Ok(RunOutput::from_items(
+            version.model.clone(),
             version,
             observations,
-            batch: None,
-            schema_fingerprint: None,
-        })
+        ))
     }
 }
 

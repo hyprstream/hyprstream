@@ -1,4 +1,4 @@
-//! Persistence: runs → P0.3 `decision_batches` rows via the Apache metrics
+//! Persistence: eval-v2 runs → P0.3 `decision_batches` rows via the Apache metrics
 //! API. The harness links only [`hyprstream_metrics_api`]; the caller wires in
 //! whatever [`StorageBackend`] the serving process provides (DuckDB in the
 //! AGPL engine, an in-memory backend in tests) — the two-process serving
@@ -8,17 +8,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyprstream_decision::arrow::{
-    DecisionSchema, CALIB_VERSION_COLUMN, FIELD_META_KIND, FIELD_META_LABELS, MODEL_VERSION_COLUMN,
-    SCHEMA_VERSION_COLUMN,
+    DecisionSchema, CALIB_VERSION_COLUMN, MODEL_VERSION_COLUMN, SCHEMA_VERSION_COLUMN,
 };
 use hyprstream_decision::confidence::{self, PRODUCER_SUM_TOLERANCE};
-use hyprstream_decision::spec::QuestionKind;
 use hyprstream_metrics_api::arrow::array::{
     Array, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
 };
 use hyprstream_metrics_api::{DecisionBatchStore, StorageBackend};
 
 use crate::error::EvalError;
+use crate::eval_batch::EvalBatchSchema;
 use crate::run::RunOutput;
 
 /// A persistence sink over any storage backend.
@@ -94,46 +93,10 @@ pub(crate) fn validate_provenance(
     fingerprint: &str,
 ) -> Result<DecisionSchema, EvalError> {
     let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
-    let arrow_schema = batch.schema();
-    let mut questions = Vec::new();
-    for field in arrow_schema.fields() {
-        let Some(id) = field.name().strip_suffix(".probabilities") else {
-            continue;
-        };
-        let kind = match field.metadata().get(FIELD_META_KIND).map(String::as_str) {
-            Some("noul") => QuestionKind::Noul,
-            Some("choice") => QuestionKind::Choice,
-            Some("score") => QuestionKind::Score,
-            _ => {
-                return Err(invalid(
-                    "batch has missing or invalid question kind metadata",
-                ))
-            }
-        };
-        let labels: Vec<String> = serde_json::from_str(
-            field
-                .metadata()
-                .get(FIELD_META_LABELS)
-                .ok_or_else(|| invalid("batch has no question labels metadata"))?,
-        )
-        .map_err(|_| invalid("batch has invalid question labels metadata"))?;
-        let question = crate::run::question_from_labels(id, kind, &labels)?;
-        questions.push(question);
-    }
-    let schema = DecisionSchema::new(questions)?;
-    let schema = if arrow_schema
-        .fields()
-        .iter()
-        .any(|field| field.name().ends_with(".conformal_set"))
-    {
-        schema
-    } else {
-        schema.without_conformal_set()
-    };
-    if schema.arrow_schema() != *arrow_schema || schema.fingerprint() != fingerprint {
-        return Err(invalid(
-            "run schema fingerprint or Arrow layout differs from the batch",
-        ));
+    let eval_schema = EvalBatchSchema::from_arrow_schema(batch.schema().as_ref())?;
+    let schema = eval_schema.decision().clone();
+    if eval_schema.fingerprint() != fingerprint {
+        return Err(invalid("eval-v2 fingerprint differs from the batch"));
     }
     if output.version.schema.is_empty()
         || output.version.model.is_empty()
@@ -144,6 +107,7 @@ pub(crate) fn validate_provenance(
         ));
     }
     validate_row_values(&schema, batch)?;
+    eval_schema.validate_observations(output, batch)?;
     for (name, expected) in [
         (SCHEMA_VERSION_COLUMN, Some(output.version.schema.as_str())),
         (MODEL_VERSION_COLUMN, Some(output.version.model.as_str())),
