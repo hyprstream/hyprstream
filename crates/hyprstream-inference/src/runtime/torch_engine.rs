@@ -2867,6 +2867,48 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    #[test]
+    fn precision_policy_preserves_aliases_and_non_cpu_modes_without_gpu_execution() {
+        for device in [Device::Cpu, Device::Cuda(0), Device::Mps] {
+            for channel in [false, true] {
+                for (aliases, expected) in [
+                    (
+                        &["fp32", "float32", "FP32", "Float32"][..],
+                        tch::Kind::Float,
+                    ),
+                    (&["fp16", "float16", "FP16", "Float16"][..], tch::Kind::Half),
+                    (
+                        &["bf16", "bfloat16", "BF16", "BFloat16"][..],
+                        tch::Kind::BFloat16,
+                    ),
+                ] {
+                    for alias in aliases {
+                        assert_eq!(
+                            resolve_inference_compute_kind(Some(alias), device, channel).unwrap(),
+                            expected
+                        );
+                    }
+                }
+                let automatic = if device == Device::Cpu && channel {
+                    tch::Kind::Float
+                } else {
+                    tch::Kind::BFloat16
+                };
+                for alias in [None, Some("auto"), Some("AUTO"), Some("fp8"), Some("FP8")] {
+                    assert_eq!(
+                        resolve_inference_compute_kind(alias, device, channel).unwrap(),
+                        automatic
+                    );
+                }
+                for invalid in ["", "fp64", "float8", "surprise"] {
+                    assert!(
+                        resolve_inference_compute_kind(Some(invalid), device, channel).is_err()
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn decision_context_uses_actual_loaded_config_and_override() {
         let directory = tempfile::tempdir().unwrap();
