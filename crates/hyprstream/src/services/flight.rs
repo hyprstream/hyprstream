@@ -79,7 +79,8 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
         resource: &str,
         operation: &str,
     ) -> Result<hyprstream_flight::VerifiedFlightContext, hyprstream_flight::FlightAuthError> {
-        self.verify_identity(authorization, resource, operation).await
+        self.verify_identity(authorization, resource, operation)
+            .await
     }
 }
 

@@ -127,9 +127,7 @@ struct G1Fixture {
 
 /// Resource verifier state bound to a composite ledger (the public
 /// `with_composite_key_set` sharing seam — no process-global publication).
-fn resource_state(
-    key_set: &Arc<CompositeKeySet>,
-) -> crate::server::state::ResourceAuthState {
+fn resource_state(key_set: &Arc<CompositeKeySet>) -> crate::server::state::ResourceAuthState {
     let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
     let federation_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x5b; 32]);
     let federation_kid = hyprstream_rpc::auth::jwt::kid_for_key(&federation_ed25519);
@@ -174,7 +172,6 @@ fn resource_state(
 }
 
 async fn fixture() -> G1Fixture {
-
     crate::mac::install_explicit_test_dispatch_pep();
     let _ = hyprstream_rpc::envelope::install_verify_config(
         hyprstream_rpc::envelope::EnvelopeVerifyConfig {
@@ -234,8 +231,10 @@ async fn fixture() -> G1Fixture {
     let git = Arc::new(tokio::sync::RwLock::new(
         git2db::Git2DB::open(root.path()).await.expect("git2db"),
     ));
-    let transport =
-        hyprstream_rpc::transport::TransportConfig::inproc(format!("flight-authz-{}", uuid::Uuid::new_v4()));
+    let transport = hyprstream_rpc::transport::TransportConfig::inproc(format!(
+        "flight-authz-{}",
+        uuid::Uuid::new_v4()
+    ));
     let service = crate::services::policy::PolicyService::new(
         policy,
         Arc::new(ca.clone()),
@@ -250,7 +249,10 @@ async fn fixture() -> G1Fixture {
         ed25519: user_ed.verifying_key().to_bytes(),
     }));
     let manager = InprocManager::new();
-    manager.spawn(Box::new(service)).await.expect("policy service spawns");
+    manager
+        .spawn(Box::new(service))
+        .await
+        .expect("policy service spawns");
 
     // The flight RELAY credential: real service JWT (subject service:flight)
     // signed by the fixture authority, attested in the trust store so
@@ -311,11 +313,7 @@ impl G1Fixture {
             .with_cnf_jwk(&self.user_ed.verifying_key().to_bytes())
             .with_cnf_hs_signer_suite(hs)
             .with_jti();
-        crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-            &claims,
-            &self.ml_dsa,
-            &self.ed,
-        )
+        crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &self.ml_dsa, &self.ed)
     }
 
     async fn authorize_verified_bounded(
@@ -324,8 +322,11 @@ impl G1Fixture {
     ) -> Result<hyprstream_flight::VerifiedFlightContext, FlightAuthError> {
         tokio::time::timeout(
             CALL_TIMEOUT,
-            self.authorizer
-                .authorize_verified(token.map(|t| format!("Bearer {t}")).as_deref(), "flight", "decide"),
+            self.authorizer.authorize_verified(
+                token.map(|t| format!("Bearer {t}")).as_deref(),
+                "flight",
+                "decide",
+            ),
         )
         .await
         .expect("authorize_verified must not wedge")
@@ -360,7 +361,10 @@ async fn wrong_tenant_user_jwt_is_denied_by_real_policy() {
     register_active_session("sess-other", OTHER_TENANT, now).await;
     let token = fx.user_bearer(now, OTHER_TENANT, "sess-other");
 
-    let result = fx.authorize_verified_bounded(Some(&token)).await.map(|_| ());
+    let result = fx
+        .authorize_verified_bounded(Some(&token))
+        .await
+        .map(|_| ());
     assert_eq!(
         result,
         Err(FlightAuthError::Forbidden(
@@ -420,13 +424,11 @@ async fn expired_jwt_denies() {
         .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes())
         .with_cnf_hs_signer_suite(hs)
         .with_jti();
-    let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-        &claims,
-        &fx.ml_dsa,
-        &fx.ed,
-    );
+    let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &fx.ml_dsa, &fx.ed);
     assert_eq!(
-        fx.authorize_verified_bounded(Some(&token)).await.map(|_| ()),
+        fx.authorize_verified_bounded(Some(&token))
+            .await
+            .map(|_| ()),
         Err(FlightAuthError::Unauthenticated(
             "Invalid access token".to_owned()
         ))
@@ -455,13 +457,11 @@ async fn wrong_audience_jwt_denies_at_the_resource_boundary() {
         .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes())
         .with_cnf_hs_signer_suite(hs)
         .with_jti();
-    let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-        &claims,
-        &fx.ml_dsa,
-        &fx.ed,
-    );
+    let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &fx.ml_dsa, &fx.ed);
     assert_eq!(
-        fx.authorize_verified_bounded(Some(&token)).await.map(|_| ()),
+        fx.authorize_verified_bounded(Some(&token))
+            .await
+            .map(|_| ()),
         Err(FlightAuthError::Unauthenticated(
             "Invalid access token".to_owned()
         ))
@@ -487,13 +487,11 @@ async fn missing_tenant_binding_denies_before_policy() {
         .with_cnf_hs_signer_suite(hs)
         .with_jti();
     claims.tenant = None;
-    let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-        &claims,
-        &fx.ml_dsa,
-        &fx.ed,
-    );
+    let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &fx.ml_dsa, &fx.ed);
     assert_eq!(
-        fx.authorize_verified_bounded(Some(&token)).await.map(|_| ()),
+        fx.authorize_verified_bounded(Some(&token))
+            .await
+            .map(|_| ()),
         Err(FlightAuthError::Forbidden(
             "Verified hosted-account tenant binding required".to_owned()
         ))
@@ -514,8 +512,7 @@ struct InjectedFailingPolicyClient {
 
 impl InjectedFailingPolicyClient {
     fn policy_calls(&self) -> u64 {
-        self.policy_calls
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.policy_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -526,7 +523,11 @@ impl hyprstream_rpc::RpcClient for InjectedFailingPolicyClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         anyhow::bail!("injected policy-client failure (test fixture)")
     }
-    async fn call_for_service(&self, _service_domain: &str, _payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    async fn call_for_service(
+        &self,
+        _service_domain: &str,
+        _payload: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
         self.policy_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         anyhow::bail!("injected policy-client failure (test fixture)")
