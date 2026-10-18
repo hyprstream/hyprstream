@@ -335,8 +335,8 @@ async fn nll_by_field_matches_the_analytic_values() {
 }
 
 #[tokio::test]
-async fn untagged_observations_join_the_split_as_unknown() {
-    // Observations with `family: None` score under the "unknown" sentinel;
+async fn untagged_observations_have_a_distinct_split_identity() {
+    // Observations with `family: None` score under the "~untagged" sentinel;
     // the shift split must name that family too, or downstream
     // `is_eval_family` would reject data the gate actually measured.
     let mut item = noul_item();
@@ -346,16 +346,16 @@ async fn untagged_observations_join_the_split_as_unknown() {
     let output = Harness.run_items(&items, &subject).await.unwrap();
     let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
     let gate = report.gate.as_ref().unwrap();
-    assert!(gate.fields.iter().all(|f| f.family == "unknown"));
-    assert_eq!(gate.shift_split.eval_families, vec!["unknown".to_owned()]);
+    assert!(gate.fields.iter().all(|f| f.family == "~untagged"));
+    assert_eq!(gate.shift_split.eval_families, vec!["~untagged".to_owned()]);
     // The family breakdown must reconcile with the gate: untagged rows
     // appear under the same sentinel, not vanish from by_family.
     assert!(
         report
             .by_family
             .iter()
-            .any(|bucket| bucket.key == "unknown"),
-        "untagged rows must appear in by_family under `unknown`: {:?}",
+            .any(|bucket| bucket.key == "~untagged"),
+        "untagged rows must appear in by_family under `~untagged`: {:?}",
         report.by_family.iter().map(|b| &b.key).collect::<Vec<_>>()
     );
 }
@@ -1064,4 +1064,195 @@ async fn agreement_summary_is_unmeasured_without_samples() {
         .unwrap();
     let summary = hyprstream_eval::agreement_summary(&[("item-1".to_owned(), output)]);
     assert_eq!(summary.mean_argmax_agreement, Some(1.0));
+}
+
+#[tokio::test]
+async fn empty_runs_validate_fallback_provenance_without_queries() {
+    let set = hyprstream_eval::EvalSet {
+        name: "empty".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![],
+    };
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    assert_eq!(
+        Harness.run_set(&set, &subject).await.unwrap().model_id,
+        "counting"
+    );
+    assert_eq!(
+        Harness.run_items(&[], &subject).await.unwrap().model_id,
+        "counting"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(matches!(
+        Harness.run_set(&set, &TruthSubject::new("")).await,
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        Harness.run_items(&[], &TruthSubject::new("")).await,
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn flip_rate_resolves_labels_for_each_item_with_a_shared_question_id() {
+    for reversed in [false, true] {
+        let question = |names: [&str; 2]| hyprstream_decision::QuestionSpec {
+            id: "shared".into(),
+            kind: hyprstream_decision::QuestionKind::Choice,
+            instructions: None,
+            body: hyprstream_decision::QuestionBody::Choice {
+                options: names
+                    .into_iter()
+                    .map(|name| hyprstream_decision::ChoiceOption {
+                        name: name.into(),
+                        rubric: None,
+                    })
+                    .collect(),
+            },
+        };
+        let item = |id: &str, names| EvalItem {
+            id: id.into(),
+            question: question(names),
+            state: Entry::Null,
+            family: None,
+            stratum: None,
+            group: Some("g".into()),
+            truth: None,
+        };
+        let items = vec![
+            item("g", ["A", "B"]),
+            item("g-p1", if reversed { ["B", "A"] } else { ["A", "B"] }),
+        ];
+        let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
+        let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+        let flip = report.flip_rate.unwrap();
+        assert_eq!(flip.groups, 1);
+        assert_eq!(flip.flip_rate, if reversed { 1.0 } else { 0.0 });
+    }
+}
+
+#[tokio::test]
+async fn optional_family_identity_is_injective_and_fit_matching_uses_raw_tags() {
+    let families = [None, Some("unknown"), Some("~untagged"), Some("~~tag")];
+    let items: Vec<_> = families
+        .into_iter()
+        .enumerate()
+        .map(|(i, family)| {
+            let mut item = noul_item();
+            item.id = format!("family-{i}");
+            item.family = family.map(str::to_owned);
+            item
+        })
+        .collect();
+    let set = hyprstream_eval::EvalSet {
+        name: "families".into(),
+        schema_version: "v1".into(),
+        questions: vec![items[0].question.clone()],
+        rows: items
+            .iter()
+            .map(|item| hyprstream_eval::EvalRow {
+                id: item.id.clone(),
+                family: item.family.clone(),
+                stratum: None,
+                group: None,
+                state: item.state.clone(),
+                truth: std::collections::BTreeMap::from([("val_q".into(), 1)]),
+            })
+            .collect(),
+    };
+    let outputs = [
+        Harness.run_items(&items, &UniformSubject).await.unwrap(),
+        Harness.run_set(&set, &UniformSubject).await.unwrap(),
+    ];
+    for output in outputs {
+        let report = score_run(&output, &ScoreConfig::default()).unwrap();
+        let gate = report.gate.unwrap();
+        let identities: std::collections::BTreeSet<_> =
+            gate.fields.iter().map(|f| f.family.as_str()).collect();
+        assert_eq!(
+            identities,
+            std::collections::BTreeSet::from(["~untagged", "unknown", "~~untagged", "~~~tag"])
+        );
+        assert_eq!(
+            gate.fields.len(),
+            4,
+            "optional families must never pool samples"
+        );
+        assert_eq!(report.nll_by_field.len(), 4);
+        assert_eq!(report.by_family.len(), 4);
+        assert_eq!(
+            gate.shift_split
+                .eval_families
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            identities
+        );
+        let report = score_run(
+            &output,
+            &ScoreConfig::default().with_fit_families(["unknown", "~untagged"]),
+        )
+        .unwrap();
+        let gate = report.gate.unwrap();
+        let identities: std::collections::BTreeSet<_> =
+            gate.fields.iter().map(|f| f.family.as_str()).collect();
+        assert_eq!(
+            identities,
+            std::collections::BTreeSet::from(["~untagged", "~~~tag"])
+        );
+        assert_eq!(gate.shift_split.fit_families, vec!["unknown", "~~untagged"]);
+        assert_eq!(
+            gate.shift_split
+                .eval_families
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            identities
+        );
+        assert_eq!(report.nll_by_field.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn duplicate_observation_identities_fail_before_subject_calls() {
+    let item = noul_item();
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    assert!(matches!(
+        Harness
+            .run_items(&[item.clone(), item.clone()], &subject)
+            .await,
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The exported identity is (item id, question id): same row ID with
+    // distinct questions remains valid, as it is in a multi-question set.
+    let mut other = item.clone();
+    other.question.id = "other".into();
+    let valid = vec![item.clone(), other];
+    let output = Harness.run_items(&valid, &subject).await.unwrap();
+    score_bench_run(&output, &valid, &ScoreConfig::default()).unwrap();
+    assert!(matches!(
+        score_bench_run(&output, &[item.clone(), item], &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    let row = hyprstream_eval::EvalRow {
+        id: "same-row".into(),
+        family: None,
+        stratum: None,
+        group: None,
+        state: Entry::Null,
+        truth: std::collections::BTreeMap::new(),
+    };
+    let set = hyprstream_eval::EvalSet {
+        name: "duplicates".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![row.clone(), row],
+    };
+    assert!(matches!(
+        Harness.run_set(&set, &subject).await,
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

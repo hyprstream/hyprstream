@@ -31,6 +31,9 @@ use crate::decision_capnp;
 /// Errors decoding a `decision.capnp` message into the IR.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DecodeError {
+    /// Every batch must identify the resolved model that produced it.
+    #[error("empty resolved model id on the wire")]
+    EmptyModelId,
     /// capnp-level structural failure (truncated message, bad pointer).
     #[error("capnp decode failed: {0}")]
     Capnp(String),
@@ -132,6 +135,9 @@ pub enum DecodeError {
 /// Errors encoding IR into a `decision.capnp` message.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum EncodeError {
+    /// Empty model provenance cannot be persisted as a decision batch.
+    #[error("empty resolved model id cannot be encoded")]
+    EmptyModelId,
     /// An abstained answer carried a conformal set — the wire contract forbids
     /// it (abstention already says "no commitment") and this module's own
     /// decoder rejects such messages.
@@ -689,6 +695,9 @@ pub fn batch_to_message(
     version: &VersionTriple,
     rows: &[AnswerRow],
 ) -> Result<capnp::message::Builder<capnp::message::HeapAllocator>, EncodeError> {
+    if version.model.is_empty() {
+        return Err(EncodeError::EmptyModelId);
+    }
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
     {
@@ -787,9 +796,13 @@ pub fn batch_from_reader(
     reader: decision_capnp::decision_batch::Reader<'_>,
 ) -> Result<(VersionTriple, Vec<AnswerRow>), DecodeError> {
     let triple = reader.get_version()?;
+    let model = triple.get_model()?.to_str()?;
+    if model.is_empty() {
+        return Err(DecodeError::EmptyModelId);
+    }
     let version = VersionTriple {
         schema: triple.get_schema()?.to_str()?.to_owned(),
-        model: triple.get_model()?.to_str()?.to_owned(),
+        model: model.to_owned(),
         calib: match triple.get_calib()?.which()? {
             crate::optional_capnp::option_text::None(()) => None,
             crate::optional_capnp::option_text::Some(calib) => Some(calib?.to_str()?.to_owned()),
