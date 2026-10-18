@@ -1466,3 +1466,88 @@ async fn empty_runs_have_no_measured_abstention_rate() {
     assert_eq!(report.abstention_rate, Some(1.0));
     assert_eq!(report.by_family[0].abstention_rate, 1.0);
 }
+
+#[tokio::test]
+async fn bench_flip_rate_compares_all_rotations_with_mixed_question_id_reuse() {
+    let mut question = hyprstream_decision::author::parse_yaml(
+        "questions:\n  shared: {type: choice, criteria: {A: null, B: null}}\n",
+    )
+    .unwrap()
+    .questions
+    .remove(0);
+    let item = |id: &str, question| EvalItem {
+        id: id.into(),
+        question,
+        state: Entry::Null,
+        family: None,
+        stratum: None,
+        group: Some("g".into()),
+        truth: None,
+    };
+    let mut items = vec![item("g", question.clone()), item("g-p1", question.clone())];
+    question.id = "distinct".into();
+    if let hyprstream_decision::QuestionBody::Choice { options } = &mut question.body {
+        options.reverse();
+    }
+    items.push(item("g-p2", question));
+    let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
+    let flip = score_bench_run(&output, &items, &ScoreConfig::default())
+        .unwrap()
+        .flip_rate
+        .unwrap();
+    assert_eq!(flip.groups, 1);
+    assert_eq!(
+        flip.flip_rate, 0.5,
+        "the distinct-ID rotation must not be skipped"
+    );
+}
+
+#[tokio::test]
+async fn bench_scoring_requires_the_exact_item_observation_identity_set() {
+    let question = hyprstream_decision::author::parse_yaml("questions:\n  shared: {type: noul}\n")
+        .unwrap()
+        .questions
+        .remove(0);
+    let items: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|id| EvalItem {
+            id: id.into(),
+            question: question.clone(),
+            state: Entry::Null,
+            family: None,
+            stratum: None,
+            group: None,
+            truth: Some(0),
+        })
+        .collect();
+    let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
+    assert_eq!(
+        score_bench_run(&output, &items, &ScoreConfig::default())
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+    let partial = Harness
+        .run_items(&items[..1], &UniformSubject)
+        .await
+        .unwrap();
+    assert!(
+        matches!(score_bench_run(&partial, &items, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("no matching observation"))
+    );
+    let mut duplicate = Harness.run_items(&items, &UniformSubject).await.unwrap();
+    duplicate
+        .observations
+        .push(duplicate.observations[0].clone());
+    assert!(
+        matches!(score_bench_run(&duplicate, &items, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("duplicate observation identity"))
+    );
+    let mut substituted = Harness.run_items(&items, &UniformSubject).await.unwrap();
+    substituted.observations[1].id = "outside".into();
+    assert!(
+        matches!(score_bench_run(&substituted, &items, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("no matching eval item"))
+    );
+}
