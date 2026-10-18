@@ -57,6 +57,7 @@ impl<B: StorageBackend> BatchSink<B> {
     ///
     /// Returns the minted batch id.
     pub async fn persist_run(&self, output: &RunOutput) -> Result<String, EvalError> {
+        output.validate_model_provenance()?;
         let batch = output.batch.as_ref().ok_or_else(|| {
             EvalError::InvalidInput(
                 "run has no Arrow batch (loose item runs are not persistable as one batch)"

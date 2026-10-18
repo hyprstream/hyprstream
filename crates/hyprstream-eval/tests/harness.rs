@@ -1551,3 +1551,39 @@ async fn bench_scoring_requires_the_exact_item_observation_identity_set() {
         Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("no matching eval item"))
     );
 }
+
+#[tokio::test]
+async fn item_scoring_preserves_resolved_alias_identity_and_rejects_mutated_provenance() {
+    let items = vec![noul_item()];
+    let mut output = Harness
+        .run_items(&items, &FreshPerResponseSubject)
+        .await
+        .unwrap();
+    assert_eq!(output.model_id, "fresh-v42");
+    assert_eq!(output.version.model, "fresh-v42");
+    assert_ne!(output.model_id, FreshPerResponseSubject.model_id());
+    assert!(output.batch.is_none());
+    score_run(&output, &ScoreConfig::default()).unwrap();
+    score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    output.model_id = "alias".into();
+    assert!(matches!(
+        score_run(&output, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        score_bench_run(&output, &items, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    output.model_id = "fresh-v42".into();
+    output.version.model = "another-resolved-version".into();
+    assert!(matches!(
+        score_run(&output, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    output.model_id.clear();
+    output.version.model.clear();
+    assert!(matches!(
+        score_bench_run(&output, &items, &ScoreConfig::default()),
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+}

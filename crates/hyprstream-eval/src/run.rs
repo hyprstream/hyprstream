@@ -151,6 +151,20 @@ pub struct RunOutput {
     pub schema_fingerprint: Option<String>,
 }
 
+impl RunOutput {
+    /// Both public model coordinates name the same resolved producer. Check
+    /// them again at consuming boundaries because callers may mutate a run.
+    pub(crate) fn validate_model_provenance(&self) -> Result<(), EvalError> {
+        if self.model_id.is_empty() || self.model_id != self.version.model {
+            return Err(EvalError::InvalidInput(
+                "run requires one nonempty resolved model id matching its version triple"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The harness. Stateless; every method is a pure function of its inputs plus
 /// the subject's behavior.
 #[derive(Debug, Clone, Copy, Default)]

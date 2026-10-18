@@ -248,6 +248,7 @@ fn field_metrics(
 
 /// Score a run's observations under the pinned protocol.
 pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport, EvalError> {
+    output.validate_model_provenance()?;
     let by_question = output.batch.is_some();
     let multi_family = family_count(&output.observations) > 1;
     // Group labeled, answered observations into fields.
