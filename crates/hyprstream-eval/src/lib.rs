@@ -61,5 +61,5 @@ pub use score::{
     agreement_summary, flip_rate_with_labels, score_bench_run, score_run, BreakdownMetrics,
     EnsembleAgreement, FlipRate, ItemScore, ScoreConfig, ScoreReport,
 };
-pub use subject::{HashSubject, HttpSubject, Subject, TruthSubject};
+pub use subject::{HashSubject, HttpBudget, HttpSubject, Subject, TruthSubject};
 pub use teacher::{EnsembleOutput, Teacher, TeacherAnswer, TeacherEnsemble, TosClass};

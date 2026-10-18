@@ -30,6 +30,15 @@ pub trait Subject: Send + Sync {
     /// as already resolved.
     fn model_id(&self) -> &str;
 
+    /// Check subject-specific input constraints without I/O, model queries,
+    /// mutable state, or other side effects. Harnesses call this for every
+    /// request before deciding any row; ensembles check every teacher first.
+    /// The default accepts inputs, including explicit null states supported
+    /// by native/in-process subjects. Transport adapters may be stricter.
+    fn preflight(&self, _set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+        Ok(())
+    }
+
     /// Answer every question in `set` for one state row. `row` is the batch
     /// row index, passed through so deterministic subjects can vary by row
     /// exactly the way the P0.7 mock does. Every declared question must be
@@ -319,15 +328,15 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             None => Err(invalid(format!("answer object is missing `{key}`"))),
             Some(Value::Null) => Ok(None),
             Some(Value::Object(map)) => {
-                // The key set must be exactly the declared labels: extra keys
-                // would be silently dropped from a distribution that still
-                // sums within tolerance, hiding a schema mismatch.
-                for key in map.keys() {
-                    if !labels.contains(key) {
-                        return Err(invalid(format!(
-                            "probabilities carry undeclared label `{key}`"
-                        )));
-                    }
+                // Equal cardinality plus the per-declared-label lookups below
+                // establishes exact key equality without scanning all labels
+                // for every response key (Score cardinality is unbounded).
+                if map.len() != labels.len() {
+                    return Err(invalid(format!(
+                        "probabilities carry {} labels; expected {}",
+                        map.len(),
+                        labels.len()
+                    )));
                 }
                 let mut probabilities = Vec::with_capacity(labels.len());
                 for label in &labels {
@@ -382,6 +391,12 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
 
 /// Parse the full response envelope into an [`AnswerRow`].
 pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerRow, EvalError> {
+    // This public parser also accepts programmatic inputs without HTTP
+    // preflight. Exact key-set admission requires unique IDs and labels.
+    let ids = crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
+    for question in &set.questions {
+        crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+    }
     let answers = body
         .get("answers")
         .and_then(Value::as_object)
@@ -390,7 +405,7 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     // otherwise be silently discarded, hiding a response/request schema
     // mismatch behind a row that passes all per-question checks.
     for key in answers.keys() {
-        if set.question(key).is_none() {
+        if !ids.contains(key.as_str()) {
             return Err(EvalError::InvalidAnswer {
                 question_id: key.clone(),
                 message: "response answers an undeclared question".to_owned(),
@@ -410,6 +425,70 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     Ok(AnswerRow { answers: row })
 }
 
+/// Decode and validate the complete HTTP response envelope. This is the same
+/// client work used by [`HttpSubject`] and the wire-floor response benchmark.
+pub fn decode_response(set: &QuestionSet, text: &str) -> Result<(AnswerRow, String), EvalError> {
+    let parsed: Value = serde_json::from_str(text)
+        .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
+    let Some(resolved) = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    else {
+        return Err(EvalError::Http(
+            "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
+                .to_owned(),
+        ));
+    };
+    let resolved = resolved.to_owned();
+    let answers = parse_response_answers(set, &parsed)?;
+    crate::run::validate_set_answer_row(set, &answers).map_err(|message| {
+        EvalError::InvalidAnswer {
+            question_id: "response".to_owned(),
+            message,
+        }
+    })?;
+    Ok((answers, resolved))
+}
+
+/// Operational bounds for remote evaluation, not inference latency targets.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpBudget {
+    /// Maximum connection-establishment time.
+    pub connect_timeout: std::time::Duration,
+    /// Whole HTTP query deadline, including response-body consumption.
+    pub request_timeout: std::time::Duration,
+    /// Maximum response-body bytes, for successful and error responses alike.
+    pub max_response_bytes: usize,
+}
+
+impl Default for HttpBudget {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(10),
+            request_timeout: std::time::Duration::from_secs(120),
+            max_response_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl HttpBudget {
+    fn validate(self) -> Result<(), &'static str> {
+        let now = std::time::Instant::now();
+        if self.connect_timeout.is_zero()
+            || self.request_timeout.is_zero()
+            || now.checked_add(self.connect_timeout).is_none()
+            || now.checked_add(self.request_timeout).is_none()
+            || self.max_response_bytes == 0
+        {
+            return Err(
+                "HTTP budgets require positive, representable deadlines and a positive body cap",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A subject reached over the jev-1 JSON/HTTPS wire (`POST /v1/systemone`).
 ///
 /// This is the reference client for every remote arm: the P0.7 stub, the
@@ -420,7 +499,8 @@ pub struct HttpSubject {
     base_url: String,
     model: String,
     token: String,
-    client: reqwest::Client,
+    client: Result<reqwest::Client, &'static str>,
+    budget: HttpBudget,
     /// The latest fully accepted response's resolved id. `Arc` so clones
     /// share the cache; version-bound results never depend on this slot.
     resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
@@ -431,10 +511,11 @@ impl std::fmt::Debug for HttpSubject {
         // Never print the bearer token: Debug output lands in logs and panic
         // diagnostics, and the token is a provider credential.
         f.debug_struct("HttpSubject")
-            .field("base_url", &self.base_url)
+            .field("base_url", &"<redacted>")
             .field("model", &self.model)
             .field("token", &"<redacted>")
-            .field("client", &self.client)
+            .field("client_ready", &self.client.is_ok())
+            .field("budget", &self.budget)
             .field("resolved", &self.resolved)
             .finish()
     }
@@ -449,11 +530,31 @@ impl HttpSubject {
         model: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
+        Self::new_with_budget(base_url, model, token, HttpBudget::default())
+    }
+
+    /// Configure finite evaluation safeguards. Invalid budgets or client
+    /// initialization are rejected by pure preflight before any teacher call;
+    /// construction never falls back to an unbounded client or panics.
+    pub fn new_with_budget(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        token: impl Into<String>,
+        budget: HttpBudget,
+    ) -> Self {
+        let client = budget.validate().and_then(|()| {
+            reqwest::Client::builder()
+                .connect_timeout(budget.connect_timeout)
+                .timeout(budget.request_timeout)
+                .build()
+                .map_err(|_| "HTTP client initialization failed")
+        });
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client,
+            budget,
             resolved: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
@@ -461,6 +562,19 @@ impl HttpSubject {
     /// The full decide-endpoint URL.
     pub fn endpoint(&self) -> String {
         format!("{}/v1/systemone", self.base_url)
+    }
+
+    // Shared with side-effect-free preflight so request construction cannot
+    // fail deterministically after an earlier ensemble teacher was queried.
+    fn request_builder(&self) -> Result<reqwest::RequestBuilder, EvalError> {
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|message| EvalError::InvalidInput((*message).to_owned()))?;
+        Ok(client
+            .post(self.endpoint())
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json"))
     }
 
     /// The requested model string (possibly an alias), as configured.
@@ -479,51 +593,47 @@ impl HttpSubject {
         set: &QuestionSet,
         state: &Entry,
     ) -> Result<(AnswerRow, String), EvalError> {
+        self.preflight(set, state)?;
         // Encode before opening a connection: serde_json otherwise turns a
         // directly-constructed non-finite IR number into JSON null.
         let body = serde_json::to_vec(&request_body(set, state, &self.model))
             .map_err(|error| EvalError::InvalidInput(format!("invalid request entry: {error}")))?;
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+        let mut response = self
+            .request_builder()?
             .body(body)
             .send()
             .await
-            .map_err(|error| EvalError::Http(format!("request failed: {error}")))?;
+            .map_err(|_| EvalError::Http("HTTP request failed or timed out".to_owned()))?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| EvalError::Http(format!("reading body: {error}")))?;
-        if !status.is_success() {
-            return Err(EvalError::Http(format!(
-                "status {}: {}",
-                status.as_u16(),
-                text
-            )));
-        }
-        let parsed: Value = serde_json::from_str(&text)
-            .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
-        let Some(resolved) = parsed
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-        else {
+        let limit = self.budget.max_response_bytes;
+        if response
+            .content_length()
+            .is_some_and(|length| !usize::try_from(length).is_ok_and(|length| length <= limit))
+        {
             return Err(EvalError::Http(
-                "response is missing the resolved `model` id the serving contract requires (absent, non-string, or empty)"
-                    .to_owned(),
+                "HTTP response exceeds the byte budget".to_owned(),
             ));
-        };
-        let resolved = resolved.to_owned();
-        let answers = parse_response_answers(set, &parsed)?;
-        crate::run::validate_set_answer_row(set, &answers).map_err(|message| {
-            EvalError::InvalidAnswer {
-                question_id: "response".to_owned(),
-                message,
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| EvalError::Http("reading HTTP response failed or timed out".to_owned()))?
+        {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(EvalError::Http(
+                    "HTTP response exceeds the byte budget".to_owned(),
+                ));
             }
-        })?;
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            // Providers may echo credentials in their bodies. Keep only status.
+            return Err(EvalError::Http(format!("status {}", status.as_u16())));
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| EvalError::Http("HTTP response is not UTF-8".to_owned()))?;
+        let (answers, resolved) = decode_response(set, text)?;
         *self.resolved.write() = Some(resolved.clone());
         Ok((answers, resolved))
     }
@@ -531,6 +641,49 @@ impl HttpSubject {
 
 #[async_trait]
 impl Subject for HttpSubject {
+    fn preflight(&self, set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+        // Direct callers also require unique question IDs and declared labels
+        // before any network call; do not rely on Harness/teacher validation.
+        crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
+        for question in &set.questions {
+            crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
+        self.budget
+            .validate()
+            .map_err(|message| EvalError::InvalidInput(message.to_owned()))?;
+        if self.model.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires a non-empty model".to_owned(),
+            ));
+        }
+        if self.token.trim().is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires a non-empty bearer token".to_owned(),
+            ));
+        }
+        if matches!(state, Entry::Null) {
+            return Err(EvalError::InvalidInput(
+                "the legacy /v1/systemone HTTP endpoint requires a non-null state".to_owned(),
+            ));
+        }
+        let endpoint = reqwest::Url::parse(&self.endpoint()).map_err(|_| {
+            EvalError::InvalidInput(
+                "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
+            )
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires an absolute HTTP(S) endpoint".to_owned(),
+            ));
+        }
+        self.request_builder()?.build().map_err(|_| {
+            // Request/headers/URL may contain credentials. Never include the
+            // underlying error or Debug representation in this public error.
+            EvalError::InvalidInput("invalid HTTP subject request configuration".to_owned())
+        })?;
+        Ok(())
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -879,6 +1032,87 @@ questions:
     }
 
     #[test]
+    fn wire_probability_keys_require_exact_declared_set() {
+        let set = fixture();
+        for id in ["tone", "severity"] {
+            let question = set.question(id).unwrap();
+            let labels = question.labels();
+            let mut exact = serde_json::Map::new();
+            // Opposite insertion order to the declared labels; the numeric
+            // vector must still follow the question, not response ordering.
+            for (index, label) in labels.iter().enumerate().rev() {
+                exact.insert(
+                    label.clone(),
+                    serde_json::json!(if index == labels.len() - 1 { 1.0 } else { 0.0 }),
+                );
+            }
+            let response = |probabilities: serde_json::Map<String, Value>| serde_json::json!({"type": question.kind.as_str(), "probabilities": probabilities});
+            let parsed = parse_answer(question, &response(exact.clone())).unwrap();
+            let probabilities = parsed.value.unwrap().probabilities();
+            assert_eq!(probabilities.len(), labels.len());
+            assert_eq!(probabilities[labels.len() - 1], 1.0);
+            assert!(probabilities[..labels.len() - 1].iter().all(|p| *p == 0.0));
+
+            let mut extra = exact.clone();
+            extra.insert("undeclared".to_owned(), serde_json::json!(0.0));
+            let mut missing = exact.clone();
+            missing.remove(&labels[0]);
+            let mut substituted = missing.clone();
+            substituted.insert("undeclared".to_owned(), serde_json::json!(0.0));
+            // All three retain a valid sum of one. The substitution also has
+            // equal cardinality, so only exact key membership can reject it.
+            for malformed in [extra, missing, substituted] {
+                let error = parse_answer(question, &response(malformed)).unwrap_err();
+                assert!(
+                    matches!(error, EvalError::InvalidAnswer { question_id, .. } if question_id == id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_score_wire_preserves_numeric_level_order() {
+        const LEVELS: usize = 4096;
+        const WINNER: usize = 3073;
+        let question = QuestionSpec {
+            id: "wide_score".to_owned(),
+            kind: hyprstream_decision::QuestionKind::Score,
+            instructions: None,
+            body: QuestionBody::Score {
+                levels: vec![None; LEVELS],
+            },
+        };
+        let wire: serde_json::Map<String, Value> = (0..LEVELS)
+            .rev()
+            .map(|level| {
+                (
+                    level.to_string(),
+                    serde_json::json!(if level == WINNER { 1.0 } else { 0.0 }),
+                )
+            })
+            .collect();
+        let parsed = parse_answer(
+            &question,
+            &serde_json::json!({"type": "score", "probabilities": wire}),
+        )
+        .unwrap();
+        let Some(AnswerValue::Score { probabilities }) = parsed.value else {
+            panic!("valid score must remain answered")
+        };
+        assert_eq!(probabilities.len(), LEVELS);
+        for (level, probability) in probabilities.iter().enumerate() {
+            assert_eq!(
+                probability.to_bits(),
+                if level == WINNER {
+                    1.0_f32.to_bits()
+                } else {
+                    0.0_f32.to_bits()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn wire_normalization_preserves_ties() {
         // Seven options rounded to 0.1429 each (sum 1.0003, legal at
         // consumer tolerance): normalization must not turn the tie into a
@@ -1157,7 +1391,7 @@ questions:
         for location in 0..6 {
             for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.25] {
                 let mut set = fixture();
-                let mut state = Entry::Null;
+                let mut state = Entry::Str("valid state".into());
                 let entry = Entry::Seq(vec![Entry::Map(vec![(
                     "nested".into(),
                     Entry::Number(number),

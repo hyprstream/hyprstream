@@ -145,8 +145,9 @@ pub struct ScoreReport {
     /// matters: an uncomputed rate must never be misread as
     /// permutation-robustness.
     pub flip_rate: Option<FlipRate>,
-    /// Overall abstention rate.
-    pub abstention_rate: f64,
+    /// Overall abstention rate. `None` when no observations were made;
+    /// `Some(0.0)` means a measured run answered every request.
+    pub abstention_rate: Option<f64>,
     /// Argmax accuracy over labeled, answered observations.
     pub accuracy: Option<f64>,
     /// Per-field negative log-likelihood, aligned with the gate report's
@@ -333,11 +334,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
 
     #[allow(clippy::cast_precision_loss)]
     let total = output.observations.len();
-    let abstention_rate = if total == 0 {
-        0.0
-    } else {
-        abstained as f64 / total as f64
-    };
+    let abstention_rate = (total > 0).then(|| abstained as f64 / total as f64);
     #[allow(clippy::cast_precision_loss)]
     let accuracy = (labeled_answered > 0).then(|| correct as f64 / labeled_answered as f64);
 

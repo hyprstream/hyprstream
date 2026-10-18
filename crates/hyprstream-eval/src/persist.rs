@@ -38,6 +38,10 @@ impl<B: StorageBackend> BatchSink<B> {
     /// are not a shared schema) — persist those per-set instead, or not at
     /// all; the observation stream is the report artifact there.
     ///
+    /// Empty set runs remain usable as report artifacts, but cannot be persisted:
+    /// the store has no schema-version metadata and an empty version column
+    /// cannot carry that component of the version triple.
+    ///
     /// Returns the minted batch id.
     pub async fn persist_run(&self, output: &RunOutput) -> Result<String, EvalError> {
         let batch = output.batch.as_ref().ok_or_else(|| {
@@ -46,6 +50,11 @@ impl<B: StorageBackend> BatchSink<B> {
                     .to_owned(),
             )
         })?;
+        if batch.num_rows() == 0 {
+            return Err(EvalError::InvalidInput(
+                "cannot persist an empty run: schema version would be lost".to_owned(),
+            ));
+        }
         let fingerprint = output
             .schema_fingerprint
             .as_deref()
