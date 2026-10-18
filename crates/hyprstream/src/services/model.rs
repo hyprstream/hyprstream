@@ -175,6 +175,9 @@ pub struct ModelServiceConfig {
 pub struct StagingModelPin {
     pub model_ref: String,
     pub commit: git2::Oid,
+    projection_policy: git2db::pinned_disk::ProjectionPolicy,
+    #[cfg(test)]
+    projection_parent: Option<std::path::PathBuf>,
 }
 
 const REVIEWED_STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
@@ -202,7 +205,43 @@ impl StagingModelPin {
                 && parsed.to_string() == model_ref,
             "bounded staging modelRef must be a canonical local branch ref"
         );
-        Ok(Self { model_ref, commit })
+        Ok(Self {
+            model_ref,
+            commit,
+            projection_policy: Default::default(),
+            #[cfg(test)]
+            projection_parent: None,
+        })
+    }
+
+    /// Reviewed Clef complete-tree contract; preserves the ordinary 2 GiB
+    /// default and A0 allowlist. This is trusted startup wiring, never RPC data.
+    /// Local objects are independently verified against captured LFS oid/size.
+    pub fn reviewed_clef_flash(
+        local_lfs: std::collections::BTreeMap<String, std::path::PathBuf>,
+    ) -> Result<Self> {
+        let mut pin = Self::new(
+            "clef-flash-fp8:main",
+            git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
+        )?;
+        // R0 normalized complete 21-file pinned tree (head + backbone + metadata).
+        pin.projection_policy = git2db::pinned_disk::ProjectionPolicy::from_trusted_contract(
+            12_174_008_714,
+            local_lfs,
+        )?;
+        Ok(pin)
+    }
+
+    fn capture_policy(&self) -> Result<git2db::pinned_disk::ProjectionPolicy> {
+        if self.projection_policy != Default::default() {
+            anyhow::ensure!(
+                self.model_ref == "clef-flash-fp8:main"
+                    && self.commit
+                        == git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
+                "Clef projection policy pin identity changed"
+            );
+        }
+        Ok(self.projection_policy.clone())
     }
 
     /// `staging` selects the code-reviewed A0 identity. Optional explicit values
@@ -1393,12 +1432,26 @@ impl ModelService {
                 model_ref_str == pin.model_ref,
                 "staging modelRef changed after admission"
             );
-            Some(
+            let policy = pin.capture_policy()?;
+            #[cfg(test)]
+            let artifact = if let Some(parent) = pin.projection_parent.as_deref() {
                 self.inner
                     .staging_pinned_artifacts
-                    .acquire(&model_path, pin.commit)
-                    .await?,
-            )
+                    .acquire_with_policy_in(&model_path, pin.commit, parent, policy)
+                    .await?
+            } else {
+                self.inner
+                    .staging_pinned_artifacts
+                    .acquire_with_policy(&model_path, pin.commit, policy)
+                    .await?
+            };
+            #[cfg(not(test))]
+            let artifact = self
+                .inner
+                .staging_pinned_artifacts
+                .acquire_with_policy(&model_path, pin.commit, policy)
+                .await?;
+            Some(artifact)
         } else if let crate::storage::GitRef::Commit(oid) = &model_ref.git_ref {
             Some(crate::storage::pinned_model::acquire_pinned_model(&model_path, *oid).await?)
         } else {
@@ -3533,6 +3586,26 @@ impl crate::services::RequestService for ModelService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clef_projection_contract_keeps_a0_default_and_rejects_rebinding() -> anyhow::Result<()> {
+        let a0 = super::StagingModelPin::reviewed()?;
+        assert_eq!(
+            a0.capture_policy()?,
+            git2db::pinned_disk::ProjectionPolicy::default()
+        );
+        let mut clef = super::StagingModelPin::reviewed_clef_flash(Default::default())?;
+        assert_ne!(
+            clef.capture_policy()?,
+            git2db::pinned_disk::ProjectionPolicy::default()
+        );
+        clef.commit = a0.commit;
+        assert!(clef.capture_policy().is_err());
+        let mut clef = super::StagingModelPin::reviewed_clef_flash(Default::default())?;
+        clef.model_ref = a0.model_ref;
+        assert!(clef.capture_policy().is_err());
+        Ok(())
+    }
+
     use super::*;
     use hyprstream_rpc::registry::{global as registry, SocketKind};
 
