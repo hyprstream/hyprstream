@@ -91,7 +91,10 @@ pub struct RuntimeConfig {
     pub mmap: bool,
     /// KV cache size in MB
     pub kv_cache_size_mb: usize,
-    /// Precision mode (BF16/FP16/FP32/FP8)
+    /// Case-insensitive compute policy: auto, BF16/bfloat16, FP16/float16,
+    /// FP32/float32, or FP8. FP8 describes weight-path selection: compute stays
+    /// BF16 except channel-FP8 CPU activation-QDQ/matmuls, which use Float32.
+    /// Checkpoint quantization remains independently validated from its tensors.
     pub precision_mode: Option<String>,
     // NEW: Concurrency and timeout settings
     pub max_concurrent_loads: usize,

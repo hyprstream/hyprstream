@@ -6,7 +6,6 @@ use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    io::Read,
     path::{Path, PathBuf},
 };
 use tch::{Device, Kind, Tensor};
@@ -130,20 +129,38 @@ impl ChannelFp8Profile {
 
     /// Bound header reads and reject missing/ambiguous scale geometry before
     /// allocating tensor payloads, even when companions live in another shard.
-    pub(crate) fn preflight(&self, shards: &[PathBuf]) -> Result<()> {
+    #[cfg(test)]
+    fn preflight(&self, shards: &[PathBuf]) -> Result<()> {
+        let mut resolved = shards
+            .iter()
+            .map(|path| {
+                Ok((
+                    path.clone(),
+                    super::model_factory::ResolvedWeight::File(std::fs::File::open(path)?),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.preflight_resolved(&mut resolved)
+    }
+
+    pub(crate) fn preflight_resolved(
+        &self,
+        shards: &mut [(PathBuf, super::model_factory::ResolvedWeight)],
+    ) -> Result<()> {
         let mut entries = HashMap::new();
-        for shard in shards {
-            let mut file = std::fs::File::open(shard)?;
-            let mut prefix = [0u8; 8];
-            file.read_exact(&mut prefix)?;
-            let len = u64::from_le_bytes(prefix);
-            ensure!(
-                len > 0 && len <= 16 * 1024 * 1024,
-                "invalid/oversized FP8 safetensors header"
-            );
-            let mut header = vec![0u8; len as usize];
-            file.read_exact(&mut header)?;
-            let object: serde_json::Map<String, Value> = serde_json::from_slice(&header)?;
+        for (_, resolved) in shards {
+            let object: serde_json::Map<String, Value> = resolved.with_reader(|reader| {
+                let mut prefix = [0u8; 8];
+                reader.read_exact(&mut prefix)?;
+                let len = u64::from_le_bytes(prefix);
+                ensure!(
+                    len > 0 && len <= 16 * 1024 * 1024,
+                    "invalid/oversized FP8 safetensors header"
+                );
+                let mut header = vec![0u8; len as usize];
+                reader.read_exact(&mut header)?;
+                Ok(serde_json::from_slice(&header)?)
+            })?;
             for (name, tensor) in object {
                 if name == "__metadata__" {
                     continue;

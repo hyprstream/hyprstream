@@ -22,6 +22,30 @@ use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument, warn};
 
+/// Resolve the compute dtype independently from checkpoint weight storage.
+/// This pure policy accepts the documented case-insensitive precision aliases;
+/// it performs no device allocation. `fp8` retains legacy BF16 compute except
+/// for qualified channel-FP8 CPU checkpoints, whose activation QDQ/matmuls run
+/// in Float32. It never requests hardware Float8 activations on CPU.
+/// Serving adapters must still enforce their own qualified-device/dtype gate.
+pub fn resolve_inference_compute_kind(
+    precision_mode: Option<&str>,
+    device: Device,
+    channel_fp8: bool,
+) -> Result<tch::Kind> {
+    match precision_mode
+        .unwrap_or("auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fp32" | "float32" => Ok(tch::Kind::Float),
+        "fp16" | "float16" => Ok(tch::Kind::Half),
+        "auto" | "fp8" if device == Device::Cpu && channel_fp8 => Ok(tch::Kind::Float),
+        "bf16" | "bfloat16" | "auto" | "fp8" => Ok(tch::Kind::BFloat16),
+        mode => anyhow::bail!("unsupported inference precision mode: {mode}"),
+    }
+}
+
 /// Build a self-explaining diagnostic for why CUDA/ROCm is unavailable.
 ///
 /// `tch::Cuda::is_available()` returns a bare `false` with no cause, which made
@@ -1053,17 +1077,11 @@ impl TorchEngine {
         let model = ModelFactory::create(
             model_path,
             &self.device,
-            match self.config.precision_mode.as_deref().unwrap_or("auto") {
-                "fp32" | "float32" if self.device == tch::Device::Cpu => tch::Kind::Float,
-                "auto"
-                    if self.device == tch::Device::Cpu
-                        && super::channel_fp8::ChannelFp8Profile::read(model_path)?.is_some() =>
-                {
-                    tch::Kind::Float
-                }
-                "auto" | "bf16" | "bfloat16" => tch::Kind::BFloat16,
-                mode => anyhow::bail!("unsupported inference precision mode: {mode}"),
-            },
+            resolve_inference_compute_kind(
+                self.config.precision_mode.as_deref(),
+                self.device,
+                super::channel_fp8::ChannelFp8Profile::read(model_path)?.is_some(),
+            )?,
             self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
             self.device_pool.as_deref(),
@@ -2848,6 +2866,48 @@ mod tests {
     use parking_lot::Mutex;
     use std::io::Write;
     use std::sync::Arc;
+
+    #[test]
+    fn precision_policy_preserves_aliases_and_non_cpu_modes_without_gpu_execution() {
+        for device in [Device::Cpu, Device::Cuda(0), Device::Mps] {
+            for channel in [false, true] {
+                for (aliases, expected) in [
+                    (
+                        &["fp32", "float32", "FP32", "Float32"][..],
+                        tch::Kind::Float,
+                    ),
+                    (&["fp16", "float16", "FP16", "Float16"][..], tch::Kind::Half),
+                    (
+                        &["bf16", "bfloat16", "BF16", "BFloat16"][..],
+                        tch::Kind::BFloat16,
+                    ),
+                ] {
+                    for alias in aliases {
+                        assert_eq!(
+                            resolve_inference_compute_kind(Some(alias), device, channel).unwrap(),
+                            expected
+                        );
+                    }
+                }
+                let automatic = if device == Device::Cpu && channel {
+                    tch::Kind::Float
+                } else {
+                    tch::Kind::BFloat16
+                };
+                for alias in [None, Some("auto"), Some("AUTO"), Some("fp8"), Some("FP8")] {
+                    assert_eq!(
+                        resolve_inference_compute_kind(alias, device, channel).unwrap(),
+                        automatic
+                    );
+                }
+                for invalid in ["", "fp64", "float8", "surprise"] {
+                    assert!(
+                        resolve_inference_compute_kind(Some(invalid), device, channel).is_err()
+                    );
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn decision_context_uses_actual_loaded_config_and_override() {
