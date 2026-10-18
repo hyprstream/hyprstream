@@ -18,6 +18,9 @@ pub use crate::config::{
     FinishReason, GenerationConfig, GenerationResult, ModelConfig, RuntimeConfig,
 };
 
+pub(crate) mod channel_fp8;
+mod resolved_spool;
+pub use channel_fp8::Fp8ExecutionError;
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod batched_lora;
 pub mod ttn_profile; // TTN analysis pipeline: adaptive layer profiling + embedded profiles // Batched multi-tenant LoRA forward pass

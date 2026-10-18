@@ -217,6 +217,20 @@ impl Qwen3_5TextConfig {
 /// If dtypes are mixed (e.g. FP8 + BF16 in the same layer), FP8 weights are dequantized to
 /// BF16 first so `cat` can proceed. This only occurs for small projection types in hybrid layers.
 fn cat_projs(projs: Vec<LinearProjection>) -> LinearProjection {
+    if projs
+        .iter()
+        .any(|p| p.channel_scale.is_some() || p.children.is_some())
+    {
+        // Child weights retain their original axes, activation QDQ and ignore policy.
+        let k = projs[0].weight.size()[0];
+        let n: i64 = projs.iter().map(|p| p.weight.size()[1]).sum();
+        let mut fused = LinearProjection::new(
+            Tensor::zeros([1, 1], (projs[0].weight.kind(), projs[0].weight.device()))
+                .expand([k, n], false),
+        );
+        fused.children = Some(projs);
+        return fused;
+    }
     #[inline]
     fn is_fp8(k: tch::Kind) -> bool {
         matches!(k, tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2)
@@ -405,9 +419,11 @@ unsafe impl Sync for RMSNormGated {}
 /// L2 normalization along last dim (used on Q and K before delta rule)
 #[inline]
 fn l2_normalize(x: &Tensor) -> Tensor {
-    // norm_scalaropt_dim = 2 GPU ops (vs 5 with manual x*x+sum+sqrt+div)
-    let norm = x.norm_scalaropt_dim(2.0, &[-1i64][..], true);
-    x / norm.clamp_min(1e-3)
+    // Match transformers 5.10.2 Qwen3.5 l2norm: epsilon is additive
+    // inside rsqrt, not a lower bound on the norm. The distinction matters
+    // for small query/key vectors and propagates through recurrent state.
+    let sum_sq = (x * x).sum_dim_intlist(&[-1i64][..], true, Kind::Float);
+    x * (sum_sq + 1e-6f64).rsqrt()
 }
 
 /// Chunked GatedDeltaNet prefill (translation of `torch_chunk_gated_delta_rule`).
@@ -696,7 +712,7 @@ impl GatedDeltaNetLayer {
 
         // Fused input projection: 1 matmul for all 4 projections.
         let h2 = hidden.reshape([batch * seq, hidden.size()[2]]);
-        let all_proj = self.in_proj_all.apply(&h2); // [batch*seq, conv_dim+val_dim+2*nv]
+        let all_proj = self.in_proj_all.try_apply(&h2)?; // [batch*seq, conv_dim+val_dim+2*nv]
         let [cd, vd, nv_d, _] = self.proj_split;
         let mut off = 0i64;
         let mixed_qkv = all_proj
@@ -890,7 +906,7 @@ impl GatedDeltaNetLayer {
         };
         let flat = normed.reshape([batch * seq, actual_vd]);
 
-        let projected = self.out_proj.apply(&flat);
+        let projected = self.out_proj.try_apply(&flat)?;
         // Standard LoRA: add correction in the OUTPUT space of out_proj (y = Wx + BAx).
         // Inject after out_proj so correction shape [B*seq, hidden_size] matches projected,
         // regardless of whether val_dim == hidden_size. (Issue 6 + standard LoRA semantics)
@@ -1020,7 +1036,7 @@ impl Qwen3_5FullAttention {
         let h2 = hidden.reshape([batch * seq, hidden.size()[2]]);
 
         // Fused QKV projection: single matmul, then split
-        let qkv = self.qkv_proj.apply(&h2);
+        let qkv = self.qkv_proj.try_apply(&h2)?;
         let [q_dim, k_dim, v_dim] = self.qkv_split;
 
         // Delta injection on q_proj and v_proj (out-of-place to avoid aliasing, C2 fix)
@@ -1195,7 +1211,7 @@ impl Qwen3_5FullAttention {
             ctx_gated
         };
 
-        let out = self.o_proj.apply(&ctx_gated);
+        let out = self.o_proj.try_apply(&ctx_gated)?;
         Ok(out.reshape([batch, seq, -1]))
     }
 
@@ -1272,9 +1288,9 @@ struct Qwen3_5Expert {
 
 impl Qwen3_5Expert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.apply(x).silu();
-        let up = self.up_proj.apply(x);
-        Ok(self.down_proj.apply(&(gate * up)))
+        let gate = self.gate_proj.try_apply(x)?.silu();
+        let up = self.up_proj.try_apply(x)?;
+        self.down_proj.try_apply(&(gate * up))
     }
 
     /// Move all projection weights to `device` (#314 pipeline placement).
@@ -1319,7 +1335,7 @@ impl Qwen3_5SparseMoE {
 
         // Router — topK on raw logits, then softmax over selected experts only.
         // Avoids softmax over all 256 experts + renormalize div+sum.
-        let logits = self.gate.apply(x); // [batch, num_experts]
+        let logits = self.gate.try_apply(x)?; // [batch, num_experts]
         let (top_logits, top_ids) = logits.topk(k, -1, true, true);
         let top_weights = top_logits.softmax(-1, dtype); // softmax over k=8 only
 
@@ -1385,7 +1401,7 @@ impl Qwen3_5SparseMoE {
         let shared_out = self.shared_expert.forward(x)?;
         let shared_out = if let Some(gate_proj) = &self.shared_expert_gate {
             // sigmoid(x @ gate_proj): [batch, 1], broadcast over hidden dim
-            let gate = gate_proj.apply(x).sigmoid();
+            let gate = gate_proj.try_apply(x)?.sigmoid();
             shared_out * gate
         } else {
             shared_out
@@ -1421,8 +1437,8 @@ unsafe impl Sync for Qwen3_5SparseMoE {}
 // ============================================================================
 
 enum Qwen3_5Mlp {
-    Dense(LlamaMLP),
-    Sparse(Qwen3_5SparseMoE),
+    Dense(Box<LlamaMLP>),
+    Sparse(Box<Qwen3_5SparseMoE>),
 }
 
 impl Qwen3_5Mlp {
@@ -1445,8 +1461,8 @@ impl Qwen3_5Mlp {
     #[inline]
     fn into_device(self, device: Device) -> Self {
         match self {
-            Qwen3_5Mlp::Dense(mlp) => Qwen3_5Mlp::Dense(mlp.into_device(device)),
-            Qwen3_5Mlp::Sparse(moe) => Qwen3_5Mlp::Sparse(moe.into_device(device)),
+            Qwen3_5Mlp::Dense(mlp) => Qwen3_5Mlp::Dense(Box::new((*mlp).into_device(device))),
+            Qwen3_5Mlp::Sparse(moe) => Qwen3_5Mlp::Sparse(Box::new((*moe).into_device(device))),
         }
     }
 }
@@ -1944,7 +1960,7 @@ impl Qwen3_5Model {
                 LinearProjection::take(weights, &format!("{prefix}.shared_expert_gate.weight"))
                     .ok();
 
-            Ok(Qwen3_5Mlp::Sparse(Qwen3_5SparseMoE {
+            Ok(Qwen3_5Mlp::Sparse(Box::new(Qwen3_5SparseMoE {
                 gate: gate_proj,
                 expert_gate_w,
                 expert_gate_scale,
@@ -1955,15 +1971,15 @@ impl Qwen3_5Model {
                 shared_expert: shared,
                 shared_expert_gate,
                 num_experts_per_tok: cfg.num_experts_per_tok,
-            }))
+            })))
         } else {
-            Ok(Qwen3_5Mlp::Dense(LlamaMLP {
+            Ok(Qwen3_5Mlp::Dense(Box::new(LlamaMLP {
                 gate_proj: LinearProjection::take(weights, &format!("{prefix}.gate_proj.weight"))?,
                 up_proj: LinearProjection::take(weights, &format!("{prefix}.up_proj.weight"))?,
                 down_proj: LinearProjection::take(weights, &format!("{prefix}.down_proj.weight"))?,
                 activation: "silu".to_owned(),
                 layer_idx,
-            }))
+            })))
         }
     }
 
@@ -2413,6 +2429,16 @@ impl Qwen3_5Model {
         range: std::ops::Range<usize>,
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
+        self.forward_layers_stateless_inner(hidden, range, delta, None)
+    }
+
+    fn forward_layers_stateless_inner(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+        check: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<Tensor> {
         let num_global = self.config.num_hidden_layers as usize;
         if range.end > num_global || range.start >= range.end {
             return Err(anyhow!(
@@ -2440,6 +2466,9 @@ impl Qwen3_5Model {
         let mut rec_local: Vec<Option<Tensor>> = (0..self.layers.len()).map(|_| None).collect();
 
         for g in range {
+            if let Some(check) = check {
+                check()?;
+            }
             let local_idx = g - self.layer_offset;
 
             // The single cross-device transfer (autograd-transparent): only when
@@ -2478,6 +2507,9 @@ impl Qwen3_5Model {
             hidden = layer.mlp.forward(&hidden)?;
             hidden = residual2 + &hidden;
         }
+        if let Some(check) = check {
+            check()?;
+        }
         Ok(hidden)
     }
 
@@ -2498,7 +2530,7 @@ impl Qwen3_5Model {
         // [B * out_patches, out_hidden_size]
         let features = enc.forward(pixel_values)?;
         // Project to text hidden size: [B * out_patches, hidden_size]
-        Ok(proj.apply(&features))
+        proj.try_apply(&features)
     }
 
     /// Build combined embeddings by replacing image placeholder tokens with vision features.
@@ -2729,7 +2761,7 @@ impl Qwen3_5Model {
         let h = mtp.pre_fc_norm_hidden.forward(hiddens)?;
         // Embedding FIRST, hidden second (checkpoint fc weight layout).
         let x = Tensor::cat(&[e, h], -1).reshape([batch * seq, 2 * hidden_sz]);
-        let x = mtp.fc.apply(&x).reshape([batch, seq, hidden_sz]);
+        let x = mtp.fc.try_apply(&x)?.reshape([batch, seq, hidden_sz]);
 
         let position_ids =
             Tensor::arange_start(base as i64, base as i64 + seq, (Kind::Int64, x.device()));
@@ -2773,6 +2805,65 @@ impl ModelOperations for Qwen3_5Model {
 
     fn config(&self) -> &dyn ArchitectureConfig {
         &self.config
+    }
+
+    fn decision_hidden_states(&self, input: &Tensor) -> Result<Tensor> {
+        self.decision_hidden_states_checked(input, &|| Ok(()))
+    }
+
+    fn decision_hidden_states_checked(
+        &self,
+        input: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
+        anyhow::ensure!(
+            input.kind() == Kind::Int64
+                && input.dim() == 2
+                && input.size()[0] == 1
+                && input.size()[1] > 0,
+            "decision input must be [1,tokens]"
+        );
+        anyhow::ensure!(
+            self.layer_offset == 0 && self.layers.len() == self.config.num_hidden_layers as usize,
+            "decision inference requires the complete backbone"
+        );
+        anyhow::ensure!(
+            input.min().int64_value(&[]) >= 0
+                && input.max().int64_value(&[]) < self.embed_tokens.size()[0],
+            "decision token ID outside embedding vocabulary"
+        );
+        let embedded = self.embed_tokens(input)?;
+        let hidden = self.forward_layers_stateless_inner(
+            &embedded,
+            0..self.layers.len(),
+            None,
+            Some(check),
+        )?;
+        Ok(self.norm.forward(&hidden)?.squeeze_dim(0))
+    }
+
+    fn decision_output_embedding_rows(&self, ids: &[i64]) -> Result<Tensor> {
+        let (weight, transposed) = match (&self.lm_head, &self.lm_head_transposed) {
+            (Some(w), _) => (w, false),
+            (None, Some(w)) => (w, true),
+            _ => return Err(anyhow!("missing output embedding table")),
+        };
+        anyhow::ensure!(
+            !matches!(weight.kind(), Kind::Float8e4m3fn | Kind::Float8e5m2),
+            "decision output rows require preserved floating output table"
+        );
+        let vocab = weight.size()[if transposed { 1 } else { 0 }];
+        anyhow::ensure!(
+            ids.iter().all(|id| *id >= 0 && *id < vocab),
+            "output token ID outside vocabulary"
+        );
+        let indices = Tensor::from_slice(ids).to_device(weight.device());
+        Ok(if transposed {
+            weight.index_select(1, &indices).transpose(0, 1)
+        } else {
+            weight.index_select(0, &indices)
+        })
     }
 
     fn forward(&self, input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
@@ -2982,6 +3073,56 @@ mod pipeline_tests {
     //! state threading were wrong, the two-stage result would diverge.
     use super::*;
     use crate::runtime::device_pool::LayerDeviceMap;
+
+    // Pinned reference: transformers 5.10.2 models/qwen3_5/modeling_qwen3_5.py
+    // l2norm computes x * rsqrt(sum(x*x) + 1e-6). Scalar f64 evaluation supplies
+    // an independent numerical reference; these are not model outputs.
+    #[test]
+    fn gdn_l2_normalize_matches_additive_epsilon_reference() {
+        let input = Tensor::from_slice(&[3.0f32, 4.0, -2.0, 1.0]).reshape([2, 2]);
+        let expected = Tensor::from_slice(&[
+            (3.0f64 / (25.0f64 + 1e-6).sqrt()) as f32,
+            (4.0f64 / (25.0f64 + 1e-6).sqrt()) as f32,
+            (-2.0f64 / (5.0f64 + 1e-6).sqrt()) as f32,
+            (1.0f64 / (5.0f64 + 1e-6).sqrt()) as f32,
+        ])
+        .reshape([2, 2]);
+        assert!(l2_normalize(&input).allclose(&expected, 1e-7, 1e-7, false));
+    }
+
+    #[test]
+    fn gdn_l2_normalize_small_vectors_do_not_clamp_norm() {
+        let input = Tensor::from_slice(&[3e-4f32, 4e-4, 1e-3, 0.0]).reshape([1, 2, 2]);
+        let a = 3e-4f32 as f64;
+        let b = 4e-4f32 as f64;
+        let c = 1e-3f32 as f64;
+        let denominator = (a * a + b * b + 1e-6).sqrt();
+        let expected = Tensor::from_slice(&[
+            (a / denominator) as f32,
+            (b / denominator) as f32,
+            (c / (c * c + 1e-6).sqrt()) as f32,
+            0.0,
+        ])
+        .reshape([1, 2, 2]);
+        let output = l2_normalize(&input);
+        assert_eq!(output.size(), input.size());
+        assert!(output.allclose(&expected, 1e-7, 1e-7, false));
+        let old_clamped = &input
+            / input
+                .norm_scalaropt_dim(2.0, &[-1i64][..], true)
+                .clamp_min(1e-3);
+        assert!((&output - old_clamped).abs().max().double_value(&[]) > 0.1);
+    }
+
+    #[test]
+    fn gdn_l2_normalize_zero_vectors_remain_finite_zero() {
+        let input = Tensor::zeros([2, 3, 4], (Kind::Float, Device::Cpu));
+        let output = l2_normalize(&input);
+        assert_eq!(output.size(), input.size());
+        assert_eq!(output.kind(), Kind::Float);
+        assert_ne!(output.isfinite().all().int64_value(&[]), 0);
+        assert_eq!(output.abs().max().double_value(&[]), 0.0);
+    }
 
     pub(super) const HIDDEN: i64 = 16;
     pub(super) const HEADS: i64 = 2;
@@ -3364,6 +3505,87 @@ mod pipeline_tests {
             w.insert(format!("{mp}.down_proj.weight"), pat(&[HIDDEN, INTER]));
         }
         w
+    }
+
+    #[test]
+    fn channel_fp8_fusion_preserves_quantized_and_ignored_boundaries() {
+        let input = Tensor::from_slice(&[448f32, 1.0625, -4.0]).reshape([1, 3]);
+        let make = || {
+            let mut w = HashMap::from([
+                (
+                    "p.weight".to_owned(),
+                    Tensor::ones([2, 3], (Kind::Float, Device::Cpu)).to_kind(Kind::Float8e4m3fn),
+                ),
+                (
+                    "p.weight_scale".to_owned(),
+                    Tensor::from_slice(&[0.25f32, 0.5]).reshape([2, 1]),
+                ),
+            ]);
+            LinearProjection::take(&mut w, "p.weight").unwrap()
+        };
+        let ignored = || LinearProjection::new(Tensor::ones([3, 1], (Kind::Float, Device::Cpu)));
+        let expected = Tensor::cat(&[make().apply(&input), ignored().apply(&input)], -1);
+        let fused = cat_projs(vec![make(), ignored()]);
+        assert!(fused.children.is_some());
+        assert_eq!(fused.weight.numel(), 9); // expanded metadata view, not materialized weights
+        assert!(fused.apply(&input).allclose(&expected, 0.0, 0.0, false));
+        assert_eq!(fused.apply(&input).double_value(&[0, 2]), 445.0625);
+    }
+
+    #[test]
+    fn decision_hidden_and_output_rows_are_fresh_and_match_full_forward() {
+        let model = whole_model();
+        let input = Tensor::from_slice(&[1i64, 5, 9, 2]).reshape([1, 4]);
+        let hidden = model.decision_hidden_states(&input).unwrap();
+        assert_eq!(hidden.size(), [4, HIDDEN]);
+        let expected_logits = whole_model().forward(&input, None).unwrap().squeeze_dim(0);
+        let rows = model.decision_output_embedding_rows(&[0, 5, 0]).unwrap();
+        let logits = hidden.matmul(&rows.transpose(0, 1));
+        let expected = expected_logits.index_select(1, &Tensor::from_slice(&[0i64, 5, 0]));
+        assert!(logits.allclose(&expected, 1e-4, 1e-4, false));
+        // Contaminate the persistent cache with unrelated generation.
+        let _ = model
+            .forward_with_cache(&Tensor::from_slice(&[7i64, 4]).reshape([1, 2]), 0)
+            .unwrap();
+        let hidden_again = model.decision_hidden_states(&input).unwrap();
+        assert!(hidden_again.allclose(&hidden, 0.0, 0.0, false));
+        assert!(model.decision_output_embedding_rows(&[-1]).is_err());
+        assert!(model.decision_output_embedding_rows(&[VOCAB]).is_err());
+        assert!(model
+            .decision_hidden_states(&Tensor::from_slice(&[VOCAB]).reshape([1, 1]))
+            .is_err());
+        assert!(model
+            .decision_hidden_states(&Tensor::zeros([1, 0], (Kind::Int64, Device::Cpu)))
+            .is_err());
+    }
+
+    #[test]
+    fn decision_cancel_between_layers_preserves_next_request() {
+        let model = whole_model();
+        let input = Tensor::from_slice(&[1i64, 5, 9, 2]).reshape([1, 4]);
+        let baseline = model.decision_hidden_states(&input).unwrap();
+        let checks = std::cell::Cell::new(0usize);
+        let cancel = || {
+            let calls = checks.get() + 1;
+            checks.set(calls);
+            // Initial admission, layer0, then abort before layer1: exactly one
+            // full decoder layer has completed when cancellation is observed.
+            if calls == 3 {
+                Err(anyhow!("request cancelled at decoder boundary"))
+            } else {
+                Ok(())
+            }
+        };
+        let failure = model
+            .decision_hidden_states_checked(&input, &cancel)
+            .unwrap_err();
+        assert!(failure.to_string().contains("request cancelled"));
+        assert_eq!(checks.get(), 3);
+        let next = model.decision_hidden_states(&input).unwrap();
+        assert!(
+            next.allclose(&baseline, 0.0, 0.0, false),
+            "cancelled request leaked recurrent/KV state"
+        );
     }
 
     fn whole_model() -> Qwen3_5Model {

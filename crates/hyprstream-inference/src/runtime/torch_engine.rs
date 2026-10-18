@@ -22,6 +22,30 @@ use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument, warn};
 
+/// Resolve the compute dtype independently from checkpoint weight storage.
+/// This pure policy accepts the documented case-insensitive precision aliases;
+/// it performs no device allocation. `fp8` retains legacy BF16 compute except
+/// for qualified channel-FP8 CPU checkpoints, whose activation QDQ/matmuls run
+/// in Float32. It never requests hardware Float8 activations on CPU.
+/// Serving adapters must still enforce their own qualified-device/dtype gate.
+pub fn resolve_inference_compute_kind(
+    precision_mode: Option<&str>,
+    device: Device,
+    channel_fp8: bool,
+) -> Result<tch::Kind> {
+    match precision_mode
+        .unwrap_or("auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fp32" | "float32" => Ok(tch::Kind::Float),
+        "fp16" | "float16" => Ok(tch::Kind::Half),
+        "auto" | "fp8" if device == Device::Cpu && channel_fp8 => Ok(tch::Kind::Float),
+        "bf16" | "bfloat16" | "auto" | "fp8" => Ok(tch::Kind::BFloat16),
+        mode => anyhow::bail!("unsupported inference precision mode: {mode}"),
+    }
+}
+
 /// Build a self-explaining diagnostic for why CUDA/ROCm is unavailable.
 ///
 /// `tch::Cuda::is_available()` returns a bare `false` with no cause, which made
@@ -721,7 +745,7 @@ impl TorchEngine {
         }
 
         // Get context window from model info that was populated from config
-        let context_window = self.model_info.lock().context_length as usize;
+        let context_window = self.effective_context_limit()?;
 
         // Initialize context state
         {
@@ -1053,7 +1077,11 @@ impl TorchEngine {
         let model = ModelFactory::create(
             model_path,
             &self.device,
-            tch::Kind::BFloat16,
+            resolve_inference_compute_kind(
+                self.config.precision_mode.as_deref(),
+                self.device,
+                super::channel_fp8::ChannelFp8Profile::read(model_path)?.is_some(),
+            )?,
             self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
             self.device_pool.as_deref(),
@@ -2325,6 +2353,66 @@ impl TorchEngine {
         Ok(logits)
     }
 
+    /// Authoritative context capacity of the loaded model. ModelInfo is populated
+    /// from the checkpoint configuration and optional max_context override during
+    /// loading; RuntimeConfig.context_length is only a constructor default.
+    /// Serving encoders and native decision admission must use this same limit.
+    pub fn effective_context_limit(&self) -> Result<usize> {
+        anyhow::ensure!(self.persistent_model.is_some(), "Model not loaded");
+        let limit = self.model_info.lock().context_length as usize;
+        anyhow::ensure!(limit > 0, "loaded model has an invalid context limit");
+        Ok(limit)
+    }
+
+    /// Execute a decision head against fresh full-sequence hidden states while
+    /// holding the backbone lock. The supplied gather reads original LM-head
+    /// rows without allocating token-by-vocabulary logits. No cache is reused.
+    pub fn with_decision_backbone<T>(
+        &self,
+        token_ids: &[i64],
+        head: impl FnOnce(&Tensor, &dyn Fn(&[i64]) -> Result<Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_decision_backbone_checked(token_ids, &|| Ok(()), head)
+    }
+
+    /// Cooperative cancellation/deadline variant. The checker runs before
+    /// admission, between decoder layers, and around head evaluation. An active
+    /// libtorch kernel completes before the next check; dropping a future alone
+    /// is not a compute-cancellation mechanism.
+    pub fn with_decision_backbone_checked<T>(
+        &self,
+        token_ids: &[i64],
+        check: &dyn Fn() -> Result<()>,
+        head: impl FnOnce(&Tensor, &dyn Fn(&[i64]) -> Result<Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        check()?;
+        anyhow::ensure!(!token_ids.is_empty(), "decision token sequence is empty");
+        let limit = self.effective_context_limit()?;
+        anyhow::ensure!(
+            token_ids.len() <= limit,
+            "decision input exceeds context limit"
+        );
+        anyhow::ensure!(
+            self.device == tch::Device::Cpu,
+            "decision backbone is CPU-only pending CPU acceptance"
+        );
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        let model = model.lock();
+        let _guard = tch::no_grad_guard();
+        let input = Tensor::from_slice(token_ids)
+            .reshape([1, token_ids.len() as i64])
+            .to_device(self.device);
+        let hidden = model.decision_hidden_states_checked(&input, check)?;
+        check()?;
+        let gather = |ids: &[i64]| model.decision_output_embedding_rows(ids);
+        let output = head(&hidden, &gather)?;
+        check()?;
+        Ok(output)
+    }
+
     /// Get the number of layers in the loaded model.
     pub fn get_num_layers(&self) -> Result<usize> {
         let model = self
@@ -2778,6 +2866,127 @@ mod tests {
     use parking_lot::Mutex;
     use std::io::Write;
     use std::sync::Arc;
+
+    #[test]
+    fn precision_policy_preserves_aliases_and_non_cpu_modes_without_gpu_execution() {
+        for device in [Device::Cpu, Device::Cuda(0), Device::Mps] {
+            for channel in [false, true] {
+                for (aliases, expected) in [
+                    (
+                        &["fp32", "float32", "FP32", "Float32"][..],
+                        tch::Kind::Float,
+                    ),
+                    (&["fp16", "float16", "FP16", "Float16"][..], tch::Kind::Half),
+                    (
+                        &["bf16", "bfloat16", "BF16", "BFloat16"][..],
+                        tch::Kind::BFloat16,
+                    ),
+                ] {
+                    for alias in aliases {
+                        assert_eq!(
+                            resolve_inference_compute_kind(Some(alias), device, channel).unwrap(),
+                            expected
+                        );
+                    }
+                }
+                let automatic = if device == Device::Cpu && channel {
+                    tch::Kind::Float
+                } else {
+                    tch::Kind::BFloat16
+                };
+                for alias in [None, Some("auto"), Some("AUTO"), Some("fp8"), Some("FP8")] {
+                    assert_eq!(
+                        resolve_inference_compute_kind(alias, device, channel).unwrap(),
+                        automatic
+                    );
+                }
+                for invalid in ["", "fp64", "float8", "surprise"] {
+                    assert!(
+                        resolve_inference_compute_kind(Some(invalid), device, channel).is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_context_uses_actual_loaded_config_and_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let shapes = [
+            ("model.embed_tokens.weight", vec![8, 4]),
+            ("model.norm.weight", vec![4]),
+            ("model.layers.0.input_layernorm.weight", vec![4]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![4]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![4, 4]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.up_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.down_proj.weight", vec![4, 8]),
+        ];
+        let weights: Vec<_> = shapes
+            .into_iter()
+            .map(|(key, shape)| {
+                (
+                    key.to_owned(),
+                    Tensor::ones(shape.as_slice(), (tch::Kind::Float, Device::Cpu)),
+                )
+            })
+            .collect();
+        Tensor::write_safetensors(&weights, &path).unwrap();
+        for (model_limit, override_limit, expected_limit, admitted_tokens) in [
+            (64usize, None, 64usize, 64usize),
+            (8192, None, 8192, 4097),
+            (8192, Some(32), 32, 32),
+        ] {
+            let config = serde_json::json!({
+                "model_type":"llama","architectures":["LlamaForCausalLM"],
+                "hidden_size":4,"intermediate_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":2,"head_dim":2,
+                "vocab_size":8,"max_position_embeddings":model_limit,
+                "rms_norm_eps":1e-5,"rope_theta":10000.0,"tie_word_embeddings":true
+            });
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let mut engine = TorchEngine::new(RuntimeConfig {
+                use_gpu: false,
+                context_length: 4096,
+                max_context: override_limit,
+                precision_mode: Some("fp32".to_owned()),
+                speculative_decoding: false,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(engine.effective_context_limit().is_err());
+            engine.load_model_file(&path).await.unwrap();
+            assert_eq!(engine.effective_context_limit().unwrap(), expected_limit);
+            assert_eq!(
+                engine.context_state.lock().as_ref().unwrap().context_window,
+                expected_limit
+            );
+            let overflow = vec![0i64; expected_limit + 1];
+            let rejected = engine
+                .with_decision_backbone_checked(&overflow, &|| Ok(()), |_, _| Ok(()))
+                .unwrap_err();
+            assert!(rejected.to_string().contains("exceeds context limit"));
+            // Llama deliberately lacks decision hidden states. Reaching that
+            // downstream error proves valid context was admitted without doing
+            // a long forward. The8192case causally admits4097tokens, which the
+            // previous RuntimeConfig default4096 incorrectly rejected.
+            let admitted = vec![0i64; admitted_tokens];
+            let downstream = engine
+                .with_decision_backbone_checked(&admitted, &|| Ok(()), |_, _| Ok(()))
+                .unwrap_err();
+            assert!(downstream
+                .to_string()
+                .contains("decision hidden states unsupported"));
+        }
+    }
 
     #[test]
     fn mtp_bonus_sampling_matches_serial_repetition_window() {

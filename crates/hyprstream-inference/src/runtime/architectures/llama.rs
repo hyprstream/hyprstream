@@ -70,6 +70,10 @@ pub(crate) struct LinearProjection {
     /// the flag is off or `scale` is None. Boxed: keeps `LinearProjection`
     /// small enough for the `Qwen3_5Mlp` enum (clippy large_enum_variant).
     pub(crate) rowwise: Option<Box<RowwiseRequant>>,
+    /// Per-output-channel E4M3FN multiplier [1,N], distinct from block scales.
+    pub(crate) channel_scale: Option<Tensor>,
+    /// Preserve original quantization boundaries through mixed projection fusion.
+    pub(crate) children: Option<Vec<LinearProjection>>,
 }
 
 /// Load-time rowwise representation used by the v1 scaled-mm recipe.
@@ -452,6 +456,8 @@ impl LinearProjection {
             scale: None,
             scale_v2: None,
             rowwise: None,
+            channel_scale: None,
+            children: None,
         }
     }
 
@@ -464,6 +470,8 @@ impl LinearProjection {
             scale: None,
             scale_v2: None,
             rowwise: None,
+            channel_scale: None,
+            children: None,
         }
     }
 
@@ -490,6 +498,8 @@ impl LinearProjection {
             scale: Some(scale),
             scale_v2: Some(scale_v2),
             rowwise,
+            channel_scale: None,
+            children: None,
         }
     }
 
@@ -498,6 +508,10 @@ impl LinearProjection {
     #[inline]
     pub(crate) fn into_device(self, device: Device) -> Self {
         Self {
+            channel_scale: self.channel_scale.map(|s| s.to_device(device)),
+            children: self
+                .children
+                .map(|ps| ps.into_iter().map(|p| p.into_device(device)).collect()),
             weight: self.weight.to_device(device),
             bias: self.bias.map(|b| b.to_device(device)),
             scale: self.scale.map(|s| s.to_device(device)),
@@ -522,6 +536,11 @@ impl LinearProjection {
     /// multiplies on each forward pass (keeping VRAM at FP8 size).
     #[inline]
     pub(crate) fn apply(&self, input: &Tensor) -> Tensor {
+        if self.children.is_some() || self.channel_scale.is_some() {
+            return self
+                .try_apply(input)
+                .unwrap_or_else(|e| panic!("legacy infallible projection: {e}"));
+        }
         // FP8 GEMM spike: config-gated (`RuntimeConfig::fp8_gemm` /
         // HYPRSTREAM_FP8_GEMM), NVIDIA Hopper (SM90, cuBLASLt ≥ 12.9) only in
         // practice. Falls through to lazy dequant when the path is unavailable
@@ -543,7 +562,7 @@ impl LinearProjection {
         let w = match self.weight.kind() {
             tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
                 // Cast FP8 → BF16 on GPU (ROCm 7.1+ dispatches on-device, no CPU fallback).
-                let w_bf16 = self.weight.to_kind(tch::Kind::BFloat16);
+                let w_bf16 = self.weight.to_kind(input.kind());
                 if let Some(scale) = &self.scale {
                     // scale: [in/128, out/128] — apply block-wise via reshape+expand+reshape.
                     // This avoids repeat_interleave (which fully materializes a copy) by using
@@ -558,9 +577,7 @@ impl LinearProjection {
                     // the stride-zero view directly. The multiply output is contiguous,
                     // so the final reshape back to 2D is zero-copy.
                     let w_4d = w_bf16.view([ss[0], block_r, ss[1], block_c]);
-                    let s_4d = scale
-                        .to_kind(tch::Kind::BFloat16)
-                        .view([ss[0], 1, ss[1], 1]);
+                    let s_4d = scale.to_kind(input.kind()).view([ss[0], 1, ss[1], 1]);
                     (w_4d * s_4d).reshape([ws[0], ws[1]])
                 } else {
                     w_bf16
@@ -575,6 +592,33 @@ impl LinearProjection {
         }
     }
 
+    /// Fallible projection path used throughout native Qwen/Clef inference.
+    /// Quantized execution errors propagate to the request boundary without
+    /// unwinding the serving thread. Legacy floating/block call sites retain
+    /// the infallible `apply` API until independently migrated.
+    pub(crate) fn try_apply(&self, input: &Tensor) -> Result<Tensor> {
+        if let Some(children) = &self.children {
+            let outputs = children
+                .iter()
+                .map(|p| p.try_apply(input))
+                .collect::<Result<Vec<_>>>()?;
+            let output = Tensor::cat(&outputs, -1);
+            return Ok(match &self.bias {
+                Some(bias) => output + bias,
+                None => output,
+            });
+        }
+        if let Some(scale) = &self.channel_scale {
+            let output = super::super::channel_fp8::channel_matmul(input, &self.weight, scale)
+                .map_err(|e| super::super::channel_fp8::Fp8ExecutionError(e.to_string()))?;
+            return Ok(match &self.bias {
+                Some(bias) => output + bias,
+                None => output,
+            });
+        }
+        Ok(self.apply(input))
+    }
+
     /// Remove weight (and its companion `_scale_inv` if present) from `weights`,
     /// transpose from `[out, in]` → `[in, out]`, and build a `LinearProjection`.
     ///
@@ -582,6 +626,19 @@ impl LinearProjection {
     /// use during `apply()`. This keeps memory at FP8 size (e.g. 7.4 GB for 35B),
     /// which is necessary when the BF16 equivalent would exceed VRAM (e.g. 70 GB > 64 GB).
     pub(crate) fn take(weights: &mut HashMap<String, Tensor>, key: &str) -> Result<Self> {
+        if let Some(scale) = weights.remove(&format!("{key}_scale")) {
+            let weight = weights
+                .remove(key)
+                .ok_or_else(|| anyhow!("Missing FP8 weight: {key}"))?;
+            super::super::channel_fp8::validate_channel_scale(&weight, &scale)?;
+            anyhow::ensure!(
+                !weights.contains_key(&format!("{key}_scale_inv")),
+                "ambiguous FP8 scale: {key}"
+            );
+            let mut p = Self::new(weight.transpose(0, 1));
+            p.channel_scale = Some(scale.transpose(0, 1));
+            return Ok(p);
+        }
         let (weight, scale) = Self::take_weight_and_scale(weights, key)?;
         Ok(match scale {
             Some(s) => Self::with_scale(weight, s),
@@ -596,6 +653,10 @@ impl LinearProjection {
         weights: &mut HashMap<String, Tensor>,
         key: &str,
     ) -> Result<(Tensor, Option<Tensor>)> {
+        anyhow::ensure!(
+            !weights.contains_key(&format!("{key}_scale")),
+            "channel FP8 cannot enter block-only expert loader: {key}"
+        );
         let weight = weights
             .remove(key)
             .ok_or_else(|| anyhow!("Missing weight tensor: {}", key))?
@@ -605,6 +666,22 @@ impl LinearProjection {
         let scale = weights
             .remove(&format!("{key}_scale_inv"))
             .map(|s| s.transpose(0, 1).contiguous());
+        if matches!(
+            weight.kind(),
+            tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2
+        ) {
+            anyhow::ensure!(scale.is_some(), "missing FP8 scale for {key}");
+            let ss = scale.as_ref().map(Tensor::size).unwrap_or_default();
+            let ws = weight.size();
+            anyhow::ensure!(
+                ss.len() == 2
+                    && ss.iter().all(|d| *d > 0)
+                    && ws.len() == 2
+                    && ws[0] % ss[0] == 0
+                    && ws[1] % ss[1] == 0,
+                "invalid FP8 block scale for {key}"
+            );
+        }
         Ok((weight, scale))
     }
 
@@ -1685,8 +1762,8 @@ impl LlamaMLP {
         let hidden_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
 
         // Apply SwiGLU: down(act(gate(x)) * up(x)) with delta corrections
-        let mut gate_pre = self.gate_proj.apply(&hidden_2d);
-        let mut up = self.up_proj.apply(&hidden_2d);
+        let mut gate_pre = self.gate_proj.try_apply(&hidden_2d)?;
+        let mut up = self.up_proj.try_apply(&hidden_2d)?;
 
         if let Some(delta) = delta {
             if delta.has_module("gate_proj", self.layer_idx) {
@@ -1704,7 +1781,7 @@ impl LlamaMLP {
         let gate = self.apply_activation(&gate_pre)?;
         let gated = &gate * &up;
 
-        let mut output = self.down_proj.apply(&gated);
+        let mut output = self.down_proj.try_apply(&gated)?;
         if let Some(delta) = delta {
             if delta.has_module("down_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&gated, "down_proj", self.layer_idx)?;
@@ -1724,8 +1801,8 @@ impl LlamaMLP {
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         // Apply SwiGLU: down(act(gate(x)) * up(x))
-        let mut gate_pre = self.gate_proj.apply(hidden_states);
-        let mut up = self.up_proj.apply(hidden_states);
+        let mut gate_pre = self.gate_proj.try_apply(hidden_states)?;
+        let mut up = self.up_proj.try_apply(hidden_states)?;
 
         if let Some(delta) = delta {
             if delta.has_module("gate_proj", self.layer_idx) {
@@ -1743,7 +1820,7 @@ impl LlamaMLP {
         let gate = self.apply_activation(&gate_pre)?;
         let gated = &gate * &up;
 
-        let mut output = self.down_proj.apply(&gated);
+        let mut output = self.down_proj.try_apply(&gated)?;
         if let Some(delta) = delta {
             if delta.has_module("down_proj", self.layer_idx) {
                 let correction = delta.forward_2d(&gated, "down_proj", self.layer_idx)?;

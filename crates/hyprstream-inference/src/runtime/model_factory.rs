@@ -25,6 +25,42 @@ use hyprstream_rpc_std::registry_client::WorktreeClient;
 /// model families and can silently drop/duplicate shards).
 const STRICT_LOADER_ENV: &str = "HYPRSTREAM_STRICT_LOADER";
 
+/// Follow the factory's authoritative config architecture detection, including
+/// accepted case variants and architectures-only metadata. Validating bytes on
+/// an existing route does not add MoE or vision inference support. Other
+/// architectures and default/unknown loading retain their existing policy.
+fn native_finite_policy(model_path: &Path) -> bool {
+    ModelConfig::detect_architecture(model_path) == ModelArchitecture::Qwen3_5
+}
+
+/// Scan raw little-endian values with constant auxiliary memory, before the
+/// corresponding tensor blob/copy/cast. This is per admitted tensor, not an
+/// all-shard preflight before ANY allocation. A failure aborts the whole load
+/// before a model is returned for inference. Packed FP8 remains packed.
+fn validate_finite_payload(name: &str, dtype: safetensors::Dtype, data: &[u8]) -> Result<()> {
+    use safetensors::Dtype;
+    let invalid = match dtype {
+        Dtype::BF16 => data
+            .chunks_exact(2)
+            .position(|b| u16::from_le_bytes([b[0], b[1]]) & 0x7f80 == 0x7f80),
+        Dtype::F16 => data
+            .chunks_exact(2)
+            .position(|b| u16::from_le_bytes([b[0], b[1]]) & 0x7c00 == 0x7c00),
+        Dtype::F32 => data.chunks_exact(4).position(|b| {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f80_0000 == 0x7f80_0000
+        }),
+        Dtype::F8_E4M3 => data.iter().position(|b| b & 0x7f == 0x7f),
+        Dtype::F8_E5M2 => data.iter().position(|b| b & 0x7c == 0x7c),
+        // Unsupported materialization dtypes still fail at the existing loader
+        // boundary below; this policy does not admit another tensor format.
+        _ => None,
+    };
+    if let Some(index) = invalid {
+        bail!("nonfinite native Qwen3.5 checkpoint tensor `{name}` ({dtype:?}) at element {index}");
+    }
+    Ok(())
+}
+
 fn strict_loader_enabled() -> bool {
     std::env::var(STRICT_LOADER_ENV)
         .map(|v| {
@@ -111,6 +147,9 @@ pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tenso
     let mut converted = 0;
 
     for key in fp8_keys {
+        if weights.contains_key(&format!("{key}_scale")) {
+            continue;
+        }
         let Some(weight) = weights.remove(&key) else {
             continue;
         };
@@ -289,6 +328,24 @@ pub(crate) enum ResolvedWeight {
     File(std::fs::File),
 }
 
+impl ResolvedWeight {
+    /// Borrow resolved content without copying owned payloads. Reset file
+    /// position for every bounded metadata pass; keep the same handle alive.
+    pub(crate) fn with_reader<T>(
+        &mut self,
+        read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            Self::File(file) => {
+                use std::io::Seek as _;
+                file.rewind()?;
+                read(file)
+            }
+            Self::Owned(bytes) => read(&mut std::io::Cursor::new(bytes.as_slice())),
+        }
+    }
+}
+
 impl ModelFactory {
     /// Detect the dtype of a model by examining its tensors
     pub async fn detect_model_dtype(model_path: &Path) -> Result<DType> {
@@ -381,6 +438,15 @@ impl ModelFactory {
         fp8_dequant_load: bool,
         speculative_decoding: bool,
     ) -> Result<Box<dyn ModelOperations>> {
+        // Validate the declared compute profile before allocating shard payloads.
+        let channel_profile = super::channel_fp8::ChannelFp8Profile::read(model_path)?;
+        if channel_profile.is_some() {
+            anyhow::ensure!(
+                *device == Device::Cpu,
+                "FP8_DYNAMIC is CPU-only pending CPU acceptance"
+            );
+            anyhow::ensure!(!fp8_dequant_load, "FP8_DYNAMIC must retain activation QDQ; eager weight-only decoding is not equivalent");
+        }
         info!("Loading model: {}", model_path.display());
         if let Some(mc) = max_context {
             info!("Using max_context override: {} tokens", mc);
@@ -416,12 +482,56 @@ impl ModelFactory {
         } else {
             shard_files.clone()
         };
-        let speculative_decoding = Self::mtp_loading_policy(
-            model_path,
-            &mtp_shards,
-            mtp_runtime_supported(speculative_decoding, kv_quant_type),
-        )
-        .await?;
+        // Snapshot finite admission at the authoritative model root before
+        // any asynchronous pointer resolution, just like other whole loads.
+        let channel_native_finite = channel_profile.is_some() && native_finite_policy(model_path);
+        let mut channel_inputs = if let Some(profile) = &channel_profile {
+            Some(
+                Self::prepare_channel_inputs(profile, &mtp_shards, |path| async move {
+                    Self::resolve_weight_for_digest(&path).await
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+        let requested = mtp_runtime_supported(speculative_decoding, kv_quant_type);
+        let speculative_decoding = if let Some(inputs) = channel_inputs.as_mut() {
+            Self::mtp_loading_policy_resolved(model_path, inputs, requested).await?
+        } else {
+            Self::mtp_loading_policy(model_path, &mtp_shards, requested).await?
+        };
+
+        if let Some(inputs) = channel_inputs {
+            let mut weights = HashMap::new();
+            for (path, resolved) in inputs {
+                Self::load_resolved_safetensors_file_inner(
+                    &path,
+                    resolved,
+                    None,
+                    &mut weights,
+                    device,
+                    dtype,
+                    speculative_decoding,
+                    channel_native_finite,
+                    true,
+                )
+                .await?;
+            }
+            let config = ModelConfig::load(model_path, &weights)?;
+            return Self::create_model_from_config(
+                config,
+                weights,
+                device,
+                dtype,
+                max_context,
+                kv_quant_type,
+                model_path,
+                device_pool,
+                fp8_dequant_load,
+                speculative_decoding,
+            );
+        }
 
         if !shard_files.is_empty() && shard_files.len() > 1 {
             // Use incremental loading for large sharded models
@@ -519,9 +629,14 @@ impl ModelFactory {
         )?;
         let metadata = Self::stage_tensor_metadata(&plan).await?;
         Self::validate_stage_tensor_schema(&config, &request.layer_range, &metadata)?;
-        let mut weights =
-            Self::load_weights_for_stage_plan(plan, request.layer_range.clone(), device, dtype)
-                .await?;
+        let mut weights = Self::load_weights_for_stage_plan(
+            plan,
+            request.layer_range.clone(),
+            device,
+            dtype,
+            native_finite_policy(model_path),
+        )
+        .await?;
         maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
 
         Self::create_llama_model(
@@ -673,9 +788,11 @@ impl ModelFactory {
         required: &mut BTreeSet<String>,
         name: &str,
     ) {
-        let scale = format!("{name}_scale_inv");
-        if weight_map.contains_key(&scale) {
-            required.insert(scale);
+        for suffix in ["_scale_inv", "_scale"] {
+            let scale = format!("{name}{suffix}");
+            if weight_map.contains_key(&scale) {
+                required.insert(scale);
+            }
         }
     }
 
@@ -1095,7 +1212,14 @@ impl ModelFactory {
         dtype: DType,
     ) -> Result<HashMap<String, Tensor>> {
         let plan = Self::stage_weight_plan(model_path, num_layers, layer_range.clone())?;
-        Self::load_weights_for_stage_plan(plan, layer_range, device, dtype).await
+        Self::load_weights_for_stage_plan(
+            plan,
+            layer_range,
+            device,
+            dtype,
+            native_finite_policy(model_path),
+        )
+        .await
     }
 
     async fn load_weights_for_stage_plan(
@@ -1103,6 +1227,7 @@ impl ModelFactory {
         layer_range: Range<usize>,
         device: &Device,
         dtype: DType,
+        native_finite: bool,
     ) -> Result<HashMap<String, Tensor>> {
         let planned_tensors: usize = plan.values().map(BTreeSet::len).sum();
         info!(
@@ -1114,8 +1239,15 @@ impl ModelFactory {
 
         let mut weights = HashMap::with_capacity(planned_tensors);
         for (shard, names) in plan {
-            Self::load_safetensors_file_selected(&shard, &names, &mut weights, device, dtype)
-                .await?;
+            Self::load_safetensors_file_selected(
+                &shard,
+                &names,
+                &mut weights,
+                device,
+                dtype,
+                native_finite,
+            )
+            .await?;
         }
 
         if weights.len() != planned_tensors {
@@ -1147,6 +1279,75 @@ impl ModelFactory {
 
     /// Preflight all shard headers before materializing any MTP tensor. The
     /// same resolved bytes/LFS handling as normal loading are used locally.
+    /// Channel preflight and materialization share exactly one resolution per
+    /// shard. File-backed staging remains mmap-backed. Each pointer-owned
+    /// buffer is verified/spilled to anonymous private disk backing before the
+    /// next resolution, never retained as a whole-checkpoint heap or resolved
+    /// a second time. The same file serves preflight and tensor loading.
+    async fn prepare_channel_inputs<F, Fut>(
+        profile: &super::channel_fp8::ChannelFp8Profile,
+        shards: &[PathBuf],
+        mut resolve: F,
+    ) -> Result<Vec<(PathBuf, ResolvedWeight)>>
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<ResolvedWeight>>,
+    {
+        Self::prepare_channel_inputs_spooling(profile, shards, &mut resolve, |bytes| async move {
+            tokio::task::spawn_blocking(move || super::resolved_spool::spool(bytes))
+                .await
+                .context("resolved FP8 spool task failed")?
+        })
+        .await
+    }
+
+    async fn prepare_channel_inputs_spooling<F, Fut, S, SFut>(
+        profile: &super::channel_fp8::ChannelFp8Profile,
+        shards: &[PathBuf],
+        mut resolve: F,
+        mut spool: S,
+    ) -> Result<Vec<(PathBuf, ResolvedWeight)>>
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<ResolvedWeight>>,
+        S: FnMut(Vec<u8>) -> SFut,
+        SFut: std::future::Future<Output = Result<std::fs::File>>,
+    {
+        let mut inputs = Vec::with_capacity(shards.len());
+        for path in shards {
+            let resolved = match resolve(path.clone()).await? {
+                ResolvedWeight::Owned(bytes) => ResolvedWeight::File(spool(bytes).await?),
+                file @ ResolvedWeight::File(_) => file,
+            };
+            inputs.push((path.clone(), resolved));
+        }
+        profile.preflight_resolved(&mut inputs)?;
+        Ok(inputs)
+    }
+
+    async fn mtp_loading_policy_resolved(
+        model_path: &Path,
+        inputs: &mut [(PathBuf, ResolvedWeight)],
+        requested: bool,
+    ) -> Result<bool> {
+        if !requested || !Self::mtp_config_policy(model_path).await? {
+            return Ok(false);
+        }
+        for (_, input) in inputs {
+            let supported = input.with_reader(|reader| {
+                let mut prefix = [0; 8];
+                reader.read_exact(&mut prefix)?;
+                let mut header = vec![0; mtp_header_len(&prefix)?];
+                reader.read_exact(&mut header)?;
+                mtp_header_supported(&header)
+            })?;
+            if !supported {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn mtp_loading_policy(
         model_path: &Path,
         shards: &[PathBuf],
@@ -1223,6 +1424,7 @@ impl ModelFactory {
         // by processing shards sequentially and immediately transferring to GPU
         info!("Loading {} weight shards", shard_files.len());
 
+        let native_finite = native_finite_policy(model_path);
         let mut all_weights = HashMap::new();
 
         for (idx, shard_file) in shard_files.iter().enumerate() {
@@ -1235,6 +1437,7 @@ impl ModelFactory {
                 device,
                 dtype,
                 speculative_decoding,
+                native_finite,
             )
             .await?;
 
@@ -1271,6 +1474,7 @@ impl ModelFactory {
         dtype: DType,
         speculative_decoding: bool,
     ) -> Result<HashMap<String, Tensor>> {
+        let native_finite = native_finite_policy(model_path);
         let mut all_weights = HashMap::new();
 
         let single_file = model_path.join("model.safetensors");
@@ -1282,6 +1486,7 @@ impl ModelFactory {
                 device,
                 dtype,
                 speculative_decoding,
+                native_finite,
             )
             .await?;
             return Ok(all_weights);
@@ -1311,6 +1516,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
                 .await?;
             }
@@ -1331,9 +1537,18 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<()> {
-        Self::load_safetensors_file_inner(path, None, weights, device, dtype, speculative_decoding)
-            .await
+        Self::load_safetensors_file_inner(
+            path,
+            None,
+            weights,
+            device,
+            dtype,
+            speculative_decoding,
+            native_finite,
+        )
+        .await
     }
 
     /// Load only `selected` tensor names from one safetensors shard.
@@ -1347,8 +1562,18 @@ impl ModelFactory {
         weights: &mut HashMap<String, Tensor>,
         device: &Device,
         dtype: DType,
+        native_finite: bool,
     ) -> Result<()> {
-        Self::load_safetensors_file_inner(path, Some(selected), weights, device, dtype, false).await
+        Self::load_safetensors_file_inner(
+            path,
+            Some(selected),
+            weights,
+            device,
+            dtype,
+            false,
+            native_finite,
+        )
+        .await
     }
 
     async fn load_safetensors_file_inner(
@@ -1358,6 +1583,33 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
+    ) -> Result<()> {
+        let resolved = Self::resolve_weight_for_digest(path).await?;
+        Self::load_resolved_safetensors_file_inner(
+            path,
+            resolved,
+            selected,
+            weights,
+            device,
+            dtype,
+            speculative_decoding,
+            native_finite,
+            false,
+        )
+        .await
+    }
+
+    async fn load_resolved_safetensors_file_inner(
+        path: &Path,
+        resolved: ResolvedWeight,
+        selected: Option<&BTreeSet<String>>,
+        weights: &mut HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+        speculative_decoding: bool,
+        native_finite: bool,
+        force_mmap: bool,
     ) -> Result<()> {
         // Stage selection always uses mmap: only selected tensor pages are copied
         // into owned CPU/device storage, so unrelated bytes in a shared shard do
@@ -1366,7 +1618,17 @@ impl ModelFactory {
         //
         // #315 note: for whole-model mode this env var is independent of
         // `RuntimeConfig.mmap`, which today gates nothing here.
+        // FP8_DYNAMIC is a bounded-memory CPU path: never add a full-shard
+        // anonymous read buffer on top of the resident packed weights.
+        let channel_mmap = force_mmap
+            || path
+                .parent()
+                .map(super::channel_fp8::ChannelFp8Profile::read)
+                .transpose()?
+                .flatten()
+                .is_some();
         let use_mmap = selected.is_some()
+            || channel_mmap
             || std::env::var("HYPRSTREAM_USE_MMAP")
                 .map(|v| v.to_lowercase() == "true" || v == "1")
                 .unwrap_or(false);
@@ -1381,7 +1643,7 @@ impl ModelFactory {
         // Resolve before deciding whether mmap is safe. A stage selects only a
         // few tensors, but a pointer shard must be resolved before safetensors
         // sees it; mmap is allowed only for an already-resolved ordinary file.
-        match Self::resolve_weight_for_digest(&path_buf).await? {
+        match resolved {
             ResolvedWeight::File(file) if use_mmap => {
                 use memmap2::Mmap;
 
@@ -1394,6 +1656,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
             }
             ResolvedWeight::File(_) => {
@@ -1406,6 +1669,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
             }
             ResolvedWeight::Owned(tensor_data) => {
@@ -1417,6 +1681,7 @@ impl ModelFactory {
                     device,
                     dtype,
                     speculative_decoding,
+                    native_finite,
                 )
             }
         }
@@ -1516,6 +1781,7 @@ impl ModelFactory {
     }
 
     /// Create tensors from deserialized safetensors
+    #[cfg(test)]
     fn create_tensors_from_safetensors(
         tensors: safetensors::SafeTensors,
         weights: &mut HashMap<String, Tensor>,
@@ -1530,6 +1796,7 @@ impl ModelFactory {
             device,
             dtype,
             speculative_decoding,
+            false,
         )
     }
 
@@ -1540,6 +1807,7 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<()> {
         let mut total_size_mb = 0.0;
         let tensors_list = if let Some(selected) = selected {
@@ -1573,6 +1841,13 @@ impl ModelFactory {
             }
             let shape: Vec<i64> = tensor_view.shape().iter().map(|&x| x as i64).collect();
             let data = tensor_view.data();
+            if native_finite {
+                // All admitted payloads are scanned, including scales and any
+                // vision bytes already loaded by this architecture. This is byte
+                // validation, not a claim of vision inference support. Selection
+                // and disabled-MTP exclusion have already happened above.
+                validate_finite_payload(&name, tensor_view.dtype(), data)?;
+            }
 
             // Map safetensors dtype to tch::Kind for size estimation
             let tensor_kind = match tensor_view.dtype() {
@@ -1585,6 +1860,13 @@ impl ModelFactory {
                 _ => tch::Kind::Float,
             };
 
+            // Scales retain their stored precision, independent of compute dtype.
+            let dtype = if name.ends_with(".weight_scale") || name.ends_with(".weight_scale_inv") {
+                tensor_kind
+            } else {
+                dtype
+            };
+
             // Calculate tensor size for progress reporting
             let tensor_size_mb = estimate_tensor_size_mb(&shape, tensor_kind);
             total_size_mb += tensor_size_mb;
@@ -1593,7 +1875,10 @@ impl ModelFactory {
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::BF16 => {
                     // Verify target dtype matches
-                    if dtype != tch::Kind::BFloat16 && dtype != tch::Kind::Half {
+                    if !matches!(
+                        dtype,
+                        tch::Kind::BFloat16 | tch::Kind::Half | tch::Kind::Float
+                    ) {
                         return Err(anyhow!("Model dtype BF16 but target dtype is {:?}", dtype));
                     }
 
@@ -1614,8 +1899,8 @@ impl ModelFactory {
                     let cpu_tensor = borrowed_tensor.copy();
 
                     // Convert dtype if needed
-                    let cpu_tensor = if dtype == tch::Kind::Half {
-                        cpu_tensor.to_kind(tch::Kind::Half)
+                    let cpu_tensor = if dtype != tch::Kind::BFloat16 {
+                        cpu_tensor.to_kind(dtype)
                     } else {
                         cpu_tensor
                     };
@@ -1631,7 +1916,10 @@ impl ModelFactory {
                 }
                 safetensors::Dtype::F16 => {
                     // Verify target dtype matches
-                    if dtype != tch::Kind::Half && dtype != tch::Kind::BFloat16 {
+                    if !matches!(
+                        dtype,
+                        tch::Kind::BFloat16 | tch::Kind::Half | tch::Kind::Float
+                    ) {
                         return Err(anyhow!("Model dtype F16 but target dtype is {:?}", dtype));
                     }
 
@@ -1644,8 +1932,8 @@ impl ModelFactory {
                     let cpu_tensor = borrowed_tensor.copy();
 
                     // Convert dtype if needed
-                    let cpu_tensor = if dtype == tch::Kind::BFloat16 {
-                        cpu_tensor.to_kind(tch::Kind::BFloat16)
+                    let cpu_tensor = if dtype != tch::Kind::Half {
+                        cpu_tensor.to_kind(dtype)
                     } else {
                         cpu_tensor
                     };
@@ -1777,6 +2065,18 @@ impl ModelFactory {
         fp8_dequant_load: bool,
         speculative_decoding: bool,
     ) -> Result<Box<dyn ModelOperations>> {
+        if let Some(profile) = super::channel_fp8::ChannelFp8Profile::read(model_path)? {
+            anyhow::ensure!(
+                !fp8_dequant_load && *device == Device::Cpu,
+                "unsupported FP8_DYNAMIC execution policy"
+            );
+            profile.validate(&weights)?;
+        } else {
+            anyhow::ensure!(
+                !weights.keys().any(|k| k.ends_with(".weight_scale")),
+                "channel FP8 weights require authoritative compressed-tensors config"
+            );
+        }
         // Run TTN analysis: Tier 1 (embedded) → Tier 2 (cached) → Tier 3 (weight entropy SVD).
         // Weights are available here, enabling Tier 3 for unknown models.
         // Result cached to .analysis/layer_profile.json; non-fatal if it fails.
@@ -2221,8 +2521,15 @@ impl ModelFactory {
             info!("Loading {} weight shards via FsOps", shard_names.len());
         }
 
-        let weights =
-            Self::load_weights_fs(fs, &shard_names, device, dtype, speculative_decoding).await?;
+        let weights = Self::load_weights_fs(
+            fs,
+            &shard_names,
+            device,
+            dtype,
+            speculative_decoding,
+            native_finite_policy(model_path),
+        )
+        .await?;
         let config = ModelConfig::load(model_path, &weights)?;
         let model = Self::create_model_from_config(
             config,
@@ -2311,6 +2618,7 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
         speculative_decoding: bool,
+        native_finite: bool,
     ) -> Result<HashMap<String, Tensor>> {
         let mut all_weights = HashMap::new();
 
@@ -2330,12 +2638,14 @@ impl ModelFactory {
 
             let data = fs.read_file_chunked(name).await?;
             let tensors = safetensors::SafeTensors::deserialize(&data)?;
-            Self::create_tensors_from_safetensors(
+            Self::create_tensors_from_safetensors_selected(
                 tensors,
+                None,
                 &mut all_weights,
                 device,
                 dtype,
                 speculative_decoding,
+                native_finite,
             )?;
         }
 
@@ -2413,6 +2723,897 @@ mod stage_subset_tests {
             serde_json::to_vec(&index).unwrap(),
         )
         .unwrap();
+    }
+
+    fn finite_fixture(name: &str, dtype: Dtype, data: Vec<u8>) -> FixtureTensor {
+        let elements = data.len() / dtype.size();
+        FixtureTensor {
+            name: name.to_owned(),
+            dtype,
+            shape: vec![elements],
+            data,
+        }
+    }
+
+    fn finite_config(dir: &Path, config: serde_json::Value) {
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn channel_profile_config() -> serde_json::Value {
+        serde_json::json!({"model_type":"qwen3_5_text","quantization_config":{
+            "quant_method":"compressed-tensors", "version":"0.19.0", "format":"float-quantized", "quantization_status":"compressed", "ignore":["lm_head"],
+            "config_groups":{"g":{"format":"float-quantized", "targets":["Linear"],
+                "weights":{"num_bits":8,"type":"float","strategy":"channel","symmetric":true,"dynamic":false},
+                "input_activations":{"num_bits":8,"type":"float","strategy":"token","symmetric":true,"dynamic":true}}}}})
+    }
+
+    #[tokio::test]
+    async fn channel_prepared_factory_single_and_sharded_cpu_forward_match() {
+        let mut results = Vec::new();
+        for sharded in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tensors = tiny_dense_tensors(true);
+            let mut scales = Vec::new();
+            for matrix in tensors.iter_mut().filter(|tensor| {
+                tensor.shape.len() == 2 && tensor.name.starts_with("model.layers.")
+            }) {
+                matrix.dtype = Dtype::F8_E4M3;
+                matrix.data = vec![0x38; matrix.shape.iter().product()];
+                scales.push(FixtureTensor::f32(
+                    format!("{}_scale", matrix.name),
+                    &[matrix.shape[0], 1],
+                    0.25,
+                ));
+            }
+            tensors.extend(scales);
+            write_tiny_dense_checkpoint(dir.path(), &tensors);
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                    .unwrap();
+            config["quantization_config"] = channel_profile_config()["quantization_config"].clone();
+            finite_config(dir.path(), config);
+            if sharded {
+                let (matrices, scales): (Vec<_>, Vec<_>) = tensors
+                    .into_iter()
+                    .partition(|tensor| !tensor.name.ends_with("_scale"));
+                write_shard(dir.path(), "a.safetensors", &matrices);
+                write_shard(dir.path(), "b.safetensors", &scales);
+                let index: Vec<_> = matrices
+                    .iter()
+                    .map(|tensor| (tensor.name.as_str(), "a.safetensors"))
+                    .chain(
+                        scales
+                            .iter()
+                            .map(|tensor| (tensor.name.as_str(), "b.safetensors")),
+                    )
+                    .collect();
+                write_index(dir.path(), &index);
+            }
+            let model = ModelFactory::create(
+                dir.path(),
+                &Device::Cpu,
+                DType::Float,
+                Some(16),
+                KVQuantType::None,
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            let result = model
+                .forward(&Tensor::from_slice(&[1i64, 2]).reshape([1, 2]), None)
+                .unwrap();
+            assert_eq!(result.kind(), DType::Float);
+            assert!(result.isfinite().all().int64_value(&[]) != 0);
+            results.push(result);
+        }
+        assert!(results[0].allclose(&results[1], 1e-6, 1e-6, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn channel_private_spool_fixture_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_prepared_cancel_during_spool_does_not_resolve_next_and_releases_fd() {
+        use parking_lot::{Condvar, Mutex as TestMutex};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = channel_private_spool_fixture_dir();
+        write_shard(
+            dir.path(),
+            "w.safetensors",
+            &[FixtureTensor {
+                name: "p.weight".into(),
+                dtype: Dtype::F8_E4M3,
+                shape: vec![2, 3],
+                data: vec![0x38; 6],
+            }],
+        );
+        let mut payload = std::fs::read(dir.path().join("w.safetensors")).unwrap();
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let fd_witness = Arc::new(TestMutex::new(None));
+        let task = {
+            let count = resolve_count.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let witness = fd_witness.clone();
+            let parent = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                ModelFactory::prepare_channel_inputs_spooling(
+                    &profile,
+                    &[PathBuf::from("w"), PathBuf::from("later")],
+                    move |_| {
+                        assert_eq!(
+                            count.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "cancelled preparation resolved another shard"
+                        );
+                        std::future::ready(Ok(ResolvedWeight::Owned(std::mem::take(&mut payload))))
+                    },
+                    move |bytes| {
+                        let parent = parent.clone();
+                        let started = started.clone();
+                        let release = release.clone();
+                        let witness = witness.clone();
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                let file = super::super::resolved_spool::spool_in(bytes, &parent)?;
+                                *witness.lock() = Some((file.as_raw_fd(), file.metadata()?.ino()));
+                                started.notify_one();
+                                let (lock, cv) = &*release;
+                                let mut guard = lock.lock();
+                                cv.wait_while(&mut guard, |ready| !*ready);
+                                drop(guard);
+                                Ok(file)
+                            })
+                            .await?
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+        {
+            let (lock, cv) = &*release;
+            *lock.lock() = true;
+            cv.notify_one();
+        }
+        let (fd, ino) = fd_witness.lock().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map(|m| m.ino() == ino)
+                .unwrap_or(false)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn channel_prepared_multiple_owned_spool_before_next_resolution() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = channel_private_spool_fixture_dir();
+        let config = channel_profile_config();
+        finite_config(dir.path(), config.clone());
+        let profile = super::super::channel_fp8::ChannelFp8Profile::parse(&config)
+            .unwrap()
+            .unwrap();
+        for (name, tensor) in [("a.safetensors", "p.weight"), ("b.safetensors", "q.weight")] {
+            write_shard(
+                dir.path(),
+                name,
+                &[FixtureTensor {
+                    name: tensor.into(),
+                    dtype: Dtype::F8_E4M3,
+                    shape: vec![2, 3],
+                    data: vec![0x38; 6],
+                }],
+            );
+        }
+        write_shard(
+            dir.path(),
+            "c.safetensors",
+            &[
+                FixtureTensor::f32("p.weight_scale", &[2, 1], 0.5),
+                FixtureTensor::f32("q.weight_scale", &[2, 1], 0.5),
+            ],
+        );
+        let paths: Vec<_> = ["a.safetensors", "b.safetensors", "c.safetensors"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        let mut payloads: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        for path in &paths {
+            std::fs::write(path, b"version https://git-lfs.github.com/spec/v1\n").unwrap();
+        }
+        let resolved = AtomicUsize::new(0);
+        let spooled = AtomicUsize::new(0);
+        let mut fds = Vec::new();
+        let inputs = ModelFactory::prepare_channel_inputs_spooling(
+            &profile,
+            &paths,
+            |_| {
+                let index = resolved.fetch_add(1, Ordering::SeqCst);
+                // Fails causally if the factory resolves all Owned payloads before
+                // converting/releasing the earlier buffer.
+                assert_eq!(spooled.load(Ordering::SeqCst), index);
+                std::future::ready(Ok(ResolvedWeight::Owned(std::mem::take(
+                    &mut payloads[index],
+                ))))
+            },
+            |bytes| {
+                let file = super::super::resolved_spool::spool_in(bytes, dir.path()).unwrap();
+                fds.push((file.as_raw_fd(), file.metadata().unwrap().ino()));
+                spooled.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(file))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.load(Ordering::SeqCst), 3);
+        assert!(inputs
+            .iter()
+            .all(|(_, r)| matches!(r, ResolvedWeight::File(_))));
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut weights = HashMap::new();
+        for (path, input) in inputs {
+            ModelFactory::load_resolved_safetensors_file_inner(
+                &path,
+                input,
+                None,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let p =
+            crate::runtime::architectures::llama::LinearProjection::take(&mut weights, "p.weight")
+                .unwrap();
+        let output = p
+            .try_apply(&Tensor::ones([1, 3], (DType::Float, Device::Cpu)))
+            .unwrap();
+        assert!((output.double_value(&[0, 0]) - 1.5).abs() < 1e-6);
+        assert!((output.double_value(&[0, 1]) - 1.53).abs() < 1e-6);
+        for (fd, ino) in fds {
+            assert!(
+                std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                    .map(|m| m.ino() != ino)
+                    .unwrap_or(true),
+                "retained spool FD leaked after load"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn channel_prepared_owned_preflight_failure_releases_all_spools() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = channel_private_spool_fixture_dir();
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        write_shard(
+            dir.path(),
+            "a.safetensors",
+            &[FixtureTensor {
+                name: "p.weight".into(),
+                dtype: Dtype::F8_E4M3,
+                shape: vec![2, 3],
+                data: vec![0x38; 6],
+            }],
+        );
+        let path = dir.path().join("a.safetensors");
+        let mut payload = std::fs::read(&path).unwrap();
+        let mut fds = Vec::new();
+        let result = ModelFactory::prepare_channel_inputs_spooling(
+            &profile,
+            &[path],
+            |_| std::future::ready(Ok(ResolvedWeight::Owned(std::mem::take(&mut payload)))),
+            |bytes| {
+                let file = super::super::resolved_spool::spool_in(bytes, dir.path()).unwrap();
+                fds.push((file.as_raw_fd(), file.metadata().unwrap().ino()));
+                std::future::ready(Ok(file))
+            },
+        )
+        .await;
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("scale"), "{error}");
+        for (fd, ino) in fds {
+            assert!(std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map(|m| m.ino() != ino)
+                .unwrap_or(true));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn channel_prepared_file_inputs_never_require_spool_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        write_shard(
+            dir.path(),
+            "a.safetensors",
+            &[
+                FixtureTensor {
+                    name: "p.weight".into(),
+                    dtype: Dtype::F8_E4M3,
+                    shape: vec![2, 3],
+                    data: vec![0x38; 6],
+                },
+                FixtureTensor::f32("p.weight_scale", &[2, 1], 0.5),
+            ],
+        );
+        let path = dir.path().join("a.safetensors");
+        let inputs = ModelFactory::prepare_channel_inputs_spooling(
+            &profile,
+            &[path],
+            |path| std::future::ready(Ok(ResolvedWeight::File(std::fs::File::open(path).unwrap()))),
+            |_| std::future::ready(Err(anyhow!("cache unavailable"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inputs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_prepared_pointer_and_file_resolve_once_through_preflight_and_load() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let config = channel_profile_config();
+        finite_config(dir.path(), config.clone());
+        let profile = super::super::channel_fp8::ChannelFp8Profile::parse(&config)
+            .unwrap()
+            .unwrap();
+        let weight = FixtureTensor {
+            name: "p.weight".into(),
+            dtype: Dtype::F8_E4M3,
+            shape: vec![2, 3],
+            data: vec![0x38; 6],
+        };
+        write_shard(dir.path(), "w.safetensors", &[weight]);
+        let weight_path = dir.path().join("w.safetensors");
+        let resolved_bytes = std::fs::read(&weight_path).unwrap();
+        // Actual path contains a pointer-shaped stub. Metadata MUST consume
+        // supplied resolved bytes, not parse this prefix as a tensor header.
+        std::fs::write(
+            &weight_path,
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:fixture\n",
+        )
+        .unwrap();
+        write_shard(
+            dir.path(),
+            "s.safetensors",
+            &[FixtureTensor::f32("p.weight_scale", &[2, 1], 0.5)],
+        );
+        let scale_path = dir.path().join("s.safetensors");
+        let count = AtomicUsize::new(0);
+        let mut inputs = ModelFactory::prepare_channel_inputs(
+            &profile,
+            &[weight_path.clone(), scale_path.clone()],
+            |path| {
+                count.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(if path == weight_path {
+                    ResolvedWeight::Owned(resolved_bytes.clone())
+                } else {
+                    ResolvedWeight::File(std::fs::File::open(path).unwrap())
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // Another bounded header pass borrows retained ownership and rewinds
+        // file readers; no payload clone/resolver call belongs to this pass.
+        profile.preflight_resolved(&mut inputs).unwrap();
+        std::fs::remove_file(&weight_path).unwrap();
+        std::fs::remove_file(&scale_path).unwrap();
+        let mut weights = HashMap::new();
+        for (path, resolved) in inputs {
+            ModelFactory::load_resolved_safetensors_file_inner(
+                &path,
+                resolved,
+                None,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "factory preflight+load must resolve once per shard"
+        );
+        assert_eq!(weights["p.weight"].kind(), DType::Float8e4m3fn);
+        assert_eq!(weights["p.weight_scale"].size(), [2, 1]);
+        let projection =
+            crate::runtime::architectures::llama::LinearProjection::take(&mut weights, "p.weight")
+                .unwrap();
+        let output = projection
+            .try_apply(&Tensor::ones([1, 3], (DType::Float, Device::Cpu)))
+            .unwrap();
+        assert!((output.double_value(&[0, 0]) - 1.5).abs() < 1e-6);
+        assert!((output.double_value(&[0, 1]) - 1.53).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn channel_prepared_header_and_resolver_failures_are_closed_before_tensors() {
+        let profile =
+            super::super::channel_fp8::ChannelFp8Profile::parse(&channel_profile_config())
+                .unwrap()
+                .unwrap();
+        let path = PathBuf::from("unresolved-pointer.safetensors");
+        let error =
+            ModelFactory::prepare_channel_inputs(&profile, std::slice::from_ref(&path), |_| {
+                std::future::ready(Err(anyhow!("malformed captured LFS pointer")))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("malformed captured LFS pointer"));
+        for data in [
+            vec![],
+            (16 * 1024 * 1024u64 + 1).to_le_bytes().to_vec(),
+            b"version https://git-lfs.github.com/spec/v1".to_vec(),
+            10u64.to_le_bytes().to_vec(),
+        ] {
+            assert!(ModelFactory::prepare_channel_inputs(
+                &profile,
+                std::slice::from_ref(&path),
+                |_| std::future::ready(Ok(ResolvedWeight::Owned(data.clone())))
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_path_rejects_nonfinite_float_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let path = dir.path().join("weights.safetensors");
+        let cases = [
+            (Dtype::BF16, vec![0x7f80u32, 0xff80, 0x7fc1, 0xffc1]),
+            (Dtype::F16, vec![0x7c00, 0xfc00, 0x7e01, 0xfe01]),
+            (
+                Dtype::F32,
+                vec![0x7f80_0000, 0xff80_0000, 0x7fc0_0001, 0xffc0_0001],
+            ),
+        ];
+        for (dtype, patterns) in cases {
+            for (index, bits) in patterns.into_iter().enumerate() {
+                let name = [
+                    "model.embed_tokens.weight",
+                    "model.norm.weight",
+                    "model.layers.0.linear_attn.A_log",
+                    "model.layers.0.self_attn.q_proj.weight_scale",
+                ][index];
+                // A finite element before the poison verifies the reported
+                // element offset; no request tensor reaches a forward pass.
+                let data = if dtype == Dtype::F32 {
+                    [0u32.to_le_bytes(), bits.to_le_bytes()].concat()
+                } else {
+                    [0u16.to_le_bytes(), (bits as u16).to_le_bytes()].concat()
+                };
+                write_shard(
+                    dir.path(),
+                    "weights.safetensors",
+                    &[finite_fixture(name, dtype, data)],
+                );
+                let mut weights = HashMap::new();
+                let error = ModelFactory::load_safetensors_file(
+                    &path,
+                    &mut weights,
+                    &Device::Cpu,
+                    DType::Float,
+                    false,
+                    native_finite_policy(dir.path()),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("nonfinite native Qwen3.5"), "{error}");
+                assert!(
+                    error.contains(name) && error.contains("element 1"),
+                    "{error}"
+                );
+                assert!(weights.is_empty(), "offending tensor was inserted");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_floating_boundaries_preserve_stored_values() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let path = dir.path().join("weights.safetensors");
+        let cases = [
+            (
+                Dtype::BF16,
+                DType::BFloat16,
+                [0u16, 0x8000, 1, 0x8001, 0x7f7f, 0xff7f]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                Dtype::F16,
+                DType::Half,
+                [0u16, 0x8000, 1, 0x8001, 0x7bff, 0xfbff]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            ),
+            (
+                Dtype::F32,
+                DType::Float,
+                [0u32, 0x8000_0000, 1, 0x8000_0001, 0x7f7f_ffff, 0xff7f_ffff]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ),
+        ];
+        for (dtype, compute, data) in cases {
+            write_shard(
+                dir.path(),
+                "weights.safetensors",
+                &[finite_fixture("model.norm.weight", dtype, data.clone())],
+            );
+            let mut weights = HashMap::new();
+            ModelFactory::load_safetensors_file(
+                &path,
+                &mut weights,
+                &Device::Cpu,
+                compute,
+                false,
+                native_finite_policy(dir.path()),
+            )
+            .await
+            .unwrap();
+            let tensor = &weights["model.norm.weight"];
+            assert_eq!(tensor.kind(), compute);
+            let mut actual = vec![0u8; data.len()];
+            tensor.copy_data_u8(&mut actual, tensor.numel());
+            assert_eq!(actual, data, "finite boundary bytes changed for{dtype:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_fp8_path_preserves_finite_codes_rejects_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5_text"}));
+        let path = dir.path().join("weights.safetensors");
+        let finite_codes = vec![0x00, 0x80, 0x01, 0x81, 0x7e, 0xfe];
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[finite_fixture(
+                "p.weight",
+                Dtype::F8_E4M3,
+                finite_codes.clone(),
+            )],
+        );
+        let mut weights = HashMap::new();
+        ModelFactory::load_safetensors_file(
+            &path,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            false,
+            native_finite_policy(dir.path()),
+        )
+        .await
+        .unwrap();
+        let tensor = &weights["p.weight"];
+        assert_eq!(tensor.kind(), DType::Float8e4m3fn);
+        let mut actual = vec![0u8; finite_codes.len()];
+        tensor.copy_data_u8(&mut actual, tensor.numel());
+        assert_eq!(actual, finite_codes); // includes signed zero and subnormals
+        let floating = tensor.to_kind(DType::Float);
+        assert_eq!(floating.double_value(&[4]), 448.0);
+        assert_eq!(floating.double_value(&[5]), -448.0);
+        for code in [0x7f, 0xff] {
+            write_shard(
+                dir.path(),
+                "weights.safetensors",
+                &[finite_fixture("p.weight", Dtype::F8_E4M3, vec![code])],
+            );
+            let mut rejected = HashMap::new();
+            let error = ModelFactory::load_safetensors_file(
+                &path,
+                &mut rejected,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                native_finite_policy(dir.path()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("nonfinite") && error.contains("p.weight"));
+            assert!(rejected.is_empty());
+        }
+        // Finite validation does not reinterpret or admit E5M2 as the separate
+        // compressed FP8_DYNAMIC profile; this is the existing loader format.
+        for code in [0x7c, 0xfc, 0x7d, 0xfd] {
+            assert!(validate_finite_payload("p.weight", Dtype::F8_E5M2, &[code]).is_err());
+        }
+        validate_finite_payload(
+            "p.weight",
+            Dtype::F8_E5M2,
+            &[0x00, 0x80, 1, 0x81, 0x7b, 0xfb],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_finite_selection_and_mtp_exclusion_precede_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let path = dir.path().join("weights.safetensors");
+        let poison = || {
+            finite_fixture(
+                "model.embed_tokens.weight",
+                Dtype::F32,
+                f32::NAN.to_le_bytes().to_vec(),
+            )
+        };
+        let mtp_poison = || {
+            finite_fixture(
+                "mtp.norm.weight",
+                Dtype::F32,
+                f32::INFINITY.to_le_bytes().to_vec(),
+            )
+        };
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[
+                FixtureTensor::f32("model.norm.weight", &[1], 1.0),
+                poison(),
+                mtp_poison(),
+            ],
+        );
+        let selected =
+            BTreeSet::from(["model.norm.weight".to_owned(), "mtp.norm.weight".to_owned()]);
+        let mut weights = HashMap::new();
+        // Actual selected path forces mmap; neither unselected text nor an
+        // explicitly selected but disabled MTP tensor is scanned/materialized.
+        ModelFactory::load_safetensors_file_selected(
+            &path,
+            &selected,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            native_finite_policy(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(weights.len(), 1);
+        assert!(weights.contains_key("model.norm.weight"));
+        let mut rejected = HashMap::new();
+        let selected = BTreeSet::from(["model.embed_tokens.weight".to_owned()]);
+        assert!(ModelFactory::load_safetensors_file_selected(
+            &path,
+            &selected,
+            &mut rejected,
+            &Device::Cpu,
+            DType::Float,
+            native_finite_policy(dir.path())
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("model.embed_tokens.weight"));
+        assert!(rejected.is_empty());
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[
+                FixtureTensor::f32("model.norm.weight", &[1], 1.0),
+                mtp_poison(),
+            ],
+        );
+        for enabled in [false, true] {
+            let mut weights = HashMap::new();
+            let result = ModelFactory::load_safetensors_file(
+                &path,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                enabled,
+                native_finite_policy(dir.path()),
+            )
+            .await;
+            if enabled {
+                assert!(result.unwrap_err().to_string().contains("mtp.norm.weight"));
+            } else {
+                result.unwrap();
+                assert_eq!(weights.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_gate_preserves_other_architecture_and_default_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.safetensors");
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[finite_fixture(
+                "model.norm.weight",
+                Dtype::F32,
+                f32::NAN.to_le_bytes().to_vec(),
+            )],
+        );
+        for (config, strict) in [
+            (None, false),
+            (Some(serde_json::json!({"model_type":"llama"})), false),
+            (
+                Some(
+                    serde_json::json!({"model_type":"llama","text_config":{"model_type":"qwen3_5_text"}}),
+                ),
+                false,
+            ),
+            (
+                Some(serde_json::json!({"text_config":{"model_type":"qwen3_5_text"}})),
+                false,
+            ),
+            (Some(serde_json::json!({"model_type":"QWEN3_5"})), true),
+            (Some(serde_json::json!({"model_type":"qwen3_5_moe"})), true),
+            (
+                Some(serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"]})),
+                true,
+            ),
+            (
+                Some(serde_json::json!({"architectures":["LlamaForCausalLM"]})),
+                false,
+            ),
+            (
+                Some(
+                    serde_json::json!({"model_type":"llama","architectures":["Qwen3_5ForConditionalGeneration"]}),
+                ),
+                false,
+            ),
+        ] {
+            if let Some(config) = config {
+                finite_config(dir.path(), config);
+            }
+            assert_eq!(native_finite_policy(dir.path()), strict);
+            let mut weights = HashMap::new();
+            let result = ModelFactory::load_safetensors_file(
+                &path,
+                &mut weights,
+                &Device::Cpu,
+                DType::Float,
+                false,
+                native_finite_policy(dir.path()),
+            )
+            .await;
+            if strict {
+                assert!(result.unwrap_err().to_string().contains("nonfinite"));
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    weights["model.norm.weight"]
+                        .isfinite()
+                        .all()
+                        .int64_value(&[]),
+                    0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_finite_nested_shard_retains_model_root_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        let nested = dir.path().join("weights");
+        std::fs::create_dir(&nested).unwrap();
+        // A shard-local config cannot override the authoritative model root.
+        finite_config(&nested, serde_json::json!({"model_type":"llama"}));
+        write_shard(
+            &nested,
+            "shard.safetensors",
+            &[finite_fixture(
+                "model.norm.weight",
+                Dtype::BF16,
+                0x7fc1u16.to_le_bytes().to_vec(),
+            )],
+        );
+        write_index(
+            dir.path(),
+            &[("model.norm.weight", "weights/shard.safetensors")],
+        );
+        let error = ModelFactory::load_weights(dir.path(), &Device::Cpu, DType::Float, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nonfinite") && error.contains("model.norm.weight"));
+    }
+
+    #[test]
+    fn native_finite_fsops_materialization_seam_rejects_nonfinite() {
+        let dir = tempfile::tempdir().unwrap();
+        finite_config(dir.path(), serde_json::json!({"model_type":"qwen3_5"}));
+        write_shard(
+            dir.path(),
+            "weights.safetensors",
+            &[finite_fixture(
+                "model.layers.0.linear_attn.dt_bias",
+                Dtype::F32,
+                f32::NEG_INFINITY.to_le_bytes().to_vec(),
+            )],
+        );
+        let bytes = std::fs::read(dir.path().join("weights.safetensors")).unwrap();
+        let mut weights = HashMap::new();
+        // Same policy and materializer called after FsOps::read_file_chunked;
+        // byte acquisition is local here, no fake RPC integration claim.
+        let error = ModelFactory::create_tensors_from_safetensors_selected(
+            safetensors::SafeTensors::deserialize(&bytes).unwrap(),
+            None,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            false,
+            native_finite_policy(dir.path()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nonfinite") && error.contains("dt_bias"));
+        assert!(weights.is_empty());
     }
 
     fn loaded_bytes(weights: &HashMap<String, Tensor>) -> usize {
@@ -3021,10 +4222,15 @@ size 4096\n",
             .unwrap_err();
         assert_pointer_resolution_error(preflight_error);
 
-        let selected_error =
-            ModelFactory::load_weights_for_stage_plan(plan, 0..1, &Device::Cpu, DType::Float)
-                .await
-                .unwrap_err();
+        let selected_error = ModelFactory::load_weights_for_stage_plan(
+            plan,
+            0..1,
+            &Device::Cpu,
+            DType::Float,
+            native_finite_policy(dir.path()),
+        )
+        .await
+        .unwrap_err();
         assert_pointer_resolution_error(selected_error);
     }
 
@@ -3371,6 +4577,48 @@ mod fp8_dequant_tests {
     }
 
     #[test]
+    fn cpu_fp32_loader_preserves_bf16_values_and_channel_fp8_scales() {
+        let floating = RawTensor::bf16("model.norm.weight", &[2], 0.125);
+        let packed = RawTensor::f8("p.weight", &[2, 3]);
+        let scale = RawTensor::bf16("p.weight_scale", &[2, 1], 0.25);
+        let fixtures = [floating, packed, scale];
+        let views: Vec<_> = fixtures
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    TensorView::new(t.dtype, t.shape.clone(), &t.data).unwrap(),
+                )
+            })
+            .collect();
+        let bytes = serialize(views, &None).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut weights = HashMap::new();
+        ModelFactory::create_tensors_from_safetensors(
+            tensors,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            false,
+        )
+        .unwrap();
+        assert_eq!(weights["model.norm.weight"].kind(), DType::Float);
+        assert_eq!(weights["model.norm.weight"].double_value(&[0]), 0.125);
+        assert_eq!(weights["p.weight"].kind(), DType::Float8e4m3fn);
+        assert_eq!(weights["p.weight_scale"].kind(), DType::BFloat16);
+        assert_eq!(
+            dequantize_fp8_weights_at_load(&mut weights),
+            0,
+            "eager block-only decoder must not erase dynamic activation QDQ"
+        );
+        assert!(weights.contains_key("p.weight_scale"));
+        let projection = LinearProjection::take(&mut weights, "p.weight").unwrap();
+        let result = projection.apply(&Tensor::ones([1, 3], (DType::Float, Device::Cpu)));
+        assert_eq!(result.kind(), DType::Float);
+        assert!(result.isfinite().all().int64_value(&[]) != 0);
+    }
+
+    #[test]
     fn dequant_at_load_noop_without_fp8() {
         let mut weights = HashMap::from([(
             "w.weight".to_owned(),
@@ -3520,6 +4768,106 @@ mod fp8_dequant_tests {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Resource-admitted, external-checkpoint CPU gate. Never downloads models.
+    /// Run only as the exact ignored test in its own process (four CPU threads).
+    #[tokio::test]
+    #[ignore = "requires explicit real-model path, receipt path and parent memory admission"]
+    async fn real_clef_fp8_cpu_backbone_smoke() {
+        let model_path = PathBuf::from(
+            std::env::var("HYPRSTREAM_CLEF_FP8_MODEL").expect("explicit model path required"),
+        );
+        let receipt_path = PathBuf::from(
+            std::env::var("HYPRSTREAM_CLEF_BACKBONE_RECEIPT")
+                .expect("explicit smoke receipt path required"),
+        );
+        assert!(model_path.is_dir());
+        let memory =
+            std::fs::read_to_string("/proc/meminfo").expect("Linux memory admission required");
+        let available_kib = memory
+            .lines()
+            .find(|line| line.starts_with("MemAvailable:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("MemAvailable required");
+        assert!(
+            available_kib >= 21 * 1024 * 1024,
+            "CPU smoke requires21GiB MemAvailable at actual test start; got{}KiB",
+            available_kib
+        );
+        tch::set_num_threads(4);
+        tch::set_num_interop_threads(1);
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).unwrap();
+        let encode = |text: &str| {
+            let encoded = tokenizer.encode(text, false).unwrap();
+            let ids: Vec<i64> = encoded.get_ids().iter().map(|id| *id as i64).collect();
+            assert!(!ids.is_empty() && ids.len() <= 32);
+            ids
+        };
+        let ids_a = encode("The quick brown fox jumps over a lazy dog.");
+        let ids_b = encode("A different independent request about ocean waves.");
+        let a = Tensor::from_slice(&ids_a).reshape([1, ids_a.len() as i64]);
+        let b = Tensor::from_slice(&ids_b).reshape([1, ids_b.len() as i64]);
+        let started = std::time::Instant::now();
+        let model = ModelFactory::create(
+            &model_path,
+            &Device::Cpu,
+            DType::Float,
+            Some(64),
+            KVQuantType::None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let load_ms = started.elapsed().as_millis();
+        assert!(matches!(
+            model.architecture(),
+            crate::runtime::architectures::ModelArchitecture::Qwen3_5
+        ));
+        let _no_grad = tch::no_grad_guard();
+        let forward_start = std::time::Instant::now();
+        let hidden = model.decision_hidden_states(&a).unwrap();
+        let first_forward_ms = forward_start.elapsed().as_millis();
+        assert_eq!(hidden.size(), [ids_a.len() as i64, 4096]);
+        assert_eq!(hidden.kind(), DType::Float);
+        assert!(hidden.isfinite().all().int64_value(&[]) != 0);
+        let rows = model
+            .decision_output_embedding_rows(&ids_a[..3.min(ids_a.len())])
+            .unwrap();
+        assert_eq!(rows.size(), [3.min(ids_a.len()) as i64, 4096]);
+        assert_eq!(rows.kind(), hidden.kind());
+        assert!(rows.isfinite().all().int64_value(&[]) != 0);
+        // Exercise another fresh request, then contaminate persistent generation
+        // state without performing any vocabulary projection.
+        let other = model.decision_hidden_states(&b).unwrap();
+        assert!(other.isfinite().all().int64_value(&[]) != 0);
+        let emb = model.embed_tokens(&b).unwrap();
+        let _ = model
+            .forward_layers(&emb, 0..model.num_layers(), 0, None)
+            .unwrap();
+        let repeated = model.decision_hidden_states(&a).unwrap();
+        let repeated_max_abs = (&hidden - &repeated).abs().max().double_value(&[]);
+        assert!(
+            hidden.allclose(&repeated, 1e-6, 1e-6, false),
+            "cross-request state contamination"
+        );
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let receipt = serde_json::json!({
+            "gate":"native-clef-backbone-cpu-smoke", "result":"PASS",
+            "model_path":model_path,"candidate_sha":std::env::var("HYPRSTREAM_CANDIDATE_SHA").ok(),
+            "device":"cpu","compute_dtype":"float32","cpu_threads":4,"context_limit":64,"admission_available_kib":available_kib,
+            "input_a_tokens":ids_a,"input_b_tokens":ids_b,"load_ms":load_ms,
+            "first_forward_ms":first_forward_ms,"elapsed_ms":started.elapsed().as_millis(),
+            "hidden_shape":hidden.size(),"lm_rows_shape":rows.size(),"repeated_max_abs":repeated_max_abs,
+            "process_memory":status.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:")).collect::<Vec<_>>(),
+            "acceptance_scope":"native-backbone-smoke-only",
+            "not_proven":["joint-head parity","trusted-reference parity","authenticated serving","GPU eligibility"]
+        });
+        std::fs::write(receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     }
 
     #[tokio::test]
