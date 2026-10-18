@@ -4,7 +4,7 @@
 //! loading of the original Clef joint head from the admitted model directory;
 //! shared cheap request preflight (raw-byte bound + ordered Clef JSON parse +
 //! per-question and AGGREGATE budget admission); encoding through the
-//! head-lane [`ClefEncoder`]; ONE fresh-state unpadded CPU forward through
+//! head-lane [`ClefEncoder`]; ONE fresh-state unpadded device-local forward through
 //! [`TorchEngine::with_decision_backbone_checked`]; softmax and canonical
 //! label remapping. The service-facing half (auth context, pinned-artifact
 //! requirement, E2 marshalling, wire response assembly) lives in
@@ -183,7 +183,7 @@ impl DecisionBackboneObserver {
 /// decoder layers, and around head evaluation. An active libtorch kernel
 /// completes before the next check; a cancelled or failed forward drops its
 /// call-local state, so nothing persists. Disconnecting a client alone does
-/// not stop a running CPU forward — the deadline and drain flag bound it.
+/// not stop a running CPU or GPU forward — the deadline and drain flag bound it.
 #[derive(Clone, Debug)]
 pub struct DecisionCancel {
     flag: Arc<AtomicBool>,
@@ -291,10 +291,10 @@ pub fn resolve_serving_kind(
     resolve_serving_kind_for_device(model_path, precision_mode, tch::Device::Cpu)
 }
 
-/// Resolve the only Clef serving precision qualified for an observed device.
+/// Resolve the Clef serving precision qualified for an observed device.
 /// CPU Float32 remains the accepted default. The initial ROCm slice admits
-/// only BF16, unquantized checkpoints; channel-FP8 remains CPU-only until its
-/// activation-QDQ/matmul implementation is qualified on ROCm.
+/// only single-device BF16 with no quantization config; channel-FP8 remains
+/// CPU-only until its activation-QDQ/matmul implementation is qualified there.
 pub fn resolve_serving_kind_for_device(
     model_path: &Path,
     precision_mode: Option<&str>,
@@ -355,6 +355,45 @@ fn quantization_config_present(model_path: &Path) -> Result<bool, ClefDecisionEr
     Ok(config
         .get("quantization_config")
         .is_some_and(|value| !value.is_null()))
+}
+
+/// Require the loader-selected backbone shards to contain floating-point
+/// tensors only. This catches quantized artifacts whose safetensors encode
+/// FP8/integers and scale companions without declaring `quantization_config`.
+/// Metadata parsing mmap-touches headers only, not the model data regions.
+fn validate_dense_float_checkpoint(model_path: &Path) -> Result<(), ClefDecisionError> {
+    let shards = crate::runtime::model_factory::ModelFactory::find_shard_files(model_path)
+        .map_err(|e| ClefDecisionError::Bundle(format!("select backbone safetensors: {e:#}")))?;
+    if shards.is_empty() {
+        return Err(ClefDecisionError::Bundle(
+            "backbone has no safetensors shards".into(),
+        ));
+    }
+    for shard in shards {
+        let file = std::fs::File::open(&shard).map_err(|e| {
+            ClefDecisionError::Bundle(format!("open backbone shard {}: {e}", shard.display()))
+        })?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+            ClefDecisionError::Bundle(format!("map backbone shard {}: {e}", shard.display()))
+        })?;
+        let (_, metadata) = SafeTensors::read_metadata(&mmap)
+            .map_err(|e| ClefDecisionError::Bundle(format!("read backbone shard metadata: {e}")))?;
+        for (name, info) in metadata.tensors() {
+            if !matches!(
+                info.dtype,
+                safetensors::Dtype::F16
+                    | safetensors::Dtype::BF16
+                    | safetensors::Dtype::F32
+                    | safetensors::Dtype::F64
+            ) {
+                return Err(ClefDecisionError::Profile(format!(
+                    "ROCm Clef serving requires floating-point backbone tensors; {name} has {:?}",
+                    info.dtype
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Head dtype from the AUTHORITATIVE shared policy
@@ -695,6 +734,9 @@ impl ClefDecisionRuntime {
     ) -> Result<Self> {
         let head_dir = Self::detect(model_path)
             .ok_or_else(|| ClefDecisionError::Bundle("not a Clef bundle".into()))?;
+        if device != tch::Device::Cpu {
+            validate_dense_float_checkpoint(model_path)?;
+        }
         let config_meta = std::fs::metadata(head_dir.join(CLEF_HEAD_CONFIG_FILE))
             .with_context(|| "stat Clef head config")?;
         if config_meta.len() > MAX_HEAD_CONFIG_BYTES as u64 {
@@ -1015,7 +1057,7 @@ pub fn encode_request(
 }
 
 /// Run one admitted, already-encoded record through the cached runtime:
-/// fresh-state CPU forward → per-question softmax → canonical remap.
+/// fresh-state device-local forward → per-question softmax → canonical remap.
 pub fn decide_encoded(
     runtime: &ClefDecisionRuntime,
     engine: &TorchEngine,
@@ -2221,6 +2263,34 @@ mod tests {
     }
 
     #[test]
+    fn rocm_checkpoint_admission_rejects_undeclared_fp8_tensor_shards() {
+        use safetensors::tensor::{serialize, TensorView};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dense_bytes = [0u8; 4];
+        let dense = TensorView::new(safetensors::Dtype::F32, vec![1], &dense_bytes).unwrap();
+        let dense_bytes_serialized = serialize([("layer.weight", dense)], &None).unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), dense_bytes_serialized).unwrap();
+        assert!(validate_dense_float_checkpoint(dir.path()).is_ok());
+
+        // FP8 plus its inverse-scale companion is supported by the generic
+        // loader even when config.json has no quantization_config declaration.
+        let fp8_bytes = [0u8; 2];
+        let fp8 = TensorView::new(safetensors::Dtype::F8_E4M3, vec![2], &fp8_bytes).unwrap();
+        let scale_bytes = [0u8; 4];
+        let scale = TensorView::new(safetensors::Dtype::F32, vec![1], &scale_bytes).unwrap();
+        let quantized = serialize(
+            [("layer.weight", fp8), ("layer.weight_scale_inv", scale)],
+            &None,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), quantized).unwrap();
+        let err = validate_dense_float_checkpoint(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("floating-point backbone tensors"));
+        assert!(err.to_string().contains("F8_E4M3"));
+    }
+
+    #[test]
     fn serving_profile_rejects_bf16_and_accepts_fp32_or_auto_fp8() {
         // Causal controls at the resolver level: non-FP8 bundle (no channel
         // profile) — auto resolves BF16 and is REJECTED for v1 serving;
@@ -2483,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ROCm/HIP libtorch and a visible GPU; run explicitly on Jensen"]
-    async fn rocm_tiny_decide_runs_backbone_head_probabilities_and_provenance() {
+    async fn rocm_tiny_decide_reports_profile_and_probabilities() {
         use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine};
 
         assert!(tch::utils::has_hip(), "test requires ROCm/HIP libtorch");
@@ -2504,10 +2574,13 @@ mod tests {
             .expect("tiny BF16 backbone load on ROCm");
         assert_eq!(engine.device(), tch::Device::Cuda(0));
 
+        let serving_kind = resolve_serving_kind_for_device(dir.path(), None, tch::Device::Cuda(0))
+            .expect("ROCm BF16 profile admission");
+        assert_eq!(serving_kind, Kind::BFloat16);
         let runtime = ClefDecisionRuntime::load_on_device(
             dir.path(),
             Some(T5_HIDDEN as u32),
-            Some(Kind::BFloat16),
+            None,
             None,
             tch::Device::Cuda(0),
         )

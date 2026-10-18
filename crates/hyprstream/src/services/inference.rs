@@ -776,6 +776,12 @@ impl InferenceService {
         // from the loaded engine (fp8 runtime follow-up: replaces the stale
         // model_info.context_length source and the checked-forward default).
         let engine_guard = self.engine.read();
+        if engine_guard.is_multi_device() {
+            return Err(crate::runtime::clef_decision::ClefDecisionError::Profile(
+                "Clef serving supports CPU or single-device ROCm only".into(),
+            )
+            .into());
+        }
         let engine_hidden = RuntimeEngine::model_info(&*engine_guard).hidden_size;
         let effective_context = engine_guard
             .effective_context_limit()
