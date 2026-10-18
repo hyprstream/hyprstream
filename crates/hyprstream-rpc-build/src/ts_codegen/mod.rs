@@ -724,7 +724,13 @@ impl CodegenBackend for TypeScriptBackend {
 /// X`, `export function X`) rather than independently re-deriving struct/enum/
 /// function naming rules, so it can never drift from what `interfaces.rs` /
 /// `builders.rs` / `parsers.rs` actually produce.
-fn scan_exported_names(content: &str) -> Vec<String> {
+#[derive(Debug, PartialEq)]
+struct ExportedSymbol {
+    name: String,
+    type_only: bool,
+}
+
+fn scan_exported_symbols(content: &str) -> Vec<ExportedSymbol> {
     const PREFIXES: &[&str] = &["export interface ", "export type ", "export function "];
     let mut names = Vec::new();
     for line in content.lines() {
@@ -736,7 +742,10 @@ fn scan_exported_names(content: &str) -> Vec<String> {
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
                 if !name.is_empty() {
-                    names.push(name);
+                    names.push(ExportedSymbol {
+                        name,
+                        type_only: *prefix != "export function ",
+                    });
                 }
                 break;
             }
@@ -766,7 +775,7 @@ fn generate_index(
 ) -> String {
     // Exported names per data-only module (services only ever barrel-export
     // their Client class, so they can't collide with each other here).
-    let data_only_exports: Vec<(&String, Vec<String>)> = all_names
+    let data_only_exports: Vec<(&String, Vec<ExportedSymbol>)> = all_names
         .iter()
         .filter(|name| !client_names.contains(name))
         .map(|name| {
@@ -775,7 +784,7 @@ fn generate_index(
                 .find(|(n, _)| n == name)
                 .map(|(_, c)| c.as_str())
                 .unwrap_or_default();
-            (name, scan_exported_names(content))
+            (name, scan_exported_symbols(content))
         })
         .collect();
 
@@ -783,8 +792,8 @@ fn generate_index(
     let mut occurrence_count: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
     for (_, names) in &data_only_exports {
-        for n in names {
-            *occurrence_count.entry(n.as_str()).or_insert(0) += 1;
+        for symbol in names {
+            *occurrence_count.entry(symbol.name.as_str()).or_insert(0) += 1;
         }
     }
 
@@ -802,9 +811,13 @@ fn generate_index(
             .find(|(n, _)| *n == name)
             .map(|(_, names)| names.as_slice())
             .unwrap_or_default();
-        let has_collision = exported
-            .iter()
-            .any(|n| occurrence_count.get(n.as_str()).copied().unwrap_or(0) > 1);
+        let has_collision = exported.iter().any(|symbol| {
+            occurrence_count
+                .get(symbol.name.as_str())
+                .copied()
+                .unwrap_or(0)
+                > 1
+        });
 
         if !has_collision {
             // No cross-module name collision — a plain wildcard re-export is safe.
@@ -817,24 +830,29 @@ fn generate_index(
         // aliasing only the colliding ones, so tsc never sees an ambiguous
         // wildcard re-export.
         let module_prefix = to_pascal_case(name);
-        let items: Vec<String> = exported
-            .iter()
-            .map(|n| {
-                if occurrence_count.get(n.as_str()).copied().unwrap_or(0) > 1 {
-                    format!("{n} as {module_prefix}{n}")
-                } else {
-                    n.clone()
-                }
-            })
-            .collect();
-        if items.is_empty() {
-            // Nothing exported from this module (e.g. an empty schema) — no-op.
-            continue;
+        // Interfaces/type aliases have no runtime binding. Retain their kind
+        // through collision aliasing so isolatedModules emits legal barrels.
+        for type_only in [true, false] {
+            let items: Vec<String> = exported
+                .iter()
+                .filter(|symbol| symbol.type_only == type_only)
+                .map(|symbol| {
+                    let n = &symbol.name;
+                    if occurrence_count.get(n.as_str()).copied().unwrap_or(0) > 1 {
+                        format!("{n} as {module_prefix}{n}")
+                    } else {
+                        n.clone()
+                    }
+                })
+                .collect();
+            if !items.is_empty() {
+                let keyword = if type_only { "export type" } else { "export" };
+                out.push_str(&format!(
+                    "{keyword} {{ {} }} from './{name}';\n",
+                    items.join(", ")
+                ));
+            }
         }
-        out.push_str(&format!(
-            "export {{ {} }} from './{name}';\n",
-            items.join(", ")
-        ));
     }
     out
 }
@@ -880,7 +898,8 @@ mod barrel_tests {
             (
                 "events".to_owned(),
                 "export interface QoS {\n  retries: number;\n}\n\
-                 export interface EventEnvelope {\n  id: string;\n}\n"
+                 export interface EventEnvelope {\n  id: string;\n}\n\
+                 export function buildQoS(): Uint8Array { return new Uint8Array(); }\n"
                     .to_owned(),
             ),
             (
@@ -905,17 +924,41 @@ mod barrel_tests {
         // re-exported (nothing gets dropped just because its sibling collided).
         assert!(out.contains("EventEnvelope"), "{out}");
         assert!(out.contains("StreamInfo"), "{out}");
+        assert!(
+            out.contains("export type { QoS as EventsQoS, EventEnvelope } from './events';"),
+            "{out}"
+        );
+        assert!(
+            out.contains("export { buildQoS } from './events';"),
+            "{out}"
+        );
     }
 
-    /// `scan_exported_names` is the single source of truth the barrel
+    /// `scan_exported_symbols` is the single source of truth the barrel
     /// generator relies on — verify it picks up every emission shape used by
     /// interfaces.rs / builders.rs / parsers.rs.
     #[test]
-    fn scan_exported_names_finds_interfaces_types_and_functions() {
+    fn scan_exported_symbols_finds_interfaces_types_and_functions() {
         let content = "export interface Foo {\n  a: number;\n}\n\
                         export type Bar =\n  | { variant: 'x'; data: undefined };\n\
                         export function buildFoo(p: Foo): Uint8Array {\n  return new Uint8Array(0);\n}\n";
-        let names = super::scan_exported_names(content);
-        assert_eq!(names, vec!["Foo", "Bar", "buildFoo"]);
+        let names = super::scan_exported_symbols(content);
+        assert_eq!(
+            names,
+            vec![
+                super::ExportedSymbol {
+                    name: "Foo".into(),
+                    type_only: true
+                },
+                super::ExportedSymbol {
+                    name: "Bar".into(),
+                    type_only: true
+                },
+                super::ExportedSymbol {
+                    name: "buildFoo".into(),
+                    type_only: false
+                }
+            ]
+        );
     }
 }

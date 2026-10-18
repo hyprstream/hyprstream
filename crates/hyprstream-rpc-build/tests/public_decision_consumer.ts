@@ -95,6 +95,10 @@ async function main() {
       body: { variant: 'choice', data: [{ name: 'z', rubric: { variant: 'some', data: nullEntry } }, { name: 'a', rubric: { variant: 'none', data: undefined } }] } },
     { id: 'score-a', kind: 'score', instructions: { variant: 'none', data: undefined },
       body: { variant: 'score', data: [{ variant: 'none', data: undefined }, { variant: 'some', data: { variant: 'number', data: 1.5 } }, { variant: 'some', data: nullEntry }] } },
+    { id: 'noul-nullable', kind: 'noul', instructions: { variant: 'none', data: undefined },
+      body: { variant: 'noul', data: { variant: 'some', data: {
+        onTrue: null, onFalse: { variant: 'some', data: nullEntry },
+      } } } },
   ] };
   ensure(JSON.stringify(parseQuestionSet(buildQuestionSet(questions))) === JSON.stringify(questions), 'actual QuestionSpec named body union must share original parent offsets');
   const ctl: CtlRequest = { fid: 17, variant: 'log', data: { maxCount: 7, refName: 'main' } };
@@ -135,6 +139,16 @@ async function main() {
   };
   const decodedCriteria = parseNoulCriteria(buildNoulCriteria(criteria));
   ensure(JSON.stringify(decodedCriteria) === JSON.stringify(criteria), 'recursive Entry seq/map/struct/union must round trip without truncation');
+  // A nullable pointer below a typed union payload must be evaluated once,
+  // then narrowed, rather than rereading an asserted expression/getter.
+  let nullableReads = 0;
+  const observed: NoulCriteria = {
+    get onTrue(): NoulCriteria['onTrue'] { nullableReads++; return { variant: 'some', data: nullEntry }; },
+    onFalse: null,
+  };
+  const observedRoundtrip = parseNoulCriteria(buildNoulCriteria(observed));
+  ensure(nullableReads === 1, 'nullable struct pointer getter must be read once');
+  ensure(observedRoundtrip.onTrue?.variant === 'some' && observedRoundtrip.onFalse === null, 'nullable pointers retain populated/null wire behavior');
   const absent = parseOptEntry(buildOptEntry_none());
   const explicitNull = parseOptEntry(buildOptEntry_some({ variant: 'null', data: undefined }));
   ensure(absent.variant === 'none', 'OptEntry.none must retain omitted-key semantics');
@@ -150,7 +164,7 @@ async function main() {
   const sent = calls[calls.length - 1];
   ensure(sent.service === 'model' && sent.method === 6, 'real decide must use canonical Model infer method metadata');
   const decoded = parseModelRequest(sent.bytes);
-  ensure(decoded.variant === 'infer' && decoded.data.variant === 'decide', 'actual public request must select native decide');
+  ensure(decoded.variant === 'infer' && decoded.data != null && decoded.data.variant === 'decide' && decoded.data.data != null, 'actual public request must select native decide');
   ensure(decoded.data.modelRef === 'clef-flash-fp8:main', 'curried model scope must survive');
   ensure(decoded.data.data.clefJson === request.clefJson, 'original JSON editor bytes/order/numbers must survive');
   ensure(decoded.data.data.maxStateTokens === 0 && decoded.data.data.timeoutMs === 17, 'explicit optional zero/value must survive');

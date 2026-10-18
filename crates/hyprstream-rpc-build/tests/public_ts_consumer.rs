@@ -321,6 +321,10 @@ for (const conformalSet of [undefined, [], ['alpha', 'λ', 'quote"slash\\']] as 
             "--lib",
             "es2020,dom,esnext.disposable",
             "--skipLibCheck",
+            // Match the website's strict nullable reads and isolated barrel
+            // handling; compilation success without these flags missed both.
+            "--strict",
+            "--isolatedModules",
         ])
         .args(&sources)
         .current_dir(&output_dir);

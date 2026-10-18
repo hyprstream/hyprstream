@@ -766,6 +766,15 @@ fn emit_field_setter(
                 if let Some(inner_name) = super::ts_option_inner(sd) {
                     emit_option_setter(out, field, sd, inner_name, builder_var, value_expr, indent);
                 } else {
+                    // Capture asserted/nested expressions exactly once. TypeScript
+                    // cannot narrow repeated `(union.data as T).nullable` reads;
+                    // the stable local preserves strict-null safety and evaluates
+                    // a property getter only once before the existing null guard.
+                    let value_id = *counter;
+                    *counter += 1;
+                    let stable_value = format!("_pv{value_id}");
+                    out.push_str(&format!("{indent}const {stable_value} = {value_expr};\n"));
+                    let value_expr = stable_value.as_str();
                     if super::is_recursive_struct(&sd.name, structs) {
                         out.push_str(&format!("{indent}if ({value_expr} != null) _write{}({builder_var}.initStruct({}, {}, {}), {value_expr});\n", sd.name, field.slot_offset, sd.data_words, sd.pointer_words));
                         return;
