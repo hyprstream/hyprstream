@@ -253,3 +253,45 @@ async fn item_runs_are_not_persistable_as_one_batch() {
     sink.init().await.unwrap();
     assert!(sink.persist_run(&output).await.is_err());
 }
+
+#[tokio::test]
+async fn empty_runs_cannot_persist_without_schema_version_metadata() {
+    let backend = Arc::new(MemoryBackend::default());
+    let sink = BatchSink::new(backend.clone());
+    sink.init().await.unwrap();
+    let mut set = workflow_set();
+    set.rows.clear();
+    let output = Harness
+        .run_set(&set, &TruthSubject::new("truth-1"))
+        .await
+        .unwrap();
+    assert_eq!(output.version.schema, "refunds-1.0.0");
+    assert_eq!(output.batch.as_ref().unwrap().num_rows(), 0);
+    assert!(matches!(
+        sink.persist_run(&output).await,
+        Err(hyprstream_eval::EvalError::InvalidInput(_))
+    ));
+    assert!(
+        backend.tables.lock()["decision_batches"].1.is_empty(),
+        "rejected persistence must not insert an unrecoverable artifact"
+    );
+    // The supported nonempty path still persists and reads a complete triple.
+    let output = Harness
+        .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+        .await
+        .unwrap();
+    let id = sink.persist_run(&output).await.unwrap();
+    let (meta, batch) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(meta.model_id, output.version.model);
+    assert_eq!(meta.calib_version, output.version.calib);
+    let schemas = batch
+        .column_by_name("schema_version")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<hyprstream_metrics_api::arrow::array::StringArray>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert!(schemas
+        .iter()
+        .all(|value| value == Some(output.version.schema.as_str())));
+}

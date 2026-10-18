@@ -30,6 +30,15 @@ pub trait Subject: Send + Sync {
     /// as already resolved.
     fn model_id(&self) -> &str;
 
+    /// Check subject-specific input constraints without I/O, model queries,
+    /// mutable state, or other side effects. Harnesses call this for every
+    /// request before deciding any row; ensembles check every teacher first.
+    /// The default accepts inputs, including explicit null states supported
+    /// by native/in-process subjects. Transport adapters may be stricter.
+    fn preflight(&self, _set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+        Ok(())
+    }
+
     /// Answer every question in `set` for one state row. `row` is the batch
     /// row index, passed through so deterministic subjects can vary by row
     /// exactly the way the P0.7 mock does. Every declared question must be
@@ -479,6 +488,7 @@ impl HttpSubject {
         set: &QuestionSet,
         state: &Entry,
     ) -> Result<(AnswerRow, String), EvalError> {
+        self.preflight(set, state)?;
         // Encode before opening a connection: serde_json otherwise turns a
         // directly-constructed non-finite IR number into JSON null.
         let body = serde_json::to_vec(&request_body(set, state, &self.model))
@@ -531,6 +541,15 @@ impl HttpSubject {
 
 #[async_trait]
 impl Subject for HttpSubject {
+    fn preflight(&self, _set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+        if matches!(state, Entry::Null) {
+            return Err(EvalError::InvalidInput(
+                "the legacy /v1/systemone HTTP endpoint requires a non-null state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -1157,7 +1176,7 @@ questions:
         for location in 0..6 {
             for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.25] {
                 let mut set = fixture();
-                let mut state = Entry::Null;
+                let mut state = Entry::Str("valid state".into());
                 let entry = Entry::Seq(vec![Entry::Map(vec![(
                     "nested".into(),
                     Entry::Number(number),

@@ -34,6 +34,9 @@ pub enum DecodeError {
     /// Every batch must identify the resolved model that produced it.
     #[error("empty resolved model id on the wire")]
     EmptyModelId,
+    /// Every batch must identify its question-set schema version.
+    #[error("empty question-set schema version on the wire")]
+    EmptySchemaVersion,
     /// capnp-level structural failure (truncated message, bad pointer).
     #[error("capnp decode failed: {0}")]
     Capnp(String),
@@ -138,6 +141,9 @@ pub enum EncodeError {
     /// Empty model provenance cannot be persisted as a decision batch.
     #[error("empty resolved model id cannot be encoded")]
     EmptyModelId,
+    /// Empty schema provenance cannot be encoded as a decision batch.
+    #[error("empty question-set schema version cannot be encoded")]
+    EmptySchemaVersion,
     /// An abstained answer carried a conformal set — the wire contract forbids
     /// it (abstention already says "no commitment") and this module's own
     /// decoder rejects such messages.
@@ -698,6 +704,9 @@ pub fn batch_to_message(
     if version.model.is_empty() {
         return Err(EncodeError::EmptyModelId);
     }
+    if version.schema.is_empty() {
+        return Err(EncodeError::EmptySchemaVersion);
+    }
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
     {
@@ -800,8 +809,12 @@ pub fn batch_from_reader(
     if model.is_empty() {
         return Err(DecodeError::EmptyModelId);
     }
+    let schema = triple.get_schema()?.to_str()?;
+    if schema.is_empty() {
+        return Err(DecodeError::EmptySchemaVersion);
+    }
     let version = VersionTriple {
-        schema: triple.get_schema()?.to_str()?.to_owned(),
+        schema: schema.to_owned(),
         model: model.to_owned(),
         calib: match triple.get_calib()?.which()? {
             crate::optional_capnp::option_text::None(()) => None,

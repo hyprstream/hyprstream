@@ -1552,7 +1552,11 @@ fn decode_rejects_duplicate_answers_instead_of_overwriting() {
     for second_id in ["q", "other"] {
         let mut message = capnp::message::Builder::new_default();
         let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
-        root.reborrow().init_version().set_model("model");
+        {
+            let mut triple = root.reborrow().init_version();
+            triple.set_schema("schema");
+            triple.set_model("model");
+        }
         let mut answers = root.init_rows(1).get(0).init_answers(2);
         for (index, id) in ["q", second_id].iter().enumerate() {
             let mut answer = answers.reborrow().get(index as u32);
@@ -1648,10 +1652,13 @@ fn wire_rejects_empty_resolved_model_ids() {
         }
         // Build the wire directly so the decoder cannot rely on the encoder's guard.
         let mut message = capnp::message::Builder::new_default();
-        message
-            .init_root::<decision_capnp::decision_batch::Builder<'_>>()
-            .init_version()
-            .set_model(model);
+        {
+            let mut triple = message
+                .init_root::<decision_capnp::decision_batch::Builder<'_>>()
+                .init_version();
+            triple.set_schema("schema");
+            triple.set_model(model);
+        }
         let bytes = wire_roundtrip(&message);
         let wire =
             capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
@@ -1661,6 +1668,50 @@ fn wire_rejects_empty_resolved_model_ids() {
             assert_eq!(decoded, Err(decision::DecodeError::EmptyModelId));
         } else {
             assert_eq!(decoded.unwrap().0.model, model);
+        }
+    }
+}
+
+#[test]
+fn wire_rejects_empty_schema_versions() {
+    use hyprstream_rpc_std::decision_capnp;
+
+    for schema in ["", "schema@revision"] {
+        let version = VersionTriple {
+            schema: schema.into(),
+            model: "resolved-model@revision".into(),
+            calib: None,
+        };
+        let encoded = decision::batch_to_message(&version, &[]);
+        if schema.is_empty() {
+            assert!(matches!(
+                encoded,
+                Err(decision::EncodeError::EmptySchemaVersion)
+            ));
+        } else {
+            assert!(encoded.is_ok());
+        }
+        // The decoder receives serialized wire built without the encoder guard.
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut triple = message
+                .init_root::<decision_capnp::decision_batch::Builder<'_>>()
+                .init_version();
+            triple.set_schema(schema);
+            triple.set_model("resolved-model@revision");
+            triple.init_calib().set_none(());
+        }
+        let bytes = wire_roundtrip(&message);
+        let wire =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .unwrap();
+        let decoded = decision::batch_from_reader(wire.get_root().unwrap());
+        if schema.is_empty() {
+            assert_eq!(decoded, Err(decision::DecodeError::EmptySchemaVersion));
+        } else {
+            let (decoded, rows) = decoded.unwrap();
+            assert_eq!(decoded, version);
+            assert!(rows.is_empty());
         }
     }
 }

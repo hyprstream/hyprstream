@@ -138,6 +138,7 @@ impl TeacherEnsemble {
                 "a teacher ensemble cannot answer an empty question set".to_owned(),
             ));
         }
+        crate::run::validate_entry(state).map_err(EvalError::InvalidInput)?;
         let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
         for question in &set.questions {
             if !ids.insert(&question.id) {
@@ -147,6 +148,11 @@ impl TeacherEnsemble {
                 )));
             }
             crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
+        // Check every teacher before querying the first one: a stricter
+        // later transport must not reject input after earlier billed calls.
+        for teacher in &self.teachers {
+            teacher.subject.preflight(set, state)?;
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
