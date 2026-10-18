@@ -383,10 +383,7 @@ questions:
             },
         ])
         .unwrap();
-        let out = ensemble
-            .decide(&set, &Entry::Null, 0, "item")
-            .await
-            .unwrap();
+        let out = ensemble.decide(&set, &Entry::Null, 0, "item").await.unwrap();
         let average = &out.average["wide"];
         hyprstream_decision::confidence::check_distribution(
             average,
@@ -455,10 +452,7 @@ questions:
             state: None,
             questions: vec![],
         };
-        assert!(ensemble
-            .decide(&empty, &Entry::Null, 0, "item")
-            .await
-            .is_err());
+        assert!(ensemble.decide(&empty, &Entry::Null, 0, "item").await.is_err());
         // Duplicate question ids: the ensemble's `average` map is keyed by
         // id, so a duplicate would silently collapse two declared questions
         // into one.

@@ -46,10 +46,9 @@ impl<B: StorageBackend> BatchSink<B> {
                     .to_owned(),
             )
         })?;
-        let fingerprint = output
-            .schema_fingerprint
-            .as_deref()
-            .ok_or_else(|| EvalError::InvalidInput("run has no schema fingerprint".to_owned()))?;
+        let fingerprint = output.schema_fingerprint.as_deref().ok_or_else(|| {
+            EvalError::InvalidInput("run has no schema fingerprint".to_owned())
+        })?;
         self.store
             .put(
                 fingerprint,

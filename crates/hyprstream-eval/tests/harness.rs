@@ -11,7 +11,9 @@ use hyprstream_decision::arrow::AnswerRow;
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision::spec::QuestionSet;
 use hyprstream_eval::score::ScoreConfig;
-use hyprstream_eval::{score_bench_run, score_run, EvalItem, Harness, Subject, TruthSubject};
+use hyprstream_eval::{
+    score_bench_run, score_run, EvalItem, Harness, Subject, TruthSubject,
+};
 
 fn small_items() -> Vec<hyprstream_bench::Item> {
     generate_all(&BenchConfig {
@@ -41,7 +43,9 @@ impl Subject for UniformSubject {
             let probabilities = vec![1.0 / n as f32; n];
             let value = match question.kind {
                 hyprstream_decision::QuestionKind::Noul => AnswerValue::Noul { p_true: 0.5 },
-                hyprstream_decision::QuestionKind::Choice => AnswerValue::Choice { probabilities },
+                hyprstream_decision::QuestionKind::Choice => {
+                    AnswerValue::Choice { probabilities }
+                }
                 hyprstream_decision::QuestionKind::Score => AnswerValue::Score { probabilities },
                 other => panic!("reserved kind {other}"),
             };
@@ -108,11 +112,7 @@ async fn uniform_subject_flips_and_miscalibrates() {
     // analytic uniform value.
     let accuracy = report.accuracy.unwrap();
     assert!(accuracy < 0.8, "uniform accuracy: {accuracy}");
-    assert!(
-        gate.macro_brier.mean > 0.3,
-        "uniform Brier: {}",
-        gate.macro_brier.mean
-    );
+    assert!(gate.macro_brier.mean > 0.3, "uniform Brier: {}", gate.macro_brier.mean);
     // Uniform argmax (D6 earliest-index) picks index 0 everywhere; rotations
     // move the correct label off index 0, so a label-comparing flip check
     // sees flips.
@@ -163,18 +163,10 @@ async fn argmax_ties_break_earliest_everywhere() {
     let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
     let obs = &output.observations[0];
     assert_eq!(obs.probabilities.as_deref(), Some([0.5, 0.5].as_slice()));
-    assert_eq!(
-        obs.argmax_label_index(),
-        Some(0),
-        "flip-label path: D6 earliest"
-    );
+    assert_eq!(obs.argmax_label_index(), Some(0), "flip-label path: D6 earliest");
 
     let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
-    assert_eq!(
-        report.items[0].correct,
-        Some(false),
-        "D6: argmax = index 0 on a tie"
-    );
+    assert_eq!(report.items[0].correct, Some(false), "D6: argmax = index 0 on a tie");
     assert_eq!(report.accuracy, Some(0.0));
 }
 
@@ -250,11 +242,7 @@ fn noul_item() -> EvalItem {
 #[tokio::test]
 async fn run_items_rejects_a_missing_answer() {
     let items = vec![noul_item()];
-    let error = Harness
-        .run_items(&items, &SilentSubject)
-        .await
-        .err()
-        .unwrap();
+    let error = Harness.run_items(&items, &SilentSubject).await.err().unwrap();
     assert!(
         matches!(error, hyprstream_eval::EvalError::InvalidAnswer { .. }),
         "missing answer must be InvalidAnswer, got {error:?}"
@@ -351,10 +339,7 @@ async fn untagged_observations_join_the_split_as_unknown() {
     // The family breakdown must reconcile with the gate: untagged rows
     // appear under the same sentinel, not vanish from by_family.
     assert!(
-        report
-            .by_family
-            .iter()
-            .any(|bucket| bucket.key == "unknown"),
+        report.by_family.iter().any(|bucket| bucket.key == "unknown"),
         "untagged rows must appear in by_family under `unknown`: {:?}",
         report.by_family.iter().map(|b| &b.key).collect::<Vec<_>>()
     );
@@ -679,10 +664,7 @@ async fn run_items_errors_when_the_model_version_changes_mid_run() {
     second.id = "val-2".into();
     let items = vec![noul_item(), second];
     let error = Harness
-        .run_items(
-            &items,
-            &VersionFlipSubject(std::sync::atomic::AtomicUsize::new(0)),
-        )
+        .run_items(&items, &VersionFlipSubject(std::sync::atomic::AtomicUsize::new(0)))
         .await
         .err()
         .unwrap();
@@ -715,10 +697,7 @@ async fn run_set_errors_when_the_model_version_changes_mid_run() {
         rows: vec![row("r1"), row("r2")],
     };
     let error = Harness
-        .run_set(
-            &set,
-            &VersionFlipSubject(std::sync::atomic::AtomicUsize::new(0)),
-        )
+        .run_set(&set, &VersionFlipSubject(std::sync::atomic::AtomicUsize::new(0)))
         .await
         .err()
         .unwrap();
@@ -886,10 +865,7 @@ async fn teacher_answers_use_the_version_bound_to_each_response() {
         state: None,
         questions: vec![noul_item().question],
     };
-    let output = ensemble
-        .decide(&set, &Entry::Null, 0, "item-1")
-        .await
-        .unwrap();
+    let output = ensemble.decide(&set, &Entry::Null, 0, "item-1").await.unwrap();
     assert_eq!(output.teacher_answers.len(), 1);
     assert_eq!(output.teacher_answers[0].model_id, "fresh-v42");
 }
@@ -1002,7 +978,7 @@ fn flip_rate_never_compares_across_questions_in_partial_set_groups() {
     };
     let observations = vec![
         obs("g", "q1", Some(vec![0.8, 0.1, 0.1])),
-        obs("g", "q2", None),    // base row abstained on q2
+        obs("g", "q2", None), // base row abstained on q2
         obs("g-p1", "q1", None), // rotated row abstained on q1
         obs("g-p1", "q2", Some(vec![0.1, 0.8, 0.1])),
     ];
@@ -1058,10 +1034,7 @@ async fn agreement_summary_is_unmeasured_without_samples() {
         state: None,
         questions: vec![noul_item().question],
     };
-    let output = ensemble
-        .decide(&set, &Entry::Null, 0, "item-1")
-        .await
-        .unwrap();
+    let output = ensemble.decide(&set, &Entry::Null, 0, "item-1").await.unwrap();
     let summary = hyprstream_eval::agreement_summary(&[("item-1".to_owned(), output)]);
     assert_eq!(summary.mean_argmax_agreement, Some(1.0));
 }

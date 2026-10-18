@@ -31,7 +31,11 @@ impl MemoryBackend {
         Status::internal(message.into())
     }
 
-    fn filter(&self, table: &str, where_col: Option<(&str, &str)>) -> Result<RecordBatch, Status> {
+    fn filter(
+        &self,
+        table: &str,
+        where_col: Option<(&str, &str)>,
+    ) -> Result<RecordBatch, Status> {
         let tables = self.tables.lock();
         let (schema, batches) = tables
             .get(table)
@@ -52,9 +56,7 @@ impl MemoryBackend {
             })
             .ok_or_else(|| Self::err(format!("where column {col_name} not found")))?;
         let mask = hyprstream_metrics_api::arrow::array::BooleanArray::from(
-            col.iter()
-                .map(|v| Some(v == Some(value)))
-                .collect::<Vec<_>>(),
+            col.iter().map(|v| Some(v == Some(value))).collect::<Vec<_>>(),
         );
         compute::filter_record_batch(&batch, &mask).map_err(|e| Self::err(e.to_string()))
     }
@@ -80,9 +82,7 @@ impl StorageBackend for MemoryBackend {
 
     async fn query_sql(&self, statement_handle: &[u8]) -> Result<RecordBatch, Status> {
         let sql = std::str::from_utf8(statement_handle).map_err(|e| Self::err(e.to_string()))?;
-        let from_pos = sql
-            .find(" FROM ")
-            .ok_or_else(|| Self::err("no FROM clause"))?;
+        let from_pos = sql.find(" FROM ").ok_or_else(|| Self::err("no FROM clause"))?;
         let table = sql[from_pos + 6..]
             .split_whitespace()
             .next()
@@ -100,10 +100,9 @@ impl StorageBackend for MemoryBackend {
     }
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
-        self.tables.lock().insert(
-            table_name.to_owned(),
-            (Arc::new(schema.clone()), Vec::new()),
-        );
+        self.tables
+            .lock()
+            .insert(table_name.to_owned(), (Arc::new(schema.clone()), Vec::new()));
         Ok(())
     }
 
@@ -127,7 +126,12 @@ impl StorageBackend for MemoryBackend {
         Ok(Vec::new())
     }
     async fn list_tables(&self) -> Result<Vec<String>, Status> {
-        Ok(self.tables.lock().keys().cloned().collect())
+        Ok(self
+            .tables
+            .lock()
+            .keys()
+            .cloned()
+            .collect())
     }
     async fn get_table_schema(&self, table_name: &str) -> Result<Arc<Schema>, Status> {
         self.tables
@@ -140,7 +144,9 @@ impl StorageBackend for MemoryBackend {
         Err(Status::unimplemented("memory backend: views"))
     }
     async fn drop_table(&self, table_name: &str) -> Result<(), Status> {
-        self.tables.lock().remove(table_name);
+        self.tables
+            .lock()
+            .remove(table_name);
         Ok(())
     }
     async fn export_to_parquet(

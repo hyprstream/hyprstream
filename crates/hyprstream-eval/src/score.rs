@@ -18,7 +18,9 @@
 use std::collections::BTreeMap;
 
 use hyprstream_calibration::metrics;
-use hyprstream_calibration::protocol::{FieldMetrics, GateReport, ShiftSplit, GATE_BIN_COUNT};
+use hyprstream_calibration::protocol::{
+    FieldMetrics, GateReport, ShiftSplit, GATE_BIN_COUNT,
+};
 use hyprstream_decision::spec::QuestionKind;
 
 use crate::error::EvalError;
@@ -57,10 +59,7 @@ impl Default for ScoreConfig {
 
 impl ScoreConfig {
     /// Declare the fit families (see [`ScoreConfig::fit_families`]).
-    pub fn with_fit_families(
-        mut self,
-        families: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_fit_families(mut self, families: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.fit_families = families.into_iter().map(Into::into).collect();
         self
     }
@@ -171,7 +170,10 @@ fn field_key(obs: &crate::run::Observation, by_question: bool, multi_family: boo
         }
         return obs.question_id.clone();
     }
-    let cardinality = obs.probabilities.as_ref().map_or(0, std::vec::Vec::len);
+    let cardinality = obs
+        .probabilities
+        .as_ref()
+        .map_or(0, std::vec::Vec::len);
     format!("{family}/{}:{cardinality}", obs.kind)
 }
 
@@ -207,12 +209,8 @@ fn field_metrics(
             n: labels.len(),
             ece: metrics::ece(probs, labels, GATE_BIN_COUNT)?,
             brier: metrics::brier(probs, labels)?,
-            sce: ordinal
-                .then(|| metrics::sce(probs, labels, GATE_BIN_COUNT))
-                .transpose()?,
-            ace: ordinal
-                .then(|| metrics::ace(probs, labels, GATE_BIN_COUNT))
-                .transpose()?,
+            sce: ordinal.then(|| metrics::sce(probs, labels, GATE_BIN_COUNT)).transpose()?,
+            ace: ordinal.then(|| metrics::ace(probs, labels, GATE_BIN_COUNT)).transpose()?,
             rps: ordinal.then(|| metrics::rps(probs, labels)).transpose()?,
         },
         nll,
@@ -544,9 +542,10 @@ pub fn agreement_summary(outputs: &[(String, EnsembleOutput)]) -> EnsembleAgreem
             (id.clone(), mean)
         })
         .collect();
-    let mean_argmax_agreement = hyprstream_calibration::protocol::macro_average(
-        &per_item.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
-    );
+    let mean_argmax_agreement =
+        hyprstream_calibration::protocol::macro_average(
+            &per_item.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        );
     EnsembleAgreement {
         mean_argmax_agreement,
         per_item,

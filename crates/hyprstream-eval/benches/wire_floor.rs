@@ -31,9 +31,7 @@ fn question_set(n: usize, k: usize) -> hyprstream_decision::QuestionSet {
             1 => {
                 doc.push_str(&format!("  q{i}:\n    type: choice\n    instructions: \"Pick the disposition for case {i}.\"\n    criteria:\n"));
                 for j in 0..k {
-                    doc.push_str(&format!(
-                        "      opt{j}: \"Disposition option number {j}\"\n"
-                    ));
+                    doc.push_str(&format!("      opt{j}: \"Disposition option number {j}\"\n"));
                 }
             }
             _ => {
@@ -53,18 +51,14 @@ fn wire_bytes(set: &hyprstream_decision::QuestionSet) -> (usize, usize) {
         &Entry::Str("The crate arrived damaged.".into()),
         "jev-stub-latest",
     );
-    let request_bytes = serde_json::to_vec(&request)
-        .unwrap_or_else(|e| panic!("json: {e}"))
-        .len();
+    let request_bytes = serde_json::to_vec(&request).unwrap_or_else(|e| panic!("json: {e}")).len();
     let row = MockDecisionModel.answer_row(set, "The crate arrived damaged.", 0);
     let response = serde_json::json!({
         "model": "jev-stub-1.0.0",
         "answers": render::render_answers(set, &row),
         "usage": {"input_tokens": 0, "output_tokens": 0},
     });
-    let response_bytes = serde_json::to_vec(&response)
-        .unwrap_or_else(|e| panic!("json: {e}"))
-        .len();
+    let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|e| panic!("json: {e}")).len();
     (request_bytes, response_bytes)
 }
 

@@ -33,9 +33,7 @@ questions:
 
 async fn serve_stub() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    hyprstream_decision_stub::facade::serve(listener)
-        .await
-        .unwrap()
+    hyprstream_decision_stub::facade::serve(listener).await.unwrap()
 }
 
 #[tokio::test]
@@ -81,10 +79,12 @@ async fn http_subject_drives_a_full_bench_slice() {
     .collect();
     let output = Harness.run_items(&items, &subject).await.unwrap();
     assert_eq!(output.observations.len(), items.len());
-    assert!(output
-        .observations
-        .iter()
-        .all(|obs| obs.probabilities.is_some()));
+    assert!(
+        output
+            .observations
+            .iter()
+            .all(|obs| obs.probabilities.is_some())
+    );
     server.abort();
 }
 
@@ -160,11 +160,8 @@ async fn wire_preserves_declared_option_order_end_to_end() {
     let set = fixture();
     let state = Entry::Str("The box was crushed.".into());
     let row = subject.decide(&set, &state, 0).await.unwrap();
-    let reference = hyprstream_decision_stub::mock::MockDecisionModel.answer_row(
-        &set,
-        "The box was crushed.",
-        0,
-    );
+    let reference =
+        hyprstream_decision_stub::mock::MockDecisionModel.answer_row(&set, "The box was crushed.", 0);
     assert_eq!(
         row, reference,
         "the wire must carry the declared option order byte-for-byte"
@@ -220,12 +217,7 @@ async fn teacher_answers_record_the_resolved_model_id() {
     }])
     .unwrap();
     let out = ensemble
-        .decide(
-            &fixture(),
-            &Entry::Str("The box was crushed.".into()),
-            0,
-            "item",
-        )
+        .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0, "item")
         .await
         .unwrap();
     assert_eq!(
@@ -278,10 +270,7 @@ async fn http_subject_rejects_a_response_without_the_resolved_model() {
         .unwrap();
     match error {
         hyprstream_eval::EvalError::Http(message) => {
-            assert!(
-                message.contains("model"),
-                "the error must name the missing field: {message}"
-            );
+            assert!(message.contains("model"), "the error must name the missing field: {message}");
         }
         other => panic!("a model-less response must be an Http error, got {other:?}"),
     }
