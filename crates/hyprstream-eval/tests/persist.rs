@@ -645,3 +645,69 @@ questions:
     let (_, stored) = sink.store().get(&id).await.unwrap().unwrap();
     assert_eq!(stored, expected);
 }
+
+#[tokio::test]
+async fn contradictory_model_provenance_is_rejected_by_scoring_and_persistence() {
+    use hyprstream_eval::{score_run, ScoreConfig};
+    let backend = Arc::new(MemoryBackend::default());
+    let sink = BatchSink::new(backend.clone());
+    sink.init().await.unwrap();
+    for mutation in [
+        "report-only",
+        "version-and-batch",
+        "empty-report",
+        "both-empty",
+    ] {
+        let mut output = Harness
+            .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+            .await
+            .unwrap();
+        match mutation {
+            "report-only" => output.model_id = "different-report-model".into(),
+            "version-and-batch" => {
+                output.version.model = "different-stored-model".into();
+                replace_version_column(
+                    &mut output,
+                    "model_version",
+                    vec![
+                        Some("different-stored-model"),
+                        Some("different-stored-model"),
+                    ],
+                );
+            }
+            "empty-report" => output.model_id.clear(),
+            "both-empty" => {
+                output.model_id.clear();
+                output.version.model.clear();
+                replace_version_column(&mut output, "model_version", vec![Some(""), Some("")]);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                score_run(&output, &ScoreConfig::default()),
+                Err(hyprstream_eval::EvalError::InvalidInput(_))
+            ),
+            "scoring mutation {mutation}"
+        );
+        assert!(
+            matches!(
+                sink.persist_run(&output).await,
+                Err(hyprstream_eval::EvalError::InvalidInput(_))
+            ),
+            "persistence mutation {mutation}"
+        );
+        assert!(
+            backend.tables.lock()["decision_batches"].1.is_empty(),
+            "mutation {mutation} reached backend"
+        );
+    }
+    let valid = Harness
+        .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+        .await
+        .unwrap();
+    score_run(&valid, &ScoreConfig::default()).unwrap();
+    let id = sink.persist_run(&valid).await.unwrap();
+    let (meta, _) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(meta.model_id, valid.model_id);
+}
