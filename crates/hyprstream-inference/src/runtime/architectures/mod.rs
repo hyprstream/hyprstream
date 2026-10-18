@@ -231,6 +231,32 @@ pub trait ModelOperations: Send {
     /// Forward pass through the model
     fn forward(&self, input: &Tensor, past_kv: Option<&Tensor>) -> Result<Tensor>;
 
+    /// Stateless full-sequence final-normalized hidden states; no vocabulary logits.
+    /// Implementations must use fresh call-local recurrent/KV state.
+    fn decision_hidden_states(&self, _input: &Tensor) -> Result<Tensor> {
+        Err(anyhow!(
+            "decision hidden states unsupported for this architecture"
+        ))
+    }
+
+    /// Stateless decision forward with a cooperative deadline/cancellation check.
+    /// Native implementations call the checker between decoder layers.
+    fn decision_hidden_states_checked(
+        &self,
+        input: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
+        self.decision_hidden_states(input)
+    }
+
+    /// Gather original output embedding rows, preserving the LM-head vocabulary axis.
+    fn decision_output_embedding_rows(&self, _ids: &[i64]) -> Result<Tensor> {
+        Err(anyhow!(
+            "decision output embeddings unsupported for this architecture"
+        ))
+    }
+
     /// Get VarStore for training (if available)
     fn var_store(&self) -> Option<&nn::VarStore> {
         None // Default implementation returns None

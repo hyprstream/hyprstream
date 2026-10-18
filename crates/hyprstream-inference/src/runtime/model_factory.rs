@@ -111,6 +111,9 @@ pub(crate) fn dequantize_fp8_weights_at_load(weights: &mut HashMap<String, Tenso
     let mut converted = 0;
 
     for key in fp8_keys {
+        if weights.contains_key(&format!("{key}_scale")) {
+            continue;
+        }
         let Some(weight) = weights.remove(&key) else {
             continue;
         };
@@ -381,6 +384,15 @@ impl ModelFactory {
         fp8_dequant_load: bool,
         speculative_decoding: bool,
     ) -> Result<Box<dyn ModelOperations>> {
+        // Validate the declared compute profile before allocating shard payloads.
+        let channel_profile = super::channel_fp8::ChannelFp8Profile::read(model_path)?;
+        if channel_profile.is_some() {
+            anyhow::ensure!(
+                *device == Device::Cpu,
+                "FP8_DYNAMIC is CPU-only pending CPU acceptance"
+            );
+            anyhow::ensure!(!fp8_dequant_load, "FP8_DYNAMIC must retain activation QDQ; eager weight-only decoding is not equivalent");
+        }
         info!("Loading model: {}", model_path.display());
         if let Some(mc) = max_context {
             info!("Using max_context override: {} tokens", mc);
@@ -416,6 +428,9 @@ impl ModelFactory {
         } else {
             shard_files.clone()
         };
+        if let Some(profile) = &channel_profile {
+            profile.preflight(&mtp_shards)?;
+        }
         let speculative_decoding = Self::mtp_loading_policy(
             model_path,
             &mtp_shards,
@@ -673,9 +688,11 @@ impl ModelFactory {
         required: &mut BTreeSet<String>,
         name: &str,
     ) {
-        let scale = format!("{name}_scale_inv");
-        if weight_map.contains_key(&scale) {
-            required.insert(scale);
+        for suffix in ["_scale_inv", "_scale"] {
+            let scale = format!("{name}{suffix}");
+            if weight_map.contains_key(&scale) {
+                required.insert(scale);
+            }
         }
     }
 
@@ -1366,7 +1383,16 @@ impl ModelFactory {
         //
         // #315 note: for whole-model mode this env var is independent of
         // `RuntimeConfig.mmap`, which today gates nothing here.
+        // FP8_DYNAMIC is a bounded-memory CPU path: never add a full-shard
+        // anonymous read buffer on top of the resident packed weights.
+        let channel_mmap = path
+            .parent()
+            .map(super::channel_fp8::ChannelFp8Profile::read)
+            .transpose()?
+            .flatten()
+            .is_some();
         let use_mmap = selected.is_some()
+            || channel_mmap
             || std::env::var("HYPRSTREAM_USE_MMAP")
                 .map(|v| v.to_lowercase() == "true" || v == "1")
                 .unwrap_or(false);
@@ -1585,6 +1611,13 @@ impl ModelFactory {
                 _ => tch::Kind::Float,
             };
 
+            // Scales retain their stored precision, independent of compute dtype.
+            let dtype = if name.ends_with(".weight_scale") || name.ends_with(".weight_scale_inv") {
+                tensor_kind
+            } else {
+                dtype
+            };
+
             // Calculate tensor size for progress reporting
             let tensor_size_mb = estimate_tensor_size_mb(&shape, tensor_kind);
             total_size_mb += tensor_size_mb;
@@ -1593,7 +1626,10 @@ impl ModelFactory {
             let tensor = match tensor_view.dtype() {
                 safetensors::Dtype::BF16 => {
                     // Verify target dtype matches
-                    if dtype != tch::Kind::BFloat16 && dtype != tch::Kind::Half {
+                    if !matches!(
+                        dtype,
+                        tch::Kind::BFloat16 | tch::Kind::Half | tch::Kind::Float
+                    ) {
                         return Err(anyhow!("Model dtype BF16 but target dtype is {:?}", dtype));
                     }
 
@@ -1614,8 +1650,8 @@ impl ModelFactory {
                     let cpu_tensor = borrowed_tensor.copy();
 
                     // Convert dtype if needed
-                    let cpu_tensor = if dtype == tch::Kind::Half {
-                        cpu_tensor.to_kind(tch::Kind::Half)
+                    let cpu_tensor = if dtype != tch::Kind::BFloat16 {
+                        cpu_tensor.to_kind(dtype)
                     } else {
                         cpu_tensor
                     };
@@ -1631,7 +1667,10 @@ impl ModelFactory {
                 }
                 safetensors::Dtype::F16 => {
                     // Verify target dtype matches
-                    if dtype != tch::Kind::Half && dtype != tch::Kind::BFloat16 {
+                    if !matches!(
+                        dtype,
+                        tch::Kind::BFloat16 | tch::Kind::Half | tch::Kind::Float
+                    ) {
                         return Err(anyhow!("Model dtype F16 but target dtype is {:?}", dtype));
                     }
 
@@ -1644,8 +1683,8 @@ impl ModelFactory {
                     let cpu_tensor = borrowed_tensor.copy();
 
                     // Convert dtype if needed
-                    let cpu_tensor = if dtype == tch::Kind::BFloat16 {
-                        cpu_tensor.to_kind(tch::Kind::BFloat16)
+                    let cpu_tensor = if dtype != tch::Kind::Half {
+                        cpu_tensor.to_kind(dtype)
                     } else {
                         cpu_tensor
                     };
@@ -1777,6 +1816,18 @@ impl ModelFactory {
         fp8_dequant_load: bool,
         speculative_decoding: bool,
     ) -> Result<Box<dyn ModelOperations>> {
+        if let Some(profile) = super::channel_fp8::ChannelFp8Profile::read(model_path)? {
+            anyhow::ensure!(
+                !fp8_dequant_load && *device == Device::Cpu,
+                "unsupported FP8_DYNAMIC execution policy"
+            );
+            profile.validate(&weights)?;
+        } else {
+            anyhow::ensure!(
+                !weights.keys().any(|k| k.ends_with(".weight_scale")),
+                "channel FP8 weights require authoritative compressed-tensors config"
+            );
+        }
         // Run TTN analysis: Tier 1 (embedded) → Tier 2 (cached) → Tier 3 (weight entropy SVD).
         // Weights are available here, enabling Tier 3 for unknown models.
         // Result cached to .analysis/layer_profile.json; non-fatal if it fails.
@@ -3371,6 +3422,48 @@ mod fp8_dequant_tests {
     }
 
     #[test]
+    fn cpu_fp32_loader_preserves_bf16_values_and_channel_fp8_scales() {
+        let floating = RawTensor::bf16("model.norm.weight", &[2], 0.125);
+        let packed = RawTensor::f8("p.weight", &[2, 3]);
+        let scale = RawTensor::bf16("p.weight_scale", &[2, 1], 0.25);
+        let fixtures = [floating, packed, scale];
+        let views: Vec<_> = fixtures
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    TensorView::new(t.dtype, t.shape.clone(), &t.data).unwrap(),
+                )
+            })
+            .collect();
+        let bytes = serialize(views, &None).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut weights = HashMap::new();
+        ModelFactory::create_tensors_from_safetensors(
+            tensors,
+            &mut weights,
+            &Device::Cpu,
+            DType::Float,
+            false,
+        )
+        .unwrap();
+        assert_eq!(weights["model.norm.weight"].kind(), DType::Float);
+        assert_eq!(weights["model.norm.weight"].double_value(&[0]), 0.125);
+        assert_eq!(weights["p.weight"].kind(), DType::Float8e4m3fn);
+        assert_eq!(weights["p.weight_scale"].kind(), DType::BFloat16);
+        assert_eq!(
+            dequantize_fp8_weights_at_load(&mut weights),
+            0,
+            "eager block-only decoder must not erase dynamic activation QDQ"
+        );
+        assert!(weights.contains_key("p.weight_scale"));
+        let projection = LinearProjection::take(&mut weights, "p.weight").unwrap();
+        let result = projection.apply(&Tensor::ones([1, 3], (DType::Float, Device::Cpu)));
+        assert_eq!(result.kind(), DType::Float);
+        assert!(result.isfinite().all().int64_value(&[]) != 0);
+    }
+
+    #[test]
     fn dequant_at_load_noop_without_fp8() {
         let mut weights = HashMap::from([(
             "w.weight".to_owned(),
@@ -3520,6 +3613,106 @@ mod fp8_dequant_tests {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Resource-admitted, external-checkpoint CPU gate. Never downloads models.
+    /// Run only as the exact ignored test in its own process (four CPU threads).
+    #[tokio::test]
+    #[ignore = "requires explicit real-model path, receipt path and parent memory admission"]
+    async fn real_clef_fp8_cpu_backbone_smoke() {
+        let model_path = PathBuf::from(
+            std::env::var("HYPRSTREAM_CLEF_FP8_MODEL").expect("explicit model path required"),
+        );
+        let receipt_path = PathBuf::from(
+            std::env::var("HYPRSTREAM_CLEF_BACKBONE_RECEIPT")
+                .expect("explicit smoke receipt path required"),
+        );
+        assert!(model_path.is_dir());
+        let memory =
+            std::fs::read_to_string("/proc/meminfo").expect("Linux memory admission required");
+        let available_kib = memory
+            .lines()
+            .find(|line| line.starts_with("MemAvailable:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("MemAvailable required");
+        assert!(
+            available_kib >= 21 * 1024 * 1024,
+            "CPU smoke requires21GiB MemAvailable at actual test start; got{}KiB",
+            available_kib
+        );
+        tch::set_num_threads(4);
+        tch::set_num_interop_threads(1);
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).unwrap();
+        let encode = |text: &str| {
+            let encoded = tokenizer.encode(text, false).unwrap();
+            let ids: Vec<i64> = encoded.get_ids().iter().map(|id| *id as i64).collect();
+            assert!(!ids.is_empty() && ids.len() <= 32);
+            ids
+        };
+        let ids_a = encode("The quick brown fox jumps over a lazy dog.");
+        let ids_b = encode("A different independent request about ocean waves.");
+        let a = Tensor::from_slice(&ids_a).reshape([1, ids_a.len() as i64]);
+        let b = Tensor::from_slice(&ids_b).reshape([1, ids_b.len() as i64]);
+        let started = std::time::Instant::now();
+        let model = ModelFactory::create(
+            &model_path,
+            &Device::Cpu,
+            DType::Float,
+            Some(64),
+            KVQuantType::None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let load_ms = started.elapsed().as_millis();
+        assert!(matches!(
+            model.architecture(),
+            crate::runtime::architectures::ModelArchitecture::Qwen3_5
+        ));
+        let _no_grad = tch::no_grad_guard();
+        let forward_start = std::time::Instant::now();
+        let hidden = model.decision_hidden_states(&a).unwrap();
+        let first_forward_ms = forward_start.elapsed().as_millis();
+        assert_eq!(hidden.size(), [ids_a.len() as i64, 4096]);
+        assert_eq!(hidden.kind(), DType::Float);
+        assert!(hidden.isfinite().all().int64_value(&[]) != 0);
+        let rows = model
+            .decision_output_embedding_rows(&ids_a[..3.min(ids_a.len())])
+            .unwrap();
+        assert_eq!(rows.size(), [3.min(ids_a.len()) as i64, 4096]);
+        assert_eq!(rows.kind(), hidden.kind());
+        assert!(rows.isfinite().all().int64_value(&[]) != 0);
+        // Exercise another fresh request, then contaminate persistent generation
+        // state without performing any vocabulary projection.
+        let other = model.decision_hidden_states(&b).unwrap();
+        assert!(other.isfinite().all().int64_value(&[]) != 0);
+        let emb = model.embed_tokens(&b).unwrap();
+        let _ = model
+            .forward_layers(&emb, 0..model.num_layers(), 0, None)
+            .unwrap();
+        let repeated = model.decision_hidden_states(&a).unwrap();
+        let repeated_max_abs = (&hidden - &repeated).abs().max().double_value(&[]);
+        assert!(
+            hidden.allclose(&repeated, 1e-6, 1e-6, false),
+            "cross-request state contamination"
+        );
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let receipt = serde_json::json!({
+            "gate":"native-clef-backbone-cpu-smoke", "result":"PASS",
+            "model_path":model_path,"candidate_sha":std::env::var("HYPRSTREAM_CANDIDATE_SHA").ok(),
+            "device":"cpu","compute_dtype":"float32","cpu_threads":4,"context_limit":64,"admission_available_kib":available_kib,
+            "input_a_tokens":ids_a,"input_b_tokens":ids_b,"load_ms":load_ms,
+            "first_forward_ms":first_forward_ms,"elapsed_ms":started.elapsed().as_millis(),
+            "hidden_shape":hidden.size(),"lm_rows_shape":rows.size(),"repeated_max_abs":repeated_max_abs,
+            "process_memory":status.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:")).collect::<Vec<_>>(),
+            "acceptance_scope":"native-backbone-smoke-only",
+            "not_proven":["joint-head parity","trusted-reference parity","authenticated serving","GPU eligibility"]
+        });
+        std::fs::write(receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     }
 
     #[tokio::test]
