@@ -12,6 +12,7 @@ use hyprstream_decision::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::family::SynthFamily;
 use crate::item::SynthItem;
 use crate::teacher::{Teacher, TosClass};
 
@@ -226,7 +227,57 @@ impl CorpusRow {
                 "row distributability differs from its teacher ToS classes",
             ));
         }
+        row.validate_artifact_digest()?;
         Ok(row)
+    }
+
+    /// Reconstruct the frozen `syn-item/1` artifact from the imported row and
+    /// verify that its provenance digest still identifies those exact bytes.
+    fn validate_artifact_digest(&self) -> Result<(), serde_json::Error> {
+        let invalid = |message: &str| <serde_json::Error as serde::de::Error>::custom(message);
+        let family = SynthFamily::from_id(&self.family)
+            .ok_or_else(|| invalid("unknown synthetic family in artifact identity"))?;
+        let question = self
+            .question_spec()
+            .ok_or_else(|| invalid("unknown question kind in artifact identity"))?;
+
+        // Reject metadata that question_spec() would otherwise ignore while
+        // rebuilding its typed body. These fields are part of the row's
+        // canonical artifact projection.
+        let expected_rubrics = question.labels().len();
+        if question.labels() != self.labels
+            || question.kind.as_str() != self.kind
+            || self.rubrics.len()
+                != match question.kind {
+                    QuestionKind::Noul => 0,
+                    QuestionKind::Choice | QuestionKind::Score => expected_rubrics,
+                    _ => return Err(invalid("unsupported question kind in artifact identity")),
+                }
+            || (question.kind != QuestionKind::Noul && self.noul_criteria.is_some())
+        {
+            return Err(invalid(
+                "row fields do not reconstruct a canonical syn-item/1 artifact",
+            ));
+        }
+
+        let item = SynthItem::new(
+            family,
+            self.seed,
+            self.rotation,
+            self.paraphrase,
+            hyprstream_decision::Entry::Str(self.state.clone()),
+            question
+                .instructions
+                .as_ref()
+                .map(hyprstream_decision::Entry::canonical_text),
+            question.body,
+        );
+        if item.id != self.id || item.group != self.group || item.hash() != self.blake3 {
+            return Err(invalid(
+                "row artifact fields do not match its syn-item/1 blake3 digest",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -415,6 +466,14 @@ mod tests {
         let spec = row.question_spec().unwrap();
         assert_eq!(spec.id, row.id);
         assert_eq!(spec.labels(), row.labels);
+    }
+
+    #[test]
+    fn imported_row_rejects_state_change_with_retained_artifact_digest() {
+        let mut row = sample_row(TosClass::OpenWeights);
+        row.state.push_str(" altered");
+        let error = CorpusRow::from_json_line(&row.to_json_line()).unwrap_err();
+        assert!(error.to_string().contains("syn-item/1 blake3 digest"));
     }
 
     #[test]

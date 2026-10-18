@@ -313,6 +313,10 @@ fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) 
     }
 }
 
+fn check_wire_distribution(probabilities: &[f32]) -> Result<(), confidence::DistributionError> {
+    confidence::check_distribution(probabilities, CONSUMER_SUM_TOLERANCE)
+}
+
 /// Parse one answer object from the response `answers` map back into the IR.
 /// A JSON `null` value position (`{"type":"noul","noul":null}`, …) is an
 /// abstention; anything structurally off is an [`EvalError::InvalidAnswer`].
@@ -364,7 +368,7 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
                     }
                     probabilities.push(p as f32);
                 }
-                confidence::check_distribution(&probabilities, CONSUMER_SUM_TOLERANCE)
+                check_wire_distribution(&probabilities)
                     .map_err(|error| invalid(format!("distribution: {error}")))?;
                 // The wire accepts consumer-tolerance sums (e.g. a rounded
                 // [0.333, 0.333, 0.333]); renormalize so the IR meets the
@@ -1133,6 +1137,20 @@ questions:
                 }
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn wide_score_distribution_uses_normative_f32_sum() {
+        // Summing these identical components as f64 is within the consumer
+        // tolerance, but the normative left-to-right f32 sum is outside it.
+        // This guards the parser's wire check against a wider-precision sum.
+        const LEVELS: usize = 1_150_000;
+        let probability = 1.0_f32 / LEVELS as f32;
+        let probabilities = vec![probability; LEVELS];
+        let f64_sum: f64 = probabilities.iter().map(|&value| f64::from(value)).sum();
+        assert!((f64_sum - 1.0).abs() <= f64::from(CONSUMER_SUM_TOLERANCE));
+        assert!(check_wire_distribution(&probabilities).is_err());
     }
 
     #[test]
