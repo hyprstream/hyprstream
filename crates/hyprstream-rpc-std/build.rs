@@ -51,20 +51,12 @@ fn main() {
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
 
-    // Copy CGR files to stable codegen-out/ for TypeScript codegen.
-    // `decision` is excluded: it is a native-only data contract (recursive
-    // Entry type, zero request/response variants) and the TypeScript generator
-    // fails closed on it. P3.1 re-evaluates TS support when the decision
-    // surface gains service registration.
+    // Copy every canonical CGR to the stable TypeScript catalog, including
+    // data-only decision. The generator supports standalone struct/union
+    // builders and parsers; public_ts_consumer checks the actual catalog.
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
     for name in &schemas {
-        if *name == "decision" {
-            // Remove any stale copy left by an earlier build in this checkout —
-            // the TS generator enumerates every .cgr in codegen-out/.
-            let _ = std::fs::remove_file(codegen_dir.join("decision.cgr"));
-            continue;
-        }
         let cgr_path = out_path.join(format!("{name}.cgr"));
         if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));

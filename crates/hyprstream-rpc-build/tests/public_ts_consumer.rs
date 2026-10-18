@@ -19,6 +19,50 @@ use std::process::Command;
 
 use hyprstream_rpc_build::compile_schemas;
 
+// Reuse the EXACT production emitter source, not a mirrored implementation.
+// The CLI's `mod ts_codegen;` and this test path compile the same module files.
+// Integration tests cannot access a binary-private module through the library.
+#[path = "../src/ts_codegen/mod.rs"]
+mod canonical_ts_codegen;
+
+fn canonical_data_companion(
+    cgr: &Path,
+    original_name: &str,
+) -> hyprstream_rpc_build::schema::types::ParsedSchema {
+    // Parse under the ORIGINAL filename: the CGR reader uses that prefix to
+    // select canonical local nodes. Renaming the CGR before parsing is invalid.
+    let mut schema =
+        hyprstream_rpc_build::schema::cgr_reader::parse_from_cgr_path(cgr, original_name)
+            .expect("parse actual canonical service metadata");
+    let request = schema
+        .request_struct
+        .take()
+        .expect("canonical request root");
+    let response = schema
+        .response_struct
+        .take()
+        .expect("canonical response root");
+    schema.structs.push(request);
+    schema.structs.push(response);
+    let before = serde_json::to_value(&schema.structs).expect("snapshot every canonical StructDef");
+    let enums_before =
+        serde_json::to_value(&schema.enums).expect("snapshot canonical enum metadata");
+    // Only service classification changes; every real root/union/field offset,
+    // type, annotation and imported StructDef remains byte-equivalent metadata.
+    schema.request_variants.clear();
+    schema.response_variants.clear();
+    schema.scoped_clients.clear();
+    assert_eq!(
+        before,
+        serde_json::to_value(&schema.structs).expect("projected StructDefs")
+    );
+    assert_eq!(
+        enums_before,
+        serde_json::to_value(&schema.enums).expect("projected enum metadata")
+    );
+    schema
+}
+
 const PUBLIC_SCHEMAS: &[&str] = &[
     "inference",
     "model",
@@ -29,6 +73,7 @@ const PUBLIC_SCHEMAS: &[&str] = &[
     "service_events",
     "chat_core",
     "oauth",
+    "decision",
     "worker",
     "workflow",
     "discovery",
@@ -121,6 +166,33 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
         PUBLIC_SCHEMAS,
     );
 
+    // Compile additional real data-only CGRs through the same production CLI,
+    // so recursive behavior is tested independently of Clef's Entry names.
+    let fixture_schema_dir = root.join("fixture-schemas");
+    fs::create_dir_all(&fixture_schema_dir).expect("create recursive schema fixture directory");
+    fs::write(
+        fixture_schema_dir.join("recursive_codegen_fixture.capnp"),
+        include_str!("recursive_codegen_fixture.capnp"),
+    )
+    .expect("write actual recursive schema fixture");
+    compile_schemas(
+        &fixture_schema_dir,
+        &cgr_dir,
+        &[fixture_schema_dir.as_path()],
+        &["recursive_codegen_fixture"],
+    );
+
+    let canonical_inputs: Vec<_> = ["model", "registry"]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                fs::read(cgr_dir.join(format!("{name}.cgr")))
+                    .expect("snapshot original canonical CGR bytes"),
+            )
+        })
+        .collect();
+
     let status = Command::new(codegen_binary())
         .args(["--input-dir", cgr_dir.to_str().expect("CGR path is UTF-8")])
         .args([
@@ -134,6 +206,53 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
         "canonical schema TypeScript generation failed"
     );
 
+    // Only the rebuilt production binary emits actual ModelClient/RegistryClient
+    // and their shared runtime. Test-only response builders reuse those exact
+    // emitter sources after canonical extraction, with service classification
+    // cleared. No handwritten client, wire encoder, cast or production export
+    // change exists solely for this fixture.
+    let mut companions = Vec::new();
+    for (name, bytes) in &canonical_inputs {
+        let path = cgr_dir.join(format!("{name}.cgr"));
+        assert_eq!(
+            *bytes,
+            fs::read(&path).expect("canonical bytes after CLI generation")
+        );
+        let companion = canonical_data_companion(&path, name);
+        companions.push((format!("{name}_wire_fixture"), companion));
+        assert_eq!(
+            *bytes,
+            fs::read(&path).expect("canonical bytes after data projection")
+        );
+    }
+    // Exercise the canonical public emitter entry point in an isolated directory.
+    // Copy ONLY the two companion schema modules: runtime/index/actual clients
+    // in output_dir remain exclusively the rebuilt production CLI's output.
+    let runtime_before =
+        fs::read(output_dir.join("capnp.ts")).expect("snapshot actual CLI runtime");
+    let index_before = fs::read(output_dir.join("index.ts")).expect("snapshot actual CLI index");
+    let companion_dir = root.join("data-companions");
+    fs::create_dir_all(&companion_dir).expect("create isolated companion output");
+    canonical_ts_codegen::generate_all(
+        &canonical_ts_codegen::TypeScriptBackend,
+        &companions,
+        &companion_dir,
+    );
+    for (name, _) in &companions {
+        fs::copy(
+            companion_dir.join(format!("{name}.ts")),
+            output_dir.join(format!("{name}.ts")),
+        )
+        .expect("copy only canonical data-only response companion");
+    }
+    assert_eq!(
+        runtime_before,
+        fs::read(output_dir.join("capnp.ts")).expect("actual CLI runtime unchanged")
+    );
+    assert_eq!(
+        index_before,
+        fs::read(output_dir.join("index.ts")).expect("actual CLI index unchanged")
+    );
     assert!(output_dir.join("capnp.ts").is_file());
     assert!(output_dir.join("index.ts").is_file());
     for schema in PUBLIC_SCHEMAS {
@@ -169,6 +288,12 @@ for (const conformalSet of [undefined, [], ['alpha', 'λ', 'quote"slash\\']] as 
 "#,
     )
     .expect("write canonical optional text-list consumer");
+
+    fs::write(
+        output_dir.join("public_decision_consumer.ts"),
+        include_str!("public_decision_consumer.ts"),
+    )
+    .expect("write real generated decision/error public consumer");
 
     let mut sources: Vec<PathBuf> = fs::read_dir(&output_dir)
         .expect("read generated TypeScript directory")
@@ -212,6 +337,15 @@ for (const conformalSet of [undefined, [], ['alpha', 'λ', 'quote"slash\\']] as 
     assert!(
         status.success(),
         "canonical optional text-list consumer failed"
+    );
+
+    let status = Command::new("node")
+        .arg(output_dir.join("compiled/public_decision_consumer.js"))
+        .status()
+        .expect("run actual generated decision/error consumer");
+    assert!(
+        status.success(),
+        "actual generated decision/error public consumer failed"
     );
 
     fs::remove_dir_all(root).expect("remove consumer test directory");
