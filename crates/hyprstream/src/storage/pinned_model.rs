@@ -2,7 +2,7 @@
 
 use anyhow::{ensure, Context, Result};
 use git2::{Oid, StatusOptions};
-use git2db::pinned_disk::DiskPinnedTreeProjection;
+use git2db::pinned_disk::{DiskPinnedTreeProjection, ProjectionPolicy};
 use git2db::pinned_tree::{PinnedTree, SealedTreeProjection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,8 @@ pub enum PinnedModelArtifact {
 /// verified file descriptors.
 #[derive(Default)]
 pub struct StagingPinnedArtifactCache {
-    entries: Mutex<HashMap<(PathBuf, git2::Oid), Weak<PinnedModelArtifact>>>,
+    entries:
+        Mutex<HashMap<(PathBuf, git2::Oid, ProjectionPolicy, PathBuf), Weak<PinnedModelArtifact>>>,
 }
 
 impl StagingPinnedArtifactCache {
@@ -67,12 +68,77 @@ impl StagingPinnedArtifactCache {
         after_admission: impl FnOnce() -> Result<()>,
         after_capture: impl FnOnce() -> Result<()>,
     ) -> Result<Arc<PinnedModelArtifact>> {
+        self.acquire_policy_with_observer(
+            worktree_path,
+            commit,
+            private_disk_parent,
+            ProjectionPolicy::default(),
+            after_admission,
+            after_capture,
+        )
+        .await
+    }
+
+    /// Server-owned per-pin policy; no request can supply expanded byte limits
+    /// or hydration paths. Distinct policies never share cache entries.
+    pub async fn acquire_with_policy(
+        &self,
+        worktree_path: &Path,
+        commit: git2::Oid,
+        policy: ProjectionPolicy,
+    ) -> Result<Arc<PinnedModelArtifact>> {
+        self.acquire_policy_with_observer(
+            worktree_path,
+            commit,
+            Path::new("/var/cache/hyprstream-pinned"),
+            policy,
+            || Ok(()),
+            || Ok(()),
+        )
+        .await
+    }
+
+    /// Isolated acceptance uses the SAME production bounded capture with a
+    /// task-owned private disk parent; no runtime env/RPC override exists.
+    #[cfg(test)]
+    pub(crate) async fn acquire_with_policy_in(
+        &self,
+        worktree_path: &Path,
+        commit: git2::Oid,
+        private_disk_parent: &Path,
+        policy: ProjectionPolicy,
+    ) -> Result<Arc<PinnedModelArtifact>> {
+        self.acquire_policy_with_observer(
+            worktree_path,
+            commit,
+            private_disk_parent,
+            policy,
+            || Ok(()),
+            || Ok(()),
+        )
+        .await
+    }
+
+    async fn acquire_policy_with_observer(
+        &self,
+        worktree_path: &Path,
+        commit: git2::Oid,
+        private_disk_parent: &Path,
+        policy: ProjectionPolicy,
+        after_admission: impl FnOnce() -> Result<()>,
+        after_capture: impl FnOnce() -> Result<()>,
+    ) -> Result<Arc<PinnedModelArtifact>> {
         // A cache hit may share only the exact commit from the exact local
         // checkout, and the checkout must still satisfy the current load's
         // clean/HEAD admission rule.
         verify_selected_checkout(worktree_path, commit)?;
         after_admission()?;
-        let key = (worktree_path.to_path_buf(), commit);
+        let key = (
+            worktree_path.to_path_buf(),
+            commit,
+            policy.clone(),
+            private_disk_parent.to_path_buf(),
+        );
         let mut entries = self.entries.lock().await;
         // The mutex is held through a whole capture. A waiter's admission
         // check above can predate that capture entirely, so re-observe the
@@ -86,10 +152,14 @@ impl StagingPinnedArtifactCache {
         // Hold the async cache lock while acquiring to make same-commit loads
         // coalesce. The bounded acquisition itself runs on the projection I/O
         // runtime, not the Model service reactor.
-        let projection =
-            DiskPinnedTreeProjection::acquire_bounded(worktree_path, commit, private_disk_parent)
-                .await
-                .with_context(|| format!("capture model commit {commit}"))?;
+        let projection = DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            worktree_path,
+            commit,
+            private_disk_parent,
+            policy,
+        )
+        .await
+        .with_context(|| format!("capture model commit {commit}"))?;
         after_capture()?;
         // Capturing a large model can take long enough for a checkout update
         // to race the admission. Do not publish an artifact unless the exact
@@ -211,7 +281,13 @@ async fn acquire_pinned_model_with_observer(
 ) -> Result<DiskPinnedTreeProjection> {
     verify_selected_checkout(worktree_path, commit)?;
     let projection = if bounded {
-        DiskPinnedTreeProjection::acquire_bounded(worktree_path, commit, private_disk_parent).await
+        DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            worktree_path,
+            commit,
+            private_disk_parent,
+            ProjectionPolicy::default(),
+        )
+        .await
     } else {
         DiskPinnedTreeProjection::acquire(worktree_path, commit, private_disk_parent).await
     }
@@ -264,6 +340,65 @@ mod tests {
     // slot. Serialize tests that acquire it so parallel libtest scheduling
     // cannot make the sharing assertion fail for unrelated test timing.
     static BOUNDED_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn projection_policy_cache_does_not_reuse_more_permissive_capture() -> Result<()> {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
+        let source = tempfile::tempdir()?;
+        let commit = commit_tracked_file(source.path(), b"12345678")?;
+        let parent = disk_backed_private_parent()?;
+        let cache = StagingPinnedArtifactCache::default();
+        let policy = ProjectionPolicy::from_trusted_contract(8, Default::default())?;
+        let a = cache
+            .acquire_policy_with_observer(
+                source.path(),
+                commit,
+                parent.path(),
+                policy.clone(),
+                || Ok(()),
+                || Ok(()),
+            )
+            .await?;
+        let b = cache
+            .acquire_policy_with_observer(
+                source.path(),
+                commit,
+                parent.path(),
+                policy,
+                || Ok(()),
+                || Ok(()),
+            )
+            .await?;
+        assert!(Arc::ptr_eq(&a, &b));
+        let lower = ProjectionPolicy::from_trusted_contract(7, Default::default())?;
+        assert!(cache
+            .acquire_policy_with_observer(
+                source.path(),
+                commit,
+                parent.path(),
+                lower.clone(),
+                || Ok(()),
+                || Ok(())
+            )
+            .await
+            .is_err());
+        drop(a);
+        drop(b);
+        let error = cache
+            .acquire_policy_with_observer(
+                source.path(),
+                commit,
+                parent.path(),
+                lower,
+                || Ok(()),
+                || Ok(()),
+            )
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("lower policy reused captured artifact"))?;
+        assert!(format!("{error:#}").contains("7-byte limit"));
+        Ok(())
+    }
 
     fn commit_tracked_file(root: &Path, bytes: &[u8]) -> Result<Oid> {
         let repo = git2db::Repository::init(root)?;
@@ -463,7 +598,12 @@ mod tests {
             .await
             .map_err(|_| anyhow::anyhow!("waiter did not reach the entries mutex"))?
             .map_err(|_| anyhow::anyhow!("waiter observer dropped before signaling"))?;
-        let key = (dir.path().to_path_buf(), commit);
+        let key = (
+            dir.path().to_path_buf(),
+            commit,
+            ProjectionPolicy::default(),
+            parent.path().to_path_buf(),
+        );
         assert!(
             entries_guard.get(&key).and_then(Weak::upgrade).is_some(),
             "the live artifact must be shareable while the waiter is parked"
