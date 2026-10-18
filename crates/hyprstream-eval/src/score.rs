@@ -249,7 +249,6 @@ fn field_metrics(
 /// Validate every input before fit/eval splitting or any metric aggregation.
 fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
-    use hyprstream_metrics_api::arrow::array::{Array, FixedSizeListArray, Float32Array};
     let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
     for obs in &output.observations {
         crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
@@ -266,57 +265,20 @@ fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
                 .map_err(|_| invalid("observation has an invalid probability distribution"))?;
         }
     }
-    if let Some(batch) = &output.batch {
+    if output.is_set_run() {
+        let batch = output
+            .batch
+            .as_ref()
+            .ok_or_else(|| invalid("set run is missing its eval-v2 Arrow batch"))?;
         let fingerprint = output
             .schema_fingerprint
             .as_deref()
             .ok_or_else(|| invalid("set run has no schema fingerprint"))?;
-        let schema = crate::persist::validate_provenance(output, batch, fingerprint)?;
-        let expected = batch
-            .num_rows()
-            .checked_mul(schema.questions().len())
-            .ok_or_else(|| invalid("set observation count overflow"))?;
-        if output.observations.len() != expected {
-            return Err(invalid(
-                "set observation count differs from its Arrow batch",
-            ));
-        }
-        for (question_index, question) in schema.questions().iter().enumerate() {
-            let probabilities = batch
-                .column_by_name(&format!("{}.probabilities", question.id))
-                .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
-                .ok_or_else(|| invalid("set run has an invalid probability column"))?;
-            let labels = question.labels();
-            for row in 0..batch.num_rows() {
-                let obs = &output.observations[row * schema.questions().len() + question_index];
-                if obs.question_id != question.id
-                    || obs.kind != question.kind
-                    || obs.labels != labels
-                {
-                    return Err(invalid(
-                        "set observation profile/order differs from its Arrow batch",
-                    ));
-                }
-                if probabilities.is_null(row) {
-                    if obs.probabilities.is_some() {
-                        return Err(invalid(
-                            "set observation abstention differs from its Arrow batch",
-                        ));
-                    }
-                } else {
-                    let values = probabilities.value(row);
-                    let values = values
-                        .as_any()
-                        .downcast_ref::<Float32Array>()
-                        .ok_or_else(|| invalid("set run has invalid probability values"))?;
-                    if obs.probabilities.as_deref() != Some(values.values().as_ref()) {
-                        return Err(invalid(
-                            "set observation probabilities differ from its Arrow batch",
-                        ));
-                    }
-                }
-            }
-        }
+        crate::persist::validate_provenance(output, batch, fingerprint)?;
+    } else if output.batch.is_some() || output.schema_fingerprint.is_some() {
+        return Err(invalid(
+            "item run cannot carry a shared Arrow batch contract",
+        ));
     }
     Ok(())
 }
