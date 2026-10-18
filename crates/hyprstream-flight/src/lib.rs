@@ -17,6 +17,7 @@
 
 pub mod cli;
 pub mod client;
+pub mod decision;
 pub mod service;
 
 // Re-export main types

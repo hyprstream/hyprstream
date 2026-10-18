@@ -15,7 +15,9 @@ path = "src/lib.rs"
 
 [dependencies]
 # Core metrics library
+hyprstream-decision = { path = "../hyprstream-decision" }
 hyprstream-metrics = { path = "../hyprstream-metrics" }
+uuid = { version = "1.0", features = ["v4"] }
 
 # Git registry service
 git2db = { path = "../git2db" }
