@@ -261,6 +261,10 @@ pub struct ClefDecisionRuntime {
     /// Kind the head tensors were converted to (must equal the engine's
     /// compute kind; mismatch fails closed inside `JointSchemaHead::forward`).
     pub compute_kind: Kind,
+    /// Device on which the backbone and materialized joint head execute.
+    /// CPU remains the default; non-CPU placement is admitted only by the
+    /// device-specific serving profile below.
+    pub device: tch::Device,
     /// ADMITTED compute profile (policy-derived at load: same ChannelFp8
     /// detector and precision mapping the engine applies), validated at
     /// forward time by JointSchemaHead's own actual hidden/row dtype+device
@@ -284,31 +288,63 @@ pub fn resolve_serving_kind(
     model_path: &Path,
     precision_mode: Option<&str>,
 ) -> Result<Kind, ClefDecisionError> {
-    let kind = default_head_kind(model_path, precision_mode)?;
-    // Clef v1 serving gate (R0 section 5): CPU Float32 ONLY. Explicit
-    // BF16/FP16 and non-channel auto/fp8 resolve (BFloat16/Half) but are
-    // NOT qualified for serving — typed rejection, no silent downgrade or
-    // promotion.
-    if kind != Kind::Float {
-        return Err(ClefDecisionError::Profile(format!(
-            "clef v1 serving profile admits cpu-float32 compute only; got {kind:?} (R0 section 5)"
-        )));
+    resolve_serving_kind_for_device(model_path, precision_mode, tch::Device::Cpu)
+}
+
+/// Resolve the only Clef serving precision qualified for an observed device.
+/// CPU Float32 remains the accepted default. The initial ROCm slice admits
+/// only BF16, unquantized checkpoints; channel-FP8 remains CPU-only until its
+/// activation-QDQ/matmul implementation is qualified on ROCm.
+pub fn resolve_serving_kind_for_device(
+    model_path: &Path,
+    precision_mode: Option<&str>,
+    device: tch::Device,
+) -> Result<Kind, ClefDecisionError> {
+    let channel_fp8 = channel_fp8_present(model_path)?;
+    let kind = default_head_kind_for_device(model_path, precision_mode, device)?;
+    match device {
+        tch::Device::Cpu if kind == Kind::Float => Ok(kind),
+        tch::Device::Cpu => Err(ClefDecisionError::Profile(format!(
+            "clef v1 CPU serving profile admits float32 compute only; got {kind:?} (R0 section 5)"
+        ))),
+        tch::Device::Cuda(index)
+            if tch::utils::has_hip()
+                && tch::Cuda::is_available()
+                && usize::try_from(tch::Cuda::device_count()).is_ok_and(|count| index < count)
+                && !channel_fp8
+                && kind == Kind::BFloat16 =>
+        {
+            Ok(kind)
+        }
+        tch::Device::Cuda(_) if !tch::utils::has_hip() => Err(ClefDecisionError::Profile(
+            "Clef GPU serving currently requires a ROCm/HIP libtorch build".into(),
+        )),
+        tch::Device::Cuda(_) if channel_fp8 => Err(ClefDecisionError::Profile(
+            "channel FP8 Clef serving is CPU-only until ROCm activation-QDQ parity is qualified"
+                .into(),
+        )),
+        tch::Device::Cuda(_) => Err(ClefDecisionError::Profile(format!(
+            "Clef ROCm BF16 serving requires bfloat16 compute; got {kind:?}"
+        ))),
+        _ => Err(ClefDecisionError::Profile(
+            "Clef serving supports CPU and qualified ROCm devices only".into(),
+        )),
     }
-    Ok(kind)
 }
 
 /// Head dtype from the AUTHORITATIVE shared policy
 /// (`torch_engine::resolve_inference_compute_kind`): case-insensitive
 /// aliases, CPU-device binding, channel-FP8 auto/fp8 -> Float. No duplicated
 /// mapping in this crate; drift is impossible by construction.
-fn default_head_kind(
+fn default_head_kind_for_device(
     model_path: &Path,
     precision_mode: Option<&str>,
+    device: tch::Device,
 ) -> Result<Kind, ClefDecisionError> {
     let channel_fp8 = channel_fp8_present(model_path)?;
     crate::runtime::torch_engine::resolve_inference_compute_kind(
         precision_mode,
-        tch::Device::Cpu,
+        device,
         channel_fp8,
     )
     .map_err(|e| ClefDecisionError::Bundle(format!("precision policy: {e}")))
@@ -353,16 +389,34 @@ pub type ComputeKind = tch::Kind;
 /// `kind` CPU matmuls (the accepted target is Float32). No hardware-FP8
 /// kernel or performance claim.
 pub fn compute_profile_string(kind: Kind, channel_fp8: bool) -> String {
+    compute_profile_string_for_device(kind, channel_fp8, tch::Device::Cpu)
+}
+
+/// Compute profile derived from the actual successful-forward device and
+/// dtype. On a ROCm libtorch build tch exposes HIP through `Device::Cuda`;
+/// report that backend explicitly so a GPU result cannot be mislabeled CPU.
+pub fn compute_profile_string_for_device(
+    kind: Kind,
+    channel_fp8: bool,
+    device: tch::Device,
+) -> String {
     let dtype = match kind {
         Kind::Float => "float32",
         Kind::BFloat16 => "bfloat16",
         Kind::Half => "float16",
         _ => "other",
     };
+    let backend = match device {
+        tch::Device::Cpu => "cpu",
+        tch::Device::Cuda(_) if tch::utils::has_hip() => "rocm",
+        tch::Device::Cuda(_) => "cuda",
+        tch::Device::Mps => "mps",
+        tch::Device::Vulkan => "vulkan",
+    };
     if channel_fp8 {
-        format!("cpu-{dtype}-fp8ch-w8a8-dynact")
+        format!("{backend}-{dtype}-fp8ch-w8a8-dynact")
     } else {
-        format!("cpu-{dtype}")
+        format!("{backend}-{dtype}")
     }
 }
 
@@ -547,6 +601,7 @@ fn materialize_head(
     metadata: &AdmittedHeadMetadata,
     tensors: &SafeTensors<'_>,
     kind: Kind,
+    device: tch::Device,
 ) -> Result<HashMap<String, Tensor>, ClefDecisionError> {
     let mut weights = HashMap::with_capacity(metadata.tensors.len());
     for (name, shape, dtype) in &metadata.tensors {
@@ -565,7 +620,8 @@ fn materialize_head(
             tensor
         } else {
             tensor.to_kind(kind)
-        };
+        }
+        .to_device(device);
         weights.insert(name.clone(), tensor);
     }
     Ok(weights)
@@ -593,6 +649,24 @@ impl ClefDecisionRuntime {
         engine_hidden: Option<u32>,
         kind_hint: Option<Kind>,
         precision_mode: Option<&str>,
+    ) -> Result<Self> {
+        Self::load_on_device(
+            model_path,
+            engine_hidden,
+            kind_hint,
+            precision_mode,
+            tch::Device::Cpu,
+        )
+    }
+
+    /// Strict head load with explicit placement matching the admitted
+    /// backbone device. The default [`Self::load`] intentionally remains CPU.
+    pub fn load_on_device(
+        model_path: &Path,
+        engine_hidden: Option<u32>,
+        kind_hint: Option<Kind>,
+        precision_mode: Option<&str>,
+        device: tch::Device,
     ) -> Result<Self> {
         let head_dir = Self::detect(model_path)
             .ok_or_else(|| ClefDecisionError::Bundle("not a Clef bundle".into()))?;
@@ -649,7 +723,10 @@ impl ClefDecisionRuntime {
             std::fs::read(&config_path).with_context(|| "reading backbone config.json")?;
         let backbone_config: Value = serde_json::from_slice(&backbone_bytes)
             .map_err(|e| ClefDecisionError::Bundle(format!("invalid backbone config.json: {e}")))?;
-        let kind = kind_hint.unwrap_or(default_head_kind(model_path, precision_mode)?);
+        let kind = match kind_hint {
+            Some(kind) => kind,
+            None => default_head_kind_for_device(model_path, precision_mode, device)?,
+        };
 
         // Metadata admission BEFORE any tensor materialization. The
         // admitted metadata is LOAD-BEARING here: the summed data-region
@@ -673,7 +750,7 @@ impl ClefDecisionRuntime {
             ))
             .to_string()
         );
-        let weights = materialize_head(&metadata, &tensors, kind)?;
+        let weights = materialize_head(&metadata, &tensors, kind, device)?;
         let head_tensor_count = weights.len() as u32;
         let head = JointSchemaHead::from_named_tensors(config, weights)
             .map_err(|e| ClefDecisionError::Bundle(format!("joint head validation: {e}")))?;
@@ -683,7 +760,7 @@ impl ClefDecisionRuntime {
         // identity.quantization (T3: identical quantized artifacts under
         // different supported compute modes must yield DISTINCT profiles).
         let fp8 = channel_fp8_present(model_path)?;
-        let compute_profile = compute_profile_string(kind, fp8);
+        let compute_profile = compute_profile_string_for_device(kind, fp8, device);
 
         Ok(Self {
             identity: ClefBundleIdentity {
@@ -707,6 +784,7 @@ impl ClefDecisionRuntime {
             encoding_version: CLEF_ENCODING_VERSION,
             channel_fp8: fp8,
             compute_kind: kind,
+            device,
             compute_profile,
         })
     }
@@ -839,7 +917,7 @@ pub fn map_question_probabilities(
     let probs = logits.softmax(-1, Kind::Float);
     let numel = probs.numel();
     let mut buf = vec![0f32; numel];
-    probs.copy_data(&mut buf, numel);
+    probs.to_device(tch::Device::Cpu).copy_data(&mut buf, numel);
     let mapped = permutation
         .iter()
         .map(|&i| buf[i as usize])
@@ -1427,6 +1505,7 @@ mod tests {
             ClefDecisionRuntime::load(dir.path(), Some(8), Some(Kind::Float), None).unwrap();
         assert_eq!(runtime.identity.head_tensor_count, weights.len() as u32);
         assert_eq!(runtime.compute_profile, "cpu-float32");
+        assert_eq!(runtime.device, tch::Device::Cpu);
         assert_eq!(runtime.encoding_version, CLEF_ENCODING_VERSION);
         assert_eq!(runtime.identity.head_weights_sha256.len(), 64);
         // Required identity material: the bundle tokenizer digest is present.
@@ -2085,13 +2164,13 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("explicit bf16 must be rejected for v1 serving"),
         };
-        assert!(err.contains("cpu-float32 compute only"), "{err}");
+        assert!(err.contains("CPU serving profile admits float32"), "{err}");
         // fp16/half alias: resolves Half, still rejected for serving.
         let err = match resolve_serving_kind(dir.path(), Some("FP16")) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("explicit fp16 must be rejected for v1 serving"),
         };
-        assert!(err.contains("cpu-float32 compute only"), "{err}");
+        assert!(err.contains("CPU serving profile admits float32"), "{err}");
         // Case-insensitive fp32 alias accepted.
         assert_eq!(
             resolve_serving_kind(dir.path(), Some("Float32")).unwrap(),
@@ -2112,7 +2191,22 @@ mod tests {
             Kind::Float
         );
         // The generic engine path (diagnostics) still resolves BF16.
-        assert_eq!(default_head_kind(dir.path(), None).unwrap(), Kind::BFloat16);
+        assert_eq!(
+            default_head_kind_for_device(dir.path(), None, tch::Device::Cpu).unwrap(),
+            Kind::BFloat16
+        );
+        let gpu_err = match resolve_serving_kind_for_device(dir.path(), None, tch::Device::Cuda(0))
+        {
+            Err(e) => e.to_string(),
+            Ok(kind) if tch::utils::has_hip() && tch::Cuda::is_available() => {
+                assert_eq!(kind, Kind::BFloat16);
+                String::new()
+            }
+            Ok(kind) => panic!("unqualified GPU unexpectedly admitted {kind:?}"),
+        };
+        if !gpu_err.is_empty() {
+            assert!(gpu_err.starts_with("clef-decision-profile"), "{gpu_err}");
+        }
     }
 
     #[tokio::test]
@@ -2270,6 +2364,44 @@ mod tests {
         );
         // Unquantized artifacts carry no execution-path suffix.
         assert_eq!(compute_profile_string(Kind::Float, false), "cpu-float32");
+        assert_eq!(
+            compute_profile_string_for_device(Kind::BFloat16, false, tch::Device::Cpu),
+            "cpu-bfloat16"
+        );
+        let gpu_profile = if tch::utils::has_hip() {
+            "rocm-bfloat16"
+        } else {
+            "cuda-bfloat16"
+        };
+        assert_eq!(
+            compute_profile_string_for_device(Kind::BFloat16, false, tch::Device::Cuda(0)),
+            gpu_profile
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ROCm/HIP libtorch and a visible GPU; run explicitly on Jensen"]
+    fn rocm_head_materialization_uses_the_backbone_device() {
+        assert!(tch::utils::has_hip(), "test requires ROCm/HIP libtorch");
+        assert!(
+            tch::Cuda::is_available(),
+            "test requires a visible ROCm GPU"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config = tiny_head_config(8);
+        let weights = tiny_head_tensors(&config);
+        write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
+        with_head_safetensors(dir.path(), |tensors, len| {
+            let metadata = head_metadata_admission(&config, Some(8), tensors, len).unwrap();
+            let placed =
+                materialize_head(&metadata, tensors, Kind::BFloat16, tch::Device::Cuda(0)).unwrap();
+            assert!(placed
+                .values()
+                .all(|tensor| tensor.device() == tch::Device::Cuda(0)));
+            assert!(placed
+                .values()
+                .all(|tensor| tensor.kind() == Kind::BFloat16));
+        });
     }
 
     #[test]

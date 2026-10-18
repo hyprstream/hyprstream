@@ -797,18 +797,15 @@ impl InferenceService {
             tokenizer, &parsed, state_cap, max_length, &cancel,
         )?;
 
-        // Clef v1 serving profile admission (R0 section 5): CPU device and
-        // Float32 compute (packed FP8 + dynamic activation QDQ for channel
-        // artifacts). Rejected BEFORE lazy head materialization or forward;
-        // no silent promotion of an unqualified kind, no GPU work (R5 gate).
-        if !engine_guard.is_cpu_device() {
-            return Err(anyhow!(
-                "clef-decision-profile: clef v1 serving is CPU-only; the admitted engine device is not CPU"
-            ));
-        }
-        crate::runtime::clef_decision::resolve_serving_kind(
+        // Admit only the device/dtype combinations qualified for this Clef
+        // endpoint. CPU Float32 remains the default; the initial GPU slice is
+        // limited to unquantized BF16 on ROCm/HIP. Channel-FP8 remains CPU-only
+        // until its activation-QDQ/matmul path is separately qualified.
+        let device = engine_guard.device();
+        crate::runtime::clef_decision::resolve_serving_kind_for_device(
             &self.model_path,
             self.precision_mode.as_deref(),
+            device,
         )
         .map_err(anyhow::Error::from)?;
         drop(engine_guard);
@@ -829,11 +826,12 @@ impl InferenceService {
                     Arc::clone(rt)
                 } else {
                     let rt = Arc::new(parking_lot::Mutex::new(
-                        crate::runtime::clef_decision::ClefDecisionRuntime::load(
+                        crate::runtime::clef_decision::ClefDecisionRuntime::load_on_device(
                             &self.model_path,
                             Some(engine_hidden),
                             None,
                             self.precision_mode.as_deref(),
+                            device,
                         )?,
                     ));
                     *guard = Some(Arc::clone(&rt));
