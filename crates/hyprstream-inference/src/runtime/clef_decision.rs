@@ -312,6 +312,7 @@ pub fn resolve_serving_kind_for_device(
                 && tch::Cuda::is_available()
                 && usize::try_from(tch::Cuda::device_count()).is_ok_and(|count| index < count)
                 && !channel_fp8
+                && !quantization_config_present(model_path)?
                 && kind == Kind::BFloat16 =>
         {
             Ok(kind)
@@ -323,6 +324,11 @@ pub fn resolve_serving_kind_for_device(
             "channel FP8 Clef serving is CPU-only until ROCm activation-QDQ parity is qualified"
                 .into(),
         )),
+        tch::Device::Cuda(_) if quantization_config_present(model_path)? => {
+            Err(ClefDecisionError::Profile(
+                "Clef ROCm serving currently admits unquantized BF16 checkpoints only".into(),
+            ))
+        }
         tch::Device::Cuda(_) => Err(ClefDecisionError::Profile(format!(
             "Clef ROCm BF16 serving requires bfloat16 compute; got {kind:?}"
         ))),
@@ -330,6 +336,25 @@ pub fn resolve_serving_kind_for_device(
             "Clef serving supports CPU and qualified ROCm devices only".into(),
         )),
     }
+}
+
+fn quantization_config_present(model_path: &Path) -> Result<bool, ClefDecisionError> {
+    let path = model_path.join("config.json");
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| ClefDecisionError::Bundle(format!("stat backbone config.json: {e}")))?;
+    if metadata.len() > MAX_HEAD_CONFIG_BYTES as u64 {
+        return Err(ClefDecisionError::Bundle(format!(
+            "backbone config.json {} bytes exceeds bound {MAX_HEAD_CONFIG_BYTES}",
+            metadata.len()
+        )));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ClefDecisionError::Bundle(format!("reading backbone config.json: {e}")))?;
+    let config: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ClefDecisionError::Bundle(format!("invalid backbone config.json: {e}")))?;
+    Ok(config
+        .get("quantization_config")
+        .is_some_and(|value| !value.is_null()))
 }
 
 /// Head dtype from the AUTHORITATIVE shared policy
@@ -1028,6 +1053,22 @@ pub fn decide_encoded(
     };
     let logits = engine
         .with_decision_backbone_checked(&encoded.input_ids, &check_backbone, |hidden, gather| {
+            anyhow::ensure!(
+                hidden.device() == runtime.device,
+                ClefDecisionError::Runtime(format!(
+                    "backbone hidden device {:?} does not match admitted profile {:?}",
+                    hidden.device(),
+                    runtime.device
+                ))
+            );
+            anyhow::ensure!(
+                hidden.kind() == runtime.compute_kind,
+                ClefDecisionError::Runtime(format!(
+                    "backbone hidden kind {:?} does not match admitted profile {:?}",
+                    hidden.kind(),
+                    runtime.compute_kind
+                ))
+            );
             // OBSERVED compute kind: recorded from the actual successful
             // hidden tensor the head validated (dtype+device), not from
             // load-time policy. Used for response provenance.
@@ -2144,6 +2185,42 @@ mod tests {
     }
 
     #[test]
+    fn rocm_profile_rejects_any_declared_quantization_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Value = serde_json::from_str(SIMPLE_BACKBONE_CONFIG).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(!quantization_config_present(dir.path()).unwrap());
+
+        // Unknown quantization methods are still quantized artifacts and must
+        // not pass the initial ROCm BF16 profile merely because the FP8 parser
+        // does not recognize them.
+        config["quantization_config"] = json!({"quant_method": "other-format"});
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(quantization_config_present(dir.path()).unwrap());
+        if tch::utils::has_hip() && tch::Cuda::is_available() {
+            let err = resolve_serving_kind_for_device(dir.path(), None, tch::Device::Cuda(0))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("admits unquantized BF16"), "{err}");
+        }
+        config["quantization_config"] = Value::Null;
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(!quantization_config_present(dir.path()).unwrap());
+    }
+
+    #[test]
     fn serving_profile_rejects_bf16_and_accepts_fp32_or_auto_fp8() {
         // Causal controls at the resolver level: non-FP8 bundle (no channel
         // profile) — auto resolves BF16 and is REJECTED for v1 serving;
@@ -2402,6 +2479,68 @@ mod tests {
                 .values()
                 .all(|tensor| tensor.kind() == Kind::BFloat16));
         });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ROCm/HIP libtorch and a visible GPU; run explicitly on Jensen"]
+    async fn rocm_tiny_decide_runs_backbone_head_probabilities_and_provenance() {
+        use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine};
+
+        assert!(tch::utils::has_hip(), "test requires ROCm/HIP libtorch");
+        assert!(
+            tch::Cuda::is_available(),
+            "test requires a visible ROCm GPU"
+        );
+        let dir = t5_bundle_dir();
+        let mut engine = create_engine(&RuntimeConfig {
+            use_gpu: true,
+            gpu_device_id: Some(0),
+            precision_mode: None,
+            ..RuntimeConfig::default()
+        })
+        .expect("single-device ROCm engine");
+        RuntimeEngine::load_model(&mut engine, dir.path())
+            .await
+            .expect("tiny BF16 backbone load on ROCm");
+        assert_eq!(engine.device(), tch::Device::Cuda(0));
+
+        let runtime = ClefDecisionRuntime::load_on_device(
+            dir.path(),
+            Some(T5_HIDDEN as u32),
+            Some(Kind::BFloat16),
+            None,
+            tch::Device::Cuda(0),
+        )
+        .expect("unquantized BF16 Clef head on ROCm");
+        assert_eq!(runtime.compute_profile, "rocm-bfloat16");
+        assert!(runtime.identity.quantization.is_none());
+
+        let tokenizer = tiny_wordlevel_tokenizer();
+        let request = t5_record("one two three");
+        let (encoded, _) = encode_request(
+            &tokenizer,
+            &request,
+            Some(DEFAULT_MAX_STATE_TOKENS as usize),
+            256,
+            &DecisionCancel::none(),
+        )
+        .expect("encode tiny decision request");
+        let (distributions, observed_kind) = decide_encoded(
+            &runtime,
+            &engine,
+            &request,
+            &encoded,
+            &DecisionCancel::none(),
+        )
+        .expect("ROCm decision inference");
+        assert_eq!(observed_kind, Kind::BFloat16);
+        assert_eq!(distributions.len(), 3);
+        for distribution in &distributions {
+            assert!(!distribution.canonical_ids.is_empty());
+            assert!(distribution.probabilities.iter().all(|p| p.is_finite()));
+            let sum: f32 = distribution.probabilities.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "{sum}");
+        }
     }
 
     #[test]
