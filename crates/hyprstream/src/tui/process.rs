@@ -83,7 +83,7 @@ pub fn spawn_pty_process(
     cols: u16,
     rows: u16,
 ) -> std::io::Result<PaneProcess> {
-    use hyprstream_tui::shell::{ShellInput, spawn_shell};
+    use hyprstream_tui::shell::{spawn_shell, ShellInput};
 
     let shell = spawn_shell(cwd, cols, rows)?;
 
@@ -119,7 +119,10 @@ pub fn spawn_pty_process(
         }
     });
 
-    Ok(PaneProcess { stdout_rx, input_tx })
+    Ok(PaneProcess {
+        stdout_rx,
+        input_tx,
+    })
 }
 
 /// Spawn a `TerminalApp` in a background thread, returning a `PaneProcess`

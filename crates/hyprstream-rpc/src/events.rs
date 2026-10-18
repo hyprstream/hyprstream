@@ -292,6 +292,27 @@ struct PrefixState {
 /// subject contexts against the canonical revocation authority on every check.
 #[async_trait::async_trait]
 pub trait EventAuthz: Send + Sync {
+    /// Bind a verified carrier witness to the authority granting clearance.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn admission_is_current(
+        &self,
+        _peer: &crate::transport::moql_admission::AdmittedMoqPeer,
+    ) -> bool {
+        true
+    }
+    /// Finite source inventory used at session admission. A held session only
+    /// revalidates its acquired grants; adding scope requires new admission.
+    fn sources(&self) -> &[&str] {
+        INTERNAL_EVENT_SOURCES
+    }
+    /// Watchdog checks must consult current authority without sampling or
+    /// suppressing audits on actual attempted operations.
+    async fn revalidate_publish(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_publish(caller, prefix).await
+    }
+    async fn revalidate_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_subscribe(caller, prefix).await
+    }
     /// May `caller` publish to the group/`prefix`? Maps to the `publish`
     /// ScopeAction.
     async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
@@ -305,6 +326,9 @@ pub trait EventAuthz: Send + Sync {
 }
 
 static EVENT_AUTHZ: OnceLock<Arc<dyn EventAuthz>> = OnceLock::new();
+
+/// Reviewed native health/lifecycle producers. Worker workflows are separate.
+pub const INTERNAL_EVENT_SOURCES: &[&str] = &["system", "model"];
 
 /// Clone the process reference monitor for authenticated network Event sessions.
 pub fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
@@ -371,6 +395,11 @@ pub struct MacEventAuthz {
 }
 
 impl MacEventAuthz {
+    /// Service-specific ownership is independent of the MAC lattice floor.
+    pub fn deny_scope(&self, subject: &Subject, prefix: &str, action: MoqEventAction) -> bool {
+        self.pep.deny_event_scope(subject, prefix, action);
+        false
+    }
     pub fn new(pep: MoqEventPep) -> Self {
         Self { pep }
     }
@@ -378,10 +407,17 @@ impl MacEventAuthz {
 
 #[async_trait::async_trait]
 impl EventAuthz for MacEventAuthz {
+    async fn revalidate_publish(&self, caller: &Subject, prefix: &str) -> bool {
+        self.pep.event_grant_is_current(caller, prefix).await
+    }
+    async fn revalidate_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+        self.pep.event_grant_is_current(caller, prefix).await
+    }
     async fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep
-                .check_event_prefix(caller, prefix, MoqEventAction::Publish).await,
+                .check_event_prefix(caller, prefix, MoqEventAction::Publish)
+                .await,
             MacDecision::Permit
         )
     }
@@ -389,7 +425,8 @@ impl EventAuthz for MacEventAuthz {
     async fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep
-                .check_event_prefix(caller, prefix, MoqEventAction::Subscribe).await,
+                .check_event_prefix(caller, prefix, MoqEventAction::Subscribe)
+                .await,
             MacDecision::Permit
         )
     }
@@ -397,7 +434,8 @@ impl EventAuthz for MacEventAuthz {
     async fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
             self.pep
-                .check_event_prefix(caller, prefix, MoqEventAction::JoinDecrypt).await,
+                .check_event_prefix(caller, prefix, MoqEventAction::JoinDecrypt)
+                .await,
             MacDecision::Permit
         )
     }
@@ -441,10 +479,19 @@ static NETWORK_EVENT_IDENTITY: OnceLock<PublisherIdentity> = OnceLock::new();
 
 /// Bind Event publishers/subscribers before construction in a single-identity
 /// native process. A later service cannot silently replace that process identity.
-pub fn install_network_event_identity(proof: &crate::transport::moql_admission::MoqlAdmissionProof) -> Result<()> {
-    anyhow::ensure!(proof.did.starts_with("did:at9p:"), "native Event identity must be checkpointed did:at9p");
-    let installed = NETWORK_EVENT_IDENTITY.get_or_init(|| PublisherIdentity::verified(proof.did.clone()));
-    anyhow::ensure!(installed.did.as_ref() == Some(&proof.did), "Event process identity already bound to another DID");
+pub fn install_network_event_identity(
+    proof: &crate::transport::moql_admission::MoqlAdmissionProof,
+) -> Result<()> {
+    anyhow::ensure!(
+        proof.did.starts_with("did:at9p:"),
+        "native Event identity must be checkpointed did:at9p"
+    );
+    let installed =
+        NETWORK_EVENT_IDENTITY.get_or_init(|| PublisherIdentity::verified(proof.did.clone()));
+    anyhow::ensure!(
+        installed.did.as_ref() == Some(&proof.did),
+        "Event process identity already bound to another DID"
+    );
     Ok(())
 }
 
@@ -983,8 +1030,11 @@ impl EventSubscriber {
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             tenant: Arc::new(RwLock::new(None)),
             authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
-            caller: NETWORK_EVENT_IDENTITY.get().and_then(|identity| identity.did.clone())
-                .map(Subject::new).unwrap_or_else(Subject::anonymous),
+            caller: NETWORK_EVENT_IDENTITY
+                .get()
+                .and_then(|identity| identity.did.clone())
+                .map(Subject::new)
+                .unwrap_or_else(Subject::anonymous),
         })
     }
 
@@ -1577,8 +1627,7 @@ mod tests {
         fn declared_worker() -> Arc<Self> {
             let table = MoqEventPolicyTable::build(
                 1,
-                [MoqEventPolicyRow::new(MoqEventPlane::Event, "worker", public_label())
-                    .unwrap()],
+                [MoqEventPolicyRow::new(MoqEventPlane::Event, "worker", public_label()).unwrap()],
             )
             .unwrap();
             Arc::new(Self {
@@ -1594,7 +1643,9 @@ mod tests {
         fn empty() -> Arc<Self> {
             Arc::new(Self {
                 inner: MacEventAuthz::new(MoqEventPep::new(
-                    Arc::new(DeclaredTrackPolicyResolver::new(MoqEventPolicyTable::empty())),
+                    Arc::new(DeclaredTrackPolicyResolver::new(
+                        MoqEventPolicyTable::empty(),
+                    )),
                     Arc::new(PublicClearance),
                     Arc::new(NoopAudit),
                 )),
@@ -1668,10 +1719,14 @@ mod tests {
         let authz = RecordingMacEventAuthz::declared_worker();
 
         let origin = crate::moq_event::MoqEventOrigin::new();
-        let public = EventPublisher::from_public_prefix("worker", origin.publisher("worker").unwrap())
-            .unwrap()
-            .with_authz(authz.clone());
-        public.publish("sandbox1", "started", b"plaintext").await.unwrap();
+        let public =
+            EventPublisher::from_public_prefix("worker", origin.publisher("worker").unwrap())
+                .unwrap()
+                .with_authz(authz.clone());
+        public
+            .publish("sandbox1", "started", b"plaintext")
+            .await
+            .unwrap();
 
         let public_subscriber = EventSubscriber::new().unwrap().with_authz(authz.clone());
         assert!(matches!(
@@ -2437,9 +2492,11 @@ mod tests {
             .contains("publish denied by event-plane authz"));
 
         let subscriber = EventSubscriber::new().unwrap();
-        assert!(!subscriber
-            .authz
-            .can_subscribe(&Subject::anonymous(), &source)
-            .await);
+        assert!(
+            !subscriber
+                .authz
+                .can_subscribe(&Subject::anonymous(), &source)
+                .await
+        );
     }
 }

@@ -188,12 +188,14 @@ async fn verified_user_transport_did_admits_its_grant_and_refuses_another_signer
 
     #[async_trait(?Send)]
     impl hyprstream_rpc::RequestService for AdmissionProbe {
-    fn decode_request_body(
-        &self,
-        signed_body: &[u8],
-    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
-        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(signed_body.to_vec()))
-    }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
 
         async fn handle_request(
             &self,

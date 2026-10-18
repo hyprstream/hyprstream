@@ -1,8 +1,6 @@
 //! Native Event transport bootstrap. Identity admission and MAC are independent.
 use anyhow::{Context, Result};
-use hyprstream_discovery::admission_roster::{
-    self, DeploymentRosterSource,
-};
+use hyprstream_discovery::admission_roster::{self, DeploymentRosterSource};
 use hyprstream_rpc::moq_authz::PeerIdentity;
 use hyprstream_rpc::transport::iroh_moq::SharedIngressAuthorizer;
 use hyprstream_rpc::transport::moql_admission::MoqlAdmissionProof;
@@ -15,7 +13,8 @@ use std::sync::Arc;
 /// config binding that could go stale at identity churn.
 pub fn require_event_tenant(proof: &MoqlAdmissionProof) -> Result<()> {
     let roster = hyprstream_discovery::production_deployment_roster()?;
-    admission_roster::require_admitted_service_binding(&roster, proof)
+    admission_roster::require_admitted_service_binding(&roster, proof)?;
+    super::native_event_policy::require_enrolled_event_identity(proof)
 }
 
 /// Initialize both CLI and service Event clients according to the deployment
@@ -33,7 +32,9 @@ pub fn ensure_event_origin_for_profile() -> Result<()> {
     hyprstream_rpc::events::install_network_event_identity(&proof)?;
     if let Some(origin) = hyprstream_rpc::moq_event::install_event_network_client_origin() {
         tokio::spawn(async move {
+            let mut failures = 0u32;
             loop {
+                let started = std::time::Instant::now();
                 let result: Result<()> = async {
                     let (transport, identity) =
                         hyprstream_discovery::production_moq_event_target().await?;
@@ -46,11 +47,24 @@ pub fn ensure_event_origin_for_profile() -> Result<()> {
                 if let Err(error) = result {
                     tracing::warn!(%error, "native Event link unavailable");
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // No authorization-failure notification exists at this layer.
+                // Slow bounded retries permit recovery without an idle deny
+                // storm. Reset only after a genuinely sustained connection.
+                if started.elapsed() >= std::time::Duration::from_secs(60) {
+                    failures = 0;
+                }
+                failures = failures.saturating_add(1);
+                tokio::time::sleep(event_retry_delay(failures)).await;
             }
         });
     }
     Ok(())
+}
+
+fn event_retry_delay(failures: u32) -> std::time::Duration {
+    let seconds = 2u64.saturating_pow(failures.min(8)).min(300);
+    // Positive jitter is bounded and never weakens the minimum retry delay.
+    std::time::Duration::from_millis(seconds * 1000 + u64::from(rand::random::<u16>() % 1000))
 }
 
 /// The Event ingress grant: the already-admitted peer's verified DID resolves
@@ -103,6 +117,7 @@ pub fn event_handler(
     // replacing the former empty-tenant-map refusal.
     let roster = hyprstream_discovery::production_deployment_roster()?;
     admission_roster::require_service_self_binding(&roster, "event", &proof)?;
+    super::native_event_policy::require_enrolled_event_identity(&proof)?;
     admission_roster::require_publisher_roster(&roster, &config.quic.event_publishers)?;
     hyprstream_rpc::events::install_network_event_identity(&proof)?;
     // Authentication stays on the per-DID authority; only grant resolution
@@ -171,9 +186,14 @@ impl EventNetworkService {
         tokio::pin!(stopped);
         stopped.as_mut().enable();
         let substrate = hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
-            self.secret, self.handler,
-            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new("Event provides only authenticated moql"),
-        ).await.map_err(|e| RpcError::SpawnFailed(format!("native Event bind: {e}")))?;
+            self.secret,
+            self.handler,
+            hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new(
+                "Event provides only authenticated moql",
+            ),
+        )
+        .await
+        .map_err(|e| RpcError::SpawnFailed(format!("native Event bind: {e}")))?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let _cancel_on_exit = cancellation.clone().drop_guard();
         let announce_cancel = cancellation.clone();
@@ -203,7 +223,10 @@ impl EventNetworkService {
             } => {},
         }
         cancellation.cancel();
-        substrate.shutdown().await.map_err(|e| RpcError::SpawnFailed(format!("Event shutdown: {e}")))
+        substrate
+            .shutdown()
+            .await
+            .map_err(|e| RpcError::SpawnFailed(format!("Event shutdown: {e}")))
     }
 }
 
@@ -230,7 +253,9 @@ impl hyprstream_rpc::service::Spawnable for EventNetworkService {
             .build()
             .map_err(|e| RpcError::SpawnFailed(e.to_string()))?;
         runtime.block_on((*self).run_until_shutdown(shutdown, move || {
-            if let Some(ready) = on_ready { let _ = ready.send(()); }
+            if let Some(ready) = on_ready {
+                let _ = ready.send(());
+            }
             let _ = hyprstream_rpc::notify::ready();
         }))
     }
@@ -272,6 +297,17 @@ pub async fn probe_event_network(timeout: std::time::Duration) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_event_retries_have_positive_jitter_and_a_finite_cap() {
+        for failures in [1, 2, 3, 8, 9, 100, u32::MAX] {
+            let delay = event_retry_delay(failures);
+            let base = 2u64.saturating_pow(failures.min(8)).min(300);
+            assert!(delay >= std::time::Duration::from_secs(base));
+            assert!(delay < std::time::Duration::from_secs(base + 1));
+            assert!(delay < std::time::Duration::from_secs(257));
+        }
+    }
+
     fn test_event_service(
         announce: hyprstream_service::service::factory::NativeIrohAnnouncementCallback,
     ) -> EventNetworkService {
@@ -312,7 +348,10 @@ mod tests {
         .await
         .context("Event lost shutdown at readiness")??;
         anyhow::ensure!(ready.get(), "Event never reached readiness");
-        anyhow::ensure!(announced.lock().is_cancelled(), "announcement was not cancelled");
+        anyhow::ensure!(
+            announced.lock().is_cancelled(),
+            "announcement was not cancelled"
+        );
         Ok(())
     }
 
@@ -369,8 +408,12 @@ mod tests {
         Ok(())
     }
 
-    fn state_with_services(service_ids: &[&str]) -> hyprstream_rpc::transport::moql_admission::AcceptedIdentityState {
-        use hyprstream_rpc::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey};
+    fn state_with_services(
+        service_ids: &[&str],
+    ) -> hyprstream_rpc::transport::moql_admission::AcceptedIdentityState {
+        use hyprstream_rpc::transport::moql_admission::{
+            AcceptedIdentityState, AcceptedSubjectKey,
+        };
         AcceptedIdentityState {
             epoch: 1,
             head_digest: [1; 64],
@@ -425,7 +468,9 @@ mod tests {
 
         // Identity churn: the same service name now lives at a new DID.
         states.write().remove(original);
-        states.write().insert(successor.to_owned(), state_with_services(&["#event"]));
+        states
+            .write()
+            .insert(successor.to_owned(), state_with_services(&["#event"]));
         assert!(
             !authorizer.authorize_ingress(&peer_of(original), "local"),
             "superseded DID must lose the grant"
@@ -439,7 +484,9 @@ mod tests {
         // genuine identity makes the name ambiguous — deny both, escalate to
         // neither (the store cannot distinguish provenance; uniqueness is the
         // discriminator).
-        states.write().insert(squatter.to_owned(), state_with_services(&["#event"]));
+        states
+            .write()
+            .insert(squatter.to_owned(), state_with_services(&["#event"]));
         assert!(!authorizer.authorize_ingress(&peer_of(successor), "local"));
         assert!(!authorizer.authorize_ingress(&peer_of(squatter), "local"));
 

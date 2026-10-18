@@ -70,15 +70,13 @@ impl ContainedFs for CanonicalRoot {
 
     fn create(&self, path: &str, mode: OpenMode) -> Result<File, FsError> {
         let resolved = self.resolve(path)?;
-        mode.to_create_options()
-            .open(&resolved)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    FsError::AlreadyExists(path.to_owned())
-                } else {
-                    FsError::Io(e)
-                }
-            })
+        mode.to_create_options().open(&resolved).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                FsError::AlreadyExists(path.to_owned())
+            } else {
+                FsError::Io(e)
+            }
+        })
     }
 
     fn mkdir(&self, path: &str) -> Result<(), FsError> {

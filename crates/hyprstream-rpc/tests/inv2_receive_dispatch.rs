@@ -157,9 +157,10 @@ struct RecordingService {
     transport: TransportConfig,
     signing_key: SigningKey,
     payloads: Arc<Mutex<Vec<Vec<u8>>>>,
-}#[async_trait(?Send)]
+}
+#[async_trait(?Send)]
 impl RequestService for RecordingService {
-fn decode_request_body(
+    fn decode_request_body(
         &self,
         signed_body: &[u8],
     ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
@@ -168,16 +169,17 @@ fn decode_request_body(
         ))
     }
 
-async fn handle_request(&self,
-        _ctx:
-        &EnvelopeContext,body: &hyprstream_rpc::service::DecodedRequestBody,) -> Result<(Vec<u8>, Option<Continuation>)> {
+    async fn handle_request(
+        &self,
+        _ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> Result<(Vec<u8>, Option<Continuation>)> {
         let payload = body.bytes();
-        self.payloads.lock().push(
-        payload.to_vec());
-        Ok(( payload.to_vec(),None))
-}
+        self.payloads.lock().push(payload.to_vec());
+        Ok((payload.to_vec(), None))
+    }
 
-fn name( &self) -> &str {
+    fn name(&self) -> &str {
         "model"
     }
 
@@ -186,8 +188,7 @@ fn name( &self) -> &str {
     }
 
     fn signing_key(&self) -> SigningKey {
-        self
-    .signing_key.clone()
+        self.signing_key.clone()
     }
 }
 
@@ -200,7 +201,8 @@ impl BrowserCurrentnessVerifier for AdvancingCurrentness {
     async fn ensure_current(&self, binding: &BrowserRequestBinding) -> Result<()> {
         anyhow::ensure!(
             binding.service_name == "model",
-            "unexpected service binding");
+            "unexpected service binding"
+        );
         anyhow::ensure!(binding.accepted_state_epoch == 9, "unexpected state epoch");
         anyhow::ensure!(
             !self.advanced.load(Ordering::SeqCst),
@@ -345,6 +347,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         response_kem_recipient: None,
         service_domain: Some("inv2-sentinel".to_owned()),
         proof_cwt: None,
+        authorization_witness: None,
     }
 }
 
@@ -716,5 +719,5 @@ async fn garbage_on_untrusted_carrier_rejected_before_handler() {
     assert!(
         !invoked.load(Ordering::SeqCst),
         "garbage must never dispatch"
-        );
-    }
+    );
+}

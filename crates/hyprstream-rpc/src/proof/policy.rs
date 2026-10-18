@@ -204,10 +204,8 @@ impl InMemoryMethodPolicy {
         leaf_path: &str,
         policy: SignaturePolicy,
     ) -> &mut Self {
-        self.rows.insert(
-            (service_domain.to_owned(), leaf_path.to_owned()),
-            policy,
-        );
+        self.rows
+            .insert((service_domain.to_owned(), leaf_path.to_owned()), policy);
         self
     }
 }
@@ -290,10 +288,60 @@ pub struct GeneratedMethodPolicyProvider {
     pub service: &'static str,
     /// Builder for the service's complete generated row set.
     pub rows_fn: fn() -> Vec<GeneratedMethodPolicyRow>,
+    /// The same bounded body decoder used by this service's dispatch.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub decode_fn: fn(&[u8]) -> Result<crate::service::DecodedRequestBody>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(GeneratedMethodPolicyProvider);
+
+/// Recover the only policy action an authenticated scoped request may mediate.
+/// The returned action is derived from the signed request leaf, not supplied
+/// by the mediator.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mediated_operation_for_request(service: &str, signed_body: &[u8]) -> Result<String> {
+    let mut providers = inventory::iter::<GeneratedMethodPolicyProvider>
+        .into_iter()
+        .filter(|provider| provider.service == service);
+    let provider = providers
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("unknown mediated service"))?;
+    anyhow::ensure!(providers.next().is_none(), "ambiguous mediated service");
+    let body = (provider.decode_fn)(signed_body)?;
+    let leaf = body
+        .leaf_path()
+        .ok_or_else(|| anyhow::anyhow!("missing mediated method leaf"))?;
+    let rows = (provider.rows_fn)();
+    validate_generated_rows(&rows)?;
+    anyhow::ensure!(
+        rows.iter().all(|row| row.service == service),
+        "mediated provider namespace mismatch"
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.leaf_path == leaf)
+        .ok_or_else(|| anyhow::anyhow!("unknown mediated method leaf"))?;
+    anyhow::ensure!(
+        row.authentication == AuthenticationRequirement::CredentialRequired
+            && !row.scope_exempt
+            && !row.scope_action.is_empty(),
+        "mediated request is not an authenticated scoped method"
+    );
+    Ok(row.scope_action.to_owned())
+}
+
+/// Bind a mediated query's operation to the original signed request leaf.
+/// This does not authenticate the body or grant authority: callers must first
+/// verify the holder transcript, credential, target, freshness and replay.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn verify_mediated_operation(service: &str, signed_body: &[u8], operation: &str) -> Result<()> {
+    anyhow::ensure!(
+        mediated_operation_for_request(service, signed_body)? == operation,
+        "mediated operation does not match an authenticated scoped method"
+    );
+    Ok(())
+}
 
 /// Validate one complete generated row set (v16 §6.1 build gates).
 ///
@@ -316,7 +364,10 @@ pub fn validate_generated_rows(rows: &[GeneratedMethodPolicyRow]) -> Result<()> 
             );
         }
         if row.symbolic_path.is_empty() {
-            bail!("generated policy row '{}' has an empty symbolic path", row.service);
+            bail!(
+                "generated policy row '{}' has an empty symbolic path",
+                row.service
+            );
         }
         if !leaf_keys.insert((row.service, row.leaf_key())) {
             bail!(
@@ -469,8 +520,7 @@ pub fn validate_generated_rows(rows: &[GeneratedMethodPolicyRow]) -> Result<()> 
         }
 
         // Approver rules must be satisfiable and exact.
-        if let SignaturePolicy::TokenBoundAndApproved { approver_rule, .. } =
-            &row.signature_policy
+        if let SignaturePolicy::TokenBoundAndApproved { approver_rule, .. } = &row.signature_policy
         {
             validate_approver_rule(row, approver_rule)?;
         }
@@ -639,7 +689,8 @@ pub fn evaluate(
 
     // 3. Approvers.
     match policy {
-        SignaturePolicy::UnauthenticatedOrTokenBound { .. } | SignaturePolicy::TokenBound { .. } => {
+        SignaturePolicy::UnauthenticatedOrTokenBound { .. }
+        | SignaturePolicy::TokenBound { .. } => {
             if !verified.approvers.is_empty() {
                 bail!(
                     "method declares no approver rule but the proof carries {} approver group(s)",
@@ -729,7 +780,9 @@ fn evaluate_approvers(rule: &ApproverRule, verified: &VerifiedProof) -> Result<(
         }
         ApproverRule::KOfN { k, .. } => {
             if presented < *k {
-                bail!("approver rule requires {k} of the allowed groups, proof carries {presented}");
+                bail!(
+                    "approver rule requires {k} of the allowed groups, proof carries {presented}"
+                );
             }
             Ok(())
         }
@@ -843,7 +896,11 @@ mod tests {
 
     #[test]
     fn a_valid_generated_inventory_validates() {
-        let rows = vec![valid_row(&[0], "a"), valid_row(&[1, 0], "b.c"), public_row(&[2], "p")];
+        let rows = vec![
+            valid_row(&[0], "a"),
+            valid_row(&[1, 0], "b.c"),
+            public_row(&[2], "p"),
+        ];
         validate_generated_rows(&rows).expect("valid inventory must validate");
     }
 
@@ -921,8 +978,7 @@ mod tests {
 
         // Compartments ride along on the target label and validate.
         let mut compartmented = valid_row(&[0], "a");
-        compartmented.target_label =
-            dispatch_label(Level::Secret, Assurance::PqHybrid, &[0, 3]);
+        compartmented.target_label = dispatch_label(Level::Secret, Assurance::PqHybrid, &[0, 3]);
         assert!(validate_generated_rows(&[compartmented]).is_ok());
     }
 
@@ -943,13 +999,21 @@ mod tests {
         bare.scope_action = "";
         bare.scope_exempt = false;
         let err = validate_generated_rows(&[bare]).unwrap_err();
-        assert!(err.to_string().contains("no recorded control-plane exemption"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("no recorded control-plane exemption"),
+            "{err}"
+        );
 
         // Exempt AND carrying a scope action: contradictory.
         let mut both = valid_row(&[0], "a");
         both.scope_exempt = true;
         let err = validate_generated_rows(&[both]).unwrap_err();
-        assert!(err.to_string().contains("scope-exempt but carries scope action"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("scope-exempt but carries scope action"),
+            "{err}"
+        );
     }
 
     /// Mutation consistency (v16 §6.1): non-read scope actions require an
@@ -1010,7 +1074,9 @@ mod tests {
             row
         };
         // No allowed groups at all.
-        assert!(validate_generated_rows(&[approved(ApproverRule::All { groups: vec![] })]).is_err());
+        assert!(
+            validate_generated_rows(&[approved(ApproverRule::All { groups: vec![] })]).is_err()
+        );
         // Threshold of zero, and threshold above the allowed set.
         assert!(validate_generated_rows(&[approved(ApproverRule::KOfN {
             k: 0,
@@ -1203,7 +1269,12 @@ mod tests {
             &[(2, "a", Some("security")), (3, "a", Some("finance"))],
         );
         assert!(evaluate(&policy, ProofDisposition::Authenticated, &repeated_group).is_err());
-        assert!(evaluate(&policy, ProofDisposition::Authenticated, &repeated_principal).is_err());
+        assert!(evaluate(
+            &policy,
+            ProofDisposition::Authenticated,
+            &repeated_principal
+        )
+        .is_err());
     }
 
     #[test]
@@ -1251,5 +1322,4 @@ mod tests {
         assert!(evaluate(&policy, ProofDisposition::Authenticated, &complete).is_ok());
         assert!(evaluate(&policy, ProofDisposition::Authenticated, &extra).is_err());
     }
-
 }

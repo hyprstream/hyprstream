@@ -365,7 +365,10 @@ where
 /// no trailing bytes.
 fn decode_browser_zmtp_request(request: &[u8]) -> Result<Bytes> {
     let (command_frame, command_len) = crate::zmtp_framing::decode_frame(request)?;
-    anyhow::ensure!(command_frame.command, "browser request omitted STREAM_TYPE command");
+    anyhow::ensure!(
+        command_frame.command,
+        "browser request omitted STREAM_TYPE command"
+    );
     let command = crate::zmtp_framing::ZmtpCommand::parse(&command_frame.data)?;
     anyhow::ensure!(
         command.name == "STREAM_TYPE" && command.body == b"REQ",

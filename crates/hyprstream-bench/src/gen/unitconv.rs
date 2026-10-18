@@ -67,7 +67,10 @@ pub fn noul(seed: u64, stratum: Stratum) -> Item {
         stratum,
         seed,
         Entry::Str(conv.text),
-        format!("Is that {claim} {} (rounded to the nearest integer)?", conv.unit),
+        format!(
+            "Is that {claim} {} (rounded to the nearest integer)?",
+            conv.unit
+        ),
         truth,
     )
 }
@@ -94,7 +97,10 @@ pub fn choice(seed: u64, stratum: Stratum) -> Item {
             "What is the converted value in {} (rounded to the nearest integer)?",
             conv.unit
         ),
-        values.iter().map(|v| format!("{v} {}", conv.unit)).collect(),
+        values
+            .iter()
+            .map(|v| format!("{v} {}", conv.unit))
+            .collect(),
         correct,
     )
 }

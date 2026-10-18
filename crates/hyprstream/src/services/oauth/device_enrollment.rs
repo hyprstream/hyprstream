@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{
     device_challenge::{
-        compute_kid, derive_challenge_key, derive_cookie_key_seed,
-        device_challenge, encode_vault_device_cookie, verify_device_enrollment,
+        compute_kid, derive_challenge_key, derive_cookie_key_seed, device_challenge,
+        encode_vault_device_cookie, verify_device_enrollment,
     },
     user_store::DeviceRecord,
 };
@@ -75,7 +75,10 @@ pub async fn device_challenge_handler(
     pubkey_arr.copy_from_slice(&pubkey_bytes);
 
     let Some(ref sk) = state.signing_key else {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "signing key not configured");
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "signing key not configured",
+        );
     };
 
     let sk_bytes = sk.to_bytes();
@@ -102,7 +105,12 @@ pub async fn device_enroll_handler(
     };
     let sig_bytes = match decode_b64url(&req.signature) {
         Some(b) if b.len() == 64 => b,
-        _ => return json_error(StatusCode::BAD_REQUEST, "signature must be 64 bytes base64url"),
+        _ => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "signature must be 64 bytes base64url",
+            )
+        }
     };
 
     let mut pubkey_arr = [0u8; 32];
@@ -111,7 +119,10 @@ pub async fn device_enroll_handler(
     sig_arr.copy_from_slice(&sig_bytes);
 
     let Some(ref sk) = state.signing_key else {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "signing key not configured");
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "signing key not configured",
+        );
     };
 
     let sk_bytes = sk.to_bytes();
@@ -184,7 +195,10 @@ pub async fn device_enroll_handler(
     (
         StatusCode::OK,
         [(header::SET_COOKIE, cookie_header)],
-        Json(EnrollResponse { adt, expires_in: 86400 }),
+        Json(EnrollResponse {
+            adt,
+            expires_in: 86400,
+        }),
     )
         .into_response()
 }

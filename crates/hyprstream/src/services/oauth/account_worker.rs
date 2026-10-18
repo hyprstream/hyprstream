@@ -199,10 +199,8 @@ pub(super) mod tests {
             expect_contained_exit(TEST, &[]);
             return;
         }
-        let worker = ContainedWorker::spawn("test-cancelled-worker", || {
-            loop {
-                std::thread::park();
-            }
+        let worker = ContainedWorker::spawn("test-cancelled-worker", || loop {
+            std::thread::park();
         })
         .unwrap();
         drop(worker);

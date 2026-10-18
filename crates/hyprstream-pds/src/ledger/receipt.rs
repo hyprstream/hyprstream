@@ -177,14 +177,20 @@ mod tests {
         // root DID (#928 rule 7). A non-DID pairwise spender must be accepted.
         let r = sample();
         assert!(!r.spender.starts_with("did:"));
-        assert_eq!(ReceiptRecord::from_dag_cbor(&r.to_dag_cbor()).expect("round-trip"), r);
+        assert_eq!(
+            ReceiptRecord::from_dag_cbor(&r.to_dag_cbor()).expect("round-trip"),
+            r
+        );
     }
 
     #[test]
     fn no_legal_identity_field_is_representable() {
         let mut v = sample().to_value();
         if let DagCbor::Map(ref mut pairs) = v {
-            pairs.push((DagCbor::Text("payerLegalId".into()), DagCbor::Text("SSN".into())));
+            pairs.push((
+                DagCbor::Text("payerLegalId".into()),
+                DagCbor::Text("SSN".into()),
+            ));
             pairs.sort_by(|a, b| a.0.as_str().unwrap_or("").cmp(b.0.as_str().unwrap_or("")));
         }
         assert!(ReceiptRecord::from_value(&v).is_err());

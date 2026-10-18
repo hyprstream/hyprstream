@@ -230,9 +230,7 @@ impl SpawnerBackend for SystemdBackend {
         cmd.arg("stop").arg(unit_name);
 
         let output = cmd.output().await.map_err(|e| {
-            RpcError::StopFailed(format!(
-                "failed to run systemctl stop for {unit_name}: {e}"
-            ))
+            RpcError::StopFailed(format!("failed to run systemctl stop for {unit_name}: {e}"))
         })?;
 
         if !output.status.success() {

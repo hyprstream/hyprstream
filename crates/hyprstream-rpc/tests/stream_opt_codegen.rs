@@ -8,8 +8,8 @@
 
 use hyprstream_rpc::capnp::{FromCapnp, ToCapnp};
 use hyprstream_rpc::stream_info::{
-    Completion, Delivery, IrohReach, Job, Log, Ordering, OverflowPolicy, Pipe, QuicReach,
-    Destination, Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
+    Completion, Delivery, Destination, IrohReach, Job, Log, Ordering, OverflowPolicy, Pipe,
+    QuicReach, Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
 };
 
 /// Serialize a `StreamInfo` through a Cap'n Proto message and read it back.
@@ -85,11 +85,18 @@ fn non_default_arms_roundtrip() {
     // Each axis exercised with a non-@0 arm, including all three group arms,
     // both scalar Retention arms, and the Void Completion::None arm.
     let qos = StreamOpt {
-        ordering: Ordering::Unordered { anti_replay_window: 7 },
-        delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
+        ordering: Ordering::Unordered {
+            anti_replay_window: 7,
+        },
+        delivery: Delivery::AtLeastOnce {
+            dedup_window: 4096,
+            resumable: true,
+        },
         completion: Completion::None,
         retention: Retention::Blocks(256),
-        overflow_policy: OverflowPolicy::DropOldest { high_water_mark: 1024 },
+        overflow_policy: OverflowPolicy::DropOldest {
+            high_water_mark: 1024,
+        },
     };
     assert_roundtrips(qos);
 
@@ -193,8 +200,13 @@ fn group_arm_field_values_preserved() {
     // Explicitly assert the group-arm leaf values survive the round-trip
     // (not just structural equality), since group arms are the new codegen path.
     let info = sample_info(StreamOpt {
-        ordering: Ordering::Unordered { anti_replay_window: 42 },
-        delivery: Delivery::AtLeastOnce { dedup_window: 99, resumable: false },
+        ordering: Ordering::Unordered {
+            anti_replay_window: 42,
+        },
+        delivery: Delivery::AtLeastOnce {
+            dedup_window: 99,
+            resumable: false,
+        },
         overflow_policy: OverflowPolicy::DropOldest { high_water_mark: 8 },
         ..StreamOpt::default()
     });
@@ -205,7 +217,10 @@ fn group_arm_field_values_preserved() {
         other => panic!("expected Unordered, got {other:?}"),
     }
     match back.qos.delivery {
-        Delivery::AtLeastOnce { dedup_window, resumable } => {
+        Delivery::AtLeastOnce {
+            dedup_window,
+            resumable,
+        } => {
             assert_eq!(dedup_window, 99);
             assert!(!resumable);
         }

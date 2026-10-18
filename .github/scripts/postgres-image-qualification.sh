@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Run the real-PostgreSQL portion of the staged OCI image profile.
+#
+# The caller must provide a private URL file for a disposable database.  This
+# script deliberately refuses to run without it: the source tests otherwise
+# return success after reporting an opt-in skip, which is not qualification.
+set -euo pipefail
+
+: "${HYPRSTREAM_POSTGRES_TEST_URL_FILE:?PostgreSQL URL file is required}"
+url_file="${HYPRSTREAM_POSTGRES_TEST_URL_FILE}"
+[[ -f "${url_file}" && ! -L "${url_file}" && -s "${url_file}" ]] || {
+  echo "PostgreSQL qualification requires a nonempty regular URL file" >&2
+  exit 1
+}
+: "${HYPRSTREAM_REPLAY_TEST_URL_FILE:?Replay qualification URL file is required}"
+replay_url_file="${HYPRSTREAM_REPLAY_TEST_URL_FILE}"
+[[ -f "${replay_url_file}" && ! -L "${replay_url_file}" && -s "${replay_url_file}" ]] || {
+  echo "Replay qualification requires a nonempty regular URL file" >&2
+  exit 1
+}
+
+readonly STAGING_POSTGRES_IMAGE_FEATURES='otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay,pglite'
+
+# These test modules each call require_db! and touch the supplied PostgreSQL
+# instance. Keep the account-store and PDS record-store coverage separate so a
+# module move or an empty filter cannot silently turn this into a green skip.
+run_live_module() {
+  local package="$1"
+  local features="$2"
+  local filter="$3"
+  local sentinel="$4"
+  shift 4
+  local -a extra_test_args=("$@")
+  local log
+  local passed
+  local cargo_status
+  local tee_status
+  local -a pipeline_status
+  log="$(mktemp "${TMPDIR:-/tmp}/hyprstream-postgres-qualification.XXXXXX.log")"
+  # The test modules share one disposable database and each initializes or
+  # clears its tables. Run each module serially so their test fixtures cannot
+  # race schema creation and turn a valid profile into a false failure.
+  # Capture the program statuses explicitly. `if ! pipeline` normalizes the
+  # failure to one, which otherwise hides an OOM/signal or a cache-permission
+  # failure on the native ARM builder. Neither status can contain the URL.
+  set +e
+  HYPRSTREAM_REPLAY_TEST_URL_FILE="${replay_url_file}" cargo test -p "${package}" --locked --lib --no-default-features \
+      --features "${features}" -- "${filter}" "${extra_test_args[@]}" \
+      --test-threads=1 --show-output 2>&1 | tee "${log}"
+  pipeline_status=("${PIPESTATUS[@]}")
+  cargo_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
+  set -e
+  if (( cargo_status != 0 || tee_status != 0 )); then
+    rm -f "${log}"
+    printf 'PostgreSQL qualification command failed filter=%s cargo_exit=%s tee_exit=%s\n' \
+      "${filter}" "${cargo_status}" "${tee_status}" >&2
+    return 1
+  fi
+  if grep -Fq 'HYPRSTREAM_POSTGRES_TEST_URL_FILE unset' "${log}"; then
+    rm -f "${log}"
+    echo "PostgreSQL qualification skipped ${filter}" >&2
+    return 1
+  fi
+  if ! grep -Fq "test ${sentinel} ... ok" "${log}"; then
+    rm -f "${log}"
+    echo "PostgreSQL qualification missed required test ${sentinel}" >&2
+    return 1
+  fi
+  passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed;.*$/\1/p' "${log}" | tail -n 1)"
+  rm -f "${log}"
+  if [[ ! "${passed}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PostgreSQL qualification ran no tests for ${filter}" >&2
+    return 1
+  fi
+  printf 'postgres-qualification filter=%s passed=%s\n' "${filter}" "${passed}"
+}
+
+run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'auth::postgres_store::tests::' \
+  'auth::postgres_store::tests::add_list_remove_pubkey'
+run_live_module hyprstream-pds postgres 'pgsql_kv::tests::live_' \
+  'pgsql_kv::tests::live_replay_admission_is_cross_handle_once_and_reclaims_expiry'
+run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'services::pds_record_rocksdb::pg_tests::live_' \
+  'services::pds_record_rocksdb::pg_tests::live_two_handle_persistence_and_visibility'
+run_live_module hyprstream "${STAGING_POSTGRES_IMAGE_FEATURES}" 'auth::postgres_replay::tests::scratch_postgres_replay_contract' \
+  'auth::postgres_replay::tests::scratch_postgres_replay_contract' --ignored

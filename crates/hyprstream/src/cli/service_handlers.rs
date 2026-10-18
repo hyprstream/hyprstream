@@ -12,6 +12,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::info;
 
+/// Reconcile the published local service roster before runtime startup.
+pub fn handle_service_reconcile_enrollment(config: &crate::config::HyprConfig) -> Result<()> {
+    let secrets = crate::config::HyprConfig::resolve_secrets_dir_for(Some(config))?;
+    let count = crate::auth::service_enrollment::reconcile_existing_services(
+        &secrets,
+        &config.oauth.issuer_url(),
+        chrono::Utc::now().timestamp(),
+    )?;
+    info!(
+        services = count,
+        "Reconciled retained service enrollment and credentials"
+    );
+    Ok(())
+}
+
 /// Persist requested built-in templates into the same policy store loaded by
 /// PolicyService, without starting a resolver or loading service credentials.
 pub async fn handle_service_provision_policy_templates(
@@ -143,13 +158,13 @@ async fn provision_policy_templates(
         &staged_model,
         &mut after_publication_write,
     )
-        .context("publish verified policy model")?;
+    .context("publish verified policy model")?;
     atomic_publish_policy_file(
         &policies_dir.join("policy.csv"),
         &staged_policy,
         &mut after_publication_write,
     )
-        .context("publish verified policy")?;
+    .context("publish verified policy")?;
 
     let published = PolicyManager::new(&policies_dir)
         .await
@@ -186,10 +201,7 @@ async fn complete_policy_state(manager: &crate::auth::PolicyManager) -> Complete
     }
 }
 
-async fn parse_complete_policy_state(
-    model: &[u8],
-    policy: &[u8],
-) -> Result<CompletePolicyState> {
+async fn parse_complete_policy_state(model: &[u8], policy: &[u8]) -> Result<CompletePolicyState> {
     use casbin::{CoreApi as _, DefaultModel, Enforcer, MgmtApi as _, StringAdapter};
 
     let model = std::str::from_utf8(model).context("captured policy model is not UTF-8")?;
@@ -386,10 +398,18 @@ pub async fn handle_service_install(
     println!("  Installing command...");
     match InstallPlan::prepare() {
         Ok(plan) => {
-            println!("    Source: {} ({})", plan.source.display(), plan.type_label());
+            println!(
+                "    Source: {} ({})",
+                plan.source.display(),
+                plan.type_label()
+            );
             match plan.execute() {
                 Ok(result) => {
-                    println!("    {} ({})", result.version_dir.display(), result.type_label());
+                    println!(
+                        "    {} ({})",
+                        result.version_dir.display(),
+                        result.type_label()
+                    );
                     println!(
                         "    {} -> ...",
                         result.bin_dir.join("hyprstream.appimage").display()
@@ -589,8 +609,9 @@ pub fn direct_child_process_config(
     if iroh_required {
         // The child's own authenticated startup boundary is the readiness
         // signal (sd_notify READY after Iroh bind and first publication).
-        config.readiness =
-            hyprstream_service::ProcessReadiness::Notify { timeout: CHILD_READINESS_TIMEOUT };
+        config.readiness = hyprstream_service::ProcessReadiness::Notify {
+            timeout: CHILD_READINESS_TIMEOUT,
+        };
     }
     Ok(config)
 }
@@ -788,10 +809,7 @@ impl RequiredLaunchGuard {
 
 impl Drop for RequiredLaunchGuard {
     fn drop(&mut self) {
-        if self.committed
-            || !self.armed
-            || (self.started.is_empty() && self.failed.is_empty())
-        {
+        if self.committed || !self.armed || (self.started.is_empty() && self.failed.is_empty()) {
             return;
         }
         // Cancellation (task abort at any await — later-child readiness or a
@@ -1004,7 +1022,6 @@ pub async fn handle_service_start(
     Ok(())
 }
 
-
 /// Start installed units and require each to reach the active state within
 /// `active_timeout` before reporting success (#1585).
 ///
@@ -1060,10 +1077,7 @@ async fn start_units_to_active(
 /// Handle `service stop` - Stop services
 ///
 /// Attempts to stop services via both systemd and PID files.
-pub async fn handle_service_stop(
-    config_services: &[String],
-    name: Option<String>,
-) -> Result<()> {
+pub async fn handle_service_stop(config_services: &[String], name: Option<String>) -> Result<()> {
     let target_services: Vec<String> = if let Some(name) = name {
         vec![name]
     } else {
@@ -1120,10 +1134,7 @@ pub async fn handle_service_stop(
 }
 
 /// Handle `service status` - Show current state
-pub async fn handle_service_status(
-    config_services: &[String],
-    verbose: bool,
-) -> Result<()> {
+pub async fn handle_service_status(config_services: &[String], verbose: bool) -> Result<()> {
     println!("Hyprstream Service Status");
     println!("{}", "=".repeat(50));
 
@@ -1226,10 +1237,7 @@ pub async fn handle_service_status(
 ///
 /// Extracted from the old `handle_service_repair` so it can be called as part
 /// of `handle_service_install` without the surrounding summary chrome.
-pub async fn run_repair_checks(
-    models_dir: &Path,
-    verbose: bool,
-) -> Result<()> {
+pub async fn run_repair_checks(models_dir: &Path, verbose: bool) -> Result<()> {
     use crate::auth::PolicyManager;
     use crate::cli::policy_handlers::load_or_generate_signing_key;
 
@@ -1262,7 +1270,11 @@ pub async fn run_repair_checks(
         }
 
         if fixed {
-            print_check(label, CheckStatus::Fixed, &format!("created missing directories under {}", models_dir.display()));
+            print_check(
+                label,
+                CheckStatus::Fixed,
+                &format!("created missing directories under {}", models_dir.display()),
+            );
         } else {
             print_check(label, CheckStatus::Ok, &format!("{}", models_dir.display()));
         }
@@ -1290,10 +1302,18 @@ pub async fn run_repair_checks(
                         }
                         Err(_) => 0,
                     };
-                    print_check(label, CheckStatus::Ok, &format!(".registry initialized ({count} commits)"));
+                    print_check(
+                        label,
+                        CheckStatus::Ok,
+                        &format!(".registry initialized ({count} commits)"),
+                    );
                 }
                 Err(e) => {
-                    print_check(label, CheckStatus::Fail, &format!(".registry git repo corrupt: {e}"));
+                    print_check(
+                        label,
+                        CheckStatus::Fail,
+                        &format!(".registry git repo corrupt: {e}"),
+                    );
                     all_passed = false;
                 }
             }
@@ -1301,14 +1321,26 @@ pub async fn run_repair_checks(
             // Initialize via Git2DB
             match git2db::Git2DB::open(models_dir).await {
                 Ok(_) => {
-                    print_check(label, CheckStatus::Fixed, ".registry initialized via Git2DB");
+                    print_check(
+                        label,
+                        CheckStatus::Fixed,
+                        ".registry initialized via Git2DB",
+                    );
                 }
                 Err(e) => {
                     // Fall back to raw git init
                     match git2::Repository::init(models_dir.join(".registry")) {
-                        Ok(_) => print_check(label, CheckStatus::Fixed, ".registry initialized (git init)"),
+                        Ok(_) => print_check(
+                            label,
+                            CheckStatus::Fixed,
+                            ".registry initialized (git init)",
+                        ),
                         Err(e2) => {
-                            print_check(label, CheckStatus::Fail, &format!("failed to init: Git2DB: {e}, git init: {e2}"));
+                            print_check(
+                                label,
+                                CheckStatus::Fail,
+                                &format!("failed to init: Git2DB: {e}, git init: {e2}"),
+                            );
                             all_passed = false;
                         }
                     }
@@ -1351,7 +1383,11 @@ pub async fn run_repair_checks(
                     print_check(label, CheckStatus::Ok, "Ed25519 key loaded (32 bytes)");
                 }
                 Ok(bytes) => {
-                    print_check(label, CheckStatus::Fail, &format!("invalid key: {} bytes (expected 32)", bytes.len()));
+                    print_check(
+                        label,
+                        CheckStatus::Fail,
+                        &format!("invalid key: {} bytes (expected 32)", bytes.len()),
+                    );
                     all_passed = false;
                 }
                 Err(e) => {
@@ -1363,7 +1399,11 @@ pub async fn run_repair_checks(
             match load_or_generate_signing_key(&keys_dir).await {
                 Ok(_) => print_check(label, CheckStatus::Fixed, "generated new Ed25519 key"),
                 Err(e) => {
-                    print_check(label, CheckStatus::Fail, &format!("failed to generate: {e}"));
+                    print_check(
+                        label,
+                        CheckStatus::Fail,
+                        &format!("failed to generate: {e}"),
+                    );
                     all_passed = false;
                 }
             }
@@ -1376,7 +1416,11 @@ pub async fn run_repair_checks(
         match crate::config::HyprConfig::resolve_secrets_dir() {
             Ok(secrets_dir) => {
                 // HTTP TLS (365-day self-signed)
-                match crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
+                match crate::auth::identity_store::load_or_generate_tls_materials(
+                    &secrets_dir,
+                    "localhost",
+                    365,
+                ) {
                     Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
                     Err(e) => {
                         print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
@@ -1385,7 +1429,11 @@ pub async fn run_repair_checks(
                 }
                 // QUIC TLS (14-day per WebTransport spec)
                 match crate::auth::identity_store::load_or_generate_tls_materials_named(
-                    &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
+                    &secrets_dir,
+                    "localhost",
+                    14,
+                    "quic-key",
+                    "quic-cert",
                 ) {
                     Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
                     Err(e) => {
@@ -1432,8 +1480,12 @@ pub async fn run_repair_checks(
                     print_check(label, CheckStatus::Ok, &name);
                 } else {
                     let mut missing = Vec::new();
-                    if !has_name { missing.push("user.name"); }
-                    if !has_email { missing.push("user.email"); }
+                    if !has_name {
+                        missing.push("user.name");
+                    }
+                    if !has_email {
+                        missing.push("user.email");
+                    }
                     let msg = format!("{} not set", missing.join(", "));
                     print_check(label, CheckStatus::Warn, &msg);
                     warnings.push(
@@ -1470,7 +1522,10 @@ pub async fn run_repair_checks(
             print_check(
                 "Service JWTs",
                 CheckStatus::Warn,
-                &format!("missing for: {}. Run: hyprstream wizard", missing_jwts.join(", ")),
+                &format!(
+                    "missing for: {}. Run: hyprstream wizard",
+                    missing_jwts.join(", ")
+                ),
             );
             warnings.push("Run 'hyprstream wizard' to generate missing service JWTs".to_owned());
         }
@@ -1485,21 +1540,29 @@ pub async fn run_repair_checks(
         if policy_csv.exists() {
             match tokio::fs::read_to_string(&policy_csv).await {
                 Ok(content) => {
-                    let rule_count = content.lines()
+                    let rule_count = content
+                        .lines()
                         .filter(|l| l.starts_with("p,") || l.starts_with("p "))
                         .count();
 
                     if rule_count > 0 {
                         // Get first subject for display
-                        let first_subject = content.lines()
+                        let first_subject = content
+                            .lines()
                             .find(|l| l.starts_with("p,") || l.starts_with("p "))
                             .and_then(|l| l.split(',').nth(1))
                             .map(|s| s.trim().to_owned())
                             .unwrap_or_default();
-                        print_check(label, CheckStatus::Ok, &format!("{rule_count} allow rule(s) ({first_subject})"));
+                        print_check(
+                            label,
+                            CheckStatus::Ok,
+                            &format!("{rule_count} allow rule(s) ({first_subject})"),
+                        );
                     } else {
                         print_check(label, CheckStatus::Warn, "no allow rules (deny-by-default)");
-                        warnings.push("Apply a template: hyprstream quick policy list-templates".to_owned());
+                        warnings.push(
+                            "Apply a template: hyprstream quick policy list-templates".to_owned(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -1509,7 +1572,9 @@ pub async fn run_repair_checks(
             }
         } else {
             print_check(label, CheckStatus::Warn, "policy.csv not found");
-            warnings.push("Run 'hyprstream service install' again after fixing policy files".to_owned());
+            warnings.push(
+                "Run 'hyprstream service install' again after fixing policy files".to_owned(),
+            );
         }
     }
 
@@ -1528,19 +1593,24 @@ pub async fn run_repair_checks(
                         print_check(label, CheckStatus::Ok, "unprovisioned (clean)");
                     }
                     Ok(entries) => {
-                        match crate::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries) {
+                        match crate::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)
+                        {
                             Ok(()) => {
                                 let n = entries.len();
                                 let noun = if n == 1 { "entry" } else { "entries" };
-                                print_check(label, CheckStatus::Ok,
-                                    &format!("{n} hybrid {noun} bound"));
+                                print_check(
+                                    label,
+                                    CheckStatus::Ok,
+                                    &format!("{n} hybrid {noun} bound"),
+                                );
                             }
                             Err(e) => {
                                 print_check(label, CheckStatus::Fail, &format!("{e}"));
                                 all_passed = false;
                                 warnings.push(
                                     "Re-provision with 'hyprstream wizard' to bind \
-                                     ML-DSA-65 keys for every service".to_owned()
+                                     ML-DSA-65 keys for every service"
+                                        .to_owned(),
                                 );
                             }
                         }
@@ -1549,7 +1619,7 @@ pub async fn run_repair_checks(
                         print_check(label, CheckStatus::Fail, &format!("parse error: {e}"));
                         all_passed = false;
                         warnings.push(
-                            "Fix the file or re-provision with 'hyprstream wizard'".to_owned()
+                            "Fix the file or re-provision with 'hyprstream wizard'".to_owned(),
                         );
                     }
                 }
@@ -1581,7 +1651,9 @@ pub async fn run_repair_checks(
     if all_passed {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("one or more repair checks failed; review output above"))
+        Err(anyhow::anyhow!(
+            "one or more repair checks failed; review output above"
+        ))
     }
 }
 
@@ -1596,11 +1668,11 @@ pub(crate) enum CheckStatus {
 
 pub(crate) fn print_check(label: &str, status: CheckStatus, detail: &str) {
     let (icon, color) = match status {
-        CheckStatus::Ok => ("\u{2713}", "\x1b[32m"),    // green checkmark
-        CheckStatus::Fixed => ("\u{2713}", "\x1b[33m"),  // yellow checkmark (fixed)
-        CheckStatus::Warn => ("\u{26A0}", "\x1b[33m"),   // yellow warning
-        CheckStatus::Fail => ("\u{2717}", "\x1b[31m"),   // red X
-        CheckStatus::Info => ("\u{25CB}", "\x1b[36m"),   // cyan circle (informational)
+        CheckStatus::Ok => ("\u{2713}", "\x1b[32m"), // green checkmark
+        CheckStatus::Fixed => ("\u{2713}", "\x1b[33m"), // yellow checkmark (fixed)
+        CheckStatus::Warn => ("\u{26A0}", "\x1b[33m"), // yellow warning
+        CheckStatus::Fail => ("\u{2717}", "\x1b[31m"), // red X
+        CheckStatus::Info => ("\u{25CB}", "\x1b[36m"), // cyan circle (informational)
     };
     println!("  {color}{icon}\x1b[0m {:<20} {detail}", label);
 }
@@ -1658,7 +1730,11 @@ impl InstallPlan {
         let source_size = validate_source(&source)?;
 
         let version = build_version();
-        let filename = if is_appimage { "hyprstream.appimage" } else { "hyprstream" };
+        let filename = if is_appimage {
+            "hyprstream.appimage"
+        } else {
+            "hyprstream"
+        };
 
         let bin_dir = hyprstream_rpc::paths::bin_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot determine user executable directory"))?;
@@ -1684,8 +1760,9 @@ impl InstallPlan {
     pub(crate) fn execute(self) -> Result<InstallResult> {
         std::fs::create_dir_all(&self.bin_dir)
             .with_context(|| format!("Failed to create directory: {}", self.bin_dir.display()))?;
-        std::fs::create_dir_all(&self.version_dir)
-            .with_context(|| format!("Failed to create directory: {}", self.version_dir.display()))?;
+        std::fs::create_dir_all(&self.version_dir).with_context(|| {
+            format!("Failed to create directory: {}", self.version_dir.display())
+        })?;
 
         // Copy binary to versioned directory (skip if already in place)
         let versioned_binary = self.version_dir.join(self.filename);
@@ -1728,7 +1805,9 @@ impl InstallPlan {
             std::os::unix::fs::symlink(&relative_path, &bin_appimage)
                 .with_context(|| format!("Failed to create symlink: {}", bin_appimage.display()))?;
             std::os::unix::fs::symlink(Path::new("hyprstream.appimage"), &bin_hyprstream)
-                .with_context(|| format!("Failed to create symlink: {}", bin_hyprstream.display()))?;
+                .with_context(|| {
+                    format!("Failed to create symlink: {}", bin_hyprstream.display())
+                })?;
         }
 
         let updated_profiles = if let Some(home) = dirs::home_dir() {
@@ -1750,13 +1829,21 @@ impl InstallPlan {
     }
 
     pub(crate) fn type_label(&self) -> &'static str {
-        if self.is_appimage { "AppImage" } else { "binary" }
+        if self.is_appimage {
+            "AppImage"
+        } else {
+            "binary"
+        }
     }
 }
 
 impl InstallResult {
     pub(crate) fn type_label(&self) -> &'static str {
-        if self.is_appimage { "AppImage" } else { "binary" }
+        if self.is_appimage {
+            "AppImage"
+        } else {
+            "binary"
+        }
     }
 }
 
@@ -1778,9 +1865,7 @@ fn binary_copy_source() -> Result<(PathBuf, bool)> {
     }
 
     // Fall back to argv[0]
-    let argv0 = std::env::args_os()
-        .next()
-        .context("No argv[0] available")?;
+    let argv0 = std::env::args_os().next().context("No argv[0] available")?;
     let path = PathBuf::from(&argv0);
 
     // Resolve relative paths against CWD
@@ -1855,10 +1940,18 @@ pub(crate) fn format_size(bytes: u64) -> String {
 
     if bytes >= GIB {
         let val = bytes as f64 / GIB as f64;
-        if val >= 100.0 { format!("{:.0} GB", val) } else { format!("{:.1} GB", val) }
+        if val >= 100.0 {
+            format!("{:.0} GB", val)
+        } else {
+            format!("{:.1} GB", val)
+        }
     } else if bytes >= MIB {
         let val = bytes as f64 / MIB as f64;
-        if val >= 100.0 { format!("{:.0} MB", val) } else { format!("{:.1} MB", val) }
+        if val >= 100.0 {
+            format!("{:.0} MB", val)
+        } else {
+            format!("{:.1} MB", val)
+        }
     } else if bytes >= KIB {
         format!("{:.0} KB", bytes as f64 / KIB as f64)
     } else {
@@ -1943,8 +2036,8 @@ pub(crate) fn is_binary_installed() -> Option<PathBuf> {
 pub(crate) fn is_appimage_file(path: &Path) -> Result<bool> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open: {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open: {}", path.display()))?;
 
     let mut header = [0u8; 11];
     if file.read_exact(&mut header).is_err() {
@@ -1975,7 +2068,8 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 /// the base64-encoded SHA-256 hash, suitable for use in the browser's
 /// `serverCertificateHashes` WebTransport option.
 pub fn handle_print_cert_hash(quic_config: &crate::config::QuicConfig) -> Result<()> {
-    let (cert_chain, _key_der) = quic_config.load_tls_materials()
+    let (cert_chain, _key_der) = quic_config
+        .load_tls_materials()
         .context("Failed to load/generate QUIC TLS certificate")?;
 
     let hash = hyprstream_rpc::transport::zmtp_quic::cert_hash(&cert_chain[0]);
@@ -1996,9 +2090,12 @@ pub fn handle_print_cert_hash(quic_config: &crate::config::QuicConfig) -> Result
 /// Idempotent: an existing key is loaded, never rotated, and up-to-date
 /// sidecars are left untouched. Prints the base64 public key and the sidecar
 /// paths for provisioning units that wire them into a credential mint.
-pub fn handle_service_ensure_key(config: Option<&crate::config::HyprConfig>, name: &str) -> Result<()> {
-    use base64::Engine as _;
+pub fn handle_service_ensure_key(
+    config: Option<&crate::config::HyprConfig>,
+    name: &str,
+) -> Result<()> {
     use crate::auth::identity_store;
+    use base64::Engine as _;
 
     identity_store::validate_service_name(name)?;
     let secrets_dir = identity_store::credentials_dir_for_config(config)?;
@@ -2007,12 +2104,20 @@ pub fn handle_service_ensure_key(config: Option<&crate::config::HyprConfig>, nam
     let key_dir = identity_store::service_signing_key_dir(&secrets_dir, name, profile);
     identity_store::ensure_service_key_sidecars(&key_dir, &key)?;
 
-    let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(key.verifying_key().as_bytes());
+    let pubkey_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
     println!("service '{name}' signing key ensured");
     println!("  public key (base64): {pubkey_b64}");
-    println!("  {}", key_dir.join(identity_store::SIGNING_KEY_PUB_NAME).display());
-    println!("  {}", key_dir.join(identity_store::SERVICE_PUBKEY_HYBRID_NAME).display());
+    println!(
+        "  {}",
+        key_dir.join(identity_store::SIGNING_KEY_PUB_NAME).display()
+    );
+    println!(
+        "  {}",
+        key_dir
+            .join(identity_store::SERVICE_PUBKEY_HYBRID_NAME)
+            .display()
+    );
     Ok(())
 }
 
@@ -2050,6 +2155,82 @@ mod offline_policy_provision_tests {
 
     fn public_templates() -> Vec<String> {
         vec!["public-inference".to_owned(), "public-read".to_owned()]
+    }
+
+    #[tokio::test]
+    async fn staging_e2e_template_grants_only_the_test_did_and_pinned_resources() {
+        assert_staging_owner_template(
+            "cyberdione-staging-e2e",
+            "did:plc:3f7ldey5bivhfjapwqi2sljy",
+            "did:plc:rjqczurevrpoz4mcnax2kgw4",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn staging_operator_template_grants_only_the_operator_did_and_pinned_resources() {
+        assert_staging_owner_template(
+            "cyberdione-staging-operator",
+            "did:plc:rjqczurevrpoz4mcnax2kgw4",
+            "did:plc:3f7ldey5bivhfjapwqi2sljy",
+        )
+        .await;
+    }
+
+    async fn assert_staging_owner_template(template: &str, did: &str, other_owner: &str) {
+        let root = tempfile::tempdir().expect("temporary models root");
+        let templates = vec![template.to_owned()];
+        handle_service_provision_policy_templates(root.path(), &templates)
+            .await
+            .expect("provision exact staging grant");
+        let manager = PolicyManager::new(root.path().join(".registry/policies"))
+            .await
+            .expect("reopen policy store");
+        for (resource, action) in [
+            ("registry:qwen2.5-0.5b-instruct", "query"),
+            ("model:Load", "write"),
+            ("model:Status", "query"),
+            ("model:qwen2.5-0.5b-instruct:main", "infer"),
+        ] {
+            for denied in [other_owner, "anonymous", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"] {
+                assert!(
+                    !manager
+                        .check_with_domain(denied, "local", resource, action)
+                        .await,
+                    "owner template must not grant {denied} {resource} {action}",
+                );
+            }
+            assert!(
+                manager
+                    .check_with_domain(did, "local", resource, action)
+                    .await
+            );
+            assert!(
+                !manager
+                    .check_with_domain(did, "other", resource, action)
+                    .await
+            );
+            assert!(
+                !manager
+                    .check_with_domain(
+                        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                        "local",
+                        resource,
+                        action
+                    )
+                    .await
+            );
+        }
+        assert!(
+            !manager
+                .check_with_domain(did, "local", "registry:other", "query")
+                .await
+        );
+        assert!(
+            !manager
+                .check_with_domain(did, "local", "model:qwen2.5-0.5b-instruct:other", "infer")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -2270,13 +2451,7 @@ mod offline_policy_provision_tests {
             "deny".to_owned(),
         ];
         denied
-            .add_policy_with_domain(
-                "service:retained",
-                "*",
-                "model:*",
-                "ttt.writeback",
-                "deny",
-            )
+            .add_policy_with_domain("service:retained", "*", "model:*", "ttt.writeback", "deny")
             .await
             .expect("add retained deny");
         denied.save().await.expect("persist retained deny");
@@ -2289,17 +2464,17 @@ mod offline_policy_provision_tests {
 
         let mut fault_reached = false;
         assert!(provision_policy_templates(
-                root.path(),
-                &public_templates(),
-                |_| {
-                    fault_reached = true;
-                    anyhow::bail!("injected failure after staged write before publication")
-                },
-                |_| Ok(()),
-                |_| Ok(()),
-            )
-            .await
-            .is_err());
+            root.path(),
+            &public_templates(),
+            |_| {
+                fault_reached = true;
+                anyhow::bail!("injected failure after staged write before publication")
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await
+        .is_err());
         assert!(fault_reached, "prepublication fault seam must be reached");
         assert_eq!(
             tokio::fs::read(&policy_path)
@@ -2338,13 +2513,7 @@ mod offline_policy_provision_tests {
             "deny".to_owned(),
         ];
         retained
-            .add_policy_with_domain(
-                "service:retained",
-                "*",
-                "model:*",
-                "ttt.writeback",
-                "deny",
-            )
+            .add_policy_with_domain("service:retained", "*", "model:*", "ttt.writeback", "deny")
             .await
             .expect("add retained deny");
         retained.save().await.expect("persist retained deny");
@@ -2362,9 +2531,15 @@ mod offline_policy_provision_tests {
             |_| Ok(()),
             |_| Ok(()),
             |destination| {
-                if destination.file_name().is_some_and(|name| name == "model.conf") {
+                if destination
+                    .file_name()
+                    .is_some_and(|name| name == "model.conf")
+                {
                     wrote_model_temp = true;
-                } else if destination.file_name().is_some_and(|name| name == "policy.csv") {
+                } else if destination
+                    .file_name()
+                    .is_some_and(|name| name == "policy.csv")
+                {
                     failed_policy_write = true;
                     anyhow::bail!("injected failure after policy temp-file write")
                 }
@@ -2414,13 +2589,7 @@ mod offline_policy_provision_tests {
             .await
             .expect("initialize policy");
         retained
-            .add_policy_with_domain(
-                "service:retained",
-                "*",
-                "model:*",
-                "ttt.writeback",
-                "deny",
-            )
+            .add_policy_with_domain("service:retained", "*", "model:*", "ttt.writeback", "deny")
             .await
             .expect("add retained deny");
         retained.save().await.expect("persist retained deny");
@@ -2464,12 +2633,10 @@ mod offline_policy_provision_tests {
             |_| Ok(()),
         )
         .await;
-        assert!(
-            result
-                .expect_err("incomplete snapshot must be rejected")
-                .to_string()
-                .contains("complete intended policy state")
-        );
+        assert!(result
+            .expect_err("incomplete snapshot must be rejected")
+            .to_string()
+            .contains("complete intended policy state"));
         assert_eq!(
             tokio::fs::read(&policy_path)
                 .await
@@ -2632,7 +2799,10 @@ mod launcher_tests {
             .join(OsString::from_vec(b"custom-\xff.toml".to_vec()));
         std::fs::write(&config_path, "[secrets]\n")?;
         let canonical = std::fs::canonicalize(&config_path)?;
-        assert!(canonical.to_str().is_none(), "fixture path must be non-UTF-8");
+        assert!(
+            canonical.to_str().is_none(),
+            "fixture path must be non-UTF-8"
+        );
 
         let loaded = crate::config::HyprConfig::from_file(&canonical)?;
         loaded.validate()?;
@@ -2649,7 +2819,11 @@ mod launcher_tests {
                 .windows(2)
                 .filter(|pair| pair[0] == "--config")
                 .collect();
-            assert_eq!(selectors.len(), 1, "one explicit selector must be forwarded");
+            assert_eq!(
+                selectors.len(),
+                1,
+                "one explicit selector must be forwarded"
+            );
             assert_eq!(
                 selectors[0][1].as_os_str().as_bytes(),
                 canonical.as_os_str().as_bytes(),
@@ -2691,8 +2865,7 @@ mod launcher_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unknown_required_roster_is_rejected_before_any_child_spawns()
-    -> anyhow::Result<()> {
+    async fn unknown_required_roster_is_rejected_before_any_child_spawns() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir()?;
@@ -2709,7 +2882,10 @@ mod launcher_tests {
         let error = launch_direct_children(&targets, true, None, &executable, &spawner)
             .await
             .expect_err("an unknown Required target must reject the whole plan");
-        assert_eq!(error.to_string(), format!("unknown native service: {unknown}"));
+        assert_eq!(
+            error.to_string(),
+            format!("unknown native service: {unknown}")
+        );
         assert!(
             !marker.exists(),
             "validation must finish before any configured executable runs"
@@ -2758,9 +2934,7 @@ mod launcher_tests {
             Ok(())
         }
         async fn start(&self, service: &str) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .push(format!("start:{service}"));
+            self.calls.lock().push(format!("start:{service}"));
             match self.start_error {
                 Some(reason) => anyhow::bail!("{reason}"),
                 None => Ok(()),
@@ -2770,9 +2944,7 @@ mod launcher_tests {
             Ok(())
         }
         async fn is_active(&self, service: &str) -> anyhow::Result<bool> {
-            self.calls
-                .lock()
-                .push(format!("active:{service}"));
+            self.calls.lock().push(format!("active:{service}"));
             use std::sync::atomic::Ordering;
             let remaining = self.active_after.load(Ordering::SeqCst);
             if remaining > 0 && remaining != u32::MAX {
@@ -2820,9 +2992,7 @@ mod launcher_tests {
         .await
         .expect_err("a unit that never activates must fail the bounded wait");
         assert!(
-            error
-                .to_string()
-                .contains("did not reach the active state"),
+            error.to_string().contains("did not reach the active state"),
             "active-state timeout expected, got: {error}"
         );
 
@@ -2939,8 +3109,8 @@ mod launcher_tests {
     /// `started.iter().rev()`, not an observed event.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    async fn required_stage_failure_aborts_launch_and_never_spawns_later_stages()
-    -> anyhow::Result<()> {
+    async fn required_stage_failure_aborts_launch_and_never_spawns_later_stages(
+    ) -> anyhow::Result<()> {
         use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
         #[allow(unused_imports)]
         use ProcessReadiness as _ProcessReadinessMarker;
@@ -2977,11 +3147,8 @@ mod launcher_tests {
         };
         // Reap confirmation: ESRCH, not merely an absent PID file.
         let assert_reaped = |pid: u32| {
-            let gone = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                None,
-            )
-            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+            let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+                .is_err_and(|e| e == nix::errno::Errno::ESRCH);
             assert!(gone, "child pid {pid} must be reaped after rollback");
         };
 
@@ -3109,11 +3276,8 @@ mod launcher_tests {
                 .context("marker must hold the child pid")
         };
         let assert_reaped = |pid: u32| {
-            let gone = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                None,
-            )
-            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+            let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+                .is_err_and(|e| e == nix::errno::Errno::ESRCH);
             assert!(gone, "cancelled child pid {pid} must be genuinely reaped");
         };
         let helper_cfg = |name: &str, pending: bool| {
@@ -3185,8 +3349,8 @@ mod launcher_tests {
     /// dropped with its spawner and must still be running afterwards.)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    async fn required_success_commit_leaves_adopted_daemons_alive_and_stoppable()
-    -> anyhow::Result<()> {
+    async fn required_success_commit_leaves_adopted_daemons_alive_and_stoppable(
+    ) -> anyhow::Result<()> {
         use hyprstream_service::{
             ProcessConfig, ProcessKind, ProcessReadiness, ProcessSpawner, SpawnedProcess,
         };
@@ -3212,9 +3376,8 @@ mod launcher_tests {
                 .parse::<u32>()
                 .context("marker must hold the child pid")
         };
-        let alive = |pid: u32| {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
-        };
+        let alive =
+            |pid: u32| nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
         let helper_cfg = |name: &str| {
             ProcessConfig::new(name, &exe)
                 .args([
@@ -3231,7 +3394,10 @@ mod launcher_tests {
         let a = format!("commit-a-{unique}");
         let b = format!("commit-b-{unique}");
         launch_planned_children(
-            vec![vec![(a.clone(), helper_cfg(&a)), (b.clone(), helper_cfg(&b))]],
+            vec![vec![
+                (a.clone(), helper_cfg(&a)),
+                (b.clone(), helper_cfg(&b)),
+            ]],
             true,
             &spawner,
         )
@@ -3250,7 +3416,10 @@ mod launcher_tests {
             }
         }
         // Stop through the launching backend's established tracked contract.
-        for (name, pid) in [(&a, marker_pid(&marker(&a))?), (&b, marker_pid(&marker(&b))?)] {
+        for (name, pid) in [
+            (&a, marker_pid(&marker(&a))?),
+            (&b, marker_pid(&marker(&b))?),
+        ] {
             assert!(alive(pid), "committed daemon {name} must still be running");
             let meta = SpawnedProcess::new(format!("{name}-{pid}"), ProcessKind::Direct(pid))
                 .with_pid_file(hyprstream_rpc::paths::service_pid_file(name));
@@ -3275,7 +3444,10 @@ mod launcher_tests {
         let d = format!("commit-d-{unique}");
         let drop_spawner = ProcessSpawner::standalone();
         launch_planned_children(
-            vec![vec![(c.clone(), helper_cfg(&c)), (d.clone(), helper_cfg(&d))]],
+            vec![vec![
+                (c.clone(), helper_cfg(&c)),
+                (d.clone(), helper_cfg(&d)),
+            ]],
             true,
             &drop_spawner,
         )
@@ -3333,8 +3505,8 @@ mod launcher_tests {
     /// `rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    async fn required_cancellation_around_startup_failure_cleans_predecessor_at_any_landing()
-    -> anyhow::Result<()> {
+    async fn required_cancellation_around_startup_failure_cleans_predecessor_at_any_landing(
+    ) -> anyhow::Result<()> {
         use hyprstream_service::{ProcessConfig, ProcessReadiness, ProcessSpawner};
         #[allow(unused_imports)]
         use ProcessReadiness as _ProcessReadinessMarker;
@@ -3414,7 +3586,10 @@ mod launcher_tests {
         let pid = marker_pid(&marker)?;
         let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
             .is_err_and(|e| e == nix::errno::Errno::ESRCH);
-        assert!(gone, "predecessor pid {pid} must be cleaned at every landing point");
+        assert!(
+            gone,
+            "predecessor pid {pid} must be cleaned at every landing point"
+        );
         assert!(
             !hyprstream_rpc::paths::service_pid_file(&ready_name).exists(),
             "predecessor must leave no PID artifact"
@@ -3431,8 +3606,8 @@ mod launcher_tests {
     /// evidenced by observed reaps (ESRCH) and PID-artifact removal.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
-    async fn rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation()
-    -> anyhow::Result<()> {
+    async fn rollback_failed_and_pending_stops_stay_guard_owned_through_cancellation(
+    ) -> anyhow::Result<()> {
         use hyprstream_service::{ProcessConfig, ProcessSpawner};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3458,11 +3633,8 @@ mod launcher_tests {
                 .context("marker must hold the child pid")
         };
         let assert_reaped = |pid: u32| {
-            let gone = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                None,
-            )
-            .is_err_and(|e| e == nix::errno::Errno::ESRCH);
+            let gone = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+                .is_err_and(|e| e == nix::errno::Errno::ESRCH);
             assert!(gone, "guard-owned child pid {pid} must be genuinely reaped");
         };
         let helper_cfg = |name: &str| {
@@ -3576,7 +3748,9 @@ mod launcher_tests {
         .await
         .expect_err("explicit config selector must not start an installed unit");
         assert!(
-            explicit_error.to_string().contains("installed hyprstream service units"),
+            explicit_error
+                .to_string()
+                .contains("installed hyprstream service units"),
             "actionable rejection expected, got: {explicit_error}"
         );
 

@@ -50,5 +50,5 @@ mod reflink;
 mod registry;
 mod vfs;
 
-pub use driver::{Driver, DriverError, DriverOpts, StorageDriver, WorktreeHandle, DriverFactory};
+pub use driver::{Driver, DriverError, DriverFactory, DriverOpts, StorageDriver, WorktreeHandle};
 pub use registry::DriverRegistry;

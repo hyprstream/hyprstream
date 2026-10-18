@@ -87,8 +87,16 @@ impl Mount for MemFs {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-        let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
+        let inner = fid
+            .downcast_ref::<MemFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let nodes = self.nodes.lock();
         match nodes.get(&inner.path) {
             Some(Some(data)) => {
@@ -104,8 +112,16 @@ impl Mount for MemFs {
         }
     }
 
-    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+    async fn write(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
+        let inner = fid
+            .downcast_ref::<MemFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let mut nodes = self.nodes.lock();
         let entry = nodes.entry(inner.path.clone()).or_insert(Some(Vec::new()));
         let buf = entry.get_or_insert_with(Vec::new);
@@ -118,8 +134,14 @@ impl Mount for MemFs {
     }
 
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-        let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
+        let inner = fid
+            .downcast_ref::<MemFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        let prefix = if inner.path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", inner.path)
+        };
         let nodes = self.nodes.lock();
         let mut entries = Vec::new();
         for (key, val) in nodes.iter() {
@@ -141,7 +163,9 @@ impl Mount for MemFs {
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        let inner = fid
+            .downcast_ref::<MemFid>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let nodes = self.nodes.lock();
         match nodes.get(&inner.path) {
             Some(val) => Ok(Stat {
@@ -211,16 +235,28 @@ impl FsMount for MemFs {
         }
     }
 
-    async fn rename(&self, from: &[&str], to: &[&str], _caller: &Subject) -> Result<(), MountError> {
+    async fn rename(
+        &self,
+        from: &[&str],
+        to: &[&str],
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let from_key = Self::key(from);
         let to_key = Self::key(to);
         let mut nodes = self.nodes.lock();
-        let val = nodes.remove(&from_key).ok_or(MountError::NotFound(from_key))?;
+        let val = nodes
+            .remove(&from_key)
+            .ok_or(MountError::NotFound(from_key))?;
         nodes.insert(to_key, val);
         Ok(())
     }
 
-    async fn setattr(&self, path: &[&str], attr: &SetAttr, _caller: &Subject) -> Result<(), MountError> {
+    async fn setattr(
+        &self,
+        path: &[&str],
+        attr: &SetAttr,
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let key = Self::key(path);
         let mut nodes = self.nodes.lock();
         let entry = nodes.get_mut(&key).ok_or(MountError::NotFound(key))?;
@@ -230,9 +266,16 @@ impl FsMount for MemFs {
         Ok(())
     }
 
-    async fn symlink(&self, path: &[&str], target: &str, _caller: &Subject) -> Result<(), MountError> {
+    async fn symlink(
+        &self,
+        path: &[&str],
+        target: &str,
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let key = Self::key(path);
-        self.nodes.lock().insert(key, Some(target.as_bytes().to_vec()));
+        self.nodes
+            .lock()
+            .insert(key, Some(target.as_bytes().to_vec()));
         Ok(())
     }
 
@@ -244,7 +287,12 @@ impl FsMount for MemFs {
         }
     }
 
-    async fn link(&self, existing: &[&str], new_path: &[&str], _caller: &Subject) -> Result<(), MountError> {
+    async fn link(
+        &self,
+        existing: &[&str],
+        new_path: &[&str],
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let ex = Self::key(existing);
         let np = Self::key(new_path);
         let mut nodes = self.nodes.lock();
@@ -272,7 +320,9 @@ struct RoMount {
 #[async_trait]
 impl Mount for RoMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-        Ok(Fid::new(MemFid { path: components.join("/") }))
+        Ok(Fid::new(MemFid {
+            path: components.join("/"),
+        }))
     }
     async fn open(&self, _fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
         if mode != 0 {
@@ -281,12 +331,22 @@ impl Mount for RoMount {
             Ok(())
         }
     }
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
         let inner = fid.downcast_ref::<MemFid>().unwrap();
         match self.files.get(&inner.path) {
             Some(data) => {
                 let s = offset as usize;
-                if s >= data.len() { Ok(vec![]) } else { Ok(data[s..std::cmp::min(s + count as usize, data.len())].to_vec()) }
+                if s >= data.len() {
+                    Ok(vec![])
+                } else {
+                    Ok(data[s..std::cmp::min(s + count as usize, data.len())].to_vec())
+                }
             }
             None => Err(MountError::NotFound(inner.path.clone())),
         }
@@ -300,7 +360,14 @@ impl Mount for RoMount {
     async fn stat(&self, fid: &Fid, _c: &Subject) -> Result<Stat, MountError> {
         let inner = fid.downcast_ref::<MemFid>().unwrap();
         match self.files.get(&inner.path) {
-            Some(d) => Ok(Stat { qtype: 0, version: 0, path: 0, size: d.len() as u64, name: inner.path.clone(), mtime: 0 }),
+            Some(d) => Ok(Stat {
+                qtype: 0,
+                version: 0,
+                path: 0,
+                size: d.len() as u64,
+                name: inner.path.clone(),
+                mtime: 0,
+            }),
             None => Err(MountError::NotFound(inner.path.clone())),
         }
     }
@@ -329,7 +396,12 @@ impl io::Write for VecWriter {
     }
 }
 impl ZeroCopyWriter for VecWriter {
-    fn write_from(&mut self, _f: &mut dyn fuse_backend_rs::file_traits::FileReadWriteVolatile, _count: usize, _off: u64) -> io::Result<usize> {
+    fn write_from(
+        &mut self,
+        _f: &mut dyn fuse_backend_rs::file_traits::FileReadWriteVolatile,
+        _count: usize,
+        _off: u64,
+    ) -> io::Result<usize> {
         Ok(0)
     }
     fn available_bytes(&self) -> usize {
@@ -351,7 +423,12 @@ impl io::Read for SliceReader<'_> {
     }
 }
 impl ZeroCopyReader for SliceReader<'_> {
-    fn read_to(&mut self, _f: &mut dyn fuse_backend_rs::file_traits::FileReadWriteVolatile, _count: usize, _off: u64) -> io::Result<usize> {
+    fn read_to(
+        &mut self,
+        _f: &mut dyn fuse_backend_rs::file_traits::FileReadWriteVolatile,
+        _count: usize,
+        _off: u64,
+    ) -> io::Result<usize> {
         Ok(0)
     }
 }
@@ -379,7 +456,11 @@ const ROOT: u64 = 1;
 #[test]
 fn lookup_and_getattr() {
     let mut ns = Namespace::new();
-    ns.mount("/data", Arc::new(MemFs::with_files(&[("hello.txt", b"hi")]))).unwrap();
+    ns.mount(
+        "/data",
+        Arc::new(MemFs::with_files(&[("hello.txt", b"hi")])),
+    )
+    .unwrap();
     let fs = build(ns);
     let ctx = Context::default();
 
@@ -400,7 +481,11 @@ fn lookup_and_getattr() {
 #[test]
 fn read_file() {
     let mut ns = Namespace::new();
-    ns.mount("/data", Arc::new(MemFs::with_files(&[("hello.txt", b"hello world")]))).unwrap();
+    ns.mount(
+        "/data",
+        Arc::new(MemFs::with_files(&[("hello.txt", b"hello world")])),
+    )
+    .unwrap();
     let fs = build(ns);
     let ctx = Context::default();
 
@@ -410,10 +495,13 @@ fn read_file() {
     let handle = handle.unwrap();
 
     let mut w = VecWriter(Vec::new());
-    let n = fs.read(&ctx, file.inode, handle, &mut w, 64, 0, None, 0).unwrap();
+    let n = fs
+        .read(&ctx, file.inode, handle, &mut w, 64, 0, None, 0)
+        .unwrap();
     assert_eq!(n, 11);
     assert_eq!(w.0, b"hello world");
-    fs.release(&ctx, file.inode, 0, handle, false, false, None).unwrap();
+    fs.release(&ctx, file.inode, 0, handle, false, false, None)
+        .unwrap();
 }
 
 #[test]
@@ -424,28 +512,59 @@ fn create_and_write_and_read() {
     let ctx = Context::default();
 
     let data = fs.lookup(&ctx, ROOT, &cstr("data")).unwrap();
-    let args = CreateIn { flags: libc::O_WRONLY as u32, mode: 0o644, umask: 0, fuse_flags: 0 };
+    let args = CreateIn {
+        flags: libc::O_WRONLY as u32,
+        mode: 0o644,
+        umask: 0,
+        fuse_flags: 0,
+    };
     let (entry, handle, _, _) = fs.create(&ctx, data.inode, &cstr("new.txt"), args).unwrap();
     let handle = handle.unwrap();
 
     let payload = b"written bytes";
-    let mut r = SliceReader { data: payload, pos: 0 };
-    let n = fs.write(&ctx, entry.inode, handle, &mut r, payload.len() as u32, 0, None, false, 0, 0).unwrap();
+    let mut r = SliceReader {
+        data: payload,
+        pos: 0,
+    };
+    let n = fs
+        .write(
+            &ctx,
+            entry.inode,
+            handle,
+            &mut r,
+            payload.len() as u32,
+            0,
+            None,
+            false,
+            0,
+            0,
+        )
+        .unwrap();
     assert_eq!(n, payload.len());
-    fs.release(&ctx, entry.inode, 0, handle, true, false, None).unwrap();
+    fs.release(&ctx, entry.inode, 0, handle, true, false, None)
+        .unwrap();
 
     // Re-open and read back.
     let file = fs.lookup(&ctx, data.inode, &cstr("new.txt")).unwrap();
     let (rh, _, _) = fs.open(&ctx, file.inode, libc::O_RDONLY as u32, 0).unwrap();
     let mut w = VecWriter(Vec::new());
-    fs.read(&ctx, file.inode, rh.unwrap(), &mut w, 64, 0, None, 0).unwrap();
+    fs.read(&ctx, file.inode, rh.unwrap(), &mut w, 64, 0, None, 0)
+        .unwrap();
     assert_eq!(w.0, payload);
 }
 
 #[test]
 fn readdir_lists_entries() {
     let mut ns = Namespace::new();
-    ns.mount("/data", Arc::new(MemFs::with_files(&[("a.txt", b"a"), ("b.txt", b"b"), ("sub/c.txt", b"c")]))).unwrap();
+    ns.mount(
+        "/data",
+        Arc::new(MemFs::with_files(&[
+            ("a.txt", b"a"),
+            ("b.txt", b"b"),
+            ("sub/c.txt", b"c"),
+        ])),
+    )
+    .unwrap();
     let fs = build(ns);
     let ctx = Context::default();
 
@@ -459,7 +578,8 @@ fn readdir_lists_entries() {
             names.push(String::from_utf8_lossy(e.name).into_owned());
             Ok(e.name.len())
         };
-        fs.readdir(&ctx, data.inode, handle, 4096, 0, &mut add).unwrap();
+        fs.readdir(&ctx, data.inode, handle, 4096, 0, &mut add)
+            .unwrap();
     }
 
     assert!(names.contains(&".".to_owned()));
@@ -472,19 +592,32 @@ fn readdir_lists_entries() {
 #[test]
 fn rename_within_mount() {
     let mut ns = Namespace::new();
-    ns.mount("/data", Arc::new(MemFs::with_files(&[("old.txt", b"payload")]))).unwrap();
+    ns.mount(
+        "/data",
+        Arc::new(MemFs::with_files(&[("old.txt", b"payload")])),
+    )
+    .unwrap();
     let fs = build(ns);
     let ctx = Context::default();
 
     let data = fs.lookup(&ctx, ROOT, &cstr("data")).unwrap();
-    fs.rename(&ctx, data.inode, &cstr("old.txt"), data.inode, &cstr("new.txt"), 0).unwrap();
+    fs.rename(
+        &ctx,
+        data.inode,
+        &cstr("old.txt"),
+        data.inode,
+        &cstr("new.txt"),
+        0,
+    )
+    .unwrap();
 
     // old gone, new present.
     assert!(fs.lookup(&ctx, data.inode, &cstr("old.txt")).is_err());
     let new = fs.lookup(&ctx, data.inode, &cstr("new.txt")).unwrap();
     let (rh, _, _) = fs.open(&ctx, new.inode, libc::O_RDONLY as u32, 0).unwrap();
     let mut w = VecWriter(Vec::new());
-    fs.read(&ctx, new.inode, rh.unwrap(), &mut w, 64, 0, None, 0).unwrap();
+    fs.read(&ctx, new.inode, rh.unwrap(), &mut w, 64, 0, None, 0)
+        .unwrap();
     assert_eq!(w.0, b"payload");
 }
 
@@ -506,7 +639,8 @@ fn mkdir_and_rmdir() {
 #[test]
 fn unlink_removes_file() {
     let mut ns = Namespace::new();
-    ns.mount("/data", Arc::new(MemFs::with_files(&[("gone.txt", b"x")]))).unwrap();
+    ns.mount("/data", Arc::new(MemFs::with_files(&[("gone.txt", b"x")])))
+        .unwrap();
     let fs = build(ns);
     let ctx = Context::default();
 
@@ -528,29 +662,42 @@ fn readonly_mount_is_erofs() {
     let ro = fs.lookup(&ctx, ROOT, &cstr("ro")).unwrap();
 
     // create / mkdir / unlink on a read-only Mount fail closed with EROFS.
-    let args = CreateIn { flags: libc::O_WRONLY as u32, mode: 0o644, umask: 0, fuse_flags: 0 };
-    let err = fs.create(&ctx, ro.inode, &cstr("nope.txt"), args).unwrap_err();
+    let args = CreateIn {
+        flags: libc::O_WRONLY as u32,
+        mode: 0o644,
+        umask: 0,
+        fuse_flags: 0,
+    };
+    let err = fs
+        .create(&ctx, ro.inode, &cstr("nope.txt"), args)
+        .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EROFS));
 
-    let err = fs.mkdir(&ctx, ro.inode, &cstr("nope"), 0o755, 0).unwrap_err();
+    let err = fs
+        .mkdir(&ctx, ro.inode, &cstr("nope"), 0o755, 0)
+        .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EROFS));
 
     // Read of an existing file still works.
     let file = fs.lookup(&ctx, ro.inode, &cstr("ro.txt")).unwrap();
     let (h, _, _) = fs.open(&ctx, file.inode, libc::O_RDONLY as u32, 0).unwrap();
     let mut w = VecWriter(Vec::new());
-    fs.read(&ctx, file.inode, h.unwrap(), &mut w, 64, 0, None, 0).unwrap();
+    fs.read(&ctx, file.inode, h.unwrap(), &mut w, 64, 0, None, 0)
+        .unwrap();
     assert_eq!(w.0, b"data");
 
     // Write-open of a read-only mount fails (EROFS).
-    let err = fs.open(&ctx, file.inode, libc::O_WRONLY as u32, 0).unwrap_err();
+    let err = fs
+        .open(&ctx, file.inode, libc::O_WRONLY as u32, 0)
+        .unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EROFS));
 }
 
 #[test]
 fn forget_reclaims_inode() {
     let mut ns = Namespace::new();
-    ns.mount("/data", Arc::new(MemFs::with_files(&[("f.txt", b"x")]))).unwrap();
+    ns.mount("/data", Arc::new(MemFs::with_files(&[("f.txt", b"x")])))
+        .unwrap();
     let fs = build(ns);
     let ctx = Context::default();
 
@@ -594,7 +741,10 @@ fn local_fuse_mount_read_and_readdir() {
     let mut ns = Namespace::new();
     ns.mount(
         "/data",
-        Arc::new(MemFs::with_files(&[("hello.txt", b"hello from fuse"), ("sub/nested.txt", b"n")])),
+        Arc::new(MemFs::with_files(&[
+            ("hello.txt", b"hello from fuse"),
+            ("sub/nested.txt", b"n"),
+        ])),
     )
     .unwrap();
     let fs = build(ns);
@@ -625,8 +775,14 @@ fn local_fuse_mount_read_and_readdir() {
         // Environment can't do a real FUSE mount (no /dev/fuse access,
         // fusermount3 not usable unprivileged, etc). Best-effort unmount in
         // case a partial mount happened, then skip.
-        let _ = std::process::Command::new("fusermount3").arg("-u").arg(&mountpoint).status();
-        let _ = std::process::Command::new("fusermount").arg("-u").arg(&mountpoint).status();
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mountpoint)
+            .status();
+        let _ = std::process::Command::new("fusermount")
+            .arg("-u")
+            .arg(&mountpoint)
+            .status();
         eprintln!(
             "skipping local_fuse_mount_read_and_readdir: could not establish a real /dev/fuse \
              mount in this environment (no access to /dev/fuse or unprivileged fusermount3)"
@@ -659,7 +815,10 @@ fn local_fuse_mount_read_and_readdir() {
         .arg(&mountpoint)
         .status();
     if !matches!(status, Ok(s) if s.success()) {
-        let _ = std::process::Command::new("fusermount").arg("-u").arg(&mountpoint).status();
+        let _ = std::process::Command::new("fusermount")
+            .arg("-u")
+            .arg(&mountpoint)
+            .status();
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -667,7 +826,10 @@ fn local_fuse_mount_read_and_readdir() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     if handle.is_finished() {
-        handle.join().expect("serve_local thread panicked").expect("serve_local returned an error");
+        handle
+            .join()
+            .expect("serve_local thread panicked")
+            .expect("serve_local returned an error");
     } else {
         // Thread didn't exit in time; nothing more we can do from the test
         // without risking a hang — leave it be (the process will reap it at
@@ -686,7 +848,11 @@ fn podman_run_reads_serve_local_vfs() {
         eprintln!("skipping podman_run_reads_serve_local_vfs: no /dev/fuse");
         return;
     }
-    if std::process::Command::new("podman").arg("--version").output().is_err() {
+    if std::process::Command::new("podman")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("skipping podman_run_reads_serve_local_vfs: no podman");
         return;
     }
@@ -697,7 +863,10 @@ fn podman_run_reads_serve_local_vfs() {
     let mut ns = Namespace::new();
     ns.mount(
         "/data",
-        Arc::new(MemFs::with_files(&[("hello.txt", b"hello from hyprstream vfs")])),
+        Arc::new(MemFs::with_files(&[(
+            "hello.txt",
+            b"hello from hyprstream vfs",
+        )])),
     )
     .expect("mount MemFs");
     let fs = build(ns);
@@ -722,8 +891,12 @@ fn podman_run_reads_serve_local_vfs() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let unmount = |mp: &std::path::Path| {
-        if !matches!(std::process::Command::new("fusermount3").arg("-u").arg(mp).status(), Ok(s) if s.success()) {
-            let _ = std::process::Command::new("fusermount").arg("-u").arg(mp).status();
+        if !matches!(std::process::Command::new("fusermount3").arg("-u").arg(mp).status(), Ok(s) if s.success())
+        {
+            let _ = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(mp)
+                .status();
         }
     };
     if !mounted {
@@ -742,8 +915,13 @@ fn podman_run_reads_serve_local_vfs() {
     let vol = format!("{}:/vfs:ro", mountpoint.display());
     let out = std::process::Command::new("podman")
         .args([
-            "run", "--rm", "--volume", &vol,
-            "docker.io/library/busybox", "cat", "/vfs/data/hello.txt",
+            "run",
+            "--rm",
+            "--volume",
+            &vol,
+            "docker.io/library/busybox",
+            "cat",
+            "/vfs/data/hello.txt",
         ])
         .output()
         .expect("podman run");

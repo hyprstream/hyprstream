@@ -23,7 +23,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use hyprstream_rpc::iroh_peer::{BrowserIrohPeer, resolve_pkarr_relay_url};
+use hyprstream_rpc::iroh_peer::{resolve_pkarr_relay_url, BrowserIrohPeer};
 
 // ============================================================================
 // IrohPeer — ephemeral browser iroh identity
@@ -60,7 +60,6 @@ impl WasmIrohPeer {
     pub fn node_id_z32(&self) -> String {
         self.inner.node_id_z32()
     }
-
 }
 
 impl Default for WasmIrohPeer {

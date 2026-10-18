@@ -23,11 +23,9 @@ pub mod cast_ui;
 pub mod wizard;
 
 #[cfg(not(target_os = "wasi"))]
-pub mod console_app;
-#[cfg(not(target_os = "wasi"))]
 pub mod chat_ui;
 #[cfg(not(target_os = "wasi"))]
-pub mod vt_pane;
+pub mod console_app;
 #[cfg(not(target_os = "wasi"))]
 pub mod container_app;
 #[cfg(not(target_os = "wasi"))]
@@ -36,3 +34,5 @@ pub mod shell;
 pub mod shell_app;
 #[cfg(not(target_os = "wasi"))]
 pub mod shell_ui;
+#[cfg(not(target_os = "wasi"))]
+pub mod vt_pane;

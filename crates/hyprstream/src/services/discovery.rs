@@ -6,10 +6,8 @@
 
 pub use hyprstream_discovery::{AuthorizationProvider, DiscoveryService};
 
-use hyprstream_rpc_std::policy_client::PolicyCheck;
 use async_trait::async_trait;
-
-
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 
 /// Policy-based authorization provider wrapping PolicyClient.
 ///
@@ -28,9 +26,67 @@ impl PolicyAuthProvider {
 
 #[async_trait(?Send)]
 impl AuthorizationProvider for PolicyAuthProvider {
+    async fn check_context(
+        &self,
+        ctx: &hyprstream_rpc::service::EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> anyhow::Result<bool> {
+        let subject = ctx.subject();
+        let request = PolicyCheck {
+            subject: subject.to_string(),
+            domain: String::new(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        crate::services::policy::check_with_holder_evidence(
+            &self.client,
+            &request,
+            ctx.jwt_token(),
+            &subject,
+            ctx.original_holder_evidence(),
+        )
+        .await
+    }
+
+    async fn check_batch_context(
+        &self,
+        ctx: &hyprstream_rpc::service::EnvelopeContext,
+        resources: &[String],
+        operation: &str,
+    ) -> anyhow::Result<Vec<bool>> {
+        anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
+        let subject = ctx.subject();
+        if ctx.jwt_token().is_some()
+            && !subject.is_federated()
+            && subject
+                .name()
+                .is_some_and(|name| name.starts_with("service:"))
+        {
+            let mut decisions = Vec::with_capacity(resources.len());
+            for resource in resources {
+                decisions.push(self.check_context(ctx, resource, operation).await?);
+            }
+            Ok(decisions)
+        } else {
+            self.check_batch(
+                &subject.to_string(),
+                "*",
+                resources,
+                operation,
+                ctx.jwt_token(),
+            )
+            .await
+        }
+    }
+
     async fn check_batch(
-        &self, subject: &str, domain: &str, resources: &[String],
-        operation: &str, bearer: Option<&str>,
+        &self,
+        subject: &str,
+        domain: &str,
+        resources: &[String],
+        operation: &str,
+        bearer: Option<&str>,
     ) -> anyhow::Result<Vec<bool>> {
         use hyprstream_rpc_std::policy_client::PolicyCheckBatch;
         anyhow::ensure!(resources.len() <= 256, "authorization batch exceeds 256");
@@ -38,18 +94,32 @@ impl AuthorizationProvider for PolicyAuthProvider {
             Some(token) => self.client.clone().with_delegated_bearer(token.to_owned()),
             None => {
                 let upstream = hyprstream_rpc::envelope::Subject::new(subject);
-                anyhow::ensure!(!upstream.is_federated() && upstream.name()
-                    .is_some_and(|name| name == "system" || name.starts_with("service:")),
-                    "service-mediated user policy check requires verified bearer");
+                anyhow::ensure!(
+                    !upstream.is_federated()
+                        && upstream
+                            .name()
+                            .is_some_and(|name| name == "system" || name.starts_with("service:")),
+                    "service-mediated user policy check requires verified bearer"
+                );
                 self.client.clone()
             }
         };
-        let request = PolicyCheckBatch { checks: resources.iter().map(|resource| PolicyCheck {
-            subject: subject.to_owned(), domain: domain.to_owned(),
-            resource: resource.clone(), operation: operation.to_owned(),
-        }).collect() };
+        let request = PolicyCheckBatch {
+            checks: resources
+                .iter()
+                .map(|resource| PolicyCheck {
+                    subject: subject.to_owned(),
+                    domain: domain.to_owned(),
+                    resource: resource.clone(),
+                    operation: operation.to_owned(),
+                })
+                .collect(),
+        };
         let result = client.check_batch(&request).await?;
-        anyhow::ensure!(result.allowed.len() == resources.len(), "invalid policy batch decision count");
+        anyhow::ensure!(
+            result.allowed.len() == resources.len(),
+            "invalid policy batch decision count"
+        );
         Ok(result.allowed)
     }
 

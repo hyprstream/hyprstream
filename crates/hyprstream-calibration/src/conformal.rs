@@ -182,8 +182,16 @@ pub fn ordinal_aps_interval(probs: &[f64], qhat: f64) -> (usize, usize) {
     let (mut lo, mut hi) = (mode, mode);
     let mut mass = probs[mode];
     while mass < qhat && (lo > 0 || hi + 1 < probs.len()) {
-        let left = if lo > 0 { probs[lo - 1] } else { f64::NEG_INFINITY };
-        let right = if hi + 1 < probs.len() { probs[hi + 1] } else { f64::NEG_INFINITY };
+        let left = if lo > 0 {
+            probs[lo - 1]
+        } else {
+            f64::NEG_INFINITY
+        };
+        let right = if hi + 1 < probs.len() {
+            probs[hi + 1]
+        } else {
+            f64::NEG_INFINITY
+        };
         if left >= right {
             lo -= 1;
             mass += probs[lo];
@@ -273,7 +281,11 @@ pub fn min_cps_interval(probs: &[f64], qhat: f64) -> (usize, usize) {
             hi = hi.max(k);
         }
     }
-    if lo > hi { (0, probs.len() - 1) } else { (lo, hi) }
+    if lo > hi {
+        (0, probs.len() - 1)
+    } else {
+        (lo, hi)
+    }
 }
 
 /// Validate that a distribution is usable for conformal scoring.

@@ -34,9 +34,9 @@ use std::ffi::CString;
 use std::io;
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use fuse_backend_rs::abi::fuse_abi::CreateIn;
 use fuse_backend_rs::api::filesystem::{Context, FileSystem, FsOptions, SetattrValid};
+use parking_lot::Mutex;
 
 use hyprstream_rpc::Subject;
 
@@ -295,7 +295,13 @@ where
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
         let ctx = context();
         let inner = fid
             .downcast_ref::<FuseFid>()
@@ -303,12 +309,27 @@ where
         let handle = inner.handle.unwrap_or(0);
         let mut writer = MemWriter::with_capacity(count as usize);
         self.fs
-            .read(&ctx, inner.inode, handle, &mut writer, count, offset, None, 0)
+            .read(
+                &ctx,
+                inner.inode,
+                handle,
+                &mut writer,
+                count,
+                offset,
+                None,
+                0,
+            )
             .map_err(|e| map_io(e, "read"))?;
         Ok(writer.into_inner())
     }
 
-    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+    async fn write(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
         let ctx = context();
         let inner = fid
             .downcast_ref::<FuseFid>()
@@ -317,7 +338,18 @@ where
         let mut reader = MemReader::new(data);
         let n = self
             .fs
-            .write(&ctx, inner.inode, handle, &mut reader, data.len() as u32, offset, None, false, 0, 0)
+            .write(
+                &ctx,
+                inner.inode,
+                handle,
+                &mut reader,
+                data.len() as u32,
+                offset,
+                None,
+                false,
+                0,
+                0,
+            )
             .map_err(|e| map_io(e, "write"))?;
         Ok(n as u32)
     }
@@ -366,7 +398,12 @@ where
                 }
                 _ => (0, None),
             };
-            entries.push(DirEntry { name, is_dir, size, stat });
+            entries.push(DirEntry {
+                name,
+                is_dir,
+                size,
+                stat,
+            });
         }
         Ok(entries)
     }
@@ -392,9 +429,13 @@ where
         // Release the open handle, if any.
         if let Some(handle) = inner.handle {
             if inner.is_dir {
-                let _ = self.fs.releasedir(&ctx, inner.inode, libc::O_RDONLY as u32, handle);
+                let _ = self
+                    .fs
+                    .releasedir(&ctx, inner.inode, libc::O_RDONLY as u32, handle);
             } else {
-                let _ = self.fs.release(&ctx, inner.inode, 0, handle, true, false, None);
+                let _ = self
+                    .fs
+                    .release(&ctx, inner.inode, 0, handle, true, false, None);
             }
         }
         // Action ORCLOSE (remove-on-clunk).
@@ -439,7 +480,9 @@ where
         // We created and opened the file; close the handle immediately — the VFS
         // create op only guarantees existence, callers re-open to write.
         if let Some(h) = handle {
-            let _ = self.fs.release(&ctx, entry.inode, args.flags, h, true, false, None);
+            let _ = self
+                .fs
+                .release(&ctx, entry.inode, args.flags, h, true, false, None);
         }
         self.forget(entry.inode, &ctx);
         let _ = caller; // carried for policy boundary; no host cred mapping yet
@@ -478,7 +521,12 @@ where
         res.map_err(|e| map_io(e, "rmdir"))
     }
 
-    async fn rename(&self, from: &[&str], to: &[&str], _caller: &Subject) -> Result<(), MountError> {
+    async fn rename(
+        &self,
+        from: &[&str],
+        to: &[&str],
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let ctx = context();
         let _g = self.lookup_guard.lock();
         let (old_dir, old_name) = self.resolve_parent(from, &ctx)?;
@@ -497,7 +545,12 @@ where
         res.map_err(|e| map_io(e, "rename"))
     }
 
-    async fn setattr(&self, path: &[&str], attr: &SetAttr, _caller: &Subject) -> Result<(), MountError> {
+    async fn setattr(
+        &self,
+        path: &[&str],
+        attr: &SetAttr,
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let ctx = context();
         if attr.is_empty() {
             return Ok(());
@@ -535,7 +588,12 @@ where
         res.map(|_| ()).map_err(|e| map_io(e, "setattr"))
     }
 
-    async fn symlink(&self, path: &[&str], target: &str, _caller: &Subject) -> Result<(), MountError> {
+    async fn symlink(
+        &self,
+        path: &[&str],
+        target: &str,
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let ctx = context();
         let _g = self.lookup_guard.lock();
         let (parent, name) = self.resolve_parent(path, &ctx)?;
@@ -558,7 +616,12 @@ where
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    async fn link(&self, existing: &[&str], new_path: &[&str], _caller: &Subject) -> Result<(), MountError> {
+    async fn link(
+        &self,
+        existing: &[&str],
+        new_path: &[&str],
+        _caller: &Subject,
+    ) -> Result<(), MountError> {
         let ctx = context();
         let _g = self.lookup_guard.lock();
         let inode = self.resolve(existing, &ctx)?;

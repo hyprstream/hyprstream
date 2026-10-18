@@ -80,7 +80,9 @@ impl OriginAdmission for PolicyOriginAdmission {
                     error = %e,
                     "PolicyService unreachable during federation admission stage 1 — failing closed"
                 );
-                anyhow::bail!("PolicyService unreachable; federation admission rejected (fail-closed): {e}")
+                anyhow::bail!(
+                    "PolicyService unreachable; federation admission rejected (fail-closed): {e}"
+                )
             }
         }
     }

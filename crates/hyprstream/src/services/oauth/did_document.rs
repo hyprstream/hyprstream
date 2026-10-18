@@ -132,7 +132,9 @@ fn normalize_atproto_handle(handle: &str) -> Option<String> {
             && label.len() <= 63
             && !label.starts_with('-')
             && !label.ends_with('-')
-            && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     });
     valid.then_some(handle)
 }
@@ -1014,17 +1016,26 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0x31; 32]);
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
         for (issuer, expected) in [
-            ("https://pds.example:8443/oauth", "did:web:pds.example%3A8443"),
+            (
+                "https://pds.example:8443/oauth",
+                "did:web:pds.example%3A8443",
+            ),
             ("https://PDS.example:443/oauth", "did:web:pds.example"),
         ] {
             let identity = render_at9p_identity(issuer, &sk, &pq_sk).unwrap();
-            let verified = hyprstream_pds::at9p_gate::verify_did_at9p(
-                &identity.did, &identity.capsule,
-            ).unwrap();
-            assert_eq!(verified.capsule().body.also_known_as.as_deref(),
-                Some(&[expected.to_owned()][..]));
+            let verified =
+                hyprstream_pds::at9p_gate::verify_did_at9p(&identity.did, &identity.capsule)
+                    .unwrap();
+            assert_eq!(
+                verified.capsule().body.also_known_as.as_deref(),
+                Some(&[expected.to_owned()][..])
+            );
         }
-        for issuer in ["https://user@pds.example", "https://[::1]:8443", "not-a-url"] {
+        for issuer in [
+            "https://user@pds.example",
+            "https://[::1]:8443",
+            "not-a-url",
+        ] {
             assert!(render_at9p_identity(issuer, &sk, &pq_sk).is_err());
         }
     }
@@ -1186,17 +1197,17 @@ mod tests {
         use crate::auth::user_store::{
             PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
         };
-        use crate::config::OAuthConfig;
         use crate::config::server::CorsConfig;
+        use crate::config::OAuthConfig;
         use crate::services::oauth::create_app;
-        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
-        use hyprstream_rpc_std::policy_client::PolicyClient;
         use async_trait::async_trait;
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
         use tower::ServiceExt; // oneshot
 
         /// User-store spy whose every method panics. The frozen account-DID
@@ -1361,7 +1372,7 @@ mod tests {
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert!(doc["@context"].is_array());
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 2); // multibase + jwk
-        // The ed25519 VM is emitted as a Multikey (#280) with a multibase key.
+                                                                            // The ed25519 VM is emitted as a Multikey (#280) with a multibase key.
         let vm = &doc["verificationMethod"][0];
         assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
         assert!(vm["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
@@ -1435,23 +1446,19 @@ mod tests {
         let vms = doc["verificationMethod"].as_array().unwrap();
         assert_eq!(vms[0]["id"].as_str().unwrap(), format!("{did}#atproto"));
         assert_eq!(vms[0]["type"].as_str().unwrap(), "Multikey");
-        assert!(
-            vms[0]["publicKeyMultibase"]
-                .as_str()
-                .unwrap()
-                .starts_with('z')
-        );
+        assert!(vms[0]["publicKeyMultibase"]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
         // Ed25519 mesh VMs still present after it.
         assert_eq!(vms.len(), 1 + 2);
         // The ed25519 mesh VM is also a Multikey (#280), not the deprecated
         // Ed25519VerificationKey2020 type, with a multibase key; JWK fallback kept.
         assert_eq!(vms[1]["type"].as_str().unwrap(), "Multikey");
-        assert!(
-            vms[1]["publicKeyMultibase"]
-                .as_str()
-                .unwrap()
-                .starts_with('z')
-        );
+        assert!(vms[1]["publicKeyMultibase"]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
         assert_eq!(vms[2]["type"].as_str().unwrap(), "JsonWebKey2020");
 
         // #atproto_pds first, origin-only (no path), correct type.
@@ -1519,13 +1526,11 @@ mod tests {
             "at://alice.pds.example.com"
         );
         // The hosted-account #atproto VM (P-256 Multikey) is present.
-        assert!(
-            doc["verificationMethod"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto")))
-        );
+        assert!(doc["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto"))));
     }
 
     /// #918 producer side: active remains the exact `#atproto` VM, while drain
@@ -1599,8 +1604,8 @@ mod tests {
     #[test]
     fn root_identity_publisher_and_consumer_enforce_bounded_overlap() {
         use hyprstream_rpc::admission::AdmittedIdentity;
-        use hyprstream_rpc::auth::AtprotoPerimeterGateway;
         use hyprstream_rpc::auth::mac::Assurance;
+        use hyprstream_rpc::auth::AtprotoPerimeterGateway;
         use hyprstream_rpc::identity_resolver::{DidDocumentProvider, MethodDispatchResolver};
 
         #[derive(Clone)]
@@ -1658,9 +1663,7 @@ mod tests {
         let first_ed = vms
             .iter()
             .filter_map(|vm| vm["publicKeyMultibase"].as_str())
-            .find_map(|multibase| {
-                hyprstream_rpc::did_web::decode_ed25519_multikey(multibase).ok()
-            })
+            .find_map(|multibase| hyprstream_rpc::did_web::decode_ed25519_multikey(multibase).ok())
             .unwrap();
         let first_pq = vms
             .iter()
@@ -1789,20 +1792,16 @@ mod tests {
         assert_eq!(&decoded[2..], vk_bytes.as_slice());
         // Referenced as both an authentication and assertion method.
         let mesh_pq_id = format!("{did}#mesh-pq");
-        assert!(
-            doc["authentication"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| *v == mesh_pq_id)
-        );
-        assert!(
-            doc["assertionMethod"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| *v == mesh_pq_id)
-        );
+        assert!(doc["authentication"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| *v == mesh_pq_id));
+        assert!(doc["assertionMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| *v == mesh_pq_id));
     }
 
     #[test]
@@ -1968,21 +1967,17 @@ mod tests {
         assert_eq!(kas[1]["type"].as_str().unwrap(), "Multikey");
 
         let vms = doc["verificationMethod"].as_array().unwrap();
-        assert!(
-            !vms.iter()
-                .any(|v| v["id"] == format!("{did}#mesh-kem-x25519"))
-        );
-        assert!(
-            !vms.iter()
-                .any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768"))
-        );
-        assert!(
-            !doc["authentication"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false))
-        );
+        assert!(!vms
+            .iter()
+            .any(|v| v["id"] == format!("{did}#mesh-kem-x25519")));
+        assert!(!vms
+            .iter()
+            .any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768")));
+        assert!(!doc["authentication"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false)));
 
         // The published X25519 leg round-trips to the exact bytes derived —
         // consistency between the DID doc and the key the node actually holds.

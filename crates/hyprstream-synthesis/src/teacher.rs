@@ -266,7 +266,10 @@ mod tests {
         );
         assert!(data_row.contains("evil\\|teacher"), "{data_row}");
         assert!(data_row.contains("1.0 injected \\| row"), "{data_row}");
-        assert!(table.lines().count() == 3, "no injected extra rows: {table}");
+        assert!(
+            table.lines().count() == 3,
+            "no injected extra rows: {table}"
+        );
     }
 
     #[test]

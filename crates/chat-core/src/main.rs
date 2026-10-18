@@ -24,11 +24,16 @@ fn read_message(reader: &mut impl Read) -> io::Result<Option<String>> {
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len == 0 || len > 10 * 1024 * 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid message length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid message length",
+        ));
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
-    String::from_utf8(buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn write_message(writer: &mut impl Write, msg: &str) -> io::Result<()> {
@@ -47,19 +52,19 @@ fn event_to_json(event: &ChatEvent) -> String {
         ChatEvent::Thinking(text) => {
             serde_json::json!({"type": "thinking", "text": text}).to_string()
         }
-        ChatEvent::ToolCallDetected { id, uuid, description, arguments } => {
-            serde_json::json!({
-                "type": "toolCallDetected",
-                "id": id, "uuid": uuid,
-                "description": description, "arguments": arguments
-            }).to_string()
-        }
-        ChatEvent::Complete => {
-            serde_json::json!({"type": "complete"}).to_string()
-        }
-        ChatEvent::Error(msg) => {
-            serde_json::json!({"type": "error", "message": msg}).to_string()
-        }
+        ChatEvent::ToolCallDetected {
+            id,
+            uuid,
+            description,
+            arguments,
+        } => serde_json::json!({
+            "type": "toolCallDetected",
+            "id": id, "uuid": uuid,
+            "description": description, "arguments": arguments
+        })
+        .to_string(),
+        ChatEvent::Complete => serde_json::json!({"type": "complete"}).to_string(),
+        ChatEvent::Error(msg) => serde_json::json!({"type": "error", "message": msg}).to_string(),
     }
 }
 
@@ -103,7 +108,9 @@ fn main() {
             if let Some(obj) = tools.as_object() {
                 for (uuid, desc) in obj {
                     if let Some(desc_str) = desc.as_str() {
-                        state.tool_descriptions.insert(uuid.clone(), desc_str.to_owned());
+                        state
+                            .tool_descriptions
+                            .insert(uuid.clone(), desc_str.to_owned());
                     }
                 }
             }
@@ -138,7 +145,8 @@ fn main() {
                             let reinvoke = serde_json::json!({
                                 "type": "reinvoke",
                                 "history": serde_json::to_value(&state.history).unwrap_or_default()
-                            }).to_string();
+                            })
+                            .to_string();
                             if write_message(&mut stdout, &reinvoke).is_err() {
                                 return;
                             }

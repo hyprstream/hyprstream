@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 
 use cas_serve::CasStore;
 use hyprstream_rpc::auth::mac::SecurityLabel;
-use hyprstream_rpc::cid::{Codec, HashAlgo, decode_cid, encode_cid};
+use hyprstream_rpc::cid::{decode_cid, encode_cid, Codec, HashAlgo};
 
-use super::CasError;
 use super::domain::DedupDomain;
-use super::manifest::{BlobManifest, looks_like_legacy_hex, merkle_from_address};
+use super::manifest::{looks_like_legacy_hex, merkle_from_address, BlobManifest};
+use super::CasError;
 
 /// Hex-character length of a `digest_length`-byte digest (2 hex chars per byte).
 const fn hex_digest_len(digest_length: u16) -> usize {
@@ -297,14 +297,8 @@ mod tests {
         let domain = DedupDomain::local_default();
         let original = payload(11, 200 * 1024);
 
-        let first = sub
-            .put(&domain, &original, Some(label()))
-            .await
-            .unwrap();
-        let second = sub
-            .put(&domain, &original, Some(label()))
-            .await
-            .unwrap();
+        let first = sub.put(&domain, &original, Some(label())).await.unwrap();
+        let second = sub.put(&domain, &original, Some(label())).await.unwrap();
         assert_eq!(first.merkle, second.merkle);
         assert_eq!(second.bytes_stored, 0, "same-domain re-upload fully dedups");
     }
@@ -318,10 +312,7 @@ mod tests {
             digest_length: 32,
             ..DedupDomain::local_default()
         };
-        let err = sub
-            .put(&domain, b"hello", Some(label()))
-            .await
-            .unwrap_err();
+        let err = sub.put(&domain, b"hello", Some(label())).await.unwrap_err();
         assert!(matches!(err, CasError::UnsupportedIngestAlgorithm(_)));
     }
 
@@ -337,10 +328,7 @@ mod tests {
             digest_length: 64,
             ..DedupDomain::local_default()
         };
-        let err = sub
-            .put(&domain, b"hello", Some(label()))
-            .await
-            .unwrap_err();
+        let err = sub.put(&domain, b"hello", Some(label())).await.unwrap_err();
         assert!(
             matches!(err, CasError::UnsupportedIngestAlgorithm(_)),
             "BLAKE3-512 ingest must be rejected until #881 lands"
@@ -357,7 +345,8 @@ mod tests {
             .put(&DedupDomain::local_default(), b"payload-bytes", None)
             .await
             .unwrap();
-        let expected = SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        let expected =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         assert_eq!(
             m.security_label, expected,
             "seal label must be derived from the domain, not caller-asserted"

@@ -35,14 +35,15 @@ async fn main() {
     let flight_addr = arg_value(&args, "--flight-listen")
         .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 8081)).to_string());
 
-    let facade_listener = TcpListener::bind(&facade_addr).unwrap_or_else(|error| panic!("bind facade: {error}"));
-    let (facade_addr, facade) =
-        hyprstream_decision_stub::facade::serve(facade_listener)
-            .await
-            .unwrap_or_else(|error| panic!("serve facade: {error}"));
+    let facade_listener =
+        TcpListener::bind(&facade_addr).unwrap_or_else(|error| panic!("bind facade: {error}"));
+    let (facade_addr, facade) = hyprstream_decision_stub::facade::serve(facade_listener)
+        .await
+        .unwrap_or_else(|error| panic!("serve facade: {error}"));
     addresses::facade(&facade_addr);
 
-    let flight_listener = TcpListener::bind(&flight_addr).unwrap_or_else(|error| panic!("bind flight: {error}"));
+    let flight_listener =
+        TcpListener::bind(&flight_addr).unwrap_or_else(|error| panic!("bind flight: {error}"));
     let (flight_addr, flight) = hyprstream_decision_stub::flight::serve(flight_listener)
         .await
         .unwrap_or_else(|error| panic!("serve flight: {error}"));

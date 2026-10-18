@@ -99,10 +99,7 @@ pub fn build_chat_vfs_namespace(
         Subject::new(pubkey_hex)
     };
 
-    let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider,
-        signing_key.clone(),
-        None,
-    )?;
+    let model_client = crate::tui::service::production_model_client(signing_key.clone())?;
 
     // Compose the standard namespace shared with the CLI shell (see
     // `crate::services::namespace_builder`). This builder does not currently

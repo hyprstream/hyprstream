@@ -68,40 +68,71 @@ use hyprstream_rpc_std::{discovery_client::DiscoveryClient, policy_client::Polic
 pub use hyprstream_inference::worktree_ext::StatResult;
 pub(crate) use hyprstream_inference::worktree_ext::WorktreeClientExt;
 // contained_root replaced by hyprstream-containedfs crate
+#[cfg(feature = "rocksdb")]
+pub mod at9p_renewal;
+pub mod at9p_verify;
 pub mod discovery;
 pub mod editing;
 pub mod factories;
 #[cfg(feature = "metrics")]
 pub mod flight;
+pub mod fs;
 pub mod generated;
 #[cfg(feature = "oci-image")]
 pub mod image_substrate;
 pub mod inference;
+pub mod kata_9p_backend;
 pub mod mcp_service;
 #[cfg(feature = "metrics")]
 pub mod metrics;
-pub mod at9p_verify;
-#[cfg(feature = "rocksdb")]
-pub mod at9p_renewal;
-pub mod ninep_bridge;
 pub mod model;
-pub mod oauth;
+pub mod namespace_builder;
+pub mod native_event_policy;
+pub mod ninep_bridge;
 pub mod oai;
+pub mod oauth;
 pub mod policy;
 pub mod public_repo;
 pub mod registry;
-pub mod revocation;
-pub mod router;
-pub mod xet;
-pub mod xet_provenance;
-pub mod fs;
-pub mod namespace_builder;
 pub mod remote_mount;
 pub mod remote_registry_mount;
-pub mod kata_9p_backend;
+pub mod revocation;
+pub mod router;
 pub mod rpc_types;
 pub mod typed;
 pub mod worker;
+pub mod xet;
+pub mod xet_provenance;
+
+#[cfg(test)]
+pub(crate) mod restart_diag {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+
+    pub(crate) fn enable() {
+        STARTED.get_or_init(Instant::now);
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn phase(label: &'static str) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        let elapsed_ms = STARTED
+            .get()
+            .map_or(0, |started| started.elapsed().as_millis());
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::Write::write_fmt(
+            &mut stderr,
+            format_args!("RESTART_DIAG_PHASE={label} elapsed_ms={elapsed_ms}\n"),
+        );
+        let _ = std::io::Write::flush(&mut stderr);
+    }
+}
 
 // Postgres-backed PDS record store (#1257) — gated behind `pds-postgres`.
 // When a `[rds]` config section is present, the factory selects this backend;
@@ -126,26 +157,26 @@ pub mod ledger;
 #[cfg(feature = "pay")]
 pub mod pay;
 
-pub use core::{
-    Continuation, EnvelopeContext, RequestService,
-};
+pub use core::{Continuation, EnvelopeContext, RequestService};
 
 // Remaining domain types
 pub use types::{
-    MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
-    DEFAULT_IOUNIT, MAX_IOUNIT,
-    QTDIR, QTFILE, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR,
-    FsDirEntryInfo,
+    FsDirEntryInfo, DEFAULT_IOUNIT, DMDIR, MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
+    MAX_IOUNIT, ORCLOSE, ORDWR, OREAD, OTRUNC, OWRITE, QTDIR, QTFILE,
 };
 // Open mode constants also re-exported from hyprstream-vfs::mount for VFS consumers.
 
+pub use at9p_verify::{credential_free_router, At9pVerifyService, VerifyFaceState};
+pub use discovery::DiscoveryService;
+#[cfg(feature = "metrics")]
+pub use flight::FlightService;
+#[cfg(feature = "oci-image")]
+pub use image_substrate::{
+    create_image_substrate_router, ImageSubstratePolicy, ImageSubstrateState,
+};
 pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
-pub use registry::RegistryService;
-pub use policy::PolicyService;
-pub use model::{ModelService, ModelServiceConfig, MODEL_ENDPOINT};
-pub use worker::build_authorize_fn;
+pub use model::{ModelService, ModelServiceConfig, StagingModelPin, MODEL_ENDPOINT};
 pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
-pub use oauth::OAuthService;
 pub use oai::OAIService;
 #[cfg(test)]
 pub(crate) use oai::{
@@ -153,15 +184,11 @@ pub(crate) use oai::{
     healthy_registry as oai_healthy_registry,
     prove_model_reachability_denial as oai_prove_model_reachability_denial,
 };
+pub use oauth::OAuthService;
+pub use policy::PolicyService;
+pub use registry::RegistryService;
+pub use worker::build_authorize_fn;
 pub use xet::{XetService, XetState};
-pub use at9p_verify::{At9pVerifyService, VerifyFaceState, credential_free_router};
-#[cfg(feature = "oci-image")]
-pub use image_substrate::{
-    create_image_substrate_router, ImageSubstratePolicy, ImageSubstrateState,
-};
-#[cfg(feature = "metrics")]
-pub use flight::FlightService;
-pub use discovery::DiscoveryService;
 
 /// Construct on the caller's runtime, using the authenticated process profile.
 pub fn policy_client_for_process(
@@ -170,7 +197,11 @@ pub fn policy_client_for_process(
     token: Option<String>,
 ) -> anyhow::Result<PolicyClient> {
     if hyprstream_discovery::native_network_required() {
-        PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, token)
+        PolicyClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key,
+            token,
+        )
     } else {
         PolicyClient::for_local_bootstrap(signing_key, compatibility_key, token)
     }
@@ -183,7 +214,11 @@ pub fn discovery_client_for_process(
     token: Option<String>,
 ) -> anyhow::Result<DiscoveryClient> {
     if hyprstream_discovery::native_network_required() {
-        DiscoveryClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, signing_key, token)
+        DiscoveryClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key,
+            token,
+        )
     } else {
         DiscoveryClient::for_local_bootstrap(signing_key, compatibility_key, token)
     }

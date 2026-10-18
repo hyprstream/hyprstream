@@ -520,10 +520,9 @@ mod tests {
             .any(|(cid, bytes)| *cid == published.mst_root
                 && hyprstream_pds::Cid::from_dag_cbor(bytes) == *cid));
         let commit = hyprstream_pds::commit::Commit::from_dag_cbor(&published.commit).unwrap();
-        let public_commit = hyprstream_pds::commit::Commit::from_atproto_dag_cbor(
-            &published.public_commit,
-        )
-        .unwrap();
+        let public_commit =
+            hyprstream_pds::commit::Commit::from_atproto_dag_cbor(&published.public_commit)
+                .unwrap();
         let record = AccountRecord::from_dag_cbor(&published.account_record).unwrap();
         commit
             .verify(&record.atproto_verifying_key().unwrap())

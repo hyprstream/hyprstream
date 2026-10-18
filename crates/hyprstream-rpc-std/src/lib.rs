@@ -16,12 +16,12 @@
 // using `crate::common_capnp`, `crate::streaming_capnp`, etc. resolves
 // ============================================================================
 
-pub use hyprstream_rpc::common_capnp;
-pub use hyprstream_rpc::streaming_capnp;
 pub use hyprstream_rpc::annotations_capnp;
-pub use hyprstream_rpc::optional_capnp;
+pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::events_capnp;
 pub use hyprstream_rpc::nine_capnp;
+pub use hyprstream_rpc::optional_capnp;
+pub use hyprstream_rpc::streaming_capnp;
 
 // ============================================================================
 // Cap'n Proto generated modules — service schemas
@@ -30,99 +30,154 @@ pub use hyprstream_rpc::nine_capnp;
 pub mod inference_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/inference_capnp.rs"));
 }
 
 pub mod model_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/model_capnp.rs"));
 }
 
 pub mod registry_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/registry_capnp.rs"));
 }
 
 pub mod policy_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/policy_capnp.rs"));
 }
 
 pub mod mcp_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/mcp_capnp.rs"));
 }
 
 pub mod metrics_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/metrics_capnp.rs"));
 }
-
 
 pub mod service_events_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/service_events_capnp.rs"));
 }
 
 pub mod chat_core_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/chat_core_capnp.rs"));
 }
 
 pub mod oauth_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/oauth_capnp.rs"));
 }
 
 pub mod worker_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
 }
 
 pub mod workflow_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/workflow_capnp.rs"));
 }
 
 pub mod discovery_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/discovery_capnp.rs"));
 }
 
 pub mod tui_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/tui_capnp.rs"));
 }
 
 pub mod compositor_ipc_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/compositor_ipc_capnp.rs"));
 }
 
@@ -166,7 +221,6 @@ pub mod mcp_client {
     extern crate self as hyprstream_rpc_std;
     hyprstream_rpc_derive::generate_rpc_client!("mcp");
 }
-
 
 pub mod metrics_client {
     #![allow(dead_code, unused_imports, unused_variables)]
@@ -226,9 +280,9 @@ pub mod compositor_ipc_types {
 /// dependency of this SDK crate.
 pub mod pay_client {
     pub use hyprstream_pay::{
-        attestation, capability, types, ATTESTATION_V1_TAG, ALL_SCOPES, IssueRequest,
-        IssueResponse, PayError, SettlementAttestation, SettlementIssuer, TariffProvider,
-        TariffQuote, TariffRequest, UnitRef,
+        attestation, capability, types, IssueRequest, IssueResponse, PayError,
+        SettlementAttestation, SettlementIssuer, TariffProvider, TariffQuote, TariffRequest,
+        UnitRef, ALL_SCOPES, ATTESTATION_V1_TAG,
     };
 }
 
@@ -237,9 +291,9 @@ pub mod pay_client {
 /// this Apache-2.0 crate is the single public SDK surface.
 pub mod prelude {
     pub use crate::{
-        discovery_client, inference_client, mcp_client, metrics_client, model_client,
-        oauth_client, pay_client, policy_client, registry_client, tui_client, worker_client,
-        workflow_client, compositor_ipc_types,
+        compositor_ipc_types, discovery_client, inference_client, mcp_client, metrics_client,
+        model_client, oauth_client, pay_client, policy_client, registry_client, tui_client,
+        worker_client, workflow_client,
     };
     pub use hyprstream_rpc::{CallOptions, FromCapnp, RpcClient, RpcClientProvider, ToCapnp};
 }
@@ -294,14 +348,20 @@ mod contract_compat_tests {
 // Generic codegen-driven service→9p projection (`ServiceMount`) + stream pipes.
 // Native and wasm both: the same generated dispatch drives the file surface on
 // either target. (#539 T3)
-pub mod vfs_mount;
+#[cfg(any(target_arch = "wasm32", test))]
+mod browser_moq_stream;
+#[cfg(target_arch = "wasm32")]
+pub mod browser_session;
+#[cfg(any(target_arch = "wasm32", test))]
+mod federate_proof_time;
+#[cfg(any(target_arch = "wasm32", test))]
+mod model_stream_response;
 pub mod stream_mount;
+pub mod vfs_mount;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
-#[cfg(target_arch = "wasm32")]
-pub mod browser_session;
 // Pure framing/reach-parsing for the moq worker — host-testable (not wasm-gated).
 pub mod moq_frame;
 #[cfg(target_arch = "wasm32")]

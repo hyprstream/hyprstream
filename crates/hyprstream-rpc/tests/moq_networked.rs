@@ -16,7 +16,7 @@ use futures::StreamExt;
 use rand::RngCore;
 
 use hyprstream_rpc::moq_stream::MoqStreamOrigin;
-use hyprstream_rpc::stream_info::{QuicReach, Destination, Role, TransportConfig};
+use hyprstream_rpc::stream_info::{Destination, QuicReach, Role, TransportConfig};
 use hyprstream_rpc::streaming::{StreamContext, StreamPayload};
 use hyprstream_rpc::transport::quinn_transport::{cert_sha256, QuinnRpcServer};
 
@@ -34,8 +34,9 @@ fn build_server() -> Result<(web_transport_quinn::Server, std::net::SocketAddr, 
     let key_der = cert_key.key_pair.serialize_der();
 
     let chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
-    let key =
-        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_der,
+    ));
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
     let server = web_transport_quinn::ServerBuilder::new()
@@ -135,9 +136,21 @@ async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
     pub_.complete_ref(b"{}").await?;
     got.push(next_payload(&mut handle).await?);
 
-    assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"alpha"), "first frame, got {:?}", got[0]);
-    assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"beta"), "second frame, got {:?}", got[1]);
-    assert!(matches!(&got[2], StreamPayload::Complete(_)), "terminal frame, got {:?}", got[2]);
+    assert!(
+        matches!(&got[0], StreamPayload::Data(d) if d == b"alpha"),
+        "first frame, got {:?}",
+        got[0]
+    );
+    assert!(
+        matches!(&got[1], StreamPayload::Data(d) if d == b"beta"),
+        "second frame, got {:?}",
+        got[1]
+    );
+    assert!(
+        matches!(&got[2], StreamPayload::Complete(_)),
+        "terminal frame, got {:?}",
+        got[2]
+    );
 
     handle.cancel();
     shutdown.cancel();

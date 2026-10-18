@@ -1,10 +1,10 @@
 //! Proof CWT claims-set types and bounded deterministic-CBOR decode.
 //!
-//! The claims set is a closed profile of RFC 8392 CWT: registered claims
-//! (`aud`, `exp`, `iat`, `cti`, `Nonce`) carry registered semantics, and four
-//! private-use claims (−70001…−70004) carry the Hyprstream-specific bindings.
-//! The claim set is closed: an unknown claim key denies. Every listed claim is
-//! always present; an inapplicable value is CBOR `null`.
+//! The generic claims set is a closed profile of RFC 8392 CWT: registered
+//! claims (`aud`, `exp`, `iat`, `cti`, `Nonce`) carry registered semantics,
+//! and four private-use claims (−70001…−70004) carry Hyprstream bindings. The
+//! unpublished −70009 recipient extension is accepted only by the dedicated
+//! deferred-Federate decoder, never by generic proof-v1 decoding.
 
 use anyhow::{bail, Result};
 use ciborium::value::Value as CborValue;
@@ -16,7 +16,7 @@ use super::{
     CWT_CLAIM_CTI, CWT_CLAIM_EXP, CWT_CLAIM_IAT, CWT_CLAIM_NONCE, MAX_BODY_BYTES,
     MAX_CHALLENGE_BYTES, MAX_SERVICE_DOMAIN_BYTES, MIN_CHALLENGE_BYTES, REQUEST_ID_SIZE,
 };
-use crate::proof::response::ResponseBinding;
+use crate::proof::{recipient_binding::FederateRecipientBinding, response::ResponseBinding};
 
 /// Decoded proof-CWT claims set.
 #[derive(Debug, Clone)]
@@ -42,6 +42,9 @@ pub struct ProofClaims {
     pub capnp_body_bytes: Vec<u8>,
     /// Response binding map, or `None` when unbound (encoded as CBOR `null`).
     pub response_binding: Option<ResponseBinding>,
+    /// Optional deferred-Federate source extension binding all forwarded
+    /// response recipients (claim −70009). Generic proof-v1 paths reject it.
+    pub federate_recipient_binding: Option<FederateRecipientBinding>,
 }
 
 impl ProofClaims {
@@ -55,6 +58,14 @@ impl ProofClaims {
     /// - Every listed claim is present (absent claims deny).
     /// - Proof-v1 size caps on `aud`, body bytes, challenge.
     pub fn decode(payload: &[u8]) -> Result<Self> {
+        Self::decode_with_federate_extension(payload, false)
+    }
+
+    pub(crate) fn decode_deferred_federate(payload: &[u8]) -> Result<Self> {
+        Self::decode_with_federate_extension(payload, true)
+    }
+
+    fn decode_with_federate_extension(payload: &[u8], allow_extension: bool) -> Result<Self> {
         // Raw-byte deterministic audit BEFORE ciborium deserialization
         // (ciborium resolves indefinite lengths and non-minimal integers
         // transparently, destroying the evidence).
@@ -78,6 +89,7 @@ impl ProofClaims {
         let mut capnp_schema_id = None;
         let mut capnp_body_bytes = None;
         let mut response_binding = None;
+        let mut federate_recipient_binding = None;
 
         for (key, val) in map.iter() {
             let ik = match key {
@@ -130,6 +142,12 @@ impl ProofClaims {
                 x if x == CLAIM_RESPONSE_BINDING as i128 => {
                     response_binding = Some(ResponseBinding::decode(val)?);
                 }
+                x if x == super::CLAIM_FEDERATE_RECIPIENT_BINDING as i128 => {
+                    if !allow_extension {
+                        bail!("proof claims: unknown claim key {}", ik);
+                    }
+                    federate_recipient_binding = Some(FederateRecipientBinding::decode(val)?);
+                }
                 _ => bail!("proof claims: unknown claim key {}", ik),
             }
         }
@@ -158,6 +176,7 @@ impl ProofClaims {
             capnp_schema_id,
             capnp_body_bytes,
             response_binding,
+            federate_recipient_binding,
         })
     }
 }

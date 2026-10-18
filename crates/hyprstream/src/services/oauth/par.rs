@@ -147,11 +147,7 @@ pub async fn push_authorization_request(
                     error = %e,
                     "CIMD resolution failed during PAR"
                 );
-                return par_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_client",
-                    None,
-                );
+                return par_error(StatusCode::BAD_REQUEST, "invalid_client", None);
             }
         }
     } else {
@@ -171,11 +167,7 @@ pub async fn push_authorization_request(
     let registered_client = match registered_client {
         Some(c) => c,
         None => {
-            return par_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_client",
-                None,
-            );
+            return par_error(StatusCode::BAD_REQUEST, "invalid_client", None);
         }
     };
 
@@ -201,7 +193,11 @@ pub async fn push_authorization_request(
     let granted_scopes = match super::state::validate_requested_scopes(
         &requested_scopes,
         &state.server_supported_scopes(),
-        if client_declared.is_empty() { None } else { Some(&client_declared) },
+        if client_declared.is_empty() {
+            None
+        } else {
+            Some(&client_declared)
+        },
         require_atproto,
     ) {
         Ok(g) => g,
@@ -226,8 +222,7 @@ pub async fn push_authorization_request(
     // snapshot so token redemption and refresh must use the SAME key.
     let client_assertion_jkt = {
         let needs_auth = super::client_auth::requires_private_key_jwt(&registered_client);
-        let has_assertion =
-            form.client_assertion.is_some() && form.client_assertion_type.is_some();
+        let has_assertion = form.client_assertion.is_some() && form.client_assertion_type.is_some();
         if needs_auth && !has_assertion {
             return par_error(
                 StatusCode::UNAUTHORIZED,
@@ -236,7 +231,10 @@ pub async fn push_authorization_request(
             );
         }
         if has_assertion {
-            let assertion = form.client_assertion.as_deref().unwrap_or_else(|| unreachable!());
+            let assertion = form
+                .client_assertion
+                .as_deref()
+                .unwrap_or_else(|| unreachable!());
             let atype = form
                 .client_assertion_type
                 .as_deref()
@@ -260,11 +258,7 @@ pub async fn push_authorization_request(
                         error = %e,
                         "client_assertion verification failed at PAR"
                     );
-                    return par_error(
-                        StatusCode::UNAUTHORIZED,
-                        "invalid_client",
-                        None,
-                    );
+                    return par_error(StatusCode::UNAUTHORIZED, "invalid_client", None);
                 }
             }
         } else {
@@ -309,11 +303,7 @@ pub async fn push_authorization_request(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "DPoP proof verification failed at PAR");
-                return par_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_dpop_proof",
-                    None,
-                );
+                return par_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", None);
             }
         }
     } else {
@@ -345,10 +335,7 @@ pub async fn push_authorization_request(
     let expires_at = Instant::now() + std::time::Duration::from_secs(PAR_TTL_SECS);
     state.pending_par_requests.write().await.insert(
         request_uri.clone(),
-        PushedAuthRequest {
-            params,
-            expires_at,
-        },
+        PushedAuthRequest { params, expires_at },
     );
 
     // #1113 rev2 finding 3: when DPoP was bound, issue a fresh server nonce

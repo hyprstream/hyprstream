@@ -228,7 +228,8 @@ mod tests {
                 "severity": {"type": "score", "criteria": ["cosmetic", "unusable"]}
             }
         }"#;
-        let request = parse_request(body).unwrap_or_else(|error| panic!("golden request parses: {error:?}"));
+        let request =
+            parse_request(body).unwrap_or_else(|error| panic!("golden request parses: {error:?}"));
         assert_eq!(request.model, "jev-latest");
         assert_eq!(request.set.questions.len(), 3);
         assert_eq!(request.set.questions[1].id, "tone");
@@ -246,10 +247,14 @@ mod tests {
                 "q": {"type": "noul", "instructions": {"threshold": 0.75, "strict": false}}
             }
         }"#;
-        let request = parse_request(body).unwrap_or_else(|error| panic!("superset scalars parse: {error:?}"));
+        let request =
+            parse_request(body).unwrap_or_else(|error| panic!("superset scalars parse: {error:?}"));
         let question = &request.set.questions[0];
         assert_eq!(
-            question.instructions.as_ref().map(hyprstream_decision::Entry::canonical_text),
+            question
+                .instructions
+                .as_ref()
+                .map(hyprstream_decision::Entry::canonical_text),
             Some(r#"{"threshold":0.75,"strict":false}"#.to_owned()),
             "scalars stay scalars through the IR (no stringification)"
         );
@@ -267,7 +272,10 @@ mod tests {
 
     #[test]
     fn reserved_and_unknown_types_are_422() {
-        for (tag, code) in [("span", "reserved_question_type"), ("bogus", "unknown_question_type")] {
+        for (tag, code) in [
+            ("span", "reserved_question_type"),
+            ("bogus", "unknown_question_type"),
+        ] {
             let body = format!(
                 r#"{{"state": "x", "model": "m", "questions": {{"q": {{"type": "{tag}"}}}}}}"#
             );

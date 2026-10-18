@@ -491,12 +491,7 @@ impl Sandbox {
     /// Like [`call_export`](Self::call_export) but driven by a pre-configured `store`
     /// (the caller has set fuel and/or the epoch deadline). Used internally by the
     /// fuel- and epoch-bounded entry points. See [`new_store`](Self::new_store).
-    fn run_export(
-        &self,
-        mut store: Store<SandboxState>,
-        name: &str,
-        input: &[u8],
-    ) -> Result<i32> {
+    fn run_export(&self, mut store: Store<SandboxState>, name: &str, input: &[u8]) -> Result<i32> {
         let instance = self
             .linker
             .instantiate(&mut store, &self.module)

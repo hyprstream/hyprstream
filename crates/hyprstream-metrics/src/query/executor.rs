@@ -24,7 +24,7 @@ pub trait QueryExecutor: Send + Sync {
         let mut stream = self.execute_stream(plan).await?;
         let mut results = Vec::new();
         let mut total_rows = 0;
-        
+
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             total_rows += batch.num_rows();

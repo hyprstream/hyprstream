@@ -207,6 +207,7 @@ impl BrowserShapedClient {
             response_kem_recipient: None,
             service_domain: Some(service.to_owned()),
             proof_cwt: None,
+            authorization_witness: None,
         };
         let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,

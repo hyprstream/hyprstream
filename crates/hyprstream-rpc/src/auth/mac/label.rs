@@ -817,7 +817,11 @@ mod tests {
     /// and every frozen level maps.
     #[test]
     fn credential_clearance_wire_is_canonical_two_axis() {
-        let value = CredentialClearance::from_label(label(Level::Confidential, Assurance::Classical, &[5, 7]));
+        let value = CredentialClearance::from_label(label(
+            Level::Confidential,
+            Assurance::Classical,
+            &[5, 7],
+        ));
         let json = serde_json::to_string(&value).unwrap();
         assert_eq!(json, "[2,[5,7]]", "exact two-axis wire form");
         let back: CredentialClearance = serde_json::from_str(&json).unwrap();
@@ -840,8 +844,7 @@ mod tests {
             (2, Level::Confidential),
             (3, Level::Secret),
         ] {
-            let v: CredentialClearance =
-                serde_json::from_str(&format!("[{raw},[]]")).unwrap();
+            let v: CredentialClearance = serde_json::from_str(&format!("[{raw},[]]")).unwrap();
             assert_eq!(v.level, lvl);
         }
     }
@@ -865,7 +868,7 @@ mod tests {
         reject("[1,160]"); // compartments as a bitmask integer, not an index array
         reject(r#"[1,["pii"]]"#); // compartment NAMES instead of indices
         reject(r#"["confidential",[]]"#); // level as a name string
-        // The struct/object form (assurance-bearing) never parses as clearance.
+                                          // The struct/object form (assurance-bearing) never parses as clearance.
         reject(r#"{"level":1,"assurance":"classical","compartments":0}"#);
     }
 
@@ -877,14 +880,15 @@ mod tests {
             CredentialClearance::from_label(label(Level::Internal, Assurance::Classical, &[3]));
         let hybrid =
             CredentialClearance::from_label(label(Level::Internal, Assurance::PqHybrid, &[3]));
-        assert_eq!(classical, hybrid, "assurance is not part of the wire identity");
+        assert_eq!(
+            classical, hybrid,
+            "assurance is not part of the wire identity"
+        );
         let json = serde_json::to_string(&hybrid).unwrap();
         assert_eq!(json, serde_json::to_string(&classical).unwrap());
         assert_eq!(json, "[1,[3]]");
         assert!(
-            !json.contains("assurance")
-                && !json.contains("classical")
-                && !json.contains("pq"),
+            !json.contains("assurance") && !json.contains("classical") && !json.contains("pq"),
             "no assurance token on the wire: {json}"
         );
     }

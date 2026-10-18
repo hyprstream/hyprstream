@@ -81,7 +81,12 @@ pub fn build_complete() -> Vec<u8> {
 /// Build a ChatCoreOut.toolCallDetected message.
 /// The ToolCallDetectedMsg struct has 4 text fields:
 ///   ptr 0: id, ptr 1: uuid, ptr 2: description, ptr 3: arguments
-pub fn build_tool_call_detected(id: &str, uuid: &str, description: &str, arguments: &str) -> Vec<u8> {
+pub fn build_tool_call_detected(
+    id: &str,
+    uuid: &str,
+    description: &str,
+    arguments: &str,
+) -> Vec<u8> {
     // For simplicity, encode as JSON in a text field rather than nested struct.
     // This avoids complex multi-pointer Cap'n Proto layout.
     // The TS side can parse either native capnp or this JSON-in-text form.
@@ -130,10 +135,7 @@ mod tests {
 
     #[test]
     fn test_encode_event_list() {
-        let events = vec![
-            build_text_event(0, "hi"),
-            build_complete(),
-        ];
+        let events = vec![build_text_event(0, "hi"), build_complete()];
         let encoded = encode_event_list(&events);
         let count = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         assert_eq!(count, 2);

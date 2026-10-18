@@ -44,14 +44,14 @@ pub const DEFAULT_PIV_SLOT: &str = "9c";
 pub const CEREMONY_MODE_SCHEMA: &str = "hyprstream.deployment-trust-ceremony-mode.v1";
 
 /// Human-visible grade of a software root. Deliberately shouty.
-pub const DEV_GRADE_LABEL: &str = "DEV-GRADE — software root, no hardware gating, not for production";
+pub const DEV_GRADE_LABEL: &str =
+    "DEV-GRADE — software root, no hardware gating, not for production";
 
 /// Grade of a token-gated root. The convenience signing path requires the
 /// token (PIN + touch), but the root seed is generated in host memory and
 /// stored in the age-encrypted authority bundle — it is recoverable by any
 /// bundle recipient, so "hardware-confined" would be materially false.
-const TOKEN_GATED_GRADE_LABEL: &str =
-    "token-gated deployment root (seed recoverable from bundle)";
+const TOKEN_GATED_GRADE_LABEL: &str = "token-gated deployment root (seed recoverable from bundle)";
 
 /// The delegation lifetime the ceremony requests (30 days).
 const DELEGATION_TTL_SECONDS: u64 = 2_592_000;
@@ -246,7 +246,10 @@ pub enum CeremonyPlan {
     /// Not requested. Node bootstrap stands alone, exactly as before.
     Skipped { reason: String },
     /// A mode was chosen; `rationale` explains the choice in one sentence.
-    Proceed { mode: CeremonyMode, rationale: String },
+    Proceed {
+        mode: CeremonyMode,
+        rationale: String,
+    },
     /// Several tokens are attached and the operator must say which one.
     ChooseToken {
         tokens: Vec<DetectedToken>,
@@ -514,14 +517,18 @@ pub fn validate_break_glass(
 ) -> Result<(), String> {
     let recipient = break_glass.recipient().trim();
     if recipient.is_empty() {
-        return Err("break-glass recipient is empty; paste the `age1…` recipient the backup \
+        return Err(
+            "break-glass recipient is empty; paste the `age1…` recipient the backup \
                     identity prints"
-            .to_owned());
+                .to_owned(),
+        );
     }
     if !recipient.is_ascii() || recipient.contains(['\n', '\r', '\0']) {
-        return Err("break-glass recipient contains characters an age recipient cannot hold; \
+        return Err(
+            "break-glass recipient contains characters an age recipient cannot hold; \
                     re-copy it without line breaks"
-            .to_owned());
+                .to_owned(),
+        );
     }
     if !recipient.starts_with("age1") {
         return Err(format!(
@@ -529,10 +536,12 @@ pub fn validate_break_glass(
         ));
     }
     if recipient == primary_recipient.trim() {
-        return Err("break-glass recipient is identical to the primary recipient; the root would \
+        return Err(
+            "break-glass recipient is identical to the primary recipient; the root would \
                     then have a single point of loss, which is exactly what the second recipient \
                     exists to prevent"
-            .to_owned());
+                .to_owned(),
+        );
     }
     if let BreakGlass::SecondToken { .. } = break_glass {
         if !recipient.starts_with("age1yubikey1") {
@@ -543,13 +552,15 @@ pub fn validate_break_glass(
         }
     }
     if !break_glass.is_protected() && policy == PlaintextPolicy::Refuse {
-        return Err("refusing an unencrypted break-glass identity: a root is exactly as strong as \
+        return Err(
+            "refusing an unencrypted break-glass identity: a root is exactly as strong as \
                     its weakest recipient, and a bare `age-keygen` file hands the deployment root \
                     to anyone who can read it. Use a second token, or a passphrase-encrypted \
                     identity (`age-keygen | age -p`). Pass \
                     --deployment-trust-allow-plaintext-break-glass only for a throwaway root you \
                     destroy immediately afterwards."
-            .to_owned());
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -833,7 +844,11 @@ pub struct CeremonyModeRecord {
 
 /// Summarise a completed selection for the emitted record.
 #[must_use]
-pub fn mode_record(mode: &CeremonyMode, break_glass: &BreakGlass, rationale: &str) -> CeremonyModeRecord {
+pub fn mode_record(
+    mode: &CeremonyMode,
+    break_glass: &BreakGlass,
+    rationale: &str,
+) -> CeremonyModeRecord {
     let token = mode.token();
     CeremonyModeRecord {
         schema: CEREMONY_MODE_SCHEMA.to_owned(),
@@ -1250,7 +1265,10 @@ mod tests {
         let CeremonyPlan::Proceed { mode, rationale } = plan else {
             panic!("expected a hardware mode, got {plan:?}");
         };
-        assert_eq!(mode, CeremonyMode::HardwareAgeRecipient { token: old_token() });
+        assert_eq!(
+            mode,
+            CeremonyMode::HardwareAgeRecipient { token: old_token() }
+        );
         assert!(!mode.ed25519_confined_to_hardware());
         assert!(rationale.contains("5.4.3"));
         assert!(rationale.contains("host memory"));
@@ -1357,7 +1375,11 @@ mod tests {
     #[test]
     fn software_is_never_chosen_over_present_hardware_without_an_explicit_override() {
         // Attached hardware always wins unless the operator overrides it.
-        for tokens in [vec![old_token()], vec![new_token()], vec![old_token(), new_token()]] {
+        for tokens in [
+            vec![old_token()],
+            vec![new_token()],
+            vec![old_token(), new_token()],
+        ] {
             let plan = plan_ceremony(&enabled(), &Ok(tokens.clone()));
             assert!(
                 !matches!(
@@ -1502,8 +1524,9 @@ mod tests {
             identity_file: PathBuf::from("/tmp/backup.key"),
             recipient: "age1backup".to_owned(),
         };
-        let error = validate_break_glass(&break_glass, "age1yubikey1primary", PlaintextPolicy::Refuse)
-            .expect_err("plaintext break-glass must be refused");
+        let error =
+            validate_break_glass(&break_glass, "age1yubikey1primary", PlaintextPolicy::Refuse)
+                .expect_err("plaintext break-glass must be refused");
         assert!(error.contains("weakest recipient"));
         assert!(error.contains("--deployment-trust-allow-plaintext-break-glass"));
     }
@@ -1528,12 +1551,10 @@ mod tests {
             identity_file: PathBuf::from("/tmp/backup.key.age"),
             recipient: "age1backup".to_owned(),
         };
-        assert!(validate_break_glass(
-            &break_glass,
-            "age1yubikey1primary",
-            PlaintextPolicy::Refuse
-        )
-        .is_ok());
+        assert!(
+            validate_break_glass(&break_glass, "age1yubikey1primary", PlaintextPolicy::Refuse)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1884,6 +1905,9 @@ mod tests {
             parse_age_keygen_recipient("Public key: age1qsoftware").as_deref(),
             Some("age1qsoftware")
         );
-        assert_eq!(parse_age_keygen_recipient("Public key: age1yubikey1q"), None);
+        assert_eq!(
+            parse_age_keygen_recipient("Public key: age1yubikey1q"),
+            None
+        );
     }
 }

@@ -39,6 +39,7 @@ async-trait.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded = "0.7"
 psl.workspace = true
 subsecond.workspace = true
 json-threat-protection.workspace = true
@@ -57,6 +58,7 @@ git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
 cas-serve = { path = "../cas-serve" }  # Content-addressed store reconstruction (getBlob #432)
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-session-store = { path = "../hyprstream-session-store", optional = true }
 hyprstream-util = { path = "../hyprstream-util" }  # Generic shared primitives (TtlCache, etc.)
 moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
 ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
@@ -242,7 +244,8 @@ cuda = []
 valkey = ["dep:fred"]  # Enable legacy Valkey/Redis-backed user and token stores
 discovery-valkey = ["hyprstream-discovery/valkey"]  # Shared/tiered Discovery state
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:hyprstream-session-store"]  # Networked Postgres UserStore for RDS (#1401)
+postgres-replay = ["postgres"]  # Durable proof and mediated replay admission on shared Postgres
 encrypted-account-admission = []  # Mandatory source-level policy: no plaintext account UserStore in production
 # Local RocksDB persistence (same shape as the `valkey` precedent): the
 # legacy RocksDbUserStore/DeviceStore, the OAuth refresh-token store, and the
@@ -253,7 +256,7 @@ encrypted-account-admission = []  # Mandatory source-level policy: no plaintext 
 # rocksdb C++ subtree.
 rocksdb = ["dep:rocksdb", "hyprstream-discovery/rocksdb"]
 credential-pds = ["encrypted-account-admission", "pglite", "rocksdb"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
-credential-pds-postgres = ["postgres"]  # Production credential/PDS with RDS Postgres backend (#1401)
+credential-pds-postgres = ["encrypted-account-admission", "postgres"]  # Production credential/PDS with RDS Postgres account backend (#1401); combine with pds-postgres,rocksdb for staging runtime
 metrics = ["encrypted-account-admission", "dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["hyprstream-inference/bnb"]  # bitsandbytes KV cache quantization (gated code lives in hyprstream-inference)
 xet = ["git2db/xet-storage", "hyprstream-inference/xet"]  # Enable XET large file storage
@@ -297,7 +300,7 @@ pay = ["ledger", "dep:hyprstream-pay"]
 # configured the Postgres store is selected and is FATAL-on-unavailable —
 # never a silent local fallback. Honors D2 (signed bytes verbatim as
 # authoritative source-of-truth; SQL rows are a projection-free KV shell).
-pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls"]
+pds-postgres = ["hyprstream-pds/postgres", "hyprstream-discovery/postgres"]  # Records + accepted-state authority on RDS Postgres (#1257); the KV/TLS/pool layer lives in hyprstream-pds
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
@@ -308,6 +311,7 @@ hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 [dev-dependencies]
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 hyprstream-discovery = { path = "../hyprstream-discovery", features = ["test-fixtures"] }
+hyprstream-pds = { path = "../hyprstream-pds", features = ["postgres-test-connect"] }  # scratch-DB live tests (NoTls, test-only)
 # Test-only: the e2e_inference integration suite drives torch devices
 # directly (DevicePool/LayerDeviceMap planning + GPU smoke tests over the
 # full service stack). The runtime dependency edge is gone (Wave B: tch

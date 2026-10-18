@@ -40,14 +40,7 @@ async fn test_worktree_creation_with_lfs_attributes() -> Result<(), Box<dyn std:
     let tree = repo.find_tree(tree_id)?;
 
     let sig = git2::Signature::now("Test", "test@example.com")?;
-    let commit_oid = repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "Initial commit",
-        &tree,
-        &[],
-    )?;
+    let commit_oid = repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?;
 
     // Create a branch for worktree (can't use main - already checked out)
     let commit = repo.find_commit(commit_oid)?;
@@ -56,7 +49,8 @@ async fn test_worktree_creation_with_lfs_attributes() -> Result<(), Box<dyn std:
     // Configure git2db
     let mut registry = Git2DB::open(temp.path()).await?;
     let repo_id = RepoId::new();
-    registry.register(repo_id.clone())
+    registry
+        .register(repo_id.clone())
         .worktree_path(&repo_dir)
         .exec()
         .await?;
@@ -64,14 +58,26 @@ async fn test_worktree_creation_with_lfs_attributes() -> Result<(), Box<dyn std:
 
     // Create worktree - should succeed
     let worktree_path = temp.path().join("worktree");
-    let result = handle.create_worktree(&worktree_path, "worktree-branch").await;
+    let result = handle
+        .create_worktree(&worktree_path, "worktree-branch")
+        .await;
 
-    assert!(result.is_ok(), "Worktree creation should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Worktree creation should succeed: {:?}",
+        result.err()
+    );
     assert!(worktree_path.exists(), "Worktree should exist");
 
     // Verify the worktree has the expected files
-    assert!(worktree_path.join("test.txt").exists(), "test.txt should exist in worktree");
-    assert!(worktree_path.join(".gitattributes").exists(), ".gitattributes should exist in worktree");
+    assert!(
+        worktree_path.join("test.txt").exists(),
+        "test.txt should exist in worktree"
+    );
+    assert!(
+        worktree_path.join(".gitattributes").exists(),
+        ".gitattributes should exist in worktree"
+    );
     Ok(())
 }
 
@@ -80,7 +86,8 @@ async fn test_worktree_creation_with_lfs_attributes() -> Result<(), Box<dyn std:
 
 /// Test that metadata save failure triggers rollback
 #[tokio::test]
-async fn test_metadata_save_failure_rolls_back_worktree() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_metadata_save_failure_rolls_back_worktree() -> Result<(), Box<dyn std::error::Error>>
+{
     // Create temp directory for test
     let temp = TempDir::new()?;
     let models_dir = temp.path().join("models");
@@ -104,14 +111,7 @@ async fn test_metadata_save_failure_rolls_back_worktree() -> Result<(), Box<dyn 
     let tree = repo.find_tree(tree_id)?;
 
     let sig = git2::Signature::now("Test", "test@example.com")?;
-    let commit_oid = repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "Initial commit",
-        &tree,
-        &[],
-    )?;
+    let commit_oid = repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?;
 
     // Create a branch for worktree (can't use main - already checked out)
     let commit = repo.find_commit(commit_oid)?;
@@ -121,14 +121,17 @@ async fn test_metadata_save_failure_rolls_back_worktree() -> Result<(), Box<dyn 
     // For now, just verify the basic worktree creation works
     let mut registry = Git2DB::open(temp.path()).await?;
     let repo_id = RepoId::new();
-    registry.register(repo_id.clone())
+    registry
+        .register(repo_id.clone())
         .worktree_path(&repo_dir)
         .exec()
         .await?;
     let handle = registry.repo(&repo_id)?;
 
     let worktree_path = temp.path().join("worktree");
-    let result = handle.create_worktree(&worktree_path, "worktree-branch").await;
+    let result = handle
+        .create_worktree(&worktree_path, "worktree-branch")
+        .await;
 
     assert!(result.is_ok(), "Basic worktree creation should succeed");
     assert!(worktree_path.exists(), "Worktree should exist");
@@ -149,7 +152,10 @@ async fn test_filtered_worktree_only_materializes_paths() -> Result<(), Box<dyn 
     // Create file structure simulating release variants
     std::fs::create_dir_all(repo_dir.join("backends/cpu"))?;
     std::fs::create_dir_all(repo_dir.join("backends/cuda130"))?;
-    std::fs::write(repo_dir.join("manifest.toml"), "[release]\nversion = \"0.1.0\"\n")?;
+    std::fs::write(
+        repo_dir.join("manifest.toml"),
+        "[release]\nversion = \"0.1.0\"\n",
+    )?;
     std::fs::write(repo_dir.join("backends/cpu/hyprstream"), "cpu-binary")?;
     std::fs::write(
         repo_dir.join("backends/cpu/manifest.toml"),
@@ -206,7 +212,9 @@ async fn test_filtered_worktree_only_materializes_paths() -> Result<(), Box<dyn 
 
     // cuda130 files should exist
     assert!(worktree_path.join("backends/cuda130/hyprstream").exists());
-    assert!(worktree_path.join("backends/cuda130/manifest.toml").exists());
+    assert!(worktree_path
+        .join("backends/cuda130/manifest.toml")
+        .exists());
     // Root manifest should exist
     assert!(worktree_path.join("manifest.toml").exists());
 
@@ -262,11 +270,7 @@ async fn test_skip_worktree_survives_subsequent_checkout() -> Result<(), Box<dyn
 
     let worktree_path = temp.path().join("skip-wt");
     handle
-        .create_filtered_worktree(
-            &worktree_path,
-            "test-branch",
-            vec!["keep/".to_owned()],
-        )
+        .create_filtered_worktree(&worktree_path, "test-branch", vec!["keep/".to_owned()])
         .await?;
 
     // Verify initial state
@@ -311,7 +315,10 @@ async fn test_skip_worktree_survives_subsequent_checkout() -> Result<(), Box<dyn
         // as long as the bit is correctly set in the index
         {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "Note: libgit2 re-materialized skip-worktree file (known limitation)");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Note: libgit2 re-materialized skip-worktree file (known limitation)"
+            );
         }
     }
 
@@ -320,7 +327,8 @@ async fn test_skip_worktree_survives_subsequent_checkout() -> Result<(), Box<dyn
 
 /// Test partial worktree cleanup on driver failure
 #[tokio::test]
-async fn test_driver_failure_cleans_up_partial_worktree() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_driver_failure_cleans_up_partial_worktree() -> Result<(), Box<dyn std::error::Error>>
+{
     // Create temp directory
     let temp = TempDir::new()?;
     let repo_dir = temp.path().join("test-repo");
@@ -344,17 +352,23 @@ async fn test_driver_failure_cleans_up_partial_worktree() -> Result<(), Box<dyn 
     // Try to create worktree with invalid ref - should fail
     let mut registry = Git2DB::open(temp.path()).await?;
     let repo_id = RepoId::new();
-    registry.register(repo_id.clone())
+    registry
+        .register(repo_id.clone())
         .worktree_path(&repo_dir)
         .exec()
         .await?;
     let handle = registry.repo(&repo_id)?;
     let worktree_path = temp.path().join("worktree");
 
-    let result = handle.create_worktree(&worktree_path, "nonexistent-branch").await;
+    let result = handle
+        .create_worktree(&worktree_path, "nonexistent-branch")
+        .await;
 
     // Should fail
-    assert!(result.is_err(), "Should fail to create worktree with invalid branch");
+    assert!(
+        result.is_err(),
+        "Should fail to create worktree with invalid branch"
+    );
 
     // Verify cleanup - worktree path should not exist
     assert!(

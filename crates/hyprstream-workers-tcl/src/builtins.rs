@@ -25,7 +25,11 @@ pub fn register_all(interp: &mut Interp, ctx_id: ContextID) {
 }
 
 /// `cat path [path ...]` — read file contents from the VFS.
-fn cmd_cat<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_cat<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 2, 0, "path ?path ...?")?;
 
@@ -46,7 +50,11 @@ fn cmd_cat<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> 
 }
 
 /// `ls [path]` — list directory entries. Defaults to `/`.
-fn cmd_ls<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_ls<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 1, 2, "?path?")?;
 
@@ -81,7 +89,11 @@ fn cmd_ls<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> B
 }
 
 /// `write path data` — write data to a VFS file.
-fn cmd_write<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_write<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 3, 3, "path data")?;
 
@@ -99,7 +111,11 @@ fn cmd_write<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -
 }
 
 /// `ctl path command [args...]` — write to a ctl file and read the response.
-fn cmd_ctl<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_ctl<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 3, 0, "path command ?args ...?")?;
 
@@ -150,7 +166,10 @@ fn json_to_tcl(val: &serde_json::Value) -> String {
             parts.join(" ")
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(|v| tcl_list_escape(&json_to_tcl(v))).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| tcl_list_escape(&json_to_tcl(v)))
+                .collect();
             items.join(" ")
         }
         serde_json::Value::String(s) => s.clone(),
@@ -162,7 +181,9 @@ fn json_to_tcl(val: &serde_json::Value) -> String {
 
 /// Escape a string for safe inclusion in a Tcl list.
 fn tcl_list_escape(s: &str) -> String {
-    if s.is_empty() || s.contains(|c: char| c.is_whitespace() || c == '{' || c == '}' || c == '\\' || c == '"') {
+    if s.is_empty()
+        || s.contains(|c: char| c.is_whitespace() || c == '{' || c == '}' || c == '\\' || c == '"')
+    {
         format!("{{{}}}", s)
     } else {
         s.to_owned()
@@ -170,7 +191,11 @@ fn tcl_list_escape(s: &str) -> String {
 }
 
 /// `help` — list VFS builtins and `/bin/` entries.
-fn cmd_help<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_help<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 1, 1, "")?;
 
@@ -210,7 +235,11 @@ fn cmd_help<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) ->
 ///
 /// Reads from `/srv/{service}/doc/{method}` in the VFS namespace.
 /// Without arguments, lists all available services.
-fn cmd_man<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_man<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 1, 0, "?service? ?method ...?")?;
 
@@ -275,7 +304,11 @@ fn cmd_man<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> 
 ///   stream /srv/model infer.generate_stream {"prompt":"hello"} chunk { puts $chunk }
 ///
 /// Also supports `stream start path method args` which returns the topic.
-fn cmd_stream<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_stream<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         // stream start path method args → returns topic
         // stream path method args varname body → iterate blocks
@@ -334,7 +367,9 @@ fn cmd_stream<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) 
 
             molt_ok!(total_output)
         } else {
-            molt_err!("usage: stream path method args varname body\n       stream start path method args")
+            molt_err!(
+                "usage: stream path method args varname body\n       stream start path method args"
+            )
         }
     })
 }
@@ -348,14 +383,21 @@ async fn start_stream(
     args: &str,
 ) -> Result<String, molt::Exception> {
     let ctl_data = format!("{} {}", method, args);
-    let result = namespace.ctl(path, ctl_data.as_bytes(), subject).await
+    let result = namespace
+        .ctl(path, ctl_data.as_bytes(), subject)
+        .await
         .map_err(|e| molt::Exception::molt_err(Value::from(format!("stream start: {}", e))))?;
     let result_str = String::from_utf8_lossy(&result);
 
-    let parsed: serde_json::Value = serde_json::from_str(&result_str)
-        .map_err(|e| molt::Exception::molt_err(Value::from(format!("stream start: invalid response: {}", e))))?;
+    let parsed: serde_json::Value = serde_json::from_str(&result_str).map_err(|e| {
+        molt::Exception::molt_err(Value::from(format!(
+            "stream start: invalid response: {}",
+            e
+        )))
+    })?;
 
-    parsed.get("topic")
+    parsed
+        .get("topic")
         .or_else(|| parsed.get("streamId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned())
@@ -363,7 +405,11 @@ async fn start_stream(
 }
 
 /// `mount [prefix]` — list mount points (read-only).
-fn cmd_mount<'a>(interp: &'a mut Interp, ctx_id: ContextID, argv: &'a [Value]) -> BoxFuture<'a, MoltResult> {
+fn cmd_mount<'a>(
+    interp: &'a mut Interp,
+    ctx_id: ContextID,
+    argv: &'a [Value],
+) -> BoxFuture<'a, MoltResult> {
     Box::pin(async move {
         molt::check_args(1, argv, 1, 2, "?prefix?")?;
 

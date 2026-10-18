@@ -99,7 +99,7 @@ fn record(
         epoch: 1,
         role,
         approver_role: None,
-            enrollment_policy_id: "test-enrollment-v1".to_owned(),
+        enrollment_policy_id: "test-enrollment-v1".to_owned(),
         not_after: FIXTURE_NOT_AFTER,
         revoked: false,
     }
@@ -213,7 +213,11 @@ fn all_positive_vectors_accept() {
 /// one). An empty set means the reason is not bound (none here).
 fn deny_reason_tokens(deny_class: &str) -> &'static [&'static str] {
     match deny_class {
-        "type-confusion" => &["typ/hs_domain mismatch", "hs_domain: missing", "typ: missing"],
+        "type-confusion" => &[
+            "typ/hs_domain mismatch",
+            "hs_domain: missing",
+            "typ: missing",
+        ],
         "missing-typ" => &["typ: missing", "missing (label 16)"],
         "domain-separation" => &["typ/hs_domain mismatch", "hs_domain"],
         "component-stripping" => &[
@@ -445,8 +449,7 @@ fn verifier_context_negatives_deny() {
     );
     // N-57: unattributed remaining lifetime 45s > 30s max.
     assert!(
-        crate::proof::verify::verify_proof_signatures(&parse_neg("N-57"), None, None, now)
-            .is_err(),
+        crate::proof::verify::verify_proof_signatures(&parse_neg("N-57"), None, None, now).is_err(),
         "N-57 (over-limit unattributed) must deny at the freshness check"
     );
 }
@@ -471,7 +474,10 @@ fn context_bound_expiry_negatives() {
         let proof = crate::proof::parser::ParsedProof::parse(&entry.1)
             .unwrap_or_else(|e| panic!("{id} must parse (its bound is context-side): {e}"));
         assert!(
-            matches!(entry.2.as_str(), "proof-credential-expiry" | "proof-session-expiry"),
+            matches!(
+                entry.2.as_str(),
+                "proof-credential-expiry" | "proof-session-expiry"
+            ),
             "{id} is a context-bound expiry negative"
         );
         let _ = proof;
@@ -487,7 +493,8 @@ fn n22_response_proof_for_another_request_denies() {
         .iter()
         .find(|(id, _, _)| id == "N-22")
         .expect("N-22 must exist");
-    let proof = crate::proof::parser::ParsedProof::parse(&n22.1).expect("N-22 parses; it is a stateful denial");
+    let proof = crate::proof::parser::ParsedProof::parse(&n22.1)
+        .expect("N-22 parses; it is a stateful denial");
     assert_ne!(
         proof.claims.request_id, FIXTURE_REQUEST_ID,
         "N-22's cti is deliberately not the request it is presented against"
@@ -643,16 +650,13 @@ fn n2_in_the_request_envelope_credential_slot_denies() {
         let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]).with_authorization(auth);
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut builder =
-                message.init_root::<crate::common_capnp::request_envelope::Builder>();
+            let mut builder = message.init_root::<crate::common_capnp::request_envelope::Builder>();
             envelope.write_to(&mut builder);
         }
         let mut bytes = Vec::new();
         capnp::serialize::write_message(&mut bytes, &message)?;
-        let reader = capnp::serialize::read_message(
-            &mut &bytes[..],
-            capnp::message::ReaderOptions::new(),
-        )?;
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())?;
         let decoded = RequestEnvelope::read_from(
             reader.get_root::<crate::common_capnp::request_envelope::Reader>()?,
         )?;
@@ -747,17 +751,12 @@ fn n2_proof_in_the_credential_slot_denies() {
         crate::auth::RFC9068_ACCESS_TOKEN_TYPES[1],
         "wit+jwt",
     ];
-    for proof_typ in [
-        crate::proof::PROOF_TYP,
-        crate::proof::RESPONSE_PROOF_TYP,
-    ] {
+    for proof_typ in [crate::proof::PROOF_TYP, crate::proof::RESPONSE_PROOF_TYP] {
         assert!(
             !credential_slot_types.contains(&proof_typ),
             "a proof media type must never be an accepted credential type"
         );
-        let header = format!(
-            r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{proof_typ}","kid":"k1"}}"#
-        );
+        let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{proof_typ}","kid":"k1"}}"#);
         let token = format!(
             "{}.{}.{}",
             URL_SAFE_NO_PAD.encode(header),
@@ -871,8 +870,7 @@ fn frozen_vectors_satisfy_only_their_matching_method_policy() {
 
     // P-1: unattributed, standalone suite, no approvers.
     let p1 = parse("P-1");
-    let p1_v =
-        crate::proof::verify::verify_proof_signatures(&p1, None, None, FIXTURE_NOW).unwrap();
+    let p1_v = crate::proof::verify::verify_proof_signatures(&p1, None, None, FIXTURE_NOW).unwrap();
     assert!(evaluate(
         &SignaturePolicy::UnauthenticatedOrTokenBound {
             suite: CryptoSuite::Classical

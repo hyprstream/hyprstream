@@ -502,7 +502,9 @@ mod extraction {
                 // receipt: payment already settled.
                 record.push((
                     "payment_method".to_owned(),
-                    Entry::Str(pick(&["card", "cash", "transfer"], rng.below(3) as usize).to_owned()),
+                    Entry::Str(
+                        pick(&["card", "cash", "transfer"], rng.below(3) as usize).to_owned(),
+                    ),
                 ));
                 record.push(("paid".to_owned(), Entry::Bool(true)));
             }

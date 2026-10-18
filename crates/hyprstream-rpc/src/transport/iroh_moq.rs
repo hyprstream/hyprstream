@@ -39,8 +39,8 @@ use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
 use crate::moq_authz::{
-    PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision, is_valid_tenant_segment,
-    tenant_prefix,
+    is_valid_tenant_segment, tenant_prefix, PeerIdentity, SharedSubscribeAuthorizer,
+    SubscribeDecision,
 };
 use crate::transport::moql_admission::MoqlAdmissionAuthenticator;
 
@@ -289,24 +289,67 @@ impl IrohMoqProtocolHandler {
         self
     }
 
-    async fn event_scopes(&self, peer: &PeerIdentity, tenant: &str, ingress: bool) -> (Vec<String>, Vec<String>) {
+    async fn event_scopes(
+        &self,
+        peer: &PeerIdentity,
+        tenant: &str,
+        ingress: bool,
+    ) -> (Vec<String>, Vec<String>) {
         let mut subscribe = Vec::new();
         let mut publish = Vec::new();
         if let (Some(authz), Some(subject)) = (&self.inner.event_authz, &peer.subject) {
             // Event has a fixed namespace. Other tenants cannot acquire local
             // visibility, even if their policy happens to permit a source.
-            if tenant != "local" { return (subscribe, publish); }
+            if tenant != "local" {
+                return (subscribe, publish);
+            }
             let subject = crate::envelope::Subject::new(subject.clone());
-            // Source inventory only, not label policy. Missing policy rows and
-            // absent verified clearances continue to deny through EventAuthz.
-            // TODO(#1530): consume the generated Event source inventory.
-            for source in ["system", "worker", "model"] {
+            // Inventory comes from the same reference monitor as label policy.
+            for source in authz.sources() {
                 let path = format!("local/events/{source}");
-                if authz.can_subscribe(&subject, source).await { subscribe.push(path.clone()); }
-                if ingress && authz.can_publish(&subject, source).await { publish.push(path); }
+                if authz.can_subscribe(&subject, source).await {
+                    subscribe.push(path.clone());
+                }
+                if ingress && authz.can_publish(&subject, source).await {
+                    publish.push(path);
+                }
             }
         }
         (subscribe, publish)
+    }
+
+    /// Revalidate only grants this session actually holds. Probing unrelated
+    /// denied scopes on every watchdog tick emits an unbounded denial WAL.
+    /// This caches no permit: every held operation is checked afresh.
+    async fn event_grants_current(
+        &self,
+        peer: &PeerIdentity,
+        scopes: &(Vec<String>, Vec<String>),
+    ) -> bool {
+        let Some(authz) = &self.inner.event_authz else {
+            return true;
+        };
+        let Some(subject) = &peer.subject else {
+            return false;
+        };
+        let subject = crate::envelope::Subject::new(subject.clone());
+        for path in &scopes.0 {
+            let Some(source) = path.strip_prefix("local/events/") else {
+                return false;
+            };
+            if !authz.revalidate_subscribe(&subject, source).await {
+                return false;
+            }
+        }
+        for path in &scopes.1 {
+            let Some(source) = path.strip_prefix("local/events/") else {
+                return false;
+            };
+            if !authz.revalidate_publish(&subject, source).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Mutate the inner config, cloning the shared `Arc<HandlerInner>` only when
@@ -451,18 +494,46 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // the peer a scoped writable origin. This keeps an ordinary subscriber
         // from colliding with a producer's broadcast names.
         let ingress_granted = self.inner.authz.authorizes_ingress(&peer, &tenant);
+        if let Some(authz) = &self.inner.event_authz {
+            if !admitted
+                .as_ref()
+                .is_some_and(|peer| authz.admission_is_current(peer))
+            {
+                conn.close(
+                    0u32.into(),
+                    b"Event enrollment does not bind admitted key/head",
+                );
+                return Ok(());
+            }
+        }
         let event_scopes = self.event_scopes(&peer, &tenant, ingress_granted).await;
         let server = if self.inner.event_authz.is_some() {
             if event_scopes.0.is_empty() && event_scopes.1.is_empty() {
                 conn.close(0u32.into(), b"no authorized event sources");
                 return Ok(());
             }
-            let read: Vec<_> = event_scopes.0.iter().map(|s| moq_net::Path::new(s)).collect();
-            let write: Vec<_> = event_scopes.1.iter().map(|s| moq_net::Path::new(s)).collect();
+            let read: Vec<_> = event_scopes
+                .0
+                .iter()
+                .map(|s| moq_net::Path::new(s))
+                .collect();
+            let write: Vec<_> = event_scopes
+                .1
+                .iter()
+                .map(|s| moq_net::Path::new(s))
+                .collect();
             // Never scope with an empty list: library defaults must not turn
             // deny into an unrestricted origin.
-            let consume = if write.is_empty() { None } else { self.inner.origin.producer.scope(&write) };
-            let publish = if read.is_empty() { None } else { self.inner.origin.consumer.scope(&read) };
+            let consume = if write.is_empty() {
+                None
+            } else {
+                self.inner.origin.producer.scope(&write)
+            };
+            let publish = if read.is_empty() {
+                None
+            } else {
+                self.inner.origin.consumer.scope(&read)
+            };
             Server::new().with_publish(publish).with_consume(consume)
         } else if ingress_granted {
             let prefix = tenant_prefix(&tenant);
@@ -472,7 +543,9 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
             };
             Server::new().with_origin(scoped_origin)
         } else {
-            let Some(scoped_consumer) = crate::moq_authz::tenant_scoped_consumer(self.inner.origin.consumer(), &tenant) else {
+            let Some(scoped_consumer) =
+                crate::moq_authz::tenant_scoped_consumer(self.inner.origin.consumer(), &tenant)
+            else {
                 return Ok(());
             };
             Server::new().with_publish(scoped_consumer)
@@ -516,9 +589,9 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                             break;
                         }
                     }
-                    if self.inner.event_authz.is_some()
-                        && self.event_scopes(&peer, &tenant, ingress_granted).await != event_scopes
-                    {
+                    if !self.inner.event_authz.as_ref().is_none_or(|authz|
+                        admitted_for_session.as_ref().is_some_and(|peer| authz.admission_is_current(peer)))
+                        || !self.event_grants_current(&peer, &event_scopes).await {
                         session_conn.close(0u32.into(), b"event policy changed");
                         break;
                     }
@@ -552,7 +625,7 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::iroh_substrate::{ALPN_MOQ_LITE, IrohSubstrate, NoopHandler};
+    use crate::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_MOQ_LITE};
     use bytes::Bytes;
     use ed25519_dalek::SigningKey;
     use iroh::{EndpointAddr, TransportAddr};
@@ -580,8 +653,8 @@ mod tests {
     /// client origin, or reach the tenant resolver. Mutating the carrier NodeId
     /// cannot change that decision because it is never an application proof.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn anonymous_carrier_cannot_publish_subscribe_or_obtain_tenant_scope()
-    -> anyhow::Result<()> {
+    async fn anonymous_carrier_cannot_publish_subscribe_or_obtain_tenant_scope(
+    ) -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let resolver_calls = Arc::new(AtomicUsize::new(0));
@@ -677,11 +750,14 @@ mod tests {
     /// a frame end-to-end. The subscriber is read-only, while trusted ingress
     /// remains both subject- and tenant-scoped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn trusted_ingress_relays_to_distinct_subscriber_and_scopes_tenants()
-    -> anyhow::Result<()> {
+    async fn trusted_ingress_relays_to_distinct_subscriber_and_scopes_tenants() -> anyhow::Result<()>
+    {
         use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
         use crate::stream_info::MoqlServerIdentity;
-        use crate::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof, MoqlServerIdentityProof, prove_moql_admission};
+        use crate::transport::moql_admission::{
+            prove_moql_admission, AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof,
+            MoqlServerIdentityProof,
+        };
 
         let server_ed = SigningKey::from_bytes(&[0x71; 32]);
         let server_pq = ml_dsa_sk_from_seed(&[0x72; 32]);
@@ -693,76 +769,152 @@ mod tests {
         let other_pq = ml_dsa_sk_from_seed(&[0x7A; 32]);
         let expiry = crate::envelope::current_timestamp() + 60_000;
         let server_identity = MoqlServerIdentity {
-            did: "did:at9p:relay".to_owned(), epoch: 1, head_digest: vec![0x75; 64],
-            expires_at_unix_ms: expiry, ed25519: server_ed.verifying_key().to_bytes(),
+            did: "did:at9p:relay".to_owned(),
+            epoch: 1,
+            head_digest: vec![0x75; 64],
+            expires_at_unix_ms: expiry,
+            ed25519: server_ed.verifying_key().to_bytes(),
             ml_dsa65: ml_dsa_sk_to_vk_bytes(&server_pq),
         };
         let server_state = AcceptedIdentityState {
-            epoch: 1, head_digest: [0x75; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
+            epoch: 1,
+            head_digest: [0x75; 64],
+            expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: server_ed.verifying_key().to_bytes(),
+                ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq),
+            }],
             service_ids: vec![],
         };
         let producer_state = AcceptedIdentityState {
-            epoch: 1, head_digest: [0x76; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: producer_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq) }],
+            epoch: 1,
+            head_digest: [0x76; 64],
+            expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: producer_ed.verifying_key().to_bytes(),
+                ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq),
+            }],
             service_ids: vec![],
         };
         let subscriber_state = AcceptedIdentityState {
-            epoch: 1, head_digest: [0x77; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: subscriber_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&subscriber_pq) }],
+            epoch: 1,
+            head_digest: [0x77; 64],
+            expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: subscriber_ed.verifying_key().to_bytes(),
+                ml_dsa_65: ml_dsa_sk_to_vk_bytes(&subscriber_pq),
+            }],
             service_ids: vec![],
         };
         let other_state = AcceptedIdentityState {
-            epoch: 1, head_digest: [0x78; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: other_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&other_pq) }],
+            epoch: 1,
+            head_digest: [0x78; 64],
+            expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: other_ed.verifying_key().to_bytes(),
+                ml_dsa_65: ml_dsa_sk_to_vk_bytes(&other_pq),
+            }],
             service_ids: vec![],
         };
-        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
-            "did:at9p:relay" => Some(server_state.clone()),
-            "did:at9p:producer" => Some(producer_state.clone()),
-            "did:at9p:subscriber" => Some(subscriber_state.clone()),
-            "did:at9p:other-producer" => Some(other_state.clone()),
-            _ => None,
-        });
-        let relay_secret = fresh_key();
-        let relay_carrier = *iroh::SecretKey::from_bytes(&relay_secret).public().as_bytes();
-        let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
-            authority,
-            Arc::new(|peer| match peer.subject.as_deref() {
-                Some("did:at9p:producer") | Some("did:at9p:subscriber") => Some("alice".to_owned()),
-                Some("did:at9p:other-producer") => Some("bob".to_owned()),
+        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> =
+            Arc::new(move |did: &str| match did {
+                "did:at9p:relay" => Some(server_state.clone()),
+                "did:at9p:producer" => Some(producer_state.clone()),
+                "did:at9p:subscriber" => Some(subscriber_state.clone()),
+                "did:at9p:other-producer" => Some(other_state.clone()),
                 _ => None,
-            }),
-        ).with_server_identity_and_carrier(MoqlServerIdentityProof {
-            identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
-        }, relay_carrier));
+            });
+        let relay_secret = fresh_key();
+        let relay_carrier = *iroh::SecretKey::from_bytes(&relay_secret)
+            .public()
+            .as_bytes();
+        let admission = Arc::new(
+            crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+                authority,
+                Arc::new(|peer| match peer.subject.as_deref() {
+                    Some("did:at9p:producer") | Some("did:at9p:subscriber") => {
+                        Some("alice".to_owned())
+                    }
+                    Some("did:at9p:other-producer") => Some("bob".to_owned()),
+                    _ => None,
+                }),
+            )
+            .with_server_identity_and_carrier(
+                MoqlServerIdentityProof {
+                    identity: server_identity.clone(),
+                    ed25519: server_ed,
+                    ml_dsa_65: server_pq,
+                },
+                relay_carrier,
+            ),
+        );
         let handler = IrohMoqProtocolHandler::new().with_authz(
             MoqAuthzConfig::default()
                 .with_admission(admission)
                 .with_ingress_authorizer(Arc::new(|peer: &PeerIdentity, tenant: &str| {
-                    matches!(peer.subject.as_deref(), Some("did:at9p:producer") | Some("did:at9p:other-producer"))
-                        && matches!(tenant, "alice" | "bob")
+                    matches!(
+                        peer.subject.as_deref(),
+                        Some("did:at9p:producer") | Some("did:at9p:other-producer")
+                    ) && matches!(tenant, "alice" | "bob")
                 })),
         );
         let relay_consumer = handler.origin_consumer().clone();
-        let relay = IrohSubstrate::new_test(relay_secret, handler, NoopHandler::new("rpc-not-wired")).await?;
-        let producer = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("producer-moq"), NoopHandler::new("producer-rpc")).await?;
-        let subscriber = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("subscriber-moq"), NoopHandler::new("subscriber-rpc")).await?;
-        let other = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("other-moq"), NoopHandler::new("other-rpc")).await?;
+        let relay =
+            IrohSubstrate::new_test(relay_secret, handler, NoopHandler::new("rpc-not-wired"))
+                .await?;
+        let producer = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("producer-moq"),
+            NoopHandler::new("producer-rpc"),
+        )
+        .await?;
+        let subscriber = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("subscriber-moq"),
+            NoopHandler::new("subscriber-rpc"),
+        )
+        .await?;
+        let other = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("other-moq"),
+            NoopHandler::new("other-rpc"),
+        )
+        .await?;
 
         let producer_conn = producer.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
-        prove_moql_admission(&producer_conn, &MoqlAdmissionProof {
-            did: "did:at9p:producer".to_owned(), ed25519: producer_ed, ml_dsa_65: producer_pq,
-            expected_server: server_identity.clone(),
-        }, *producer.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
+        prove_moql_admission(
+            &producer_conn,
+            &MoqlAdmissionProof {
+                did: "did:at9p:producer".to_owned(),
+                ed25519: producer_ed,
+                ml_dsa_65: producer_pq,
+                expected_server: server_identity.clone(),
+            },
+            *producer.endpoint_id().as_bytes(),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
         let producer_origin: OriginProducer = Origin::random().produce();
-        let producer_session = Client::new().with_origin(producer_origin.clone()).connect(Session::raw(producer_conn)).await?;
+        let producer_session = Client::new()
+            .with_origin(producer_origin.clone())
+            .connect(Session::raw(producer_conn))
+            .await?;
 
-        let subscriber_conn = subscriber.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
-        prove_moql_admission(&subscriber_conn, &MoqlAdmissionProof {
-            did: "did:at9p:subscriber".to_owned(), ed25519: subscriber_ed, ml_dsa_65: subscriber_pq,
-            expected_server: server_identity.clone(),
-        }, *subscriber.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
+        let subscriber_conn = subscriber
+            .connect(direct_addr(&relay), ALPN_MOQ_LITE)
+            .await?;
+        prove_moql_admission(
+            &subscriber_conn,
+            &MoqlAdmissionProof {
+                did: "did:at9p:subscriber".to_owned(),
+                ed25519: subscriber_ed,
+                ml_dsa_65: subscriber_pq,
+                expected_server: server_identity.clone(),
+            },
+            *subscriber.endpoint_id().as_bytes(),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
         let subscriber_origin: OriginProducer = Origin::random().produce();
         let subscriber_consumer = subscriber_origin.consume();
         let subscriber_session = Client::new()
@@ -772,32 +924,62 @@ mod tests {
             .await?;
 
         let broadcast_name = "alice/from-producer";
-        let mut producer_broadcast = producer_origin.create_broadcast(broadcast_name).ok_or_else(|| anyhow::anyhow!("create producer broadcast"))?;
+        let mut producer_broadcast = producer_origin
+            .create_broadcast(broadcast_name)
+            .ok_or_else(|| anyhow::anyhow!("create producer broadcast"))?;
         let mut producer_track = producer_broadcast.create_track(Track::new("tokens"))?;
         let mut producer_group = producer_track.create_group(Group::from(0u64))?;
         producer_group.write_frame(Bytes::from_static(b"producer frame"))?;
         drop(producer_group);
-        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast(broadcast_name)).await?.ok_or_else(|| anyhow::anyhow!("relay did not ingest trusted producer origin"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_consumer.announced_broadcast(broadcast_name),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("relay did not ingest trusted producer origin"))?;
 
-        let broadcast = tokio::time::timeout(std::time::Duration::from_secs(2), subscriber_consumer.announced_broadcast(broadcast_name)).await?.ok_or_else(|| anyhow::anyhow!("distinct subscriber did not receive relay announcement"))?;
+        let broadcast = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            subscriber_consumer.announced_broadcast(broadcast_name),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("distinct subscriber did not receive relay announcement"))?;
         let track = broadcast.subscribe_track(&Track::new("tokens"))?;
-        let mut group = tokio::time::timeout(std::time::Duration::from_secs(2), track.get_group(0)).await??.ok_or_else(|| anyhow::anyhow!("subscriber track ended before producer frame"))?;
-        assert_eq!(group.read_frame().await?, Some(Bytes::from_static(b"producer frame")));
+        let mut group = tokio::time::timeout(std::time::Duration::from_secs(2), track.get_group(0))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("subscriber track ended before producer frame"))?;
+        assert_eq!(
+            group.read_frame().await?,
+            Some(Bytes::from_static(b"producer frame"))
+        );
 
         // An authenticated subscriber is read-only even when it offers an
         // origin: it cannot inject a same-tenant broadcast into the relay.
         let _subscriber_injection = subscriber_origin
             .create_broadcast("alice/subscriber-injected")
             .ok_or_else(|| anyhow::anyhow!("create subscriber injection"))?;
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), relay_consumer.announced_broadcast("alice/subscriber-injected")).await.is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            relay_consumer.announced_broadcast("alice/subscriber-injected")
+        )
+        .await
+        .is_err());
 
         // A separately trusted bob producer can connect, but its scoped origin
         // cannot ingest into alice and its scoped consumer cannot observe alice.
         let other_conn = other.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
-        prove_moql_admission(&other_conn, &MoqlAdmissionProof {
-            did: "did:at9p:other-producer".to_owned(), ed25519: other_ed, ml_dsa_65: other_pq,
-            expected_server: server_identity,
-        }, *other.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
+        prove_moql_admission(
+            &other_conn,
+            &MoqlAdmissionProof {
+                did: "did:at9p:other-producer".to_owned(),
+                ed25519: other_ed,
+                ml_dsa_65: other_pq,
+                expected_server: server_identity,
+            },
+            *other.endpoint_id().as_bytes(),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
         let other_origin: OriginProducer = Origin::random().produce();
         let other_consumer = other_origin.consume();
         let other_session = Client::new()
@@ -808,8 +990,18 @@ mod tests {
         let _cross_tenant_injection = other_origin
             .create_broadcast("alice/cross-tenant-injected")
             .ok_or_else(|| anyhow::anyhow!("create cross-tenant injection"))?;
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), relay_consumer.announced_broadcast("alice/cross-tenant-injected")).await.is_err());
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), other_consumer.announced_broadcast(broadcast_name)).await.is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            relay_consumer.announced_broadcast("alice/cross-tenant-injected")
+        )
+        .await
+        .is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            other_consumer.announced_broadcast(broadcast_name)
+        )
+        .await
+        .is_err());
 
         drop(other_session);
         drop(subscriber_session);
@@ -827,10 +1019,13 @@ mod tests {
     /// announcement is carried on that connection without any reconnect.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn revoked_ingress_closes_live_producer_session() -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use crate::crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
         use crate::stream_info::MoqlServerIdentity;
-        use crate::transport::moql_admission::{AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof, MoqlServerIdentityProof, prove_moql_admission};
+        use crate::transport::moql_admission::{
+            prove_moql_admission, AcceptedIdentityState, AcceptedSubjectKey, MoqlAdmissionProof,
+            MoqlServerIdentityProof,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let server_ed = SigningKey::from_bytes(&[0x81; 32]);
         let server_pq = ml_dsa_sk_from_seed(&[0x82; 32]);
@@ -838,33 +1033,60 @@ mod tests {
         let producer_pq = ml_dsa_sk_from_seed(&[0x84; 32]);
         let expiry = crate::envelope::current_timestamp() + 60_000;
         let server_identity = MoqlServerIdentity {
-            did: "did:at9p:relay".to_owned(), epoch: 1, head_digest: vec![0x85; 64],
-            expires_at_unix_ms: expiry, ed25519: server_ed.verifying_key().to_bytes(),
+            did: "did:at9p:relay".to_owned(),
+            epoch: 1,
+            head_digest: vec![0x85; 64],
+            expires_at_unix_ms: expiry,
+            ed25519: server_ed.verifying_key().to_bytes(),
             ml_dsa65: ml_dsa_sk_to_vk_bytes(&server_pq),
         };
         let server_state = AcceptedIdentityState {
-            epoch: 1, head_digest: [0x85; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: server_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq) }],
+            epoch: 1,
+            head_digest: [0x85; 64],
+            expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: server_ed.verifying_key().to_bytes(),
+                ml_dsa_65: ml_dsa_sk_to_vk_bytes(&server_pq),
+            }],
             service_ids: vec![],
         };
         let producer_state = AcceptedIdentityState {
-            epoch: 1, head_digest: [0x86; 64], expires_at_unix_ms: Some(expiry),
-            subject_keys: vec![AcceptedSubjectKey { ed25519: producer_ed.verifying_key().to_bytes(), ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq) }],
+            epoch: 1,
+            head_digest: [0x86; 64],
+            expires_at_unix_ms: Some(expiry),
+            subject_keys: vec![AcceptedSubjectKey {
+                ed25519: producer_ed.verifying_key().to_bytes(),
+                ml_dsa_65: ml_dsa_sk_to_vk_bytes(&producer_pq),
+            }],
             service_ids: vec![],
         };
-        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> = Arc::new(move |did: &str| match did {
-            "did:at9p:relay" => Some(server_state.clone()),
-            "did:at9p:producer" => Some(producer_state.clone()),
-            _ => None,
-        });
+        let authority: Arc<dyn crate::transport::moql_admission::AcceptedStateAuthority> =
+            Arc::new(move |did: &str| match did {
+                "did:at9p:relay" => Some(server_state.clone()),
+                "did:at9p:producer" => Some(producer_state.clone()),
+                _ => None,
+            });
         let relay_secret = fresh_key();
-        let relay_carrier = *iroh::SecretKey::from_bytes(&relay_secret).public().as_bytes();
-        let admission = Arc::new(crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
-            authority,
-            Arc::new(|peer| (peer.subject.as_deref() == Some("did:at9p:producer")).then(|| "alice".to_owned())),
-        ).with_server_identity_and_carrier(MoqlServerIdentityProof {
-            identity: server_identity.clone(), ed25519: server_ed, ml_dsa_65: server_pq,
-        }, relay_carrier));
+        let relay_carrier = *iroh::SecretKey::from_bytes(&relay_secret)
+            .public()
+            .as_bytes();
+        let admission = Arc::new(
+            crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
+                authority,
+                Arc::new(|peer| {
+                    (peer.subject.as_deref() == Some("did:at9p:producer"))
+                        .then(|| "alice".to_owned())
+                }),
+            )
+            .with_server_identity_and_carrier(
+                MoqlServerIdentityProof {
+                    identity: server_identity.clone(),
+                    ed25519: server_ed,
+                    ml_dsa_65: server_pq,
+                },
+                relay_carrier,
+            ),
+        );
         // Mutable policy backing the ingress decision; the test flips
         // `grant` mid-session to model a grant revocation.
         let grant = Arc::new(AtomicBool::new(true));
@@ -879,16 +1101,34 @@ mod tests {
                 })),
         );
         let relay_consumer = handler.origin_consumer().clone();
-        let relay = IrohSubstrate::new_test(relay_secret, handler, NoopHandler::new("rpc-not-wired")).await?;
-        let producer = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("producer-moq"), NoopHandler::new("producer-rpc")).await?;
+        let relay =
+            IrohSubstrate::new_test(relay_secret, handler, NoopHandler::new("rpc-not-wired"))
+                .await?;
+        let producer = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("producer-moq"),
+            NoopHandler::new("producer-rpc"),
+        )
+        .await?;
 
         let producer_conn = producer.connect(direct_addr(&relay), ALPN_MOQ_LITE).await?;
-        prove_moql_admission(&producer_conn, &MoqlAdmissionProof {
-            did: "did:at9p:producer".to_owned(), ed25519: producer_ed, ml_dsa_65: producer_pq,
-            expected_server: server_identity.clone(),
-        }, *producer.endpoint_id().as_bytes(), std::time::Duration::from_secs(2)).await?;
+        prove_moql_admission(
+            &producer_conn,
+            &MoqlAdmissionProof {
+                did: "did:at9p:producer".to_owned(),
+                ed25519: producer_ed,
+                ml_dsa_65: producer_pq,
+                expected_server: server_identity.clone(),
+            },
+            *producer.endpoint_id().as_bytes(),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
         let producer_origin: OriginProducer = Origin::random().produce();
-        let producer_session = Client::new().with_origin(producer_origin.clone()).connect(Session::raw(producer_conn)).await?;
+        let producer_session = Client::new()
+            .with_origin(producer_origin.clone())
+            .connect(Session::raw(producer_conn))
+            .await?;
 
         // Granted: the producer's announce is carried end-to-end.
         let mut first = producer_origin
@@ -898,9 +1138,12 @@ mod tests {
         let mut group = track.create_group(Group::from(0u64))?;
         group.write_frame(Bytes::from_static(b"first frame"))?;
         drop(group);
-        tokio::time::timeout(std::time::Duration::from_secs(2), relay_consumer.announced_broadcast("alice/first"))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("relay did not ingest the granted producer origin"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_consumer.announced_broadcast("alice/first"),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("relay did not ingest the granted producer origin"))?;
 
         // Revoke the grant. The writable scoped origin is already in the
         // peer's hands; only the live-session recheck can stop it.
@@ -912,18 +1155,30 @@ mod tests {
         // `Err(Error::Transport(..))` from `closed()` unconditionally, with
         // the transport close reason inside; the session resolving at all IS
         // the close — that is the success condition here.
-        let close = tokio::time::timeout(std::time::Duration::from_secs(5), producer_session.closed())
-            .await
-            .map_err(|_| anyhow::anyhow!("revoked ingress did not close the live producer session"))?;
+        let close =
+            tokio::time::timeout(std::time::Duration::from_secs(5), producer_session.closed())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("revoked ingress did not close the live producer session")
+                })?;
         match close {
             Err(moq_net::Error::Transport(_)) => {}
-            other => return Err(anyhow::anyhow!("unexpected session close outcome: {other:?}")),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unexpected session close outcome: {other:?}"
+                ))
+            }
         }
         let _late = producer_origin
             .create_broadcast("alice/after-revoke")
             .ok_or_else(|| anyhow::anyhow!("create post-revocation broadcast"))?;
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), relay_consumer.announced_broadcast("alice/after-revoke")).await.is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                relay_consumer.announced_broadcast("alice/after-revoke")
+            )
+            .await
+            .is_err(),
             "a revoked producer must not announce further broadcasts on the same connection"
         );
 
@@ -973,17 +1228,22 @@ mod tests {
             Arc::new(move |did: &str| (did == server_did).then(|| accepted_server.clone()));
 
         let server_secret = fresh_key();
-        let server_carrier = *iroh::SecretKey::from_bytes(&server_secret).public().as_bytes();
+        let server_carrier = *iroh::SecretKey::from_bytes(&server_secret)
+            .public()
+            .as_bytes();
         let admission = Arc::new(
             crate::transport::moql_admission::MoqlAdmissionAuthenticator::new(
                 authority,
                 Arc::new(|_peer| None),
             )
-            .with_server_identity_and_carrier(MoqlServerIdentityProof {
-                identity: server_identity,
-                ed25519: server_ed,
-                ml_dsa_65: server_pq,
-            }, server_carrier),
+            .with_server_identity_and_carrier(
+                MoqlServerIdentityProof {
+                    identity: server_identity,
+                    ed25519: server_ed,
+                    ml_dsa_65: server_pq,
+                },
+                server_carrier,
+            ),
         );
         let handler = IrohMoqProtocolHandler::new()
             .with_authz(MoqAuthzConfig::default().with_admission(admission))

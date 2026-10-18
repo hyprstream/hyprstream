@@ -10,12 +10,18 @@ pub mod server;
 // Re-export main configuration types
 pub use server::{CorsConfig, SamplingParamDefaults, ServerConfig, ServerConfigBuilder};
 
+// The records/repository RDS binding type lives in `hyprstream-pds` so the
+// discovery crate's accepted-state authority shares the same audited
+// resolution and verify-full validation code. Re-exported here so every
+// existing `crate::config::RdsConfig` path keeps resolving.
+pub use hyprstream_pds::rds::RdsConfig;
+
 // Inference-facing config types moved to `hyprstream-inference` (Wave B decomposition);
 // re-exported here so every existing `crate::config::...` path keeps resolving.
 pub use hyprstream_inference::config::{
-    FinishReason, GenerationConfig, GenerationResult, HyprstreamTrainingConfig, ModelConfig,
-    RuntimeConfig, TTTMetrics, TTTTrainingConfig, TrainingMode, default_lora_rank,
-    default_target_modules,
+    default_lora_rank, default_target_modules, FinishReason, GenerationConfig, GenerationResult,
+    HyprstreamTrainingConfig, ModelConfig, RuntimeConfig, TTTMetrics, TTTTrainingConfig,
+    TrainingMode,
 };
 
 // Export root configuration and builder (defined below in this module)
@@ -297,274 +303,6 @@ pub struct HyprConfig {
     #[cfg(feature = "postgres-ledger")]
     #[serde(default)]
     pub ledger_postgres_pool_size: Option<usize>,
-}
-
-/// Records/repository RDS (Multi-AZ Postgres) configuration.
-///
-/// The effective binding is resolved by [`RdsConfig::resolved_from_env`]:
-/// explicit TOML values win; otherwise the records role's scoped environment
-/// variables carry the paths (`HYPRSTREAM_RECORDS_URL_FILE`,
-/// `HYPRSTREAM_RECORDS_SSLROOTCERT_FILE` — metal RDS runtime contract v1.1);
-/// as a last resort the shared credentials directory is consulted
-/// (`$HYPRSTREAM_POSTGRES_CREDENTIALS_PATH/records-url` and `rds-ca.pem`),
-/// but only when the `records-url` file actually exists there, so a
-/// credentials-role-only deployment never silently activates the records
-/// backend. An env var carries only the *path* to a secret file — the
-/// password-bearing URL itself never transits the process environment.
-///
-/// The URL file contains one newline-terminated libpq URL. It is file-backed
-/// so rotation/repointing is a deployment-side file swap, not a secret-bearing
-/// config or environment value.
-///
-/// `cell_id` stamps the cell (single-writer consistency domain) this node
-/// belongs to — the honorable-mention guard from the arch verdict so no code
-/// path assumes it is the only cell in the universe. For the demo leaf this is
-/// the one provider/region cell; it becomes the placement key at Stage 2.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RdsConfig {
-    /// Path to the records role's Postgres URL file. When `None` (and no
-    /// env binding resolves), the local backend (RocksDB) is used; deployed
-    /// records services resolve this to the records role's URL file.
-    #[serde(default)]
-    pub url_file: Option<PathBuf>,
-
-    /// Path to the records role's PEM CA file. Mandatory whenever
-    /// `url_file` is configured; the connector pins this trust store for the
-    /// RDS connection.
-    #[serde(default)]
-    pub root_cert_file: Option<PathBuf>,
-
-    /// Cell identifier (consistency-domain label). Stamped into the schema;
-    /// the demo leaf has exactly one cell. Honorable-mention guard from the
-    /// recursive-federation arch verdict.
-    #[serde(default = "default_rds_cell_id")]
-    pub cell_id: String,
-}
-
-/// A contract-validated records URL translated for the pinned driver.
-///
-/// The original password-bearing URL is intentionally private and this type
-/// does not implement `Debug` or `Display`. Metal's `verify-full` policy has
-/// already been checked structurally; the internal URL uses the pinned
-/// driver's `sslmode=require`, with CA and hostname verification supplied by
-/// the rustls connector. It deliberately does not implement `Debug` or
-/// `Display`, so a password-bearing URL cannot leak through diagnostics.
-#[cfg(feature = "pds-postgres")]
-pub(crate) struct ValidatedRdsUrl {
-    driver_url: String,
-    dns_hostname: String,
-}
-
-#[cfg(feature = "pds-postgres")]
-impl ValidatedRdsUrl {
-    #[cfg(feature = "pds-postgres")]
-    pub(crate) fn driver_url(&self) -> &str {
-        &self.driver_url
-    }
-
-    #[cfg(feature = "pds-postgres")]
-    pub(crate) fn dns_hostname(&self) -> &str {
-        &self.dns_hostname
-    }
-}
-
-fn default_rds_cell_id() -> String {
-    "demo-leaf".to_owned()
-}
-
-impl RdsConfig {
-    /// Records-role env var carrying the PATH to the Postgres URL file
-    /// (metal RDS runtime contract v1.1). Never the URL itself.
-    pub const RECORDS_URL_FILE_ENV: &'static str = "HYPRSTREAM_RECORDS_URL_FILE";
-    /// Records-role env var carrying the PATH to the pinned RDS CA PEM.
-    pub const RECORDS_SSLROOTCERT_FILE_ENV: &'static str =
-        "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE";
-    /// Shared Postgres credentials directory env var (metal renders the
-    /// per-role URL files and `rds-ca.pem` under it).
-    pub const POSTGRES_CREDENTIALS_PATH_ENV: &'static str = "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH";
-    /// File names metal renders under the shared credentials directory.
-    const RECORDS_URL_FILE_NAME: &'static str = "records-url";
-    const RDS_CA_FILE_NAME: &'static str = "rds-ca.pem";
-
-    /// True when a Postgres URL is configured (the deployed posture).
-    pub fn is_configured(&self) -> bool {
-        self.url_file.is_some()
-    }
-
-    /// Resolve the effective records-role binding. Explicit TOML values win;
-    /// otherwise the records role's scoped env vars; otherwise the shared
-    /// credentials directory — consulted only when `records-url` actually
-    /// exists there, so a credentials-role-only deployment does not activate
-    /// the records backend. The `cell_id` is preserved as configured.
-    ///
-    /// Fails closed when the directory fallback's `records-url` candidate is
-    /// rendered-but-broken: a stat failure other than `NotFound` (e.g. an
-    /// unreadable parent) is itself an error, and a dangling symlink still
-    /// binds so the later URL read fails loudly. Only a genuinely absent
-    /// candidate leaves the local backend selected — a broken binding must
-    /// never silently become "not rendered".
-    pub fn resolved_from_env(&self) -> anyhow::Result<Self> {
-        self.resolve_with(|key| std::env::var_os(key))
-    }
-
-    /// The testable core of [`Self::resolved_from_env`]: the environment is
-    /// injected so resolution is exercised without mutating process state.
-    fn resolve_with(
-        &self,
-        env: impl Fn(&str) -> Option<std::ffi::OsString>,
-    ) -> anyhow::Result<Self> {
-        let credentials_dir = || env(Self::POSTGRES_CREDENTIALS_PATH_ENV).map(PathBuf::from);
-        let url_file = match self
-            .url_file
-            .clone()
-            .or_else(|| env(Self::RECORDS_URL_FILE_ENV).map(PathBuf::from))
-        {
-            Some(explicit) => Some(explicit),
-            None => match credentials_dir() {
-                Some(dir) => {
-                    let candidate = dir.join(Self::RECORDS_URL_FILE_NAME);
-                    // Directory fallback is opt-in by file presence: a shared
-                    // credentials dir that holds no records role must not turn
-                    // the records store Postgres-bound. Presence is lexical
-                    // (symlink_metadata, not is_file): a dangling symlink
-                    // still binds so the subsequent read fails closed, and a
-                    // stat error other than NotFound (ENOTDIR/EACCES on a
-                    // parent) is itself fatal — both are "rendered but
-                    // broken", never "not rendered".
-                    match std::fs::symlink_metadata(&candidate) {
-                        Ok(_) => Some(candidate),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "records-role URL candidate at {} cannot be stat'ed ({e}); \
-                                 refusing to silently select the local backend",
-                                candidate.display()
-                            ));
-                        }
-                    }
-                }
-                None => None,
-            },
-        };
-        let root_cert_file = self
-            .root_cert_file
-            .clone()
-            .or_else(|| env(Self::RECORDS_SSLROOTCERT_FILE_ENV).map(PathBuf::from))
-            .or_else(|| credentials_dir().map(|dir| dir.join(Self::RDS_CA_FILE_NAME)));
-        Ok(Self {
-            url_file,
-            root_cert_file,
-            cell_id: self.cell_id.clone(),
-        })
-    }
-
-    /// Read and validate the records role's URL and CA-file bindings.
-    ///
-    /// The contract URL must use `postgresql`/`postgres`, name one nonempty DNS
-    /// host, and contain exactly one query pair `sslmode=verify-full`. After
-    /// validation, that value is translated to the pinned driver's supported
-    /// `require` mode; rustls supplies the CA and hostname verification that
-    /// implements the validated verify-full policy.
-    #[cfg(feature = "pds-postgres")]
-    pub(crate) fn read_url(&self) -> anyhow::Result<ValidatedRdsUrl> {
-        let url_path = self
-            .url_file
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("RDS url_file not configured"))?;
-        let root_cert_path = self
-            .root_cert_file
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("RDS root_cert_file not configured"))?;
-
-        let url = std::fs::read_to_string(url_path)
-            .map_err(|e| anyhow::anyhow!("failed to read RDS url_file at {url_path:?}: {e}"))?;
-        let url = url.trim();
-        anyhow::ensure!(
-            !url.is_empty(),
-            "RDS url_file at {url_path:?} is empty — refusing to start with no backend"
-        );
-
-        let validated = Self::validate_url(url)
-            .map_err(|e| anyhow::anyhow!("RDS URL at {url_path:?} is nonconformant: {e}"))?;
-
-        std::fs::File::open(root_cert_path).map_err(|e| {
-            anyhow::anyhow!("RDS root_cert_file at {root_cert_path:?} is not readable: {e}")
-        })?;
-
-        Ok(validated)
-    }
-
-    /// Structurally validate the v1.1 URL and produce a driver-compatible URL.
-    /// The URL itself is never included in an error.
-    #[cfg(feature = "pds-postgres")]
-    pub(crate) fn validate_url(url: &str) -> anyhow::Result<ValidatedRdsUrl> {
-        let mut parsed =
-            url::Url::parse(url).map_err(|e| anyhow::anyhow!("not a valid URL: {e}"))?;
-
-        anyhow::ensure!(
-            matches!(parsed.scheme(), "postgresql" | "postgres"),
-            "URL scheme must be 'postgresql' or 'postgres', got '{}'",
-            parsed.scheme()
-        );
-
-        let dns_hostname = match parsed.host() {
-            Some(url::Host::Domain(host)) if !host.is_empty() => {
-                let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-                let loopback_name = ["local", "host"].concat();
-                let loopback_v4 = ["127", "0", "0", "1"].join(".");
-                anyhow::ensure!(
-                    normalized != loopback_name && normalized != loopback_v4,
-                    "URL host must not be a local loopback endpoint"
-                );
-                host.to_owned()
-            }
-            Some(url::Host::Ipv4(host)) => {
-                anyhow::ensure!(
-                    !host.is_loopback(),
-                    "URL host must not be a local loopback endpoint"
-                );
-                host.to_string()
-            }
-            Some(url::Host::Ipv6(host)) => {
-                anyhow::ensure!(
-                    !host.is_loopback(),
-                    "URL host must not be a local loopback endpoint"
-                );
-                host.to_string()
-            }
-            Some(url::Host::Domain(_)) | None => anyhow::bail!("URL is missing a nonempty host"),
-        };
-
-        let mut sslmode_values = Vec::new();
-        let mut driver_pairs = Vec::new();
-        for (key, value) in parsed.query_pairs() {
-            if key == "sslmode" {
-                sslmode_values.push(value.into_owned());
-                driver_pairs.push((key.into_owned(), "require".to_owned()));
-            } else {
-                driver_pairs.push((key.into_owned(), value.into_owned()));
-            }
-        }
-        anyhow::ensure!(
-            sslmode_values.len() == 1,
-            "URL must contain exactly one sslmode query parameter"
-        );
-        anyhow::ensure!(
-            sslmode_values[0] == "verify-full",
-            "sslmode must be exactly 'verify-full'"
-        );
-
-        parsed.query_pairs_mut().clear().extend_pairs(driver_pairs);
-        Ok(ValidatedRdsUrl {
-            driver_url: parsed.into(),
-            dns_hostname,
-        })
-    }
-
-    /// Return the explicit records CA-file path.
-    pub fn root_cert_file(&self) -> Option<&Path> {
-        self.root_cert_file.as_deref()
-    }
 }
 
 /// Persistent secrets storage configuration.
@@ -1974,11 +1712,12 @@ fn default_oauth_port() -> u16 {
     6791
 }
 
-/// Which backend stores user credentials and refresh tokens.
+/// Which backend stores account credentials.
 ///
-/// `Pglite` selects the shared embedded PGlite/Postgres relational store for
-/// the **account system of record** (UserStore). Token and device stores
-/// remain on RocksDB/Valkey — a pglite TokenStore does not exist.
+/// `Pglite` selects the embedded relational store; `Postgres` selects the
+/// networked RDS relational store. Token and device stores remain independent
+/// RocksDB/Valkey services — neither relational UserStore implements a token
+/// store.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
@@ -1986,6 +1725,8 @@ pub enum CredentialsBackend {
     Valkey,
     /// Relational UserStore on the shared #1351 PGlite substrate.
     Pglite,
+    /// Networked relational UserStore on the RDS Postgres substrate.
+    Postgres,
 }
 
 fn default_credentials_backend() -> CredentialsBackend {
@@ -1997,8 +1738,8 @@ impl CredentialsBackend {
     /// UserStore columns as plaintext.
     pub fn ensure_allowed_for_build(self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self == Self::Pglite,
-            "encrypted credential storage requires credentials.backend = \"pglite\""
+            matches!(self, Self::Pglite | Self::Postgres),
+            "encrypted credential storage requires credentials.backend = \"pglite\" or \"postgres\""
         );
         Ok(())
     }
@@ -2025,7 +1766,8 @@ impl Default for ValkeyCredentialsConfig {
 
 /// Credentials storage configuration.
 ///
-/// Selects the backend for user profiles, pubkeys, and refresh tokens.
+/// Selects the backend for user profiles and pubkeys. OAuth refresh tokens use
+/// their independent token store.
 ///
 /// # Example TOML
 /// ```toml
@@ -2373,9 +2115,7 @@ impl At9pRenewalConfig {
     /// Defaults to 24 h (see the field docs for the defensive rationale).
     pub fn valid_for_seconds(&self) -> anyhow::Result<i64> {
         const DEFAULT_RENEWAL_TTL_SECS: i64 = 86_400;
-        let ttl = self
-            .valid_for_secs
-            .unwrap_or(DEFAULT_RENEWAL_TTL_SECS);
+        let ttl = self.valid_for_secs.unwrap_or(DEFAULT_RENEWAL_TTL_SECS);
         anyhow::ensure!(
             (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS).contains(&ttl),
             "[registry.at9p_renewal] valid_for_secs must be {}..{} seconds",
@@ -2432,6 +2172,28 @@ pub struct PolicyServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Optional signed MAC boot artifacts. Supported for OS-owned deployments
+    /// with a chain-enrolled Policy authority; invalid artifacts abort startup.
+    #[serde(default)]
+    pub boot_policy: Option<MacBootPolicyConfig>,
+}
+
+/// Both independently provisioned artifacts and their expected policy pin are
+/// mandatory when configured. Keep this generation/hash pin in the
+/// OS-owned deployment configuration, outside the replaceable artifact
+/// directory. Deploy a new pin and matching artifacts as one release; a
+/// mismatch fails startup closed. Recovery restores the matching backed-up
+/// config and artifacts. Lowering the pin is an explicit rollback decision.
+/// Trust keys are never supplied by these files or this configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacBootPolicyConfig {
+    pub policy_path: PathBuf,
+    pub approval_path: PathBuf,
+    pub expected_generation: u64,
+    /// Hex-encoded 32-byte compiled policy hash, independently pinned by the
+    /// OS-owned deployment configuration.
+    pub expected_policy_hash: String,
 }
 
 /// Discovery service configuration.
@@ -2542,14 +2304,14 @@ impl Default for ServicesConfig {
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
     let mut services = vec![
-        "event".to_owned(),     // Must start first (message bus)
-        "registry".to_owned(),  // Model registry
-        "policy".to_owned(),    // Authorization
-        "streams".to_owned(),   // Streaming proxy with JWT validation
-        "worker".to_owned(),    // Container workloads
-        "model".to_owned(),     // Model management
-        "oauth".to_owned(),     // OAuth 2.1 authorization server
-        "oai".to_owned(),       // OpenAI-compatible HTTP API
+        "event".to_owned(),    // Must start first (message bus)
+        "registry".to_owned(), // Model registry
+        "policy".to_owned(),   // Authorization
+        "streams".to_owned(),  // Streaming proxy with JWT validation
+        "worker".to_owned(),   // Container workloads
+        "model".to_owned(),    // Model management
+        "oauth".to_owned(),    // OAuth 2.1 authorization server
+        "oai".to_owned(),      // OpenAI-compatible HTTP API
     ];
     #[cfg(feature = "metrics")]
     {
@@ -2735,7 +2497,6 @@ impl InferenceServerConfig {
         format!("inference-cpu-{}", self.replica)
     }
 }
-
 
 /// Application-level LoRA settings (TOML config: enabled, max_adapters, etc.)
 ///
@@ -3456,7 +3217,10 @@ impl SamplingParams {
     ///
     /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
     /// letting the engine use its defaults.
-    pub fn into_generation_request(self, prompt: String) -> hyprstream_rpc_std::inference_client::GenerationRequest {
+    pub fn into_generation_request(
+        self,
+        prompt: String,
+    ) -> hyprstream_rpc_std::inference_client::GenerationRequest {
         hyprstream_rpc_std::inference_client::GenerationRequest {
             prompt,
             max_tokens: self.max_tokens.map(|v| v as u32),
@@ -3561,7 +3325,10 @@ mod tests {
             Ok(_) => panic!("6h check vs 10m TTL must be refused"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("half of valid_for_secs"), "{error}");
+        assert!(
+            error.to_string().contains("half of valid_for_secs"),
+            "{error}"
+        );
         // Interval at exactly half the TTL still leaves a schedule where the
         // head expires on the tick boundary: refuse strictly below only.
         let boundary = At9pRenewalConfig {
@@ -3616,310 +3383,6 @@ mod tests {
         assert!(bad_ttl.validated().is_err());
     }
 
-    #[cfg(feature = "pds-postgres")]
-    fn rds_fixture(url: &str) -> (tempfile::TempDir, RdsConfig) {
-        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let url_file = dir.path().join("records-url");
-        let root_cert_file = dir.path().join("rds-ca.pem");
-        std::fs::write(&url_file, format!("{url}\n")).unwrap_or_else(|e| panic!("{e}"));
-        // RdsConfig validates readability; the connector performs PEM parsing.
-        std::fs::write(&root_cert_file, b"connector-validates-this-pem")
-            .unwrap_or_else(|e| panic!("{e}"));
-        let config = RdsConfig {
-            url_file: Some(url_file),
-            root_cert_file: Some(root_cert_file),
-            cell_id: "test-cell".to_owned(),
-        };
-        (dir, config)
-    }
-
-    /// Empty env lookup for `resolve_with` tests.
-    fn no_env(_: &str) -> Option<std::ffi::OsString> {
-        None
-    }
-
-    #[test]
-    fn rds_resolution_leaves_local_backend_when_unbound() {
-        let config = RdsConfig::default();
-        let resolved = config
-            .resolve_with(no_env)
-            .unwrap_or_else(|e| panic!("unbound resolution must not fail: {e}"));
-        assert!(!resolved.is_configured());
-        assert_eq!(resolved.root_cert_file, None);
-    }
-
-    #[test]
-    fn rds_resolution_binds_role_scoped_env_files() {
-        let config = RdsConfig::default();
-        let resolved = config
-            .resolve_with(|key| match key {
-                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/run/cred/records-url".into()),
-                "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/run/cred/rds-ca.pem".into()),
-                _ => None,
-            })
-            .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
-        assert!(resolved.is_configured());
-        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/run/cred/records-url")));
-        assert_eq!(
-            resolved.root_cert_file.as_deref(),
-            Some(Path::new("/run/cred/rds-ca.pem"))
-        );
-    }
-
-    #[test]
-    fn rds_resolution_toml_overrides_env() {
-        let config = RdsConfig {
-            url_file: Some(PathBuf::from("/toml/records-url")),
-            root_cert_file: Some(PathBuf::from("/toml/rds-ca.pem")),
-            cell_id: "toml-cell".to_owned(),
-        };
-        let resolved = config
-            .resolve_with(|key| match key {
-                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/env/records-url".into()),
-                "HYPRSTREAM_RECORDS_SSLROOTCERT_FILE" => Some("/env/rds-ca.pem".into()),
-                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some("/env".into()),
-                _ => None,
-            })
-            .unwrap_or_else(|e| panic!("TOML-pinned resolution must not fail: {e}"));
-        assert_eq!(resolved.url_file.as_deref(), Some(Path::new("/toml/records-url")));
-        assert_eq!(
-            resolved.root_cert_file.as_deref(),
-            Some(Path::new("/toml/rds-ca.pem"))
-        );
-        assert_eq!(resolved.cell_id, "toml-cell");
-    }
-
-    #[test]
-    fn rds_resolution_uses_credentials_dir_only_when_records_url_exists() {
-        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let env = |key: &str| match key {
-            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
-            _ => None,
-        };
-
-        // A credentials-role-only directory (no records-url) must NOT
-        // activate the records backend.
-        let config = RdsConfig::default();
-        let resolved = config
-            .resolve_with(env)
-            .unwrap_or_else(|e| panic!("absent records-url must resolve cleanly: {e}"));
-        assert!(
-            !resolved.is_configured(),
-            "a shared credentials dir without records-url stays on the local backend"
-        );
-
-        // Once metal renders the records role into the directory, the binding
-        // resolves — including the CA file at its rendered location.
-        std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
-            .unwrap_or_else(|e| panic!("{e}"));
-        let resolved = config
-            .resolve_with(env)
-            .unwrap_or_else(|e| panic!("rendered records-url must resolve: {e}"));
-        assert!(resolved.is_configured());
-        assert_eq!(resolved.url_file.as_deref(), Some(dir.path().join("records-url").as_path()));
-        assert_eq!(
-            resolved.root_cert_file.as_deref(),
-            Some(dir.path().join("rds-ca.pem").as_path())
-        );
-    }
-
-    #[test]
-    fn rds_resolution_role_env_wins_over_credentials_dir() {
-        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(dir.path().join("records-url"), b"postgresql://x\n")
-            .unwrap_or_else(|e| panic!("{e}"));
-        let config = RdsConfig::default();
-        let resolved = config
-            .resolve_with(|key| match key {
-                "HYPRSTREAM_RECORDS_URL_FILE" => Some("/scoped/records-url".into()),
-                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
-                _ => None,
-            })
-            .unwrap_or_else(|e| panic!("scoped-env resolution must not fail: {e}"));
-        assert_eq!(
-            resolved.url_file.as_deref(),
-            Some(Path::new("/scoped/records-url")),
-            "the role-scoped env binding takes precedence over the shared directory"
-        );
-        // The CA still falls through to the rendered directory default.
-        assert_eq!(
-            resolved.root_cert_file.as_deref(),
-            Some(dir.path().join("rds-ca.pem").as_path())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rds_resolution_distinguishes_absent_dangling_and_unstatable_records_url() {
-        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let env = |key: &str| match key {
-            "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(dir.path().as_os_str().to_owned()),
-            _ => None,
-        };
-        let config = RdsConfig::default();
-
-        // Genuinely absent → unbound (local backend), no error.
-        let resolved = config
-            .resolve_with(env)
-            .unwrap_or_else(|e| panic!("absent records-url must resolve cleanly: {e}"));
-        assert!(!resolved.is_configured());
-
-        // Dangling symlink → the binding still resolves (lexical presence),
-        // so the later URL read fails closed instead of silently keeping the
-        // local backend while an AZ peer runs RDS.
-        let dangling = dir.path().join("records-url");
-        std::os::unix::fs::symlink(dir.path().join("missing-target"), &dangling)
-            .unwrap_or_else(|e| panic!("{e}"));
-        let resolved = config
-            .resolve_with(env)
-            .unwrap_or_else(|e| panic!("dangling records-url must still resolve: {e}"));
-        assert!(
-            resolved.is_configured(),
-            "a dangling records-url is rendered-but-broken: it must bind so the read fails closed"
-        );
-
-        // A stat error other than NotFound (here ENOTDIR: the credentials
-        // path is a regular file) is fatal at resolution, never silently local.
-        let file_dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let not_a_dir = file_dir.path().join("not-a-dir");
-        std::fs::write(&not_a_dir, b"x").unwrap_or_else(|e| panic!("{e}"));
-        let err = config
-            .resolve_with(|key| match key {
-                "HYPRSTREAM_POSTGRES_CREDENTIALS_PATH" => Some(not_a_dir.as_os_str().to_owned()),
-                _ => None,
-            })
-            .err()
-            .unwrap_or_else(|| panic!("an unstat-able records-url candidate must fail resolution"));
-        assert!(
-            err.to_string().contains("cannot be stat'ed"),
-            "the error must name the stat failure: {err}"
-        );
-    }
-
-    #[cfg(feature = "pds-postgres")]
-    #[test]
-    fn rds_contract_accepts_exact_verify_full_and_translates_for_driver() {
-        let (_dir, config) = rds_fixture(
-            "postgresql://records:secret@db.internal.example/records?application_name=pds&sslmode=verify-full",
-        );
-        let validated = config
-            .read_url()
-            .unwrap_or_else(|e| panic!("valid records URL rejected: {e}"));
-
-        assert_eq!(validated.dns_hostname, "db.internal.example");
-        let parsed = url::Url::parse(&validated.driver_url)
-            .unwrap_or_else(|e| panic!("translated URL is invalid: {e}"));
-        let sslmodes: Vec<_> = parsed
-            .query_pairs()
-            .filter(|(key, _)| key == "sslmode")
-            .map(|(_, value)| value.into_owned())
-            .collect();
-        assert_eq!(sslmodes, ["require"]);
-    }
-
-    #[cfg(feature = "pds-postgres")]
-    #[test]
-    fn rds_contract_matches_decoded_sslmode_query_keys() {
-        let (_dir, config) = rds_fixture(
-            "postgresql://records:secret@db.internal.example/records?ssl%6dode=verify-full",
-        );
-        assert!(config.read_url().is_ok());
-    }
-
-    #[cfg(feature = "pds-postgres")]
-    #[test]
-    fn rds_contract_rejects_nonconforming_urls() {
-        let rejected = [
-            ("malformed", "not a URL"),
-            (
-                "wrong-scheme",
-                "https://db.internal.example/records?sslmode=verify-full",
-            ),
-            ("absent-host", "postgresql:///records?sslmode=verify-full"),
-            (
-                "canonical-ipv4-loopback",
-                "postgresql://127.0.0.1/records?sslmode=verify-full",
-            ),
-            (
-                "canonical-ipv6-loopback",
-                "postgresql://[::1]/records?sslmode=verify-full",
-            ),
-            (
-                "localhost",
-                "postgresql://localhost/records?sslmode=verify-full",
-            ),
-            ("absent-sslmode", "postgresql://db.internal.example/records"),
-            (
-                "disable",
-                "postgresql://db.internal.example/records?sslmode=disable",
-            ),
-            (
-                "allow",
-                "postgresql://db.internal.example/records?sslmode=allow",
-            ),
-            (
-                "prefer",
-                "postgresql://db.internal.example/records?sslmode=prefer",
-            ),
-            (
-                "require",
-                "postgresql://db.internal.example/records?sslmode=require",
-            ),
-            (
-                "verify-ca",
-                "postgresql://db.internal.example/records?sslmode=verify-ca",
-            ),
-            (
-                "duplicate",
-                "postgresql://db.internal.example/records?sslmode=verify-full&sslmode=verify-full",
-            ),
-            (
-                "conflict",
-                "postgresql://db.internal.example/records?sslmode=verify-full&sslmode=require",
-            ),
-            (
-                "decoded-duplicate",
-                "postgresql://db.internal.example/records?sslmode=verify-full&ssl%6dode=verify-full",
-            ),
-            (
-                "userinfo-marker-bypass",
-                "postgresql://user:sslmode=verify-full@db.internal.example/records",
-            ),
-        ];
-
-        for (case, url) in rejected {
-            let (_dir, config) = rds_fixture(url);
-            assert!(
-                config.read_url().is_err(),
-                "nonconforming case {case} was accepted"
-            );
-        }
-    }
-
-    #[cfg(feature = "pds-postgres")]
-    #[test]
-    fn rds_contract_does_not_extend_loopback_rejection_to_other_ip_spellings() {
-        for url in [
-            "postgresql://192.0.2.10/records?sslmode=verify-full",
-            "postgresql://[2001:db8::10]/records?sslmode=verify-full",
-        ] {
-            let (_dir, config) = rds_fixture(url);
-            assert!(config.read_url().is_ok(), "relaxed contract rejected {url}");
-        }
-    }
-
-    #[cfg(feature = "pds-postgres")]
-    #[test]
-    fn rds_contract_requires_explicit_readable_ca_file() {
-        let (_dir, mut config) = rds_fixture(
-            "postgres://records:secret@db.internal.example/records?sslmode=verify-full",
-        );
-        config.root_cert_file = None;
-        assert!(config.read_url().is_err());
-
-        config.root_cert_file = Some(std::path::PathBuf::from("/missing/records-rds-ca.pem"));
-        assert!(config.read_url().is_err());
-    }
     #[test]
     fn default_startup_services_are_available_in_this_build() {
         let startup = super::default_startup_services();
@@ -3948,7 +3411,12 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
-        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+        use axum::{
+            body::Body,
+            http::{header, Request},
+            routing::get,
+            Router,
+        };
         use tower::ServiceExt;
 
         for origins in [
@@ -3962,37 +3430,74 @@ mod tests {
                 ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
                 ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
                 ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
-                ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+                (
+                    "HYPRSTREAM__OAUTH__EXTERNAL_URL",
+                    "https://discovery.staging.lab.hyprstream.com",
+                ),
                 ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
-            ].into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
             let cfg: HyprConfig = config::Config::builder()
                 .add_source(config::Config::try_from(&HyprConfig::default())?)
                 .add_source(HyprConfig::environment_source().source(Some(source)))
                 .build()?
                 .try_deserialize()?;
-            assert_eq!(cfg.oauth.cors.allowed_origins, origins.split(',').map(str::trim).collect::<Vec<_>>());
+            assert_eq!(
+                cfg.oauth.cors.allowed_origins,
+                origins.split(',').map(str::trim).collect::<Vec<_>>()
+            );
             assert!(cfg.oauth.cors.enabled);
             assert!(cfg.oauth.cors.allow_credentials);
             assert!(!cfg.oauth.cors.permissive_headers);
-            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(
+                cfg.oauth.external_url.as_deref(),
+                Some("https://discovery.staging.lab.hyprstream.com")
+            );
             assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
 
             let app = Router::new()
                 .route("/probe", get(|| async { "ok" }))
                 .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
-            for origin in cfg.oauth.cors.allowed_origins.iter().map(String::as_str)
+            for origin in cfg
+                .oauth
+                .cors
+                .allowed_origins
+                .iter()
+                .map(String::as_str)
                 .chain(["https://not-allowed.example"])
             {
-                let response = app.clone().oneshot(Request::builder()
-                    .uri("/probe")
-                    .header(header::ORIGIN, origin)
-                    .body(Body::empty())?).await?;
-                let allowed = cfg.oauth.cors.allowed_origins.iter().any(|value| value == origin);
-                assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                    .and_then(|value| value.to_str().ok()), allowed.then_some(origin));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/probe")
+                            .header(header::ORIGIN, origin)
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                let allowed = cfg
+                    .oauth
+                    .cors
+                    .allowed_origins
+                    .iter()
+                    .any(|value| value == origin);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .and_then(|value| value.to_str().ok()),
+                    allowed.then_some(origin)
+                );
                 if allowed {
-                    assert_eq!(response.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
-                        .and_then(|value| value.to_str().ok()), Some("true"));
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("true")
+                    );
                 }
             }
         }
@@ -4007,7 +3512,10 @@ mod tests {
             ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
             ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
             ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
-            ("HYPRSTREAM__OAUTH__EXTERNAL_URL", "https://discovery.staging.lab.hyprstream.com"),
+            (
+                "HYPRSTREAM__OAUTH__EXTERNAL_URL",
+                "https://discovery.staging.lab.hyprstream.com",
+            ),
             ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
         ]
         .into_iter()
@@ -4023,20 +3531,34 @@ mod tests {
     /// Drive the real `cors_layer` middleware with an `Origin` request and
     /// return the `(access-control-allow-origin, access-control-allow-credentials)`
     /// header values it emits.
-    async fn cors_probe(cfg: &HyprConfig, origin: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
-        use axum::{body::Body, http::{header, Request}, routing::get, Router};
+    async fn cors_probe(
+        cfg: &HyprConfig,
+        origin: &str,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        use axum::{
+            body::Body,
+            http::{header, Request},
+            routing::get,
+            Router,
+        };
         use tower::ServiceExt;
         let app = Router::new()
             .route("/probe", get(|| async { "ok" }))
             .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
         let response = app
-            .oneshot(Request::builder()
-                .uri("/probe")
-                .header(header::ORIGIN, origin)
-                .body(Body::empty())?)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())?,
+            )
             .await?;
         let header_str = |name: header::HeaderName| {
-            response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_owned)
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
         };
         Ok((
             header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
@@ -4045,7 +3567,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost() -> anyhow::Result<()> {
+    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost(
+    ) -> anyhow::Result<()> {
         // An empty, whitespace-only, or separators-only value must trim+filter
         // to an empty vector so the middleware's localhost fallback applies —
         // the same posture as the legacy `HYPRSTREAM_CORS_ORIGINS` parser.
@@ -4054,7 +3577,10 @@ mod tests {
             assert!(cfg.oauth.cors.allowed_origins.is_empty(), "{origins:?}");
             assert!(cfg.oauth.cors.enabled);
             assert!(cfg.oauth.cors.allow_credentials);
-            assert_eq!(cfg.oauth.external_url.as_deref(), Some("https://discovery.staging.lab.hyprstream.com"));
+            assert_eq!(
+                cfg.oauth.external_url.as_deref(),
+                Some("https://discovery.staging.lab.hyprstream.com")
+            );
             assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
 
             // The exact four-origin localhost fallback set is allowed and echoes
@@ -4083,13 +3609,21 @@ mod tests {
     async fn oauth_cors_env_mixed_valid_and_empty_entries_drops_empties() -> anyhow::Result<()> {
         // Empty entries interleaved with real origins are dropped after trimming;
         // the surviving exact list both serves itself and disables the fallback.
-        let cfg = cors_cfg_from_env(" , https://staging-amp.hyprstream.com ,, https://second.example\t,")?;
+        let cfg = cors_cfg_from_env(
+            " , https://staging-amp.hyprstream.com ,, https://second.example\t,",
+        )?;
         assert_eq!(
             cfg.oauth.cors.allowed_origins,
-            vec!["https://staging-amp.hyprstream.com".to_owned(), "https://second.example".to_owned()]
+            vec![
+                "https://staging-amp.hyprstream.com".to_owned(),
+                "https://second.example".to_owned()
+            ]
         );
         assert!(cfg.oauth.cors.allow_credentials);
-        for origin in ["https://staging-amp.hyprstream.com", "https://second.example"] {
+        for origin in [
+            "https://staging-amp.hyprstream.com",
+            "https://second.example",
+        ] {
             let (acao, credentials) = cors_probe(&cfg, origin).await?;
             assert_eq!(acao, Some(origin.to_owned()));
             assert_eq!(credentials, Some("true".to_owned()));
@@ -4105,7 +3639,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off() -> anyhow::Result<()> {
+    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off(
+    ) -> anyhow::Result<()> {
         // Trimming a whitespace-padded star intentionally selects the explicit
         // wildcard operator, which always disables ambient credentials.
         let cfg = cors_cfg_from_env(" * ")?;
@@ -4161,9 +3696,7 @@ mod tests {
         // A pre-#1652 DID-valued list is exactly this failure: DIDs are not
         // factory service names.
         config.event_publishers.clear();
-        config
-            .event_publishers
-            .insert("did:at9p:9f7abc".to_owned());
+        config.event_publishers.insert("did:at9p:9f7abc".to_owned());
         assert!(
             config.validate_admission_policy().is_err(),
             "DID-valued event_publishers must fail loudly, not become silent read-only"
@@ -4229,9 +3762,47 @@ mod tests {
 
     #[test]
     fn credential_pds_rejects_plaintext_capable_backends() {
-        assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
-        assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
-        assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
+        assert!(CredentialsBackend::Pglite
+            .ensure_allowed_for_build()
+            .is_ok());
+        assert!(CredentialsBackend::Postgres
+            .ensure_allowed_for_build()
+            .is_ok());
+        assert!(CredentialsBackend::Rocksdb
+            .ensure_allowed_for_build()
+            .is_err());
+        assert!(CredentialsBackend::Valkey
+            .ensure_allowed_for_build()
+            .is_err());
+    }
+
+    #[test]
+    fn credentials_backend_deserializes_postgres() {
+        let config: CredentialsConfig =
+            toml::from_str("backend = \"postgres\"").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(config.backend, CredentialsBackend::Postgres);
+    }
+
+    #[test]
+    fn nested_environment_selects_postgres_accounts_and_rds_cell() -> anyhow::Result<()> {
+        let source = [
+            ("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres"),
+            ("HYPRSTREAM__RDS__CELL_ID", "staging-us-east-1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let config: HyprConfig = Config::builder()
+            .add_source(Config::try_from(&HyprConfig::default())?)
+            .add_source(HyprConfig::environment_source().source(Some(source)))
+            .build()?
+            .try_deserialize()?;
+
+        assert_eq!(config.credentials.backend, CredentialsBackend::Postgres);
+        assert_eq!(config.rds.cell_id, "staging-us-east-1");
+        let resolved_rds = config.rds.resolve_with(|_| None)?;
+        assert_eq!(resolved_rds.cell_id, "staging-us-east-1");
+        Ok(())
     }
 
     #[test]
@@ -4666,7 +4237,6 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         );
         assert_eq!(cfg.oauth.active_secs(), 30);
     }
-
 
     /// RAII guard to set/unset a process env var for the duration of a test and
     /// restore the previous value, keeping env-mutating tests from leaking state.

@@ -99,6 +99,25 @@ pub async fn production_moq_event_pep(
     audit_stream: &str,
     track_policy: MoqEventPolicyTable,
 ) -> anyhow::Result<MoqEventPep> {
+    production_moq_event_pep_with_clearance(
+        signing_key,
+        oauth,
+        audit_stream,
+        track_policy,
+        Arc::new(VerifiedClaimsMoqClearanceSource),
+    )
+    .await
+}
+
+/// Explicit authority injection for checkpoint-admitted native services. This
+/// does not manufacture JWT claims or populate the verified-claims cache.
+pub async fn production_moq_event_pep_with_clearance(
+    signing_key: SigningKey,
+    oauth: &crate::config::OAuthConfig,
+    audit_stream: &str,
+    track_policy: MoqEventPolicyTable,
+    clearance: Arc<dyn ClearanceSource>,
+) -> anyhow::Result<MoqEventPep> {
     anyhow::ensure!(
         !audit_stream.is_empty()
             && audit_stream
@@ -124,7 +143,7 @@ pub async fn production_moq_event_pep(
     .context("open MoQ MAC audit store")?;
     Ok(audited_moq_event_pep(
         Arc::new(DeclaredTrackPolicyResolver::new(track_policy)),
-        Arc::new(VerifiedClaimsMoqClearanceSource),
+        clearance,
         Arc::new(audit_store),
     ))
 }
@@ -136,7 +155,10 @@ pub struct VerifiedClaimsMoqClearanceSource;
 
 #[async_trait::async_trait]
 impl ClearanceSource for VerifiedClaimsMoqClearanceSource {
-    async fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+    async fn clearance(
+        &self,
+        subject: &Subject,
+    ) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
         hyprstream_rpc::auth::mac::subject_context(subject, None).await
     }
 }
@@ -158,6 +180,7 @@ const fn audit_reason(reason: MoqMacAuditReason) -> DecisionReason {
         MoqMacAuditReason::Mac(MacDenyReason::FloorDeny) => DecisionReason::FloorDeny,
         MoqMacAuditReason::Mac(MacDenyReason::StaleAuthority) => DecisionReason::MoqStaleAuthority,
         MoqMacAuditReason::UnknownObjectIdentity => DecisionReason::MoqUnknownObjectIdentity,
+        MoqMacAuditReason::SourceOwnershipDenied => DecisionReason::MoqSourceOwnershipDenied,
         MoqMacAuditReason::TrackAdmissionHookUnavailable => {
             DecisionReason::MoqTrackAdmissionHookUnavailable
         }
@@ -279,7 +302,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "5:tenantworker",
                 MoqEventAction::Publish,
-            ).await,
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )
@@ -306,7 +330,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "registry.repo789.push",
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Permit
         );
         // Only denials flow to the deny sink today (the permit-side WAL is
@@ -328,7 +353,8 @@ mod tests {
                 &Subject::new("did:web:tenant-a"),
                 "registry.repo789.push",
                 MoqEventAction::Subscribe,
-            ).await,
+            )
+            .await,
             hyprstream_rpc::auth::mac::MacDecision::Deny(
                 hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject
             )

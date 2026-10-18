@@ -28,7 +28,11 @@ pub fn render_login_page(
     }
 
     let local_section = if has_local_auth {
-        let collapsed = if providers.is_empty() { "" } else { "collapsed" };
+        let collapsed = if providers.is_empty() {
+            ""
+        } else {
+            "collapsed"
+        };
         format!(
             r#"<details class="local-auth {collapsed}" {open}>
                 <summary>Sign in with Ed25519 key</summary>

@@ -1,12 +1,7 @@
-use hyprstream_metrics::storage::{StorageBackendType, duckdb::DuckDbBackend};
 use crate::service::FlightSqlServer;
 use config::{Config, File};
-use std::{
-    collections::HashMap,
-    error::Error as StdError,
-    fmt,
-    path::PathBuf,
-};
+use hyprstream_metrics::storage::{duckdb::DuckDbBackend, StorageBackendType};
+use std::{collections::HashMap, error::Error as StdError, fmt, path::PathBuf};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{debug, error, info};
 
@@ -34,13 +29,13 @@ impl StdError for ConnectionError {
     }
 }
 
-pub async fn handle_server(
-    config: Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = format!("{}:{}",
+pub async fn handle_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = format!(
+        "{}:{}",
         config.get_string("host")?.as_str(),
         config.get_string("port")?.as_str()
-    ).parse()?;
+    )
+    .parse()?;
 
     let backend = match config.get_string("storage.type")?.as_str() {
         "duckdb" => {
@@ -59,29 +54,32 @@ pub async fn handle_server(
         let cert = match config.get::<Vec<u8>>("tls.cert_data") {
             Ok(data) => data,
             Err(_) => {
-                let path = config.get_string("tls.cert_path")
+                let path = config
+                    .get_string("tls.cert_path")
                     .map_err(|_| "TLS certificate not found")?;
-                std::fs::read(path)
-                    .map_err(|_| "Failed to read TLS certificate")?
+                std::fs::read(path).map_err(|_| "Failed to read TLS certificate")?
             }
         };
         let key = match config.get::<Vec<u8>>("tls.key_data") {
             Ok(data) => data,
             Err(_) => {
-                let path = config.get_string("tls.key_path")
+                let path = config
+                    .get_string("tls.key_path")
                     .map_err(|_| "TLS key not found")?;
-                std::fs::read(path)
-                    .map_err(|_| "Failed to read TLS key")?
+                std::fs::read(path).map_err(|_| "Failed to read TLS key")?
             }
         };
         let identity = Identity::from_pem(&cert, &key);
 
         let mut tls_config = ServerTlsConfig::new().identity(identity);
 
-        if let Some(ca) = config.get::<Vec<u8>>("tls.ca_data").ok()
-            .or_else(|| config.get_string("tls.ca_path").ok()
+        if let Some(ca) = config.get::<Vec<u8>>("tls.ca_data").ok().or_else(|| {
+            config
+                .get_string("tls.ca_path")
+                .ok()
                 .filter(|p| !p.is_empty())
-                .and_then(|p| std::fs::read(p).ok())) {
+                .and_then(|p| std::fs::read(p).ok())
+        }) {
             tls_config = tls_config.client_ca_root(Certificate::from_pem(&ca));
         }
 
@@ -95,14 +93,10 @@ pub async fn handle_server(
         "Server configuration"
     );
 
-    server
-        .add_service(service)
-        .serve(addr)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Server failed to start");
-            e
-        })?;
+    server.add_service(service).serve(addr).await.map_err(|e| {
+        error!(error = %e, "Server failed to start");
+        e
+    })?;
 
     Ok(())
 }

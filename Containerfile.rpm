@@ -16,8 +16,10 @@ RUN set -eu; \
     printf '%s  /tmp/hyprstream.rpm\n' "$RPM_SHA256" | sha256sum --check -; \
     test "$(rpm -qp --queryformat '%{ARCH}' /tmp/hyprstream.rpm)" = "$RPM_ARCH"; \
     rpm -qp --provides /tmp/hyprstream.rpm | grep -Fx "bundled(hyprstream-source) = $SOURCE_COMMIT"; \
-    dnf -y --setopt=install_weak_deps=False install /tmp/hyprstream.rpm; \
+    dnf -y --setopt=install_weak_deps=False install /tmp/hyprstream.rpm git-core; \
     rpm -qf /usr/bin/hyprstream; \
+    rpm -qf /usr/bin/git; \
+    /usr/bin/git --version; \
     /usr/bin/hyprstream --version; \
     ln -s /usr/bin/hyprstream /hyprstream; \
     dnf clean all; \
@@ -26,11 +28,15 @@ RUN set -eu; \
 RUN getent passwd 65532 >/dev/null || \
     useradd --uid 65532 --gid 65532 --no-create-home \
       --home-dir /var/lib/hyprstream --shell /sbin/nologin hyprstream
+RUN install -d -m 0700 -o 65532 -g 65532 /var/cache/hyprstream-pinned
 LABEL org.opencontainers.image.source="https://github.com/hyprstream/hyprstream" \
       org.opencontainers.image.revision="${SOURCE_COMMIT}" \
       ai.hyprstream.rpm.sha256="${RPM_SHA256}" \
       ai.hyprstream.rpm.arch="${RPM_ARCH}"
 ENV HOME=/var/lib/hyprstream RUST_LOG=info
 USER 65532:65532
+RUN test -x /usr/bin/git && \
+    test -w /var/cache/hyprstream-pinned && \
+    test "$(stat -c '%a:%u:%g' /var/cache/hyprstream-pinned)" = '700:65532:65532'
 ENTRYPOINT ["/hyprstream"]
 CMD ["--help"]

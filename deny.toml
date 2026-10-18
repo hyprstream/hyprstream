@@ -102,6 +102,11 @@ version = "*"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
+name = "hyprstream-session-store"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 name = "hyprstream-vfs-server"
 version = "*"
 allow = ["AGPL-3.0-only"]

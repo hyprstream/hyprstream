@@ -9,10 +9,12 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".dispatchMac;
 using import "/annotations.capnp".mutationSemantics;
+using import "/annotations.capnp".maxLen;
 using import "/annotations.capnp".dispatchPublic;
 using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
+using import "/annotations.capnp".domainType;
 using Opt = import "/optional.capnp";
 
 # Unified policy request with union discriminator (follows RegistryRequest pattern)
@@ -146,7 +148,171 @@ struct PolicyRequest {
     # consume-once). WS-E calls this for a derived AsOriginator dispatch.
     exchangeDelegated @28 :ExchangeDelegated
       $scope(manage) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
+
+    # Read-only decision about a holder whose original request is independently
+    # verified by Policy. The mediator remains the authenticated RPC caller;
+    # this operation never mints or installs the holder's identity. Resources
+    # may cross service prefixes (e.g. Registry filters model permissions), but
+    # the holder, mediator target, and operation must be proved, not asserted.
+    checkMediated @29 :MediatedPolicyCheck
+      $scopeExempt("authorization query verifies holder evidence and mediator admission internally; requiring the queried authority here would be circular")
+      $dispatchMac("internal:pq-hybrid");
+
+    # Internal full-record lookup; explicit configured service/key/tenant/resource
+    # capability required by Policy. No provider installed by default, no grants.
+    resolveSessionPrimary @30 :ResolveSessionPrimary
+      $scope(query) $dispatchMac("internal:pq-hybrid");
+
+    # One request-local, service-authenticated boundary: fresh account/tenant/
+    # grant/session check followed by durable session-bound proof replay consume.
+    # The caller must have verified the original holder's hybrid proof first.
+    # No token, reusable permit or positive cache is returned.
+    admitFederateRequest @31 :AdmitFederateRequest
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
+
+    # OAuth-only source-to-authority prepare. The result is a server-only
+    # one-use handle plus the binding that OAuth puts in the signed challenge.
+    # The handler verifies the direct enrolled OAuth caller, not a browser.
+    prepareFederateSession @32 :PrepareFederateSession
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
+
+    # OAuth-only redeem after both holder signatures have been verified. Policy
+    # rechecks authority and commits the session before returning it for signing.
+    commitFederateSession @33 :CommitFederateSession
+      $scope(query) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid");
   }
+}
+
+# Metadata from an OAuth-verified Federate ID token; never the raw token.
+# This is accepted only from the enrolled OAuth service over signed RPC.
+struct FederateVerifiedSource {
+  issuer @0 :Text $maxLen(2048);
+  subject @1 :Text $maxLen(256);
+  jti @2 :Text $maxLen(256);
+  nonce @3 :Text $maxLen(256);
+  tokenHash @4 :Data $maxLen(32);
+  issuedAt @5 :Int64;
+  expiresAt @6 :Int64;
+  # Server-verified Dex federated_claims.user_id from the pinned ATProto connector.
+  atprotoDid @7 :Text $maxLen(255);
+}
+
+struct PrepareFederateSession {
+  source @0 :FederateVerifiedSource;
+  requested @1 :List(Text) $maxLen(64);
+  challengeId @2 :Data $maxLen(32);
+  challengeCreatedAt @3 :Int64;
+  # Keys committed by the verified source nonce before the challenge exists.
+  edPublic @4 :Data $maxLen(32);
+  pqPublic @5 :Data $maxLen(1952);
+}
+
+struct PreparedFederateSession {
+  accountId @0 :Text;
+  subject @1 :Text;
+  tenant @2 :Text;
+  requested @3 :List(Text);
+  granted @4 :List(Text);
+  revision @5 :Text;
+  # Random opaque handle. It is never sent to the browser.
+  policyHandle @6 :Data;
+}
+
+struct CommitFederateSession {
+  source @0 :FederateVerifiedSource;
+  policyHandle @1 :Data $maxLen(32);
+  challengeId @2 :Data $maxLen(32);
+  challengeCreatedAt @3 :Int64;
+  challengeExpiresAt @4 :Int64;
+  edPublic @5 :Data $maxLen(32);
+  pqPublic @6 :Data $maxLen(1952);
+}
+
+# Exact durable session receipt returned by Policy after PostgreSQL commit.
+struct FederateCommittedSession {
+  host @0 :Text;
+  sid @1 :Text;
+  accountId @2 :Text;
+  subject @3 :Text;
+  tenant @4 :Text;
+  client @5 :Text;
+  resource @6 :Text;
+  scopes @7 :List(Text);
+  grantRevision @8 :Text;
+  edPublic @9 :Data;
+  pqPublic @10 :Data;
+  generation @11 :Data;
+  collisionInventoryId @12 :Data;
+  proofEpoch @13 :Int64;
+  expiresAt @14 :Int64;
+}
+
+struct ResolveSessionPrimary {
+  issuer @0 :Text $maxLen(2048);
+  profile @1 :Text $maxLen(64);
+  sid @2 :Text $maxLen(128);
+  subject @3 :Text $maxLen(256);
+  tenant @4 :Text $maxLen(256);
+  client @5 :Text $maxLen(256);
+  audience @6 :Text $maxLen(2048);
+  scopes @7 :List(Text) $maxLen(64);
+  edPublic @8 :Data $maxLen(32);
+  suiteThumbprint @9 :Data $maxLen(32);
+  generation @10 :Data $maxLen(32);
+  expiresAt @11 :Int64;
+}
+
+# Active only. grantRevision is historical admission provenance, not an allow.
+struct SessionPrimary {
+  host @0 :Text;
+  profile @1 :Text;
+  suite @2 :Text;
+  sid @3 :Text;
+  accountId @4 :Text;
+  subject @5 :Text;
+  tenant @6 :Text;
+  client @7 :Text;
+  resource @8 :Text;
+  scopes @9 :List(Text);
+  grantRevision @10 :Text;
+  edPublic @11 :Data;
+  pqPublic @12 :Data;
+  generation @13 :Data;
+  createdAt @14 :Int64;
+  expiresAt @15 :Int64;
+  proofEpoch @16 :UInt64;
+  collisionInventoryId @17 :Data;
+}
+
+struct AdmitFederateRequest {
+  issuer @0 :Text $maxLen(2048);
+  profile @1 :Text $maxLen(64);
+  sid @2 :Text $maxLen(128);
+  subject @3 :Text $maxLen(256);
+  tenant @4 :Text $maxLen(256);
+  client @5 :Text $maxLen(256);
+  audience @6 :Text $maxLen(2048);
+  scopes @7 :List(Text) $maxLen(64);
+  edPublic @8 :Data $maxLen(32);
+  suiteThumbprint @9 :Data $maxLen(32);
+  generation @10 :Data $maxLen(32);
+  collisionInventoryId @11 :Data $maxLen(32);
+  expiresAt @12 :Int64;
+  proofEpoch @13 :UInt64;
+  verifiedNamespace @14 :Data $maxLen(32);
+  requestId @15 :Data $maxLen(16);
+  resource @16 :Text $maxLen(256);
+  operation @17 :Text $maxLen(64);
+}
+
+struct MediatedPolicyCheck {
+  # Bounded original signed request, never a credential alone. No nested
+  # mediation; the implementation must verify the original target and holder.
+  evidence @0 :Data $domainType("hyprstream_rpc::sensitive::SensitiveBytes");
+  # $maxLen mirrors the mediated-query dimension validator: rejected at the
+  # borrowed reader before any owned String is allocated.
+  resource @1 :Text $maxLen(4096);
+  operation @2 :Text $maxLen(128);
 }
 
 # Authorization check parameters
@@ -368,6 +534,11 @@ struct PolicyResponse {
 
     # Minted delegated at+jwt/wit from exchangeDelegated (fresh jti).
     exchangeDelegatedResult @29 :TokenInfo;
+    checkMediatedResult @30 :Bool;
+    resolveSessionPrimaryResult @31 :SessionPrimary;
+    admitFederateRequestResult @32 :Bool;
+    prepareFederateSessionResult @33 :PreparedFederateSession;
+    commitFederateSessionResult @34 :FederateCommittedSession;
   }
 }
 

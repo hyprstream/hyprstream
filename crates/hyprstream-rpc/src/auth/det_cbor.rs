@@ -92,10 +92,7 @@ mod tests {
     #[test]
     fn text_and_array_shapes() {
         // ["a", []] → 82 61 61 80
-        let v = DetCborValue::Array(vec![
-            DetCborValue::Text("a"),
-            DetCborValue::Array(vec![]),
-        ]);
+        let v = DetCborValue::Array(vec![DetCborValue::Text("a"), DetCborValue::Array(vec![])]);
         assert_eq!(det_cbor(&v), vec![0x82, 0x61, 0x61, 0x80]);
     }
 }

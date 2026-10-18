@@ -52,12 +52,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Keep container builds on the same compiler/components as local builds and CI.
+# Placing the override at / also covers the later /build working directory.
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install sccache for compilation caching (works with BuildKit cache mounts)
-RUN cargo install sccache --locked
+ARG HYPRSTREAM_BUILD_JOBS
+RUN if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
@@ -92,9 +97,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install sccache --locked
+ARG HYPRSTREAM_BUILD_JOBS
+RUN if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
@@ -370,6 +379,22 @@ ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 FROM builder-${VARIANT} AS builder
 
+# The pinned-disk reader invokes absolute /usr/bin/git with env_clear. Carry
+# the selected architecture's Git and its actual non-glibc dependency closure;
+# do not copy a host binary or replace the pinned runtime base's libc/loader.
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+RUN set -eu; \
+    install -D -m 0755 /usr/bin/git /out/runtime/usr/bin/git; \
+    ldd /usr/bin/git > /out/git.ldd; \
+    if grep -q 'not found' /out/git.ldd; then exit 1; fi; \
+    mkdir -p /out/runtime/usr/lib64; \
+    awk '/=> \// { print $3 }' /out/git.ldd | while read -r library; do \
+      case "${library##*/}" in libc.so.*|ld-linux*) continue ;; esac; \
+      install -m 0644 "$library" "/out/runtime/usr/lib64/${library##*/}"; \
+    done; \
+    install -d -m 0700 -o "$RUNTIME_UID" -g "$RUNTIME_GID" /out/private-cache/hyprstream-pinned
+
 # Set working directory
 WORKDIR /build
 
@@ -396,7 +421,9 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
 # Note: --no-default-features excludes systemd (not needed in containers).
-# credential-pds is mandatory for the production encrypted UserStore boundary.
+# CPU consumers support encrypted networked accounts AND pilot-local PGlite
+# accounts. Keep the standalone pglite feature (not the credential-pds umbrella)
+# alongside Postgres/replay; GPU publication explicitly selects its own profile.
 # Cache mounts:
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
@@ -410,11 +437,14 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # defaulting to the in-container /build/target for every other invocation
 # (docker-build.yml, build-image.yml).
 ARG CARGO_TARGET_DIR=/build/target
+ARG HYPRSTREAM_BUILD_JOBS
+ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay,pglite
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
+    if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features "${HYPRSTREAM_FEATURES}" \
     && mkdir -p /out \
     && cp "${CARGO_TARGET_DIR:-/build/target}/release/hyprstream" /out/hyprstream
 
@@ -545,10 +575,18 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 FROM runtime-${VARIANT} AS runtime
 
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+
 # Copy only the final binary out of the builder. Cargo's target directory is a
 # cache mount, so tens of gigabytes of intermediate objects never enter an OCI
 # layer (critical on the Graviton publisher's small root filesystem).
 COPY --from=builder /out/hyprstream /hyprstream
+COPY --from=builder /out/runtime/ /
+# Only this private mutable cache belongs to the runtime account. Keep Git and
+# its libraries root-owned, and make ownership explicit across the stage COPY.
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /out/private-cache/ /var/cache/
+COPY --chmod=0555 .github/scripts/check-runtime-pinned-model.sh /usr/local/libexec/check-runtime-pinned-model
 
 # Set library paths
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64
@@ -563,9 +601,11 @@ EXPOSE 8080 50051
 # binary and its libraries are root-owned and world-readable/executable, which
 # is what an immutable runtime wants: the service can execute them and cannot
 # rewrite them.
-ARG RUNTIME_UID
-ARG RUNTIME_GID
 USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# Runs in every actual amd64/arm64 published image, as its default non-root
+# account, without inherited library/config environment in the Git child.
+RUN /bin/sh /usr/local/libexec/check-runtime-pinned-model
 
 # Run hyprstream (the runtime base has no working directory conventions of its
 # own, so use an absolute path)

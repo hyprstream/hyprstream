@@ -86,13 +86,15 @@ fn make_sign_fn(
     Closure<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
 ) {
     use ed25519_dalek::Signer as _;
-    let closure = Closure::wrap(Box::new(move |input: js_sys::Uint8Array| -> js_sys::Promise {
-        let bytes = input.to_vec();
-        let signature = signing_key.sign(&bytes).to_bytes();
-        js_sys::Promise::resolve(&JsValue::from(js_sys::Uint8Array::from(
-            signature.as_slice(),
-        )))
-    }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>);
+    let closure = Closure::wrap(
+        Box::new(move |input: js_sys::Uint8Array| -> js_sys::Promise {
+            let bytes = input.to_vec();
+            let signature = signing_key.sign(&bytes).to_bytes();
+            js_sys::Promise::resolve(&JsValue::from(js_sys::Uint8Array::from(
+                signature.as_slice(),
+            )))
+        }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
+    );
     let function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
     (function, closure)
 }
@@ -105,11 +107,199 @@ fn make_pq_sign_fn() -> (
     js_sys::Function,
     Closure<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
 ) {
-    let closure = Closure::wrap(Box::new(move |_input: js_sys::Uint8Array| -> js_sys::Promise {
-        js_sys::Promise::resolve(&JsValue::from(js_sys::Uint8Array::new_with_length(0)))
-    }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>);
+    let closure = Closure::wrap(
+        Box::new(move |_input: js_sys::Uint8Array| -> js_sys::Promise {
+            js_sys::Promise::resolve(&JsValue::from(js_sys::Uint8Array::new_with_length(0)))
+        }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
+    );
     let function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
     (function, closure)
+}
+
+/// Exercise the real JS callback boundary while signing the fixed P0 proof
+/// vector. The private fixture key is created only inside this WASM test.
+fn make_fixture_pq_sign_fn() -> (
+    js_sys::Function,
+    Closure<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
+) {
+    let closure = Closure::wrap(
+        Box::new(move |input: js_sys::Uint8Array| -> js_sys::Promise {
+            let key = hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[10; 32]);
+            let signature = hyprstream_rpc::crypto::pq::ml_dsa_sign(&key, &input.to_vec());
+            js_sys::Promise::resolve(&JsValue::from(js_sys::Uint8Array::from(
+                signature.as_slice(),
+            )))
+        }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
+    );
+    let function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+    (function, closure)
+}
+
+#[wasm_bindgen(inline_js = "
+    let __fixedRandomDescriptor;
+    let __fixedRandomCalls = 0;
+    export function installFixedProofRandom() {
+        if (__fixedRandomDescriptor !== undefined) throw new Error('fixed proof RNG already installed');
+        const crypto = globalThis.crypto;
+        const own = Object.getOwnPropertyDescriptor(crypto, 'getRandomValues');
+        __fixedRandomDescriptor = own || null;
+        __fixedRandomCalls = 0;
+        try {
+            Object.defineProperty(crypto, 'getRandomValues', {
+                configurable: true,
+                value: (array) => {
+                    if (!(array instanceof Uint8Array) || array.length !== 16) {
+                        throw new Error('unexpected random request during proof-vector test');
+                    }
+                    __fixedRandomCalls += 1;
+                    array.fill(0x3c);
+                    return array;
+                },
+            });
+            if (!Object.prototype.hasOwnProperty.call(crypto, 'getRandomValues')) {
+                throw new Error('RNG stub did not install');
+            }
+        } catch (error) {
+            restoreProofRandom();
+            throw error;
+        }
+    }
+    export function fixedProofRandomCallCount() { return __fixedRandomCalls; }
+    export function restoreProofRandom() {
+        if (__fixedRandomDescriptor === undefined) return;
+        const crypto = globalThis.crypto;
+        if (__fixedRandomDescriptor === null) delete crypto.getRandomValues;
+        else Object.defineProperty(crypto, 'getRandomValues', __fixedRandomDescriptor);
+        __fixedRandomDescriptor = undefined;
+    }
+")]
+extern "C" {
+    #[wasm_bindgen(catch)]
+    fn installFixedProofRandom() -> Result<(), JsValue>;
+    fn fixedProofRandomCallCount() -> u32;
+    fn restoreProofRandom();
+}
+
+struct FixedProofRandomGuard;
+
+impl Drop for FixedProofRandomGuard {
+    fn drop(&mut self) {
+        restoreProofRandom();
+    }
+}
+
+#[wasm_bindgen_test]
+async fn federate_cose_js_signer_matches_native_p0_bytes() {
+    use hyprstream_rpc::crypto::hybrid_kem::{recipient_from_seeds, SuiteId};
+    use hyprstream_rpc::proof::build::{
+        build_authenticated_hybrid_request_proof,
+        build_authenticated_hybrid_request_proof_with_signer, AuthenticatedHybridProofSigner,
+        AuthenticatedRequestProofInput,
+    };
+    use hyprstream_rpc::proof::{parser::ParsedProof, recipient_binding::FederateRecipientBinding};
+    use hyprstream_rpc::signer::JsSigner;
+
+    let ed_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let ed_public = ed_key.verifying_key().to_bytes();
+    let pq_key = hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[10; 32]);
+    let pq_public = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_key);
+    let (ed_sign_fn, _ed_callback) = make_sign_fn(ed_key);
+    let (pq_sign_fn, _pq_callback) = make_fixture_pq_sign_fn();
+    let browser_signer = JsSigner::new_hybrid(&ed_public, ed_sign_fn, &pq_public, pq_sign_fn)
+        .expect("fixture browser signer");
+    let native_signer = AuthenticatedHybridProofSigner::new(
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+        b"proof-fixture-ed".to_vec(),
+        hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[10; 32]),
+        b"proof-fixture-pq".to_vec(),
+    )
+    .expect("fixture native signer");
+
+    let suite = SuiteId::HyKemX25519MlKem768;
+    let response = recipient_from_seeds(suite, &[&[7; 32], &[9; 64]])
+        .expect("fixed response recipient")
+        .public();
+    let stream = recipient_from_seeds(suite, &[&[8; 32], &[10; 64]])
+        .expect("fixed stream recipient")
+        .public();
+    let binding =
+        FederateRecipientBinding::from_recipients(Some(&response), Some(&stream), Some([0x5a; 32]))
+            .expect("fixed recipient binding");
+    let input = AuthenticatedRequestProofInput {
+        service_domain: "registry.svc.hyprstream.test",
+        credential: b"fixture.sender.constrained.jwt",
+        issued_at: 1_800_000_000 - 5,
+        expires_at: 1_800_000_000 + 30,
+        capnp_schema_id: 0xd4d0_f2a1_b3c5_8e67,
+        capnp_body: b"federate-proof-vector-v1",
+        response_binding: None,
+        federate_recipient_binding: Some(&binding),
+    };
+    installFixedProofRandom().expect("browser proof RNG test stub");
+    let _random_guard = FixedProofRandomGuard;
+    let native =
+        build_authenticated_hybrid_request_proof(&input, &native_signer).expect("native P0 vector");
+    let browser = build_authenticated_hybrid_request_proof_with_signer(
+        &input,
+        &browser_signer,
+        b"proof-fixture-ed",
+        b"proof-fixture-pq",
+    )
+    .await
+    .expect("JS callback vector");
+    assert_eq!(
+        fixedProofRandomCallCount(),
+        2,
+        "each public builder must draw one 16-byte request ID"
+    );
+    assert_eq!(
+        browser, native,
+        "browser JS callbacks must emit exact P0 COSE bytes"
+    );
+    use sha2::Digest as _;
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&browser)),
+        "186b33dad6d4b41ed750b0d05e408dcaa78e708c33abac7bf4c2778bcf6826d6",
+        "browser COSE must match the reviewed P0 vector",
+    );
+
+    let proof =
+        ParsedProof::parse_deferred_federate_request(&browser).expect("Federate proof must parse");
+    assert_eq!(
+        proof.claims.federate_recipient_binding.as_ref(),
+        Some(&binding)
+    );
+    let wrong_response = recipient_from_seeds(suite, &[&[11; 32], &[12; 64]])
+        .expect("substitute response recipient")
+        .public();
+    assert!(!proof
+        .claims
+        .federate_recipient_binding
+        .as_ref()
+        .unwrap()
+        .matches(Some(&wrong_response), Some(&stream), Some([0x5a; 32]),));
+
+    let (wrong_ed_fn, _wrong_ed_callback) =
+        make_sign_fn(ed25519_dalek::SigningKey::from_bytes(&[99; 32]));
+    let (valid_pq_fn, _valid_pq_callback) = make_fixture_pq_sign_fn();
+    let wrong_signer = JsSigner::new_hybrid(&ed_public, wrong_ed_fn, &pq_public, valid_pq_fn)
+        .expect("claimed fixture public keys");
+    assert!(
+        build_authenticated_hybrid_request_proof_with_signer(
+            &input,
+            &wrong_signer,
+            b"proof-fixture-ed",
+            b"proof-fixture-pq",
+        )
+        .await
+        .is_err(),
+        "a JS callback signing with a different key must fail closed"
+    );
+    assert_eq!(
+        fixedProofRandomCallCount(),
+        3,
+        "bad callback still draws a fresh request ID"
+    );
 }
 
 fn dpop_bound_at_jwt(pubkey: &[u8; 32]) -> String {
@@ -267,7 +457,8 @@ async fn renew_chains_exchange_using_current_access_token_as_subject() {
         "renew must present the prior access token as subject_token: {renew_body}"
     );
     assert!(
-        renew_body.contains("subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token"),
+        renew_body
+            .contains("subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token"),
         "renew must use the access_token subject_token_type (chained exchange): {renew_body}"
     );
 }
@@ -320,15 +511,14 @@ async fn revoke_marks_session_unusable_even_when_transport_fails() {
     // tried to kill.
     assert!(session.is_revoked());
 
-    let client_result = session.client("https://registry.example.test", "registry").await;
+    let client_result = session
+        .client("https://registry.example.test", "registry")
+        .await;
     let client_err = match client_result {
         Ok(_) => panic!("client() must fail closed on a revoked session"),
         Err(e) => err_message(e),
     };
-    assert!(
-        client_err.contains("[session_revoked]"),
-        "{client_err}"
-    );
+    assert!(client_err.contains("[session_revoked]"), "{client_err}");
 }
 
 #[wasm_bindgen_test]
@@ -361,7 +551,9 @@ async fn expired_session_rejects_client_construction_without_any_network_call() 
     .await
     .expect("establish must succeed even though expires_in is 0");
 
-    let expired_result = session.client("https://registry.example.test", "registry").await;
+    let expired_result = session
+        .client("https://registry.example.test", "registry")
+        .await;
     let err = match expired_result {
         Ok(_) => panic!("client() must fail closed on an expired session"),
         Err(e) => err_message(e),

@@ -68,7 +68,9 @@ impl std::fmt::Display for ClientAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingAssertion => write!(f, "client_assertion required for private_key_jwt"),
-            Self::UnsupportedAssertionType(t) => write!(f, "unsupported client_assertion_type: {t}"),
+            Self::UnsupportedAssertionType(t) => {
+                write!(f, "unsupported client_assertion_type: {t}")
+            }
             Self::NoKeys => write!(f, "client has no jwks/jwks_uri for private_key_jwt"),
             Self::JwksUriFetchFailed(e) => write!(f, "jwks_uri fetch failed: {e}"),
             Self::TrustPolicyDenied(e) => write!(f, "CIMD trust policy denied: {e}"),
@@ -126,7 +128,9 @@ pub async fn verify_client_assertion(
     expected_audiences: &[String],
 ) -> Result<VerifiedAssertion, ClientAuthError> {
     if assertion_type != JWT_BEARER_ASSERTION_TYPE {
-        return Err(ClientAuthError::UnsupportedAssertionType(assertion_type.to_owned()));
+        return Err(ClientAuthError::UnsupportedAssertionType(
+            assertion_type.to_owned(),
+        ));
     }
     let keys = resolve_keys(state, client).await?;
     let verified =
@@ -279,7 +283,9 @@ async fn resolve_keys(
     // error, matching resolve_cimd_client.
     if client.is_cimd {
         if let Some(origin) = super::registration::extract_origin(&client.client_id) {
-            if let Err(e) = super::registration::check_federation_register_for_client_auth(state, &origin).await {
+            if let Err(e) =
+                super::registration::check_federation_register_for_client_auth(state, &origin).await
+            {
                 return Err(ClientAuthError::TrustPolicyDenied(e));
             }
         }
@@ -368,7 +374,8 @@ async fn fetch_jwks_uri(state: &OAuthState, url: &str) -> Result<Value, ClientAu
     let _ = extract_keys_array(&jwks)?;
 
     // Cache (write lock).
-    state.jwks_uri_cache
+    state
+        .jwks_uri_cache
         .write()
         .await
         .insert(url.to_owned(), (jwks.clone(), Instant::now()));
@@ -415,9 +422,13 @@ fn check_claims(
     client_id: &str,
     expected_audiences: &[String],
 ) -> Result<(), ClientAuthError> {
-    let iss = claims.get("iss").and_then(Value::as_str)
+    let iss = claims
+        .get("iss")
+        .and_then(Value::as_str)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing iss".to_owned()))?;
-    let sub = claims.get("sub").and_then(Value::as_str)
+    let sub = claims
+        .get("sub")
+        .and_then(Value::as_str)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing sub".to_owned()))?;
     if iss != client_id {
         return Err(ClientAuthError::InvalidClaim(format!(
@@ -435,7 +446,9 @@ fn check_claims(
     // iat is REQUIRED (#1146 T3.3): together with the mandatory jti it
     // bounds the replay window and gives operators an issuance-time
     // audit anchor. Reject assertions dated beyond a 60s clock skew.
-    let iat = claims.get("iat").and_then(Value::as_i64)
+    let iat = claims
+        .get("iat")
+        .and_then(Value::as_i64)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing iat".to_owned()))?;
     if iat > now.saturating_add(60) {
         return Err(ClientAuthError::InvalidClaim(format!(
@@ -453,7 +466,9 @@ fn check_claims(
 
     // Explicit exp check — defend against jsonwebtoken's
     // Validation::validate_exp behaviour quirks across versions.
-    let exp = claims.get("exp").and_then(Value::as_i64)
+    let exp = claims
+        .get("exp")
+        .and_then(Value::as_i64)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing exp".to_owned()))?;
     if exp <= now {
         return Err(ClientAuthError::InvalidClaim(format!(
@@ -491,7 +506,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::time::Instant;
 
-    fn make_client(client_id: &str, jwks: serde_json::Value, auth_method: &str) -> RegisteredClient {
+    fn make_client(
+        client_id: &str,
+        jwks: serde_json::Value,
+        auth_method: &str,
+    ) -> RegisteredClient {
         RegisteredClient {
             client_id: client_id.to_owned(),
             redirect_uris: vec!["http://localhost/cb".to_owned()],
@@ -721,7 +740,9 @@ mod tests {
         claims["iat"] = serde_json::json!(now);
         claims["exp"] = serde_json::json!(now + MAX_CLIENT_ASSERTION_LIFETIME_SECS + 1);
         let got = check_claims(&claims, "https://app.test/c", &issuer_audiences());
-        assert!(matches!(got, Err(ClientAuthError::InvalidClaim(message)) if message.contains("lifetime")));
+        assert!(
+            matches!(got, Err(ClientAuthError::InvalidClaim(message)) if message.contains("lifetime"))
+        );
     }
 
     #[test]

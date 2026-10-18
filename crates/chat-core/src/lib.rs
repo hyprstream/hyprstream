@@ -223,19 +223,29 @@ impl ChatState {
                     self.in_tool_call = false;
                     let buf = std::mem::take(&mut self.tool_call_buf);
                     if let Some((uuid, arguments)) = parse_tool_call_buf(&buf) {
-                        let description = self.tool_descriptions
-                            .get(&uuid).cloned().unwrap_or_else(|| uuid.clone());
+                        let description = self
+                            .tool_descriptions
+                            .get(&uuid)
+                            .cloned()
+                            .unwrap_or_else(|| uuid.clone());
                         self.tool_call_counter += 1;
                         let id = format!("tc-{}", self.tool_call_counter);
                         if let Some(last) = self.history.last_mut() {
                             last.tool_calls.push(ToolCallRecord {
-                                id: id.clone(), uuid: uuid.clone(),
+                                id: id.clone(),
+                                uuid: uuid.clone(),
                                 description: description.clone(),
-                                arguments: arguments.clone(), result: None,
+                                arguments: arguments.clone(),
+                                result: None,
                             });
                         }
                         self.pending_tool_calls += 1;
-                        events.push(ChatEvent::ToolCallDetected { id, uuid, description, arguments });
+                        events.push(ChatEvent::ToolCallDetected {
+                            id,
+                            uuid,
+                            description,
+                            arguments,
+                        });
                     }
                 }
 
@@ -249,7 +259,10 @@ impl ChatState {
             }
             ChatCommand::ToolCallResult { id, result } => {
                 // Inject tool result into history
-                if let Some(last_assistant) = self.history.iter_mut().rev()
+                if let Some(last_assistant) = self
+                    .history
+                    .iter_mut()
+                    .rev()
                     .find(|e| e.role == ChatRole::Assistant)
                 {
                     if let Some(tc) = last_assistant.tool_calls.iter_mut().find(|t| t.id == id) {
@@ -336,7 +349,8 @@ impl ChatState {
                     self.in_tool_call = false;
                     let buf = std::mem::take(&mut self.tool_call_buf);
                     if let Some((uuid, arguments)) = parse_tool_call_buf(&buf) {
-                        let description = self.tool_descriptions
+                        let description = self
+                            .tool_descriptions
                             .get(&uuid)
                             .cloned()
                             .unwrap_or_else(|| uuid.clone());
@@ -503,7 +517,9 @@ impl WasmChatState {
     #[wasm_bindgen(constructor)]
     pub fn new(format: &str) -> Self {
         let fmt = ToolCallFormat::from_architecture(format);
-        Self { inner: ChatState::new(fmt) }
+        Self {
+            inner: ChatState::new(fmt),
+        }
     }
 
     /// Set tool descriptions as a JSON object: {"uuid": "description", ...}
@@ -592,9 +608,12 @@ fn event_to_capnp(event: &ChatEvent) -> Vec<u8> {
     match event {
         ChatEvent::Content(text) => capnp::build_text_event(0, text),
         ChatEvent::Thinking(text) => capnp::build_text_event(1, text),
-        ChatEvent::ToolCallDetected { id, uuid, description, arguments } => {
-            capnp::build_tool_call_detected(id, uuid, description, arguments)
-        }
+        ChatEvent::ToolCallDetected {
+            id,
+            uuid,
+            description,
+            arguments,
+        } => capnp::build_tool_call_detected(id, uuid, description, arguments),
         ChatEvent::Complete => capnp::build_complete(),
         ChatEvent::Error(msg) => capnp::build_text_event(4, msg),
     }
@@ -605,7 +624,12 @@ fn event_to_json_value(event: &ChatEvent) -> serde_json::Value {
     match event {
         ChatEvent::Content(text) => serde_json::json!({"type": "content", "text": text}),
         ChatEvent::Thinking(text) => serde_json::json!({"type": "thinking", "text": text}),
-        ChatEvent::ToolCallDetected { id, uuid, description, arguments } => {
+        ChatEvent::ToolCallDetected {
+            id,
+            uuid,
+            description,
+            arguments,
+        } => {
             serde_json::json!({"type": "toolCallDetected", "id": id, "uuid": uuid,
                 "description": description, "arguments": arguments})
         }
@@ -620,11 +644,26 @@ mod tests {
 
     #[test]
     fn test_tool_call_format_from_architecture() {
-        assert_eq!(ToolCallFormat::from_architecture("qwen3"), ToolCallFormat::Qwen3Xml);
-        assert_eq!(ToolCallFormat::from_architecture("qwen3_5"), ToolCallFormat::Qwen35XmlParam);
-        assert_eq!(ToolCallFormat::from_architecture("llama3"), ToolCallFormat::LlamaJson);
-        assert_eq!(ToolCallFormat::from_architecture("mistral"), ToolCallFormat::MistralJson);
-        assert_eq!(ToolCallFormat::from_architecture("gemma"), ToolCallFormat::None);
+        assert_eq!(
+            ToolCallFormat::from_architecture("qwen3"),
+            ToolCallFormat::Qwen3Xml
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture("qwen3_5"),
+            ToolCallFormat::Qwen35XmlParam
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture("llama3"),
+            ToolCallFormat::LlamaJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture("mistral"),
+            ToolCallFormat::MistralJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture("gemma"),
+            ToolCallFormat::None
+        );
     }
 
     #[test]
@@ -676,9 +715,8 @@ mod tests {
     fn test_ingest_token_tool_call_json() {
         let mut state = ChatState::new(ToolCallFormat::Qwen3Xml);
         state.handle_command(ChatCommand::UserMessage("list repos".into()));
-        let events = state.ingest_token(
-            r#"<tool_call>{"name": "list_repos", "arguments": {}}</tool_call>"#
-        );
+        let events =
+            state.ingest_token(r#"<tool_call>{"name": "list_repos", "arguments": {}}</tool_call>"#);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ChatEvent::ToolCallDetected { uuid, .. } => assert_eq!(uuid, "list_repos"),
@@ -696,7 +734,9 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ChatEvent::ToolCallDetected { uuid, arguments, .. } => {
+            ChatEvent::ToolCallDetected {
+                uuid, arguments, ..
+            } => {
                 assert_eq!(uuid, "get_weather");
                 assert!(arguments.contains("NYC"));
             }

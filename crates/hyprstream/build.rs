@@ -39,14 +39,33 @@ fn compile_capnp_schemas() {
     let rpc_schemas = ["streaming", "nine"];
 
     // Compile hyprstream-rpc schemas with rpc_schema_dir as src_prefix
-    hyprstream_rpc_build::compile_schemas(&rpc_schema_dir, out_path, &[&rpc_schema_dir], &rpc_schemas);
+    hyprstream_rpc_build::compile_schemas(
+        &rpc_schema_dir,
+        out_path,
+        &[&rpc_schema_dir],
+        &rpc_schemas,
+    );
 
     // Copy CGR files from hyprstream-rpc-std so the proc macro can find them.
     // DEP_HYPRSTREAM_RPC_STD_OUT_DIR is set by hyprstream-rpc-std's build.rs.
     if let Ok(std_out_dir) = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR") {
-        let std_schemas = ["inference", "model", "registry", "policy", "mcp",
-                          "metrics", "notification", "service_events", "chat_core", "oauth",
-                          "worker", "workflow", "discovery", "tui", "compositor_ipc"];
+        let std_schemas = [
+            "inference",
+            "model",
+            "registry",
+            "policy",
+            "mcp",
+            "metrics",
+            "notification",
+            "service_events",
+            "chat_core",
+            "oauth",
+            "worker",
+            "workflow",
+            "discovery",
+            "tui",
+            "compositor_ipc",
+        ];
         for name in &std_schemas {
             let cgr_src = Path::new(&std_out_dir).join(format!("{name}.cgr"));
             let cgr_dst = out_path.join(format!("{name}.cgr"));
@@ -65,9 +84,25 @@ fn compile_capnp_schemas() {
     // Copy CGR files to stable codegen-out/ for TypeScript codegen
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
-    for name in ["inference", "model", "registry", "policy", "mcp", "metrics",
-                 "service_events", "chat_core", "oauth", "worker", "workflow",
-                 "discovery", "tui", "compositor_ipc"].iter().chain(rpc_schemas.iter()) {
+    for name in [
+        "inference",
+        "model",
+        "registry",
+        "policy",
+        "mcp",
+        "metrics",
+        "service_events",
+        "chat_core",
+        "oauth",
+        "worker",
+        "workflow",
+        "discovery",
+        "tui",
+        "compositor_ipc",
+    ]
+    .iter()
+    .chain(rpc_schemas.iter())
+    {
         let cgr_path = out_path.join(format!("{name}.cgr"));
         if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));

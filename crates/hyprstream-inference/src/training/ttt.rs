@@ -27,8 +27,8 @@ use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 use tch::{Device, Tensor};
 
-use crate::runtime::TorchEngine;
 use super::tenant_delta::TenantDelta;
+use crate::runtime::TorchEngine;
 
 /// Configuration for Test-Time Training
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +137,7 @@ fn default_tau_heavy() -> f32 {
     50.0
 }
 fn default_tau_reject() -> f32 {
-    200.0  // Perplexity > 200 is likely adversarial or garbage — skip TTT entirely
+    200.0 // Perplexity > 200 is likely adversarial or garbage — skip TTT entirely
 }
 fn default_delta_min() -> f32 {
     0.01
@@ -146,10 +146,10 @@ fn default_adaptive_steps() -> bool {
     true
 }
 fn default_max_adaptation_ms() -> u64 {
-    30_000  // 30 seconds — sufficient for consumer GPUs (RTX 4090: ~7s/step)
+    30_000 // 30 seconds — sufficient for consumer GPUs (RTX 4090: ~7s/step)
 }
 fn default_max_gradient_steps() -> usize {
-    50  // Safety ceiling for client overrides; explicit training needs more steps
+    50 // Safety ceiling for client overrides; explicit training needs more steps
 }
 fn default_pending_rollback_ms() -> u64 {
     60_000
@@ -195,9 +195,7 @@ impl Default for GradientGatingConfig {
 }
 
 #[allow(dead_code)]
-fn compute_per_layer_grad_norms(
-    vs: &tch::nn::VarStore,
-) -> HashMap<String, f64> {
+fn compute_per_layer_grad_norms(vs: &tch::nn::VarStore) -> HashMap<String, f64> {
     let mut norms: HashMap<String, f64> = HashMap::new();
     for (name, var) in vs.variables() {
         if !var.grad().defined() {
@@ -341,9 +339,7 @@ impl RankOracle {
         self.observation_count > 0 && self.observation_count % self.config.adaptation_interval == 0
     }
 
-    pub fn recommend(
-        &self,
-    ) -> HashMap<String, crate::runtime::ttn_profile::RankSignal> {
+    pub fn recommend(&self) -> HashMap<String, crate::runtime::ttn_profile::RankSignal> {
         self.tracker.rank_adaptation_signals(
             self.config.low_utilization_threshold,
             self.config.high_utilization_threshold,
@@ -546,7 +542,11 @@ pub struct TestTimeTrainer {
 impl TestTimeTrainer {
     /// Create a new TTT trainer with the given configuration
     pub fn new(config: TTTConfig, device: Device) -> Self {
-        Self { config, gradient_gating: GradientGatingConfig::default(), device }
+        Self {
+            config,
+            gradient_gating: GradientGatingConfig::default(),
+            device,
+        }
     }
 
     /// Create a new TTT trainer with gradient gating configuration
@@ -624,10 +624,7 @@ impl TestTimeTrainer {
         let config = delta.muon_config.clone();
         for (name, var) in &variables {
             if var.requires_grad() && var.grad().defined() {
-                let state = delta
-                    .muon_states
-                    .entry(name.clone())
-                    .or_default();
+                let state = delta.muon_states.entry(name.clone()).or_default();
                 muon_step(var, state, &config);
             }
         }
@@ -748,10 +745,12 @@ impl TestTimeTrainer {
         let initial_perplexity = initial_loss.exp();
 
         // Gate step count based on perplexity, then clamp to max
-        let gated_steps = self.gate_steps(initial_perplexity, overrides)
+        let gated_steps = self
+            .gate_steps(initial_perplexity, overrides)
             .min(self.config.max_gradient_steps);
 
-        let time_budget_ms = overrides.max_adaptation_ms
+        let time_budget_ms = overrides
+            .max_adaptation_ms
             .unwrap_or(self.config.max_adaptation_ms);
 
         if gated_steps == 0 {
@@ -803,12 +802,30 @@ impl TestTimeTrainer {
         // Run gradient loop with catch_unwind for panic safety.
         // On panic, delta is restored from pre_snapshot.
         let loop_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            self.adapt_tenant_inner(engine, delta, &tokens, gated_steps, lr, &start, budget, initial_loss_tensor)
+            self.adapt_tenant_inner(
+                engine,
+                delta,
+                &tokens,
+                gated_steps,
+                lr,
+                &start,
+                budget,
+                initial_loss_tensor,
+            )
         }));
 
         match loop_result {
             Ok(Ok(inner)) => {
-                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils, gated_layer_keys) = inner;
+                let (
+                    actual_steps,
+                    losses,
+                    grad_norms,
+                    any_clipped,
+                    final_loss,
+                    final_perplexity,
+                    rank_utils,
+                    gated_layer_keys,
+                ) = inner;
 
                 let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
                 let loss_improvement = initial_loss - final_loss;
@@ -852,7 +869,8 @@ impl TestTimeTrainer {
                                         RankSignal::Increase => {
                                             let new_rank = current * 2;
                                             delta.set_effective_rank(key, new_rank);
-                                            let actual = delta.effective_rank(key).unwrap_or(new_rank);
+                                            let actual =
+                                                delta.effective_rank(key).unwrap_or(new_rank);
                                             tracing::info!(key = %key, from = current, to = actual, "Rank oracle: increased");
                                         }
                                         RankSignal::Hold => {}
@@ -910,7 +928,10 @@ impl TestTimeTrainer {
             Ok(Err(e)) => {
                 // Gradient loop returned an error — restore delta, momentum, SSM states,
                 // and requires_grad (gradient gating may have frozen some variables).
-                tracing::warn!("TTT adapt_tenant gradient loop error, restoring delta: {}", e);
+                tracing::warn!(
+                    "TTT adapt_tenant gradient loop error, restoring delta: {}",
+                    e
+                );
                 let _ = delta.load_state_dict(&pre_snapshot);
                 super::muon::restore_muon_states(&mut delta.muon_states, &muon_snapshot);
                 Self::restore_requires_grad(delta);
@@ -941,7 +962,12 @@ impl TestTimeTrainer {
     }
 
     #[allow(dead_code)]
-    fn apply_gradient_gating(&self, delta: &TenantDelta, step: usize, total_steps: usize) -> Vec<String> {
+    fn apply_gradient_gating(
+        &self,
+        delta: &TenantDelta,
+        step: usize,
+        total_steps: usize,
+    ) -> Vec<String> {
         if !self.gradient_gating.enabled || total_steps <= self.gradient_gating.warmup_steps {
             return Vec::new();
         }
@@ -991,7 +1017,16 @@ impl TestTimeTrainer {
         start: &Instant,
         budget: Duration,
         initial_loss_tensor: Tensor,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, HashMap<String, f64>, Vec<String>)> {
+    ) -> Result<(
+        usize,
+        Vec<f32>,
+        Vec<f32>,
+        bool,
+        f32,
+        f32,
+        HashMap<String, f64>,
+        Vec<String>,
+    )> {
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
         let mut losses = vec![initial_loss];
         let mut grad_norms = Vec::with_capacity(gated_steps);
@@ -1014,8 +1049,10 @@ impl TestTimeTrainer {
             if start.elapsed() >= budget {
                 tracing::warn!(
                     "TTT: time budget exhausted after {}/{} steps ({:.0}ms >= {}ms)",
-                    actual_steps, gated_steps,
-                    start.elapsed().as_millis(), budget.as_millis()
+                    actual_steps,
+                    gated_steps,
+                    start.elapsed().as_millis(),
+                    budget.as_millis()
                 );
                 break;
             }
@@ -1053,7 +1090,16 @@ impl TestTimeTrainer {
             Self::restore_requires_grad(delta);
         }
 
-        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, rank_utils, gated_layer_keys))
+        Ok((
+            actual_steps,
+            losses,
+            grad_norms,
+            any_clipped,
+            final_loss,
+            final_perplexity,
+            rank_utils,
+            gated_layer_keys,
+        ))
     }
 
     /// Compute NTP loss with a tenant delta applied
@@ -1084,9 +1130,7 @@ impl TestTimeTrainer {
             let vocab_size = logits.size()[2];
 
             // Shift for next-token prediction
-            let pred_logits = logits
-                .narrow(1, 0, seq_len - 1)
-                .reshape([-1, vocab_size]);
+            let pred_logits = logits.narrow(1, 0, seq_len - 1).reshape([-1, vocab_size]);
 
             let target_ids = input_ids.narrow(1, 1, seq_len - 1).reshape([-1]);
 
@@ -1133,8 +1177,7 @@ impl TestTimeTrainer {
 
         // Clamp steps to hard ceiling
         let clamped_steps = gradient_steps.min(self.config.max_gradient_steps);
-        let time_budget_ms = max_adaptation_ms
-            .unwrap_or(self.config.max_adaptation_ms);
+        let time_budget_ms = max_adaptation_ms.unwrap_or(self.config.max_adaptation_ms);
         let budget = Duration::from_millis(time_budget_ms);
 
         let lr = learning_rate.unwrap_or(delta.learning_rate);
@@ -1152,7 +1195,17 @@ impl TestTimeTrainer {
 
         match loop_result {
             Ok(Ok(inner)) => {
-                let (actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity, gated_layer_keys) = inner;
+                let (
+                    actual_steps,
+                    losses,
+                    grad_norms,
+                    any_clipped,
+                    final_loss,
+                    final_perplexity,
+                    initial_loss,
+                    initial_perplexity,
+                    gated_layer_keys,
+                ) = inner;
 
                 let avg_loss = losses.iter().sum::<f32>() / losses.len() as f32;
                 let loss_improvement = initial_loss - final_loss;
@@ -1192,7 +1245,8 @@ impl TestTimeTrainer {
                                         RankSignal::Increase => {
                                             let new_rank = current * 2;
                                             delta.set_effective_rank(key, new_rank);
-                                            let actual = delta.effective_rank(key).unwrap_or(new_rank);
+                                            let actual =
+                                                delta.effective_rank(key).unwrap_or(new_rank);
                                             tracing::info!(key = %key, from = current, to = actual, "Rank oracle: increased");
                                         }
                                         RankSignal::Hold => {}
@@ -1282,7 +1336,17 @@ impl TestTimeTrainer {
         lr: f64,
         start: &Instant,
         budget: Duration,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>, bool, f32, f32, f32, f32, Vec<String>)> {
+    ) -> Result<(
+        usize,
+        Vec<f32>,
+        Vec<f32>,
+        bool,
+        f32,
+        f32,
+        f32,
+        f32,
+        Vec<String>,
+    )> {
         // Compute initial loss
         let initial_loss_tensor = self.compute_ntp_loss_with_delta(engine, delta, tokens)?;
         let initial_loss = initial_loss_tensor.double_value(&[]) as f32;
@@ -1309,8 +1373,10 @@ impl TestTimeTrainer {
             if start.elapsed() >= budget {
                 tracing::warn!(
                     "TTT train_step: time budget exhausted after {}/{} steps ({:.0}ms >= {}ms)",
-                    actual_steps, clamped_steps,
-                    start.elapsed().as_millis(), budget.as_millis()
+                    actual_steps,
+                    clamped_steps,
+                    start.elapsed().as_millis(),
+                    budget.as_millis()
                 );
                 break;
             }
@@ -1335,7 +1401,17 @@ impl TestTimeTrainer {
             Self::restore_requires_grad(delta);
         }
 
-        Ok((actual_steps, losses, grad_norms, any_clipped, final_loss, final_perplexity, initial_loss, initial_perplexity, gated_layer_keys))
+        Ok((
+            actual_steps,
+            losses,
+            grad_norms,
+            any_clipped,
+            final_loss,
+            final_perplexity,
+            initial_loss,
+            initial_perplexity,
+            gated_layer_keys,
+        ))
     }
 }
 
@@ -1434,17 +1510,14 @@ mod tests {
 
     #[test]
     fn test_gradient_gating_with_real_backward() {
-        use tch::{Kind, nn::VarStore};
+        use tch::{nn::VarStore, Kind};
         let vs = VarStore::new(Device::Cpu);
         let root = vs.root();
         let a = root
             .sub("layer_0")
             .sub("q_proj")
             .kaiming_uniform("lora_a", &[4, 8]);
-        let b = root
-            .sub("layer_0")
-            .sub("q_proj")
-            .zeros("lora_b", &[8, 4]);
+        let b = root.sub("layer_0").sub("q_proj").zeros("lora_b", &[8, 4]);
         let x = Tensor::randn([2, 8], (Kind::Float, Device::Cpu));
 
         // Forward + backward with requires_grad=true
@@ -1464,9 +1537,7 @@ mod tests {
         let loss2 = out2.sum(Kind::Float);
         loss2.backward();
         // a should have NO gradient (frozen)
-        assert!(
-            !a.grad().defined() || a.grad().abs().sum(Kind::Double).double_value(&[]) == 0.0
-        );
+        assert!(!a.grad().defined() || a.grad().abs().sum(Kind::Double).double_value(&[]) == 0.0);
         // b should still have gradient
         assert!(b.grad().defined());
 

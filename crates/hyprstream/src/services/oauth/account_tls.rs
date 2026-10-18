@@ -15,7 +15,7 @@ pub(super) async fn serve_with_reload(
     reload_interval: Duration,
 ) -> Result<(), RpcError> {
     let live_tls = match &bound {
-        BoundHttpListener::Https(_, tls) => tls.clone(),
+        BoundHttpListener::Https(_, tls) => tls.rustls.clone(),
         BoundHttpListener::Http(_) => {
             return Err(RpcError::SpawnFailed(
                 "account listener requires TLS".to_owned(),
@@ -74,7 +74,7 @@ mod tests {
         let tls = super::super::resolve_account_http_tls(&config, &zone).await?;
         let bound = crate::server::tls::bind_listener(
             "127.0.0.1:0".parse()?,
-            Some(tls),
+            Some(crate::server::tls::ResolvedTlsConfig::ordinary(tls)),
             "AccountRotationTest",
         )?;
         let address = match &bound {

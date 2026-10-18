@@ -46,9 +46,9 @@ use super::tenant_delta::{
     load_state_dict_from_bytes, serialize_state_dict_to_bytes, TenantDelta, TenantDeltaConfig,
 };
 use crate::runtime::kv_cache::KVCacheRegistry;
-use hyprstream_rpc_std::registry_client::WorktreeClient;
 use crate::worktree_ext::WorktreeClientExt;
 use hyprstream_rpc::Subject;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
 
 /// Maximum snapshot size in bytes (512 MB). Deltas exceeding this are not snapshotted on eviction.
 const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
@@ -423,7 +423,11 @@ impl DeltaPool {
             match fs.read_file_chunked(&rel_path).await {
                 Ok(bytes) => {
                     if let Err(e) = fs.write_file_chunked(&corrupt_rel, &bytes).await {
-                        tracing::warn!("Failed to write quarantined snapshot {}: {}", corrupt_rel, e);
+                        tracing::warn!(
+                            "Failed to write quarantined snapshot {}: {}",
+                            corrupt_rel,
+                            e
+                        );
                     }
                 }
                 Err(e) => {
@@ -441,10 +445,18 @@ impl DeltaPool {
                 .snapshots_dir
                 .join(format!("{}.safetensors.corrupt", id_filename));
             if let Err(e) = std::fs::rename(&path, &corrupt) {
-                tracing::warn!("Failed to quarantine corrupt snapshot {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to quarantine corrupt snapshot {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
-        tracing::warn!("Quarantined corrupt snapshot for '{}' -> {}", id_filename, corrupt_rel);
+        tracing::warn!(
+            "Quarantined corrupt snapshot for '{}' -> {}",
+            id_filename,
+            corrupt_rel
+        );
     }
 
     /// Get an existing delta (returns None if not found)
@@ -616,24 +628,28 @@ impl DeltaPool {
                 .snapshots_dir
                 .join(format!("{}.safetensors", id_filename));
             // Safety: snapshot_data is Some only when self.fs.is_some() was true above
-            let Some(ref fs) = self.fs else { unreachable!() };
+            let Some(ref fs) = self.fs else {
+                unreachable!()
+            };
             let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
 
             if memory_bytes > MAX_SNAPSHOT_BYTES {
                 tracing::warn!(
                     "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
-                    id, memory_bytes, MAX_SNAPSHOT_BYTES
+                    id,
+                    memory_bytes,
+                    MAX_SNAPSHOT_BYTES
                 );
                 None
             } else {
                 match async {
-                    fs.mkdir_p("adapters/.snapshots").await.map_err(|e| {
-                        anyhow::anyhow!("FsOps mkdir failed: {}", e)
-                    })?;
+                    fs.mkdir_p("adapters/.snapshots")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("FsOps mkdir failed: {}", e))?;
                     let bytes = serialize_state_dict_to_bytes(&state_dict)?;
-                    fs.write_file_chunked(&rel_path, &bytes).await.map_err(
-                        |e| anyhow::anyhow!("FsOps write_file failed: {}", e),
-                    )?;
+                    fs.write_file_chunked(&rel_path, &bytes)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("FsOps write_file failed: {}", e))?;
                     Ok::<(), anyhow::Error>(())
                 }
                 .await
@@ -641,15 +657,13 @@ impl DeltaPool {
                     Ok(()) => {
                         tracing::info!(
                             "Auto-snapshot delta '{}' before eviction via FsOps: {}",
-                            id, rel_path
+                            id,
+                            rel_path
                         );
                         Some(snapshot_file)
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to snapshot delta '{}' via FsOps: {}",
-                            id, e
-                        );
+                        tracing::warn!("Failed to snapshot delta '{}' via FsOps: {}", id, e);
                         None
                     }
                 }
@@ -678,9 +692,7 @@ impl DeltaPool {
     /// **WARNING**: This uses `futures::executor::block_on()` for snapshot I/O.
     /// Only safe to call from non-async contexts (tests, standalone threads).
     /// In async contexts, use `evict_lru_async()` instead.
-    pub fn evict_lru(
-        &self,
-    ) -> Option<(Subject, Arc<Mutex<TenantDelta>>, Option<PathBuf>)> {
+    pub fn evict_lru(&self) -> Option<(Subject, Arc<Mutex<TenantDelta>>, Option<PathBuf>)> {
         // For sync callers, we can't do async I/O. Remove without snapshot
         // if there's no WorktreeClient, or use block_on only in non-async contexts.
         if self.deltas.is_empty() {
@@ -693,58 +705,61 @@ impl DeltaPool {
         let id_filename = Self::sanitize_filename(&id.to_string());
 
         // Snapshot without async I/O — extract state dict only, skip FsOps writes
-        let snapshot_path = {
-            let d = delta.lock();
-            if d.accumulated_steps > 0 {
-                let snapshot_file = self
-                    .snapshots_dir
-                    .join(format!("{}.safetensors", id_filename));
-                // In sync context, we can only write directly to the snapshots_dir
-                // (not through WorktreeClient which requires async)
-                let state_dict = Self::snapshot_state_dict(&d);
-                let memory_bytes = d.memory_bytes();
-                drop(d);
+        let snapshot_path =
+            {
+                let d = delta.lock();
+                if d.accumulated_steps > 0 {
+                    let snapshot_file = self
+                        .snapshots_dir
+                        .join(format!("{}.safetensors", id_filename));
+                    // In sync context, we can only write directly to the snapshots_dir
+                    // (not through WorktreeClient which requires async)
+                    let state_dict = Self::snapshot_state_dict(&d);
+                    let memory_bytes = d.memory_bytes();
+                    drop(d);
 
-                if memory_bytes > MAX_SNAPSHOT_BYTES {
-                    tracing::warn!(
+                    if memory_bytes > MAX_SNAPSHOT_BYTES {
+                        tracing::warn!(
                         "Delta '{}' exceeds max snapshot size ({} bytes > {}), skipping snapshot",
                         id, memory_bytes, MAX_SNAPSHOT_BYTES
                     );
-                    None
-                } else {
-                    match serialize_state_dict_to_bytes(&state_dict) {
-                        Ok(bytes) => {
-                            if let Err(e) = std::fs::create_dir_all(&self.snapshots_dir) {
-                                tracing::warn!("Failed to create snapshots dir: {}", e);
-                                None
-                            } else if let Err(e) = std::fs::write(&snapshot_file, &bytes) {
+                        None
+                    } else {
+                        match serialize_state_dict_to_bytes(&state_dict) {
+                            Ok(bytes) => {
+                                if let Err(e) = std::fs::create_dir_all(&self.snapshots_dir) {
+                                    tracing::warn!("Failed to create snapshots dir: {}", e);
+                                    None
+                                } else if let Err(e) = std::fs::write(&snapshot_file, &bytes) {
+                                    tracing::warn!(
+                                        "Failed to write snapshot for delta '{}': {}",
+                                        id,
+                                        e
+                                    );
+                                    None
+                                } else {
+                                    tracing::info!(
+                                        "Auto-snapshot delta '{}' before eviction: {}",
+                                        id,
+                                        snapshot_file.display()
+                                    );
+                                    Some(snapshot_file)
+                                }
+                            }
+                            Err(e) => {
                                 tracing::warn!(
-                                    "Failed to write snapshot for delta '{}': {}",
-                                    id, e
+                                    "Failed to serialize delta '{}' for snapshot: {}",
+                                    id,
+                                    e
                                 );
                                 None
-                            } else {
-                                tracing::info!(
-                                    "Auto-snapshot delta '{}' before eviction: {}",
-                                    id,
-                                    snapshot_file.display()
-                                );
-                                Some(snapshot_file)
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to serialize delta '{}' for snapshot: {}",
-                                id, e
-                            );
-                            None
-                        }
                     }
+                } else {
+                    None
                 }
-            } else {
-                None
-            }
-        };
+            };
 
         // Invalidate dependent KV caches
         if let Some(kv_reg) = &self.kv_registry {
@@ -884,7 +899,11 @@ impl DeltaPool {
                         )
                     }
                     Err(e) => {
-                        tracing::warn!("export_all: failed to snapshot delta '{}': {} (loss)", id, e);
+                        tracing::warn!(
+                            "export_all: failed to snapshot delta '{}': {} (loss)",
+                            id,
+                            e
+                        );
                         None
                     }
                 }
@@ -1101,7 +1120,10 @@ mod tests {
         // Evict (sync path writes snapshot to `dir`), then hydrate a fresh miss.
         let evicted = pool.evict_lru();
         assert!(evicted.is_some());
-        assert!(evicted.unwrap().2.is_some(), "eviction should write a snapshot");
+        assert!(
+            evicted.unwrap().2.is_some(),
+            "eviction should write a snapshot"
+        );
         assert_eq!(pool.tenant_count(), 0);
 
         let delta_arc = pool.get_or_hydrate(&tid).await.unwrap();
@@ -1112,7 +1134,11 @@ mod tests {
             .abs()
             .max()
             .double_value(&[]);
-        assert!(max_diff < 1e-6, "B weights rehydrated (max diff {})", max_diff);
+        assert!(
+            max_diff < 1e-6,
+            "B weights rehydrated (max diff {})",
+            max_diff
+        );
 
         drop(d);
         let _ = std::fs::remove_dir_all(&dir);

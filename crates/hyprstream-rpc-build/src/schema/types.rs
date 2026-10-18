@@ -172,6 +172,9 @@ pub struct FieldDef {
     pub description: String,
     /// From `$fixedSize(N)` annotation: generates `[u8; N]` instead of `Vec<u8>` for Data fields.
     pub fixed_size: Option<u32>,
+    /// From `$maxLen(N)` annotation: Text fields reject decoded values longer
+    /// than N at the borrowed reader, before any owned String is allocated.
+    pub max_len: Option<u32>,
     /// From `$optional` annotation: field is optional in MCP tool schemas and uses
     /// type-appropriate zero-value defaults when absent at runtime.
     pub optional: bool,

@@ -40,8 +40,7 @@ use tracing::{debug, info, warn};
 /// concurrent registration from different schemes (each holding only their
 /// own per-scheme lock) causes heap corruption. This mutex ensures only one
 /// thread calls `git2::transport::register` at a time.
-static GIT2_TRANSPORT_REGISTER_LOCK: Lazy<Mutex<()>> =
-    Lazy::new(|| Mutex::new(()));
+static GIT2_TRANSPORT_REGISTER_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Thread-safe transport registry with proper lifecycle management
 pub struct TransportRegistry {
@@ -392,7 +391,9 @@ mod tests {
                 let registry = Arc::clone(&registry);
                 let factory = Arc::clone(&factory);
                 let scheme = scheme.clone();
-                std::thread::spawn(move || registry.register_transport(scheme, Arc::clone(&factory)))
+                std::thread::spawn(move || {
+                    registry.register_transport(scheme, Arc::clone(&factory))
+                })
             })
             .collect();
 
@@ -493,8 +494,7 @@ mod tests {
 
         {
             let _guard = TransportGuard::new(registry.clone(), scheme.clone());
-            let result = registry
-                .register_transport(scheme.clone(), Arc::clone(&factory));
+            let result = registry.register_transport(scheme.clone(), Arc::clone(&factory));
             assert!(result.is_ok());
             assert!(registry.has_transport(&scheme));
         } // Guard goes out of scope

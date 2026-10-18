@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
-use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::events::EventSubscriber;
+use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
@@ -18,21 +18,25 @@ use hyprstream_vfs::Namespace;
 
 use crate::error::Result;
 use crate::events::ReceivedEvent;
-use crate::generated::workflow_client::{WorkflowHandler, dispatch_workflow};
+use crate::generated::workflow_client::{dispatch_workflow, WorkflowHandler};
 use hyprstream_rpc_std::workflow_client::{
-    WorkflowResponseVariant,
-    WorkflowDef as WorkflowDefWire, WorkflowInfo, WorkflowRun as WorkflowRunWire,
-    JobRun as JobRunWire, StepRun as StepRunWire,
-    RunStatus as WireRunStatus,
     // Request types
-    DispatchRequest, SubscribeRequest,
+    DispatchRequest,
+    JobRun as JobRunWire,
+    RunStatus as WireRunStatus,
+    StepRun as StepRunWire,
+    SubscribeRequest,
+    WorkflowDef as WorkflowDefWire,
+    WorkflowInfo,
+    WorkflowResponseVariant,
+    WorkflowRun as WorkflowRunWire,
 };
 
 use super::runner::WorkflowRunner;
 use super::scheduler::JobScheduler;
 use super::subscription::WorkflowSubscription;
 use super::triggers::{EventHandler, EventTrigger, HandlerResult};
-use super::{RunId, WorkflowId, Workflow};
+use super::{RunId, Workflow, WorkflowId};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Internal domain types — NOT exposed in the public API.
@@ -159,10 +163,7 @@ impl WorkflowService {
     ///
     /// * `transport` - Transport configuration for service binding
     /// * `signing_key` - Signing key for message authentication
-    pub fn new(
-        transport: TransportConfig,
-        signing_key: SigningKey,
-    ) -> Self {
+    pub fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
         Self {
             workflows: RwLock::new(HashMap::new()),
             runs: Arc::new(RwLock::new(HashMap::new())),
@@ -430,7 +431,10 @@ impl WorkflowService {
         for handler in handlers.iter() {
             if handler.matches(&event) {
                 match handler.handle(&event).await {
-                    Ok(HandlerResult::Dispatch { workflow_id, inputs }) => {
+                    Ok(HandlerResult::Dispatch {
+                        workflow_id,
+                        inputs,
+                    }) => {
                         tracing::info!(
                             workflow_id = %workflow_id,
                             trigger_event = %topic,
@@ -479,7 +483,8 @@ impl WorkflowService {
     /// Vec (not an error) if no path is registered for the repo or if the
     /// workflows directory does not exist.
     pub(crate) async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>> {
-        self.scan_repo_with(repo_id, super::parser::ParseMode::Legacy).await
+        self.scan_repo_with(repo_id, super::parser::ParseMode::Legacy)
+            .await
     }
 
     /// Scan a repository with an explicit [`ParseMode`] (#1432).
@@ -627,9 +632,9 @@ impl WorkflowService {
     ) -> Result<RunId> {
         // Reject reserved _-prefixed keys in user inputs (provenance injection prevention).
         if let Some(bad_key) = inputs.keys().find(|k| k.starts_with('_')) {
-            return Err(crate::error::WorkerError::WorkflowParseError(
-                format!("input keys starting with '_' are reserved: {bad_key}"),
-            ));
+            return Err(crate::error::WorkerError::WorkflowParseError(format!(
+                "input keys starting with '_' are reserved: {bad_key}"
+            )));
         }
 
         let workflows = self.workflows.read().await;
@@ -844,15 +849,23 @@ fn to_run_data(run: &WorkflowRun) -> WorkflowRunWire {
         status: run.status,
         started_at: run.started_at.map(|t| t.timestamp()).unwrap_or(0),
         completed_at: run.completed_at.map(|t| t.timestamp()).unwrap_or(0),
-        jobs: run.jobs.values().map(|j| JobRunWire {
-            name: j.name.clone(),
-            status: j.status,
-            steps: j.steps.iter().map(|s| StepRunWire {
-                name: s.name.clone(),
-                status: s.status,
-                exit_code: s.exit_code.unwrap_or(0),
-            }).collect(),
-        }).collect(),
+        jobs: run
+            .jobs
+            .values()
+            .map(|j| JobRunWire {
+                name: j.name.clone(),
+                status: j.status,
+                steps: j
+                    .steps
+                    .iter()
+                    .map(|s| StepRunWire {
+                        name: s.name.clone(),
+                        status: s.status,
+                        exit_code: s.exit_code.unwrap_or(0),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -861,26 +874,34 @@ fn to_run_data(run: &WorkflowRun) -> WorkflowRunWire {
 // Spawnable blanket impl and must be run on a LocalSet or single-threaded runtime.
 #[async_trait::async_trait(?Send)]
 impl WorkflowHandler for WorkflowService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> AnyhowResult<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> AnyhowResult<()> {
         if let Some(ref auth_fn) = self.authorize_fn {
             let subject = ctx.subject().to_string();
-            let domain = ctx.domain()?;
-            let allowed = auth_fn(
-                subject.clone(),
-                domain,
-                resource.to_owned(),
-                operation.to_owned(),
-                ctx.jwt_token().map(str::to_owned),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
-                false
-            });
+            let allowed = auth_fn(ctx.clone(), resource.to_owned(), operation.to_owned())
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "Policy check failed for {} on {}: {} - denying access",
+                        subject,
+                        resource,
+                        e
+                    );
+                    false
+                });
             if allowed {
                 Ok(())
             } else {
-                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+                anyhow::bail!(
+                    "Unauthorized: {} cannot {} on {}",
+                    subject,
+                    operation,
+                    resource
+                )
             }
         } else {
             // No authorization configured — fail-closed
@@ -962,7 +983,9 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         request: &DispatchRequest,
     ) -> AnyhowResult<WorkflowResponseVariant> {
-        let inputs_map: HashMap<String, String> = request.inputs.iter()
+        let inputs_map: HashMap<String, String> = request
+            .inputs
+            .iter()
             .map(|kv| (kv.key.clone(), kv.value.clone()))
             .collect();
         // Pass the verified `Subject` through directly — never round-trip it
@@ -972,7 +995,9 @@ impl WorkflowHandler for WorkflowService {
         // would then pass the fail-closed admission check this dispatch path
         // feeds (#527) — defeating per-subject quota + the anonymous deny.
         let subject = ctx.subject();
-        let run_id = self.dispatch(&request.workflow_id.clone(), inputs_map, &subject).await?;
+        let run_id = self
+            .dispatch(&request.workflow_id.clone(), inputs_map, &subject)
+            .await?;
         Ok(WorkflowResponseVariant::DispatchResult(run_id))
     }
 
@@ -1007,7 +1032,10 @@ impl WorkflowHandler for WorkflowService {
         }
         {
             let mut repo_workflows = self.repo_workflows.write().await;
-            repo_workflows.entry(repo_id).or_default().push(subscription);
+            repo_workflows
+                .entry(repo_id)
+                .or_default()
+                .push(subscription);
         }
 
         tracing::info!(workflow_id = %request.workflow_id, sub_id = %sub_id, "Subscribed");
@@ -1065,7 +1093,7 @@ impl WorkflowHandler for WorkflowService {
     ) -> AnyhowResult<WorkflowResponseVariant> {
         let runs = self.list_runs(&workflow_id.to_owned()).await?;
         Ok(WorkflowResponseVariant::ListRunsResult(
-            runs.iter().map(to_run_data).collect()
+            runs.iter().map(to_run_data).collect(),
         ))
     }
 }
@@ -1086,7 +1114,11 @@ impl RequestService for WorkflowService {
         crate::generated::workflow_client::decode_workflow_request_body(signed_body)
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, body: &hyprstream_rpc::service::DecodedRequestBody,) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         tracing::debug!(
             "Workflow request from {} (request_id={})",
             ctx.subject(),
@@ -1147,22 +1179,48 @@ fn extract_triggers(workflow: &Workflow) -> Vec<EventTrigger> {
         WorkflowTrigger::Complex(map) => map.keys().cloned().collect(),
     };
 
-    event_names.iter().flat_map(|event| match event.as_str() {
-        "push" => vec![EventTrigger::RepositoryEvent { event_type: RepoEventType::Push, pattern: None }],
-        "pull_request" => vec![EventTrigger::RepositoryEvent { event_type: RepoEventType::PullRequest, pattern: None }],
-        // GitHub's `create` event fires for BOTH branch and tag creation. There
-        // is no dedicated branch-create variant in RepoEventType, so emit a Tag
-        // trigger plus a Push trigger (the closest branch-ref match) to avoid
-        // silently dropping branch-creation events.
-        "create" => vec![
-            EventTrigger::RepositoryEvent { event_type: RepoEventType::Tag, pattern: None },
-            EventTrigger::RepositoryEvent { event_type: RepoEventType::Push, pattern: None },
-        ],
-        "tag" => vec![EventTrigger::RepositoryEvent { event_type: RepoEventType::Tag, pattern: None }],
-        "workflow_dispatch" => vec![EventTrigger::WorkflowDispatch { inputs: std::collections::HashMap::new() }],
-        "schedule" | "training" => vec![EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() }],
-        _ => vec![EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() }],
-    }).collect()
+    event_names
+        .iter()
+        .flat_map(|event| match event.as_str() {
+            "push" => vec![EventTrigger::RepositoryEvent {
+                event_type: RepoEventType::Push,
+                pattern: None,
+            }],
+            "pull_request" => vec![EventTrigger::RepositoryEvent {
+                event_type: RepoEventType::PullRequest,
+                pattern: None,
+            }],
+            // GitHub's `create` event fires for BOTH branch and tag creation. There
+            // is no dedicated branch-create variant in RepoEventType, so emit a Tag
+            // trigger plus a Push trigger (the closest branch-ref match) to avoid
+            // silently dropping branch-creation events.
+            "create" => vec![
+                EventTrigger::RepositoryEvent {
+                    event_type: RepoEventType::Tag,
+                    pattern: None,
+                },
+                EventTrigger::RepositoryEvent {
+                    event_type: RepoEventType::Push,
+                    pattern: None,
+                },
+            ],
+            "tag" => vec![EventTrigger::RepositoryEvent {
+                event_type: RepoEventType::Tag,
+                pattern: None,
+            }],
+            "workflow_dispatch" => vec![EventTrigger::WorkflowDispatch {
+                inputs: std::collections::HashMap::new(),
+            }],
+            "schedule" | "training" => vec![EventTrigger::Custom {
+                topic: format!("training.{event}"),
+                pattern: String::new(),
+            }],
+            _ => vec![EventTrigger::Custom {
+                topic: format!("repo.{event}"),
+                pattern: String::new(),
+            }],
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1179,9 +1237,9 @@ mod tests {
     // anonymous context can't be built from this crate; this test pins the
     // invariant the dispatch boundary depends on instead.
 
-    use hyprstream_vfs::Subject;
     use hyprstream_rpc::prelude::SigningKey;
     use hyprstream_rpc::transport::TransportConfig;
+    use hyprstream_vfs::Subject;
     use rand::rngs::OsRng;
     use std::path::PathBuf;
 
@@ -1244,7 +1302,8 @@ jobs:
         write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         let defs = svc.scan_repo("acme").await?;
         assert_eq!(defs.len(), 1, "legacy mode loads the unknown-key workflow");
@@ -1257,12 +1316,16 @@ jobs:
         write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         let defs = svc
             .scan_repo_with("acme", super::super::parser::ParseMode::Strict)
             .await?;
-        assert!(defs.is_empty(), "strict mode skips the unknown-key workflow");
+        assert!(
+            defs.is_empty(),
+            "strict mode skips the unknown-key workflow"
+        );
         Ok(())
     }
 
@@ -1275,7 +1338,8 @@ jobs:
         write_workflow(tmp.path(), KNOWN_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
             .await?;
@@ -1304,7 +1368,11 @@ jobs:
         // 3. Fail-closed confirmation: dispatching the evicted id must now
         //    be WorkflowNotFound, not a stale run.
         match svc
-            .dispatch(&wf_id, std::collections::HashMap::new(), &Subject::anonymous())
+            .dispatch(
+                &wf_id,
+                std::collections::HashMap::new(),
+                &Subject::anonymous(),
+            )
             .await
         {
             Err(crate::error::WorkerError::WorkflowNotFound(id)) => assert_eq!(id, wf_id),
@@ -1321,7 +1389,8 @@ jobs:
         write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         svc.rescan_repo("acme").await?;
         let wf_id = String::from("acme:.github/workflows/gate.yml");
@@ -1346,9 +1415,11 @@ jobs:
         write_workflow(tmp.path(), KNOWN_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
         // Gate loads in strict mode → records the mode per-repo.
-        svc.set_repo_mode("acme", super::super::parser::ParseMode::Strict).await;
+        svc.set_repo_mode("acme", super::super::parser::ParseMode::Strict)
+            .await;
         svc.rescan_repo("acme").await?; // registers the known workflow
 
         let wf_id = String::from("acme:.github/workflows/gate.yml");
@@ -1376,7 +1447,8 @@ jobs:
         write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
         // No set_repo_mode call → default Legacy.
         svc.rescan_repo("acme").await?;
 
@@ -1400,7 +1472,8 @@ jobs:
         write_workflow(tmp.path(), KNOWN_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         // Enter strict via the explicit rescan variant only.
         svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
@@ -1437,7 +1510,8 @@ jobs:
         write_workflow(tmp.path(), KNOWN_YAML).await?;
 
         let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        svc.register_repo_path("acme", PathBuf::from(tmp.path()))
+            .await;
 
         // Explicit strict selection.
         svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
@@ -1483,7 +1557,8 @@ jobs:
         handles.push({
             let svc = Arc::clone(&svc);
             tokio::spawn(async move {
-                svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict).await
+                svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+                    .await
             })
         });
         for _ in 0..4 {
@@ -1533,12 +1608,11 @@ jobs:
         // Strict selection, concurrently. The per-repo mutex serializes them.
         let svc_a = Arc::clone(&svc);
         let svc_b = Arc::clone(&svc);
-        let (ra, rb) = tokio::join!(
-            async { svc_a.rescan_repo("acme").await },
-            async {
-                svc_b.rescan_repo_with("acme", super::super::parser::ParseMode::Strict).await
-            }
-        );
+        let (ra, rb) = tokio::join!(async { svc_a.rescan_repo("acme").await }, async {
+            svc_b
+                .rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+                .await
+        });
         ra?;
         rb?;
 
@@ -1590,10 +1664,14 @@ jobs:
             *pk == key_a || *pk == key_b
         }));
 
-        assert!(RequestService::accept_delegated_bearer(&svc, &key_a),
-            "must accept authorized MCP key A");
-        assert!(RequestService::accept_delegated_bearer(&svc, &key_b),
-            "must accept authorized MCP key B");
+        assert!(
+            RequestService::accept_delegated_bearer(&svc, &key_a),
+            "must accept authorized MCP key A"
+        );
+        assert!(
+            RequestService::accept_delegated_bearer(&svc, &key_b),
+            "must accept authorized MCP key B"
+        );
         // Non-MCP signer rejected — independently scoped, not a wildcard.
         assert!(!RequestService::accept_delegated_bearer(&svc, &[0xEF; 32]));
         assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]));
@@ -1622,17 +1700,20 @@ jobs:
 
         let key = [0x77; 32];
         // While authorized → accepted.
-        assert!(RequestService::accept_delegated_bearer(&svc, &key),
-            "must accept while the key is live-authorized");
+        assert!(
+            RequestService::accept_delegated_bearer(&svc, &key),
+            "must accept while the key is live-authorized"
+        );
 
         // Simulate live revocation (trust store removes / expires the key).
         authorized.store(false, Ordering::Relaxed);
 
         // Same key, same authorizer, same service — now rejected. No snapshot.
-        assert!(!RequestService::accept_delegated_bearer(&svc, &key),
-            "must reject immediately after live revocation (no frozen snapshot)");
+        assert!(
+            !RequestService::accept_delegated_bearer(&svc, &key),
+            "must reject immediately after live revocation (no frozen snapshot)"
+        );
     }
-
 
     #[test]
     fn jwt_expected_audience_round_trips_through_request_service() {
@@ -1641,8 +1722,7 @@ jobs:
         use hyprstream_rpc::transport::TransportConfig;
 
         let sk = SigningKey::from_bytes(&[0x42; 32]);
-        let mut svc =
-            WorkflowService::new(TransportConfig::inproc("wf-plumb-test"), sk);
+        let mut svc = WorkflowService::new(TransportConfig::inproc("wf-plumb-test"), sk);
         // Default: no audience configured → a JWT-auth request would be denied
         // at envelope verification (the pre-fix behavior the review flagged).
         assert!(RequestService::expected_audience(&svc).is_none());

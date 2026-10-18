@@ -64,11 +64,10 @@ impl At9pCapsuleResolver for At9pGateResolver {
             .subject_keys
             .iter()
             .map(|subject| {
-                let ed25519: [u8; 32] = subject
-                    .ed25519_pub
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow!("ed25519 subject key is not {ED25519_PUBLIC_KEY_LEN} bytes"))?;
+                let ed25519: [u8; 32] =
+                    subject.ed25519_pub.as_slice().try_into().map_err(|_| {
+                        anyhow!("ed25519 subject key is not {ED25519_PUBLIC_KEY_LEN} bytes")
+                    })?;
                 let ml_dsa_65 = ml_dsa_vk_from_bytes(&subject.mldsa65_pub)?;
                 Ok(VerifiedAt9pKeys::key(ed25519, ml_dsa_65))
             })
@@ -167,7 +166,9 @@ mod tests {
     fn gate_resolver_returns_verified_subject_keys() {
         let (capsule, bytes, did) = signed(1);
         let primary = capsule.body.subject_keys[0].clone();
-        let verified = At9pGateResolver::new().verify_bytes(&did, &bytes).expect("GATE passes");
+        let verified = At9pGateResolver::new()
+            .verify_bytes(&did, &bytes)
+            .expect("GATE passes");
         let ed_arr: [u8; 32] = primary.ed25519_pub.as_slice().try_into().unwrap();
         let selected = verified
             .for_ed25519(&ed_arr)
@@ -257,11 +258,8 @@ mod tests {
         let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://node8").unwrap();
         let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
         // s1 listed FIRST, s2 second.
-        let body = CapsuleBody::new(
-            vec![s1.keypair.clone(), s2.keypair.clone()],
-            vec![service],
-        )
-        .unwrap();
+        let body =
+            CapsuleBody::new(vec![s1.keypair.clone(), s2.keypair.clone()], vec![service]).unwrap();
         // Self-certify with s1 (the first key).
         let capsule = sign_capsule(body, &s1.ed_sk, &s1.pq_sk).unwrap();
         let bytes = capsule.to_dag_cbor().unwrap();
@@ -293,7 +291,9 @@ mod tests {
 
         // The binding is s2's ATOMIC pair — bound under ed2, equal to s2's PQ half.
         assert_eq!(store.len(), 1);
-        let bound = store.ml_dsa_key_for(&ed2).expect("s2 hybrid binding installed");
+        let bound = store
+            .ml_dsa_key_for(&ed2)
+            .expect("s2 hybrid binding installed");
         assert_eq!(ml_dsa_vk_bytes(&bound), s2.keypair.mldsa65_pub);
         // And nothing was bound under s1 (no positional collapse).
         assert!(store.ml_dsa_key_for(&ed1).is_none());
@@ -308,11 +308,8 @@ mod tests {
         let outsider = signer(12);
         let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://node10").unwrap();
         let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
-        let body = CapsuleBody::new(
-            vec![s1.keypair.clone(), s2.keypair.clone()],
-            vec![service],
-        )
-        .unwrap();
+        let body =
+            CapsuleBody::new(vec![s1.keypair.clone(), s2.keypair.clone()], vec![service]).unwrap();
         let capsule = sign_capsule(body, &s1.ed_sk, &s1.pq_sk).unwrap();
         let bytes = capsule.to_dag_cbor().unwrap();
         let did = format!("{DID_AT9P_PREFIX}{}", capsule.cid512().unwrap());

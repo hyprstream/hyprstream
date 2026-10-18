@@ -118,36 +118,35 @@ where
     let response_recipient = ctx.response_kem_recipient.clone();
     let request_iat = ctx.request_iat;
     let request_nonce = ctx.request_nonce;
-    let sign_response_with_challenge = |payload: Vec<u8>,
-                                        server_challenge: Option<Vec<u8>>|
-     -> Result<ResponseEnvelope> {
-        if carrier.forbids_cleartext_envelope() {
-            let recipient = response_recipient
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing authenticated response recipient"))?;
-            ResponseEnvelope::new_signed_encrypted_with_challenge(
-                request_id,
-                payload,
-                server_challenge,
-                signing_key,
-                &response_pq_key,
-                recipient,
-                request_iat,
-                &request_nonce,
-                actual_service_domain,
-            )
-            .map_err(Into::into)
-        } else {
-            ResponseEnvelope::new_signed_with_challenge(
-                request_id,
-                payload,
-                server_challenge,
-                signing_key,
-                Some(&response_pq_key),
-                crate::crypto::CryptoPolicy::Hybrid,
-            )
-        }
-    };
+    let sign_response_with_challenge =
+        |payload: Vec<u8>, server_challenge: Option<Vec<u8>>| -> Result<ResponseEnvelope> {
+            if carrier.forbids_cleartext_envelope() {
+                let recipient = response_recipient
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing authenticated response recipient"))?;
+                ResponseEnvelope::new_signed_encrypted_with_challenge(
+                    request_id,
+                    payload,
+                    server_challenge,
+                    signing_key,
+                    &response_pq_key,
+                    recipient,
+                    request_iat,
+                    &request_nonce,
+                    actual_service_domain,
+                )
+                .map_err(Into::into)
+            } else {
+                ResponseEnvelope::new_signed_with_challenge(
+                    request_id,
+                    payload,
+                    server_challenge,
+                    signing_key,
+                    Some(&response_pq_key),
+                    crate::crypto::CryptoPolicy::Hybrid,
+                )
+            }
+        };
     let sign_response = |payload: Vec<u8>| sign_response_with_challenge(payload, None);
 
     /// Serialize a signed response envelope to wire bytes.
@@ -247,7 +246,9 @@ where
         let recovered = match browser_transcript.as_ref() {
             Some(transcript) => &transcript.binding,
             None => {
-                return dispatch_denied("authenticated WebTransport request omitted browser binding")
+                return dispatch_denied(
+                    "authenticated WebTransport request omitted browser binding",
+                )
             }
         };
         let binding = recovered;
@@ -262,7 +263,9 @@ where
             && binding.carrier_profile
                 == crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport)
         {
-            return dispatch_denied("browser provisioning capability/scope/carrier misclassification");
+            return dispatch_denied(
+                "browser provisioning capability/scope/carrier misclassification",
+            );
         }
         let verifier = match crate::envelope::global_browser_currentness_verifier() {
             Some(verifier) => verifier,
@@ -273,7 +276,9 @@ where
             }
         };
         if let Err(e) = verifier.ensure_current(binding).await {
-            return dispatch_denied(&format!("browser accepted-current evidence rejected: {e:#}"));
+            return dispatch_denied(&format!(
+                "browser accepted-current evidence rejected: {e:#}"
+            ));
         }
     }
 
@@ -295,6 +300,7 @@ where
         );
         return dispatch_denied(&format!("claims verification: {e}"));
     }
+    let deferred_federate = ctx.deferred_federate_credential().is_some();
 
     // Proof-CWT structural parse and profile gates (§5.2: parse canonical COSE
     // and proof payload under bounds, then bind the service coordinate and
@@ -306,115 +312,122 @@ where
     // than dropping the connection and telling the client nothing.
     let parsed_proof = {
         let parsed = (|| -> Result<Option<crate::proof::parser::ParsedProof>> {
-        // Proof-CWT structural parse (v16 §5.2 pipeline: parse canonical COSE
-        // and proof payload under bounds). This runs the bounded parser which
-        // validates the profile's structural rules (typ, hs_domain, crit,
-        // signature plan, claims, key set) but does NOT verify cryptographic
-        // signatures. Signature verification and replay admission run after
-        // policy evaluation, immediately before handler entry.
-        let parsed = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
-            let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
-                    .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
+            // Proof-CWT structural parse (v16 §5.2 pipeline: parse canonical COSE
+            // and proof payload under bounds). This runs the bounded parser which
+            // validates the profile's structural rules (typ, hs_domain, crit,
+            // signature plan, claims, key set) but does NOT verify cryptographic
+            // signatures. Signature verification and replay admission run after
+            // policy evaluation, immediately before handler entry.
+            let parsed = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
+                let proof = if deferred_federate {
+                    crate::proof::parser::ParsedProof::parse_deferred_federate_request(proof_cwt)
+                } else {
+                    crate::proof::parser::ParsedProof::parse(proof_cwt)
+                }
+                .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
 
-            // CRITICAL: only request proofs are valid in request dispatch.
-            if proof.kind != crate::proof::ProofKind::Request {
-                warn!(
-                    "{} rejected {} proof in request dispatch",
-                    service.name(),
-                    match proof.kind {
-                        crate::proof::ProofKind::Response => "response",
-                        crate::proof::ProofKind::Request => "request",
-                    }
-                );
-                anyhow::bail!("proof kind mismatch: only request proofs accepted in dispatch");
-            }
+                // CRITICAL: only request proofs are valid in request dispatch.
+                if proof.kind != crate::proof::ProofKind::Request {
+                    warn!(
+                        "{} rejected {} proof in request dispatch",
+                        service.name(),
+                        match proof.kind {
+                            crate::proof::ProofKind::Response => "response",
+                            crate::proof::ProofKind::Request => "request",
+                        }
+                    );
+                    anyhow::bail!("proof kind mismatch: only request proofs accepted in dispatch");
+                }
 
-            // The proof's aud MUST match the service domain.
-            if proof.claims.aud != actual_service_domain {
-                warn!(
-                    "{} proof aud mismatch: '{}' vs '{}'",
-                    service.name(), proof.claims.aud, actual_service_domain
-                );
-                anyhow::bail!("proof aud mismatch");
-            }
+                // The proof's aud MUST match the service domain.
+                if proof.claims.aud != actual_service_domain {
+                    warn!(
+                        "{} proof aud mismatch: '{}' vs '{}'",
+                        service.name(),
+                        proof.claims.aud,
+                        actual_service_domain
+                    );
+                    anyhow::bail!("proof aud mismatch");
+                }
 
-            // Freshness: per-disposition bounds against verifier clock.
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let skew_tolerance_secs: u64 = 30;
-            let max_lifetime_secs: u64 = match proof.disposition {
-                crate::proof::ProofDisposition::Authenticated => 300,  // 5 min
-                crate::proof::ProofDisposition::Unattributed => 30,   // seconds-scale
-            };
-            if proof.claims.iat.abs_diff(now_secs) > skew_tolerance_secs {
-                anyhow::bail!("proof freshness: iat outside {skew_tolerance_secs}s tolerance");
-            }
-            if proof.claims.exp <= now_secs {
-                anyhow::bail!("proof freshness: exp expired");
-            }
-            if proof.claims.exp > now_secs + max_lifetime_secs {
-                anyhow::bail!(
-                    "proof freshness: exp exceeds {max_lifetime_secs}s max lifetime for {:?}",
-                    proof.disposition
-                );
-            }
+                // Freshness: per-disposition bounds against verifier clock.
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let skew_tolerance_secs: u64 = 30;
+                let max_lifetime_secs: u64 = match proof.disposition {
+                    crate::proof::ProofDisposition::Authenticated => 300, // 5 min
+                    crate::proof::ProofDisposition::Unattributed => 30,   // seconds-scale
+                };
+                if proof.claims.iat.abs_diff(now_secs) > skew_tolerance_secs {
+                    anyhow::bail!("proof freshness: iat outside {skew_tolerance_secs}s tolerance");
+                }
+                if proof.claims.exp <= now_secs {
+                    anyhow::bail!("proof freshness: exp expired");
+                }
+                if proof.claims.exp > now_secs + max_lifetime_secs {
+                    anyhow::bail!(
+                        "proof freshness: exp exceeds {max_lifetime_secs}s max lifetime for {:?}",
+                        proof.disposition
+                    );
+                }
 
-            // Anti-stockpiling challenge pre-check (§4.7). The server challenge
-            // is a plaintext claim available at parse time, so a stale or
-            // unknown unattributed challenge is rejected HERE — before the
-            // expensive hybrid Ed25519 + ML-DSA-65 verification — so an
-            // unattributed flood cannot force per-request crypto with a
-            // guessed/expired challenge. This is the challenge's stated role:
-            // a rejection handle that costs no signature verification and no
-            // replay-store entry. The authoritative, TOCTOU-free `validate()`
-            // that yields the matched `accept_until` still runs atomically at
-            // replay admission below; this early call is a load-shedding
-            // pre-filter and is intentionally non-consuming.
-            if proof.disposition == crate::proof::ProofDisposition::Unattributed {
-                let challenge = proof.claims.nonce.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("unattributed proof missing Nonce claim")
-                })?;
-                match crate::proof::admission::global_challenge_manager() {
-                    Some(mgr) => {
-                        if mgr.validate(challenge, now_secs).is_none() {
-                            anyhow::bail!(
+                // Anti-stockpiling challenge pre-check (§4.7). The server challenge
+                // is a plaintext claim available at parse time, so a stale or
+                // unknown unattributed challenge is rejected HERE — before the
+                // expensive hybrid Ed25519 + ML-DSA-65 verification — so an
+                // unattributed flood cannot force per-request crypto with a
+                // guessed/expired challenge. This is the challenge's stated role:
+                // a rejection handle that costs no signature verification and no
+                // replay-store entry. The authoritative, TOCTOU-free `validate()`
+                // that yields the matched `accept_until` still runs atomically at
+                // replay admission below; this early call is a load-shedding
+                // pre-filter and is intentionally non-consuming.
+                if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+                    let challenge =
+                        proof.claims.nonce.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("unattributed proof missing Nonce claim")
+                        })?;
+                    match crate::proof::admission::global_challenge_manager() {
+                        Some(mgr) => {
+                            if mgr.validate(challenge, now_secs).is_none() {
+                                anyhow::bail!(
                                 "unattributed proof challenge invalid/expired (pre-verification)"
+                            );
+                            }
+                        }
+                        None => {
+                            anyhow::bail!(
+                                "unattributed proof requires a challenge manager to be installed"
                             );
                         }
                     }
-                    None => {
-                        anyhow::bail!(
-                            "unattributed proof requires a challenge manager to be installed"
-                        );
-                    }
+                }
+
+                debug!(
+                    "{} proof-CWT parsed (not yet crypto-verified): disposition={:?} request_id={}",
+                    service.name(),
+                    proof.disposition,
+                    hex::encode(proof.claims.request_id)
+                );
+                Some(proof)
+            } else {
+                None
+            };
+            // After carrier recovery: verify proof body bytes match the ONE decoded
+            // request body that feeds both PEP and handler (v16 §5.1 invariant).
+            if let Some(ref proof) = parsed {
+                if proof.claims.capnp_body_bytes != payload {
+                    warn!(
+                        "{} proof body mismatch after carrier recovery: {} vs {} bytes",
+                        service.name(),
+                        proof.claims.capnp_body_bytes.len(),
+                        payload.len()
+                    );
+                    anyhow::bail!("proof body bytes do not match decoded request body");
                 }
             }
-
-            debug!(
-                "{} proof-CWT parsed (not yet crypto-verified): disposition={:?} request_id={}",
-                service.name(),
-                proof.disposition,
-                hex::encode(proof.claims.request_id)
-            );
-            Some(proof)
-        } else {
-            None
-        };
-        // After carrier recovery: verify proof body bytes match the ONE decoded
-        // request body that feeds both PEP and handler (v16 §5.1 invariant).
-        if let Some(ref proof) = parsed {
-            if proof.claims.capnp_body_bytes != payload {
-                warn!(
-                    "{} proof body mismatch after carrier recovery: {} vs {} bytes",
-                    service.name(),
-                    proof.claims.capnp_body_bytes.len(),
-                    payload.len()
-                );
-                anyhow::bail!("proof body bytes do not match decoded request body");
-            }
-        }
             Ok(parsed)
         })();
         match parsed {
@@ -443,79 +456,87 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let verified_proof = match parsed_proof.as_ref() {
-        None => None,
-        Some(proof) => {
-            let authority = (|| -> Result<crate::proof::verify::VerifiedProof> {
-                // Every required component MUST cryptographically verify under
-                // the key its own enrolled signer-suite record pins.
-                // Verification also yields the replay namespace this proof is
-                // admitted under; it is never derived from wire material.
-                let cnf_key = ctx.authenticated_signer_key();
-                let verified = crate::proof::verify::verify_proof_signatures(
-                    proof,
-                    cnf_key.as_ref(),
-                    crate::proof::enrollment::global_enrollment_resolver(),
-                    now_secs,
-                )
-                .with_context(|| {
-                    format!("{} proof signature verification failed", service.name())
-                })?;
-
-                // Credential hash binding. Presenting a credential never
-                // leaves the proof in the unattributed branch (§4.4): hash
-                // absence is permitted only when no credential is presented,
-                // so a credential alongside an unattributed proof denies
-                // rather than silently dropping to system-low.
-                if proof.disposition == crate::proof::ProofDisposition::Unattributed
-                    && ctx.jwt_token().is_some()
-                {
-                    anyhow::bail!("credential presented with a proof carrying no credential_hash");
-                }
-                // Missing credential MUST deny — no skip/downgrade.
-                if proof.disposition == crate::proof::ProofDisposition::Authenticated {
-                    let expected_hash = proof.claims.credential_hash.ok_or_else(|| {
-                        anyhow::anyhow!("authenticated proof missing credential_hash")
+    let mut verified_proof = if deferred_federate {
+        None
+    } else {
+        match parsed_proof.as_ref() {
+            None => None,
+            Some(proof) => {
+                let authority = (|| -> Result<crate::proof::verify::VerifiedProof> {
+                    // Every required component MUST cryptographically verify under
+                    // the key its own enrolled signer-suite record pins.
+                    // Verification also yields the replay namespace this proof is
+                    // admitted under; it is never derived from wire material.
+                    let cnf_key = ctx.authenticated_signer_key();
+                    let verified = crate::proof::verify::verify_proof_signatures(
+                        proof,
+                        cnf_key.as_ref(),
+                        crate::proof::enrollment::global_enrollment_resolver(),
+                        now_secs,
+                    )
+                    .with_context(|| {
+                        format!("{} proof signature verification failed", service.name())
                     })?;
-                    let jwt = ctx.jwt_token().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "authenticated proof: no credential (JWT) resolved from claims"
-                        )
-                    })?;
-                    use sha2::{Digest, Sha256};
-                    let actual_hash = Sha256::digest(jwt.as_bytes());
-                    if actual_hash.as_slice() != expected_hash {
-                        anyhow::bail!("proof credential hash does not match presented credential");
-                    }
 
-                    // A proof must not outlive the credential that authorizes
-                    // it (§4.5). The enrollment record bounds the enrollment's
-                    // own validity; this bounds the presented credential
-                    // instance, so an admin-anchored enrollment with no expiry
-                    // cannot extend a short-lived token's reach.
-                    if let Some(credential_exp) =
-                        ctx.claims().map(|claims| claims.exp).filter(|exp| *exp > 0)
+                    // Credential hash binding. Presenting a credential never
+                    // leaves the proof in the unattributed branch (§4.4): hash
+                    // absence is permitted only when no credential is presented,
+                    // so a credential alongside an unattributed proof denies
+                    // rather than silently dropping to system-low.
+                    if proof.disposition == crate::proof::ProofDisposition::Unattributed
+                        && ctx.jwt_token().is_some()
                     {
-                        let credential_exp = credential_exp as u64;
-                        if proof.claims.exp > credential_exp {
+                        anyhow::bail!(
+                            "credential presented with a proof carrying no credential_hash"
+                        );
+                    }
+                    // Missing credential MUST deny — no skip/downgrade.
+                    if proof.disposition == crate::proof::ProofDisposition::Authenticated {
+                        let expected_hash = proof.claims.credential_hash.ok_or_else(|| {
+                            anyhow::anyhow!("authenticated proof missing credential_hash")
+                        })?;
+                        let jwt = ctx.jwt_token().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "authenticated proof: no credential (JWT) resolved from claims"
+                            )
+                        })?;
+                        use sha2::{Digest, Sha256};
+                        let actual_hash = Sha256::digest(jwt.as_bytes());
+                        if actual_hash.as_slice() != expected_hash {
                             anyhow::bail!(
+                                "proof credential hash does not match presented credential"
+                            );
+                        }
+
+                        // A proof must not outlive the credential that authorizes
+                        // it (§4.5). The enrollment record bounds the enrollment's
+                        // own validity; this bounds the presented credential
+                        // instance, so an admin-anchored enrollment with no expiry
+                        // cannot extend a short-lived token's reach.
+                        if let Some(credential_exp) =
+                            ctx.claims().map(|claims| claims.exp).filter(|exp| *exp > 0)
+                        {
+                            let credential_exp = credential_exp as u64;
+                            if proof.claims.exp > credential_exp {
+                                anyhow::bail!(
                                 "proof exp {} exceeds the presented credential's exp {credential_exp}",
                                 proof.claims.exp
                             );
+                            }
                         }
                     }
-                }
-                Ok(verified)
-            })();
-            match authority {
-                Ok(verified) => Some(verified),
-                Err(e) => {
-                    warn!(
-                        "{} proof authority denied (id={}): {e:#}",
-                        service.name(),
-                        request_id
-                    );
-                    return dispatch_denied("dispatch denied");
+                    Ok(verified)
+                })();
+                match authority {
+                    Ok(verified) => Some(verified),
+                    Err(e) => {
+                        warn!(
+                            "{} proof authority denied (id={}): {e:#}",
+                            service.name(),
+                            request_id
+                        );
+                        return dispatch_denied("dispatch denied");
+                    }
                 }
             }
         }
@@ -527,8 +548,9 @@ where
     // then feeds the generated method policy below, the dispatch MAC PEP, and
     // finally the handler — no dispatch component re-reads discriminants and
     // no second decode with different traversal or resource limits can select
-    // a handler. Deliberately placed after signature verification so
-    // unauthenticated garbage cannot trigger Cap'n Proto decode work.
+    // a handler. Ordinary requests reach this after proof verification.
+    // Deferred Federate requests have a verified host JWT and signed envelope;
+    // the narrow hook below verifies the original holder against this body.
     let decoded_body = match service.decode_request_body(&payload) {
         Ok(body) => body,
         Err(e) => {
@@ -540,6 +562,42 @@ where
             return dispatch_denied("dispatch denied");
         }
     };
+
+    let mut deferred_federate_replay = None;
+    if deferred_federate {
+        let Some(proof) = parsed_proof.as_ref() else {
+            return dispatch_denied("Federate holder proof missing");
+        };
+        let recipients_match = proof
+            .claims
+            .federate_recipient_binding
+            .as_ref()
+            .is_some_and(|binding| {
+                binding.matches(
+                    ctx.response_kem_recipient(),
+                    ctx.stream_kem_recipient(),
+                    ctx.ephemeral_pubkey(),
+                )
+            });
+        if !recipients_match {
+            return dispatch_denied("Federate recipient binding denied");
+        }
+        let (verified, holder_ed, resource, operation, replay_key, replay_expiry) = match service
+            .admit_deferred_federate_request(&ctx, &decoded_body, proof)
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => return dispatch_denied("Federate request admission denied"),
+        };
+        if ctx
+            .commit_deferred_federate(&verified, holder_ed, resource.clone(), operation.clone())
+            .is_err()
+        {
+            return dispatch_denied("Federate holder/subject mismatch");
+        }
+        deferred_federate_replay = Some((replay_key, replay_expiry, resource, operation));
+        verified_proof = Some(verified);
+    }
 
     // 2e. Generated per-method signature policy (§5.2 step 5, §4.4). The
     // decoded leaf — not the caller — decides whether this method may be
@@ -623,11 +681,8 @@ where
     // consumed — never a transport-specific hint such as the browser
     // transcript's method commitment (v16 §5.1: one derived method identity
     // feeds policy, PEP, and handler).
-    let mac_decision = crate::auth::mac::check_dispatch_mac(
-        &ctx,
-        actual_service_domain,
-        decoded_body.leaf_path(),
-    );
+    let mac_decision =
+        crate::auth::mac::check_dispatch_mac(&ctx, actual_service_domain, decoded_body.leaf_path());
     if let crate::auth::mac::MacDecision::Deny(reason) = mac_decision {
         let mac_resource = match decoded_body.leaf_path_string() {
             Some(leaf) => format!("{actual_service_domain}:method:{leaf}"),
@@ -661,96 +716,156 @@ where
     // 2e. Replay admission (§5.2 step 7). Deliberately last: the pipeline
     // admits the replay key only after policy evaluation, so rejected and
     // denied requests never consume store capacity.
-    if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
-      let proof_admission = (|| -> Result<()> {
-        // Gate 3: Challenge validation (unattributed proofs only).
-        // validate() atomically returns the matched challenge's accept_until
-        // so we can compute replay expiry without a TOCTOU race.
-        let challenge_accept_until: Option<u64> = if proof.disposition == crate::proof::ProofDisposition::Unattributed {
-            let challenge = proof.claims.nonce.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("unattributed proof missing Nonce claim"))?;
-            match crate::proof::admission::global_challenge_manager() {
-                Some(mgr) => {
-                    let accept_until = mgr.validate(challenge, now_secs)
-                        .ok_or_else(|| {
-                            warn!("{} unattributed proof challenge invalid/expired", service.name());
-                            anyhow::anyhow!("proof challenge validation failed")
+    // Federate's original-holder proof is admitted by the request-local
+    // serving adapter after its fresh Policy check; it uses this same shared
+    // replay store with the signed hybrid-key namespace.
+    if !deferred_federate {
+        if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
+            let proof_admission = (|| -> Result<()> {
+                // Gate 3: Challenge validation (unattributed proofs only).
+                // validate() atomically returns the matched challenge's accept_until
+                // so we can compute replay expiry without a TOCTOU race.
+                let challenge_accept_until: Option<u64> =
+                    if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+                        let challenge = proof.claims.nonce.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("unattributed proof missing Nonce claim")
                         })?;
-                    Some(accept_until)
-                }
-                None => {
-                    warn!("{} no challenge manager installed; denying unattributed proof", service.name());
-                    anyhow::bail!("unattributed proof requires a challenge manager to be installed");
-                }
-            }
-        } else {
-            None
-        };
+                        match crate::proof::admission::global_challenge_manager() {
+                            Some(mgr) => {
+                                let accept_until =
+                                    mgr.validate(challenge, now_secs).ok_or_else(|| {
+                                        warn!(
+                                            "{} unattributed proof challenge invalid/expired",
+                                            service.name()
+                                        );
+                                        anyhow::anyhow!("proof challenge validation failed")
+                                    })?;
+                                Some(accept_until)
+                            }
+                            None => {
+                                warn!(
+                                    "{} no challenge manager installed; denying unattributed proof",
+                                    service.name()
+                                );
+                                anyhow::bail!(
+                                "unattributed proof requires a challenge manager to be installed"
+                            );
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
-        // Gate 4: Replay admission using the process-global ProofReplayStore.
-        // No auto-install: the store must be explicitly installed at startup.
-        // If absent, deny fail-closed.
-        let replay_store = crate::proof::admission::global_proof_replay_store()
+                // Gate 4: Replay admission using the process-global ProofReplayStore.
+                // No auto-install: the store must be explicitly installed at startup.
+                // If absent, deny fail-closed.
+                let replay_store = crate::proof::admission::global_proof_replay_store()
             .ok_or_else(|| {
                 anyhow::anyhow!("no ProofReplayStore installed; install via set_global_proof_replay_store at startup")
             })?;
 
-        // Compute replay expiry using the atomically-returned challenge
-        // accept_until (no TOCTOU race).
-        let replay_expiry = match challenge_accept_until {
-            Some(au) => proof.claims.exp.min(au),
-            None => proof.claims.exp,
-        };
+                // Compute replay expiry using the atomically-returned challenge
+                // accept_until (no TOCTOU race).
+                let replay_expiry = match challenge_accept_until {
+                    Some(au) => proof.claims.exp.min(au),
+                    None => proof.claims.exp,
+                };
 
-        // v16 credentials are Reusable-only (OneShotTransaction cut from scope,
-        // operator decision 2026-08-20): replay admission is keyed by the proof,
-        // so many fresh proofs may use one credential. There is no per-credential
-        // consume-once path.
-        //
-        // The replay namespace comes from verification, not from wire
-        // material: the credential-bound primary signer-suite thumbprint
-        // (exact suite ID, ordered pinned component keys, enrollment epoch)
-        // for authenticated proofs, and the (plan, key set) thumbprint for
-        // unattributed ones.
-        let replay_key = crate::proof::admission::ProofReplayKey {
-            signer_thumbprint: verified.replay_thumbprint,
-            request_id: proof.claims.request_id,
-        };
+                // v16 credentials are Reusable-only (OneShotTransaction cut from scope,
+                // operator decision 2026-08-20): replay admission is keyed by the proof,
+                // so many fresh proofs may use one credential. There is no per-credential
+                // consume-once path.
+                //
+                // The replay namespace comes from verification, not from wire
+                // material: the credential-bound primary signer-suite thumbprint
+                // (exact suite ID, ordered pinned component keys, enrollment epoch)
+                // for authenticated proofs, and the (plan, key set) thumbprint for
+                // unattributed ones.
+                let replay_key = crate::proof::admission::ProofReplayKey {
+                    signer_thumbprint: verified.replay_thumbprint,
+                    request_id: proof.claims.request_id,
+                };
 
-        match crate::proof::admission::admit_request_proof(
-            replay_store,
-            proof.disposition,
-            &replay_key,
-            replay_expiry,
-        ) {
-            crate::proof::admission::ProofAdmissionResult::Admitted => {
-                debug!("{} proof replay admission: admitted", service.name());
-            }
-            crate::proof::admission::ProofAdmissionResult::Replayed => {
-                warn!("{} proof replay detected", service.name());
-                anyhow::bail!("proof replay detected");
-            }
-            crate::proof::admission::ProofAdmissionResult::Failed => {
-                // Capacity, backend unavailability, or a namespace this node
-                // holds no history for. Every one of them is a denial.
-                warn!(
+                match crate::proof::admission::admit_request_proof(
+                    replay_store,
+                    proof.disposition,
+                    &replay_key,
+                    replay_expiry,
+                ) {
+                    crate::proof::admission::ProofAdmissionResult::Admitted => {
+                        debug!("{} proof replay admission: admitted", service.name());
+                    }
+                    crate::proof::admission::ProofAdmissionResult::Replayed => {
+                        warn!("{} proof replay detected", service.name());
+                        anyhow::bail!("proof replay detected");
+                    }
+                    crate::proof::admission::ProofAdmissionResult::Failed => {
+                        // Capacity, backend unavailability, or a namespace this node
+                        // holds no history for. Every one of them is a denial.
+                        warn!(
                     "{} proof replay admission failed closed (capacity, backend, or namespace affinity)",
                     service.name()
                 );
-                anyhow::bail!("proof replay admission could not be guaranteed");
+                        anyhow::bail!("proof replay admission could not be guaranteed");
+                    }
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = proof_admission {
+                warn!(
+                    "{} proof admission denied (id={}): {e:#}",
+                    service.name(),
+                    request_id
+                );
+                return dispatch_denied("dispatch denied");
             }
         }
-        Ok(())
-      })();
+    }
 
-      if let Err(e) = proof_admission {
-        warn!(
-            "{} proof admission denied (id={}): {e:#}",
-            service.name(),
-            request_id
-        );
-        return dispatch_denied("dispatch denied");
-      }
+    // Fresh Policy authorization and the durable session-bound replay consume
+    // are one transaction in Policy. Defer that call until every local method
+    // and MAC gate has passed, so an otherwise valid proof denied here remains
+    // retryable. It is the final authorization gate before handler dispatch.
+    if deferred_federate {
+        let Some((replay_key, replay_expiry, resource, operation)) =
+            deferred_federate_replay.as_ref()
+        else {
+            return dispatch_denied("Federate replay admission unavailable");
+        };
+        if service
+            .commit_deferred_federate_request(&ctx, resource, operation, replay_key, *replay_expiry)
+            .await
+            .is_err()
+        {
+            warn!("{} Federate Policy/replay admission denied", service.name());
+            return dispatch_denied("dispatch denied");
+        }
+        let Some(replay_store) = crate::proof::admission::global_proof_replay_store() else {
+            return dispatch_denied("Federate replay admission unavailable");
+        };
+        let Some(proof) = parsed_proof.as_ref() else {
+            return dispatch_denied("Federate holder proof missing");
+        };
+        match crate::proof::admission::admit_request_proof(
+            replay_store,
+            proof.disposition,
+            replay_key,
+            *replay_expiry,
+        ) {
+            crate::proof::admission::ProofAdmissionResult::Admitted => {}
+            crate::proof::admission::ProofAdmissionResult::Replayed => {
+                warn!("{} Federate proof replay detected", service.name());
+                return dispatch_denied("dispatch denied");
+            }
+            crate::proof::admission::ProofAdmissionResult::Failed => {
+                warn!(
+                    "{} Federate proof replay admission failed closed",
+                    service.name()
+                );
+                return dispatch_denied("dispatch denied");
+            }
+        }
     }
 
     // 3. Handle request — from the same decoded body the policy and MAC

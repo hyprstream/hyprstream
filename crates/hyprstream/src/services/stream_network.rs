@@ -74,17 +74,16 @@ pub fn stream_ingress_authorizer(
     Arc::new(
         move |peer: &hyprstream_rpc::moq_authz::PeerIdentity, tenant: &str| {
             peer.subject.as_deref().is_some_and(|did| {
-                publishers.contains(did)
-                    && {
-                        let snapshot = roster.roster();
-                        admission_roster::roster_tenant(
-                            &snapshot,
-                            did,
-                            hyprstream_rpc::envelope::current_timestamp(),
-                        )
-                        .as_deref()
-                            == Some(tenant)
-                    }
+                publishers.contains(did) && {
+                    let snapshot = roster.roster();
+                    admission_roster::roster_tenant(
+                        &snapshot,
+                        did,
+                        hyprstream_rpc::envelope::current_timestamp(),
+                    )
+                    .as_deref()
+                        == Some(tenant)
+                }
             })
         },
     )
@@ -265,7 +264,9 @@ mod tests {
     }
 
     fn live_roster(
-        states: &Arc<parking_lot::RwLock<std::collections::BTreeMap<String, AcceptedIdentityState>>>,
+        states: &Arc<
+            parking_lot::RwLock<std::collections::BTreeMap<String, AcceptedIdentityState>>,
+        >,
     ) -> Arc<dyn hyprstream_discovery::admission_roster::DeploymentRosterSource> {
         let states = Arc::clone(states);
         Arc::new(move || states.read().clone().into_iter().collect::<Vec<_>>())
@@ -514,7 +515,9 @@ mod tests {
         // notwithstanding) cannot inject into the shared origin.
         assert!(tokio::time::timeout(
             Duration::from_millis(250),
-            origin.consumer().announced_broadcast("local/streams/reader-injected")
+            origin
+                .consumer()
+                .announced_broadcast("local/streams/reader-injected")
         )
         .await
         .is_err());

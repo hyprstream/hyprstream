@@ -31,12 +31,7 @@ pub struct EventTokenManager {
 
 impl EventTokenManager {
     /// Create a new EventTokenManager with an initial token.
-    pub fn new(
-        initial_token: String,
-        scope: String,
-        audience: String,
-        ttl_secs: u64,
-    ) -> Self {
+    pub fn new(initial_token: String, scope: String, audience: String, ttl_secs: u64) -> Self {
         Self {
             current_token: Arc::new(RwLock::new(initial_token)),
             scope,
@@ -82,9 +77,10 @@ impl EventTokenManager {
         let cancel = self.cancel.clone();
 
         // Refresh at max(ttl * 3/4, ttl - 60), with a minimum of 1s to prevent busy-loop.
-        let refresh_interval = Duration::from_secs(
-            std::cmp::max(1, std::cmp::max(ttl_secs * 3 / 4, ttl_secs.saturating_sub(60)))
-        );
+        let refresh_interval = Duration::from_secs(std::cmp::max(
+            1,
+            std::cmp::max(ttl_secs * 3 / 4, ttl_secs.saturating_sub(60)),
+        ));
 
         let handle = tokio::spawn(async move {
             loop {
@@ -147,12 +143,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_token() {
-        let mgr = EventTokenManager::new(
-            "old".to_owned(),
-            "scope".to_owned(),
-            "aud".to_owned(),
-            600,
-        );
+        let mgr =
+            EventTokenManager::new("old".to_owned(), "scope".to_owned(), "aud".to_owned(), 600);
         mgr.set_token("new".to_owned()).await;
         assert_eq!(mgr.token().await, "new");
     }

@@ -1587,9 +1587,7 @@ struct Ops { union { bad @0 :Void $dispatchMac("internal:pq-hybrid"); good @1 :V
 struct BothRequest { union { run @0 :Ops $scope(query) $dispatchMac("internal:pq-hybrid") $dispatchPublic("reason"); other @1 :Void $scope(query) $dispatchMac("internal:pq-hybrid"); } }
 struct BothResponse { union { ok @0 :Void; other @1 :Void; } }
 "#;
-        assert!(try_parse_schema("both", both)
-            .unwrap_err()
-            .contains("BOTH"));
+        assert!(try_parse_schema("both", both).unwrap_err().contains("BOTH"));
 
         let empty = r#"@0x9a1b2c3d4e5f6073;
 enum ScopeAction { query @0; write @1; }
@@ -1653,7 +1651,10 @@ struct RecursiveResponse {{ union {{ ok @0 :Void; other @1 :Void; }} }}
             "naturally-idempotent",
         );
         let err = try_parse_schema("recursive", &top_bad_mac).unwrap_err();
-        assert!(err.contains("dispatchMac") && err.contains("not-a-mac"), "{err}");
+        assert!(
+            err.contains("dispatchMac") && err.contains("not-a-mac"),
+            "{err}"
+        );
 
         let top_empty_mutation = schema(
             "internal:pq-hybrid",
@@ -1669,7 +1670,10 @@ struct RecursiveResponse {{ union {{ ok @0 :Void; other @1 :Void; }} }}
             "naturally-idempotent",
         );
         let err = try_parse_schema("recursive", &nested_bad_mac).unwrap_err();
-        assert!(err.contains("dispatchMac") && err.contains("not-a-mac"), "{err}");
+        assert!(
+            err.contains("dispatchMac") && err.contains("not-a-mac"),
+            "{err}"
+        );
 
         let nested_empty_mutation = schema(
             "internal:pq-hybrid",
@@ -1721,7 +1725,11 @@ struct ValidRequest {
 struct ValidResponse { union { ok @0 :Void; other @1 :Void; } }
 "#;
         let parsed = try_parse_schema("valid", valid).expect("valid recursive schema");
-        let inner = parsed.structs.iter().find(|s| s.name == "Inner").expect("Inner");
+        let inner = parsed
+            .structs
+            .iter()
+            .find(|s| s.name == "Inner")
+            .expect("Inner");
         assert!(inner.union_arms[0].dispatch_public_present);
         assert!(!inner.union_arms[1].dispatch_mac_present);
     }
@@ -1750,7 +1758,10 @@ struct DirectRequest {
 struct DirectResponse { union { ok @0 :Void; other @1 :Void; } }
 "#;
         let err = try_parse_schema("direct", direct).unwrap_err();
-        assert!(err.contains("BOTH") && err.contains("dispatchPublic"), "{err}");
+        assert!(
+            err.contains("BOTH") && err.contains("dispatchPublic"),
+            "{err}"
+        );
 
         let nested = r#"@0x91a2b3c4d5e6f704;
 annotation scopeExempt(field) :Text;
@@ -1772,7 +1783,10 @@ struct NestedRequest {
 struct NestedResponse { union { ok @0 :Void; other @1 :Void; } }
 "#;
         let err = try_parse_schema("nested", nested).unwrap_err();
-        assert!(err.contains("BOTH") && err.contains("dispatchPublic"), "{err}");
+        assert!(
+            err.contains("BOTH") && err.contains("dispatchPublic"),
+            "{err}"
+        );
     }
 
     /// P2 (`PRRT_kwDONmv2Pc6gGRV5`) reason boundaries through the actual
@@ -2023,6 +2037,7 @@ struct EmbedImagesResponse {
                 type_name: "List(GhostStruct)".to_owned(),
                 description: String::new(),
                 fixed_size: None,
+                max_len: None,
                 optional: false,
                 slot_offset: 0,
                 section: FieldSection::Pointer,

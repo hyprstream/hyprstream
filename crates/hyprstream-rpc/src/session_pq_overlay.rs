@@ -224,7 +224,11 @@ impl RebindEvent {
     /// refused first. `justification` is carried into the applied-rebind
     /// notification so the record says who decided and on what basis.
     #[must_use]
-    pub fn approve(self, provenance: PqProvenance, justification: impl Into<String>) -> RebindApproval {
+    pub fn approve(
+        self,
+        provenance: PqProvenance,
+        justification: impl Into<String>,
+    ) -> RebindApproval {
         RebindApproval {
             event: self,
             provenance,
@@ -953,7 +957,10 @@ mod tests {
         // The event reached the sink before the caller saw the outcome.
         assert_eq!(CountingSink::count(&sink.refused), 1);
         assert_eq!(event.established_provenance(), PqProvenance::TofuBound);
-        assert_ne!(event.established_fingerprint(), event.presented_fingerprint());
+        assert_ne!(
+            event.established_fingerprint(),
+            event.presented_fingerprint()
+        );
         // Last write did NOT win.
         assert_eq!(
             ml_dsa_vk_bytes(&overlay.verifying_key_for(&id).unwrap()),
@@ -969,8 +976,7 @@ mod tests {
         let rotated = pq_key(16);
 
         let _ = overlay.observe_first_contact(id, &original);
-        let FirstContactOutcome::RebindRefused(event) =
-            overlay.observe_first_contact(id, &rotated)
+        let FirstContactOutcome::RebindRefused(event) = overlay.observe_first_contact(id, &rotated)
         else {
             panic!("rotation must surface as a refused rebind");
         };
@@ -994,8 +1000,7 @@ mod tests {
         let other = pq_key(19);
 
         let _ = overlay.observe_first_contact(id, &original);
-        let FirstContactOutcome::RebindRefused(event) =
-            overlay.observe_first_contact(id, &rotated)
+        let FirstContactOutcome::RebindRefused(event) = overlay.observe_first_contact(id, &rotated)
         else {
             panic!("expected a refusal");
         };
@@ -1016,7 +1021,10 @@ mod tests {
             PqProvenance::TofuBound.key_material(),
             VerifiedKeyMaterial::Classical
         );
-        assert_eq!(PqProvenance::TofuBound.assurance_ceiling(), Assurance::Classical);
+        assert_eq!(
+            PqProvenance::TofuBound.assurance_ceiling(),
+            Assurance::Classical
+        );
         assert!(PqProvenance::TofuBound.assurance_ceiling() < Assurance::PqHybrid);
     }
 
@@ -1153,7 +1161,11 @@ mod tests {
         let key = pq_key(29);
         let _ = overlay.observe_first_contact(promoted, &key);
         overlay
-            .promote_out_of_band(&promoted, &composite_fingerprint(&promoted, &key), "printed")
+            .promote_out_of_band(
+                &promoted,
+                &composite_fingerprint(&promoted, &key),
+                "printed",
+            )
             .unwrap();
 
         // Every slot holds operator-established trust, so the arriving identity
@@ -1195,8 +1207,14 @@ mod tests {
         let b = ed_identity(16);
         let k1 = pq_key(28);
         let k2 = pq_key(29);
-        assert_ne!(composite_fingerprint(&a, &k1), composite_fingerprint(&b, &k1));
-        assert_ne!(composite_fingerprint(&a, &k1), composite_fingerprint(&a, &k2));
+        assert_ne!(
+            composite_fingerprint(&a, &k1),
+            composite_fingerprint(&b, &k1)
+        );
+        assert_ne!(
+            composite_fingerprint(&a, &k1),
+            composite_fingerprint(&a, &k2)
+        );
     }
 
     #[test]

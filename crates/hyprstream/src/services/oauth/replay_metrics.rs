@@ -108,7 +108,10 @@ mod tests {
     fn full_warnings_are_rate_limited_per_barrier() {
         let barrier = "replay_metrics_rate_limit_test";
         assert!(should_warn_full(barrier, InsertIfAbsentNoEvictResult::Full));
-        assert!(!should_warn_full(barrier, InsertIfAbsentNoEvictResult::Full));
+        assert!(!should_warn_full(
+            barrier,
+            InsertIfAbsentNoEvictResult::Full
+        ));
         assert!(!should_warn_full(
             barrier,
             InsertIfAbsentNoEvictResult::Duplicate

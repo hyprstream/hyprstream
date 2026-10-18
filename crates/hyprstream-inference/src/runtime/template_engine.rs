@@ -256,7 +256,8 @@ impl TemplateEngine {
 
 {% elif message['role'] == 'assistant' %}### Assistant: {{ message['content'] }}
 
-{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant: {% endif %}"#.to_owned()
+{% endif %}{% endfor %}{% if add_generation_prompt %}### Assistant: {% endif %}"#
+                    .to_owned()
             }
             "qwen" | "qwen2" => {
                 // Qwen2-style template with special tokens
@@ -273,14 +274,16 @@ impl TemplateEngine {
 {% endif %}
 {% endfor %}
 {% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"#.to_owned()
+{% endif %}"#
+                    .to_owned()
             }
             "mistral" | "mixtral" => {
                 // Mistral/Mixtral template
                 r#"{% for message in messages %}
 {% if message['role'] == 'user' %}[INST] {{ message['content'] }} [/INST]
 {% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>
-{% endif %}{% endfor %}"#.to_owned()
+{% endif %}{% endfor %}"#
+                    .to_owned()
             }
             "gemma" | "gemma2" => {
                 // Gemma-style template
@@ -291,7 +294,8 @@ impl TemplateEngine {
 {{ message['content'] }}<end_of_turn>
 {% endif %}{% endfor %}
 {% if add_generation_prompt %}<start_of_turn>model
-{% endif %}"#.to_owned()
+{% endif %}"#
+                    .to_owned()
             }
             "chatml" | "chatgpt" => {
                 // ChatML format (GPT-style)
@@ -300,7 +304,8 @@ impl TemplateEngine {
 {{ message['content'] }}<|im_end|>
 {% endfor %}
 {% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"#.to_owned()
+{% endif %}"#
+                    .to_owned()
             }
             "janus" | "janus-1.3b" | "janus-pro" => {
                 // DeepSeek/Janus format - simple User:/Assistant: format
@@ -308,14 +313,16 @@ impl TemplateEngine {
 {% if message['role'] == 'user' %}User: {{ message['content'] }}
 {% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}
 {% endif %}{% endfor %}
-{% if add_generation_prompt %}Assistant: {% endif %}"#.to_owned()
+{% if add_generation_prompt %}Assistant: {% endif %}"#
+                    .to_owned()
             }
             _ => {
                 // Default simple template
                 r#"{% for message in messages %}
 {{ message['role'] }}: {{ message['content'] }}
 {% endfor %}
-{% if add_generation_prompt %}assistant: {% endif %}"#.to_owned()
+{% if add_generation_prompt %}assistant: {% endif %}"#
+                    .to_owned()
             }
         }
     }
@@ -414,26 +421,28 @@ fn length_filter(value: &Value) -> Result<Value, minijinja::Error> {
 ///
 /// Supports optional `indent` keyword argument for pretty-printing, matching
 /// Jinja2's `tojson(indent=4)` syntax used by Llama 3.1 templates.
-fn tojson_filter(value: &Value, kwargs: minijinja::value::Kwargs) -> Result<Value, minijinja::Error> {
+fn tojson_filter(
+    value: &Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<Value, minijinja::Error> {
     let indent: Option<usize> = kwargs.get("indent")?;
     kwargs.assert_all_used()?;
 
     let json_str = if let Some(n) = indent {
         // Pretty-print with the requested indentation
-        let v: serde_json::Value = serde_json::from_str(
-            &serde_json::to_string(&value).map_err(|e| {
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&value).map_err(|e| {
                 minijinja::Error::new(
                     minijinja::ErrorKind::InvalidOperation,
                     format!("Failed to serialize to JSON: {e}"),
                 )
-            })?,
-        )
-        .map_err(|e| {
-            minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                format!("Failed to re-parse JSON for indentation: {e}"),
-            )
-        })?;
+            })?)
+            .map_err(|e| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("Failed to re-parse JSON for indentation: {e}"),
+                )
+            })?;
         let indent_bytes = b" ".repeat(n);
         let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_bytes);
         let mut buf = Vec::new();
@@ -577,13 +586,18 @@ mod tests {
                 r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
 ' + message['content'] + '<|im_end|>' + '
 '}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
-' }}{% endif %}"#.to_owned(),
+' }}{% endif %}"#
+                    .to_owned(),
             ),
             ..Default::default()
         };
 
         let engine = TemplateEngine::new(config)?;
-        let messages = vec![ChatMessage { role: "user".into(), content: Some("Hello".into()), ..Default::default() }];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("Hello".into()),
+            ..Default::default()
+        }];
 
         let result = engine.apply_chat_template(&messages, Some(true), None)?;
         assert!(result.contains("<|im_start|>user"));
@@ -609,16 +623,29 @@ mod tests {
 {% if message['role'].startswith('sys') %}System: {{ message['content'] }}
 {% elif message['role'].endswith('er') %}User: {{ message['content'] }}
 {% elif message['role'].startswith('assist') %}Assistant: {{ message['content'] }}
-{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#.to_owned(),
+{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#
+                    .to_owned(),
             ),
             ..Default::default()
         };
 
         let engine = TemplateEngine::new(config)?;
         let messages = vec![
-            ChatMessage { role: "system".into(), content: Some("You are a helpful assistant.".into()), ..Default::default() },
-            ChatMessage { role: "user".into(), content: Some("Hello!".into()), ..Default::default() },
-            ChatMessage { role: "assistant".into(), content: Some("Hi there!".into()), ..Default::default() },
+            ChatMessage {
+                role: "system".into(),
+                content: Some("You are a helpful assistant.".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Hello!".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Hi there!".into()),
+                ..Default::default()
+            },
         ];
 
         let result = engine.apply_chat_template(&messages, Some(true), None)?;
@@ -644,16 +671,29 @@ mod tests {
 {% elif message['role'].endswith('ant') %}
 [ASSISTANT] {{ message['content'] }}
 {% endif %}
-{% endfor %}"#.to_owned(),
+{% endfor %}"#
+                    .to_owned(),
             ),
             ..Default::default()
         };
 
         let engine = TemplateEngine::new(config)?;
         let messages = vec![
-            ChatMessage { role: "system".into(), content: Some("Configure the model".into()), ..Default::default() },
-            ChatMessage { role: "user".into(), content: Some("What's 2+2?".into()), ..Default::default() },
-            ChatMessage { role: "assistant".into(), content: Some("4".into()), ..Default::default() },
+            ChatMessage {
+                role: "system".into(),
+                content: Some("Configure the model".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("What's 2+2?".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("4".into()),
+                ..Default::default()
+            },
         ];
 
         let result = engine.apply_chat_template(&messages, Some(false), None)?;
@@ -670,13 +710,18 @@ mod tests {
             chat_template: Some(
                 r#"{% for message in messages %}
 {{ message['content'].strip() }}
-{% endfor %}"#.to_owned(),
+{% endfor %}"#
+                    .to_owned(),
             ),
             ..Default::default()
         };
 
         let engine = TemplateEngine::new(config)?;
-        let messages = vec![ChatMessage { role: "user".into(), content: Some("  Hello World  ".into()), ..Default::default() }];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("  Hello World  ".into()),
+            ..Default::default()
+        }];
 
         let result = engine.apply_chat_template(&messages, Some(false), None)?;
         assert!(result.contains("Hello World"));
@@ -701,7 +746,8 @@ CONTENT:{{ content }}
 {%- else -%}
 CONTENT:{{ content }}
 {%- endif -%}
-{%- endfor -%}"#.to_owned(),
+{%- endfor -%}"#
+                    .to_owned(),
             ),
             ..Default::default()
         };
@@ -715,14 +761,22 @@ CONTENT:{{ content }}
             ..Default::default()
         }];
 
-        let result = engine.apply_chat_template(&messages, Some(false), None).expect("test: apply template");
+        let result = engine
+            .apply_chat_template(&messages, Some(false), None)
+            .expect("test: apply template");
         assert!(result.contains("THINK:I should search."));
         assert!(result.contains("CONTENT:Here is the answer."));
 
         // Message without think tags
-        let messages_no_think = vec![ChatMessage { role: "user".into(), content: Some("Hello".into()), ..Default::default() }];
+        let messages_no_think = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("Hello".into()),
+            ..Default::default()
+        }];
 
-        let result = engine.apply_chat_template(&messages_no_think, Some(false), None).expect("test: apply no-think");
+        let result = engine
+            .apply_chat_template(&messages_no_think, Some(false), None)
+            .expect("test: apply no-think");
         assert!(result.contains("CONTENT:Hello"));
     }
 
@@ -790,16 +844,21 @@ When you need to use a tool, respond with a tool_call block.<|im_end|>
         };
         let engine = TemplateEngine::new(config)?;
 
-        let messages = vec![
-            ChatMessage { role: "user".into(), content: Some("What's the weather?".into()), ..Default::default() },
-        ];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("What's the weather?".into()),
+            ..Default::default()
+        }];
         let tools = serde_json::json!([make_tool("get_weather", "Get current weather")]);
 
         let result = engine.apply_chat_template(&messages, Some(true), Some(&tools))?;
 
         // Tool definitions should appear in system message
         assert!(result.contains("get_weather"), "should contain tool name");
-        assert!(result.contains("Get current weather"), "should contain tool description");
+        assert!(
+            result.contains("Get current weather"),
+            "should contain tool description"
+        );
         // User message present
         assert!(result.contains("What's the weather?"));
         // Generation prompt present
@@ -817,10 +876,26 @@ When you need to use a tool, respond with a tool_call block.<|im_end|>
         let engine = TemplateEngine::new(config)?;
 
         let messages = vec![
-            ChatMessage { role: "system".into(), content: Some("You are helpful.".into()), ..Default::default() },
-            ChatMessage { role: "user".into(), content: Some("Hello".into()), ..Default::default() },
-            ChatMessage { role: "assistant".into(), content: Some("Hi! How can I help?".into()), ..Default::default() },
-            ChatMessage { role: "user".into(), content: Some("Tell me a joke.".into()), ..Default::default() },
+            ChatMessage {
+                role: "system".into(),
+                content: Some("You are helpful.".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Hello".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Hi! How can I help?".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Tell me a joke.".into()),
+                ..Default::default()
+            },
         ];
 
         let result = engine.apply_chat_template(&messages, Some(true), None)?;
@@ -842,7 +917,10 @@ When you need to use a tool, respond with a tool_call block.<|im_end|>
 
         // Generation prompt at the end
         let gen_pos = result.rfind("<|im_start|>assistant").unwrap();
-        assert!(gen_pos > user2_pos, "generation prompt should be after last user message");
+        assert!(
+            gen_pos > user2_pos,
+            "generation prompt should be after last user message"
+        );
 
         Ok(())
     }
@@ -903,14 +981,12 @@ When you need to use a tool, respond with a tool_call block.<|im_end|>
         };
         let engine = TemplateEngine::new(config)?;
 
-        let messages = vec![
-            ChatMessage {
-                role: "tool".into(),
-                content: Some(r#"{"result": "success"}"#.into()),
-                tool_call_id: Some("call_abc".into()),
-                ..Default::default()
-            },
-        ];
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: Some(r#"{"result": "success"}"#.into()),
+            tool_call_id: Some("call_abc".into()),
+            ..Default::default()
+        }];
 
         let result = engine.apply_chat_template(&messages, Some(false), None)?;
 

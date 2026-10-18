@@ -83,9 +83,7 @@ use hyprstream_pds::tid::Tid;
 
 use hyprstream_rpc::cid::{decode_cid, Codec, HashAlgo};
 use hyprstream_rpc::did_web::ed25519_to_did_key;
-use hyprstream_rpc::transport::iroh_substrate::{
-    IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC,
-};
+use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC};
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -292,7 +290,9 @@ impl ProtocolHandler for PdsProofHandler {
                 .await
                 .map_err(AcceptError::from_err)?;
             let reply = self.respond(&req);
-            send.write_all(&reply).await.map_err(AcceptError::from_err)?;
+            send.write_all(&reply)
+                .await
+                .map_err(AcceptError::from_err)?;
             send.finish().map_err(AcceptError::from_err)?;
             let _ = send.stopped().await;
         }
@@ -334,7 +334,11 @@ fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
 }
 
 /// Client-side fetch: open one bidi stream, send `line`, read the reply to FIN.
-async fn fetch_over_iroh(client: &IrohSubstrate, addr: &EndpointAddr, line: &str) -> Result<Vec<u8>> {
+async fn fetch_over_iroh(
+    client: &IrohSubstrate,
+    addr: &EndpointAddr,
+    line: &str,
+) -> Result<Vec<u8>> {
     let conn = client
         .connect(addr.clone(), ALPN_HYPRSTREAM_RPC)
         .await
@@ -420,7 +424,9 @@ async fn node_a_publish(
     let atproto_vk = VerifyingKey::from(&signing_key);
     let unsigned = UnsignedCommit::new(node.did.clone(), root_cid, Tid::now(), None);
     let commit = Commit::sign(&unsigned, &signing_key);
-    commit.verify(&atproto_vk).context("node A: own commit must verify")?;
+    commit
+        .verify(&atproto_vk)
+        .context("node A: own commit must verify")?;
 
     // ── Step 5: emit the CAR proof for the target record ─────────────────────
     let proof = tree
@@ -502,9 +508,16 @@ async fn e7_two_node_federation_publish_resolve_verify_fetch() -> Result<()> {
     // ── Two independent nodes, distinct identities ───────────────────────────
     let (node_a, mut reg_a, reg_a_root) = FederationNode::new("nodeA").await?;
     let (node_b, _reg_b, _reg_b_root) = FederationNode::new("nodeB").await?;
-    assert_ne!(node_a.node_key, node_b.node_key, "nodes must have distinct keys");
+    assert_ne!(
+        node_a.node_key, node_b.node_key,
+        "nodes must have distinct keys"
+    );
     assert_ne!(node_a.did, node_b.did, "nodes must have distinct DIDs");
-    assert!(node_a.did.starts_with("did:key:z"), "did:key form: {}", node_a.did);
+    assert!(
+        node_a.did.starts_with("did:key:z"),
+        "did:key form: {}",
+        node_a.did
+    );
 
     // ── Node A publishes (steps 1–5) ─────────────────────────────────────────
     let published = Arc::new(node_a_publish(&node_a, &mut reg_a, &reg_a_root).await?);
@@ -630,8 +643,13 @@ async fn e7_d5_tampered_record_rejected() -> Result<()> {
     let mut tampered = commit.clone();
     tampered.data = PdsCid::from_dag_cbor(b"not the real MST root");
     assert!(
-        verify_record_proof(&tampered, &published.atproto_vk, &published.proof, &honest_record)
-            .is_err(),
+        verify_record_proof(
+            &tampered,
+            &published.atproto_vk,
+            &published.proof,
+            &honest_record
+        )
+        .is_err(),
         "D5: a commit whose data (root) was tampered must be rejected"
     );
 
@@ -675,7 +693,11 @@ async fn e7_d5_tampered_content_blob_rejected() -> Result<()> {
     );
     // And the honest bytes still match (sanity that the check is real, not always-false).
     let honest_oid = git_oid_of_object(git2::ObjectType::Commit, &honest)?;
-    assert_eq!(honest_oid.to_string(), oid_hex, "honest content must match OID");
+    assert_eq!(
+        honest_oid.to_string(),
+        oid_hex,
+        "honest content must match OID"
+    );
     Ok(())
 }
 

@@ -59,7 +59,9 @@ pub enum MetricError {
     },
 
     /// A shift split was constructed with overlapping fit and evaluation families.
-    #[error("shift split violation: families {families:?} appear on both the fit and evaluation side")]
+    #[error(
+        "shift split violation: families {families:?} appear on both the fit and evaluation side"
+    )]
     ShiftSplitOverlap {
         /// The overlapping family identifiers.
         families: Vec<String>,

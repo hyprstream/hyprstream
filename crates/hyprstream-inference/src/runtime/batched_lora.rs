@@ -37,12 +37,7 @@ impl BatchedLoRAForward {
     /// * `max_rank` - Maximum LoRA rank to pad to (default: 8)
     /// * `scaling` - LoRA scaling factor (alpha / rank)
     /// * `device` - Device for tensor allocation
-    pub fn new(
-        delta_pool: Arc<DeltaPool>,
-        max_rank: usize,
-        scaling: f64,
-        device: Device,
-    ) -> Self {
+    pub fn new(delta_pool: Arc<DeltaPool>, max_rank: usize, scaling: f64, device: Device) -> Self {
         Self {
             delta_pool,
             max_rank,
@@ -93,10 +88,7 @@ impl BatchedLoRAForward {
         for tenant_id in tenant_ids {
             if let Some(delta_arc) = self.delta_pool.get(tenant_id) {
                 let delta = delta_arc.lock();
-                if let (Some(a), Some(b)) = (
-                    delta.lora_a.get(&key),
-                    delta.lora_b.get(&key),
-                ) {
+                if let (Some(a), Some(b)) = (delta.lora_a.get(&key), delta.lora_b.get(&key)) {
                     // A: [rank, in_features], B: [out_features, rank]
                     a_matrices.push(Some(a.shallow_clone()));
                     b_matrices.push(Some(b.shallow_clone()));
@@ -118,8 +110,11 @@ impl BatchedLoRAForward {
                 .map(|xi| {
                     let shape = xi.size();
                     let out_features = shape[shape.len() - 1]; // same as in_features for q/v proj
-                    Tensor::zeros(shape.as_slice(), (xi.kind(), xi.device()))
-                        .narrow(-1, 0, out_features)
+                    Tensor::zeros(shape.as_slice(), (xi.kind(), xi.device())).narrow(
+                        -1,
+                        0,
+                        out_features,
+                    )
                 })
                 .collect();
             return Ok(results);
@@ -183,10 +178,7 @@ impl BatchedLoRAForward {
             delta.forward(x, module_name, layer_idx)
         } else {
             // No delta for this tenant — return zeros
-            Ok(Tensor::zeros(
-                x.size().as_slice(),
-                (x.kind(), x.device()),
-            ))
+            Ok(Tensor::zeros(x.size().as_slice(), (x.kind(), x.device())))
         }
     }
 
@@ -223,7 +215,15 @@ mod tests {
             layer_overrides: None,
         };
 
-        let pool = DeltaPool::new(config, module_dims, device, None, std::env::temp_dir().join("batched_lora_test_snapshots"), None, 2);
+        let pool = DeltaPool::new(
+            config,
+            module_dims,
+            device,
+            None,
+            std::env::temp_dir().join("batched_lora_test_snapshots"),
+            None,
+            2,
+        );
         (Arc::new(pool), device)
     }
 
@@ -235,7 +235,9 @@ mod tests {
         let x = Tensor::randn([1, 5, 64], (Kind::Float, device));
         let tenant = Subject::new("missing");
 
-        let result = batched.single_tenant_forward(&x, "q_proj", &tenant, 0).unwrap();
+        let result = batched
+            .single_tenant_forward(&x, "q_proj", &tenant, 0)
+            .unwrap();
         assert_eq!(result.size(), vec![1, 5, 64]);
 
         // Should be all zeros
@@ -254,7 +256,9 @@ mod tests {
         let batched = BatchedLoRAForward::new(pool, 4, 0.5, device);
         let x = Tensor::randn([1, 5, 64], (Kind::Float, device));
 
-        let result = batched.single_tenant_forward(&x, "q_proj", &tenant_a, 0).unwrap();
+        let result = batched
+            .single_tenant_forward(&x, "q_proj", &tenant_a, 0)
+            .unwrap();
         assert_eq!(result.size(), vec![1, 5, 64]);
     }
 
@@ -284,7 +288,6 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].size(), vec![1, 5, 64]);
         assert_eq!(results[1].size(), vec![1, 5, 64]);
-
     }
 
     #[test]
@@ -313,6 +316,10 @@ mod tests {
             .abs()
             .sum(Kind::Float)
             .double_value(&[]);
-        assert!(diff < 1e-6, "Batched should match sequential: diff={}", diff);
+        assert!(
+            diff < 1e-6,
+            "Batched should match sequential: diff={}",
+            diff
+        );
     }
 }

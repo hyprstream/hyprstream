@@ -305,6 +305,152 @@ fn decode_ed25519(b64: &str) -> anyhow::Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).context("invalid Ed25519 verifying key")
 }
 
+/// Initialize only the node authority, without provisioning a service roster.
+/// Existing authority always wins; disagreement is an error, never rotation.
+pub fn ensure_node_authority(secrets_dir: &Path) -> anyhow::Result<()> {
+    use super::identity_store as ids;
+    anyhow::ensure!(
+        secrets_dir.join("ca-key").try_exists()?
+            || secrets_dir.join("signing-key").try_exists()?
+            || !(secrets_dir.join("ca-pubkey").try_exists()?
+                || secrets_dir.join("ca-mldsa-pubkey").try_exists()?),
+        "retained public CA exists without private authority; restore the original key"
+    );
+    let root = if secrets_dir.join("ca-key").try_exists()? {
+        ids::load_ca_signing_key(secrets_dir)?
+    } else {
+        ids::load_or_generate_node_signing_key(secrets_dir)?
+    };
+    if secrets_dir.join("signing-key").try_exists()? {
+        let signing = ids::load_existing_service_signing_key(
+            secrets_dir,
+            "policy",
+            ids::SecretsProfile::SharedDirectory,
+        )?;
+        anyhow::ensure!(
+            signing.verifying_key() == root.verifying_key(),
+            "node signing key disagrees with retained CA"
+        );
+    }
+    let ca = hyprstream_rpc::node_identity::derive_purpose_key(&root, "hyprstream-jwt-v1");
+    let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+    let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq);
+    let has_public = secrets_dir.join("ca-pubkey").try_exists()?;
+    let has_pq = secrets_dir.join("ca-mldsa-pubkey").try_exists()?;
+    if has_public {
+        anyhow::ensure!(
+            ids::load_ca_verifying_key(secrets_dir)? == ca.verifying_key(),
+            "retained CA verifying key mismatch"
+        );
+    }
+    if has_pq {
+        anyhow::ensure!(
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ids::load_ca_ml_dsa_verifying_key(
+                secrets_dir
+            )?) == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&pq_vk),
+            "retained CA post-quantum key mismatch"
+        );
+    }
+    if !secrets_dir.join("ca-key").try_exists()? {
+        ids::write_ca_signing_key(secrets_dir, &root)?;
+    }
+    if !secrets_dir.join("signing-key").try_exists()? {
+        ids::write_secret(secrets_dir, "signing-key", &root.to_bytes())?;
+    }
+    if !has_public {
+        ids::write_ca_verifying_key(secrets_dir, &ca.verifying_key())?;
+    }
+    if !has_pq {
+        ids::write_ca_ml_dsa_verifying_key(secrets_dir, &pq_vk)?;
+    }
+    Ok(())
+}
+
+/// Reconcile credentials for the exact already-provisioned local bootstrap set.
+/// Unlike the wizard, this never generates keys or changes bootstrap-pubkeys.
+/// Validate the entire retained authority before publishing any credentials.
+pub fn reconcile_existing_services(
+    secrets_dir: &Path,
+    issuer: &str,
+    now: i64,
+) -> anyhow::Result<usize> {
+    use super::identity_store::{self, BootstrapPubkey, SecretsProfile};
+    anyhow::ensure!(
+        !issuer.trim().is_empty(),
+        "service enrollment requires a local issuer"
+    );
+    let bootstrap = identity_store::load_bootstrap_pubkeys_hybrid(secrets_dir)?;
+    anyhow::ensure!(!bootstrap.is_empty(), "no provisioned bootstrap services");
+    identity_store::ensure_bootstrap_pubkeys_hybrid(&bootstrap)?;
+    let root = identity_store::load_ca_signing_key(secrets_dir)?;
+    let ca = hyprstream_rpc::node_identity::derive_purpose_key(&root, "hyprstream-jwt-v1");
+    anyhow::ensure!(
+        identity_store::load_ca_verifying_key(secrets_dir)? == ca.verifying_key(),
+        "retained CA verifying key disagrees with signing authority"
+    );
+    let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+    anyhow::ensure!(
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&identity_store::load_ca_ml_dsa_verifying_key(
+            secrets_dir
+        )?) == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq)
+        ),
+        "retained CA post-quantum key disagrees with signing authority"
+    );
+    let mut local_keys = HashMap::new();
+    for name in bootstrap.keys() {
+        let key = identity_store::load_existing_service_signing_key(
+            secrets_dir,
+            name,
+            SecretsProfile::SharedDirectory,
+        )?;
+        if name == "policy" {
+            anyhow::ensure!(
+                key.verifying_key() == root.verifying_key(),
+                "Policy key disagrees with CA authority"
+            );
+        }
+        local_keys.insert(name.clone(), BootstrapPubkey::for_service_key(&key)?);
+    }
+    // Validate both halves against the actual retained private identities,
+    // including on first manifest creation.
+    ServiceEnrollmentManifest::from_bootstrap(&bootstrap).validate_key_agreement(&local_keys)?;
+    let retained = ServiceEnrollmentManifest::load(secrets_dir)?;
+    let enrollment = retained
+        .clone()
+        .unwrap_or_else(|| ServiceEnrollmentManifest::from_bootstrap(&bootstrap));
+    enrollment.reconcile_with_bootstrap(&bootstrap)?;
+    let mut credentials = Vec::new();
+    for (name, key) in &bootstrap {
+        anyhow::ensure!(
+            enrollment.allows_audience(name, Some(issuer)),
+            "enrollment audience denies service {name}"
+        );
+        let jwt = super::service_jwt::issue_or_load_service_jwt(
+            secrets_dir,
+            name,
+            &ca,
+            key,
+            issuer,
+            now,
+            enrollment.clearance_for_service(name).as_ref(),
+        )?;
+        credentials.push((name, jwt));
+    }
+    if retained.is_none() {
+        let mut staged = tempfile::NamedTempFile::new_in(secrets_dir)?;
+        serde_json::to_writer_pretty(&mut staged, &enrollment)?;
+        staged.as_file().sync_all()?;
+        staged
+            .persist_noclobber(secrets_dir.join(SERVICE_ENROLLMENT_FILE))
+            .context("publish new service-enrollment manifest without replacing retained state")?;
+    }
+    for (name, jwt) in &credentials {
+        identity_store::write_service_jwt(secrets_dir, name, jwt)?;
+    }
+    Ok(credentials.len())
+}
+
 // ── Process-global handle ─────────────────────────────────────────────────
 
 /// Process-global enrollment manifest, installed once at startup. `None`
@@ -347,6 +493,186 @@ mod tests {
     use super::*;
     use crate::auth::identity_store::BootstrapPubkey;
     use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level};
+
+    fn retained_services() -> tempfile::TempDir {
+        use crate::auth::identity_store as ids;
+        let dir = tempfile::tempdir().unwrap();
+        let root = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        let discovery = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+        let ca = hyprstream_rpc::node_identity::derive_purpose_key(&root, "hyprstream-jwt-v1");
+        ids::write_ca_signing_key(dir.path(), &root).unwrap();
+        ids::write_secret(dir.path(), "signing-key", &root.to_bytes()).unwrap();
+        ids::write_secret(
+            &dir.path().join("discovery"),
+            "signing-key",
+            &discovery.to_bytes(),
+        )
+        .unwrap();
+        ids::write_ca_verifying_key(dir.path(), &ca.verifying_key()).unwrap();
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        ids::write_ca_ml_dsa_verifying_key(
+            dir.path(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq),
+        )
+        .unwrap();
+        ids::write_bootstrap_pubkeys_hybrid(
+            dir.path(),
+            &HashMap::from([
+                (
+                    "policy".to_owned(),
+                    BootstrapPubkey::for_service_key(&root).unwrap(),
+                ),
+                (
+                    "discovery".to_owned(),
+                    BootstrapPubkey::for_service_key(&discovery).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn node_authority_is_idempotent_and_does_not_provision_a_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_node_authority(dir.path()).unwrap();
+        let paths = ["ca-key", "signing-key", "ca-pubkey", "ca-mldsa-pubkey"];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|p| std::fs::read(dir.path().join(p)).unwrap())
+            .collect();
+        ensure_node_authority(dir.path()).unwrap();
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(dir.path().join(path)).unwrap(), bytes);
+        }
+        assert!(!dir.path().join("bootstrap-pubkeys").exists());
+        assert!(!dir.path().join(SERVICE_ENROLLMENT_FILE).exists());
+        std::fs::remove_file(dir.path().join("signing-key")).unwrap();
+        ensure_node_authority(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("signing-key")).unwrap(),
+            std::fs::read(dir.path().join("ca-key")).unwrap()
+        );
+        std::fs::write(dir.path().join("signing-key"), [99; 32]).unwrap();
+        assert!(ensure_node_authority(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("signing-key")).unwrap(),
+            [99; 32]
+        );
+    }
+
+    #[test]
+    fn retained_enrollment_reconciles_exact_services_and_preserves_keys_and_valid_tokens() {
+        use crate::auth::identity_store as ids;
+        let dir = retained_services();
+        let now = chrono::Utc::now().timestamp();
+        let paths = [
+            "ca-key",
+            "signing-key",
+            "discovery/signing-key",
+            "bootstrap-pubkeys",
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|p| std::fs::read(dir.path().join(p)).unwrap())
+            .collect();
+        // Legacy credentials do not survive without their clearance projection.
+        ids::write_service_jwt(dir.path(), "policy", "legacy-invalid-token").unwrap();
+        assert_eq!(
+            reconcile_existing_services(dir.path(), "https://node.invalid", now).unwrap(),
+            2
+        );
+        let manifest = ServiceEnrollmentManifest::load_and_validate(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.services.len(), 2);
+        let mut tokens = Vec::new();
+        for name in ["policy", "discovery"] {
+            assert_eq!(
+                manifest.services[name].clearance.assurance,
+                Assurance::PqHybrid
+            );
+            let token = ids::load_service_jwt(dir.path(), name).unwrap().unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(token.split('.').nth(1).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(payload.get("clearance").is_some());
+            assert_eq!(payload["sub"], format!("service:{name}"));
+            tokens.push(token);
+        }
+        reconcile_existing_services(dir.path(), "https://node.invalid", now + 1).unwrap();
+        for (name, token) in ["policy", "discovery"].iter().zip(tokens) {
+            assert!(
+                ids::load_service_jwt(dir.path(), name).unwrap().unwrap() == token,
+                "valid retained token must be reused"
+            );
+        }
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(dir.path().join(path)).unwrap(), bytes);
+        }
+        assert!(
+            !dir.path().join("registry").exists(),
+            "reconcile must not provision unrelated identities"
+        );
+    }
+
+    #[test]
+    fn retained_enrollment_refuses_malformed_mismatched_or_disallowed_authority_before_writes() {
+        use crate::auth::identity_store as ids;
+        for failure in [
+            "malformed",
+            "manifest-key",
+            "private-key",
+            "audience",
+            "missing-key",
+        ] {
+            let dir = retained_services();
+            reconcile_existing_services(dir.path(), "https://node.invalid", 1_700_000_000).unwrap();
+            let path = dir.path().join(SERVICE_ENROLLMENT_FILE);
+            let mut manifest = ServiceEnrollmentManifest::load(dir.path())
+                .unwrap()
+                .unwrap();
+            match failure {
+                "malformed" => std::fs::write(&path, b"{broken").unwrap(),
+                "manifest-key" => {
+                    manifest.services.get_mut("policy").unwrap().ed25519_pubkey = test_key_b64().0;
+                    manifest.write(dir.path()).unwrap();
+                }
+                "private-key" => {
+                    ids::write_secret(&dir.path().join("discovery"), "signing-key", &[99; 32])
+                        .unwrap();
+                }
+                "audience" => {
+                    manifest
+                        .services
+                        .get_mut("discovery")
+                        .unwrap()
+                        .allowed_audiences = Some(vec!["https://other.invalid".into()]);
+                    manifest.write(dir.path()).unwrap();
+                }
+                "missing-key" => {
+                    std::fs::remove_file(dir.path().join("discovery/signing-key")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&path).unwrap();
+            let token = ids::load_service_jwt(dir.path(), "policy").unwrap();
+            assert!(
+                reconcile_existing_services(dir.path(), "https://node.invalid", 1_800_000_000)
+                    .is_err(),
+                "{failure}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{failure}");
+            assert_eq!(
+                ids::load_service_jwt(dir.path(), "policy").unwrap(),
+                token,
+                "{failure}"
+            );
+        }
+    }
 
     fn test_label() -> SecurityLabel {
         SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY)

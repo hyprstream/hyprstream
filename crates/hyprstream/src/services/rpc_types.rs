@@ -21,11 +21,7 @@ pub use hyprstream_rpc::streaming::StreamInfo;
 
 // Re-export generic streaming types from hyprstream-rpc
 pub use hyprstream_rpc::streaming::{
-    BatchingConfig,
-    StreamHmacState,
-    StreamPayload,
-    StreamPayloadData,
-    StreamVerifier,
+    BatchingConfig, StreamHmacState, StreamPayload, StreamPayloadData, StreamVerifier,
 };
 
 // ============================================================================
@@ -89,7 +85,8 @@ impl InferenceComplete {
 
     /// Deserialize from StreamPayload.complete bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("Failed to parse InferenceComplete: {}", e))
+        serde_json::from_slice(data)
+            .map_err(|e| anyhow::anyhow!("Failed to parse InferenceComplete: {}", e))
     }
 }
 
@@ -98,7 +95,9 @@ impl From<&crate::runtime::GenerationStats> for InferenceComplete {
         let finish_reason = match &stats.finish_reason {
             Some(crate::config::FinishReason::MaxTokens) => "length",
             Some(crate::config::FinishReason::EndOfSequence) => "eos",
-            Some(crate::config::FinishReason::Stop | crate::config::FinishReason::StopToken(_)) => "stop",
+            Some(crate::config::FinishReason::Stop | crate::config::FinishReason::StopToken(_)) => {
+                "stop"
+            }
             Some(crate::config::FinishReason::Error(_)) => "error",
             None => "unknown",
         };
@@ -116,7 +115,7 @@ impl From<&crate::runtime::GenerationStats> for InferenceComplete {
             inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
             perplexity: stats.quality_metrics.as_ref().map(|m| m.perplexity),
             avg_entropy: stats.quality_metrics.as_ref().map(|m| m.avg_entropy),
-            ttt_metrics: None,  // Attached by execute_stream in InferenceService
+            ttt_metrics: None, // Attached by execute_stream in InferenceService
         }
     }
 }
@@ -156,16 +155,14 @@ impl StreamPayloadExt for StreamPayload {
                     .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in token: {}", e))?;
                 Ok(InferenceStreamPayload::Token(text))
             }
-            StreamPayload::Error(message) => {
-                Ok(InferenceStreamPayload::Error(message))
-            }
+            StreamPayload::Error(message) => Ok(InferenceStreamPayload::Error(message)),
             StreamPayload::Complete(data) => {
                 let stats = InferenceComplete::from_bytes(&data)?;
                 Ok(InferenceStreamPayload::Complete(stats))
             }
-            StreamPayload::Tagged { .. } => {
-                Err(anyhow::anyhow!("Unexpected Tagged payload in inference stream"))
-            }
+            StreamPayload::Tagged { .. } => Err(anyhow::anyhow!(
+                "Unexpected Tagged payload in inference stream"
+            )),
         }
     }
 }

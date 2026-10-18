@@ -45,7 +45,9 @@ fn check_observation(probs: &[f64], label: usize, index: usize) -> Result<(), Me
     if (sum - 1.0).abs() > 1e-2 {
         return Err(MetricError::InvalidDistribution {
             index,
-            reason: format!("probabilities sum to {sum}, outside the consumer tolerance |Σp − 1| ≤ 1e-2"),
+            reason: format!(
+                "probabilities sum to {sum}, outside the consumer tolerance |Σp − 1| ≤ 1e-2"
+            ),
         });
     }
     if label >= probs.len() {

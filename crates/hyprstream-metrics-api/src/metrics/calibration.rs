@@ -18,9 +18,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::storage::StorageBackend;
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -208,9 +206,7 @@ impl CalibrationParams {
             }
             if let Some(card) = self.cardinality {
                 if card >= 0 && k as i64 != card {
-                    return Err(invalid(
-                        "dirichlet dimension must equal cardinality",
-                    ));
+                    return Err(invalid("dirichlet dimension must equal cardinality"));
                 }
             }
         }
@@ -225,11 +221,12 @@ impl CalibrationParams {
                     if !(0.0..1.0).contains(&e.level) {
                         return Err(invalid("conformal levels must be in (0, 1)"));
                     }
-                    if !e.lower.is_finite() || !e.upper.is_finite() || e.lower < 0.0 || e.upper < 0.0
+                    if !e.lower.is_finite()
+                        || !e.upper.is_finite()
+                        || e.lower < 0.0
+                        || e.upper < 0.0
                     {
-                        return Err(invalid(
-                            "ordinal interval offsets must be finite and >= 0",
-                        ));
+                        return Err(invalid("ordinal interval offsets must be finite and >= 0"));
                     }
                 }
             }
@@ -310,7 +307,10 @@ pub fn params_to_record_batch(params: &CalibrationParams) -> Result<RecordBatch,
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![params.version.schema_id.as_str()])),
         Arc::new(StringArray::from(vec![params.version.model_id.as_str()])),
-        Arc::new(StringArray::from(vec![params.version.calib_version.as_str()])),
+        Arc::new(StringArray::from(vec![params
+            .version
+            .calib_version
+            .as_str()])),
         Arc::new(StringArray::from(vec![params.primitive.as_str()])),
         Arc::new(Float64Array::from(vec![params.temperature])),
         Arc::new(StringArray::from(vec![null_bias.as_deref()])),
@@ -385,10 +385,14 @@ pub fn params_from_row(batch: &RecordBatch, row: usize) -> Result<CalibrationPar
     let col = |name: &str| batch.column_by_name(name);
     let primitive = DecisionPrimitive::parse(&req_string(col("primitive"), row, "primitive")?)?;
     let null_bias: Option<Vec<f64>> = decode_json(opt_string(col("null_bias"), row)?, "null_bias")?;
-    let dirichlet: Option<DirichletParams> =
-        decode_json(opt_string(col("dirichlet_params"), row)?, "dirichlet_params")?;
-    let conformal: Option<ConformalParams> =
-        decode_json(opt_string(col("conformal_params"), row)?, "conformal_params")?;
+    let dirichlet: Option<DirichletParams> = decode_json(
+        opt_string(col("dirichlet_params"), row)?,
+        "dirichlet_params",
+    )?;
+    let conformal: Option<ConformalParams> = decode_json(
+        opt_string(col("conformal_params"), row)?,
+        "conformal_params",
+    )?;
     Ok(CalibrationParams {
         version: VersionTriple {
             schema_id: req_string(col("schema_id"), row, "schema_id")?,
@@ -454,7 +458,9 @@ impl<B: StorageBackend> CalibrationStore<B> {
             )));
         }
         let batch = params_to_record_batch(params)?;
-        self.backend.insert_into_table(CALIBRATION_TABLE, batch).await
+        self.backend
+            .insert_into_table(CALIBRATION_TABLE, batch)
+            .await
     }
 
     /// The newest parameter row for a (schema, model, primitive), by fit time.
@@ -513,7 +519,11 @@ fn count_rows(batch: &RecordBatch) -> Result<u64, Status> {
 mod tests {
     use super::*;
 
-    fn params(primitive: DecisionPrimitive, calib_version: &str, fitted_at: i64) -> CalibrationParams {
+    fn params(
+        primitive: DecisionPrimitive,
+        calib_version: &str,
+        fitted_at: i64,
+    ) -> CalibrationParams {
         CalibrationParams {
             version: VersionTriple {
                 schema_id: "jev1:q1".to_owned(),

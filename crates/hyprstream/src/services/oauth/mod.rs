@@ -26,11 +26,11 @@
 //!   /oauth/device/verify                     → user verification page
 //! ```
 
-mod account_worker;
 mod account_tls;
+mod account_worker;
 
-pub mod auth;
 pub(crate) mod atproto_session;
+pub mod auth;
 pub mod authorize;
 pub mod browser_session;
 pub mod challenge;
@@ -42,6 +42,18 @@ pub mod device_enrollment;
 pub mod did_document;
 pub mod dpop;
 pub mod federation_entity;
+// Exact Federate routes deny until the authenticated Policy runtime is installed.
+#[allow(dead_code)]
+pub(crate) mod federate_exchange;
+pub(crate) mod federate_host;
+#[cfg(feature = "postgres")]
+pub(crate) mod federate_policy;
+#[allow(dead_code)]
+pub(crate) mod federate_source;
+// H3b.1 proof primitive only: no constructor installs its authority provider.
+#[cfg(feature = "postgres")]
+#[allow(dead_code)]
+pub(crate) mod federate_proof;
 pub mod identity_registration;
 pub mod introspection;
 pub mod jwks;
@@ -95,12 +107,64 @@ use state::OAuthState;
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "oauth";
 
+/// Use only this OAuth instance's enrolled credential. Native clients retain
+/// their existing renewing provider; the initial token enables that provider.
+pub(crate) fn runtime_policy_client(
+    transport: &TransportConfig,
+    signing_key: hyprstream_rpc::crypto::SigningKey,
+    policy_vk: hyprstream_rpc::crypto::VerifyingKey,
+) -> Result<PolicyClient> {
+    let token = crate::services::factories::service_token(&signing_key)
+        .ok_or_else(|| anyhow::anyhow!("OAuth has no enrolled service credential"))?;
+    if hyprstream_discovery::native_network_required() {
+        PolicyClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key,
+            Some(token),
+        )
+    } else {
+        anyhow::ensure!(
+            matches!(
+                &transport.endpoint,
+                hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                    | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                    | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+            ),
+            "local bootstrap refuses network transport; use the identity-bound provider",
+        );
+        let key = signing_key.verifying_key();
+        let provider = Arc::new(move || {
+            hyprstream_service::global_trust_store()
+                .get(&key)
+                .and_then(|attestation| attestation.jwt)
+        });
+        let rpc = hyprstream_rpc::dial::dial_with_token_provider(
+            transport,
+            hyprstream_rpc::signer::LocalSigner::new(signing_key),
+            Some(policy_vk),
+            Some(provider),
+        )?;
+        Ok(PolicyClient::new(rpc))
+    }
+}
+
 /// Create the OAuth Axum router.
 ///
 /// CORS is outermost (applied last) so OPTIONS preflights are handled before
 /// any inner middleware (like logging) runs. This fixes the previous ordering
 /// where logging was outermost and CORS was inner.
 pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfig) -> Router {
+    // The public TLS hostname terminates on OAuth. Keep this one bootstrap
+    // route independently rate-limited before accepted-state resolution.
+    let browser_provisioning_router = Router::new()
+        .route(
+            "/.well-known/hyprstream/browser-provisioning/:service",
+            get(crate::server::routes::browser_provisioning::oauth_browser_provisioning),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state.browser_provisioning_rate_limiter),
+            crate::server::middleware::browser_provisioning_rate_limit_middleware,
+        ));
     // ── Public routes ──────────────────────────────────────────────────────────
     // No Bearer token required. Includes all OAuth flow endpoints (clients are
     // unauthenticated when they arrive) and SCIM discovery (RFC 7644 §4).
@@ -136,6 +200,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/oauth/par", post(par::push_authorization_request))
+        .route("/oauth/federate/challenge", post(federate_host::challenge))
         .route("/oauth/token", post(token::exchange_token))
         .route("/oauth/spiffe/wit", post(spiffe::exchange_workload_wit))
         .route("/oauth/jwks", get(jwks::jwks))
@@ -159,10 +224,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             browser_session::SESSION_EXCHANGE_PATH,
             post(browser_session::exchange),
         )
-        .route(
-            browser_session::WHOAMI_PATH,
-            get(browser_session::whoami),
-        )
+        .route(browser_session::WHOAMI_PATH, get(browser_session::whoami))
         .route(
             "/oauth/external/authorize/:provider",
             get(oidc_callback::external_authorize),
@@ -226,10 +288,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         ));
 
     let protected_routes = Router::new()
-        .route(
-            xrpc::GET_SERVICE_AUTH_PATH,
-            get(xrpc::get_service_auth),
-        )
+        .route(xrpc::GET_SERVICE_AUTH_PATH, get(xrpc::get_service_auth))
         .route("/oauth/introspect", post(introspection::introspect_token))
         .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
         .route(
@@ -241,11 +300,13 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(userinfo::userinfo).post(userinfo::userinfo),
         )
         .merge(authority_router)
-        .merge(if state.public_repo_writer.is_some() || state.hosted_public_repo_writer.is_some() {
-            xrpc::xrpc_write_routes()
-        } else {
-            Router::new()
-        })
+        .merge(
+            if state.public_repo_writer.is_some() || state.hosted_public_repo_writer.is_some() {
+                xrpc::xrpc_write_routes()
+            } else {
+                Router::new()
+            },
+        )
         .merge(if state.atproto_session_resolver.is_some() {
             xrpc::xrpc_session_routes()
         } else {
@@ -253,9 +314,9 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         });
 
     let protected_router = protected_routes.layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state),
-            auth::require_bearer_token,
-        ));
+        Arc::clone(&state),
+        auth::require_bearer_token,
+    ));
 
     // Browser identity mutations authenticate with the server-side login
     // session. This is separate from the tenant-requiring bearer middleware:
@@ -266,14 +327,21 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/api/identity/register",
             post(identity_registration::register_self_service),
         )
-        .route(
-            "/api/identity/intake",
-            post(identity_registration::intake_federated_identity),
-        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             identity_registration::require_registration_session,
-        ));
+        ))
+        .merge(
+            Router::new()
+                .route(
+                    "/api/identity/intake",
+                    post(identity_registration::intake_federated_identity),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    identity_registration::require_local_intake_session,
+                )),
+        );
 
     // ── DID-document routes ──────────────────────────────────────────────────────
     // Public, secret-free GET endpoints (did:web + atproto handle resolution).
@@ -293,14 +361,15 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             state.deployment_well_known_dir.clone(),
         ));
     } else {
-        did_router = did_router.route(
-            "/.well-known/did.json",
-            get(did_document::root_did_document),
-        )
-        .route(
-            "/.well-known/at9p/:cid.cbor",
-            get(did_document::at9p_capsule),
-        );
+        did_router = did_router
+            .route(
+                "/.well-known/did.json",
+                get(did_document::root_did_document),
+            )
+            .route(
+                "/.well-known/at9p/:cid.cbor",
+                get(did_document::at9p_capsule),
+            );
     }
     let mut did_router = did_router
         // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
@@ -315,6 +384,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         );
 
     let mut api_router = public_router
+        .merge(browser_provisioning_router)
         .merge(protected_router)
         .merge(self_service_identity_router);
 
@@ -446,15 +516,16 @@ async fn warm_hosted_did_index(
     authority: hyprstream_rpc::Subject,
     timeout: std::time::Duration,
 ) -> Result<(), hyprstream_rpc::error::RpcError> {
-    let mut worker = account_worker::ContainedWorker::spawn("hyprstream-oauth-index-warmup", move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("warm-up runtime: {error}"))?;
-        runtime
-            .block_on(store.refresh_hosted_did_index(&authority))
-            .map_err(|error| format!("index refresh: {error}"))
-    })?;
+    let mut worker =
+        account_worker::ContainedWorker::spawn("hyprstream-oauth-index-warmup", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("warm-up runtime: {error}"))?;
+            runtime
+                .block_on(store.refresh_hosted_did_index(&authority))
+                .map_err(|error| format!("index refresh: {error}"))
+        })?;
     worker.finish(timeout).await?.map_err(|error| {
         hyprstream_rpc::error::RpcError::SpawnFailed(format!(
             "hosted account index warm-up failed: {error}"
@@ -504,7 +575,9 @@ async fn bind_oauth_substrate_profile<F, Fut>(
 >
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>>,
+    Fut: std::future::Future<
+        Output = anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate>,
+    >,
 {
     match build().await {
         Ok(substrate) => Ok(Some(substrate)),
@@ -549,7 +622,7 @@ fn classify_oauth_endpoint_install(
             drop(returned);
             OAuthEndpointInstall::ExistingGlobalRetained
         }
-}
+    }
 }
 
 pub struct OAuthService {
@@ -658,10 +731,13 @@ impl OAuthService {
 
 fn account_http_socket_addr(config: &crate::account::AccountHttpConfig) -> Result<SocketAddr> {
     // Preserve bracketed IPv6 configurations while accepting bare IP literals.
-    let host = config.host.strip_prefix('[')
+    let host = config
+        .host
+        .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(&config.host);
-    let ip = host.parse::<std::net::IpAddr>()
+    let ip = host
+        .parse::<std::net::IpAddr>()
         .map_err(|error| anyhow::anyhow!("invalid account HTTP bind IP: {error}"))?;
     Ok(SocketAddr::new(ip, config.port))
 }
@@ -674,7 +750,10 @@ async fn resolve_account_http_tls(
     config: &crate::account::AccountHttpConfig,
     zone: &crate::account::AccountZone,
 ) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
-    anyhow::ensure!(config.port != 0, "account HTTP listener port must be non-zero");
+    anyhow::ensure!(
+        config.port != 0,
+        "account HTTP listener port must be non-zero"
+    );
     anyhow::ensure!(
         config.tls_cert.is_file(),
         "account TLS certificate is unavailable: {}",
@@ -723,7 +802,10 @@ async fn resolve_account_http_tls(
 #[cfg(test)]
 fn runtime_clients(
     signing_key: &ed25519_dalek::SigningKey,
-) -> anyhow::Result<(PolicyClient, hyprstream_rpc_std::discovery_client::DiscoveryClient)> {
+) -> anyhow::Result<(
+    PolicyClient,
+    hyprstream_rpc_std::discovery_client::DiscoveryClient,
+)> {
     let trust = hyprstream_service::global_trust_store();
     let policy_key = trust
         .resolve_one("policy")
@@ -824,19 +906,13 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let policy_client = if hyprstream_discovery::native_network_required() {
-                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, self.signing_key.clone(), None)
-                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("failed to create PolicyClient: {e}")))?
-            } else {
-                PolicyClient::for_local_transport_bootstrap(
-                    &self.policy_transport,
-                    self.signing_key.clone(),
-                    policy_vk,
-                    None,
-                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                    format!("failed to create PolicyClient: {e}"),
-                ))?
-            };
+            let policy_client = runtime_policy_client(
+                &self.policy_transport,
+                self.signing_key.clone(),
+                policy_vk,
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                format!("failed to create PolicyClient: {e}"),
+            ))?;
 
             let discovery_vk = match hyprstream_service::global_trust_store().resolve_one("discovery") {
                 Some(vk) => vk,
@@ -870,8 +946,12 @@ impl Spawnable for OAuthService {
             // credential-store boundary. Account-store construction failure
             // fails closed; no caller can inject a raw backend here.
             let credentials_config = crate::config::HyprConfig::load()
-                .map(|c| c.credentials)
-                .unwrap_or_default();
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "failed to load production credential configuration: {error}"
+                    ))
+                })?
+                .credentials;
             let (user_store, device_store_opt) =
                 crate::auth::ProductionUserStore::open_with_device_store(
                     &credentials_dir,
@@ -1082,7 +1162,8 @@ impl Spawnable for OAuthService {
                 policy_client,
                 discovery_client.clone(),
                 jwt_verifying_key,
-            );
+            )
+            .with_browser_provisioning_signer(self.signing_key.clone());
             if let Some(store) = &hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
             }
@@ -1137,8 +1218,32 @@ impl Spawnable for OAuthService {
             if let Some(key) = ca_jwt_key {
                 oauth_state = oauth_state.with_ca_jwt_key(key);
             }
+            // Install the FederateIssuer for the Federate login path (#1718).
+            // Uses the PolicyClient for prepare/commit and the active OAuth
+            // access-token key (including key-store rotation) for the session JWT.
             if let Some(store) = signing_key_store {
                 oauth_state = oauth_state.with_signing_key_store(store);
+            }
+            #[cfg(feature = "postgres")]
+            if federate_source::FederateHost::new(&oauth_state.issuer_url).is_ok() {
+                let admission = std::sync::Arc::new(
+                    crate::services::oauth::federate_policy::PolicyFederateAdmission::new(
+                        oauth_state.policy_client.clone(),
+                    ),
+                );
+                let signer = oauth_state
+                    .federate_signer()
+                    .await
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                        format!("FederateSigner construction failed: {e:#}"),
+                    ))?;
+                oauth_state
+                    .install_federate_issuer(admission, signer)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                        format!("FederateIssuer installation failed: {e:#}"),
+                    ))?;
+            } else {
+                tracing::warn!("Federate exchange disabled: OAuth issuer must be an exact canonical HTTPS origin");
             }
             oauth_state = oauth_state.with_root_identity_key_store(root_identity_store);
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
@@ -1176,14 +1281,17 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
-            // The token store is decoupled from the account backend: a pglite
-            // UserStore does not imply a pglite TokenStore — refresh tokens
-            // always go to RocksDB or Valkey.
+            // The token store is decoupled from the account backend: neither
+            // PGlite nor RDS Postgres UserStore implements a token store.
+            // Refresh tokens always go to RocksDB or Valkey.
             #[cfg(feature = "rocksdb")]
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
-                // Pglite account store falls through to RocksDB for tokens.
-                CredentialsBackend::Pglite | CredentialsBackend::Rocksdb => {
+                // Relational account stores deliberately fall through to
+                // RocksDB for durable OAuth refresh tokens.
+                CredentialsBackend::Pglite
+                | CredentialsBackend::Postgres
+                | CredentialsBackend::Rocksdb => {
                     #[cfg(feature = "rocksdb")]
                     {
                         match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
@@ -1366,7 +1474,7 @@ impl Spawnable for OAuthService {
                     })?;
                 let account_bound = crate::server::tls::bind_listener(
                     account_addr,
-                    Some(account_tls),
+                    Some(crate::server::tls::ResolvedTlsConfig::ordinary(account_tls)),
                     "AccountHttpService",
                 )?;
                 Some((account_bound, account_app, http_config.clone(), zone))
@@ -1716,7 +1824,11 @@ impl Spawnable for OAuthService {
             if let Err(error) = &result {
                 tracing::error!(%error, "dedicated OAuth process failed");
             }
-            std::process::exit(if result.is_ok() { 0 } else { account_worker::WORKER_FAILURE_EXIT });
+            std::process::exit(if result.is_ok() {
+                0
+            } else {
+                account_worker::WORKER_FAILURE_EXIT
+            });
         }
         result
     }
@@ -1787,14 +1899,21 @@ mod tests {
         // checkpoint-backed discovery resolver; compat dials the
         // factory-resolved IPC transports (20-space continuation inside the
         // profile branch).
-        assert!(run.contains(
-            "PolicyClient::for_local_transport_bootstrap(\n                    &self.policy_transport,"
-        ));
+        assert!(run.contains("runtime_policy_client(\n                &self.policy_transport,"));
+        let policy_constructor = production
+            .split("pub(crate) fn runtime_policy_client(")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Create the OAuth Axum router.").next())
+            .expect("production Policy constructor must exist");
+        assert!(policy_constructor.contains("factories::service_token(&signing_key)"));
+        assert!(policy_constructor.contains("dial::dial_with_token_provider("));
+        assert!(policy_constructor.contains("local bootstrap refuses network transport"));
+        assert!(policy_constructor.contains("Some(token)"));
         assert!(run.contains(
             "DiscoveryClient::for_local_transport_bootstrap(\n                    &self.discovery_transport,"
         ));
         assert!(
-            run.contains("if hyprstream_discovery::native_network_required() {\n                PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, "),
+            policy_constructor.contains("if hyprstream_discovery::native_network_required() {\n        PolicyClient::from_provider("),
             "Required profile must resolve Policy through the checkpoint resolver"
         );
         assert!(
@@ -1827,7 +1946,10 @@ mod tests {
             ("[::1]", "[::1]:8443"),
         ] {
             config.host = host.to_owned();
-            assert_eq!(account_http_socket_addr(&config).unwrap().to_string(), expected);
+            assert_eq!(
+                account_http_socket_addr(&config).unwrap().to_string(),
+                expected
+            );
         }
         for invalid in ["localhost", "[::1", "::1]", "127.0.0.1:8443"] {
             config.host = invalid.to_owned();
@@ -1849,9 +1971,15 @@ mod tests {
         };
         let transport = TransportConfig::inproc("test-containment-unused");
         let service = OAuthService::new(
-            Default::default(), Default::default(), account, sk.clone(),
-            transport.clone(), transport.clone(), transport,
-            sk.verifying_key(), sk.verifying_key(),
+            Default::default(),
+            Default::default(),
+            account,
+            sk.clone(),
+            transport.clone(),
+            transport.clone(),
+            transport,
+            sk.verifying_key(),
+            sk.verifying_key(),
         );
         let result = Box::new(service).run(Arc::new(Notify::new()), None);
         assert!(matches!(result,
@@ -1864,9 +1992,11 @@ mod tests {
     fn oauth_warms_hosted_did_index_before_readiness() {
         let source = include_str!("mod.rs");
         let production = source
-            .get(..source
-                .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used")
-                .expect("test module must remain explicit"))
+            .get(
+                ..source
+                    .find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used")
+                    .expect("test module must remain explicit"),
+            )
             .expect("production source must precede tests");
         let run_start = production
             .find("impl Spawnable for OAuthService")
@@ -1878,7 +2008,10 @@ mod tests {
         let ready = run
             .find("serve_bridged(")
             .expect("OAuth readiness boundary must remain explicit");
-        assert!(warmup < ready, "OAuth must not signal readiness before index warm-up");
+        assert!(
+            warmup < ready,
+            "OAuth must not signal readiness before index warm-up"
+        );
         let warmup_block = &run[warmup..ready];
         assert!(
             warmup_block.contains("warm_hosted_did_index(")
@@ -1900,7 +2033,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hosted_did_warmup_timeout_does_not_wait_for_blocking_scan() {
-        const TEST: &str = "services::oauth::tests::hosted_did_warmup_timeout_does_not_wait_for_blocking_scan";
+        const TEST: &str =
+            "services::oauth::tests::hosted_did_warmup_timeout_does_not_wait_for_blocking_scan";
         if !account_worker::tests::is_child(TEST) {
             account_worker::tests::expect_contained_exit(TEST, &[]);
             return;
@@ -1927,9 +2061,7 @@ mod tests {
         ));
         let _ = warm_hosted_did_index(
             store,
-            hyprstream_rpc::Subject::new(
-                hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
-            ),
+            hyprstream_rpc::Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT),
             std::time::Duration::from_millis(20),
         )
         .await;
@@ -1982,8 +2114,14 @@ mod tests {
         app.clone()
             .oneshot(
                 axum::http::Request::post(uri)
-                    .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {bearer}"),
+                    )
                     .body(axum::body::Body::from(encode_form(fields)))
                     .unwrap(),
             )
@@ -2247,9 +2385,9 @@ mod tests {
             ));
         }
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
-            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(std::sync::Arc::new(
-                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
-            ));
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(
+                std::sync::Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
+            );
         }
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -2269,10 +2407,10 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
-        use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
+        use crate::services::PolicyService;
         use hyprstream_rpc_std::discovery_client::DiscoveryClient;
         use hyprstream_rpc_std::policy_client::PolicyClient;
-        use crate::services::PolicyService;
+        use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 
         const ISSUER: &str = "https://pds.example.test:8443";
         const GENERIC_ISSUER: &str = "https://pds.example.test:8443/configured/path";
@@ -2358,21 +2496,19 @@ mod tests {
                 ) -> Option<crate::services::policy::PrimaryGroup> {
                     (principal == "alice").then(|| crate::services::policy::PrimaryGroup {
                         suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
-                        ordered_component_keys: vec![
-                            ed25519_dalek::SigningKey::from_bytes(&[0x63; 32])
-                                .verifying_key()
-                                .to_bytes()
-                                .to_vec(),
-                        ],
+                        ordered_component_keys: vec![ed25519_dalek::SigningKey::from_bytes(
+                            &[0x63; 32],
+                        )
+                        .verifying_key()
+                        .to_bytes()
+                        .to_vec()],
                     })
                 }
             }
             Arc::new(AliceResolver)
         })
         .with_token_clearance_resolver(Arc::new(|subject| {
-            use hyprstream_rpc::auth::mac::{
-                Assurance, CompartmentSet, Level, SecurityLabel,
-            };
+            use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
             (subject == MAPPED_DID).then(|| {
                 SecurityLabel::new(
                     Level::Secret,
@@ -2407,7 +2543,8 @@ mod tests {
                 UserProfile {
                     atproto_did: Some(MAPPED_DID.to_owned()),
                     ..Default::default()
-                }.into(),
+                }
+                .into(),
             )
             .await?;
         assert_eq!(
@@ -2474,8 +2611,7 @@ mod tests {
         )?;
         let sealed_account = pending_account.seal(account_signature)?;
         let atproto_signing_key = sealed_account.atproto_signing_key().clone();
-        let atproto_document =
-            serde_json::from_slice(sealed_account.did_document().as_bytes())?;
+        let atproto_document = serde_json::from_slice(sealed_account.did_document().as_bytes())?;
         let pds_root = SyntheticNode::dir().with_child(
             HOSTED_TENANT,
             SyntheticNode::dir().with_child(
@@ -2511,12 +2647,8 @@ mod tests {
         )
         .with_user_store(crate::auth::ProductionUserStore::for_test(user_store))
         .with_hosted_account_store(hosted_account_store)
-        .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
-            atproto_document,
-        )))
-        .with_hosted_account_zone(crate::account::AccountZone::new(
-            "acct.example.test",
-        )?);
+        .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(atproto_document)))
+        .with_hosted_account_zone(crate::account::AccountZone::new("acct.example.test")?);
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
             token_dir.path().join("refresh.db"),
@@ -2594,35 +2726,27 @@ mod tests {
         // #1119 service assertions prove the external DID and requested
         // operation. They do not bind that DID to a local tenant.
         let now = chrono::Utc::now().timestamp();
-        let service_header = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&serde_json::json!({
-                "alg": "ES256", "typ": "JWT", "kid": "#atproto"
-            }))?,
-        );
-        let make_service_jwt_with_times = |audience: &str,
-                                           lxm: &str,
-                                           jti: &str,
-                                           iat: i64,
-                                           exp: i64|
-         -> anyhow::Result<String> {
-            let payload = URL_SAFE_NO_PAD.encode(
-                serde_json::to_vec(&serde_json::json!({
+        let service_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+            "alg": "ES256", "typ": "JWT", "kid": "#atproto"
+        }))?);
+        let make_service_jwt_with_times =
+            |audience: &str, lxm: &str, jti: &str, iat: i64, exp: i64| -> anyhow::Result<String> {
+                let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
                     "iss": MAPPED_DID,
                     "aud": audience,
                     "iat": iat,
                     "exp": exp,
                     "lxm": lxm,
                     "jti": jti
-                }))?,
-            );
-            let signing_input = format!("{service_header}.{payload}");
-            let signature: p256::ecdsa::Signature =
-                atproto_signing_key.sign(signing_input.as_bytes());
-            Ok(format!(
-                "{signing_input}.{}",
-                URL_SAFE_NO_PAD.encode(signature.to_bytes())
-            ))
-        };
+                }))?);
+                let signing_input = format!("{service_header}.{payload}");
+                let signature: p256::ecdsa::Signature =
+                    atproto_signing_key.sign(signing_input.as_bytes());
+                Ok(format!(
+                    "{signing_input}.{}",
+                    URL_SAFE_NO_PAD.encode(signature.to_bytes())
+                ))
+            };
         let make_service_jwt = |audience: &str, lxm: &str, jti: &str| {
             make_service_jwt_with_times(audience, lxm, jti, now, now + 60)
         };
@@ -2642,10 +2766,7 @@ mod tests {
         let exchange_request = |jwt: &str, tenant: &str| {
             axum::http::Request::post("/xrpc/ai.hyprstream.identity.exchangeUcan")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(
-                    axum::http::header::AUTHORIZATION,
-                    format!("Bearer {jwt}"),
-                )
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {jwt}"))
                 .header("DPoP", &exchange_dpop)
                 .body(axum::body::Body::from(
                     serde_json::json!({
@@ -2800,8 +2921,9 @@ mod tests {
                 std::time::Duration::from_secs(300),
             )
             .await;
-        let cimd_par_challenge =
-            URL_SAFE_NO_PAD.encode(Sha256::digest(b"cimd-ceiling-pkce-verifier-abcdefghijklmnopqrstuvwxyz"));
+        let cimd_par_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            b"cimd-ceiling-pkce-verifier-abcdefghijklmnopqrstuvwxyz",
+        ));
         let cimd_over_scope_par = post_form(
             &app,
             "/oauth/par",
@@ -3019,10 +3141,7 @@ mod tests {
             axum::http::StatusCode::OK,
             "{service_auth_json}"
         );
-        assert_eq!(
-            service_auth_cache_control.as_ref().unwrap(),
-            "no-store"
-        );
+        assert_eq!(service_auth_cache_control.as_ref().unwrap(), "no-store");
         let service_jwt = service_auth_json["token"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("service-auth response token"))?
@@ -3058,18 +3177,15 @@ mod tests {
             )
             .await?;
         assert_eq!(session.status(), axum::http::StatusCode::OK);
-        assert!(
-            session.headers()[axum::http::header::SET_COOKIE]
-                .to_str()?
-                .starts_with("hyprstream_session=")
-        );
+        assert!(session.headers()[axum::http::header::SET_COOKIE]
+            .to_str()?
+            .starts_with("hyprstream_session="));
 
         // A confidential atproto client signs private_key_jwt with the AS
         // issuer as the assertion audience (atproto mandate, #1146 T1.2),
         // even though the configured generic issuer carries a path.
-        let advertised_metadata = response_json(
-            get(&app, "/.well-known/oauth-authorization-server").await,
-        ).await;
+        let advertised_metadata =
+            response_json(get(&app, "/.well-known/oauth-authorization-server").await).await;
         let advertised_token_endpoint = advertised_metadata["token_endpoint"]
             .as_str()
             .unwrap()
@@ -3145,7 +3261,10 @@ mod tests {
         )
         .await;
         assert_eq!(wrong_aud_par.status(), axum::http::StatusCode::UNAUTHORIZED);
-        assert_eq!(response_json(wrong_aud_par).await["error"], "invalid_client");
+        assert_eq!(
+            response_json(wrong_aud_par).await["error"],
+            "invalid_client"
+        );
 
         let private_par_proof = dpop_proof(
             &private_dpop_key,
@@ -3177,9 +3296,11 @@ mod tests {
             ],
             Some(&private_par_proof),
             false,
-        ).await;
+        )
+        .await;
         assert_eq!(private_par.status(), axum::http::StatusCode::CREATED);
-        let private_dpop_nonce = private_par.headers()
+        let private_dpop_nonce = private_par
+            .headers()
             .get("DPoP-Nonce")
             .and_then(|value| value.to_str().ok())
             .unwrap()
@@ -3198,7 +3319,8 @@ mod tests {
         let private_authorize_html = response_text(private_authorize).await;
         let private_nonce = html_hidden_value(&private_authorize_html, "nonce").to_owned();
         let private_signed = format!("{fingerprint}:{private_nonce}:{private_challenge}");
-        let private_signature = STANDARD.encode(user_key.sign(private_signed.as_bytes()).to_bytes());
+        let private_signature =
+            STANDARD.encode(user_key.sign(private_signed.as_bytes()).to_bytes());
         let private_callback = post_form(
             &app,
             "/oauth/authorize",
@@ -3215,9 +3337,11 @@ mod tests {
             ],
             None,
             false,
-        ).await;
+        )
+        .await;
         assert_eq!(private_callback.status(), axum::http::StatusCode::SEE_OTHER);
-        let private_location = private_callback.headers()
+        let private_location = private_callback
+            .headers()
             .get(axum::http::header::LOCATION)
             .and_then(|value| value.to_str().ok())
             .unwrap();
@@ -3249,13 +3373,17 @@ mod tests {
             ],
             Some(&replay_assertion_proof),
             false,
-        ).await;
+        )
+        .await;
         assert_eq!(
             replayed_assertion.status(),
             axum::http::StatusCode::UNAUTHORIZED,
             "a replayed client_assertion jti must be rejected"
         );
-        assert_eq!(response_json(replayed_assertion).await["error"], "invalid_client");
+        assert_eq!(
+            response_json(replayed_assertion).await["error"],
+            "invalid_client"
+        );
 
         let private_token_proof = dpop_proof(
             &private_dpop_key,
@@ -3284,9 +3412,16 @@ mod tests {
             ],
             Some(&private_token_proof),
             false,
-        ).await;
-        assert_eq!(wrong_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
-        assert_eq!(response_json(wrong_audience).await["error"], "invalid_client");
+        )
+        .await;
+        assert_eq!(
+            wrong_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            response_json(wrong_audience).await["error"],
+            "invalid_client"
+        );
 
         // #1146 T1.2 (rev): the RFC 7523 token-endpoint audience form is NOT
         // accepted at the token endpoint either — atproto mandates the AS
@@ -3313,13 +3448,17 @@ mod tests {
             ],
             Some(&private_token_proof),
             false,
-        ).await;
+        )
+        .await;
         assert_eq!(
             endpoint_audience.status(),
             axum::http::StatusCode::UNAUTHORIZED,
             "the token-endpoint audience form must be rejected (issuer-only)"
         );
-        assert_eq!(response_json(endpoint_audience).await["error"], "invalid_client");
+        assert_eq!(
+            response_json(endpoint_audience).await["error"],
+            "invalid_client"
+        );
 
         // #1146 T1.2: the reference confidential client sends the AS ISSUER
         // as the assertion audience — previously rejected, now the ONLY
@@ -3345,7 +3484,8 @@ mod tests {
             ],
             Some(&private_token_proof),
             false,
-        ).await;
+        )
+        .await;
         assert_eq!(private_token.status(), axum::http::StatusCode::OK);
         let private_token_nonce = private_token
             .headers()
@@ -3355,7 +3495,10 @@ mod tests {
             .to_owned();
         let private_token_json = response_json(private_token).await;
         assert_eq!(private_token_json["token_type"], "DPoP");
-        assert_eq!(jwt_claims(private_token_json["access_token"].as_str().unwrap())["iss"], ISSUER);
+        assert_eq!(
+            jwt_claims(private_token_json["access_token"].as_str().unwrap())["iss"],
+            ISSUER
+        );
         let private_refresh_token = private_token_json["refresh_token"]
             .as_str()
             .unwrap()
@@ -3397,9 +3540,15 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "refresh must not switch to another registered assertion key"
         );
-        assert_eq!(response_json(switch_refresh).await["error"], "invalid_client");
+        assert_eq!(
+            response_json(switch_refresh).await["error"],
+            "invalid_client"
+        );
         assert!(
-            state.get_refresh_token(&private_refresh_token).await?.is_some(),
+            state
+                .get_refresh_token(&private_refresh_token)
+                .await?
+                .is_some(),
             "a rejected client authentication must not consume the refresh token"
         );
 
@@ -3490,9 +3639,15 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "key removal from the client JWKS must revoke the session"
         );
-        assert_eq!(response_json(removed_key_refresh).await["error"], "invalid_client");
+        assert_eq!(
+            response_json(removed_key_refresh).await["error"],
+            "invalid_client"
+        );
         assert!(
-            state.get_refresh_token(&rotated_refresh_token).await?.is_some(),
+            state
+                .get_refresh_token(&rotated_refresh_token)
+                .await?
+                .is_some(),
             "a rejected client authentication must not consume the refresh token"
         );
 
@@ -3552,34 +3707,66 @@ mod tests {
         // by mutating hidden fields on the callback POST.
         let downgrade_challenge =
             URL_SAFE_NO_PAD.encode(Sha256::digest(GENERIC_PKCE_VERIFIER.as_bytes()));
-        let downgrade_par = post_form(&app, "/oauth/par", &[
-            ("client_id", CLIENT_ID), ("redirect_uri", REDIRECT_URI),
-            ("code_challenge", &downgrade_challenge), ("code_challenge_method", "S256"),
-            ("response_type", "code"), ("state", "scope-binding-state"),
-            ("scope", "read:*:*"), ("resource", ISSUER),
-        ], None, false).await;
+        let downgrade_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &downgrade_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "scope-binding-state"),
+                ("scope", "read:*:*"),
+                ("resource", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
         assert_eq!(downgrade_par.status(), axum::http::StatusCode::CREATED);
         let downgrade_par_json = response_json(downgrade_par).await;
         let downgrade_request_uri = downgrade_par_json["request_uri"].as_str().unwrap();
         let downgrade_authorize_uri = format!(
             "/oauth/authorize?{}",
-            encode_form(&[("request_uri", downgrade_request_uri), ("client_id", CLIENT_ID)])
+            encode_form(&[
+                ("request_uri", downgrade_request_uri),
+                ("client_id", CLIENT_ID)
+            ])
         );
         let downgrade_authorize = get(&app, &downgrade_authorize_uri).await;
         assert_eq!(downgrade_authorize.status(), axum::http::StatusCode::OK);
         let downgrade_html = response_text(downgrade_authorize).await;
         let downgrade_nonce = html_hidden_value(&downgrade_html, "nonce").to_owned();
         let downgrade_signed = format!("{fingerprint}:{downgrade_nonce}:{downgrade_challenge}");
-        let downgrade_signature = STANDARD.encode(user_key.sign(downgrade_signed.as_bytes()).to_bytes());
-        let upgraded_callback = post_form(&app, "/oauth/authorize", &[
-            ("client_id", CLIENT_ID), ("redirect_uri", REDIRECT_URI),
-            ("code_challenge", &downgrade_challenge), ("scope", "atproto"),
-            ("state", "scope-binding-state"), ("resource", ISSUER),
-            ("nonce", &downgrade_nonce), ("fingerprint", &fingerprint),
-            ("signature", &downgrade_signature),
-        ], None, false).await;
-        assert_eq!(upgraded_callback.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(response_json(upgraded_callback).await["error"], "invalid_request");
+        let downgrade_signature =
+            STANDARD.encode(user_key.sign(downgrade_signed.as_bytes()).to_bytes());
+        let upgraded_callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &downgrade_challenge),
+                ("scope", "atproto"),
+                ("state", "scope-binding-state"),
+                ("resource", ISSUER),
+                ("nonce", &downgrade_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &downgrade_signature),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            upgraded_callback.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            response_json(upgraded_callback).await["error"],
+            "invalid_request"
+        );
 
         // A real generic authorization-code flow retains the local username
         // byte-for-byte and emits the legacy Bearer response shape.
@@ -3661,8 +3848,14 @@ mod tests {
         let generic_token_json = response_json(generic_token).await;
         assert_eq!(generic_token_json["token_type"], "Bearer");
         assert!(generic_token_json.get("sub").is_none());
-        let generic_access_token = generic_token_json["access_token"].as_str().unwrap().to_owned();
-        let generic_refresh_token = generic_token_json["refresh_token"].as_str().unwrap().to_owned();
+        let generic_access_token = generic_token_json["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let generic_refresh_token = generic_token_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let generic_claims = jwt_claims(&generic_access_token);
         assert_eq!(generic_claims["sub"], "alice");
         assert_eq!(generic_claims["iss"], GENERIC_ISSUER);
@@ -3781,7 +3974,10 @@ mod tests {
             inflated_exchange.status(),
             axum::http::StatusCode::BAD_REQUEST
         );
-        assert_eq!(response_json(inflated_exchange).await["error"], "invalid_scope");
+        assert_eq!(
+            response_json(inflated_exchange).await["error"],
+            "invalid_scope"
+        );
 
         // The same endpoint accepts a production composite access token and
         // preserves a requested subset of its signed grant. This exercises the
@@ -3844,9 +4040,9 @@ mod tests {
         // (grant_type, subject_token, subject_token_type, client_id, resource)
         // — so the contract is tested against the frontend's generated
         // request, not a Rust-local fixture.
-        use rand::Rng as _;
         use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
         use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
+        use rand::Rng as _;
         let browser_subject = state
             .policy_client
             .issue_token(&IssueToken {
@@ -3894,26 +4090,27 @@ mod tests {
         // for a correctly configured deployment (the AS's own origin), so
         // every test built from this helper now exercises the client
         // actually sending the modeled resource, not a native-only fixture.
-        let browser_fields =
-            |subject: &str, audience: Option<&str>| -> Vec<(String, String)> {
-                let body = hyprstream_rpc::wasm_token_exchange::exchange_form_body(
-                    subject,
-                    "urn:ietf:params:oauth:token-type:access_token",
-                    BROWSER_PUBLIC_CLIENT_ID,
-                    ISSUER,
-                );
-                let mut pairs: Vec<(String, String)> =
-                    url::form_urlencoded::parse(body.as_bytes())
-                        .into_owned()
-                        .collect();
-                if let Some(aud) = audience {
-                    pairs.push(("audience".to_owned(), aud.to_owned()));
-                }
-                pairs
-            };
+        let browser_fields = |subject: &str, audience: Option<&str>| -> Vec<(String, String)> {
+            let body = hyprstream_rpc::wasm_token_exchange::exchange_form_body(
+                subject,
+                "urn:ietf:params:oauth:token-type:access_token",
+                BROWSER_PUBLIC_CLIENT_ID,
+                ISSUER,
+            );
+            let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect();
+            if let Some(aud) = audience {
+                pairs.push(("audience".to_owned(), aud.to_owned()));
+            }
+            pairs
+        };
         let str_slice = strs_of;
         fn strs_of(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
-            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+            pairs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect()
         }
 
         // Negative: no DPoP proof → sender binding is mandatory.
@@ -3936,8 +4133,7 @@ mod tests {
         let pf = browser_fields(&browser_subject, Some(ISSUER));
         let pf_refs = str_slice(&pf);
         let ok_proof = fresh_browser_proof();
-        let browser_ok =
-            post_form(&app, "/oauth/token", &pf_refs, Some(&ok_proof), false).await;
+        let browser_ok = post_form(&app, "/oauth/token", &pf_refs, Some(&ok_proof), false).await;
         assert_eq!(
             browser_ok.status(),
             axum::http::StatusCode::OK,
@@ -3952,7 +4148,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store")
         );
-        assert!(browser_ok.headers().get(axum::http::header::LOCATION).is_none());
+        assert!(browser_ok
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .is_none());
         let browser_json = response_json(browser_ok).await;
         assert_eq!(browser_json["token_type"].as_str(), Some("DPoP"));
         assert_eq!(
@@ -4019,8 +4218,7 @@ mod tests {
         let rf = browser_fields(&replay_subject, Some(ISSUER));
         let rf_refs = str_slice(&rf);
         // Reuse the positive proof's jti → single-use replay rejection.
-        let replay =
-            post_form(&app, "/oauth/token", &rf_refs, Some(&ok_proof), false).await;
+        let replay = post_form(&app, "/oauth/token", &rf_refs, Some(&ok_proof), false).await;
         assert_eq!(replay.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(response_json(replay).await["error"], "invalid_dpop_proof");
 
@@ -4040,7 +4238,10 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::get("/oauth/userinfo")
-                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {browser_access}"))
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {browser_access}"),
+                    )
                     .body(Body_::empty())
                     .unwrap(),
             )
@@ -4054,7 +4255,10 @@ mod tests {
 
         // DPoP proof without nonce → 401 use_dpop_nonce (the exchange marked
         // this key as nonced). Extract the fresh nonce for the retry.
-        let no_nonce_jti = format!("res-no-nonce-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let no_nonce_jti = format!(
+            "res-no-nonce-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
         let no_nonce_proof = dpop_resource_proof(
             &browser_dpop_key,
             "GET",
@@ -4067,7 +4271,10 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::get("/oauth/userinfo")
-                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {browser_access}"),
+                    )
                     .header("DPoP", &no_nonce_proof)
                     .body(Body_::empty())
                     .unwrap(),
@@ -4080,10 +4287,16 @@ mod tests {
             .get("DPoP-Nonce")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        assert!(resource_nonce.is_some(), "use_dpop_nonce response MUST carry a DPoP-Nonce header");
+        assert!(
+            resource_nonce.is_some(),
+            "use_dpop_nonce response MUST carry a DPoP-Nonce header"
+        );
 
         // Resource success WITH the nonce: matching proof key + ath + nonce.
-        let success_jti = format!("res-ok-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let success_jti = format!(
+            "res-ok-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
         let success_proof = dpop_resource_proof(
             &browser_dpop_key,
             "GET",
@@ -4096,7 +4309,10 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::get("/oauth/userinfo")
-                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {browser_access}"),
+                    )
                     .header("DPoP", &success_proof)
                     .body(Body_::empty())
                     .unwrap(),
@@ -4111,7 +4327,10 @@ mod tests {
 
         // Key mismatch rejection: attacker proof key ≠ the token's cnf.jkt.
         let attacker_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let mismatch_jti = format!("res-mismatch-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let mismatch_jti = format!(
+            "res-mismatch-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
         let mismatch_proof = dpop_resource_proof(
             &attacker_key,
             "GET",
@@ -4124,7 +4343,10 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::get("/oauth/userinfo")
-                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {browser_access}"),
+                    )
                     .header("DPoP", &mismatch_proof)
                     .body(Body_::empty())
                     .unwrap(),
@@ -4173,7 +4395,10 @@ mod tests {
         // Same-key positive: exchange the bound subject under a proof from the
         // SAME key. Bootstrap (no nonce) is fine — this is the first exchange
         // for this DPoP key.
-        let same_key_jti = format!("same-key-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let same_key_jti = format!(
+            "same-key-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
         let same_key_proof = dpop_proof(&subject_key, &token_endpoint_url, &same_key_jti, None);
         let same_key_fields = browser_fields(&cnf_bound_subject, Some(ISSUER));
         let same_key_refs = str_slice(&same_key_fields);
@@ -4222,8 +4447,16 @@ mod tests {
             })
             .await?
             .token;
-        let cross_key_jti = format!("cross-key-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
-        let cross_key_proof = dpop_proof(&attacker_subject_key, &token_endpoint_url, &cross_key_jti, None);
+        let cross_key_jti = format!(
+            "cross-key-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
+        let cross_key_proof = dpop_proof(
+            &attacker_subject_key,
+            &token_endpoint_url,
+            &cross_key_jti,
+            None,
+        );
         let cross_key_fields = browser_fields(&cnf_bound_subject_2, Some(ISSUER));
         let cross_key_refs = str_slice(&cross_key_fields);
         let cross_key_resp = post_form(
@@ -4321,15 +4554,20 @@ mod tests {
             "requested_token_type".to_owned(),
             "urn:ietf:params:oauth:token-type:refresh_token".to_owned(),
         ));
-        let rtt_resp =
-            post_form(&app, "/oauth/token", &str_slice(&rtt_fields), None, false).await;
+        let rtt_resp = post_form(&app, "/oauth/token", &str_slice(&rtt_fields), None, false).await;
         assert_eq!(rtt_resp.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(response_json(rtt_resp).await["error"], "invalid_target");
 
         let mut tenant_fields = browser_fields(&browser_subject, Some(ISSUER));
         tenant_fields.push(("tenant".to_owned(), "some-other-tenant".to_owned()));
-        let tenant_resp =
-            post_form(&app, "/oauth/token", &str_slice(&tenant_fields), None, false).await;
+        let tenant_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&tenant_fields),
+            None,
+            false,
+        )
+        .await;
         assert_eq!(tenant_resp.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(response_json(tenant_resp).await["error"], "invalid_request");
 
@@ -4347,8 +4585,14 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(resource_bad_resp.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(response_json(resource_bad_resp).await["error"], "invalid_target");
+        assert_eq!(
+            resource_bad_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            response_json(resource_bad_resp).await["error"],
+            "invalid_target"
+        );
 
         // Duplicate `resource` fields: `axum::Form<TokenRequest>` deserializes
         // via serde's generated struct visitor, which errors on a field set
@@ -4406,8 +4650,12 @@ mod tests {
             "resource-ok-{}",
             URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
         );
-        let resource_ok_proof =
-            dpop_proof(&resource_ok_key, &token_endpoint_url, &resource_ok_jti, None);
+        let resource_ok_proof = dpop_proof(
+            &resource_ok_key,
+            &token_endpoint_url,
+            &resource_ok_jti,
+            None,
+        );
         let resource_ok_resp = post_form(
             &app,
             "/oauth/token",
@@ -4557,7 +4805,10 @@ mod tests {
             false,
         )
         .await;
-        assert_eq!(wasm_nonce_required_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            wasm_nonce_required_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
         let wasm_fresh_nonce = wasm_nonce_required_resp
             .headers()
             .get("DPoP-Nonce")
@@ -4571,8 +4822,7 @@ mod tests {
         // Retry with a fresh proof carrying the server nonce — matches exactly
         // what `decide_nonce_outcome` -> `NonceOutcome::RetryWithNonce` drives
         // the browser client to do.
-        let wasm_retry_proof =
-            build_wasm_proof("wasm-shared-retry", Some(&wasm_fresh_nonce));
+        let wasm_retry_proof = build_wasm_proof("wasm-shared-retry", Some(&wasm_fresh_nonce));
         let wasm_retry_resp = post_form(
             &app,
             "/oauth/token",
@@ -4595,10 +4845,15 @@ mod tests {
             "/oauth/introspect",
             &[("token", &generic_refresh_token)],
             &generic_access_token,
-        ).await;
+        )
+        .await;
         let generic_introspection_status = generic_introspection.status();
         let generic_introspection_json = response_json(generic_introspection).await;
-        assert_eq!(generic_introspection_status, axum::http::StatusCode::OK, "{generic_introspection_json}");
+        assert_eq!(
+            generic_introspection_status,
+            axum::http::StatusCode::OK,
+            "{generic_introspection_json}"
+        );
         assert_eq!(generic_introspection_json["active"], true);
         assert_eq!(generic_introspection_json["sub"], "alice");
 
@@ -4609,7 +4864,8 @@ mod tests {
             "/oauth/introspect",
             &[("token", &generic_access_token)],
             &generic_access_token,
-        ).await;
+        )
+        .await;
         assert_eq!(access_introspection.status(), axum::http::StatusCode::OK);
         let access_introspection_json = response_json(access_introspection).await;
         assert_eq!(access_introspection_json["active"], true);
@@ -4634,8 +4890,12 @@ mod tests {
             "/oauth/introspect",
             &[("token", &generic_refresh_token)],
             &wrong_audience,
-        ).await;
-        assert_eq!(rejected_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
+        )
+        .await;
+        assert_eq!(
+            rejected_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
 
         let wrong_issuer = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
             &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
@@ -4650,7 +4910,8 @@ mod tests {
             "/oauth/introspect",
             &[("token", &wrong_issuer)],
             &generic_access_token,
-        ).await;
+        )
+        .await;
         assert_eq!(rejected_issuer.status(), axum::http::StatusCode::OK);
         assert_eq!(response_json(rejected_issuer).await["active"], false);
 

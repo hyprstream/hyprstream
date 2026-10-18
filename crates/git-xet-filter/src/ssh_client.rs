@@ -90,9 +90,9 @@ impl SshConfig {
     /// - `ssh://user@host:port/path/to/storage`
     /// - `ssh://host/path` (uses current user)
     pub fn from_url(url: &str) -> Result<Self> {
-        let url = url
-            .strip_prefix("ssh://")
-            .ok_or_else(|| XetError::new(XetErrorKind::InvalidConfig, "URL must start with ssh://"))?;
+        let url = url.strip_prefix("ssh://").ok_or_else(|| {
+            XetError::new(XetErrorKind::InvalidConfig, "URL must start with ssh://")
+        })?;
 
         // Parse user@host:port/path
         let (user_host, path) = match url.find('/') {
@@ -112,7 +112,10 @@ impl SshConfig {
             Some(idx) => {
                 let port_str = &host_port[idx + 1..];
                 let port = port_str.parse().map_err(|_| {
-                    XetError::new(XetErrorKind::InvalidConfig, format!("Invalid port: {}", port_str))
+                    XetError::new(
+                        XetErrorKind::InvalidConfig,
+                        format!("Invalid port: {}", port_str),
+                    )
                 })?;
                 (&host_port[..idx], port)
             }
@@ -402,10 +405,7 @@ impl StorageBackend for SshStorage {
     async fn clean_file(&self, path: &Path) -> Result<String> {
         // Read file and upload
         let data = tokio::fs::read(path).await.map_err(|e| {
-            XetError::new(
-                XetErrorKind::IoError,
-                format!("Failed to read file: {}", e),
-            )
+            XetError::new(XetErrorKind::IoError, format!("Failed to read file: {}", e))
         })?;
         self.clean_bytes(&data).await
     }
@@ -462,7 +462,10 @@ impl StorageBackend for SshStorage {
             .get("merkle_hash")
             .and_then(|h| h.as_str())
             .ok_or_else(|| {
-                XetError::new(XetErrorKind::InvalidPointer, "Missing merkle_hash in pointer")
+                XetError::new(
+                    XetErrorKind::InvalidPointer,
+                    "Missing merkle_hash in pointer",
+                )
             })?;
 
         let response = self
@@ -491,11 +494,7 @@ impl StorageBackend for SshStorage {
     }
 
     async fn smudge_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<Vec<u8>> {
-        let response = self
-            .request(Request::GetFile {
-                hash: hash.hex(),
-            })
-            .await?;
+        let response = self.request(Request::GetFile { hash: hash.hex() }).await?;
 
         match response {
             Response::File { data } => {

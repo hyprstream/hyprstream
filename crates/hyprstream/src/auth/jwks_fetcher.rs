@@ -26,7 +26,7 @@ fn jwks_fetcher_with_client(client: reqwest::Client) -> JwksFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, routing::get};
+    use axum::{routing::get, Json, Router};
 
     struct TestTls {
         root_pem: Vec<u8>,

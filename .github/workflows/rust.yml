@@ -110,12 +110,23 @@ jobs:
             # coverage continues in metrics-profile-nightly.yml), so the workspace-wide
             # lint would pull the whole DuckDB/DataFusion tree into every PR check.
             cargo clippy --all-targets -- -D warnings
+            # Program leaf stays outside default-members; select it explicitly.
+            bash .github/scripts/synthesis-ci.sh lint
             # The workspace lint builds default features only, so the
             # RDS-backed PDS record store (#1257, `pds-postgres`) is cfg-gated
             # out of it. Lint it explicitly so the module and its tests
             # always compile in CI. Keep this script apostrophe-free: it is
             # single-quoted, and an apostrophe would terminate it early.
+            # H2 admission is gated by postgres, distinct from pds-postgres.
+            cargo clippy -p hyprstream --all-targets --features postgres -- -D warnings
+            cargo test -p hyprstream --features postgres --lib h2_admission
+            cargo test -p hyprstream-pds-service --lib h2_current_tenant
             cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings
+            # Disabled Federate session proof core is behind the application
+            # postgres feature, distinct from pds-postgres. Compile and exercise
+            # it plus the shared source-verifier vectors on this exact PR head.
+            cargo clippy -p hyprstream --all-targets --features postgres -- -D warnings
+            cargo test -p hyprstream --features postgres --lib federate_
             sccache --show-stats
           '
 
@@ -161,6 +172,7 @@ jobs:
             python3 scripts/check_license_boundary.py
             python3 -m unittest discover -s scripts/tests -p "test_check_program_boundaries.py"
             python3 scripts/check_program_boundaries.py
+            python3 -m unittest discover -s scripts/tests -p "test_synthesis_ci.py"
             python3 scripts/check_build_matrix.py
             python3 -m unittest discover -s scripts/tests -p "test_check_build_matrix.py"
           '
@@ -243,19 +255,19 @@ jobs:
             sccache --show-stats
           '
 
-    # #1425 r3: actually EXECUTES crates/hyprstream-rpc/tests/wasm_browser_fetch.rs
-    # in a real headless browser, as an isolated named wasm test artifact — not
+    # Actually EXECUTES browser-fetch and browser-session proof tests in a
+    # real headless browser, as isolated named wasm test artifacts — not
     # just a compile check. Deliberately does not use `wasm-pack test`: it
     # unconditionally passes `--tests` to cargo, which additionally compiles
     # every other (native-only) test target in the crate and fails before a
-    # browser is ever launched. browser-wasm-test.sh builds only the named
+    # browser is ever launched. browser-wasm-test.sh builds each named
     # integration test via `cargo test --test <name>` (never `--tests`) and
     # runs it through a wasm-bindgen version-matched wasm-bindgen-test-runner.
     # browser-wasm-test-ci.sh installs a headless-capable Chromium + matching
     # chromedriver from the container's own package repo (arch-correct for
     # this arm64/Graviton runner, unlike Google's x64-only Chrome-for-Testing
     # distribution) before delegating to it.
-    - name: Run browser-fetch conformance test (headless Chromium, rust-builder container)
+    - name: Run browser fetch/session proof tests (headless Chromium, rust-builder container)
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \

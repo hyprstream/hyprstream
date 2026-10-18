@@ -76,7 +76,9 @@ impl ScopedRoot {
                         match safe_path::scoped_join(&self.root, parent) {
                             Ok(resolved_parent) => {
                                 if !resolved_parent.starts_with(&self.root) {
-                                    return Err(FsError::path_escape("escaped root via parent symlink"));
+                                    return Err(FsError::path_escape(
+                                        "escaped root via parent symlink",
+                                    ));
                                 }
                                 let filename = validated.file_name().unwrap_or_default();
                                 Ok(resolved_parent.join(filename))
@@ -109,15 +111,13 @@ impl ContainedFs for ScopedRoot {
 
     fn create(&self, path: &str, mode: OpenMode) -> Result<File, FsError> {
         let resolved = self.resolve(path)?;
-        mode.to_create_options()
-            .open(&resolved)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    FsError::AlreadyExists(path.to_owned())
-                } else {
-                    FsError::Io(e)
-                }
-            })
+        mode.to_create_options().open(&resolved).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                FsError::AlreadyExists(path.to_owned())
+            } else {
+                FsError::Io(e)
+            }
+        })
     }
 
     fn mkdir(&self, path: &str) -> Result<(), FsError> {

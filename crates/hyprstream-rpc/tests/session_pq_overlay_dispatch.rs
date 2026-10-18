@@ -191,6 +191,7 @@ impl DynamicClient {
             response_kem_recipient: None,
             service_domain: Some(service.to_owned()),
             proof_cwt: None,
+            authorization_witness: None,
         };
         let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
             hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
@@ -326,22 +327,15 @@ fn swap_outer_layer(signed: &mut SignedEnvelope, attacker_pq: &MlDsaSigningKey) 
         envelope::REQUEST_ENVELOPE_TYPE_ID,
     );
     let (inner_bytes, _) = decode_composite_for_test(&signed.cose).unwrap();
-    let (ed_sig, _) =
-        hyprstream_rpc::crypto::cose_sign::split_composite(&signed.cose).unwrap();
+    let (ed_sig, _) = hyprstream_rpc::crypto::cose_sign::split_composite(&signed.cose).unwrap();
 
     let attacker_kid = ml_dsa_sk_to_vk_bytes(attacker_pq);
-    let tbs = hyprstream_rpc::crypto::cose_sign::outer_tbs(
-        attacker_kid.clone(),
-        &payload,
-        &ed_sig,
-        &aad,
-    );
+    let tbs =
+        hyprstream_rpc::crypto::cose_sign::outer_tbs(attacker_kid.clone(), &payload, &ed_sig, &aad);
     let attacker_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(attacker_pq, &tbs);
-    let attacker_outer = hyprstream_rpc::crypto::cose_sign::outer_layer_for_test(
-        attacker_kid.clone(),
-        attacker_sig,
-    )
-    .unwrap();
+    let attacker_outer =
+        hyprstream_rpc::crypto::cose_sign::outer_layer_for_test(attacker_kid.clone(), attacker_sig)
+            .unwrap();
 
     signed.cose = encode_composite_for_test(inner_bytes, Some(attacker_outer)).unwrap();
     attacker_kid
@@ -382,9 +376,12 @@ async fn unenrolled_hybrid_client_dispatches_and_stays_classical() {
     // Precondition: nobody anchored this identity, and nothing knows it yet.
     assert!(f.overlay.provenance_for(&client.identity()).is_none());
 
-    dispatch(&service, &client.signed_request("overlay-first-contact", b"hello"))
-        .await
-        .expect("first contact from an unenrolled hybrid client must dispatch");
+    dispatch(
+        &service,
+        &client.signed_request("overlay-first-contact", b"hello"),
+    )
+    .await
+    .expect("first contact from an unenrolled hybrid client must dispatch");
 
     assert!(service.was_invoked());
     assert_eq!(service.observed_signer(), Some(client.identity()));
@@ -563,9 +560,12 @@ async fn a_pq_less_envelope_does_not_clear_an_established_binding() {
     let client = DynamicClient::new(0xA5);
     let service = ObservingService::new("overlay-downgrade");
 
-    dispatch(&service, &client.signed_request("overlay-downgrade", b"bound"))
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        &client.signed_request("overlay-downgrade", b"bound"),
+    )
+    .await
+    .unwrap();
     let bound_key = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
         &f.overlay.verifying_key_for(&client.identity()).unwrap(),
     );
@@ -677,8 +677,7 @@ async fn an_uncommitted_composite_cannot_establish_a_binding() {
         &client.pq_sk,
         &outer_tbs(pq_kid.clone(), &payload, &ed_sig, &aad),
     );
-    signed.cose =
-        assemble_composite_nested((ed_kid, ed_sig), Some((pq_kid, pq_sig))).unwrap();
+    signed.cose = assemble_composite_nested((ed_kid, ed_sig), Some((pq_kid, pq_sig))).unwrap();
 
     let service = ObservingService::new("overlay-uncommitted");
     dispatch(&service, &signed)
@@ -789,7 +788,8 @@ async fn an_admin_anchored_key_outranks_an_overlay_entry() {
 #[tokio::test]
 async fn a_flood_of_self_minted_identities_does_not_lock_out_new_clients() {
     let f = fixtures();
-    let flood_overlay = SessionPqOverlay::new(Arc::new(RecordingSink::default())).with_max_entries(3);
+    let flood_overlay =
+        SessionPqOverlay::new(Arc::new(RecordingSink::default())).with_max_entries(3);
 
     for i in 0..6u8 {
         let flooder = DynamicClient::new(0xF0 + i);
@@ -814,9 +814,12 @@ async fn out_of_band_promotion_raises_assurance_and_can_be_revoked() {
     let client = DynamicClient::new(0xA6);
     let service = ObservingService::new("overlay-promote");
 
-    dispatch(&service, &client.signed_request("overlay-promote", b"before"))
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        &client.signed_request("overlay-promote", b"before"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         service.observed_key_material(),
         Some(VerifiedKeyMaterial::Classical)
@@ -825,15 +828,21 @@ async fn out_of_band_promotion_raises_assurance_and_can_be_revoked() {
     // The operator compares the fingerprint over the PAIR through a channel
     // with different compromise assumptions, then promotes.
     let fingerprint = composite_fingerprint(&client.identity(), &client.pq_vk());
-    assert_eq!(f.overlay.fingerprint_for(&client.identity()), Some(fingerprint));
+    assert_eq!(
+        f.overlay.fingerprint_for(&client.identity()),
+        Some(fingerprint)
+    );
     f.overlay
         .promote_out_of_band(&client.identity(), &fingerprint, "operator-published")
         .expect("a matching out-of-band fingerprint promotes");
 
     let promoted = ObservingService::new("overlay-promote-2");
-    dispatch(&promoted, &client.signed_request("overlay-promote-2", b"after"))
-        .await
-        .unwrap();
+    dispatch(
+        &promoted,
+        &client.signed_request("overlay-promote-2", b"after"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         promoted.observed_key_material(),
         Some(VerifiedKeyMaterial::PqHybrid),
@@ -844,9 +853,12 @@ async fn out_of_band_promotion_raises_assurance_and_can_be_revoked() {
     // breaking the live session.
     assert!(f.overlay.revoke_promotion(&client.identity()));
     let revoked = ObservingService::new("overlay-promote-3");
-    dispatch(&revoked, &client.signed_request("overlay-promote-3", b"revoked"))
-        .await
-        .expect("revoking a promotion does not break verifiability");
+    dispatch(
+        &revoked,
+        &client.signed_request("overlay-promote-3", b"revoked"),
+    )
+    .await
+    .expect("revoking a promotion does not break verifiability");
     assert_eq!(
         revoked.observed_key_material(),
         Some(VerifiedKeyMaterial::Classical),

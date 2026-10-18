@@ -38,12 +38,12 @@ pub fn draw(frame: &mut Frame, app: &ShellApp) {
     draw_window_strip(frame, chunks[2], app);
 
     match app.mode {
-        ShellMode::ModelList                 => draw_model_modal(frame, area, app),
-        ShellMode::Settings                  => draw_settings_modal(frame, area, app),
-        ShellMode::StartMenu { selected }    => draw_start_menu(frame, area, selected),
-        ShellMode::CloneFlow(_)              => draw_clone_modal(frame, area, app),
-        ShellMode::GitOpInProgress { .. }    => draw_git_op_modal(frame, area, app),
-        ShellMode::Normal                    => {}
+        ShellMode::ModelList => draw_model_modal(frame, area, app),
+        ShellMode::Settings => draw_settings_modal(frame, area, app),
+        ShellMode::StartMenu { selected } => draw_start_menu(frame, area, selected),
+        ShellMode::CloneFlow(_) => draw_clone_modal(frame, area, app),
+        ShellMode::GitOpInProgress { .. } => draw_git_op_modal(frame, area, app),
+        ShellMode::Normal => {}
     }
 }
 
@@ -65,8 +65,15 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &ShellApp) {
     }
 
     let left_w = area.width.saturating_sub(clock_width);
-    let left_area  = Rect { width: left_w, ..area };
-    let right_area = Rect { x: area.x + left_w, width: clock_width, ..area };
+    let left_area = Rect {
+        width: left_w,
+        ..area
+    };
+    let right_area = Rect {
+        x: area.x + left_w,
+        width: clock_width,
+        ..area
+    };
 
     frame.render_widget(
         Paragraph::new(Line::from(left_spans)).style(Style::default().bg(theme::BG_PANEL)),
@@ -101,7 +108,7 @@ fn current_time_str() -> String {
 fn draw_content(frame: &mut Frame, area: Rect, app: &ShellApp) {
     match app.windows.get(app.active) {
         Some(win) => draw_pane(frame, area, win),
-        None      => app.bg.render(frame, area),
+        None => app.bg.render(frame, area),
     }
 }
 
@@ -163,31 +170,37 @@ fn draw_model_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    let hint_area = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
-    let list_area = Rect { height: inner.height.saturating_sub(2), ..inner };
+    let hint_area = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    let list_area = Rect {
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
 
     let mut hint_spans = vec![
-        Span::styled("c",     theme::help_key()),
-        Span::styled(" clone  ",    theme::help_text()),
-        Span::styled("p",     theme::help_key()),
-        Span::styled(" pull  ",     theme::help_text()),
-        Span::styled("P",     theme::help_key()),
-        Span::styled(" push  ",     theme::help_text()),
-        Span::styled("l",     theme::help_key()),
-        Span::styled(" load  ",     theme::help_text()),
-        Span::styled("u",     theme::help_key()),
-        Span::styled(" unload  ",   theme::help_text()),
+        Span::styled("c", theme::help_key()),
+        Span::styled(" clone  ", theme::help_text()),
+        Span::styled("p", theme::help_key()),
+        Span::styled(" pull  ", theme::help_text()),
+        Span::styled("P", theme::help_key()),
+        Span::styled(" push  ", theme::help_text()),
+        Span::styled("l", theme::help_key()),
+        Span::styled(" load  ", theme::help_text()),
+        Span::styled("u", theme::help_key()),
+        Span::styled(" unload  ", theme::help_text()),
     ];
     if cfg!(any(target_os = "linux", target_os = "openbsd")) {
-        hint_spans.push(Span::styled("T",     theme::help_key()));
-        hint_spans.push(Span::styled(" term  ",    theme::help_text()));
+        hint_spans.push(Span::styled("T", theme::help_key()));
+        hint_spans.push(Span::styled(" term  ", theme::help_text()));
     }
     hint_spans.extend([
-        Span::styled("Esc",   theme::help_key()),
-        Span::styled(" close",      theme::help_text()),
+        Span::styled("Esc", theme::help_key()),
+        Span::styled(" close", theme::help_text()),
     ]);
-    let hint = Paragraph::new(Line::from(hint_spans))
-    .style(Style::default().bg(theme::BG_PANEL));
+    let hint = Paragraph::new(Line::from(hint_spans)).style(Style::default().bg(theme::BG_PANEL));
     frame.render_widget(hint, hint_area);
 
     app.model_list.render(frame, list_area);
@@ -226,11 +239,21 @@ fn draw_clone_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
         ShellMode::CloneFlow(CloneScreen::EnterName(input, _url)) => {
             input.render(frame, inner);
         }
-        ShellMode::CloneFlow(CloneScreen::Cloning { name, progress_msg, progress_pct, .. }) => {
+        ShellMode::CloneFlow(CloneScreen::Cloning {
+            name,
+            progress_msg,
+            progress_pct,
+            ..
+        }) => {
             let bar_width = inner.width.saturating_sub(8) as usize;
             let filled = (bar_width as u16 * (*progress_pct as u16) / 100) as usize;
             let empty = bar_width.saturating_sub(filled);
-            let bar = format!("[{}{}] {:>3}%", "#".repeat(filled), " ".repeat(empty), progress_pct);
+            let bar = format!(
+                "[{}{}] {:>3}%",
+                "#".repeat(filled),
+                " ".repeat(empty),
+                progress_pct
+            );
 
             let text = vec![
                 Line::from(Span::styled(name.as_str(), theme::help_text())),
@@ -242,7 +265,10 @@ fn draw_clone_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
         }
         ShellMode::CloneFlow(CloneScreen::Done(msg)) => {
             let text = vec![
-                Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Green))),
+                Line::from(Span::styled(
+                    msg.as_str(),
+                    Style::default().fg(Color::Green),
+                )),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("Enter", theme::help_key()),
@@ -275,15 +301,20 @@ fn draw_git_op_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
     frame.render_widget(Clear, modal);
 
     let (title, model_ref, progress_msg) = match &app.mode {
-        ShellMode::GitOpInProgress { op_name, model_ref, progress_msg } => {
-            (op_name.as_str(), model_ref.as_str(), progress_msg.as_str())
-        }
+        ShellMode::GitOpInProgress {
+            op_name,
+            model_ref,
+            progress_msg,
+        } => (op_name.as_str(), model_ref.as_str(), progress_msg.as_str()),
         _ => return,
     };
 
     let display_title = if title.is_empty() { "Git" } else { title };
     let block = Block::default()
-        .title(Span::styled(format!(" {display_title} "), theme::title_style()))
+        .title(Span::styled(
+            format!(" {display_title} "),
+            theme::title_style(),
+        ))
         .borders(Borders::ALL)
         .border_style(theme::border_style())
         .style(Style::default().bg(theme::BG_PANEL));
@@ -357,7 +388,10 @@ fn draw_settings_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
 
     // Clamp the preview render area to PREVIEW_W so matrix columns line up.
     let pw = preview_inner.width.min(PREVIEW_W);
-    let preview_render = Rect { width: pw, ..preview_inner };
+    let preview_render = Rect {
+        width: pw,
+        ..preview_inner
+    };
     app.preview_bg.render(frame, preview_render);
 
     // Hint bar.
@@ -366,13 +400,13 @@ fn draw_settings_modal(frame: &mut Frame, full_area: Rect, app: &ShellApp) {
         Span::raw(" "),
         Span::styled("Navigate", theme::help_text()),
         Span::raw("  "),
-        Span::styled("Enter",    theme::help_key()),
+        Span::styled("Enter", theme::help_key()),
         Span::raw(" "),
-        Span::styled("Select",   theme::help_text()),
+        Span::styled("Select", theme::help_text()),
         Span::raw("  "),
-        Span::styled("Esc",      theme::help_key()),
+        Span::styled("Esc", theme::help_key()),
         Span::raw(" "),
-        Span::styled("Cancel",   theme::help_text()),
+        Span::styled("Cancel", theme::help_text()),
     ];
     frame.render_widget(
         Paragraph::new(Line::from(hint_spans)).style(Style::default().bg(theme::BG_PANEL)),
@@ -407,12 +441,23 @@ fn draw_start_menu(frame: &mut Frame, area: Rect, selected: usize) {
 
     let inner_w = inner.width as usize;
     for (i, (label, hint)) in MENU_ITEMS.iter().enumerate() {
-        let row = Rect { y: inner.y + i as u16, height: 1, ..inner };
-        let style = if i == selected { theme::tab_active() } else { theme::help_text() };
-        let text = format!(" {:<lw$}{:>rw$}",
-            label, hint,
+        let row = Rect {
+            y: inner.y + i as u16,
+            height: 1,
+            ..inner
+        };
+        let style = if i == selected {
+            theme::tab_active()
+        } else {
+            theme::help_text()
+        };
+        let text = format!(
+            " {:<lw$}{:>rw$}",
+            label,
+            hint,
             lw = inner_w.saturating_sub(hint.len() + 2),
-            rw = hint.len() + 1);
+            rw = hint.len() + 1
+        );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(text, style)))
                 .style(Style::default().bg(theme::BG_PANEL)),

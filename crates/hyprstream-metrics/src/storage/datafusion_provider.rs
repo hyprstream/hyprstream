@@ -42,10 +42,7 @@ impl DuckDBTableProvider {
         // Get schema from DuckDB
         let schema = backend.get_table_schema(&table_name).await?;
 
-        debug!(
-            fields = schema.fields().len(),
-            "Retrieved schema for table"
-        );
+        debug!(fields = schema.fields().len(), "Retrieved schema for table");
 
         Ok(Self {
             backend,
@@ -55,11 +52,7 @@ impl DuckDBTableProvider {
     }
 
     /// Create a provider with a known schema (avoids async schema lookup).
-    pub fn with_schema(
-        backend: Arc<DuckDbBackend>,
-        table_name: String,
-        schema: SchemaRef,
-    ) -> Self {
+    pub fn with_schema(backend: Arc<DuckDbBackend>, table_name: String, schema: SchemaRef) -> Self {
         Self {
             backend,
             table_name,
@@ -155,9 +148,9 @@ impl DuckDBExec {
         filters: Vec<Expr>,
         limit: Option<usize>,
     ) -> Self {
-        use datafusion::physical_plan::Partitioning;
         use datafusion::physical_expr::EquivalenceProperties;
         use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+        use datafusion::physical_plan::Partitioning;
 
         // Compute projected schema
         let projected_schema = if let Some(ref proj) = projection {
@@ -335,8 +328,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_provider_with_datafusion() -> std::result::Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_duckdb_provider_with_datafusion(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Create test backend
         let backend = Arc::new(DuckDbBackend::new_in_memory()?);
         backend.init().await?;

@@ -25,17 +25,20 @@ const QUESTIONS: &str = r#"{
     "severity": {"type": "score", "criteria": ["cosmetic", "usable", "unusable"]}
 }"#;
 
-async fn start() -> (
-    std::net::SocketAddr,
-    tokio::task::JoinHandle<()>,
-) {
+async fn start() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("bind: {error}"));
-    serve(listener).await.unwrap_or_else(|error| panic!("serve: {error}"))
+    serve(listener)
+        .await
+        .unwrap_or_else(|error| panic!("serve: {error}"))
 }
 
 async fn client(addr: std::net::SocketAddr) -> FlightSqlServiceClient<tonic::transport::Channel> {
-    let endpoint = Endpoint::new(format!("http://{addr}")).unwrap_or_else(|error| panic!("endpoint: {error}"));
-    let channel = endpoint.connect().await.unwrap_or_else(|error| panic!("connect: {error}"));
+    let endpoint =
+        Endpoint::new(format!("http://{addr}")).unwrap_or_else(|error| panic!("endpoint: {error}"));
+    let channel = endpoint
+        .connect()
+        .await
+        .unwrap_or_else(|error| panic!("connect: {error}"));
     FlightSqlServiceClient::new(channel)
 }
 
@@ -60,31 +63,54 @@ async fn decide_prepared_statement_round_trip() {
         .unwrap_or_else(|error| panic!("prepare: {error}"));
 
     // Parameter schema: one non-null utf8 `state` column.
-    let parameter_schema = statement.parameter_schema().unwrap_or_else(|error| panic!("parameter schema: {error}"));
+    let parameter_schema = statement
+        .parameter_schema()
+        .unwrap_or_else(|error| panic!("parameter schema: {error}"));
     assert_eq!(parameter_schema.fields().len(), 1);
     assert_eq!(parameter_schema.field(0).name(), STATE_PARAMETER);
     assert!(!parameter_schema.field(0).is_nullable());
 
     // Dataset schema: exactly the P0.1a DecisionSchema contract, labels in field metadata.
-    let dataset_schema: Schema = statement.dataset_schema().unwrap_or_else(|error| panic!("dataset schema: {error}")).clone();
-    assert!(dataset_schema.metadata().is_empty(), "labels never in schema metadata");
-    let probabilities = dataset_schema.field_with_name("tone.probabilities").unwrap_or_else(|error| panic!("column: {error}"));
+    let dataset_schema: Schema = statement
+        .dataset_schema()
+        .unwrap_or_else(|error| panic!("dataset schema: {error}"))
+        .clone();
+    assert!(
+        dataset_schema.metadata().is_empty(),
+        "labels never in schema metadata"
+    );
+    let probabilities = dataset_schema
+        .field_with_name("tone.probabilities")
+        .unwrap_or_else(|error| panic!("column: {error}"));
     assert_eq!(
-        probabilities.metadata().get(FIELD_META_KIND).map(String::as_str),
+        probabilities
+            .metadata()
+            .get(FIELD_META_KIND)
+            .map(String::as_str),
         Some("choice")
     );
     assert_eq!(
-        probabilities.metadata().get(FIELD_META_LABELS).map(String::as_str),
+        probabilities
+            .metadata()
+            .get(FIELD_META_LABELS)
+            .map(String::as_str),
         Some(r#"["angry","calm","pleading"]"#)
     );
     match probabilities.data_type() {
-        DataType::FixedSizeList(_, width) => assert_eq!(usize::try_from(*width).unwrap_or_else(|error| panic!("width: {error}")), 3),
+        DataType::FixedSizeList(_, width) => assert_eq!(
+            usize::try_from(*width).unwrap_or_else(|error| panic!("width: {error}")),
+            3
+        ),
         other => panic!("tone.probabilities must be fixed_size_list, got {other}"),
     }
-    assert!(dataset_schema.field_with_name(SCHEMA_VERSION_COLUMN).is_ok());
+    assert!(dataset_schema
+        .field_with_name(SCHEMA_VERSION_COLUMN)
+        .is_ok());
     assert!(dataset_schema.field_with_name(MODEL_VERSION_COLUMN).is_ok());
     assert!(dataset_schema.field_with_name(CALIB_VERSION_COLUMN).is_ok());
-    assert!(dataset_schema.field_with_name("severity.conformal_set").is_ok());
+    assert!(dataset_schema
+        .field_with_name("severity.conformal_set")
+        .is_ok());
 
     // Bind 4 states, execute, validate the batch against DecisionSchema semantics.
     statement
@@ -95,19 +121,33 @@ async fn decide_prepared_statement_round_trip() {
             "Where is my order?",
         ]))
         .unwrap_or_else(|error| panic!("bind parameters: {error}"));
-    let info = statement.execute().await.unwrap_or_else(|error| panic!("execute: {error}"));
+    let info = statement
+        .execute()
+        .await
+        .unwrap_or_else(|error| panic!("execute: {error}"));
     let mut batches = Vec::new();
     for endpoint in &info.endpoint {
         let ticket = endpoint.ticket.clone().unwrap_or_else(|| panic!("ticket"));
-        let mut stream = client.do_get(ticket).await.unwrap_or_else(|error| panic!("do_get: {error}"));
-        while let Some(batch) = stream.try_next().await.unwrap_or_else(|error| panic!("batch: {error}")) {
+        let mut stream = client
+            .do_get(ticket)
+            .await
+            .unwrap_or_else(|error| panic!("do_get: {error}"));
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .unwrap_or_else(|error| panic!("batch: {error}"))
+        {
             batches.push(batch);
         }
     }
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 4);
-    assert_eq!(batch.schema().as_ref(), &dataset_schema, "streamed schema == prepared dataset schema");
+    assert_eq!(
+        batch.schema().as_ref(),
+        &dataset_schema,
+        "streamed schema == prepared dataset schema"
+    );
 
     let labels = ["angry", "calm", "pleading"];
     let tone_probs = batch
@@ -166,7 +206,10 @@ async fn decide_prepared_statement_round_trip() {
         assert!(calib_col.is_null(row), "uncalibrated triple");
     }
 
-    statement.close().await.unwrap_or_else(|error| panic!("close: {error}"));
+    statement
+        .close()
+        .await
+        .unwrap_or_else(|error| panic!("close: {error}"));
     server.abort();
 }
 
@@ -227,7 +270,10 @@ async fn invalid_decide_documents_fail_at_create() {
         .join(",");
     let error = client
         .prepare(
-            decide_document(&format!(r#"{{"q": {{"type": "choice", "criteria": {{{options}}}}}}}"#), "qs-v1"),
+            decide_document(
+                &format!(r#"{{"q": {{"type": "choice", "criteria": {{{options}}}}}}}"#),
+                "qs-v1",
+            ),
             None,
         )
         .await
@@ -247,8 +293,14 @@ async fn same_document_shares_handle_and_is_deterministic() {
     first
         .set_parameters(parameters(&["same state", "same state"]))
         .unwrap_or_else(|error| panic!("bind: {error}"));
-    let info = first.execute().await.unwrap_or_else(|error| panic!("execute: {error}"));
-    let ticket = info.endpoint[0].ticket.clone().unwrap_or_else(|| panic!("ticket"));
+    let info = first
+        .execute()
+        .await
+        .unwrap_or_else(|error| panic!("execute: {error}"));
+    let ticket = info.endpoint[0]
+        .ticket
+        .clone()
+        .unwrap_or_else(|| panic!("ticket"));
     let batches: Vec<RecordBatch> = client
         .do_get(ticket)
         .await
@@ -264,8 +316,14 @@ async fn same_document_shares_handle_and_is_deterministic() {
     second
         .set_parameters(parameters(&["same state", "same state"]))
         .unwrap_or_else(|error| panic!("bind: {error}"));
-    let info = second.execute().await.unwrap_or_else(|error| panic!("execute: {error}"));
-    let ticket = info.endpoint[0].ticket.clone().unwrap_or_else(|| panic!("ticket"));
+    let info = second
+        .execute()
+        .await
+        .unwrap_or_else(|error| panic!("execute: {error}"));
+    let ticket = info.endpoint[0]
+        .ticket
+        .clone()
+        .unwrap_or_else(|| panic!("ticket"));
     let batches2: Vec<RecordBatch> = client
         .do_get(ticket)
         .await

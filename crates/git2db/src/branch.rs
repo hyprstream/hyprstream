@@ -82,39 +82,42 @@ impl<'a> BranchManager<'a> {
             // List local branches
             for (branch, _) in (repo.branches(Some(BranchType::Local)).map_err(|e| {
                 Git2DBError::internal(format!("Failed to list local branches: {e}"))
-            })?).flatten() {
-            if let Some(name) = branch.name().ok().flatten() {
-                let is_head = head_name.as_deref() == Some(name);
-                let oid = branch.get().target();
+            })?)
+            .flatten()
+            {
+                if let Some(name) = branch.name().ok().flatten() {
+                    let is_head = head_name.as_deref() == Some(name);
+                    let oid = branch.get().target();
 
-                branches.push(Branch {
-                    name: name.to_owned(),
-                    branch_type: BranchKind::Local,
-                    is_head,
-                    oid,
-                    tracking: branch
-                        .upstream()
-                        .ok()
-                        .and_then(|u| u.name().ok().flatten().map(std::borrow::ToOwned::to_owned)),
-                });
-            }
+                    branches.push(Branch {
+                        name: name.to_owned(),
+                        branch_type: BranchKind::Local,
+                        is_head,
+                        oid,
+                        tracking: branch.upstream().ok().and_then(|u| {
+                            u.name().ok().flatten().map(std::borrow::ToOwned::to_owned)
+                        }),
+                    });
+                }
             }
 
             // List remote branches
             for (branch, _) in (repo.branches(Some(BranchType::Remote)).map_err(|e| {
                 Git2DBError::internal(format!("Failed to list remote branches: {e}"))
-            })?).flatten() {
-            if let Some(name) = branch.name().ok().flatten() {
-                let oid = branch.get().target();
+            })?)
+            .flatten()
+            {
+                if let Some(name) = branch.name().ok().flatten() {
+                    let oid = branch.get().target();
 
-                branches.push(Branch {
-                    name: name.to_owned(),
-                    branch_type: BranchKind::Remote,
-                    is_head: false,
-                    oid,
-                    tracking: None,
-                });
-            }
+                    branches.push(Branch {
+                        name: name.to_owned(),
+                        branch_type: BranchKind::Remote,
+                        is_head: false,
+                        oid,
+                        tracking: None,
+                    });
+                }
             }
 
             Ok(branches)
@@ -134,9 +137,9 @@ impl<'a> BranchManager<'a> {
                 Git2DBError::repository(&path, format!("Failed to open repository: {e}"))
             })?;
 
-            let head = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let head = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             // Check if HEAD is a branch
             if !head.is_branch() {
@@ -145,7 +148,8 @@ impl<'a> BranchManager<'a> {
 
             let name = head
                 .shorthand()
-                .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD has no name"))?.to_owned();
+                .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD has no name"))?
+                .to_owned();
 
             let oid = head.target();
 
@@ -216,10 +220,7 @@ impl<'a> BranchManager<'a> {
                         })?;
                         head.peel_to_commit()
                             .map_err(|e| {
-                                Git2DBError::reference(
-                                    "HEAD",
-                                    format!("HEAD is not a commit: {e}"),
-                                )
+                                Git2DBError::reference("HEAD", format!("HEAD is not a commit: {e}"))
                             })?
                             .id()
                     }
@@ -283,9 +284,9 @@ impl<'a> BranchManager<'a> {
                 .map_err(|_| Git2DBError::reference(&name, "Branch not found"))?;
 
             let reference = branch.into_reference();
-            let commit = reference.peel_to_commit().map_err(|e| {
-                Git2DBError::reference(&name, format!("Failed to get commit: {e}"))
-            })?;
+            let commit = reference
+                .peel_to_commit()
+                .map_err(|e| Git2DBError::reference(&name, format!("Failed to get commit: {e}")))?;
 
             // Checkout the branch
             repo.checkout_tree(commit.as_object(), None)

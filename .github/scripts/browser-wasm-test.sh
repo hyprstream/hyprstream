@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Execute the #1425 browser-fetch conformance test
-# (crates/hyprstream-rpc/tests/wasm_browser_fetch.rs) in a real headless
-# browser, as an isolated named wasm test artifact.
+# Execute the browser-fetch conformance and browser-session proof tests in a
+# real headless browser, each as an isolated named wasm test artifact.
 #
 # Deliberately does NOT use `wasm-pack test`: wasm-pack unconditionally passes
 # `--tests` to its underlying `cargo build`, which additionally compiles every
@@ -9,12 +8,12 @@
 # which has hundreds of native-only `#[tokio::test]`s scattered through
 # hyprstream-rpc's source files (transport, service, moq_stream, federation
 # key sources, event crypto, ...). None of that is wasm32-buildable, so
-# `wasm-pack test ... --test wasm_browser_fetch` fails during compilation
+# `wasm-pack test ... --test <name>` fails during compilation
 # before a browser is ever launched.
 #
 # Building the NAMED integration test directly via `cargo test --test <name>`
 # (never `--tests`) links the lib crate normally (no `cfg(test)`), so none of
-# the lib's own internal unit tests are pulled in — only this one artifact
+# the lib's own internal unit tests are pulled in — only each named artifact
 # plus its own dependencies.
 #
 # The compiled `.wasm` test binary is then executed by a version-matched
@@ -29,8 +28,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CRATE_MANIFEST="$REPO_ROOT/crates/hyprstream-rpc/Cargo.toml"
-TEST_NAME="wasm_browser_fetch"
 
 append_rustflag() {
   local flag="$1"
@@ -69,15 +66,21 @@ fi
 
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$RUNNER_BIN"
 
-# `--test` (singular, named) — NOT `--tests` — is the entire point: it builds
-# and runs only this one integration test binary.
+# `--test` (singular, named) — NOT `--tests` — is the entire point: each
+# invocation builds and runs only its named integration test binary. Keep the
+# receipt below after both invocations so CI cannot attest to a partial run.
 cargo test --locked \
-  --manifest-path "$CRATE_MANIFEST" \
+  --manifest-path "$REPO_ROOT/crates/hyprstream-rpc/Cargo.toml" \
   --target wasm32-unknown-unknown \
-  --test "$TEST_NAME"
+  --test wasm_browser_fetch
+
+cargo test --locked \
+  --manifest-path "$REPO_ROOT/crates/hyprstream-rpc-std/Cargo.toml" \
+  --target wasm32-unknown-unknown \
+  --test wasm_browser_session
 
 # Runtime execution receipt. When the caller supplies BROWSER_ATTEST_NONCE,
-# echo it into a receipt file — reached only after the browser run above
+# echo it into a receipt file — reached only after both browser runs above
 # succeeded (set -e). The caller asserts the receipt out-of-band, so a change
 # anywhere in the invocation chain that stops this script from running (or
 # from reaching this point) is detected by the receipt being absent or stale,

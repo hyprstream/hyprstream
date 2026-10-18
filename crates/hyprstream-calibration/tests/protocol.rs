@@ -105,8 +105,7 @@ fn gate_report_applies_macro_rule_and_serializes() {
         },
     ];
     let split = ShiftSplit::new(["alpha", "beta"], ["gamma"]).unwrap();
-    let report =
-        GateReport::assemble("subject-arm", "deterministic", split, fields, 1234).unwrap();
+    let report = GateReport::assemble("subject-arm", "deterministic", split, fields, 1234).unwrap();
     // Macro means are field-equal: the n=10 field counts as much as the n=500 field.
     assert!((report.macro_ece.mean - 0.06).abs() < 1e-12);
     assert!((report.macro_brier.mean - 0.20).abs() < 1e-12);

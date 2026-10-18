@@ -8,9 +8,9 @@
 use async_trait::async_trait;
 
 #[cfg(target_arch = "wasm32")]
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
-#[cfg(target_arch = "wasm32")]
 use hyprstream_rpc::Subject;
+#[cfg(target_arch = "wasm32")]
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
 #[cfg(target_arch = "wasm32")]
 use crate::client::{P9Client, P9Transport};
@@ -48,50 +48,85 @@ unsafe impl<T: P9Transport> Sync for WanixMount<T> {}
 #[async_trait(?Send)]
 impl<T: P9Transport + 'static> Mount for WanixMount<T> {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-        let (fid, _qids) = self.client.walk(components).await
+        let (fid, _qids) = self
+            .client
+            .walk(components)
+            .await
             .map_err(|e| MountError::NotFound(e.to_string()))?;
         Ok(Fid::new(P9FidState { fid }))
     }
 
     async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
-        let state = fid.downcast_ref::<P9FidState>()
+        let state = fid
+            .downcast_ref::<P9FidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        self.client.open(state.fid, mode as u32).await
+        self.client
+            .open(state.fid, mode as u32)
+            .await
             .map_err(|e| MountError::Io(e.to_string()))?;
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-        let state = fid.downcast_ref::<P9FidState>()
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
+        let state = fid
+            .downcast_ref::<P9FidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        self.client.read(state.fid, offset, count).await
+        self.client
+            .read(state.fid, offset, count)
+            .await
             .map_err(|e| MountError::Io(e.to_string()))
     }
 
-    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        let state = fid.downcast_ref::<P9FidState>()
+    async fn write(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
+        let state = fid
+            .downcast_ref::<P9FidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        self.client.write(state.fid, offset, data).await
+        self.client
+            .write(state.fid, offset, data)
+            .await
             .map_err(|e| MountError::Io(e.to_string()))
     }
 
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-        let state = fid.downcast_ref::<P9FidState>()
+        let state = fid
+            .downcast_ref::<P9FidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        let entries = self.client.readdir(state.fid, 0, 65536).await
+        let entries = self
+            .client
+            .readdir(state.fid, 0, 65536)
+            .await
             .map_err(|e| MountError::Io(e.to_string()))?;
-        Ok(entries.into_iter().map(|e| DirEntry {
-            name: e.name,
-            is_dir: e.qid.is_dir(),
-            size: 0,
-            stat: None,
-        }).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| DirEntry {
+                name: e.name,
+                is_dir: e.qid.is_dir(),
+                size: 0,
+                stat: None,
+            })
+            .collect())
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let state = fid.downcast_ref::<P9FidState>()
+        let state = fid
+            .downcast_ref::<P9FidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        let (qid, mode, size, mtime) = self.client.getattr(state.fid).await
+        let (qid, mode, size, mtime) = self
+            .client
+            .getattr(state.fid)
+            .await
             .map_err(|e| MountError::Io(e.to_string()))?;
         Ok(Stat {
             qtype: qid.qtype,

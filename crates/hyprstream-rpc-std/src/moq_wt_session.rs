@@ -88,7 +88,7 @@ impl web_transport_trait::Session for WtSession {
     }
 
     fn protocol(&self) -> Option<&str> {
-        self.0.protocol()
+        crate::browser_moq_stream::negotiated_protocol(self.0.protocol())
     }
 
     fn close(&self, code: u32, reason: &str) {

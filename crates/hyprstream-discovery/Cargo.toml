@@ -26,6 +26,11 @@ valkey = ["dep:fred"]
 # enabled but pulls nothing, and all rocksdb code is gated
 # `#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]`.
 rocksdb = ["dep:rocksdb"]
+# Checkpointed accepted-state authority on the networked RDS Postgres backend
+# (the `pds_kv` KV shell in hyprstream-pds). Selected by the resolved `[rds]`
+# binding handed in at bootstrap; fails closed, never falls back to local
+# RocksDB. Native-only, like `rocksdb`.
+postgres = ["hyprstream-pds/postgres"]
 
 [dependencies]
 # Workspace crates
@@ -102,6 +107,10 @@ tokio = { workspace = true }
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 # #893 (at9p D1) — mint real hybrid-signed capsules for the resolver tests.
 hyprstream-crypto = { path = "../hyprstream-crypto" }
+# Scratch-DB live tests for the Postgres accepted-state authority (NoTls, test-only).
+hyprstream-pds = { path = "../hyprstream-pds", features = ["postgres-test-connect"] }
+# Direct scratch-DB cleanup connection for the torn-fixture isolation guard.
+tokio-postgres = { workspace = true }
 # K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
 proptest = { workspace = true }
 serde_yaml = { workspace = true }

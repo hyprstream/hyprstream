@@ -82,6 +82,27 @@ impl ParsedProof {
     /// - Per-signature: `alg` fully specified, `kid` present, group in plan.
     /// - Claims payload: closed claim set, deterministic encoding.
     pub fn parse(cbor_bytes: &[u8]) -> Result<Self> {
+        Self::parse_with_federate_extension(cbor_bytes, false)
+    }
+
+    /// Parse a request proof under the deferred Federate source extension.
+    /// This is intentionally not the generic v16 parser: callers may use it
+    /// only after establishing the deferred Federate envelope profile.
+    pub fn parse_deferred_federate_request(cbor_bytes: &[u8]) -> Result<Self> {
+        let proof = Self::parse_with_federate_extension(cbor_bytes, true)?;
+        if proof.kind != ProofKind::Request {
+            bail!("deferred Federate proof must be a request proof");
+        }
+        if proof.claims.federate_recipient_binding.is_none() {
+            bail!("deferred Federate proof requires recipient binding");
+        }
+        Ok(proof)
+    }
+
+    fn parse_with_federate_extension(
+        cbor_bytes: &[u8],
+        allow_federate_extension: bool,
+    ) -> Result<Self> {
         if cbor_bytes.len() > MAX_COSE_OBJECT_BYTES {
             bail!(
                 "proof: object size {} exceeds cap of {} bytes",
@@ -217,7 +238,11 @@ impl ParsedProof {
         validate_signatures_against_plan(&signatures, &plan, structure, &protected_map)?;
 
         // Decode claims payload.
-        let claims = ProofClaims::decode(&payload_raw)?;
+        let claims = if allow_federate_extension {
+            ProofClaims::decode_deferred_federate(&payload_raw)?
+        } else {
+            ProofClaims::decode(&payload_raw)?
+        };
 
         // If this is a response proof, credential_hash must be null.
         if kind == ProofKind::Response && claims.credential_hash.is_some() {
@@ -412,7 +437,10 @@ fn validate_signatures_against_plan(
 /// by kid, algorithm, key type, and curve/parameters, in the plan's component
 /// order. Private key material is forbidden. A malformed, unknown, duplicate,
 /// surplus, reordered, or mismatched key denies the complete proof (finding 3).
-pub(super) fn validate_unattributed_key_set(ks_val: &CborValue, plan: &SignaturePlan) -> Result<()> {
+pub(super) fn validate_unattributed_key_set(
+    ks_val: &CborValue,
+    plan: &SignaturePlan,
+) -> Result<()> {
     let arr = match ks_val {
         CborValue::Array(a) => a,
         _ => bail!("proof: hs_unattributed_key_set must be array"),

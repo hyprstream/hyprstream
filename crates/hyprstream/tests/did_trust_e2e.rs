@@ -286,9 +286,16 @@ async fn did_anchored_bootstrap_boots_end_to_end() {
     hyprstream_discovery::initialize_deployment_checkpoint_store()
         .expect("fresh test deployment must provision its checkpoint store");
     let node_key = SigningKey::from_bytes(&[0x56; 32]);
-    hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true, false)
-        .await
-        .expect("DID-anchored bootstrap must boot against the real serving side");
+    hyprstream_discovery::bootstrap_deployment_process(
+        node_key,
+        None,
+        fixture.trust_source(),
+        true,
+        false,
+        &hyprstream_pds::rds::RdsConfig::default(),
+    )
+    .await
+    .expect("DID-anchored bootstrap must boot against the real serving side");
 
     // Mode-confusion guard: a remote-node boot deliberately leaves the
     // native-network profile FALSE (the DID-anchored arm refuses
@@ -427,8 +434,12 @@ async fn dead_or_wrong_key_discovery_fails_liveness() {
 async fn stopping_bound_service_cancels_announcement_lifetime() {
     let mut fixture = build_fixture().await;
     assert!(!fixture.announcement_cancellation.is_cancelled());
-    tokio::time::timeout(std::time::Duration::from_secs(10), fixture._discovery.stop())
-        .await.expect("service stop must drain without competing Notify consumers")
-        .expect("service stop");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fixture._discovery.stop(),
+    )
+    .await
+    .expect("service stop must drain without competing Notify consumers")
+    .expect("service stop");
     assert!(fixture.announcement_cancellation.is_cancelled());
 }

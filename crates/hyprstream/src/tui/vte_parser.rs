@@ -91,10 +91,12 @@ impl<'a> PanePerformer<'a> {
         let area = buf.buffer.area();
         if x < area.width && y < area.height {
             buf.buffer[(x, y)].set_symbol(symbol);
-            buf.buffer[(x, y)].set_style(Style::default()
-                .fg(self.sgr.fg)
-                .bg(self.sgr.bg)
-                .add_modifier(self.sgr.modifiers));
+            buf.buffer[(x, y)].set_style(
+                Style::default()
+                    .fg(self.sgr.fg)
+                    .bg(self.sgr.bg)
+                    .add_modifier(self.sgr.modifiers),
+            );
             buf.mark_dirty(y);
         }
     }
@@ -285,10 +287,7 @@ impl<'a> PanePerformer<'a> {
     }
 
     /// Parse extended color (256-color or RGB) from SGR params.
-    fn parse_extended_color<'b>(
-        &self,
-        iter: &mut impl Iterator<Item = &'b [u16]>,
-    ) -> Color {
+    fn parse_extended_color<'b>(&self, iter: &mut impl Iterator<Item = &'b [u16]>) -> Color {
         match iter.next().map(|p| p[0]) {
             Some(5) => {
                 // 256-color: ESC[38;5;Nm
@@ -332,7 +331,9 @@ impl<'a> vte::Perform for PanePerformer<'a> {
         self.set_cell(x, y, s);
 
         // Advance cursor (wide char detection).
-        let width = if c.is_ascii() { 1 } else {
+        let width = if c.is_ascii() {
+            1
+        } else {
             let cp = c as u32;
             if (0x1100..=0x115F).contains(&cp)
                 || (0x2E80..=0x303E).contains(&cp)
@@ -680,7 +681,8 @@ impl<'a> vte::Perform for PanePerformer<'a> {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+    }
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
 }
@@ -763,8 +765,8 @@ mod tests {
         {
             let mut perf = PanePerformer::new(&mut pane);
             perf.feed(b"\x1b[5;5H"); // row 5, col 5
-            perf.feed(b"\x1b[2A");   // up 2
-            perf.feed(b"\x1b[3C");   // right 3
+            perf.feed(b"\x1b[2A"); // up 2
+            perf.feed(b"\x1b[3C"); // right 3
         }
         assert_eq!(pane.cursor.y, 2); // 5-1-2 = 2
         assert_eq!(pane.cursor.x, 7); // 5-1+3 = 7
@@ -789,7 +791,7 @@ mod tests {
             let mut perf = PanePerformer::new(&mut pane);
             perf.feed(b"Hello World");
             perf.feed(b"\x1b[1;6H"); // Move to col 6
-            perf.feed(b"\x1b[K");    // Erase to end of line
+            perf.feed(b"\x1b[K"); // Erase to end of line
         }
         assert_eq!(pane.primary.buffer[(0, 0)].symbol(), "H");
         assert_eq!(pane.primary.buffer[(4, 0)].symbol(), "o");
@@ -865,7 +867,7 @@ mod tests {
             perf.feed(b"\x1b[1;1HAAAAA"); // Row 1
             perf.feed(b"\x1b[2;1HBBBBB"); // Row 2
             perf.feed(b"\x1b[3;1HCCCCC"); // Row 3
-            // Now at row 3, col 5. LF should scroll.
+                                          // Now at row 3, col 5. LF should scroll.
             perf.feed(b"\r\nDDDDD");
         }
         // After scroll: row 0=B, row 1=C, row 2=D
@@ -887,7 +889,7 @@ mod tests {
             perf.feed(b"\x1b[1;1HAAAAA"); // Row 0: 5 chars → pending_wrap=true
             perf.feed(b"\x1b[2;1HBBBBB"); // Row 1: CUP cancels pending_wrap
             perf.feed(b"\x1b[3;1HCCCCC"); // Row 2: 5 chars → pending_wrap=true
-            // No further input: wrap never fires, NO scroll happens.
+                                          // No further input: wrap never fires, NO scroll happens.
         }
         // All three rows must retain their content.
         assert_eq!(pane.primary.buffer[(0, 0)].symbol(), "A");
@@ -905,7 +907,7 @@ mod tests {
             perf.feed(b"\x1b[1;1HAAAAA"); // Row 0
             perf.feed(b"\x1b[2;1HBBBBB"); // Row 1
             perf.feed(b"\x1b[3;1HCCCCC"); // Row 2: pending_wrap=true
-            // Next char fires pending_wrap → wrap → scroll.
+                                          // Next char fires pending_wrap → wrap → scroll.
             perf.feed(b"D");
         }
         // After scroll: row0=B, row1=C, row2 starts with D.
@@ -942,9 +944,9 @@ mod tests {
         {
             let mut perf = PanePerformer::new(&mut pane);
             perf.feed(b"\x1b[5;10H"); // row 5, col 10
-            perf.feed(b"\x1b7");      // DECSC
-            perf.feed(b"\x1b[1;1H");  // Home
-            perf.feed(b"\x1b8");      // DECRC
+            perf.feed(b"\x1b7"); // DECSC
+            perf.feed(b"\x1b[1;1H"); // Home
+            perf.feed(b"\x1b8"); // DECRC
         }
         assert_eq!(pane.cursor.y, 4);
         assert_eq!(pane.cursor.x, 9);
@@ -984,8 +986,8 @@ mod tests {
             // then erase to end of line — erased cells should keep the dark-blue bg.
             perf.feed(b"\x1b[48;2;20;20;40m"); // dark-blue bg
             perf.feed(b"ABC");
-            perf.feed(b"\x1b[1;4H");            // cursor to col 4
-            perf.feed(b"\x1b[K");               // EL: erase to EOL
+            perf.feed(b"\x1b[1;4H"); // cursor to col 4
+            perf.feed(b"\x1b[K"); // EL: erase to EOL
         }
         // Cols 3..cols should have dark-blue bg (not Reset)
         for x in 3..10u16 {
@@ -1010,9 +1012,9 @@ mod tests {
         {
             let mut perf = PanePerformer::new(&mut pane);
             perf.feed(b"\x1b[48;2;10;10;20m"); // set bg
-            // Move to last row then issue one more LF to trigger scroll
-            perf.feed(b"\x1b[10;1H");           // cursor to row 10 (bottom)
-            perf.feed(b"\n");                    // one LF → scroll up 1
+                                               // Move to last row then issue one more LF to trigger scroll
+            perf.feed(b"\x1b[10;1H"); // cursor to row 10 (bottom)
+            perf.feed(b"\n"); // one LF → scroll up 1
         }
         // Bottom row (row 9, 0-indexed) should have been cleared with the
         // current background color, not Color::Reset.

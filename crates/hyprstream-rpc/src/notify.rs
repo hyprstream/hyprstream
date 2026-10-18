@@ -34,9 +34,7 @@ pub fn ready() -> Result<()> {
 /// other value is a pathname address.
 #[cfg(not(feature = "systemd"))]
 pub fn ready() -> Result<()> {
-    use nix::sys::socket::{
-        sendto, socket, AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr,
-    };
+    use nix::sys::socket::{sendto, socket, AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
 
@@ -184,12 +182,8 @@ mod tests {
         let received = {
             let mut iov = [IoSliceMut::new(&mut buffer)];
             let mut cmsg = cmsg_space!(UnixCredentials);
-            let message = recvmsg::<UnixAddr>(
-                fd.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg),
-                MsgFlags::empty(),
-            )?;
+            let message =
+                recvmsg::<UnixAddr>(fd.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
             message.bytes
         };
         assert!(received > 0);

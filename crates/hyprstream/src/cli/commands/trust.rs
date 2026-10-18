@@ -17,6 +17,8 @@ mod tests {
 
 #[derive(Debug, Subcommand)]
 pub enum TrustCommand {
+    /// Sign reviewed enrollment-only MAC boot artifacts with an existing enrolled Policy key.
+    SignMacBootPolicy(SignMacBootPolicyArgs),
     /// Generate an Ed25519 + ML-DSA-65 deployment authority.
     MintDeploymentCa(MintDeploymentCaArgs),
     /// Create a root-authorized, registry-only online signer.
@@ -34,8 +36,30 @@ pub enum TrustCommand {
     /// optionally enable the unattended registry-credential refresher.
     Install(InstallDeploymentTrustArgs),
 
-/// Mint the deployment anchor capsule and its did:web document.
+    /// Mint the deployment anchor capsule and its did:web document.
     MintAnchorCapsule(MintAnchorCapsuleArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SignMacBootPolicyArgs {
+    /// Public CompiledPolicy JSON, including reviewed enrollment and an empty TE matrix.
+    #[arg(long)]
+    pub policy_input: PathBuf,
+    /// Authority-reviewed empty-capability UCAN JSON; no delegated chain is inferred.
+    #[arg(long)]
+    pub reviewed_ucan: PathBuf,
+    /// Independently reviewed lattice/policy generation; never inferred.
+    #[arg(long)]
+    pub expected_generation: u64,
+    /// Independently reviewed full policy BLAKE3 hash (64 hex digits).
+    #[arg(long)]
+    pub expected_hash: String,
+    /// Existing Policy credentials and deployment-chain-enrolled bootstrap roster.
+    #[arg(long)]
+    pub secrets_dir: PathBuf,
+    /// New directory for signed-policy.json and signed-approval.json; never overwritten.
+    #[arg(long)]
+    pub output_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -123,7 +147,6 @@ pub struct MintAnchorCapsuleArgs {
     /// Replace existing output files.
     #[arg(long)]
     pub force: bool,
-
 }
 
 #[derive(Debug, Args)]

@@ -48,7 +48,9 @@ pub(crate) fn register_payload(filter_ptr: *const OpaqueGitFilter, payload: XetF
 ///
 /// Returns None if the payload was not found (e.g., double-unregister or corrupted registry)
 #[cfg(feature = "xet-storage")]
-pub(crate) fn unregister_payload(filter_ptr: *const OpaqueGitFilter) -> Option<Arc<XetFilterPayload>> {
+pub(crate) fn unregister_payload(
+    filter_ptr: *const OpaqueGitFilter,
+) -> Option<Arc<XetFilterPayload>> {
     let key = filter_ptr as usize;
     tracing::debug!("Unregistering payload for filter instance {:x}", key);
     PAYLOAD_REGISTRY.remove(&key).map(|(_, p)| p)
@@ -58,7 +60,9 @@ pub(crate) fn unregister_payload(filter_ptr: *const OpaqueGitFilter) -> Option<A
 #[cfg(feature = "xet-storage")]
 fn get_payload(filter_ptr: *const OpaqueGitFilter) -> Option<Arc<XetFilterPayload>> {
     let key = filter_ptr as usize;
-    PAYLOAD_REGISTRY.get(&key).map(|entry| entry.value().clone())
+    PAYLOAD_REGISTRY
+        .get(&key)
+        .map(|entry| entry.value().clone())
 }
 
 /// Initialize callback (called once when filter is first used)
@@ -235,7 +239,12 @@ fn smudge_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<V
         .runtime
         .block_on(payload.storage.smudge_bytes(pointer_str))
         .map_err(|e| XetError::new(XetErrorKind::RuntimeError, format!("Runtime error: {e}")))?
-        .map_err(|e| XetError::new(XetErrorKind::DownloadFailed, format!("Download failed: {e}")))?;
+        .map_err(|e| {
+            XetError::new(
+                XetErrorKind::DownloadFailed,
+                format!("Download failed: {e}"),
+            )
+        })?;
 
     tracing::debug!("XET smudge {}: pointer -> {} bytes", path, content.len());
     crate::notify_smudge_progress(path);
@@ -252,11 +261,17 @@ fn clean_data(payload: &XetFilterPayload, input: &[u8], path: &str) -> Result<Ve
 
     // Write to temporary file for upload
     let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-        XetError::new(XetErrorKind::IoError, format!("Failed to create temp file: {e}"))
+        XetError::new(
+            XetErrorKind::IoError,
+            format!("Failed to create temp file: {e}"),
+        )
     })?;
 
     std::fs::write(temp_file.path(), input).map_err(|e| {
-        XetError::new(XetErrorKind::IoError, format!("Failed to write temp file: {e}"))
+        XetError::new(
+            XetErrorKind::IoError,
+            format!("Failed to write temp file: {e}"),
+        )
     })?;
 
     // Upload to XET CAS
@@ -287,7 +302,10 @@ fn write_to_next(next: *mut OpaqueGitWriteStream, data: &[u8]) -> Result<(), Xet
         let write_fn = (*ws).write;
         let result = write_fn(ws, data.as_ptr().cast::<c_char>(), data.len());
         if result < 0 {
-            return Err(XetError::new(XetErrorKind::IoError, "Write to next stream failed"));
+            return Err(XetError::new(
+                XetErrorKind::IoError,
+                "Write to next stream failed",
+            ));
         }
     }
     Ok(())
@@ -310,7 +328,10 @@ fn close_next(next: *mut OpaqueGitWriteStream) -> Result<(), XetError> {
         let close_fn = (*ws).close;
         let result = close_fn(ws);
         if result < 0 {
-            return Err(XetError::new(XetErrorKind::IoError, "Close next stream failed"));
+            return Err(XetError::new(
+                XetErrorKind::IoError,
+                "Close next stream failed",
+            ));
         }
     }
     Ok(())
@@ -380,7 +401,11 @@ pub extern "C" fn xet_filter_stream(
 
     tracing::debug!(
         "XET filter stream: mode={}, path={}",
-        if mode == GIT_FILTER_SMUDGE { "smudge" } else { "clean" },
+        if mode == GIT_FILTER_SMUDGE {
+            "smudge"
+        } else {
+            "clean"
+        },
         path
     );
 

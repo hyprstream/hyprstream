@@ -95,7 +95,7 @@ run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 # chromedriver were installed as root by the workflow before this script
 # dropped to the non-root `ci` user (see rust.yml's `build` job), so
 # browser-wasm-test-ci.sh finds them already on PATH and skips straight to
-# resolving + running crates/hyprstream-rpc/tests/wasm_browser_fetch.rs in a
+# resolving + running the browser-fetch and browser-session proof tests in a
 # real headless Chromium — the same required-merge-gate invariant the fast PR
 # `WASM (browser client)` job checks, but the fast job is explicitly skipped
 # on `merge_group` (rust.yml:167), so this is the only required-gate path that
@@ -134,6 +134,26 @@ run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
 # acceptance criterion: a measured 318s doctest phase was paying release LTO
 # for almost no runtime win on doc examples. Parity with the nextest profile.
 run_phase "doctests" cargo test --profile ci-test --doc
+
+# Decision/evaluation crates deliberately stay outside default-members. Select
+# them explicitly so workspace membership cannot give a false green result.
+# Use the same CPU libtorch and ci-test profile as the native production test
+# lane; no download-libtorch or alternative device profile is introduced.
+decision_packages=(
+  -p hyprstream-decision
+  -p hyprstream-calibration
+  -p hyprstream-decision-head
+  -p hyprstream-decision-stub
+  -p hyprstream-eval
+)
+run_phase "decision and evaluation nextest" cargo nextest run --locked \
+  --cargo-profile ci-test --profile ci --no-default-features "${decision_packages[@]}"
+run_phase "decision and evaluation doctests" cargo test --locked \
+  --profile ci-test --no-default-features "${decision_packages[@]}" --doc
+
+# Synthesis remains an independent program leaf outside default-members.
+# Run its binary/integration tests and doctests in the production test profile.
+run_phase "synthesis tests and doctests" bash .github/scripts/synthesis-ci.sh test
 
 # RELEASE / FEATURE LANES moved to the parallel build-release job
 # (.github/scripts/graviton-release-lanes.sh) on 2026-09-15: the native

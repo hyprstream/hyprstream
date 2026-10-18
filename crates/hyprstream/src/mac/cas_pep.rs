@@ -587,7 +587,9 @@ mod tests {
         let resolver = CasObjectLabelResolver::from_domain(&DedupDomain::local_default());
         assert!(resolver.resolve(CAS_SERVICE_DOMAIN, None).is_some());
         assert!(resolver.resolve("registry", None).is_none());
-        assert!(resolver.resolve(CAS_SERVICE_DOMAIN, Some(&[1][..])).is_none());
+        assert!(resolver
+            .resolve(CAS_SERVICE_DOMAIN, Some(&[1][..]))
+            .is_none());
     }
 
     // ── DenyAllClearanceSource ──────────────────────────────────────────────
@@ -595,7 +597,10 @@ mod tests {
     #[tokio::test]
     async fn deny_all_clearance_source_returns_none() {
         let src = DenyAllClearanceSource;
-        assert!(src.clearance_for("anyone", Some("tenant-a")).await.is_none());
+        assert!(src
+            .clearance_for("anyone", Some("tenant-a"))
+            .await
+            .is_none());
         assert!(src.clearance_for("admin", None).await.is_none());
     }
 
@@ -607,13 +612,15 @@ mod tests {
         let label = domain_label(&DedupDomain::local_default());
         let labeled = CasObjectLabelResolver::new(Some(label));
         assert_eq!(
-            pep.check_read("any-subject", Some("tenant-a"), &labeled).await,
+            pep.check_read("any-subject", Some("tenant-a"), &labeled)
+                .await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
         // Unlabeled object also denies.
         let unlabeled = CasObjectLabelResolver::new(None);
         assert_eq!(
-            pep.check_read("any-subject", Some("tenant-a"), &unlabeled).await,
+            pep.check_read("any-subject", Some("tenant-a"), &unlabeled)
+                .await,
             MacDecision::Deny(MacDenyReason::NoClearance)
         );
     }
@@ -663,7 +670,8 @@ mod tests {
 
     async fn check(pep: &CasPep, subject_id: &str, label: Option<SecurityLabel>) -> MacDecision {
         let resolver = CasObjectLabelResolver::new(label);
-        pep.check_read(subject_id, Some("tenant-a"), &resolver).await
+        pep.check_read(subject_id, Some("tenant-a"), &resolver)
+            .await
     }
 
     #[derive(Default)]
@@ -689,7 +697,10 @@ mod tests {
             sink.clone(),
         );
         let label = domain_label(&DedupDomain::local_default()); // Internal
-        assert_eq!(check(&pep, "secret-user", Some(label)).await, MacDecision::Permit);
+        assert_eq!(
+            check(&pep, "secret-user", Some(label)).await,
+            MacDecision::Permit
+        );
 
         let records = sink.records.lock();
         assert_eq!(records.len(), 1);

@@ -8,22 +8,22 @@
 //! `on_stream_complete()`, etc. directly, and `submit_message_payload()` returns
 //! the serialized JSON request for the host to forward.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use waxterm::input::KeyPress;
 
 #[cfg(not(target_os = "wasi"))]
-use std::sync::Arc;
-#[cfg(not(target_os = "wasi"))]
-use std::sync::mpsc;
-#[cfg(not(target_os = "wasi"))]
-use std::time::Instant;
-#[cfg(not(target_os = "wasi"))]
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 #[cfg(not(target_os = "wasi"))]
 use ratatui_textarea::TextArea;
+#[cfg(not(target_os = "wasi"))]
+use std::sync::mpsc;
+#[cfg(not(target_os = "wasi"))]
+use std::sync::Arc;
+#[cfg(not(target_os = "wasi"))]
+use std::time::Instant;
 #[cfg(not(target_os = "wasi"))]
 use waxterm::app::TerminalApp;
 
@@ -34,13 +34,13 @@ fn keypress_to_crossterm(key: KeyPress) -> Option<KeyEvent> {
             (KeyCode::Char(b as char), KeyModifiers::NONE)
         }
         KeyPress::Char(0x0A) => (KeyCode::Enter, KeyModifiers::NONE), // Ctrl-J
-        KeyPress::Enter      => (KeyCode::Enter, KeyModifiers::NONE),
-        KeyPress::Backspace  => (KeyCode::Backspace, KeyModifiers::NONE),
-        KeyPress::ArrowLeft  => (KeyCode::Left, KeyModifiers::NONE),
+        KeyPress::Enter => (KeyCode::Enter, KeyModifiers::NONE),
+        KeyPress::Backspace => (KeyCode::Backspace, KeyModifiers::NONE),
+        KeyPress::ArrowLeft => (KeyCode::Left, KeyModifiers::NONE),
         KeyPress::ArrowRight => (KeyCode::Right, KeyModifiers::NONE),
-        KeyPress::ArrowUp    => (KeyCode::Up, KeyModifiers::NONE),
-        KeyPress::ArrowDown  => (KeyCode::Down, KeyModifiers::NONE),
-        KeyPress::Tab        => (KeyCode::Tab, KeyModifiers::NONE),
+        KeyPress::ArrowUp => (KeyCode::Up, KeyModifiers::NONE),
+        KeyPress::ArrowDown => (KeyCode::Down, KeyModifiers::NONE),
+        KeyPress::Tab => (KeyCode::Tab, KeyModifiers::NONE),
         // Ctrl-letter keys (0x01–0x1A, excluding already handled)
         KeyPress::Char(b) if b < 0x20 => {
             let ch = (b + b'a' - 1) as char;
@@ -55,7 +55,6 @@ fn keypress_to_crossterm(key: KeyPress) -> Option<KeyEvent> {
         state: KeyEventState::NONE,
     })
 }
-
 
 // ============================================================================
 // Public types
@@ -187,8 +186,9 @@ pub type CancelHandle = Box<dyn FnOnce() + Send + 'static>;
 /// Must be `Send + 'static` because it is moved into the background thread
 /// spawned by `spawn_app_process`.
 #[cfg(not(target_os = "wasi"))]
-pub type StreamSpawner =
-    Box<dyn Fn(Vec<ChatHistoryEntry>, mpsc::SyncSender<ChatEvent>) -> CancelHandle + Send + 'static>;
+pub type StreamSpawner = Box<
+    dyn Fn(Vec<ChatHistoryEntry>, mpsc::SyncSender<ChatEvent>) -> CancelHandle + Send + 'static,
+>;
 
 /// Tool executor injected at construction time.
 ///
@@ -218,7 +218,9 @@ pub enum ChatMode {
     Editor,
     /// Settings modal: ↑/↓ select field, ←/→ adjust, Enter save, Esc discard.
     #[cfg(not(target_os = "wasi"))]
-    Settings { selected_field: usize },
+    Settings {
+        selected_field: usize,
+    },
 }
 
 // ============================================================================
@@ -274,7 +276,6 @@ pub struct ChatApp {
     last_esc: Option<Instant>,
 
     // ── Generation config + settings modal ───────────────────────────────────
-
     /// Shared generation config (read by spawner each invocation).
     #[cfg(not(target_os = "wasi"))]
     pub gen_config: Arc<parking_lot::RwLock<ChatGenConfig>>,
@@ -292,7 +293,6 @@ pub struct ChatApp {
     pub is_server_spawned: bool,
 
     // ── Tool calling ─────────────────────────────────────────────────────────
-
     /// Optional tool executor (None when MCP service is unavailable).
     #[cfg(not(target_os = "wasi"))]
     tool_caller: Option<ToolCaller>,
@@ -311,7 +311,6 @@ pub struct ChatApp {
     pub spinner_tick: u32,
 
     // ── VFS namespace for / command routing ──────────────────────────────────
-
     /// VFS namespace for / path commands. None on WASM.
     vfs: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
     /// Caller identity for VFS operations.
@@ -330,7 +329,10 @@ pub struct ChatApp {
     tcl_owner: Option<crate::shell_driver::ShellOwner>,
     /// Deferred init data for the Tcl shell owner (Send-safe). Consumed on first
     /// access by [`ensure_tcl_shell`](Self::ensure_tcl_shell).
-    tcl_shell_init: Option<(hyprstream_vfs::Subject, std::sync::Arc<hyprstream_vfs::Namespace>)>,
+    tcl_shell_init: Option<(
+        hyprstream_vfs::Subject,
+        std::sync::Arc<hyprstream_vfs::Namespace>,
+    )>,
     /// Dedicated-thread driver for direct `Namespace` access (`cat`/`ls`), used
     /// by bare-path slash commands that don't need a Tcl interpreter at all. See
     /// [`ensure_ns_driver`](Self::ensure_ns_driver) and the routing split in
@@ -499,8 +501,16 @@ impl ChatApp {
         let mut ta = TextArea::default();
         ta.set_block(hyprstream_compositor::theme::input_block());
         ta.set_line_number_style(hyprstream_compositor::theme::gutter_style());
-        ta.set_cursor_line_style(Style::default().bg(hyprstream_compositor::theme::BG).fg(Color::White));
-        ta.set_style(Style::default().bg(hyprstream_compositor::theme::BG).fg(Color::White));
+        ta.set_cursor_line_style(
+            Style::default()
+                .bg(hyprstream_compositor::theme::BG)
+                .fg(Color::White),
+        );
+        ta.set_style(
+            Style::default()
+                .bg(hyprstream_compositor::theme::BG)
+                .fg(Color::White),
+        );
         ta.set_placeholder_text("Type a message…");
         ta
     }
@@ -595,7 +605,11 @@ impl ChatApp {
     /// `TclShell` is `!Send` and ChatApp must cross a thread boundary in
     /// `spawn_app_process` before it can settle on the thread its owner will
     /// spawn from.
-    pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject) -> Self {
+    pub fn with_vfs(
+        mut self,
+        ns: std::sync::Arc<hyprstream_vfs::Namespace>,
+        subject: hyprstream_vfs::Subject,
+    ) -> Self {
         self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
         self.vfs = Some(ns);
         self.vfs_subject = subject;
@@ -668,8 +682,7 @@ impl ChatApp {
                 None if delta > 0 => self.settings_draft.top_k = Some(1),
                 Some(1) if delta < 0 => self.settings_draft.top_k = None,
                 Some(v) => {
-                    self.settings_draft.top_k =
-                        Some((v as i32 + delta).clamp(1, 200) as usize);
+                    self.settings_draft.top_k = Some((v as i32 + delta).clamp(1, 200) as usize);
                 }
                 _ => {}
             },
@@ -775,14 +788,16 @@ impl ChatApp {
 
         // Cache format-derived markers before mutably borrowing history.
         let open_marker: Option<(&'static str, &'static str)> = match self.tool_call_format {
-            ToolCallFormat::Qwen3Xml      => Some(("<tool_call>", "</tool_call>")),
+            ToolCallFormat::Qwen3Xml => Some(("<tool_call>", "</tool_call>")),
             ToolCallFormat::Qwen35XmlParam => Some(("<tool_call>", "</tool_call>")),
-            ToolCallFormat::LlamaJson     => Some(("<|python_tag|>", "")),
-            ToolCallFormat::MistralJson   => Some(("[TOOL_CALLS]", "")),
-            ToolCallFormat::None          => None,
+            ToolCallFormat::LlamaJson => Some(("<|python_tag|>", "")),
+            ToolCallFormat::MistralJson => Some(("[TOOL_CALLS]", "")),
+            ToolCallFormat::None => None,
         };
 
-        let Some(last) = self.history.last_mut() else { return detected };
+        let Some(last) = self.history.last_mut() else {
+            return detected;
+        };
         let mut remaining = token;
 
         while !remaining.is_empty() {
@@ -868,9 +883,7 @@ impl ChatApp {
     fn ensure_tcl_shell(&mut self) {
         if self.tcl_owner.is_none() {
             if let Some((subject, namespace)) = self.tcl_shell_init.take() {
-                self.tcl_owner = Some(crate::shell_driver::ShellOwner::spawn(
-                    subject, namespace,
-                ));
+                self.tcl_owner = Some(crate::shell_driver::ShellOwner::spawn(subject, namespace));
             }
         }
     }
@@ -1024,7 +1037,9 @@ impl ChatApp {
     /// were typed while we were streaming.
     fn on_stream_done(&mut self) {
         #[cfg(not(target_os = "wasi"))]
-        { self.cancel_handle = None; }
+        {
+            self.cancel_handle = None;
+        }
         self.in_thinking = false;
         self.in_tool_call = false;
         self.tool_call_buf.clear();
@@ -1046,7 +1061,10 @@ impl ChatApp {
         let detected = self.ingest_token(token);
         #[cfg(not(target_os = "wasi"))]
         for (uuid, arguments) in detected {
-            let description = self.tool_descriptions.get(&uuid).cloned()
+            let description = self
+                .tool_descriptions
+                .get(&uuid)
+                .cloned()
                 .unwrap_or_else(|| uuid.clone());
             // Generate a unique correlation ID per invocation so two calls to the
             // same tool function can be distinguished in ToolCallResult matching.
@@ -1116,7 +1134,9 @@ impl ChatApp {
             last.content = format!("[Error: {msg}]");
         }
         #[cfg(not(target_os = "wasi"))]
-        { self.cancel_handle = None; }
+        {
+            self.cancel_handle = None;
+        }
         self.in_thinking = false;
         self.in_tool_call = false;
         self.tool_call_buf.clear();
@@ -1138,11 +1158,15 @@ impl ChatApp {
         // start_generation().  Pop only that entry to preserve any Tool messages
         // from a preceding agentic round (so context is intact on retry).
         // Fall back to popping until User if the history shape is unexpected.
-        let tail_is_empty_assistant = self.history.last().map(|e| {
-            matches!(e.role, ChatRole::Assistant)
-                && e.content.is_empty()
-                && e.tool_calls.is_empty()
-        }).unwrap_or(false);
+        let tail_is_empty_assistant = self
+            .history
+            .last()
+            .map(|e| {
+                matches!(e.role, ChatRole::Assistant)
+                    && e.content.is_empty()
+                    && e.tool_calls.is_empty()
+            })
+            .unwrap_or(false);
         if tail_is_empty_assistant {
             self.history.pop();
         } else {
@@ -1216,7 +1240,9 @@ impl ChatApp {
     pub fn handle_key(&mut self, key: KeyPress) -> Option<String> {
         if matches!(self.mode, ChatMode::Streaming) {
             match key {
-                KeyPress::Escape | KeyPress::F(10) => { self.quit = true; }
+                KeyPress::Escape | KeyPress::F(10) => {
+                    self.quit = true;
+                }
                 _ => {}
             }
             return None;
@@ -1327,23 +1353,33 @@ impl TerminalApp for ChatApp {
                     }
                 }
                 KeyPress::ArrowLeft => {
-                    self.textarea.move_cursor(ratatui_textarea::CursorMove::Back);
+                    self.textarea
+                        .move_cursor(ratatui_textarea::CursorMove::Back);
                     true
                 }
                 KeyPress::ArrowRight => {
-                    self.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
+                    self.textarea
+                        .move_cursor(ratatui_textarea::CursorMove::Forward);
                     true
                 }
                 KeyPress::ArrowUp | KeyPress::ScrollUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(
-                        if matches!(key, KeyPress::ScrollUp) { 3 } else { 1 },
-                    );
+                    self.scroll_offset =
+                        self.scroll_offset
+                            .saturating_add(if matches!(key, KeyPress::ScrollUp) {
+                                3
+                            } else {
+                                1
+                            });
                     true
                 }
                 KeyPress::ArrowDown | KeyPress::ScrollDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(
-                        if matches!(key, KeyPress::ScrollDown) { 3 } else { 1 },
-                    );
+                    self.scroll_offset =
+                        self.scroll_offset
+                            .saturating_sub(if matches!(key, KeyPress::ScrollDown) {
+                                3
+                            } else {
+                                1
+                            });
                     true
                 }
                 _ => false,
@@ -1390,23 +1426,33 @@ impl TerminalApp for ChatApp {
                     }
                 }
                 KeyPress::ArrowLeft => {
-                    self.textarea.move_cursor(ratatui_textarea::CursorMove::Back);
+                    self.textarea
+                        .move_cursor(ratatui_textarea::CursorMove::Back);
                     true
                 }
                 KeyPress::ArrowRight => {
-                    self.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
+                    self.textarea
+                        .move_cursor(ratatui_textarea::CursorMove::Forward);
                     true
                 }
                 KeyPress::ArrowUp | KeyPress::ScrollUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(
-                        if matches!(key, KeyPress::ScrollUp) { 3 } else { 1 },
-                    );
+                    self.scroll_offset =
+                        self.scroll_offset
+                            .saturating_add(if matches!(key, KeyPress::ScrollUp) {
+                                3
+                            } else {
+                                1
+                            });
                     true
                 }
                 KeyPress::ArrowDown | KeyPress::ScrollDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(
-                        if matches!(key, KeyPress::ScrollDown) { 3 } else { 1 },
-                    );
+                    self.scroll_offset =
+                        self.scroll_offset
+                            .saturating_sub(if matches!(key, KeyPress::ScrollDown) {
+                                3
+                            } else {
+                                1
+                            });
                     true
                 }
                 _ => false,
@@ -1424,7 +1470,8 @@ impl TerminalApp for ChatApp {
                     *self.gen_config.write() = draft.clone();
                     if draft.context_window != old_context {
                         if self.is_server_spawned {
-                            let ctx_str = draft.context_window
+                            let ctx_str = draft
+                                .context_window
                                 .map_or("default".to_owned(), |n| n.to_string());
                             self.pending_toasts.push(format!(
                                 "Context window set to {ctx_str}. Reload model to apply: \
@@ -1441,13 +1488,17 @@ impl TerminalApp for ChatApp {
                 }
                 KeyPress::ArrowUp => {
                     if selected_field > 0 {
-                        self.mode = ChatMode::Settings { selected_field: selected_field - 1 };
+                        self.mode = ChatMode::Settings {
+                            selected_field: selected_field - 1,
+                        };
                     }
                     true
                 }
                 KeyPress::ArrowDown => {
                     if selected_field < 4 {
-                        self.mode = ChatMode::Settings { selected_field: selected_field + 1 };
+                        self.mode = ChatMode::Settings {
+                            selected_field: selected_field + 1,
+                        };
                     }
                     true
                 }
@@ -1542,11 +1593,16 @@ impl TerminalApp for ChatApp {
                     self.on_template_error(s);
                     redraw = true;
                 }
-                Ok(ChatEvent::ToolCallDetected { id, uuid, description, arguments }) => {
+                Ok(ChatEvent::ToolCallDetected {
+                    id,
+                    uuid,
+                    description,
+                    arguments,
+                }) => {
                     // Security: only dispatch tools present in the allowlist fetched
                     // from list_tools().  Models cannot invoke arbitrary endpoints.
-                    let allowed = self.tool_caller.is_none()
-                        || self.tool_descriptions.contains_key(&uuid);
+                    let allowed =
+                        self.tool_caller.is_none() || self.tool_descriptions.contains_key(&uuid);
 
                     // Record the tool call on the last assistant entry.
                     if let Some(last) = self.history.last_mut() {
@@ -1555,7 +1611,9 @@ impl TerminalApp for ChatApp {
                             uuid: uuid.clone(),
                             description: description.clone(),
                             arguments: arguments.clone(),
-                            result: if allowed { None } else {
+                            result: if allowed {
+                                None
+                            } else {
                                 Some(format!("[Tool not found: {uuid}]"))
                             },
                         });
@@ -1597,7 +1655,11 @@ impl TerminalApp for ChatApp {
                     }
                     redraw = true;
                 }
-                Ok(ChatEvent::ToolCallResult { id, uuid: _, result }) => {
+                Ok(ChatEvent::ToolCallResult {
+                    id,
+                    uuid: _,
+                    result,
+                }) => {
                     // Guard: ignore stale/duplicate results (e.g. after on_stream_error
                     // reset pending_tool_calls to 0, or a duplicate delivery).
                     if self.pending_tool_calls == 0 {
@@ -1685,7 +1747,14 @@ mod tests {
     /// so the interpreter's substitution/grouping semantics are preserved.
     #[test]
     fn bare_path_with_metachar_routes_to_eval() {
-        for bad in ["srv/$x", "srv/[a]", "srv/{b}", "srv/\"q\"", "srv;c", "srv\\d"] {
+        for bad in [
+            "srv/$x",
+            "srv/[a]",
+            "srv/{b}",
+            "srv/\"q\"",
+            "srv;c",
+            "srv\\d",
+        ] {
             let class = classify_vfs_command(bad, true);
             assert!(
                 matches!(class, VfsCommandClass::Eval(ref s) if s == bad),
@@ -1739,7 +1808,10 @@ mod tests {
     /// `ls` and `ls <path>` route to direct ls.
     #[test]
     fn ls_routes_to_direct_ls() {
-        assert!(matches!(classify_vfs_command("ls", false), VfsCommandClass::Ls(None)));
+        assert!(matches!(
+            classify_vfs_command("ls", false),
+            VfsCommandClass::Ls(None)
+        ));
         assert!(matches!(
             classify_vfs_command("ls /srv", false),
             VfsCommandClass::Ls(Some(p)) if p == "/srv"
@@ -1750,7 +1822,14 @@ mod tests {
     /// unknown commands, empty input — falls through to Tcl `eval` unchanged.
     #[test]
     fn non_direct_commands_route_to_eval() {
-        for input in ["write /x y", "ctl /svc start", "mount foo", "help", "frobnicate", ""] {
+        for input in [
+            "write /x y",
+            "ctl /svc start",
+            "mount foo",
+            "help",
+            "frobnicate",
+            "",
+        ] {
             assert!(
                 matches!(classify_vfs_command(input, false), VfsCommandClass::Eval(s) if s == input),
                 "input {input:?} should Eval unchanged"
@@ -1763,7 +1842,9 @@ mod tests {
     #[test]
     fn metachar_detection_is_complete() {
         // Each Tcl-significant character, in an otherwise-inert string.
-        for c in ['$', '[', ']', '{', '}', '"', ';', '\\', ' ', '\t', '\n', '\r'] {
+        for c in [
+            '$', '[', ']', '{', '}', '"', ';', '\\', ' ', '\t', '\n', '\r',
+        ] {
             assert!(has_tcl_metachars(&format!("x{c}y")), "failed to flag {c:?}");
         }
         // A plain path is clean.

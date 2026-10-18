@@ -46,7 +46,6 @@ use crate::config::{TlsConfig, XetConfig};
 use crate::server::state::ResourceAuthState;
 use crate::server::tls::{resolve_rustls_config, serve_app};
 use crate::server::{middleware as server_middleware, AuthenticatedUser};
-use hyprstream_rpc_std::registry_client::RegistryClient;
 use crate::storage::cas::{CasMount, CasMountAuthorizer, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{
@@ -60,6 +59,7 @@ use axum::{
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use hyprstream_service::Spawnable;
 use hyprstream_vfs::{Mount, MountError, OREAD};
 use std::net::SocketAddr;
@@ -438,8 +438,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use hyprstream_rpc::auth::{
-        CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
-        CredentialId,
+        CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState, CredentialId,
     };
     use std::collections::HashMap;
     use tower::ServiceExt; // oneshot
@@ -504,9 +503,9 @@ mod tests {
         // when no other test in this binary got there first — under nextest
         // per-test process isolation no other test can provide it.
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
-            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(
-                Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
-            );
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
         }
         std::fs::create_dir_all(dir.join("xorbs")).unwrap();
         std::fs::write(dir.join("xorbs").join(format!("default.{hash}")), bytes).unwrap();
@@ -683,9 +682,9 @@ mod tests {
         // which is what the middleware checks. If the global isn't set yet,
         // set it from the state's local instance so both are the same store.
         if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
-            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(
-                Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
-            );
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
         }
         let cred_id = CredentialId::jwt(ISSUER, "revoked-xet");
         hyprstream_rpc::auth::global_credential_revocation_store()

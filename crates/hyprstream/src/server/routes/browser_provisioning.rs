@@ -5,6 +5,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hyprstream_rpc::browser_provisioning::{BrowserCarrierProfile, BrowserProvisioningRequest};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +24,32 @@ pub async fn browser_provisioning(
     Path(service): Path<String>,
     Query(query): Query<BrowserProvisioningQuery>,
 ) -> Response {
+    serve_browser_provisioning(service, query, &state.signing_key, false).await
+}
+
+/// The public HTTPS listener belongs to OAuth, not the OAI HTTP
+/// listener. Its Web-PKI identity authenticates this projection; the target
+/// service's response/KEM keys still come only from accepted-current state.
+pub async fn oauth_browser_provisioning(
+    State(state): State<Arc<crate::services::oauth::state::OAuthState>>,
+    Path(service): Path<String>,
+    Query(query): Query<BrowserProvisioningQuery>,
+) -> Response {
+    if service != "registry" && service != "model" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(signing_key) = state.browser_provisioning_signer.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    serve_browser_provisioning(service, query, signing_key, true).await
+}
+
+async fn serve_browser_provisioning(
+    service: String,
+    query: BrowserProvisioningQuery,
+    signing_key: &hyprstream_rpc::crypto::SigningKey,
+    authenticated_https_origin: bool,
+) -> Response {
     let request = match BrowserProvisioningRequest::new(
         service,
         query.capability,
@@ -38,7 +65,11 @@ pub async fn browser_provisioning(
         }
     };
     let document = match hyprstream_discovery::production_browser_provisioning(request).await {
-        Ok(document) => match document.sign_projection(&state.signing_key) {
+        Ok(document) => match if authenticated_https_origin {
+            document.sign_projection_for_https_origin(signing_key)
+        } else {
+            document.sign_projection(signing_key)
+        } {
             Ok(document) => document,
             Err(error) => {
                 tracing::error!(error = %error, "browser projection signing failed closed");
@@ -111,6 +142,28 @@ mod tests {
         BrowserProvisioningDocument, BrowserProvisioningMaterial, BrowserRouteRole,
         BrowserTransportSecurity,
     };
+
+    #[test]
+    fn browser_carrier_query_matches_emitted_and_legacy_spelling() {
+        for profile in [
+            BrowserCarrierProfile::OwnedHybridWebTransport.as_str(),
+            "owned-hybrid-webtransport",
+        ] {
+            let uri: axum::http::Uri = format!(
+                "/.well-known/hyprstream/browser-provisioning/model?capability=hyprstream-rpc%2F1&scope=model&carrier_profile={profile}"
+            )
+            .parse()
+            .expect("valid URI");
+            let Query(query) = Query::<BrowserProvisioningQuery>::try_from_uri(&uri)
+                .expect("parse browser provisioning query");
+            assert_eq!(query.capability, "hyprstream-rpc/1");
+            assert_eq!(query.scope, "model");
+            assert_eq!(
+                query.carrier_profile,
+                BrowserCarrierProfile::OwnedHybridWebTransport
+            );
+        }
+    }
 
     #[test]
     fn invalid_query_context_is_rejected_before_resolver_use() {

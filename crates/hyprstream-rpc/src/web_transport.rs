@@ -27,6 +27,8 @@ use crate::zmtp_framing;
 /// Renamed from `WtClient` for consistency with `ZmqConnection`.
 pub struct WtConnection {
     wt: web_sys::WebTransport,
+    tls_url: String,
+    tls_hashes: Vec<[u8; 32]>,
 }
 
 // SAFETY: wasm32 is single-threaded.
@@ -36,10 +38,11 @@ unsafe impl Sync for WtConnection {}
 impl WtConnection {
     /// Connect to a hyprstream WebTransport endpoint.
     pub async fn connect(url: &str, cert_hash: Option<&str>) -> Result<Self> {
-        let cert_hashes = match cert_hash { Some(hash) => {
-                vec![ base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD, hash
-            ).map_err(|e| anyhow!("invalid cert hash: {}", e))?
+        let cert_hashes = match cert_hash {
+            Some(hash) => {
+                vec![
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash)
+                        .map_err(|e| anyhow!("invalid cert hash: {}", e))?
                         .try_into()
                         .map_err(|_| anyhow!("certificate hash must be 32 bytes"))?,
                 ]
@@ -58,11 +61,10 @@ impl WtConnection {
         if !cert_hashes.is_empty() {
             let mut js_hashes = Vec::with_capacity(cert_hashes.len());
             for hash_bytes in cert_hashes {
-
-            let js_hash = web_sys::WebTransportHash::new();
-            js_hash.set_algorithm("sha-256");
-            let js_bytes = js_sys::Uint8Array::from(&hash_bytes[..]);
-            js_hash.set_value(&js_bytes.buffer());
+                let js_hash = web_sys::WebTransportHash::new();
+                js_hash.set_algorithm("sha-256");
+                let js_bytes = js_sys::Uint8Array::from(&hash_bytes[..]);
+                js_hash.set_value(&js_bytes.buffer());
                 js_hashes.push(js_hash);
             }
 
@@ -72,23 +74,38 @@ impl WtConnection {
         let wt = web_sys::WebTransport::new_with_options(url, &opts)
             .map_err(|e| anyhow!("WebTransport::new failed: {:?}", e))?;
 
-        JsFuture::from(wt.ready()).await
+        JsFuture::from(wt.ready())
+            .await
             .map_err(|e| anyhow!("WebTransport connect failed: {:?}", e))?;
 
-        Ok(Self { wt })
+        Ok(Self {
+            wt,
+            tls_url: url.to_owned(),
+            tls_hashes: cert_hashes.to_vec(),
+        })
+    }
+
+    /// Effective TLS policy used by this connection. Browser provisioning
+    /// validates it before dialing; stream consumers may reuse it only after
+    /// matching the signed stream destination to this exact authority.
+    pub fn tls_policy(&self) -> (&str, &[[u8; 32]]) {
+        (&self.tls_url, &self.tls_hashes)
     }
 
     /// Send a REQ/REP request. Returns response payload bytes.
     pub async fn request(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        let bidi = JsFuture::from(self.wt.create_bidirectional_stream()).await
+        let bidi = JsFuture::from(self.wt.create_bidirectional_stream())
+            .await
             .map_err(|e| anyhow!("createBidirectionalStream: {:?}", e))?;
 
-        let writable: web_sys::WritableStream = js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
-            .map_err(|_| anyhow!("no writable"))?
-            .unchecked_into();
-        let readable: web_sys::ReadableStream = js_sys::Reflect::get(&bidi, &JsValue::from_str("readable"))
-            .map_err(|_| anyhow!("no readable"))?
-            .unchecked_into();
+        let writable: web_sys::WritableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
+                .map_err(|_| anyhow!("no writable"))?
+                .unchecked_into();
+        let readable: web_sys::ReadableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("readable"))
+                .map_err(|_| anyhow!("no readable"))?
+                .unchecked_into();
 
         // Build ZMTP command + multipart
         let cmd = zmtp_framing::encode_command("STREAM_TYPE", b"REQ");
@@ -98,12 +115,15 @@ impl WtConnection {
         combined.extend_from_slice(&msg);
 
         // Write
-        let writer = writable.get_writer()
+        let writer = writable
+            .get_writer()
             .map_err(|e| anyhow!("getWriter: {:?}", e))?;
         let js_data = js_sys::Uint8Array::from(&combined[..]);
-        JsFuture::from(writer.write_with_chunk(&js_data)).await
+        JsFuture::from(writer.write_with_chunk(&js_data))
+            .await
             .map_err(|e| anyhow!("write: {:?}", e))?;
-        JsFuture::from(writer.ready()).await
+        JsFuture::from(writer.ready())
+            .await
             .map_err(|e| anyhow!("writer.ready: {:?}", e))?;
         let _ = JsFuture::from(writer.close()).await;
         writer.release_lock();
@@ -113,11 +133,16 @@ impl WtConnection {
         let mut chunks: Vec<u8> = Vec::new();
 
         loop {
-            let result = JsFuture::from(reader.read()).await
+            let result = JsFuture::from(reader.read())
+                .await
                 .map_err(|e| anyhow!("read: {:?}", e))?;
             let done = js_sys::Reflect::get(&result, &JsValue::from_str("done"))
-                .unwrap_or(JsValue::TRUE).as_bool().unwrap_or(true);
-            if done { break; }
+                .unwrap_or(JsValue::TRUE)
+                .as_bool()
+                .unwrap_or(true);
+            if done {
+                break;
+            }
             let value = js_sys::Reflect::get(&result, &JsValue::from_str("value"))
                 .map_err(|_| anyhow!("no value"))?;
             let chunk = js_sys::Uint8Array::from(value);
@@ -137,15 +162,18 @@ impl WtConnection {
 
     /// Open a SUB stream (internal, returns WtSubscriber).
     async fn open_subscriber(&self, topic: &[u8]) -> Result<WtSubscriber> {
-        let bidi = JsFuture::from(self.wt.create_bidirectional_stream()).await
+        let bidi = JsFuture::from(self.wt.create_bidirectional_stream())
+            .await
             .map_err(|e| anyhow!("createBidirectionalStream: {:?}", e))?;
 
-        let writable: web_sys::WritableStream = js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
-            .map_err(|_| anyhow!("no writable"))?
-            .unchecked_into();
-        let readable: web_sys::ReadableStream = js_sys::Reflect::get(&bidi, &JsValue::from_str("readable"))
-            .map_err(|_| anyhow!("no readable"))?
-            .unchecked_into();
+        let writable: web_sys::WritableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
+                .map_err(|_| anyhow!("no writable"))?
+                .unchecked_into();
+        let readable: web_sys::ReadableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("readable"))
+                .map_err(|_| anyhow!("no readable"))?
+                .unchecked_into();
 
         // Send STREAM_TYPE=SUB + topic
         let cmd = zmtp_framing::encode_command("STREAM_TYPE", b"SUB");
@@ -154,10 +182,12 @@ impl WtConnection {
         combined.extend_from_slice(&cmd);
         combined.extend_from_slice(&msg);
 
-        let writer = writable.get_writer()
+        let writer = writable
+            .get_writer()
             .map_err(|e| anyhow!("getWriter: {:?}", e))?;
         let js_data = js_sys::Uint8Array::from(&combined[..]);
-        JsFuture::from(writer.write_with_chunk(&js_data)).await
+        JsFuture::from(writer.write_with_chunk(&js_data))
+            .await
             .map_err(|e| anyhow!("write: {:?}", e))?;
         let _ = JsFuture::from(writer.close()).await;
         writer.release_lock();
@@ -166,7 +196,10 @@ impl WtConnection {
         let (tx, rx) = futures::channel::mpsc::unbounded();
 
         // Spawn a reader task that feeds frames into the channel
-        let inner = WtSubStreamInner { reader, buffer: Vec::new(), };
+        let inner = WtSubStreamInner {
+            reader,
+            buffer: Vec::new(),
+        };
         wasm_bindgen_futures::spawn_local(async move {
             let mut inner = inner;
             loop {
@@ -190,12 +223,14 @@ impl WtConnection {
 
     /// Open a PUB stream (STREAM_TYPE=PUB) for control messages.
     async fn open_publisher(&self, topic: &[u8]) -> Result<WtPublisher> {
-        let bidi = JsFuture::from(self.wt.create_bidirectional_stream()).await
+        let bidi = JsFuture::from(self.wt.create_bidirectional_stream())
+            .await
             .map_err(|e| anyhow!("createBidirectionalStream: {:?}", e))?;
 
-        let writable: web_sys::WritableStream = js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
-            .map_err(|_| anyhow!("no writable"))?
-            .unchecked_into();
+        let writable: web_sys::WritableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
+                .map_err(|_| anyhow!("no writable"))?
+                .unchecked_into();
 
         // Send STREAM_TYPE=PUB + topic (keep writable open for subsequent messages)
         let cmd = zmtp_framing::encode_command("STREAM_TYPE", b"PUB");
@@ -204,10 +239,12 @@ impl WtConnection {
         combined.extend_from_slice(&cmd);
         combined.extend_from_slice(&msg);
 
-        let writer = writable.get_writer()
+        let writer = writable
+            .get_writer()
             .map_err(|e| anyhow!("getWriter: {:?}", e))?;
         let js_data = js_sys::Uint8Array::from(&combined[..]);
-        JsFuture::from(writer.write_with_chunk(&js_data)).await
+        JsFuture::from(writer.write_with_chunk(&js_data))
+            .await
             .map_err(|e| anyhow!("write: {:?}", e))?;
         // Do NOT close the writer — keep it open for sending ctrl messages
         writer.release_lock();
@@ -268,11 +305,16 @@ impl WtSubStreamInner {
                 }
             }
 
-            let result = JsFuture::from(self.reader.read()).await
+            let result = JsFuture::from(self.reader.read())
+                .await
                 .map_err(|e| anyhow!("read: {:?}", e))?;
             let done = js_sys::Reflect::get(&result, &JsValue::from_str("done"))
-                .unwrap_or(JsValue::TRUE).as_bool().unwrap_or(true);
-            if done { return Ok(None); }
+                .unwrap_or(JsValue::TRUE)
+                .as_bool()
+                .unwrap_or(true);
+            if done {
+                return Ok(None);
+            }
 
             let value = js_sys::Reflect::get(&result, &JsValue::from_str("value"))
                 .map_err(|_| anyhow!("no value"))?;
@@ -323,10 +365,13 @@ unsafe impl Sync for WtPublisher {}
 impl PublishSink for WtPublisher {
     async fn send_frames(&self, frames: &[&[u8]]) -> Result<()> {
         let encoded = zmtp_framing::encode_multipart(frames);
-        let writer = self.writable.get_writer()
+        let writer = self
+            .writable
+            .get_writer()
             .map_err(|e| anyhow!("getWriter: {:?}", e))?;
         let js_data = js_sys::Uint8Array::from(&encoded[..]);
-        JsFuture::from(writer.write_with_chunk(&js_data)).await
+        JsFuture::from(writer.write_with_chunk(&js_data))
+            .await
             .map_err(|e| anyhow!("write: {:?}", e))?;
         writer.release_lock();
         Ok(())

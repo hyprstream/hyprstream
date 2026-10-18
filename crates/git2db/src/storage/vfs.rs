@@ -6,16 +6,13 @@
 //! In our case, it creates standard git worktrees using libgit2 without
 //! any storage optimization layers underneath.
 
-use super::driver::{Driver, DriverOpts, WorktreeHandle, DriverFactory};
+use super::driver::{Driver, DriverFactory, DriverOpts, WorktreeHandle};
 use crate::errors::{Git2DBError, Git2DBResult};
 use async_trait::async_trait;
 use std::path::Path;
 use tracing::{info, warn};
 
-inventory::submit!(DriverFactory::new(
-    "vfs",
-    || Box::new(VfsDriver)
-));
+inventory::submit!(DriverFactory::new("vfs", || Box::new(VfsDriver)));
 
 /// VFS storage driver (plain git worktree, no optimization)
 ///
@@ -73,8 +70,11 @@ impl Driver for VfsDriver {
     }
 
     async fn get_worktrees(&self, base_repo: &Path) -> Git2DBResult<Vec<WorktreeHandle>> {
-        let worktrees_dir = base_repo.parent()
-            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+        let worktrees_dir = base_repo
+            .parent()
+            .ok_or_else(|| {
+                Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path")
+            })?
             .join("worktrees");
 
         let mut worktrees = Vec::new();
@@ -89,9 +89,11 @@ impl Driver for VfsDriver {
             let worktree_path = entry.path();
 
             // Skip non-directories and git's internal directories
-            if !worktree_path.is_dir() || worktree_path.file_name().is_some_and(|name| {
-                name.to_string_lossy().starts_with(".git")
-            }) {
+            if !worktree_path.is_dir()
+                || worktree_path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".git"))
+            {
                 continue;
             }
 
@@ -104,12 +106,21 @@ impl Driver for VfsDriver {
         Ok(worktrees)
     }
 
-    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>> {
-        let worktrees_dir = base_repo.parent()
-            .ok_or_else(|| Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path"))?
+    async fn get_worktree(
+        &self,
+        base_repo: &Path,
+        branch: &str,
+    ) -> Git2DBResult<Option<WorktreeHandle>> {
+        let worktrees_dir = base_repo
+            .parent()
+            .ok_or_else(|| {
+                Git2DBError::invalid_path(base_repo.to_path_buf(), "Invalid base repository path")
+            })?
             .join("worktrees");
         let worktree_path = hyprstream_containedfs::contained_join(&worktrees_dir, branch)
-            .map_err(|e| Git2DBError::invalid_path(worktrees_dir, format!("Path containment: {e}")))?;
+            .map_err(|e| {
+                Git2DBError::invalid_path(worktrees_dir, format!("Path containment: {e}"))
+            })?;
 
         if worktree_path.exists() && worktree_path.join(".git").exists() {
             Ok(Some(WorktreeHandle::new(worktree_path, "vfs".to_owned())))
@@ -162,9 +173,9 @@ pub(crate) fn apply_pathspec_filter(
 
     // Step 1: Remove working-tree files that don't match keep_paths
     {
-        let index = wt_repo.index().map_err(|e| {
-            Git2DBError::internal(format!("Failed to open index: {e}"))
-        })?;
+        let index = wt_repo
+            .index()
+            .map_err(|e| Git2DBError::internal(format!("Failed to open index: {e}")))?;
         for i in 0..index.len() {
             let entry = match index.get(i) {
                 Some(e) => e,
@@ -176,7 +187,10 @@ pub(crate) fn apply_pathspec_filter(
                 let full_path = worktree_path.join(&path);
                 if full_path.exists() {
                     if let Err(e) = std::fs::remove_file(&full_path) {
-                        warn!("Could not remove filtered path {}: {e}", full_path.display());
+                        warn!(
+                            "Could not remove filtered path {}: {e}",
+                            full_path.display()
+                        );
                     }
                 }
             }
@@ -188,9 +202,9 @@ pub(crate) fn apply_pathspec_filter(
     // Step 2: Set skip-worktree bits on excluded index entries
     mark_skip_worktree(&wt_repo, keep_paths)?;
 
-    let index = wt_repo.index().map_err(|e| {
-        Git2DBError::internal(format!("Failed to open index: {e}"))
-    })?;
+    let index = wt_repo
+        .index()
+        .map_err(|e| Git2DBError::internal(format!("Failed to open index: {e}")))?;
     let total = index.len();
     let skipped = (0..total)
         .filter(|i| {
@@ -218,9 +232,9 @@ pub(crate) fn mark_skip_worktree(
     repo: &git2::Repository,
     keep_paths: &[String],
 ) -> Git2DBResult<()> {
-    let mut index = repo.index().map_err(|e| {
-        Git2DBError::internal(format!("Failed to open index: {e}"))
-    })?;
+    let mut index = repo
+        .index()
+        .map_err(|e| Git2DBError::internal(format!("Failed to open index: {e}")))?;
 
     for i in 0..index.len() {
         let entry = match index.get(i) {
@@ -233,17 +247,14 @@ pub(crate) fn mark_skip_worktree(
             let mut modified = entry;
             modified.flags_extended |= GIT_INDEX_ENTRY_SKIP_WORKTREE;
             index.add(&modified).map_err(|e| {
-                Git2DBError::internal(format!(
-                    "Failed to set skip-worktree on '{}': {e}",
-                    path
-                ))
+                Git2DBError::internal(format!("Failed to set skip-worktree on '{}': {e}", path))
             })?;
         }
     }
 
-    index.write().map_err(|e| {
-        Git2DBError::internal(format!("Failed to write index: {e}"))
-    })?;
+    index
+        .write()
+        .map_err(|e| Git2DBError::internal(format!("Failed to write index: {e}")))?;
 
     Ok(())
 }
@@ -299,8 +310,9 @@ impl VfsDriver {
             }
 
             let result = (|| -> Git2DBResult<()> {
-                let repo = git2::Repository::open(&base_repo)
-                    .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
+                let repo = git2::Repository::open(&base_repo).map_err(|e| {
+                    Git2DBError::internal(format!("Failed to open repository: {e}"))
+                })?;
 
                 let object = repo.revparse_single(&ref_spec).map_err(|e| {
                     Git2DBError::internal(format!("Failed to resolve ref '{}': {}", ref_spec, e))
@@ -330,7 +342,9 @@ impl VfsDriver {
                         &worktree_path,
                         Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
                     )
-                    .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
+                    .map_err(|e| {
+                        Git2DBError::internal(format!("Failed to create worktree: {e}"))
+                    })?;
 
                     info!(
                         "Created git worktree at {} for branch '{}' (commit: {})",
@@ -340,7 +354,9 @@ impl VfsDriver {
                     );
                 } else {
                     repo.worktree(worktree_name, &worktree_path, None)
-                        .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
+                        .map_err(|e| {
+                            Git2DBError::internal(format!("Failed to create worktree: {e}"))
+                        })?;
 
                     let wt_repo = git2::Repository::open(&worktree_path)?;
                     wt_repo.set_head_detached(commit.id()).map_err(|e| {
@@ -349,7 +365,9 @@ impl VfsDriver {
 
                     wt_repo
                         .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                        .map_err(|e| Git2DBError::internal(format!("Failed to checkout HEAD: {e}")))?;
+                        .map_err(|e| {
+                            Git2DBError::internal(format!("Failed to checkout HEAD: {e}"))
+                        })?;
 
                     info!(
                         "Created git worktree at {} for ref '{}' (detached HEAD at {})",
@@ -402,7 +420,8 @@ mod tests {
     /// ref that doesn't resolve, or a worktree-add failure) was silently
     /// swallowed and `create_git_worktree` returned `Ok(())` regardless.
     #[tokio::test]
-    async fn create_git_worktree_propagates_inner_error() -> Result<(), Box<dyn std::error::Error>> {
+    async fn create_git_worktree_propagates_inner_error() -> Result<(), Box<dyn std::error::Error>>
+    {
         // A repo with no commits at all: `ref_spec` cannot resolve to
         // anything, so libgit2's `revparse_single` fails inside the
         // spawn_blocking closure — exactly the kind of failure that used to
