@@ -25,20 +25,12 @@ use hyprstream_rpc_std::registry_client::WorktreeClient;
 /// model families and can silently drop/duplicate shards).
 const STRICT_LOADER_ENV: &str = "HYPRSTREAM_STRICT_LOADER";
 
-/// Clef's native Qwen3.5 path rejects nonfinite admitted checkpoint payloads.
-/// Keep this architecture policy explicit: other loaders retain their behavior.
-fn native_finite_policy(model_path: &Path) -> Result<bool> {
-    let path = model_path.join("config.json");
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let config: serde_json::Value = serde_json::from_reader(file)?;
-    let model_type = config["model_type"]
-        .as_str()
-        .or_else(|| config["text_config"]["model_type"].as_str());
-    Ok(matches!(model_type, Some("qwen3_5" | "qwen3_5_text")))
+/// Follow the factory's authoritative config architecture detection, including
+/// accepted case variants and architectures-only metadata. Validating bytes on
+/// an existing route does not add MoE or vision inference support. Other
+/// architectures and default/unknown loading retain their existing policy.
+fn native_finite_policy(model_path: &Path) -> bool {
+    ModelConfig::detect_architecture(model_path) == ModelArchitecture::Qwen3_5
 }
 
 /// Scan raw little-endian values with constant auxiliary memory, before the
@@ -583,7 +575,7 @@ impl ModelFactory {
             request.layer_range.clone(),
             device,
             dtype,
-            native_finite_policy(model_path)?,
+            native_finite_policy(model_path),
         )
         .await?;
         maybe_dequantize_fp8_weights_at_load(&mut weights, fp8_dequant_load, device_pool);
@@ -1166,7 +1158,7 @@ impl ModelFactory {
             layer_range,
             device,
             dtype,
-            native_finite_policy(model_path)?,
+            native_finite_policy(model_path),
         )
         .await
     }
@@ -1304,7 +1296,7 @@ impl ModelFactory {
         // by processing shards sequentially and immediately transferring to GPU
         info!("Loading {} weight shards", shard_files.len());
 
-        let native_finite = native_finite_policy(model_path)?;
+        let native_finite = native_finite_policy(model_path);
         let mut all_weights = HashMap::new();
 
         for (idx, shard_file) in shard_files.iter().enumerate() {
@@ -1354,7 +1346,7 @@ impl ModelFactory {
         dtype: DType,
         speculative_decoding: bool,
     ) -> Result<HashMap<String, Tensor>> {
-        let native_finite = native_finite_policy(model_path)?;
+        let native_finite = native_finite_policy(model_path);
         let mut all_weights = HashMap::new();
 
         let single_file = model_path.join("model.safetensors");
@@ -2380,7 +2372,7 @@ impl ModelFactory {
             device,
             dtype,
             speculative_decoding,
-            native_finite_policy(model_path)?,
+            native_finite_policy(model_path),
         )
         .await?;
         let config = ModelConfig::load(model_path, &weights)?;
@@ -2636,7 +2628,7 @@ mod stage_subset_tests {
                     &Device::Cpu,
                     DType::Float,
                     false,
-                    native_finite_policy(dir.path()).unwrap(),
+                    native_finite_policy(dir.path()),
                 )
                 .await
                 .unwrap_err()
@@ -2695,7 +2687,7 @@ mod stage_subset_tests {
                 &Device::Cpu,
                 compute,
                 false,
-                native_finite_policy(dir.path()).unwrap(),
+                native_finite_policy(dir.path()),
             )
             .await
             .unwrap();
@@ -2729,7 +2721,7 @@ mod stage_subset_tests {
             &Device::Cpu,
             DType::Float,
             false,
-            native_finite_policy(dir.path()).unwrap(),
+            native_finite_policy(dir.path()),
         )
         .await
         .unwrap();
@@ -2754,7 +2746,7 @@ mod stage_subset_tests {
                 &Device::Cpu,
                 DType::Float,
                 false,
-                native_finite_policy(dir.path()).unwrap(),
+                native_finite_policy(dir.path()),
             )
             .await
             .unwrap_err()
@@ -2814,7 +2806,7 @@ mod stage_subset_tests {
             &mut weights,
             &Device::Cpu,
             DType::Float,
-            native_finite_policy(dir.path()).unwrap(),
+            native_finite_policy(dir.path()),
         )
         .await
         .unwrap();
@@ -2828,7 +2820,7 @@ mod stage_subset_tests {
             &mut rejected,
             &Device::Cpu,
             DType::Float,
-            native_finite_policy(dir.path()).unwrap()
+            native_finite_policy(dir.path())
         )
         .await
         .unwrap_err()
@@ -2851,7 +2843,7 @@ mod stage_subset_tests {
                 &Device::Cpu,
                 DType::Float,
                 enabled,
-                native_finite_policy(dir.path()).unwrap(),
+                native_finite_policy(dir.path()),
             )
             .await;
             if enabled {
@@ -2887,13 +2879,29 @@ mod stage_subset_tests {
             ),
             (
                 Some(serde_json::json!({"text_config":{"model_type":"qwen3_5_text"}})),
+                false,
+            ),
+            (Some(serde_json::json!({"model_type":"QWEN3_5"})), true),
+            (Some(serde_json::json!({"model_type":"qwen3_5_moe"})), true),
+            (
+                Some(serde_json::json!({"architectures":["Qwen3_5ForConditionalGeneration"]})),
                 true,
+            ),
+            (
+                Some(serde_json::json!({"architectures":["LlamaForCausalLM"]})),
+                false,
+            ),
+            (
+                Some(
+                    serde_json::json!({"model_type":"llama","architectures":["Qwen3_5ForConditionalGeneration"]}),
+                ),
+                false,
             ),
         ] {
             if let Some(config) = config {
                 finite_config(dir.path(), config);
             }
-            assert_eq!(native_finite_policy(dir.path()).unwrap(), strict);
+            assert_eq!(native_finite_policy(dir.path()), strict);
             let mut weights = HashMap::new();
             let result = ModelFactory::load_safetensors_file(
                 &path,
@@ -2901,7 +2909,7 @@ mod stage_subset_tests {
                 &Device::Cpu,
                 DType::Float,
                 false,
-                native_finite_policy(dir.path()).unwrap(),
+                native_finite_policy(dir.path()),
             )
             .await;
             if strict {
@@ -2971,7 +2979,7 @@ mod stage_subset_tests {
             &Device::Cpu,
             DType::Float,
             false,
-            native_finite_policy(dir.path()).unwrap(),
+            native_finite_policy(dir.path()),
         )
         .unwrap_err()
         .to_string();
@@ -3590,7 +3598,7 @@ size 4096\n",
             0..1,
             &Device::Cpu,
             DType::Float,
-            native_finite_policy(dir.path()).unwrap(),
+            native_finite_policy(dir.path()),
         )
         .await
         .unwrap_err();
