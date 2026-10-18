@@ -148,11 +148,17 @@ and geometry per quantized tensor, dtype identities, ignore-list agreement, and
 the E4M3FN interpretation (never FNUZ, never integer reinterpretation). Missing,
 extra, nonfinite, or geometry-mismatched tensors are typed load errors. Strict
 finite checks are normative at load: any NaN/Inf weight, scale, or norm
-parameter fails the load. Implementation evidence to date covers the head
-tensors and the 200 weight-scale tensors (1,425,408 scale values audited: zero
-0, negative 0, nonfinite 0; see the manifest receipts); whole-backbone weight
-finite-load verification is not yet evidenced, and no implementation PASS is
-claimed.
+parameter fails the load. The original finite-value audit covers only the 200
+weight-scale tensors (1,425,408 values: zero 0, negative 0, nonfinite 0; see
+`fp8-scale-audit-receipt.json` beside the artifact manifest). The manifest's head
+content hashes establish artifact identity, not finiteness. Separate archived
+development load-time evidence now binds the checked native constructor,
+executed source/artifact receipts, and all 122 tensors of the pinned head:
+[`native-head-finite-load-receipt.json`](../../crates/hyprstream-decision-head/fixtures/native-head-finite-load-receipt.json).
+Its reproducible public-receipt derivation performs no tensor execution. This is
+not a standalone head scan or current-main/new-candidate qualification;
+whole-backbone weight finite-load verification and an implementation PASS are
+not claimed here.
 
 ## 5. Compute profile (CPU v1)
 
@@ -266,4 +272,11 @@ hashing; none execute model code.
   compressed-tensors 0.19.0 @ 525a7a7b… pinned with zero-only-epsilon and FP32
   compute-profile semantics; choice sorted-ID output vs authored-IR remap and
   score index-vs-level adapter made explicit; fixture-absence claim scoped to
-  the pinned trees; finite-load evidence scoped to head+scales.
+  the pinned trees; scale finite-value audit attached.
+- rev 3 (2026-10-18, review correction): removed the unsupported head-finiteness
+  claim. The attached audit covers scales only; head content hashes do not
+  prove finiteness. The strict runtime finite-load requirement is unchanged.
+- rev 4 (2026-10-18, archived evidence binding): attached a separate reproducible
+  receipt for the previously executed f2a82911/e90affaa development native load
+  of all 122 pinned head tensors. The original scale audit remains scale-only;
+  no standalone head scan or current-main/new-candidate qualification is claimed.
