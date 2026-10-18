@@ -553,6 +553,9 @@ pub(crate) fn validate_answer_row(
 /// Index declared IDs once without changing their original order. Direct
 /// programmatic inputs must not collapse duplicate declarations into one map key.
 pub(crate) fn question_ids(set: &QuestionSet) -> Result<std::collections::HashSet<&str>, String> {
+    if set.questions.is_empty() {
+        return Err("a question set requires at least one question".to_owned());
+    }
     let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
     for question in &set.questions {
         if !ids.insert(question.id.as_str()) {

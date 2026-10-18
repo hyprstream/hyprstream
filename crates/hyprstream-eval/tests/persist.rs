@@ -295,3 +295,105 @@ async fn empty_runs_cannot_persist_without_schema_version_metadata() {
         .iter()
         .all(|value| value == Some(output.version.schema.as_str())));
 }
+
+fn replace_version_column(
+    output: &mut hyprstream_eval::RunOutput,
+    name: &str,
+    values: Vec<Option<&str>>,
+) {
+    use hyprstream_metrics_api::arrow::array::StringArray;
+    let batch = output.batch.as_ref().unwrap();
+    let index = batch.schema().index_of(name).unwrap();
+    let mut columns = batch.columns().to_vec();
+    columns[index] = Arc::new(StringArray::from(values));
+    output.batch = Some(RecordBatch::try_new(batch.schema(), columns).unwrap());
+}
+
+#[tokio::test]
+async fn detached_or_embedded_provenance_forgery_is_rejected_before_backend_write() {
+    let backend = Arc::new(MemoryBackend::default());
+    let sink = BatchSink::new(backend.clone());
+    sink.init().await.unwrap();
+    for mutation in [
+        "fingerprint",
+        "schema",
+        "model",
+        "calib",
+        "embedded-second-model",
+        "embedded-calib",
+        "coherent-empty-calib",
+        "labels",
+    ] {
+        let mut output = Harness
+            .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+            .await
+            .unwrap();
+        match mutation {
+            "fingerprint" => output.schema_fingerprint = Some("forged-schema".into()),
+            "schema" => output.version.schema = "other-schema-version".into(),
+            "model" => output.version.model = "other-model".into(),
+            "calib" => output.version.calib = Some("other-calibration".into()),
+            "embedded-second-model" => replace_version_column(
+                &mut output,
+                "model_version",
+                vec![Some("truth-1"), Some("other-model")],
+            ),
+            "embedded-calib" => replace_version_column(
+                &mut output,
+                "calib_version",
+                vec![None, Some("other-calibration")],
+            ),
+            "coherent-empty-calib" => {
+                output.version.calib = Some(String::new());
+                replace_version_column(&mut output, "calib_version", vec![Some(""), Some("")]);
+            }
+            "labels" => {
+                let batch = output.batch.as_ref().unwrap();
+                let mut fields = batch.schema().fields().to_vec();
+                let mut metadata = fields[0].metadata().clone();
+                metadata.insert("jev.labels".into(), "[\"false\",\"renamed\"]".into());
+                fields[0] = Arc::new(fields[0].as_ref().clone().with_metadata(metadata));
+                output.batch = Some(
+                    RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec())
+                        .unwrap(),
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                sink.persist_run(&output).await,
+                Err(hyprstream_eval::EvalError::InvalidInput(_))
+            ),
+            "mutation {mutation}"
+        );
+        assert!(
+            backend.tables.lock()["decision_batches"].1.is_empty(),
+            "mutation {mutation} reached the backend"
+        );
+    }
+    // Absent calibration remains distinct from a present, empty version.
+    let uncalibrated = Harness
+        .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+        .await
+        .unwrap();
+    let id = sink.persist_run(&uncalibrated).await.unwrap();
+    let (meta, _) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(meta.calib_version, None);
+
+    // A matching non-null calibration version remains valid on every payload row.
+    let mut valid = Harness
+        .run_set(&workflow_set(), &TruthSubject::new("truth-1"))
+        .await
+        .unwrap();
+    valid.version.calib = Some("calibration-1".into());
+    replace_version_column(
+        &mut valid,
+        "calib_version",
+        vec![Some("calibration-1"), Some("calibration-1")],
+    );
+    let id = sink.persist_run(&valid).await.unwrap();
+    let (meta, _) = sink.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(meta.calib_version.as_deref(), Some("calibration-1"));
+    assert_eq!(meta.model_id, "truth-1");
+}
