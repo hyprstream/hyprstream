@@ -871,7 +871,8 @@ pub fn encode_request(
         max_length,
         max_state_tokens,
     };
-    let encoded = ClefEncoder::encode(tokenizer, &request.record, limits)?;
+    let encoded =
+        ClefEncoder::encode(tokenizer, &request.record, limits).map_err(ClefDecisionError::from)?;
     cancel.check()?;
     let usage = accounting(&encoded, &limits);
     Ok((encoded, usage))
@@ -1593,6 +1594,36 @@ mod tests {
                 ],
             },
         }
+    }
+
+    #[test]
+    fn encoder_schema_overflow_preserves_typed_input_error() {
+        let tokenizer = tiny_wordlevel_tokenizer();
+        let body = serde_json::to_string(&json!({
+            "model": "tiny", "state": "small",
+            "questions": {"overflow": {"type": "noul", "instructions": "word ".repeat(4000)}}
+        }))
+        .unwrap();
+        let request = preflight_body(&body).expect("cheap preflight admits valid schema JSON");
+        let error = encode_request(&tokenizer, &request, None, 1024, &DecisionCancel::none())
+            .expect_err("tokenized schema must overflow");
+        assert!(
+            matches!(error.downcast_ref::<ClefDecisionError>(), Some(ClefDecisionError::Input(message)) if message.contains("schema requires"))
+        );
+        assert!(error.to_string().starts_with("clef-decision-input:"));
+        // The underlying real encoder produces a different error type; bare ?
+        // would lose the service/runtime classification and fail this test.
+        let raw = ClefEncoder::encode(
+            &tokenizer,
+            &request.record,
+            ClefEncodingLimits {
+                max_length: 1024,
+                max_state_tokens: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(raw, ClefError::Input(_)));
+        assert!(raw.to_string().starts_with("invalid Clef input:"));
     }
 
     fn t5_bundle_dir() -> tempfile::TempDir {
