@@ -30,7 +30,7 @@
 //!   surface so emitted columns compose unquoted in SQL (the ADBC path). Wire-level ids
 //!   stay opaque; the constraint applies at schema construction, not at authoring.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder};
@@ -396,9 +396,16 @@ impl DecisionSchema {
         rows: &[AnswerRow],
     ) -> Result<RecordBatch, BatchError> {
         let row_count = rows.len();
+        // Validate dense rows against a precomputed ID set. Scanning all questions for
+        // every answer key made this O(R * Q²) for R rows and Q questions.
+        let question_ids: HashSet<&str> = self
+            .questions
+            .iter()
+            .map(|question| question.id.as_str())
+            .collect();
         for (row_index, row) in rows.iter().enumerate() {
             for key in row.answers.keys() {
-                if !self.questions.iter().any(|question| &question.id == key) {
+                if !question_ids.contains(key.as_str()) {
                     return Err(BatchError::UnknownQuestion {
                         row: row_index,
                         question_id: key.clone(),

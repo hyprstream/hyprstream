@@ -399,6 +399,36 @@ fn batch_encoding_with_abstention_and_conformal_set() {
 }
 
 #[test]
+fn dense_batch_with_many_questions_and_rows() {
+    const QUESTION_COUNT: usize = 96;
+    const ROW_COUNT: usize = 48;
+
+    let document = format!(
+        "questions:\n{}",
+        (0..QUESTION_COUNT)
+            .map(|index| format!("  q_{index}:\n    type: noul\n"))
+            .collect::<String>()
+    );
+    let question_set = parse_yaml(&document).expect("dense question set parses");
+    let schema = DecisionSchema::from_question_set(&question_set).expect("schema builds");
+    let rows = (0..ROW_COUNT)
+        .map(|_| AnswerRow {
+            answers: question_set
+                .questions
+                .iter()
+                .map(|question| (question.id.clone(), QuestionAnswer::abstained()))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let batch = schema
+        .build_batch(&version(), &rows)
+        .expect("dense batch builds");
+    assert_eq!(batch.num_rows(), ROW_COUNT);
+    assert_eq!(batch.num_columns(), QUESTION_COUNT * 3 + 3);
+}
+
+#[test]
 fn batch_version_triple_allows_uncalibrated() {
     let schema = DecisionSchema::from_question_set(&fixture_set()).expect("schema builds");
     let rows = vec![row(vec![
