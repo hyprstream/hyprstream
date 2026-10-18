@@ -1103,3 +1103,54 @@ fn public_response_decode_rejects_duplicate_ids_and_indexes_wide_exact_keys() {
         matches!(parse_response_answers(&set, &missing), Err(hyprstream_eval::EvalError::InvalidAnswer {ref question_id, ref message}) if question_id == "q2048" && message == "response has no answer for a declared question")
     );
 }
+
+#[test]
+fn public_response_parser_rejects_empty_question_set_before_reading_answers() {
+    use hyprstream_eval::subject::parse_response_answers;
+    let mut set = author::parse_yaml("questions:\n  answer: {type: noul}\n").unwrap();
+    let body = serde_json::json!({"answers":{"answer":{"type":"noul","noul":0.5}}});
+    assert_eq!(
+        parse_response_answers(&set, &body).unwrap().answers.len(),
+        1
+    );
+    set.questions.clear();
+    for body in [serde_json::json!({"answers":{}}), serde_json::json!({})] {
+        assert!(matches!(parse_response_answers(&set, &body),
+            Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("at least one question")));
+    }
+}
+
+#[tokio::test]
+async fn direct_http_empty_question_set_is_rejected_without_connecting() {
+    for empty in [false, true] {
+        let body = r#"{"model":"resolved-v1","answers":{"answer":{"type":"noul","noul":0.5}}}"#;
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (address, server, mut accepted) = serve_budget_reply(reply.into_bytes(), false).await;
+        let mut set = author::parse_yaml("questions:\n  answer: {type: noul}\n").unwrap();
+        if empty {
+            set.questions.clear();
+        }
+        let subject = HttpSubject::new(format!("http://{address}"), "alias", "token");
+        let result = subject.decide(&set, &Entry::Str("state".into()), 0).await;
+        if empty {
+            assert!(
+                matches!(result, Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("at least one question"))
+            );
+            assert!(matches!(
+                accepted.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(subject.resolved_model_id(), "alias");
+            server.abort();
+        } else {
+            assert_eq!(result.unwrap().answers.len(), 1);
+            assert_eq!(subject.resolved_model_id(), "resolved-v1");
+            accepted.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+}

@@ -28,6 +28,8 @@ def admit_comparison_mode(reference_mode, *, backbone_only, head_only, include_h
         raise ValueError("backbone-only requires a full reference")
     if reference_mode == "full" and not backbone_only and not has_native_records:
         raise ValueError("full-port comparison requires --native-records for exact encoding and labels")
+    if reference_mode == "full" and not backbone_only and not include_hidden:
+        raise ValueError("full-port comparison requires --include-hidden for backbone and embedding tensors")
 
 def question_winners(key, reference, native, records):
     """Report first-index argmax in model and canonical label coordinates.
@@ -42,7 +44,14 @@ def question_winners(key, reference, native, records):
     record = records["records"][record_index]
     question = record["questions"][question_index]
     ids = question["option_ids"]
-    kind = question["question_type"]
+    encoded_kind = question["question_type"]
+    # Official records use exact integer tags; bool/float are not numeric tags.
+    if type(encoded_kind) is int and encoded_kind in (0, 1, 2):
+        kind = ("noul", "choice", "score")[encoded_kind]
+    elif type(encoded_kind) is str and encoded_kind in ("noul", "choice", "score"):
+        kind = encoded_kind
+    else:
+        raise ValueError(f"unknown question type: {encoded_kind}")
     if kind == "noul":
         canonical = ["false", "true"]
     elif kind == "choice":

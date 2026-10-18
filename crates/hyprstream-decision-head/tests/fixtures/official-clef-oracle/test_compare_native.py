@@ -33,6 +33,27 @@ class ComparatorAdmissionTests(unittest.TestCase):
         compare.admit_comparison_mode("full", backbone_only=False, head_only=False,
                                      include_hidden=True, has_native_records=True)
 
+    def test_full_port_requires_hidden_even_with_records_present(self):
+        with self.assertRaisesRegex(ValueError, "requires --include-hidden"):
+            compare.admit_comparison_mode("full", backbone_only=False, head_only=False,
+                                          include_hidden=False, has_native_records=True)
+        compare.admit_comparison_mode("full", backbone_only=False, head_only=False,
+                                     include_hidden=True, has_native_records=True)
+
+    def test_cli_full_profile_without_hidden_fails_before_tensor_or_record_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "provenance.json").write_text(json.dumps({"mode": "full"}))
+            result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                "--reference", str(root), "--native-tensors", str(root / "unused"),
+                "--native-records", str(root / "missing-records.json"),
+                "--tolerance-file", str(HERE / "full-port-tolerances-v1.json"),
+                "--report", str(root / "report.json")], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires --include-hidden", result.stderr)
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
+            self.assertFalse((root / "report.json").exists())
+
     def test_head_and_backbone_are_explicit_separate_scopes(self):
         compare.admit_comparison_mode("head", backbone_only=False, head_only=True,
                                      include_hidden=False, has_native_records=False)
@@ -111,6 +132,37 @@ class ComparatorAdmissionTests(unittest.TestCase):
 
 
 class WinnerReportingTests(unittest.TestCase):
+    def test_actual_committed_numeric_records_cover_all_three_types(self):
+        records = json.loads((HERE / "records.json").read_text())
+        seen = set()
+        for ri, record in enumerate(records["records"]):
+            for qi, question in enumerate(record["questions"]):
+                tag = question["question_type"]
+                self.assertIs(type(tag), int)
+                expected_kind = ("noul", "choice", "score")[tag]
+                ids = question["option_ids"]
+                values = [float(i) for i in range(len(ids))]
+                result = compare.question_winners(f"r{ri}.q{qi}.logits", values, values, records)
+                self.assertEqual(result["question_type"], expected_kind)
+                self.assertEqual(result["native_winner"]["option_id"], ids[-1])
+                self.assertFalse(result["disagreement"])
+                seen.add(tag)
+        self.assertEqual(seen, {0, 1, 2})
+
+    def test_numeric_tags_match_string_kind_and_reject_bool_float_or_unknown(self):
+        records = fixture()
+        for qi, tag in enumerate((0, 1, 2)):
+            values = [float(i) for i in range(len(records["records"][0]["questions"][qi]["option_ids"]))]
+            expected = compare.question_winners(f"r0.q{qi}.probabilities", values, values, records)
+            numeric = copy.deepcopy(records)
+            numeric["records"][0]["questions"][qi]["question_type"] = tag
+            self.assertEqual(compare.question_winners(f"r0.q{qi}.probabilities", values, values, numeric), expected)
+        for invalid in (True, False, 0.0, 1.0, -1, 3, "0", None):
+            bad = fixture()
+            bad["records"][0]["questions"][0]["question_type"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "unknown question type"):
+                compare.question_winners("r0.q0.logits", [1, 0], [1, 0], bad)
+
     def test_near_tie_flip_is_reported_despite_numeric_tolerance(self):
         baseline, candidate = [0.50001, 0.49999], [0.49999, 0.50001]
         self.assertTrue(all(abs(x - y) <= 1e-4 + 1e-4 * abs(x) for x, y in zip(baseline, candidate)))
