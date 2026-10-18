@@ -918,3 +918,100 @@ async fn http_budget_accepts_valid_response_and_redacts_provider_error_body() {
         .unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn http_subject_validates_choice_identity_before_accepting_response_keys() {
+    // This map has three keys and sums to one. Repeating the zero-mass
+    // "angry" option would make count + declared-label lookups accept an
+    // undeclared "outside" key unless programmatic input is validated first.
+    let body = r#"{"model":"resolved-v1","answers":{"pick":{"type":"choice","probabilities":{"angry":0.0,"calm":1.0,"outside":0.0}}}}"#;
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    for duplicate in [false, true] {
+        let (address, server, mut accepted) =
+            serve_budget_reply(reply.as_bytes().to_vec(), false).await;
+        let names = ["angry", if duplicate { "angry" } else { "outside" }, "calm"];
+        let question = hyprstream_decision::QuestionSpec {
+            id: "pick".to_owned(),
+            kind: hyprstream_decision::QuestionKind::Choice,
+            instructions: None,
+            body: hyprstream_decision::QuestionBody::Choice {
+                options: names
+                    .into_iter()
+                    .map(|name| hyprstream_decision::ChoiceOption {
+                        name: name.to_owned(),
+                        rubric: None,
+                    })
+                    .collect(),
+            },
+        };
+        let set = hyprstream_decision::QuestionSet {
+            state: None,
+            questions: vec![question],
+        };
+        let subject = HttpSubject::new(format!("http://{address}"), "alias", "token");
+        let result = subject
+            .decide(&set, &Entry::Str("valid state".into()), 0)
+            .await;
+        if duplicate {
+            assert!(
+                matches!(result, Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("repeats option"))
+            );
+            assert!(matches!(
+                accepted.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            server.abort();
+        } else {
+            let row = result.unwrap();
+            assert_eq!(
+                row.answers["pick"].value.as_ref().unwrap().probabilities(),
+                vec![0.0, 0.0, 1.0]
+            );
+            accepted.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+}
+
+#[test]
+fn public_response_parser_rejects_duplicate_choice_identity() {
+    let body = serde_json::json!({"answers": {"pick": {"type": "choice", "probabilities": {"angry": 0.0, "calm": 1.0, "outside": 0.0}}}});
+    for duplicate in [false, true] {
+        let names = ["angry", if duplicate { "angry" } else { "outside" }, "calm"];
+        let set = hyprstream_decision::QuestionSet {
+            state: None,
+            questions: vec![hyprstream_decision::QuestionSpec {
+                id: "pick".to_owned(),
+                kind: hyprstream_decision::QuestionKind::Choice,
+                instructions: None,
+                body: hyprstream_decision::QuestionBody::Choice {
+                    options: names
+                        .into_iter()
+                        .map(|name| hyprstream_decision::ChoiceOption {
+                            name: name.to_owned(),
+                            rubric: None,
+                        })
+                        .collect(),
+                },
+            }],
+        };
+        // Call the public API directly: no Subject/Harness preflight can
+        // protect this boundary from the equal-count zero-mass substitution.
+        let result = hyprstream_eval::subject::parse_response_answers(&set, &body);
+        if duplicate {
+            assert!(
+                matches!(result, Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("repeats option"))
+            );
+        } else {
+            let row = result.unwrap();
+            assert_eq!(
+                row.answers["pick"].value.as_ref().unwrap().probabilities(),
+                vec![0.0, 0.0, 1.0]
+            );
+        }
+    }
+}
