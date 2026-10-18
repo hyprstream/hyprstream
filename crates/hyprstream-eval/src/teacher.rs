@@ -149,6 +149,11 @@ impl TeacherEnsemble {
             }
             crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
         }
+        // Check every teacher before querying the first one: a stricter
+        // later transport must not reject input after earlier billed calls.
+        for teacher in &self.teachers {
+            teacher.subject.preflight(set, state)?;
+        }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
             // Bind provenance to THIS response: reading resolved_model_id

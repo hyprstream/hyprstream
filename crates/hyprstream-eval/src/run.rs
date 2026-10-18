@@ -219,6 +219,11 @@ impl Harness {
                 }
             }
         }
+        // Subject-specific checks must also complete for ALL requests before
+        // any decide call (e.g. the legacy HTTP endpoint rejects null state).
+        for row in &set.rows {
+            subject.preflight(&question_set, &row.state)?;
+        }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
         // Pin the resolved model id from the FIRST response: an HTTP subject
@@ -337,6 +342,13 @@ impl Harness {
                     )));
                 }
             }
+        }
+        for item in items {
+            let set = QuestionSet {
+                state: Some(item.state.clone()),
+                questions: vec![item.question.clone()],
+            };
+            subject.preflight(&set, &item.state)?;
         }
         let mut observations = Vec::with_capacity(items.len());
         let mut pinned_model: Option<String> = None;
