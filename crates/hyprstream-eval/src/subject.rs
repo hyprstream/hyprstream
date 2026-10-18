@@ -232,10 +232,10 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     }
 }
 
-fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
+pub(crate) fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
-    // The caller may have selected the winner before narrowing wire f64 values.
+    // The caller may have selected the winner before narrowing f64 values.
     if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
         let max = probabilities.iter().copied().fold(0.0f32, f32::max);
         probabilities[winner] = max.next_up().min(1.0);
