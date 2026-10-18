@@ -24,6 +24,7 @@ parking_lot.workspace = true
 regex.workspace = true
 safetensors.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
@@ -35,6 +36,10 @@ tracing.workspace = true
 git2db = { path = "../git2db", features = ["overlayfs"] }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
+# R4 serving: pure Clef admission validation + head/encoder contract (Apache
+# leaf crates; no AGPL dependency beneath them).
+hyprstream-decision = { path = "../hyprstream-decision" }
+hyprstream-decision-head = { path = "../hyprstream-decision-head" }
 
 # Torch backend. CPU/CUDA/ROCm is selected by the LIBTORCH environment (tch-rs),
 # not by cargo features; see the root Cargo.toml comments.

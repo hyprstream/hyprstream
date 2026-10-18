@@ -2085,6 +2085,21 @@ impl ModelService {
         }
     }
 
+    /// Re-wrap decision-serving failures as [`hyprstream_rpc::TypedRpcError`]
+    /// so the generated scoped dispatcher re-emits the typed wire code
+    /// instead of collapsing to INTERNAL (S9). Generic errors pass through.
+    fn typed_decision_error(e: impl Into<anyhow::Error>) -> anyhow::Error {
+        let e = e.into();
+        let message = e.to_string();
+        match crate::services::decision::error_code_for(&message) {
+            Some(code) => anyhow::Error::new(hyprstream_rpc::TypedRpcError {
+                code: code.to_owned(),
+                message,
+            }),
+            None => e,
+        }
+    }
+
     /// Mint-side scope for one forwarded struct/Void Inference operation:
     /// the exact dispatch coordinate for `variant` plus its scope operation.
     fn inference_scope(
@@ -2788,6 +2803,47 @@ impl InferHandler for ModelService {
             .get_inference_client(model_ref, ctx, Self::inference_scope("embed", "infer"))
             .await?;
         client.embed(data).await
+    }
+
+    /// Typed Clef decision gateway (R4). The SHARED cheap preflight runs HERE,
+    /// BEFORE `get_inference_client` — which loads the backbone — so invalid
+    /// raw JSON/media/duplicate-ID/cardinality/aggregate-budget/oversized
+    /// bodies can never allocate a model. The worker revalidates after its
+    /// own authorization PEP. No unauthenticated admission is created: this
+    /// handler runs after the generated Model dispatch PEP (infer scope).
+    async fn handle_decide(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &hyprstream_rpc_std::inference_client::DecisionRequest,
+    ) -> Result<hyprstream_rpc_std::inference_client::DecisionResponse> {
+        // Cheap shared preflight FIRST (byte bound, ordered parse, media/
+        // duplicate/numeric/cardinality/aggregate/deadline admission), then
+        // the raw-model match and the pin gate — ALL before
+        // get_inference_client, which loads the backbone. The worker
+        // revalidates everything after its own PEP.
+        let parsed = crate::services::decision::preflight_parsed(data)
+            .map_err(Self::typed_decision_error)?;
+        crate::services::decision::ensure_model_matches(&parsed.model, Some(model_ref))
+            .map_err(Self::typed_decision_error)?;
+        let resolved = self.resolve_model_ref(model_ref).await?;
+        let is_commit = matches!(resolved.git_ref, crate::storage::GitRef::Commit(_));
+        let staging_admits = self
+            .config
+            .staging_model_pin
+            .as_ref()
+            .is_some_and(|pin| pin.admits(model_ref));
+        crate::services::decision::ensure_pinned_for_decision(is_commit, staging_admits, model_ref)
+            .map_err(Self::typed_decision_error)?;
+
+        let client = self
+            .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "infer"))
+            .await?;
+        client
+            .decide(data)
+            .await
+            .map_err(Self::typed_decision_error)
     }
 
     async fn handle_status(
@@ -3563,9 +3619,12 @@ impl crate::services::RequestService for ModelService {
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        // Typed decision-serving failures carry their pinned code; every
+        // other error keeps the generic INTERNAL code.
+        let code = crate::services::decision::error_code_for(error).unwrap_or("INTERNAL");
         let variant = ModelResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_owned(),
+            code: code.to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
@@ -3734,6 +3793,225 @@ mod tests {
         }
         assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
         Ok(())
+    }
+
+    // ── R4 decide ingress: cheap gates run BEFORE any backbone load ────────
+
+    fn wire_decide_request(
+        clef_json: &str,
+    ) -> hyprstream_rpc_std::inference_client::DecisionRequest {
+        hyprstream_rpc_std::inference_client::DecisionRequest {
+            clef_json: clef_json.to_owned(),
+            max_state_tokens: None,
+            timeout_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_ingress_preflight_rejects_before_load() {
+        let service = selector_model_service().await;
+        let ctx = boundary_caller_ctx(3600);
+
+        // Invalid body (media field): the shared preflight error surfaces,
+        // never a model-load error — no load may be attempted.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clef-decision-input"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+
+        // Model mismatch vs the route ref: rejected before load.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"some-other-model","state":null,"questions":{"q":{"type":"noul"}}}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decision-model-mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_ingress_rejects_mutable_refs_before_load() {
+        let service = selector_model_service().await;
+        let ctx = boundary_caller_ctx(3600);
+        // Valid body, branch ref: pin gate rejects BEFORE load_model.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}}}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decision-not-pinned"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+
+        // A commit ref passes the pin gate and reaches the load, which then
+        // fails on the missing worktree — proving gate ORDER, not absence.
+        let commit_ref = format!("nonexistent-model:{}", "0".repeat(40));
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                &commit_ref,
+                &wire_decide_request(&format!(
+                    r#"{{"model":"{commit_ref}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#
+                )),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("decision-not-pinned"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn real_model_scoped_dispatch_carries_typed_decision_code() {
+        // REAL generated scoped dispatch (decode -> authorize -> handler ->
+        // error serialization) against a REAL permissive PolicyService: an
+        // invalid decide body must surface ErrorInfo code DECISION_INPUT on
+        // the wire, not INTERNAL.
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+        let policy_key = SigningKey::from_bytes(&[0x77; 32]);
+        let policy_manager = Arc::new(crate::auth::PolicyManager::permissive().await.unwrap());
+        let (policy_transport, policy_endpoint) =
+            restart_acceptance_inproc_endpoint("policy", "decide-typed");
+        let policy_service = crate::services::PolicyService::new(
+            policy_manager,
+            Arc::new(policy_key.clone()),
+            crate::config::TokenConfig::default(),
+            Arc::new(RwLock::new(
+                git2db::Git2DB::open(tempfile::tempdir().unwrap().path())
+                    .await
+                    .unwrap(),
+            )),
+            policy_transport.clone(),
+        );
+        use hyprstream_service::ServiceManager as _;
+        let manager = hyprstream_service::InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await.unwrap();
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap(
+            &policy_endpoint,
+            policy_key.clone(),
+            policy_key.verifying_key(),
+            None,
+        )
+        .unwrap();
+
+        let model_key = SigningKey::from_bytes(&[0x41; 32]);
+        let infrastructure = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc("decide-typed-registry"),
+            Arc::new(BoundaryDialState::default()),
+        ));
+        let service = ModelService::new(
+            ModelServiceConfig::default(),
+            model_key,
+            policy_client,
+            RegistryClient::new(infrastructure),
+            TransportConfig::inproc("decide-typed-model"),
+            TransportConfig::inproc("decide-typed-policy"),
+        )
+        .await
+        .unwrap();
+
+        let ctx = boundary_caller_ctx(3600);
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request =
+                message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+            request.set_id(11);
+            let mut infer = request.init_infer();
+            infer.set_model_ref("nonexistent-model:main");
+            let mut decide = infer.init_decide();
+            decide.set_clef_json(
+                r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+            );
+        })
+        .unwrap();
+        let body =
+            crate::services::generated::model_client::decode_model_request_body(&bytes).unwrap();
+        // The REAL generated scoped dispatch: authorize (real policy admit)
+        // then the handler's typed preflight failure, serialized by the
+        // generated error wrapper (not the direct builder).
+        let (response, _cont) = dispatch_model(&service, &ctx, &body)
+            .await
+            .expect("scoped dispatch returns a typed error RESPONSE, not Err");
+        let parsed =
+            hyprstream_rpc_std::model_client::ModelClient::parse_response(&response).unwrap();
+        match parsed {
+            ModelResponseVariant::InferResult(infer) => match infer {
+                hyprstream_rpc_std::model_client::InferResponse::Error(info) => {
+                    assert_eq!(info.code, "DECISION_INPUT", "message: {}", info.message);
+                    assert!(
+                        info.message.contains("clef-decision-input"),
+                        "{}",
+                        info.message
+                    );
+                }
+                other => panic!("expected typed error, got {other:?}"),
+            },
+            ModelResponseVariant::Error(info) => {
+                // authorize failures land here; a typed dispatch failure must not
+                panic!(
+                    "error escaped to outer variant with code {}: {}",
+                    info.code, info.message
+                );
+            }
+            other => panic!("expected infer error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_gateway_typed_error_codes_reach_model_wire() {
+        let service = selector_model_service().await;
+        // The Model gateway's own error payload carries decision typed codes
+        // (scoped dispatcher failures would otherwise land in INTERNAL).
+        for (message, code) in [
+            ("decision-not-pinned: x", "DECISION_NOT_PINNED"),
+            ("decision-model-mismatch: y", "DECISION_MODEL_MISMATCH"),
+            ("clef-decision-input: z", "DECISION_INPUT"),
+        ] {
+            let payload = service.build_error_payload(9, message);
+            let parsed = hyprstream_rpc_std::model_client::ModelClient::parse_response(&payload)
+                .expect("parse model error payload");
+            match parsed {
+                ModelResponseVariant::Error(info) => {
+                    assert_eq!(info.code, code, "message {message}");
+                    assert_eq!(info.message, message);
+                }
+                other => panic!("expected Error variant, got {other:?}"),
+            }
+        }
+        let payload = service.build_error_payload(9, "unrelated");
+        let parsed =
+            hyprstream_rpc_std::model_client::ModelClient::parse_response(&payload).expect("parse");
+        match parsed {
+            ModelResponseVariant::Error(info) => assert_eq!(info.code, "INTERNAL"),
+            other => panic!("expected Error variant, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::resolve::ResolvedSchema;
+use crate::resolve::{owned_struct_name, ResolvedSchema};
 use crate::schema::types::collect_list_struct_types;
 use crate::schema::types::*;
 use crate::util::*;
@@ -32,6 +32,110 @@ fn resolve_capnp_mod(
     }
 }
 
+/// Resolve the actual generated module path, including inline group parents.
+fn capnp_data_path(type_name: &str, capnp_mod: &TokenStream) -> TokenStream {
+    type_name
+        .split('.')
+        .fold(capnp_mod.clone(), |path, segment| {
+            let module = format_ident!("{}", to_capnp_module_name(segment));
+            quote! { #path::#module }
+        })
+}
+
+fn generate_named_group_data(
+    s: &StructDef,
+    resolved: &ResolvedSchema,
+    capnp_mod: &TokenStream,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let mut tokens = TokenStream::new();
+    for field in s.non_union_fields() {
+        let Some(group) = &field.named_group else {
+            continue;
+        };
+        let name = &group.name;
+        if group.is_pure_union() {
+            tokens.extend(generate_union_enum(name, group, resolved));
+            tokens.extend(generate_union_to_capnp_impl(
+                name,
+                group,
+                resolved,
+                capnp_mod,
+                service_name,
+                types_crate,
+            ));
+            tokens.extend(generate_union_from_capnp_impl(
+                name,
+                group,
+                resolved,
+                capnp_mod,
+                service_name,
+                types_crate,
+            ));
+        } else {
+            tokens.extend(generate_data_struct(name, group, resolved));
+            tokens.extend(generate_to_capnp_impl(
+                name,
+                group,
+                resolved,
+                capnp_mod,
+                service_name,
+                types_crate,
+            ));
+            tokens.extend(generate_from_capnp_impl(
+                name,
+                group,
+                resolved,
+                capnp_mod,
+                service_name,
+                types_crate,
+            ));
+        }
+        tokens.extend(generate_named_group_data(
+            group,
+            resolved,
+            capnp_mod,
+            service_name,
+            types_crate,
+        ));
+    }
+    tokens
+}
+
+// Field-level Option wrappers are unwrapped by field codegen, but raw union
+// and list payloads need their own wire enum. Also discover references that
+// live inside named groups rather than the legacy flat field list.
+fn collect_owned_payload_refs(s: &StructDef, refs: &mut std::collections::BTreeSet<String>) {
+    fn add(raw: &str, refs: &mut std::collections::BTreeSet<String>) {
+        let inner = raw.strip_prefix("List(").and_then(|s| s.strip_suffix(')'));
+        if let Some(inner) = inner {
+            add(inner, refs);
+        } else {
+            refs.insert(raw.to_owned());
+        }
+    }
+    for field in &s.fields {
+        if let Some(group) = &field.named_group {
+            collect_owned_payload_refs(group, refs);
+        }
+        if field.type_name.starts_with("List(") {
+            add(&field.type_name, refs);
+        }
+    }
+    for arm in &s.union_arms {
+        match &arm.payload {
+            ArmPayload::Type(raw) => add(raw, refs),
+            ArmPayload::Group(leaves) => {
+                for leaf in leaves {
+                    add(&leaf.type_name, refs);
+                }
+            }
+            ArmPayload::Void => {}
+        }
+    }
+}
+
 /// Generate Rust data structs with ToCapnp/FromCapnp impls, and enum types.
 pub fn generate_data_structs(
     resolved: &ResolvedSchema,
@@ -48,12 +152,25 @@ pub fn generate_data_structs(
     // Known service names that have their own `_client` module.
     // Types imported from one of these are emitted as `pub type Foo = super::{origin}_client::Foo;`
     // instead of full struct + trait impls, avoiding duplicate definitions.
-    const SERVICE_MODULES: &[&str] = &["inference", "model", "registry", "policy", "worker", "mcp"];
+    // "decision" is a data-only schema (no request/response unions) whose
+    // owned types are canonically generated once in `decision_client`; every
+    // service schema that nests Decision.DecisionBatch (inference, model)
+    // aliases that single type instead of regenerating structurally identical
+    // copies that would need hand-written conversions between modules.
+    const SERVICE_MODULES: &[&str] = &[
+        "inference",
+        "model",
+        "registry",
+        "policy",
+        "worker",
+        "mcp",
+        "decision",
+    ];
 
     // For data-only schemas (no request/response unions), generate ALL structs.
     // For service schemas, only generate types referenced by variants.
     let is_data_only = resolved.raw.request_variants.is_empty();
-    let list_struct_types = if is_data_only {
+    let mut list_struct_types: Vec<String> = if is_data_only {
         resolved
             .raw
             .structs
@@ -63,6 +180,15 @@ pub fn generate_data_structs(
     } else {
         collect_list_struct_types(resolved.raw)
     };
+    let mut payload_refs = std::collections::BTreeSet::new();
+    for s in &resolved.raw.structs {
+        collect_owned_payload_refs(s, &mut payload_refs);
+    }
+    for name in &payload_refs {
+        if resolved.find_struct(name).is_some() && !list_struct_types.contains(name) {
+            list_struct_types.push(name.clone());
+        }
+    }
     for type_name in &list_struct_types {
         // Synthetic capnp group nodes are named `Parent.armName` (e.g.
         // `Ordering.unordered`). They are not standalone Rust types — their leaf
@@ -73,7 +199,7 @@ pub fn generate_data_structs(
         }
         if let Some(s) = resolved.find_struct(type_name) {
             // Skip Option* wrapper structs — they become Option<T> fields, not standalone types
-            if s.option_inner_type().is_some() {
+            if s.option_inner_type().is_some() && !payload_refs.contains(type_name) {
                 continue;
             }
 
@@ -81,8 +207,11 @@ pub fn generate_data_structs(
             // instead of a full struct definition. This avoids duplicate types and the need for
             // hand-written `From` impls between structurally identical generated types.
             if let Some(origin) = s.origin_file.as_deref() {
-                if origin != service_name && SERVICE_MODULES.contains(&origin) {
-                    let data_name = format_ident!("{}", type_name);
+                if origin != service_name
+                    && SERVICE_MODULES.contains(&origin)
+                    && s.option_inner_type().is_none()
+                {
+                    let data_name = format_ident!("{}", owned_struct_name(type_name));
                     let origin_mod = format_ident!("{}_client", origin);
                     tokens.extend(quote! {
                         pub type #data_name = super::#origin_mod::#data_name;
@@ -96,11 +225,11 @@ pub fn generate_data_structs(
                     ("streaming", "hyprstream_rpc::stream_info"),
                     ("common", "hyprstream_rpc::common_types"),
                 ];
-                if origin != service_name {
+                if origin != service_name && s.option_inner_type().is_none() {
                     if let Some((_, rpc_mod)) =
                         RPC_CRATE_MODULES.iter().find(|(name, _)| *name == origin)
                     {
-                        let data_name = format_ident!("{}", type_name);
+                        let data_name = format_ident!("{}", owned_struct_name(type_name));
                         #[allow(clippy::expect_used)] // compile-time constant path
                         let rpc_path: syn::Path =
                             syn::parse_str(rpc_mod).expect("invalid RPC_CRATE_MODULES path");
@@ -113,11 +242,18 @@ pub fn generate_data_structs(
             }
 
             let capnp_mod = resolve_capnp_mod(s.origin_file.as_deref(), service_name, types_crate);
+            tokens.extend(generate_named_group_data(
+                s,
+                resolved,
+                &capnp_mod,
+                service_name,
+                types_crate,
+            ));
 
             // Pure tagged-union structs (a capnp `union { ... }` with no sibling
             // non-union fields) become native Rust enums — one variant per arm —
             // instead of an (empty) struct. Option<T> wrappers are handled above.
-            if s.is_pure_union() && s.option_inner_type().is_none() {
+            if s.is_pure_union() {
                 tokens.extend(generate_union_enum(type_name, s, resolved));
                 tokens.extend(generate_union_to_capnp_impl(
                     type_name,
@@ -189,7 +325,7 @@ fn generate_enum_type(e: &EnumDef, resolved: &ResolvedSchema) -> TokenStream {
 }
 
 fn generate_data_struct(type_name: &str, s: &StructDef, resolved: &ResolvedSchema) -> TokenStream {
-    let data_name = format_ident!("{}", type_name);
+    let data_name = format_ident!("{}", owned_struct_name(type_name));
     let doc = format!("Generated from Cap'n Proto struct {type_name}");
 
     let fields: Vec<TokenStream> = s
@@ -201,7 +337,10 @@ fn generate_data_struct(type_name: &str, s: &StructDef, resolved: &ResolvedSchem
                 .and_then(|s| s.option_inner_type())
                 .map(|inner_name| rust_type_tokens(&resolved.resolve_type(inner_name).rust_owned));
 
-            let inner_type = if let Some(dt) = field.domain_type.as_deref() {
+            let inner_type = if let Some(group) = &field.named_group {
+                let name = format_ident!("{}", owned_struct_name(&group.name));
+                quote! { #name }
+            } else if let Some(dt) = field.domain_type.as_deref() {
                 // Field-level `$domainType`: use the newtype (wire type unchanged).
                 resolve_field_domain_type(dt)
             } else if field.type_name == "Data" && field.fixed_size.is_some() {
@@ -246,7 +385,7 @@ fn generate_data_struct(type_name: &str, s: &StructDef, resolved: &ResolvedSchem
     // arms round-trip. Pure unions are handled by `generate_union_enum`; structs
     // with no union skip this entirely.
     let (content_field, content_enum) = if s.has_union && !s.is_pure_union() {
-        let content_enum_name = format_ident!("{}Content", type_name);
+        let content_enum_name = format_ident!("{}Content", owned_struct_name(type_name));
         let enum_def = generate_mixed_union_enum(type_name, s, resolved);
         (quote! { pub content: #content_enum_name, }, enum_def)
     } else {
@@ -273,7 +412,7 @@ fn generate_mixed_union_enum(
     s: &StructDef,
     resolved: &ResolvedSchema,
 ) -> TokenStream {
-    let enum_name = format_ident!("{}Content", type_name);
+    let enum_name = format_ident!("{}Content", owned_struct_name(type_name));
     let doc = format!("Anonymous union of Cap'n Proto struct {type_name}");
 
     let default_arm = s.union_arms.iter().find(|a| a.discriminant_value == 0);
@@ -365,7 +504,7 @@ fn arm_payload_type_tokens(type_name: &str, resolved: &ResolvedSchema) -> TokenS
 /// Each arm maps to a variant: Void → unit, single-type → tuple, group → struct.
 /// The discriminant-0 arm carries `#[default]`.
 fn generate_union_enum(type_name: &str, s: &StructDef, resolved: &ResolvedSchema) -> TokenStream {
-    let enum_name = format_ident!("{}", type_name);
+    let enum_name = format_ident!("{}", owned_struct_name(type_name));
     let doc = format!("Generated from Cap'n Proto union {type_name}");
 
     // The discriminant-0 arm is the capnp zero-fill default. If it's a Void arm
@@ -448,7 +587,150 @@ fn generate_union_enum(type_name: &str, s: &StructDef, resolved: &ResolvedSchema
     }
 }
 
-/// Generate the value-setter for a scalar/Text/Data/enum/struct union-arm payload.
+// List arms are pointer payloads. Share this conversion between pure and mixed
+// unions so selecting the discriminant and preserving every element agree.
+fn union_list_element_type(ct: &CapnpType, resolved: &ResolvedSchema) -> CapnpType {
+    match ct {
+        CapnpType::ListText => CapnpType::Text,
+        CapnpType::ListData => CapnpType::Data,
+        CapnpType::ListPrimitive(inner) => (**inner).clone(),
+        CapnpType::ListStruct(name) => resolved.resolve_type(name).capnp_type.clone(),
+        _ => unreachable!("union list helper requires a list type"),
+    }
+}
+
+fn union_list_write_items(
+    ct: &CapnpType,
+    value: &TokenStream,
+    resolved: &ResolvedSchema,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let element = union_list_element_type(ct, resolved);
+    let write = match &element {
+        CapnpType::Text => quote! { __list.set(__i as u32, __item.as_str()); },
+        CapnpType::Data => quote! { __list.set(__i as u32, __item.as_slice()); },
+        CapnpType::Struct(_) => quote! {
+            hyprstream_rpc::capnp::ToCapnp::write_to(__item, &mut __list.reborrow().get(__i as u32));
+        },
+        CapnpType::Enum(name) => {
+            let Some(e) = resolved.find_enum(name) else {
+                let error = format!("unresolved union list enum: {name}");
+                return quote! { compile_error!(#error) };
+            };
+            let capnp = resolve_capnp_mod(
+                lookup_origin_file(name, resolved),
+                service_name,
+                types_crate,
+            );
+            let owned = format_ident!("{}", name);
+            let arms = e.variants.iter().map(|(name, _)| {
+                let v = resolved.name(name).pascal_ident.clone();
+                quote! { #owned::#v => #capnp::#owned::#v }
+            });
+            quote! { __list.set(__i as u32, match __item { #(#arms,)* }); }
+        }
+        inner if inner.is_list() => {
+            let nested = union_list_write_items(
+                inner,
+                &quote! { __item },
+                resolved,
+                service_name,
+                types_crate,
+            );
+            quote! {
+                let mut __list = __list.reborrow().init(__i as u32, __item.len() as u32);
+                #nested
+            }
+        }
+        CapnpType::Bool
+        | CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => quote! { __list.set(__i as u32, *__item); },
+        unsupported => {
+            let error = format!("unsupported union list element: {unsupported:?}");
+            quote! { compile_error!(#error); }
+        }
+    };
+    quote! {
+        for (__i, __item) in (#value).iter().enumerate() {
+            #write
+        }
+    }
+}
+
+fn union_list_read(
+    ct: &CapnpType,
+    reader: &TokenStream,
+    resolved: &ResolvedSchema,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let element = union_list_element_type(ct, resolved);
+    let read = match &element {
+        CapnpType::Text => quote! { __list.get(__i)?.to_str()?.to_owned() },
+        CapnpType::Data => quote! { __list.get(__i)?.to_vec() },
+        CapnpType::Struct(_) => {
+            quote! { hyprstream_rpc::capnp::FromCapnp::read_from(__list.get(__i))? }
+        }
+        CapnpType::Enum(name) => {
+            let Some(e) = resolved.find_enum(name) else {
+                let error = format!("unresolved union list enum: {name}");
+                return quote! { compile_error!(#error) };
+            };
+            let capnp = resolve_capnp_mod(
+                lookup_origin_file(name, resolved),
+                service_name,
+                types_crate,
+            );
+            let owned = format_ident!("{}", name);
+            let arms = e.variants.iter().map(|(name, _)| {
+                let v = resolved.name(name).pascal_ident.clone();
+                quote! { #capnp::#owned::#v => #owned::#v }
+            });
+            quote! { match __list.get(__i)? { #(#arms,)* } }
+        }
+        inner if inner.is_list() => union_list_read(
+            inner,
+            &quote! { __list.get(__i)? },
+            resolved,
+            service_name,
+            types_crate,
+        ),
+        CapnpType::Bool
+        | CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => quote! { __list.get(__i) },
+        unsupported => {
+            let error = format!("unsupported union list element: {unsupported:?}");
+            quote! { compile_error!(#error) }
+        }
+    };
+    quote! { {
+        let __list = #reader;
+        let mut __out = Vec::with_capacity(__list.len() as usize);
+        for __i in 0..__list.len() {
+            __out.push(#read);
+        }
+        __out
+    } }
+}
+
+/// Generate the value-setter for a scalar/Text/Data/enum/struct/list union-arm payload.
 ///
 /// `value` is a binding (e.g. `v`) holding `&T` for the arm's owned Rust type.
 /// `setter`/`init` are the capnp builder method idents for this arm.
@@ -507,6 +789,13 @@ fn union_arm_value_setter(
                 hyprstream_rpc::capnp::ToCapnp::write_to(#value, &mut __arm);
             }
         }
+        ref list if list.is_list() => {
+            let items = union_list_write_items(list, value, resolved, service_name, types_crate);
+            quote! {
+                let mut __list = builder.reborrow().#init((#value).len() as u32);
+                #items
+            }
+        }
         _ => {
             let _ = capnp_mod;
             TokenStream::new()
@@ -523,8 +812,8 @@ fn generate_union_to_capnp_impl(
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let enum_name = format_ident!("{}", type_name);
-    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+    let enum_name = format_ident!("{}", owned_struct_name(type_name));
+    let capnp_path = capnp_data_path(type_name, capnp_mod);
 
     let arms: Vec<TokenStream> = s.union_arms.iter().map(|arm| {
         let variant = resolved.name(&arm.name).pascal_ident.clone();
@@ -571,7 +860,7 @@ fn generate_union_to_capnp_impl(
 
     quote! {
         impl hyprstream_rpc::capnp::ToCapnp for #enum_name {
-            type Builder<'a> = #capnp_mod::#capnp_struct::Builder<'a>;
+            type Builder<'a> = #capnp_path::Builder<'a>;
 
             #[allow(unused_variables, unused_mut)]
             fn write_to(&self, builder: &mut Self::Builder<'_>) {
@@ -592,15 +881,14 @@ fn generate_union_from_capnp_impl(
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let enum_name = format_ident!("{}", type_name);
-    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
-    let union_mod = format_ident!("{}", to_capnp_module_name(type_name));
+    let enum_name = format_ident!("{}", owned_struct_name(type_name));
+    let capnp_path = capnp_data_path(type_name, capnp_mod);
 
     let arms: Vec<TokenStream> = s.union_arms.iter().map(|arm| {
         let variant = resolved.name(&arm.name).pascal_ident.clone();
         match &arm.payload {
             ArmPayload::Void => {
-                quote! { #capnp_mod::#union_mod::Which::#variant(()) => Self::#variant, }
+                quote! { #capnp_path::Which::#variant(()) => Self::#variant, }
             }
             ArmPayload::Type(t) => {
                 let ct = resolved.resolve_type(t).capnp_type.clone();
@@ -609,14 +897,14 @@ fn generate_union_from_capnp_impl(
                     CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
                     | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
                     | CapnpType::Float32 | CapnpType::Float64 => {
-                        quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(v), }
+                        quote! { #capnp_path::Which::#variant(v) => Self::#variant(v), }
                     }
                     // Text / Data / Struct bind a Result<Reader> — unwrap with `?`.
                     CapnpType::Text => {
-                        quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(v?.to_str()?.to_string()), }
+                        quote! { #capnp_path::Which::#variant(v) => Self::#variant(v?.to_str()?.to_string()), }
                     }
                     CapnpType::Data => {
-                        quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(v?.to_vec()), }
+                        quote! { #capnp_path::Which::#variant(v) => Self::#variant(v?.to_vec()), }
                     }
                     CapnpType::Enum(ref name) => {
                         if let Some(e) = resolved.find_enum(name) {
@@ -631,15 +919,19 @@ fn generate_union_from_capnp_impl(
                                 let vp = resolved.name(vname).pascal_ident.clone();
                                 quote! { #field_capnp_mod::#type_ident::#vp => #enum_rust::#vp }
                             }).collect();
-                            quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(match v? { #(#match_arms,)* }), }
+                            quote! { #capnp_path::Which::#variant(v) => Self::#variant(match v? { #(#match_arms,)* }), }
                         } else {
-                            quote! { #capnp_mod::#union_mod::Which::#variant(_) => Self::#variant(Default::default()), }
+                            quote! { #capnp_path::Which::#variant(_) => Self::#variant(Default::default()), }
                         }
                     }
                     CapnpType::Struct(_) => {
-                        quote! { #capnp_mod::#union_mod::Which::#variant(r) => Self::#variant(hyprstream_rpc::capnp::FromCapnp::read_from(r?)?), }
+                        quote! { #capnp_path::Which::#variant(r) => Self::#variant(hyprstream_rpc::capnp::FromCapnp::read_from(r?)?), }
                     }
-                    _ => quote! { #capnp_mod::#union_mod::Which::#variant(_) => Self::#variant(Default::default()), },
+                    ref list if list.is_list() => {
+                        let read = union_list_read(list, &quote! { v? }, resolved, service_name, types_crate);
+                        quote! { #capnp_path::Which::#variant(v) => Self::#variant(#read), }
+                    }
+                    _ => quote! { #capnp_path::Which::#variant(_) => Self::#variant(Default::default()), },
                 }
             }
             ArmPayload::Group(leaves) => {
@@ -654,14 +946,14 @@ fn generate_union_from_capnp_impl(
                         _ => quote! { #leaf_name: g.#leaf_getter() },
                     }
                 }).collect();
-                quote! { #capnp_mod::#union_mod::Which::#variant(g) => Self::#variant { #(#leaf_reads,)* }, }
+                quote! { #capnp_path::Which::#variant(g) => Self::#variant { #(#leaf_reads,)* }, }
             }
         }
     }).collect();
 
     quote! {
         impl hyprstream_rpc::capnp::FromCapnp for #enum_name {
-            type Reader<'a> = #capnp_mod::#capnp_struct::Reader<'a>;
+            type Reader<'a> = #capnp_path::Reader<'a>;
 
             #[allow(unused_variables)]
             fn read_from(reader: Self::Reader<'_>) -> anyhow::Result<Self> {
@@ -685,8 +977,8 @@ fn generate_to_capnp_impl(
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let data_name = format_ident!("{}", type_name);
-    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+    let data_name = format_ident!("{}", owned_struct_name(type_name));
+    let capnp_path = capnp_data_path(type_name, capnp_mod);
 
     let field_setters: Vec<TokenStream> = s
         .non_union_fields()
@@ -695,7 +987,7 @@ fn generate_to_capnp_impl(
 
     // Mixed struct: emit the anonymous-union setters by matching on `self.content`.
     let content_setter = if s.has_union && !s.is_pure_union() {
-        let content_enum = format_ident!("{}Content", type_name);
+        let content_enum = format_ident!("{}Content", owned_struct_name(type_name));
         let arms: Vec<TokenStream> = s.union_arms.iter().map(|arm| {
             let variant = resolved.name(&arm.name).pascal_ident.clone();
             let arm_snake = &resolved.name(&arm.name).snake;
@@ -747,7 +1039,7 @@ fn generate_to_capnp_impl(
 
     quote! {
         impl hyprstream_rpc::capnp::ToCapnp for #data_name {
-            type Builder<'a> = #capnp_mod::#capnp_struct::Builder<'a>;
+            type Builder<'a> = #capnp_path::Builder<'a>;
 
             #[allow(unused_variables, unused_mut)]
             fn write_to(&self, builder: &mut Self::Builder<'_>) {
@@ -775,12 +1067,19 @@ fn generate_data_field_setter(
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
+    if field.named_group.is_some() {
+        let rust_name = resolved.name(&field.name).snake_ident.clone();
+        let init = format_ident!("init_{}", resolved.name(&field.name).snake);
+        return quote! { hyprstream_rpc::capnp::ToCapnp::write_to(&self.#rust_name, &mut builder.reborrow().#init()); };
+    }
+
     // Check for Option* wrapper struct field
     if let Some(inner_type_name) = resolved
         .find_struct(&field.type_name)
         .and_then(|s| s.option_inner_type())
     {
         let rust_name = resolved.name(&field.name).snake_ident.clone();
+
         let field_snake = &resolved.name(&field.name).snake;
         let init_name = format_ident!("init_{}", field_snake);
         let ct = resolved.resolve_type(inner_type_name).capnp_type.clone();
@@ -803,6 +1102,20 @@ fn generate_data_field_setter(
             }
             CapnpType::Data => {
                 quote! { opt.set_some(__v.as_slice()); }
+            }
+            CapnpType::ListText => {
+                quote! {
+                    let mut __list = opt.reborrow().init_some(__v.len() as u32);
+                    for (i, item) in __v.iter().enumerate() {
+                        __list.set(i as u32, item.as_str());
+                    }
+                }
+            }
+            CapnpType::Struct(_) => {
+                // Struct payloads are WRITTEN, never silently dropped: the
+                // old fallback left the arm as none (silent data loss on
+                // round-trip for option-wrapped structured payloads).
+                quote! { hyprstream_rpc::capnp::ToCapnp::write_to(__v, &mut opt.reborrow().init_some()); }
             }
             _ => quote! { let _ = opt; }, // fallback: leave as none
         };
@@ -987,8 +1300,8 @@ fn generate_from_capnp_impl(
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    let data_name = format_ident!("{}", type_name);
-    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+    let data_name = format_ident!("{}", owned_struct_name(type_name));
+    let capnp_path = capnp_data_path(type_name, capnp_mod);
 
     let field_readers: Vec<TokenStream> = s
         .non_union_fields()
@@ -997,13 +1310,12 @@ fn generate_from_capnp_impl(
 
     // Mixed struct: read the anonymous union via `which()` into `content`.
     let content_reader = if s.has_union && !s.is_pure_union() {
-        let content_enum = format_ident!("{}Content", type_name);
-        let union_mod = format_ident!("{}", to_capnp_module_name(type_name));
+        let content_enum = format_ident!("{}Content", owned_struct_name(type_name));
         let arms: Vec<TokenStream> = s.union_arms.iter().map(|arm| {
             let variant = resolved.name(&arm.name).pascal_ident.clone();
             match &arm.payload {
                 ArmPayload::Void => {
-                    quote! { #capnp_mod::#union_mod::Which::#variant(()) => #content_enum::#variant, }
+                    quote! { #capnp_path::Which::#variant(()) => #content_enum::#variant, }
                 }
                 ArmPayload::Type(t) => {
                     let ct = resolved.resolve_type(t).capnp_type.clone();
@@ -1011,13 +1323,13 @@ fn generate_from_capnp_impl(
                         CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
                         | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
                         | CapnpType::Float32 | CapnpType::Float64 => {
-                            quote! { #capnp_mod::#union_mod::Which::#variant(v) => #content_enum::#variant(v), }
+                            quote! { #capnp_path::Which::#variant(v) => #content_enum::#variant(v), }
                         }
                         CapnpType::Text => {
-                            quote! { #capnp_mod::#union_mod::Which::#variant(v) => #content_enum::#variant(v?.to_str()?.to_string()), }
+                            quote! { #capnp_path::Which::#variant(v) => #content_enum::#variant(v?.to_str()?.to_string()), }
                         }
                         CapnpType::Data => {
-                            quote! { #capnp_mod::#union_mod::Which::#variant(v) => #content_enum::#variant(v?.to_vec()), }
+                            quote! { #capnp_path::Which::#variant(v) => #content_enum::#variant(v?.to_vec()), }
                         }
                         CapnpType::Enum(ref name) => {
                             if let Some(e) = resolved.find_enum(name) {
@@ -1032,15 +1344,19 @@ fn generate_from_capnp_impl(
                                     let vp = resolved.name(vname).pascal_ident.clone();
                                     quote! { #field_capnp_mod::#type_ident::#vp => #enum_rust::#vp }
                                 }).collect();
-                                quote! { #capnp_mod::#union_mod::Which::#variant(v) => #content_enum::#variant(match v? { #(#match_arms,)* }), }
+                                quote! { #capnp_path::Which::#variant(v) => #content_enum::#variant(match v? { #(#match_arms,)* }), }
                             } else {
-                                quote! { #capnp_mod::#union_mod::Which::#variant(_) => #content_enum::#variant(Default::default()), }
+                                quote! { #capnp_path::Which::#variant(_) => #content_enum::#variant(Default::default()), }
                             }
                         }
                         CapnpType::Struct(_) => {
-                            quote! { #capnp_mod::#union_mod::Which::#variant(r) => #content_enum::#variant(hyprstream_rpc::capnp::FromCapnp::read_from(r?)?), }
+                            quote! { #capnp_path::Which::#variant(r) => #content_enum::#variant(hyprstream_rpc::capnp::FromCapnp::read_from(r?)?), }
                         }
-                        _ => quote! { #capnp_mod::#union_mod::Which::#variant(_) => #content_enum::#variant(Default::default()), },
+                        ref list if list.is_list() => {
+                        let read = union_list_read(list, &quote! { v? }, resolved, service_name, types_crate);
+                        quote! { #capnp_path::Which::#variant(v) => #content_enum::#variant(#read), }
+                    }
+                    _ => quote! { #capnp_path::Which::#variant(_) => #content_enum::#variant(Default::default()), },
                     }
                 }
                 ArmPayload::Group(leaves) => {
@@ -1055,7 +1371,7 @@ fn generate_from_capnp_impl(
                             _ => quote! { #leaf_name: g.#leaf_getter() },
                         }
                     }).collect();
-                    quote! { #capnp_mod::#union_mod::Which::#variant(g) => #content_enum::#variant { #(#leaf_reads,)* }, }
+                    quote! { #capnp_path::Which::#variant(g) => #content_enum::#variant { #(#leaf_reads,)* }, }
                 }
             }
         }).collect();
@@ -1070,7 +1386,7 @@ fn generate_from_capnp_impl(
 
     quote! {
         impl hyprstream_rpc::capnp::FromCapnp for #data_name {
-            type Reader<'a> = #capnp_mod::#capnp_struct::Reader<'a>;
+            type Reader<'a> = #capnp_path::Reader<'a>;
 
             #[allow(unused_variables)]
             fn read_from(reader: Self::Reader<'_>) -> anyhow::Result<Self> {
@@ -1089,12 +1405,19 @@ fn generate_data_field_reader(
     service_name: &str,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
+    if field.named_group.is_some() {
+        let rust_name = resolved.name(&field.name).snake_ident.clone();
+        let getter = format_ident!("get_{}", resolved.name(&field.name).snake);
+        return quote! { #rust_name: hyprstream_rpc::capnp::FromCapnp::read_from(reader.#getter())?, };
+    }
+
     let inner = generate_data_field_reader_inner(field, resolved, service_name, types_crate);
     if field.optional {
         // Wrap in Option: non-default → Some, default → None.
         // Only Text and List types use the $optional sentinel convention.
         // Numeric/float/enum types use Option* union structs (handled in generate_data_field_reader_inner).
         let rust_name = resolved.name(&field.name).snake_ident.clone();
+
         let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
         let ct = resolved.resolve_type(&field.type_name).capnp_type.clone();
         match ct {
@@ -1256,9 +1579,15 @@ fn generate_data_field_reader_inner(
         );
         let type_mod = format_ident!("{}", to_capnp_module_name(&field.type_name));
         let inner_ct = resolved.resolve_type(inner_type_name).capnp_type.clone();
-        // For Text inner type, getter returns Result<text::Reader>
+        // For Text inner type, getter returns Result<text::Reader>. Pointer
+        // payloads (Struct/Data/List*) arrive as Result<Reader, capnp::Error>
+        // and MUST be unwrapped; Struct arms convert through FromCapnp and
+        // list-of-struct arms element-wise (decision.capnp OptEntry/OptEntry-
+        // style wrappers over structured payloads are the first consumers).
         let some_expr = match inner_ct {
-            CapnpType::Text => quote! { v.to_str()?.to_string() },
+            // Text payloads arrive as Result<text::Reader, capnp::Error> too
+            // (pointer arm): unwrap before to_str.
+            CapnpType::Text => quote! { v?.to_str()?.to_string() },
             CapnpType::Enum(ref enum_name) => {
                 // Convert capnp enum value to Rust enum
                 if let Some(e) = resolved.find_enum(enum_name) {
@@ -1278,6 +1607,22 @@ fn generate_data_field_reader_inner(
                 } else {
                     quote! { Default::default() }
                 }
+            }
+            CapnpType::Data => {
+                quote! { v?.to_vec() }
+            }
+            CapnpType::ListText => {
+                quote! { {
+                    let __list = v?;
+                    let mut __out = Vec::with_capacity(__list.len() as usize);
+                    for __i in 0..__list.len() {
+                        __out.push(__list.get(__i)?.to_str()?.to_string());
+                    }
+                    __out
+                } }
+            }
+            CapnpType::Struct(_) => {
+                quote! { hyprstream_rpc::capnp::FromCapnp::read_from(v?)? }
             }
             _ => quote! { v },
         };
@@ -1500,6 +1845,7 @@ mod field_domain_type_tests {
             discriminant_value: 0xFFFF,
             serde_rename: None,
             domain_type: domain_type.map(String::from),
+            named_group: None,
         }
     }
 
@@ -1513,6 +1859,35 @@ mod field_domain_type_tests {
             request_struct: None,
             response_struct: None,
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "owned Rust group name collision")]
+    fn named_group_owned_name_collision_is_rejected() {
+        let empty = StructDef {
+            name: "Parent.body".into(),
+            fields: vec![],
+            has_union: false,
+            domain_type: None,
+            origin_file: None,
+            data_words: 0,
+            pointer_words: 0,
+            discriminant_count: 0,
+            discriminant_offset: 0,
+            union_arms: vec![],
+        };
+        let mut body = text_field("body", None);
+        body.type_name = "Group".into();
+        body.section = FieldSection::Group;
+        body.named_group = Some(Box::new(empty.clone()));
+        let mut parent = empty.clone();
+        parent.name = "Parent".into();
+        parent.fields = vec![body];
+        let mut collision = empty;
+        collision.name = "ParentBody".into();
+        let mut schema = data_only_schema(parent);
+        schema.structs.push(collision);
+        let _ = ResolvedSchema::from(&schema);
     }
 
     /// A field carrying `$domainType("hyprstream_rpc::identity::Did")` must emit the newtype

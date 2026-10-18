@@ -1455,6 +1455,7 @@ fn field_def_from_slot(
         discriminant_value: disc,
         serde_rename,
         domain_type,
+        named_group: None,
     })
 }
 
@@ -1605,18 +1606,17 @@ fn extract_struct_from_node(
     optional_id: Option<u64>,
     serde_rename_id: Option<u64>,
     origin_file: Option<String>,
+    allow_named_group: bool,
 ) -> Result<Option<StructDef>, String> {
     let struct_reader = match node.which() {
         Ok(capnp::schema_capnp::node::Struct(s)) => s,
         _ => return Ok(None),
     };
 
-    // Synthetic group nodes (capnp emits one per `:group { ... }` arm, named
-    // `Parent.armName`) are NOT standalone types in any language binding — their
-    // leaf fields are inlined into the parent. Their dotted name is also not a
-    // valid Rust/TS identifier. Skip them: their structured shape is captured in
-    // the parent union's `union_arms`.
-    if struct_reader.get_is_group() {
+    // Inline group nodes stay out of the flat standalone type list. Union-arm
+    // leaves are folded into union_arms; named non-union groups are retained
+    // only through a verified parent field's additive named_group metadata.
+    if struct_reader.get_is_group() && !allow_named_group {
         return Ok(None);
     }
 
@@ -1660,13 +1660,13 @@ fn extract_struct_from_node(
 
         // Slot fields go through the shared `field_def_from_slot` helper (also used
         // by the union-arm group-leaf loop) so the two can't drift. Group fields
-        // keep the flat `("Group", 0, Group)` fallback so the TS/wire-format path is
-        // byte-for-byte unchanged — their structured shape lives in `union_arms`.
+        // keep the flat `("Group", 0, Group)` fallback for the TS/wire-format
+        // path. Named non-union children carry separate additive metadata.
         let field_def = match field.which() {
             Ok(capnp::schema_capnp::field::Slot(slot)) => {
                 field_def_from_slot(field, slot, node_map, ann)?
             }
-            Ok(capnp::schema_capnp::field::Group(_)) => {
+            Ok(capnp::schema_capnp::field::Group(group)) => {
                 let field_name = field
                     .get_name()
                     .map_err(|e| format!("{e}"))?
@@ -1704,6 +1704,49 @@ fn extract_struct_from_node(
                         Some(sr)
                     }
                 };
+                // Named non-union groups have their own nested Reader/Builder.
+                // Preserve their metadata without changing the legacy flat Group
+                // field or folding them into the parent's anonymous union.
+                let named_group = if disc == 0xFFFF {
+                    let group_info = node_map
+                        .get(&group.get_type_id())
+                        .ok_or_else(|| format!("named group '{field_name}': missing node"))?;
+                    let expected_name = format!("{}.{}", info.short_name, field_name);
+                    if group_info.parent_id != info.id || group_info.short_name != expected_name {
+                        return Err(format!(
+                            "named group '{field_name}': invalid parent/type path"
+                        ));
+                    }
+                    let group_node = nodes.get(group_info.index);
+                    if !matches!(group_node.which(), Ok(capnp::schema_capnp::node::Struct(g)) if g.get_is_group())
+                    {
+                        return Err(format!(
+                            "named group '{field_name}': expected inline group node"
+                        ));
+                    }
+                    // Every recursive edge extends the verified parent name, so
+                    // the finite CGR node graph cannot form a group cycle.
+                    Some(Box::new(
+                        extract_struct_from_node(
+                            group_node,
+                            group_info,
+                            nodes,
+                            node_map,
+                            mcp_desc_id,
+                            param_desc_id,
+                            domain_type_id,
+                            fixed_size_id,
+                            max_len_id,
+                            optional_id,
+                            serde_rename_id,
+                            origin_file.clone(),
+                            true,
+                        )?
+                        .ok_or_else(|| format!("named group '{field_name}': missing definition"))?,
+                    ))
+                } else {
+                    None
+                };
                 FieldDef {
                     name: field_name,
                     type_name: "Group".into(),
@@ -1717,6 +1760,7 @@ fn extract_struct_from_node(
                     serde_rename,
                     // Group fields carry no field-level $domainType (they are inlined unions).
                     domain_type: None,
+                    named_group,
                 }
             }
             Err(e) => return Err(format!("Field error: {e}")),
@@ -1766,6 +1810,26 @@ fn extract_struct_from_node(
     }))
 }
 
+fn collect_struct_type_refs(s: &StructDef, refs: &mut std::collections::HashSet<String>) {
+    for field in &s.fields {
+        collect_type_refs(&field.type_name, refs);
+        if let Some(group) = &field.named_group {
+            collect_struct_type_refs(group, refs);
+        }
+    }
+    for arm in &s.union_arms {
+        match &arm.payload {
+            ArmPayload::Type(name) => collect_type_refs(name, refs),
+            ArmPayload::Group(leaves) => {
+                for leaf in leaves {
+                    collect_type_refs(&leaf.type_name, refs);
+                }
+            }
+            ArmPayload::Void => {}
+        }
+    }
+}
+
 /// Extract all struct definitions from the schema (for the given service file).
 ///
 /// Two-pass extraction:
@@ -1807,6 +1871,7 @@ fn extract_all_structs(
             optional_id,
             serde_rename_id,
             None,
+            false,
         )? {
             structs.push(s);
         }
@@ -1823,24 +1888,9 @@ fn extract_all_structs(
         let mut referenced_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        // Collect refs from fields of all known structs (local + imported).
+        // Include named-group children without exposing them as flat structs.
         for s in &structs {
-            for f in &s.fields {
-                collect_type_refs(&f.type_name, &mut referenced_names);
-            }
-            // Group-arm leaf types are not in the flat `fields` list, so feed them
-            // (and single-type arm payloads, for robustness) into the ref collector.
-            for arm in &s.union_arms {
-                match &arm.payload {
-                    ArmPayload::Type(name) => collect_type_refs(name, &mut referenced_names),
-                    ArmPayload::Group(leaves) => {
-                        for leaf in leaves {
-                            collect_type_refs(&leaf.type_name, &mut referenced_names);
-                        }
-                    }
-                    ArmPayload::Void => {}
-                }
-            }
+            collect_struct_type_refs(s, &mut referenced_names);
         }
 
         // Also collect from union variant fields of local CGR nodes.
@@ -1889,6 +1939,7 @@ fn extract_all_structs(
                         optional_id,
                         serde_rename_id,
                         Some(origin),
+                        false,
                     )? {
                         known_names.insert(ref_name.clone());
                         structs.push(s);
@@ -1999,9 +2050,7 @@ fn extract_all_enums(
 
     let mut referenced_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in all_structs {
-        for f in &s.fields {
-            collect_type_refs(&f.type_name, &mut referenced_names);
-        }
+        collect_struct_type_refs(s, &mut referenced_names);
     }
 
     for ref_name in &referenced_names {
@@ -2561,5 +2610,78 @@ mod mandatory_mutation_policy_tests {
         // a valid (or absent) maxLen is untouched by this validation.
         assert!(validate_max_len("fixedSizeZeroField", None).is_ok());
         assert!(validate_max_len("fixedSizeZeroField", Some(64)).is_ok());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod named_group_tests {
+    use super::*;
+
+    #[test]
+    fn named_group_metadata_preserves_flat_fields_and_inline_union_arms() {
+        let tmp =
+            std::env::temp_dir().join(format!("hyprstream_named_group_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("named.capnp");
+        std::fs::write(
+            &source,
+            r#"
+@0xe954aa15232ac087;
+struct Sample {
+  id @0 :Text;
+  body :union {
+    empty @1 :Void;
+    choice @2 :List(Float32);
+  }
+}
+struct Inline {
+  union {
+    empty @0 :Void;
+    selected :group { label @1 :Text; }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let cgr = tmp.join("named.cgr");
+        capnpc::CompilerCommand::new()
+            .src_prefix(&tmp)
+            .output_path(&tmp)
+            .file(&source)
+            .raw_code_generator_request_path(&cgr)
+            .run()
+            .unwrap();
+        let schema = parse_from_cgr_path(&cgr, "named").unwrap();
+        let sample = schema.structs.iter().find(|s| s.name == "Sample").unwrap();
+        let body = sample.fields.iter().find(|f| f.name == "body").unwrap();
+        assert_eq!(body.type_name, "Group");
+        assert_eq!(body.section, FieldSection::Group);
+        assert_eq!(body.slot_offset, 0);
+        assert_eq!(body.discriminant_value, 0xFFFF);
+        let group = body.named_group.as_ref().unwrap();
+        assert_eq!(group.name, "Sample.body");
+        assert!(group.is_pure_union());
+        assert_eq!(group.discriminant_count, 2);
+        assert!(
+            matches!(&group.union_arms[1].payload, ArmPayload::Type(t) if t == "List(Float32)")
+        );
+        assert!(!schema.structs.iter().any(|s| s.name.contains('.')));
+        let inline = schema.structs.iter().find(|s| s.name == "Inline").unwrap();
+        assert!(inline.fields.iter().all(|f| f.named_group.is_none()));
+        let ArmPayload::Group(leaves) = &inline.union_arms[1].payload else {
+            panic!("inline group must remain folded")
+        };
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].name, "label");
+        assert_eq!(leaves[0].type_name, "Text");
+        assert!(leaves[0].named_group.is_none());
+        let ordinary = &sample.fields[0];
+        assert!(ordinary.named_group.is_none());
+        assert!(serde_json::to_value(ordinary)
+            .unwrap()
+            .get("named_group")
+            .is_none());
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 }

@@ -1487,7 +1487,15 @@ fn find_typed_return_info(
 
     let error_arm = if has_error {
         quote! {
-            #response_type::Error(ref e) => Err(anyhow::anyhow!("{}", e.message)),
+            // Typed error tunnel: the wire ErrorInfo code rides in the typed
+            // error (Display stays message-only so existing string matching
+            // is unchanged); service-side scoped wrappers re-emit the code.
+            #response_type::Error(ref e) => Err(anyhow::Error::new(
+                hyprstream_rpc::error::TypedRpcError {
+                    code: e.code.clone(),
+                    message: e.message.clone(),
+                },
+            )),
         }
     } else {
         TokenStream::new()

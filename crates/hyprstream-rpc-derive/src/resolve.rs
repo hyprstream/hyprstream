@@ -12,6 +12,15 @@ use quote::format_ident;
 use crate::schema::types::*;
 use crate::util::{to_pascal_case, to_snake_case, CapnpType};
 
+/// Owned Rust name for a nested inline group; ordinary type names are unchanged.
+pub(crate) fn owned_struct_name(raw: &str) -> String {
+    if raw.contains('.') {
+        raw.split('.').map(to_pascal_case).collect()
+    } else {
+        raw.to_owned()
+    }
+}
+
 /// Cached name conversions for a single identifier string.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -86,8 +95,31 @@ impl<'a> ResolvedSchema<'a> {
             type_strings.insert(v.type_name.clone());
         }
 
-        // Walk structs and their fields
-        for s in &schema.structs {
+        // Group children add names and referenced types without changing the
+        // flat struct index consumed by existing schema/wire code.
+        fn walk_struct(
+            s: &StructDef,
+            name_strings: &mut HashSet<String>,
+            type_strings: &mut HashSet<String>,
+            owned_names: &mut HashMap<String, String>,
+        ) {
+            let owned = owned_struct_name(&s.name);
+            if let Some(previous) = owned_names.insert(owned.clone(), s.name.clone()) {
+                assert_eq!(
+                    previous, s.name,
+                    "owned Rust group name collision for {owned}"
+                );
+            }
+            if s.has_union && !s.is_pure_union() {
+                let content = format!("{owned}Content");
+                let origin = format!("{}#content", s.name);
+                if let Some(previous) = owned_names.insert(content.clone(), origin.clone()) {
+                    assert_eq!(
+                        previous, origin,
+                        "owned Rust group name collision for {content}"
+                    );
+                }
+            }
             name_strings.insert(s.name.clone());
             // Struct names are also valid type references (e.g., when used in
             // List(StructName) or as field types in other structs)
@@ -95,6 +127,9 @@ impl<'a> ResolvedSchema<'a> {
             for f in &s.fields {
                 name_strings.insert(f.name.clone());
                 type_strings.insert(f.type_name.clone());
+                if let Some(group) = &f.named_group {
+                    walk_struct(group, name_strings, type_strings, owned_names);
+                }
             }
             // Walk union arms: arm names become Rust enum variant idents, and arm /
             // group-leaf type names need classification so codegen can resolve them.
@@ -114,9 +149,20 @@ impl<'a> ResolvedSchema<'a> {
                 }
             }
         }
+        let mut owned_names = HashMap::new();
+        for s in &schema.structs {
+            walk_struct(s, &mut name_strings, &mut type_strings, &mut owned_names);
+        }
 
         // Walk enums
         for e in &schema.enums {
+            if let Some(previous) = owned_names.insert(e.name.clone(), e.name.clone()) {
+                assert_eq!(
+                    previous, e.name,
+                    "owned Rust group name collision for {}",
+                    e.name
+                );
+            }
             name_strings.insert(e.name.clone());
             // Enum names are also valid type references
             type_strings.insert(e.name.clone());
@@ -157,8 +203,9 @@ impl<'a> ResolvedSchema<'a> {
         let names: HashMap<String, ResolvedName> = name_strings
             .into_iter()
             .map(|raw| {
-                let snake = to_snake_case(&raw);
-                let pascal = to_pascal_case(&raw);
+                let normalized = raw.replace('.', "_");
+                let snake = to_snake_case(&normalized);
+                let pascal = to_pascal_case(&normalized);
                 let snake_ident = format_ident!("{}", snake);
                 let pascal_ident = format_ident!("{}", pascal);
                 (

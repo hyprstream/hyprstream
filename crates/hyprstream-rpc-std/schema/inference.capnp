@@ -9,6 +9,10 @@ using import "/annotations.capnp".mutationSemantics;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".serdeRename;
 using Opt = import "/optional.capnp";
+# System One typed decision surface (P3.1): the E2 #1663 data contract
+# (distributions, VersionTriple with explicit calibration-null) is imported
+# from decision.capnp; service-owned wrapper types live here.
+using Decision = import "/decision.capnp";
 
 # Cap'n Proto schema for inference service
 #
@@ -114,6 +118,13 @@ struct InferenceRequest {
 
     # TTN layer profile (returns JSON-encoded LayerProfile for diagnostics/tooling)
     getLayerProfile @33 :Void $scope(query) $dispatchMac("internal:pq-hybrid");
+
+    # Typed Clef decision inference (text/JSON only). Parses the ORIGINAL raw
+    # Clef JSON body server-side through the ordered ClefRequest visitor;
+    # returns E2 decision.capnp distributions with calibration=null.
+    # Pure function of (admitted weights, request body): no generation state,
+    # no KV/GDN reuse, no session mutation — replay yields the same answer.
+    decide @34 :DecisionRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
   }
 }
 
@@ -174,6 +185,9 @@ struct InferenceResponse {
 
     # TTN layer profile result
     getLayerProfileResult @34 :LayerProfileResult;
+
+    # Decision inference result
+    decideResult @35 :DecisionResponse;
   }
 }
 
@@ -445,4 +459,85 @@ struct CapacityError {
   currentSteps @0 :UInt32;
   maxSteps @1 :UInt32;
   message @2 :Text;
+}
+
+# =============================================================================
+# Typed decision serving (P3.1) — Clef joint-schema decisions
+# =============================================================================
+
+# One text/JSON Clef decision request. The body is the ORIGINAL raw Clef
+# wire JSON: the server parses it directly with the ordered ClefRequest
+# visitor (question insertion order preserved; duplicate request fields and
+# question IDs rejected; unsupported media fields rejected; numeric domain
+# enforced lexically BEFORE any Value conversion). It is deliberately NOT
+# pre-parsed into an unordered Value map on either side of the wire.
+struct DecisionRequest {
+  clefJson @0 :Text
+    $paramDescription("Original raw Clef request JSON body (model/state/questions record). Bounded server-side before the ordered parse.");
+
+  # Optional explicit state-token budget override. The server clamps it to the
+  # serving profile: callers may LOWER the default, never raise it.
+  maxStateTokens @1 :Opt.OptionUint32
+    $paramDescription("Maximum state tokens admitted before deterministic truncation. Unset/clamped to server default.");
+
+  # Optional wall-clock budget for this decision. Clamped by the server to a
+  # hard maximum; enforcement is cooperative (checked before admission, per
+  # decoder layer, and around head evaluation). An in-flight libtorch kernel
+  # completes before the next check; client disconnect alone does not stop a
+  # running CPU forward.
+  timeoutMs @2 :Opt.OptionUint32
+    $paramDescription("Soft deadline in milliseconds for this decision request. Clamped to the server maximum.");
+}
+
+# Actual identity of the serving path that produced the batch. These are
+# OBSERVED values from the admitted immutable artifact — never directory
+# names, request echoes, or hardcoded revisions. Decision serving requires a
+# retained pinned artifact; artifactCommit is its immutable content identity.
+# Digests are computed once from the same bytes the runtime loaded. calibration
+# identity stays inside DecisionBatch.version (OptionText; none = uncalibrated).
+struct DecisionProvenance {
+  encodingVersion @0 :Text
+    $paramDescription("Clef encoding contract version actually used (e.g. cloudflare-clef-8b2e5fd-1).");
+  modelRef @1 :Text
+    $paramDescription("Admitted worker model reference (resolved identity), e.g. name:branch. Empty only for unbound standalone fixtures.");
+  artifactCommit @2 :Text
+    $paramDescription("Pinned artifact commit OID (immutable content identity of the whole model tree). Decision serving fails closed without one.");
+  headWeightsSha256 @3 :Text
+    $paramDescription("SHA-256 of the joint head weights actually loaded.");
+  headConfigSha256 @4 :Text
+    $paramDescription("SHA-256 of the joint head config actually loaded.");
+  tokenizerSha256 @5 :Text
+    $paramDescription("SHA-256 of tokenizer.json in the same immutable tree; empty when the bundle ships none.");
+  backboneConfigSha256 @6 :Text
+    $paramDescription("SHA-256 of the backbone config.json in the same immutable tree; empty when absent.");
+  quantization @7 :Text
+    $paramDescription("Quantization format actually declared by config.json (e.g. float-quantized-channel-w8-dynact); empty when unquantized.");
+  headTensorCount @8 :UInt32
+    $paramDescription("Number of strict-validated head tensors loaded (122 for the official joint head config).");
+  computeProfile @9 :Text
+    $paramDescription("Compute profile actually used, e.g. cpu-float-quantized-channel-w8-dynact or cpu-float32. No hidden precision fallback.");
+}
+
+# The limits actually applied to this record (schema overflow is rejected,
+# never silently truncated).
+struct DecisionAppliedLimits {
+  maxLength @0 :UInt32
+    $paramDescription("Total encoding token budget applied.");
+  maxStateTokens @1 :Opt.OptionUint32
+    $paramDescription("State-token budget applied after None resolution.");
+  stateTokensAdmitted @2 :UInt32
+    $paramDescription("State tokens present in the encoded sequence AFTER truncation.");
+  sequenceTokens @3 :UInt32
+    $paramDescription("Final input token count of the encoded record.");
+  stateTruncated @4 :Bool
+    $paramDescription("Whether the state segment was truncated to fit the budget.");
+}
+
+struct DecisionResponse {
+  # Typed decision distributions per the E2 decision.capnp contract:
+  # rows bind answers by request question IDs; VersionTriple carries
+  # schema/model identity with calib = none (uncalibrated native output).
+  batch @0 :Decision.DecisionBatch;
+  provenance @1 :DecisionProvenance;
+  limits @2 :DecisionAppliedLimits;
 }

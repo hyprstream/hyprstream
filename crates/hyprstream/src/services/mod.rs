@@ -71,6 +71,7 @@ pub(crate) use hyprstream_inference::worktree_ext::WorktreeClientExt;
 #[cfg(feature = "rocksdb")]
 pub mod at9p_renewal;
 pub mod at9p_verify;
+pub mod decision;
 pub mod discovery;
 pub mod editing;
 pub mod factories;
