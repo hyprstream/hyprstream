@@ -48,6 +48,7 @@
 //! [`hyprstream_calibrated disclosure`]: hyprstream_calibration::disclosure
 
 pub mod error;
+mod eval_batch;
 pub mod persist;
 pub mod run;
 pub mod score;
