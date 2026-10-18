@@ -9,6 +9,7 @@
 
 use crate::{Git2DBError, Git2DBResult, GitManager, Oid};
 use git2::{ObjectType, Repository, Tree};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "linux")]
@@ -29,6 +30,53 @@ const PROJECTION_PREFIX: &str = "git2db-pinned-disk-";
 const OWNER_FILE: &str = ".git2db-pinned-disk-owner-v1";
 const OWNER_MARKER: &[u8] = b"git2db-pinned-disk-owner-v1\n";
 static PROJECTION_CAPACITY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Trusted server-side capture policy. Never deserialize this from an RPC.
+/// Existing callers keep the 2 GiB ceiling and remote pointer resolver.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectionPolicy {
+    max_expanded_bytes: u64,
+    local_lfs: BTreeMap<String, PathBuf>,
+}
+
+impl Default for ProjectionPolicy {
+    fn default() -> Self {
+        Self {
+            max_expanded_bytes: MAX_EXPANDED_BYTES,
+            local_lfs: BTreeMap::new(),
+        }
+    }
+}
+
+impl ProjectionPolicy {
+    /// Construct from a reviewed server-owned complete-tree contract.
+    /// A nonempty local map is authoritative: missing LFS objects fail closed,
+    /// rather than starting an unrequested remote CAS download.
+    pub fn from_trusted_contract(
+        max_expanded_bytes: u64,
+        local_lfs: BTreeMap<String, PathBuf>,
+    ) -> Git2DBResult<Self> {
+        if max_expanded_bytes == 0 || max_expanded_bytes.checked_add(FREE_SPACE_RESERVE).is_none() {
+            return Err(internal("invalid projection byte ceiling"));
+        }
+        for (oid, path) in &local_lfs {
+            if oid.len() != 64
+                || !oid
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || !path.is_absolute()
+            {
+                return Err(internal(
+                    "local LFS map requires lowercase SHA256 and absolute paths",
+                ));
+            }
+        }
+        Ok(Self {
+            max_expanded_bytes,
+            local_lfs,
+        })
+    }
+}
 
 // This absolute path is populated by the runtime image's git-core package.
 // The OCI digest, not a mutable host PATH, pins the executable at deployment.
@@ -173,7 +221,15 @@ impl DiskPinnedTreeProjection {
         commit: Oid,
         private_disk_parent: &Path,
     ) -> Git2DBResult<Self> {
-        Self::acquire_with_capacity(repo_path, commit, private_disk_parent, None, None).await
+        Self::acquire_with_capacity(
+            repo_path,
+            commit,
+            private_disk_parent,
+            None,
+            None,
+            ProjectionPolicy::default(),
+        )
+        .await
     }
 
     /// Staging admission with one global lease retained until the artifact is
@@ -196,6 +252,36 @@ impl DiskPinnedTreeProjection {
         private_disk_parent: &Path,
         hooks: Option<StreamHooks>,
     ) -> Git2DBResult<Self> {
+        Self::acquire_bounded_policy_hooked(
+            repo_path,
+            commit,
+            private_disk_parent,
+            hooks,
+            ProjectionPolicy::default(),
+        )
+        .await
+    }
+
+    /// Capture under a trusted per-pin policy while retaining the global lease.
+    #[cfg(target_os = "linux")]
+    pub async fn acquire_bounded_with_policy(
+        repo_path: &Path,
+        commit: Oid,
+        private_disk_parent: &Path,
+        policy: ProjectionPolicy,
+    ) -> Git2DBResult<Self> {
+        Self::acquire_bounded_policy_hooked(repo_path, commit, private_disk_parent, None, policy)
+            .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn acquire_bounded_policy_hooked(
+        repo_path: &Path,
+        commit: Oid,
+        private_disk_parent: &Path,
+        hooks: Option<StreamHooks>,
+        policy: ProjectionPolicy,
+    ) -> Git2DBResult<Self> {
         let capacity = Arc::clone(PROJECTION_CAPACITY.get_or_init(|| Arc::new(Semaphore::new(1))))
             .try_acquire_owned()
             .map_err(|_| internal("bounded model projection capacity is occupied"))?;
@@ -217,6 +303,7 @@ impl DiskPinnedTreeProjection {
                 &private_disk_parent,
                 Some(capacity),
                 hooks,
+                policy,
             ))
         })
         .await
@@ -229,6 +316,7 @@ impl DiskPinnedTreeProjection {
         private_disk_parent: &Path,
         capacity: Option<OwnedSemaphorePermit>,
         mut hooks: Option<StreamHooks>,
+        policy: ProjectionPolicy,
     ) -> Git2DBResult<Self> {
         verify_private_disk_parent(private_disk_parent)?;
         scavenge_abandoned_projections(private_disk_parent)?;
@@ -248,15 +336,17 @@ impl DiskPinnedTreeProjection {
             &mut entries,
             &mut visited_entries,
         )?;
-        let projected_bytes = preflight_projection(&repo, &mut entries, private_disk_parent)?;
+        let projected_bytes =
+            preflight_projection(&repo, &mut entries, private_disk_parent, &policy)?;
         if entries.len() > MAX_FILES {
             return Err(internal(format!(
                 "model tree exceeds {MAX_FILES} file limit"
             )));
         }
-        if projected_bytes > MAX_EXPANDED_BYTES {
+        if projected_bytes > policy.max_expanded_bytes {
             return Err(internal(format!(
-                "model projection exceeds {MAX_EXPANDED_BYTES}-byte limit"
+                "model projection exceeds {}-byte limit",
+                policy.max_expanded_bytes
             )));
         }
         let git_dir = repo.path().to_path_buf();
@@ -301,7 +391,8 @@ impl DiskPinnedTreeProjection {
                     #[cfg(feature = "xet-storage")]
                     {
                         let resolved = payload_dir.join(format!("{index}.resolved"));
-                        resolve_pointer_to_file(&bytes, &resolved, &mut storage, &root).await?;
+                        resolve_pointer_to_file(&bytes, &resolved, &mut storage, &root, &policy)
+                            .await?;
                         final_path = resolved;
                     }
                     #[cfg(not(feature = "xet-storage"))]
@@ -371,9 +462,22 @@ impl DiskPinnedTreeProjection {
         _private_disk_parent: &Path,
         _capacity: Option<OwnedSemaphorePermit>,
         _hooks: Option<StreamHooks>,
+        _policy: ProjectionPolicy,
     ) -> Git2DBResult<Self> {
         Err(internal(
             "disk-backed pinned projection requires Linux /proc/self/fd",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn acquire_bounded_with_policy(
+        _repo_path: &Path,
+        _commit: Oid,
+        _private_disk_parent: &Path,
+        _policy: ProjectionPolicy,
+    ) -> Git2DBResult<Self> {
+        Err(internal(
+            "bounded pinned projection requires Linux /proc/self/fd",
         ))
     }
 
@@ -588,6 +692,7 @@ fn preflight_projection(
     repo: &Repository,
     entries: &mut [BlobEntry],
     parent: &Path,
+    policy: &ProjectionPolicy,
 ) -> Git2DBResult<u64> {
     let odb = repo
         .odb()
@@ -631,9 +736,10 @@ fn preflight_projection(
         total = total
             .checked_add(if blob_size <= 4096 { size } else { 0 })
             .ok_or_else(|| internal("model size overflow"))?;
-        if total > MAX_EXPANDED_BYTES {
+        if total > policy.max_expanded_bytes {
             return Err(internal(format!(
-                "model projection exceeds {MAX_EXPANDED_BYTES}-byte limit"
+                "model projection exceeds {}-byte limit",
+                policy.max_expanded_bytes
             )));
         }
     }
@@ -847,10 +953,28 @@ async fn resolve_pointer_to_file(
     path: &Path,
     storage: &mut Option<crate::LfsStorage>,
     owner: &OwnedProjection,
+    policy: &ProjectionPolicy,
 ) -> Git2DBResult<()> {
     let text = std::str::from_utf8(bytes).map_err(|e| internal(format!("pointer UTF-8: {e}")))?;
     if text.starts_with("# xet version") {
         return Err(internal("unsupported legacy XET pointer"));
+    }
+    if crate::is_lfs_pointer(text) && !policy.local_lfs.is_empty() {
+        let pointer = crate::LfsPointer::parse(text)?;
+        let source = policy
+            .local_lfs
+            .get(pointer.oid())
+            .ok_or_else(|| internal("captured LFS oid missing from local hydration map"))?
+            .clone();
+        let destination = path.to_path_buf();
+        let expected = pointer.oid().to_owned();
+        let size = pointer.size();
+        spawn_owned_verifier(owner, move || {
+            hydrate_local_lfs(&source, &destination, &expected, size)
+        })
+        .await
+        .map_err(|e| internal(format!("local LFS hydration task failed: {e}")))??;
+        return Ok(());
     }
     if storage.is_none() {
         *storage = Some(crate::LfsStorage::new(&crate::XetConfig::default()).await?);
@@ -881,7 +1005,11 @@ async fn resolve_pointer_to_file(
     let info: data::XetFileInfo =
         serde_json::from_str(text).map_err(|e| internal(format!("invalid XET pointer: {e}")))?;
     let written = storage
-        .smudge_xet_pointer_to_file_bounded(text, path, info.file_size().min(MAX_EXPANDED_BYTES))
+        .smudge_xet_pointer_to_file_bounded(
+            text,
+            path,
+            info.file_size().min(policy.max_expanded_bytes),
+        )
         .await?;
     if written != info.file_size() {
         return Err(internal(
@@ -905,6 +1033,56 @@ fn spawn_owned_verifier(
         let _task_owner = task_owner;
         verify()
     })
+}
+
+/// Copy into a new private inode; never publish an alias of the hydration
+/// source. Bounded reads/writes and destination hashing reject source races.
+#[cfg(all(feature = "xet-storage", target_os = "linux"))]
+fn hydrate_local_lfs(
+    source: &Path,
+    destination: &Path,
+    expected_sha: &str,
+    expected_size: u64,
+) -> Git2DBResult<()> {
+    use std::io::{Read as _, Write as _};
+    if source.canonicalize().map_err(internal)? != source {
+        return Err(internal(
+            "local LFS hydration source contains a symlink or noncanonical path",
+        ));
+    }
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)
+        .map_err(internal)?;
+    let metadata = input.metadata().map_err(internal)?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Err(internal(
+            "local LFS hydration source is not a regular file of captured size",
+        ));
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)
+        .map_err(internal)?;
+    let mut remaining = expected_size;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let cap = remaining.min(buffer.len() as u64) as usize;
+        let count = input.read(&mut buffer[..cap]).map_err(internal)?;
+        if count == 0 {
+            return Err(internal("local LFS hydration source truncated"));
+        }
+        output.write_all(&buffer[..count]).map_err(internal)?;
+        remaining -= count as u64;
+    }
+    if input.read(&mut buffer[..1]).map_err(internal)? != 0 {
+        return Err(internal("local LFS hydration source grew"));
+    }
+    drop(output);
+    verify_lfs_file(destination, expected_sha, expected_size)
 }
 
 #[cfg(feature = "xet-storage")]
@@ -990,6 +1168,179 @@ mod tests {
         .map_err(internal)?;
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).map_err(internal)?;
         Ok(parent)
+    }
+
+    #[cfg(feature = "xet-storage")]
+    fn lfs_pointer(content: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{:x}\nsize {}\n",
+            Sha256::digest(content),
+            content.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn projection_policy_small_ceiling_is_causal_and_default_unchanged() -> Git2DBResult<()> {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
+        let source = tempfile::tempdir().map_err(internal)?;
+        let commit = commit_files(source.path(), &[("a", b"12345678")])?;
+        let parent = disk_backed_private_parent()?;
+        assert_eq!(
+            ProjectionPolicy::default().max_expanded_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+        let too_small = ProjectionPolicy::from_trusted_contract(7, BTreeMap::new())?;
+        assert!(DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            source.path(),
+            commit,
+            parent.path(),
+            too_small
+        )
+        .await
+        .is_err());
+        assert!(fs::read_dir(parent.path())
+            .map_err(internal)?
+            .next()
+            .is_none());
+        let admitted = ProjectionPolicy::from_trusted_contract(8, BTreeMap::new())?;
+        let artifact = DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            source.path(),
+            commit,
+            parent.path(),
+            admitted,
+        )
+        .await?;
+        assert_eq!(
+            fs::read(artifact.root().join("a")).map_err(internal)?,
+            b"12345678"
+        );
+        drop(artifact);
+        assert!(
+            DiskPinnedTreeProjection::acquire_bounded(source.path(), commit, parent.path())
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "xet-storage")]
+    #[tokio::test]
+    async fn projection_policy_local_lfs_without_xet_is_immutable_and_hash_verified(
+    ) -> Git2DBResult<()> {
+        use sha2::{Digest, Sha256};
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
+        let source = tempfile::tempdir().map_err(internal)?;
+        let hydrated = tempfile::tempdir().map_err(internal)?;
+        let bytes = b"authentic original tensor bytes";
+        let pointer = lfs_pointer(bytes);
+        let oid = format!("{:x}", Sha256::digest(bytes));
+        let blob = hydrated.path().join("weights");
+        fs::write(&blob, bytes).map_err(internal)?;
+        let commit = commit_files(source.path(), &[("weights", pointer.as_bytes())])?;
+        let parent = disk_backed_private_parent()?;
+        let policy = ProjectionPolicy::from_trusted_contract(
+            bytes.len() as u64,
+            BTreeMap::from([(oid, blob.clone())]),
+        )?;
+        let artifact = DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            source.path(),
+            commit,
+            parent.path(),
+            policy.clone(),
+        )
+        .await?;
+        // Same-size mutation MUST NOT alter a published artifact.
+        fs::write(&blob, vec![b'x'; bytes.len()]).map_err(internal)?;
+        assert_eq!(
+            fs::read(artifact.root().join("weights")).map_err(internal)?,
+            bytes
+        );
+        drop(artifact);
+        let error = DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            source.path(),
+            commit,
+            parent.path(),
+            policy,
+        )
+        .await
+        .err()
+        .ok_or_else(|| internal("malformed input unexpectedly admitted"))?;
+        assert!(error.to_string().contains("SHA-256/size mismatch"));
+        assert!(fs::read_dir(parent.path())
+            .map_err(internal)?
+            .next()
+            .is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "xet-storage")]
+    #[tokio::test]
+    async fn projection_policy_giant_declared_lfs_stops_before_payload_allocation(
+    ) -> Git2DBResult<()> {
+        let _guard = BOUNDED_PROJECTION_TEST_LOCK.lock().await;
+        let source = tempfile::tempdir().map_err(internal)?;
+        let hydrated = tempfile::tempdir().map_err(internal)?;
+        let oid = "0".repeat(64);
+        let declared = 3 * 1024 * 1024 * 1024;
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {declared}\n"
+        );
+        let commit = commit_files(source.path(), &[("weights", pointer.as_bytes())])?;
+        let parent = disk_backed_private_parent()?;
+        let error = DiskPinnedTreeProjection::acquire_bounded(source.path(), commit, parent.path())
+            .await
+            .err()
+            .ok_or_else(|| internal("malformed input unexpectedly admitted"))?;
+        assert!(error.to_string().contains("2147483648-byte limit"));
+        assert!(fs::read_dir(parent.path())
+            .map_err(internal)?
+            .next()
+            .is_none());
+        let small = hydrated.path().join("small");
+        fs::write(&small, b"tiny").map_err(internal)?;
+        let policy =
+            ProjectionPolicy::from_trusted_contract(declared, BTreeMap::from([(oid, small)]))?;
+        let error = DiskPinnedTreeProjection::acquire_bounded_with_policy(
+            source.path(),
+            commit,
+            parent.path(),
+            policy,
+        )
+        .await
+        .err()
+        .ok_or_else(|| internal("malformed input unexpectedly admitted"))?;
+        assert!(error.to_string().contains("regular file of captured size"));
+        assert!(fs::read_dir(parent.path())
+            .map_err(internal)?
+            .next()
+            .is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "xet-storage")]
+    #[test]
+    fn projection_policy_local_source_rejects_alias_size_and_oversize_without_large_allocation(
+    ) -> Git2DBResult<()> {
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().map_err(internal)?;
+        let source = directory.path().join("source");
+        fs::write(&source, b"good").map_err(internal)?;
+        let oid = format!("{:x}", Sha256::digest(b"good"));
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&source, &link).map_err(internal)?;
+        assert!(hydrate_local_lfs(&link, &directory.path().join("copy"), &oid, 4).is_err());
+        assert!(hydrate_local_lfs(&source, &directory.path().join("short"), &oid, 3).is_err());
+        let sparse = directory.path().join("sparse");
+        File::create(&sparse)
+            .map_err(internal)?
+            .set_len(3 * 1024 * 1024 * 1024)
+            .map_err(internal)?;
+        assert!(hydrate_local_lfs(&sparse, &directory.path().join("large"), &oid, 4).is_err());
+        assert!(!directory.path().join("large").exists());
+        assert!(ProjectionPolicy::from_trusted_contract(0, BTreeMap::new()).is_err());
+        assert!(ProjectionPolicy::from_trusted_contract(u64::MAX, BTreeMap::new()).is_err());
+        Ok(())
     }
 
     #[test]
