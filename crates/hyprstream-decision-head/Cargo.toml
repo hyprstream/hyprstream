@@ -16,8 +16,9 @@ description = "Native Clef joint-schema encoder and inference head, plus the leg
 hyprstream-decision = { path = "../hyprstream-decision" }
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json = { workspace = true, features = ["raw_value", "float_roundtrip"] }
 tokenizers = { workspace = true }
+ryu = "=1.0.20"
 
 # Torch backend, matching the workspace idiom: hyprstream's tch-rs fork; the
 # CPU/CUDA/ROCm backend follows whichever libtorch build LIBTORCH points at
