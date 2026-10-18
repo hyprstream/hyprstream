@@ -1,0 +1,43 @@
+{
+  "source_repo": "Cloudflare/clef-flash",
+  "source_revision": "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+  "mode": "head",
+  "input_kind": "synthetic_hidden_original_embedding_rows",
+  "compute_dtype": "float32",
+  "source_head_dtype": "bfloat16",
+  "torch": "2.11.0+cpu",
+  "transformers": "5.10.2",
+  "tokenizers": "0.22.2",
+  "safetensors": "0.7.0",
+  "threads": 2,
+  "interop_threads": 1,
+  "artifact_manifest_sha256": "80398badcdbdb97ad5e1cdd591436837f6c5ff3244fe1da6b2207381e04cd2a6",
+  "corpus_sha256": "ebba1c6f29e8f10e243be6353d3665470ffb41681a430f29fea81e2f19ef0972",
+  "generator_sha256": "51974abb9ba4d9a24f6d18b81139d51821da2cd9b3f2c70598d9bf60aef7b0ba",
+  "rehashed_files": {
+    "joint_schema_model.py": "0e304cf7c6500e8bb59bef7e2afd2c6373f82596dfb3b57d1aa93c175e2dc3a3",
+    "joint_head_config.json": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+    "joint_head.safetensors": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "91a08f825d370d085d692e04cf117cdd7faad7bf18e996f1e6031b6dab03db72",
+    "config.json": "66f87f6fb2616b46604daf2a9c67ddc87938296d07156efa34d59b5be49e3238",
+    "model.safetensors.index.json": "941305ff9f77551e145a6cea976ef456cd5cb208cbece99f168376c752fcf96c"
+  },
+  "embedding_shard": "model-00001-of-00004.safetensors",
+  "embedding_shard_attested_sha256": "8b45a8e968141cdcc58fb71c9adfc258e2c77b5f062bc636c1fd5bc5d916b565",
+  "embedding_shape": [
+    248320,
+    4096
+  ],
+  "selected_embedding_rows": 69,
+  "files": {
+    "records.json": "7cb9e9dc84743db79a30172160d4880160904e38f1a095007844c4684298de2c",
+    "tensors.safetensors": "4499343320c401308e2844d9285b44d880a8aa8b5f84843378737327d56e0ad3"
+  },
+  "tolerances_before_comparison": {
+    "logit_absolute": 0.0001,
+    "probability_absolute": 1e-05,
+    "relative": 0
+  },
+  "limitations": "Official head on synthetic hidden input, not full backbone, FP8, calibration or CPU serving qualification."
+}

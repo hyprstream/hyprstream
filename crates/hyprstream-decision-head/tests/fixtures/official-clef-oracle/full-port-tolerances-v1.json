@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "declared_before_full_port_comparison": true,
+  "profile": "native-original-f32-cpu-vs-official-original-f32-cpu",
+  "encoding": "exact token IDs, spans, question types, option IDs/order and truncation accounting",
+  "hidden": {"atol": 0.001, "rtol": 0.0001},
+  "logits": {"atol": 0.001, "rtol": 0.0001},
+  "probabilities": {"atol": 0.0001, "rtol": 0.0001},
+  "label_mapping": "exact labels and question IDs; report every argmax disagreement",
+  "scope": "engineering port parity on five declared public synthetic records; not task accuracy, calibration or a latency/product SLA",
+  "fp8_quantization_acceptance": "separate profile; these tolerances do not qualify FP8 drift",
+  "failure_policy": "investigate source/profile differences; do not loosen thresholds after observing results"
+}
