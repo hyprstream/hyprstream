@@ -608,3 +608,8 @@ mod tests {
         assert!(JointSchemaHead::from_named_tensors(c, ws).is_err());
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "oracle_tests.rs"]
+mod oracle_tests;
