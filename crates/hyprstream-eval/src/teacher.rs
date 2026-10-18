@@ -1,0 +1,497 @@
+//! Teacher ensemble: roster, ToS provenance, raw per-teacher vectors,
+//! corrected-ensemble stand-in (the average — corrections land in P0.5), and
+//! argmax agreement against it.
+//!
+//! Per the program plan (P1.3/P0.5 contract): teacher identity is
+//! configuration with provenance, **raw per-teacher probability vectors are
+//! persisted** (corrections fit in P0.5 must be re-appliable at training
+//! time), and every teacher carries a [`TosClass`] so encumbered rows are
+//! never published and never enter Apache artifacts.
+
+use hyprstream_decision::arrow::AnswerRow;
+use hyprstream_decision::entry::Entry;
+use hyprstream_decision::spec::QuestionSet;
+
+use crate::error::EvalError;
+use crate::subject::Subject;
+
+/// Distribution-license class of a teacher's outputs, per the out-of-band
+/// roster decision (plan Q4). Recorded per teacher at roster time and carried
+/// on every [`TeacherAnswer`]; the class is **provenance**, not an enforced
+/// gate — P1.3's distributability flags and publication decisions consume it
+/// downstream, and [`TosClass::Unknown`] must be treated as the most
+/// restrictive class there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TosClass {
+    /// Outputs may be redistributed in public/Apache artifacts.
+    Distributable,
+    /// Outputs usable for training internally but never published.
+    InternalOnly,
+    /// Class not yet determined — treated as the most restrictive class for
+    /// any publication decision.
+    Unknown,
+}
+
+impl TosClass {
+    /// Wire form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Distributable => "distributable",
+            Self::InternalOnly => "internal-only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One teacher: a named subject plus its provenance.
+pub struct Teacher {
+    /// Stable roster id (recorded in DISCLOSURE / provenance rows).
+    pub id: String,
+    /// ToS class from the roster decision.
+    pub tos_class: TosClass,
+    /// The subject answering on this teacher's behalf.
+    pub subject: Box<dyn Subject>,
+}
+
+/// One teacher's raw answer to one item, with provenance. This is the
+/// persisted unit — corrections are never baked in here.
+#[derive(Debug, Clone)]
+pub struct TeacherAnswer {
+    /// Roster id.
+    pub teacher_id: String,
+    /// ToS class at run time.
+    pub tos_class: TosClass,
+    /// Resolved model id the teacher's endpoint reported.
+    pub model_id: String,
+    /// The raw answer row (distributions as emitted).
+    pub row: AnswerRow,
+}
+
+/// A roster of teachers queried in lockstep over the same items.
+pub struct TeacherEnsemble {
+    teachers: Vec<Teacher>,
+}
+
+/// The ensemble's answers to one item: every teacher's raw row, the plain
+/// average distribution per question (the corrected-ensemble stand-in until
+/// P0.5 fits corrections), and per-question argmax agreement.
+#[derive(Debug, Clone)]
+pub struct EnsembleOutput {
+    /// Raw per-teacher answers, in roster order.
+    pub teacher_answers: Vec<TeacherAnswer>,
+    /// Per-question average distribution (question id → mean over teachers).
+    pub average: std::collections::BTreeMap<String, Vec<f32>>,
+    /// Per-question fraction of teachers whose argmax label matches the
+    /// average distribution's argmax (D6 tie-breaks, earliest first).
+    pub argmax_agreement: std::collections::BTreeMap<String, f64>,
+}
+
+impl TeacherEnsemble {
+    /// Build an ensemble from a roster. A single-teacher roster is legal (the
+    /// agreement metrics then degenerate to 1.0); an empty one is not.
+    pub fn new(teachers: Vec<Teacher>) -> Result<Self, EvalError> {
+        if teachers.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "a teacher ensemble needs at least one teacher".to_owned(),
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for teacher in &teachers {
+            if teacher.id.is_empty() {
+                return Err(EvalError::InvalidInput(
+                    "a teacher id must be nonempty — it is the roster identity recorded in disclosure and provenance rows".to_owned(),
+                ));
+            }
+            if !ids.insert(teacher.id.clone()) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate teacher id `{}`",
+                    teacher.id
+                )));
+            }
+        }
+        Ok(Self { teachers })
+    }
+
+    /// The roster, in order.
+    pub fn teachers(&self) -> &[Teacher] {
+        &self.teachers
+    }
+
+    /// Query every teacher for one item and combine the answers.
+    pub async fn decide(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        row: usize,
+        item_id: &str,
+    ) -> Result<EnsembleOutput, EvalError> {
+        // Same preflight as both harness run paths, before any (possibly
+        // billed) teacher query: the set must be nonempty, every question
+        // must satisfy the jev-1 v1 profile, and question ids must be
+        // unique — the ensemble's `average` map is keyed by id, so a
+        // duplicate would silently collapse two declared questions into
+        // one (and an HTTP teacher would be billed before its side rejects
+        // the duplicate JSON keys).
+        if set.questions.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "a teacher ensemble cannot answer an empty question set".to_owned(),
+            ));
+        }
+        let mut ids = std::collections::HashSet::with_capacity(set.questions.len());
+        for question in &set.questions {
+            if !ids.insert(&question.id) {
+                return Err(EvalError::InvalidInput(format!(
+                    "duplicate question id `{}`",
+                    question.id
+                )));
+            }
+            crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
+        let mut teacher_answers = Vec::with_capacity(self.teachers.len());
+        for teacher in &self.teachers {
+            // Bind provenance to THIS response: reading resolved_model_id
+            // after decide races with a concurrent ensemble/run sharing the
+            // subject (its response can overwrite the resolved slot in
+            // between), persisting raw targets under the wrong model id.
+            let (answer_row, resolved) = teacher
+                .subject
+                .decide_with_version(set, state, row)
+                .await
+                .map_err(|error| EvalError::Subject {
+                    model: teacher.subject.model_id().to_owned(),
+                    item_id: item_id.to_owned(),
+                    message: error.to_string(),
+                })?;
+            // Teacher rows are averaged raw: a malformed row (missing answer,
+            // wrong cardinality, non-normalized distribution) would silently
+            // corrupt the ensemble, so apply the same ingest rules as runs.
+            crate::run::validate_set_answer_row(set, &answer_row).map_err(|message| {
+                EvalError::InvalidAnswer {
+                    question_id: item_id.to_owned(),
+                    message: format!("teacher `{}`: {message}", teacher.id),
+                }
+            })?;
+            teacher_answers.push(TeacherAnswer {
+                teacher_id: teacher.id.clone(),
+                tos_class: teacher.tos_class,
+                model_id: resolved,
+                row: answer_row,
+            });
+        }
+        Ok(combine(set, teacher_answers))
+    }
+}
+
+/// Combine raw teacher answers into the average + agreement view.
+fn combine(set: &QuestionSet, teacher_answers: Vec<TeacherAnswer>) -> EnsembleOutput {
+    let mut average = std::collections::BTreeMap::new();
+    let mut argmax_agreement = std::collections::BTreeMap::new();
+    for question in &set.questions {
+        let cardinality = question.cardinality();
+        // Abstentions count as disagreements and do not contribute to the
+        // average (no distribution to average); if every teacher abstains the
+        // average is the uniform distribution and agreement is 0.
+        let mut sum = vec![0f64; cardinality];
+        let mut answered = 0usize;
+        let mut argmaxes = Vec::with_capacity(teacher_answers.len());
+        for answer in &teacher_answers {
+            let value = answer
+                .row
+                .answers
+                .get(&question.id)
+                .and_then(|qa| qa.value.as_ref());
+            match value {
+                Some(value) => {
+                    let probs = value.probabilities();
+                    for (acc, p) in sum.iter_mut().zip(&probs) {
+                        *acc += f64::from(*p);
+                    }
+                    answered += 1;
+                    argmaxes.push(hyprstream_decision::confidence::argmax_index(&probs));
+                }
+                None => argmaxes.push(None),
+            }
+        }
+        // Both the answered-teacher mean (f64 → f32 conversion drift) and
+        // the all-abstained uniform fallback (rounded reciprocal — the same
+        // high-cardinality case TruthSubject handles) must satisfy the D5
+        // producer tolerance: the average is the P0.5 target distribution.
+        let mut mean: Vec<f32> = if answered > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            sum.iter().map(|s| (s / answered as f64) as f32).collect()
+        } else {
+            let uniform = 1.0 / cardinality as f32;
+            vec![uniform; cardinality]
+        };
+        crate::subject::normalize_distribution(&mut mean);
+        let ensemble_argmax = hyprstream_decision::confidence::argmax_index(&mean);
+        let matches = argmaxes
+            .iter()
+            .filter(|argmax| **argmax == ensemble_argmax)
+            .count();
+        #[allow(clippy::cast_precision_loss)]
+        let agreement = matches as f64 / teacher_answers.len() as f64;
+        average.insert(question.id.clone(), mean);
+        argmax_agreement.insert(question.id.clone(), agreement);
+    }
+    EnsembleOutput {
+        teacher_answers,
+        average,
+        argmax_agreement,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::subject::TruthSubject;
+    use hyprstream_decision::author;
+
+    fn fixture() -> QuestionSet {
+        author::parse_yaml(
+            r#"
+questions:
+  tone:
+    type: choice
+    criteria: { angry: "Hostile", calm: ~ }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn teacher(id: &str, truth: usize) -> Teacher {
+        Teacher {
+            id: id.to_owned(),
+            tos_class: TosClass::Distributable,
+            subject: Box::new(TruthSubject::new(id).with_truth("tone", truth)),
+        }
+    }
+
+    #[tokio::test]
+    async fn agreement_tracks_argmax_consensus() {
+        let set = fixture();
+        let ensemble =
+            TeacherEnsemble::new(vec![teacher("a", 0), teacher("b", 0), teacher("c", 1)]).unwrap();
+        let out = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .unwrap();
+        // Ensemble argmax is option 0 (two one-hot votes to one); teachers a
+        // and b match, c does not.
+        let agreement = out.argmax_agreement["tone"];
+        assert!((agreement - 2.0 / 3.0).abs() < 1e-12);
+        let avg = &out.average["tone"];
+        assert!((avg[0] - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(out.teacher_answers.len(), 3);
+        assert_eq!(out.teacher_answers[0].tos_class, TosClass::Distributable);
+    }
+
+    #[tokio::test]
+    async fn empty_roster_is_rejected() {
+        assert!(TeacherEnsemble::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn tos_class_serializes_in_the_documented_wire_form() {
+        // The derived serde form must match `as_str` — JSON/TOML rosters and
+        // persisted provenance use the documented kebab-case values.
+        for class in [
+            TosClass::Distributable,
+            TosClass::InternalOnly,
+            TosClass::Unknown,
+        ] {
+            let serialized = serde_json::to_string(&class).unwrap();
+            assert_eq!(
+                serialized,
+                format!("\"{}\"", class.as_str()),
+                "serde form must match the documented wire form"
+            );
+            let roundtrip: TosClass = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(roundtrip, class);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_teacher_ids_are_rejected() {
+        // The id is the roster identity recorded in disclosure/provenance
+        // rows — an empty one makes outputs unattributable.
+        let error = TeacherEnsemble::new(vec![teacher("", 0)]).err().unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "empty teacher id must be InvalidInput, got {error:?}"
+        );
+    }
+
+    /// Abstains on every question.
+    struct AbstainSubject;
+
+    #[async_trait::async_trait]
+    impl Subject for AbstainSubject {
+        fn model_id(&self) -> &str {
+            "abstain-1"
+        }
+
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            _state: &Entry,
+            _row: usize,
+        ) -> Result<AnswerRow, EvalError> {
+            let mut answers = std::collections::BTreeMap::new();
+            for question in &set.questions {
+                answers.insert(
+                    question.id.clone(),
+                    hyprstream_decision::answer::QuestionAnswer::abstained(),
+                );
+            }
+            Ok(AnswerRow { answers })
+        }
+    }
+
+    #[tokio::test]
+    async fn all_abstained_average_is_producer_valid_at_high_cardinality() {
+        // 78 options: the naive `1.0 / 78` f32 uniform sums to ~1.0000011,
+        // beyond the D5 producer tolerance — the ensemble average is the
+        // P0.5 target and must be a valid distribution.
+        let options = (0..78)
+            .map(|i| hyprstream_decision::spec::ChoiceOption {
+                name: format!("o{i}"),
+                rubric: None,
+            })
+            .collect();
+        let set = QuestionSet {
+            state: None,
+            questions: vec![hyprstream_decision::spec::QuestionSpec {
+                id: "wide".into(),
+                kind: hyprstream_decision::QuestionKind::Choice,
+                instructions: None,
+                body: hyprstream_decision::spec::QuestionBody::Choice { options },
+            }],
+        };
+        let ensemble = TeacherEnsemble::new(vec![
+            Teacher {
+                id: "a".to_owned(),
+                tos_class: TosClass::Distributable,
+                subject: Box::new(AbstainSubject),
+            },
+            Teacher {
+                id: "b".to_owned(),
+                tos_class: TosClass::Distributable,
+                subject: Box::new(AbstainSubject),
+            },
+        ])
+        .unwrap();
+        let out = ensemble.decide(&set, &Entry::Null, 0, "item").await.unwrap();
+        let average = &out.average["wide"];
+        hyprstream_decision::confidence::check_distribution(
+            average,
+            hyprstream_decision::confidence::PRODUCER_SUM_TOLERANCE,
+        )
+        .unwrap();
+    }
+
+    /// A teacher emitting a wrong-cardinality distribution must be rejected
+    /// before averaging, not silently zip-truncated into the ensemble.
+    struct WideSubject;
+
+    #[async_trait::async_trait]
+    impl Subject for WideSubject {
+        fn model_id(&self) -> &str {
+            "wide-1"
+        }
+
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            _state: &Entry,
+            _row: usize,
+        ) -> Result<AnswerRow, EvalError> {
+            let mut answers = std::collections::BTreeMap::new();
+            for question in &set.questions {
+                answers.insert(
+                    question.id.clone(),
+                    hyprstream_decision::answer::QuestionAnswer::answered(
+                        hyprstream_decision::answer::AnswerValue::Choice {
+                            // One more probability than the declared options.
+                            probabilities: vec![0.25; question.cardinality() + 1],
+                        },
+                    ),
+                );
+            }
+            Ok(AnswerRow { answers })
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_violating_question_sets_are_rejected_before_querying() {
+        // A zero-option choice would otherwise be queried (and billed)
+        // against every teacher; with abstaining teachers it could even
+        // produce an empty "average" instead of an input error.
+        let set = QuestionSet {
+            state: None,
+            questions: vec![hyprstream_decision::spec::QuestionSpec {
+                id: "broken".into(),
+                kind: hyprstream_decision::QuestionKind::Choice,
+                instructions: None,
+                body: hyprstream_decision::spec::QuestionBody::Choice { options: vec![] },
+            }],
+        };
+        let ensemble = TeacherEnsemble::new(vec![teacher("a", 0)]).unwrap();
+        let error = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "zero-option choice must be InvalidInput, got {error:?}"
+        );
+        let empty = QuestionSet {
+            state: None,
+            questions: vec![],
+        };
+        assert!(ensemble.decide(&empty, &Entry::Null, 0, "item").await.is_err());
+        // Duplicate question ids: the ensemble's `average` map is keyed by
+        // id, so a duplicate would silently collapse two declared questions
+        // into one.
+        let set = fixture();
+        let duplicated = QuestionSet {
+            state: None,
+            questions: vec![set.questions[0].clone(), set.questions[0].clone()],
+        };
+        let error = ensemble
+            .decide(&duplicated, &Entry::Null, 0, "item")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "duplicate question ids must be InvalidInput, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_teacher_rows_are_rejected_before_averaging() {
+        let set = fixture();
+        let ensemble = TeacherEnsemble::new(vec![
+            teacher("a", 0),
+            Teacher {
+                id: "wide".to_owned(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(WideSubject),
+            },
+        ])
+        .unwrap();
+        let error = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EvalError::InvalidAnswer { .. }),
+            "wrong cardinality must be InvalidAnswer, got {error:?}"
+        );
+    }
+}
