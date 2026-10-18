@@ -362,8 +362,17 @@ fn quantization_config_present(model_path: &Path) -> Result<bool, ClefDecisionEr
 /// FP8/integers and scale companions without declaring `quantization_config`.
 /// Metadata parsing mmap-touches headers only, not the model data regions.
 fn validate_dense_float_checkpoint(model_path: &Path) -> Result<(), ClefDecisionError> {
-    let shards = crate::runtime::model_factory::ModelFactory::find_shard_files(model_path)
+    let selected_shards = crate::runtime::model_factory::ModelFactory::find_shard_files(model_path)
         .map_err(|e| ClefDecisionError::Bundle(format!("select backbone safetensors: {e:#}")))?;
+    // Match ModelFactory::create + load_weights exactly: a lone index entry
+    // does not win over a coexisting model.safetensors because load_weights
+    // takes the single-file fast path first.
+    let single_file = model_path.join("model.safetensors");
+    let shards = if selected_shards.len() <= 1 && single_file.exists() {
+        vec![single_file]
+    } else {
+        selected_shards
+    };
     if shards.is_empty() {
         return Err(ClefDecisionError::Bundle(
             "backbone has no safetensors shards".into(),
@@ -735,6 +744,16 @@ impl ClefDecisionRuntime {
         let head_dir = Self::detect(model_path)
             .ok_or_else(|| ClefDecisionError::Bundle("not a Clef bundle".into()))?;
         if device != tch::Device::Cpu {
+            let admitted_kind =
+                resolve_serving_kind_for_device(model_path, precision_mode, device)?;
+            if let Some(kind_hint) = kind_hint {
+                if kind_hint != admitted_kind {
+                    return Err(ClefDecisionError::Profile(format!(
+                        "head kind hint {kind_hint:?} does not match admitted device profile {admitted_kind:?}"
+                    ))
+                    .into());
+                }
+            }
             validate_dense_float_checkpoint(model_path)?;
         }
         let config_meta = std::fs::metadata(head_dir.join(CLEF_HEAD_CONFIG_FILE))
@@ -2287,6 +2306,24 @@ mod tests {
         std::fs::write(dir.path().join("model.safetensors"), quantized).unwrap();
         let err = validate_dense_float_checkpoint(dir.path()).unwrap_err();
         assert!(err.to_string().contains("floating-point backbone tensors"));
+        assert!(err.to_string().contains("F8_E4M3"));
+
+        // Match a loader corner case: an index naming one dense shard does
+        // not override a coexisting model.safetensors in the single-file
+        // fast path. The verifier must inspect the same FP8 file the loader
+        // will actually consume.
+        let dense = TensorView::new(safetensors::Dtype::F32, vec![1], &dense_bytes).unwrap();
+        let dense_shard = serialize([("layer.weight", dense)], &None).unwrap();
+        std::fs::write(dir.path().join("dense-shard.safetensors"), dense_shard).unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&json!({
+                "weight_map": {"layer.weight": "dense-shard.safetensors"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = validate_dense_float_checkpoint(dir.path()).unwrap_err();
         assert!(err.to_string().contains("F8_E4M3"));
     }
 
