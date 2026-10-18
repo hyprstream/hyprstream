@@ -38,6 +38,17 @@ def admit_original_f32_cpu_profile(provenance, *, backbone_only, tolerance_profi
                 or provenance.get("device") != "cpu"):
             raise ValueError("original-Float32 CPU gate requires a full Float32 CPU official oracle")
 
+def admit_tolerance_corpus(provenance, tolerance_profile):
+    """Bind a declared comparison profile to its exact source corpus."""
+    if tolerance_profile is None:
+        return
+    expected = tolerance_profile.get("corpus_sha256")
+    actual = provenance.get("corpus_sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("tolerance profile must declare a lowercase SHA-256 corpus_sha256")
+    if actual != expected:
+        raise ValueError("reference corpus_sha256 does not match tolerance profile")
+
 
 def floating_comparison_entry(key, x, y, used_atol, used_rtol, torch):
     """Unavailable nonfinite metrics remain JSON null in a failed hashed report."""
@@ -177,6 +188,10 @@ def main():
     try:
         admit_original_f32_cpu_profile(provenance, backbone_only=a.backbone_only,
                                        tolerance_profile=tolerance_profile)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    try:
+        admit_tolerance_corpus(provenance, tolerance_profile)
     except ValueError as error:
         raise SystemExit(str(error)) from error
     records = json.loads((a.reference / "records.json").read_text())

@@ -31,6 +31,35 @@ def fixture():
 
 
 class ComparatorAdmissionTests(unittest.TestCase):
+    def test_full_port_tolerance_profile_pins_the_five_record_corpus(self):
+        profile = json.loads((HERE / "full-port-tolerances-v1.json").read_text())
+        corpus_digest = hashlib.sha256((HERE / "corpus.json").read_bytes()).hexdigest()
+        self.assertEqual(profile["corpus_sha256"], corpus_digest)
+        compare.admit_tolerance_corpus({"corpus_sha256": corpus_digest}, profile)
+        with self.assertRaisesRegex(ValueError, "does not match tolerance profile"):
+            compare.admit_tolerance_corpus({"corpus_sha256": "0" * 64}, profile)
+        for invalid in (None, "", "A" * 64, "0" * 63):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "must declare"):
+                compare.admit_tolerance_corpus({"corpus_sha256": corpus_digest}, {"corpus_sha256": invalid})
+
+    def test_cli_rejects_mismatched_corpus_before_tensor_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "provenance.json").write_text(json.dumps({
+                "mode": "full", "compute_dtype": "float32", "device": "cpu",
+                "corpus_sha256": "0" * 64,
+                "files": {},
+            }))
+            result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                "--reference", str(root), "--native-tensors", str(root / "unused"),
+                "--native-records", str(root / "unused-records"), "--include-hidden",
+                "--tolerance-file", str(HERE / "full-port-tolerances-v1.json"),
+                "--report", str(root / "report")], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reference corpus_sha256 does not match tolerance profile", result.stderr)
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
+            self.assertFalse((root / "report").exists())
+
     def test_full_port_requires_native_records_with_any_tolerance_source(self):
         for include_hidden in (False, True):
             with self.subTest(include_hidden=include_hidden), self.assertRaisesRegex(ValueError, "requires --native-records"):
