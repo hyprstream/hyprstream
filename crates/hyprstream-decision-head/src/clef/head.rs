@@ -423,6 +423,9 @@ mod tests {
         let c = config();
         let head = JointSchemaHead::from_named_tensors(c.clone(), weights(&c)).expect("head");
         let record = EncodedClefRecord {
+            state_tokens_before_truncation: 0,
+            state_tokens_admitted: 0,
+            state_truncated: false,
             record_id: "r".into(),
             input_ids: vec![0, 1, 2, 0],
             questions: vec![EncodedClefQuestion {
@@ -508,6 +511,9 @@ mod tests {
             .collect();
         let head = JointSchemaHead::from_named_tensors(c, ws).expect("head");
         let record = EncodedClefRecord {
+            state_tokens_before_truncation: 0,
+            state_tokens_admitted: 0,
+            state_truncated: false,
             record_id: "joint".into(),
             input_ids: (0..8).collect(),
             questions: vec![
@@ -564,6 +570,9 @@ mod tests {
         let head =
             JointSchemaHead::from_named_tensors(config, tensors).expect("strict pinned head");
         let record = EncodedClefRecord {
+            state_tokens_before_truncation: 0,
+            state_tokens_admitted: 0,
+            state_truncated: false,
             record_id: "head-smoke".into(),
             input_ids: vec![1, 2, 3, 4],
             questions: vec![EncodedClefQuestion {
