@@ -712,7 +712,7 @@ fn validate_one_answer(
     check_distribution(&probabilities, PRODUCER_SUM_TOLERANCE)
         .map_err(|error| format!("distribution violates producer tolerance (D5): {error}"))?;
     if let Some(set) = &answer.conformal_set {
-        let labels = question.labels();
+        let labels: std::collections::HashSet<_> = question.labels().into_iter().collect();
         for label in set {
             if !labels.contains(label) {
                 return Err(format!(
@@ -769,7 +769,7 @@ pub(crate) fn question_from_labels(
 #[cfg(test)]
 mod row_identity_tests {
     use super::*;
-    use hyprstream_decision::answer::QuestionAnswer;
+    use hyprstream_decision::answer::{AnswerValue, QuestionAnswer};
     use hyprstream_decision::arrow::AnswerRow;
     use hyprstream_decision::author;
 
@@ -807,6 +807,37 @@ mod row_identity_tests {
         assert!(
             matches!(validate_set_answer_row(&set, &missing), Err(ref message) if message.contains("missing an answer for question `right`"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conformal_members_validate_against_high_cardinality_labels() -> Result<(), String> {
+        use hyprstream_decision::spec::{QuestionBody, QuestionKind, QuestionSpec};
+
+        let labels: Vec<String> = (0..4096).map(|index| format!("level-{index:04}")).collect();
+        let question = QuestionSpec {
+            id: "score".into(),
+            kind: QuestionKind::Score,
+            instructions: None,
+            body: QuestionBody::Score {
+                levels: vec![None; labels.len()],
+            },
+        };
+        let conformal_set = question.labels();
+        assert_eq!(conformal_set.len(), labels.len());
+        let row = AnswerRow {
+            answers: [(
+                question.id.clone(),
+                QuestionAnswer {
+                    value: Some(AnswerValue::Score {
+                        probabilities: vec![1.0 / labels.len() as f32; labels.len()],
+                    }),
+                    conformal_set: Some(conformal_set),
+                },
+            )]
+            .into(),
+        };
+        validate_answer_row(&question, &row)?;
         Ok(())
     }
 }

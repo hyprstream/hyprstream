@@ -11,7 +11,9 @@ use hyprstream_decision::arrow::AnswerRow;
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision::spec::QuestionSet;
 use hyprstream_eval::score::ScoreConfig;
-use hyprstream_eval::{score_bench_run, score_run, EvalItem, Harness, Subject, TruthSubject};
+use hyprstream_eval::{
+    score_bench_run, score_run, EvalItem, EvalRow, EvalSet, Harness, Subject, TruthSubject,
+};
 
 fn small_items() -> Vec<hyprstream_bench::Item> {
     generate_all(&BenchConfig {
@@ -1624,6 +1626,83 @@ async fn item_scoring_preserves_resolved_alias_identity_and_rejects_mutated_prov
         score_bench_run(&output, &items, &ScoreConfig::default()),
         Err(hyprstream_eval::EvalError::InvalidInput(_))
     ));
+}
+
+struct PartialSetSubject;
+
+#[async_trait::async_trait]
+impl Subject for PartialSetSubject {
+    fn model_id(&self) -> &str {
+        "partial-set-1"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            let answer = if row == 0 && question.id == "q1" {
+                QuestionAnswer::answered(AnswerValue::Choice {
+                    probabilities: vec![0.9, 0.1],
+                })
+            } else if row == 1 && question.id == "q2" {
+                QuestionAnswer::answered(AnswerValue::Choice {
+                    probabilities: vec![0.1, 0.9],
+                })
+            } else {
+                QuestionAnswer::abstained()
+            };
+            answers.insert(question.id.clone(), answer);
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn set_shaped_score_does_not_use_bench_cross_question_fallback() {
+    let questions = hyprstream_decision::author::parse_yaml(
+        "questions:\n  q1: {type: choice, criteria: {yes: null, no: null}}\n  q2: {type: choice, criteria: {yes: null, no: null}}\n",
+    )
+    .unwrap()
+    .questions;
+    let rows: Vec<_> = ["g", "g-p1"]
+        .into_iter()
+        .map(|id| EvalRow {
+            id: id.into(),
+            family: None,
+            stratum: None,
+            group: Some("g".into()),
+            state: Entry::Null,
+            truth: Default::default(),
+        })
+        .collect();
+    let set = EvalSet {
+        name: "partial-set".into(),
+        schema_version: "v1".into(),
+        questions: questions.clone(),
+        rows,
+    };
+    let output = Harness.run_set(&set, &PartialSetSubject).await.unwrap();
+    let items: Vec<_> = set
+        .rows
+        .iter()
+        .flat_map(|row| {
+            questions.iter().map(move |question| EvalItem {
+                id: row.id.clone(),
+                question: question.clone(),
+                state: row.state.clone(),
+                family: row.family.clone(),
+                stratum: row.stratum.clone(),
+                group: row.group.clone(),
+                truth: None,
+            })
+        })
+        .collect();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    assert!(report.flip_rate.is_none());
 }
 
 #[tokio::test]

@@ -225,6 +225,14 @@ fn combine(set: &QuestionSet, teacher_answers: Vec<TeacherAnswer>) -> EnsembleOu
                 None => argmaxes.push(None),
             }
         }
+        // Preserve D6 in the accumulation precision, before narrowing can
+        // merge a unique later-index winner with an earlier component.
+        let mut winner: Option<(usize, f64)> = None;
+        for (index, &total) in sum.iter().enumerate() {
+            if winner.is_none_or(|(_, best)| total > best) {
+                winner = Some((index, total));
+            }
+        }
         // Both the answered-teacher mean (f64 → f32 conversion drift) and
         // the all-abstained uniform fallback (rounded reciprocal — the same
         // high-cardinality case TruthSubject handles) must satisfy the D5
@@ -236,7 +244,11 @@ fn combine(set: &QuestionSet, teacher_answers: Vec<TeacherAnswer>) -> EnsembleOu
             let uniform = 1.0 / cardinality as f32;
             vec![uniform; cardinality]
         };
-        crate::subject::normalize_distribution(&mut mean);
+        if let Some((winner, _)) = winner {
+            crate::subject::normalize_distribution_with_winner(&mut mean, winner);
+        } else {
+            crate::subject::normalize_distribution(&mut mean);
+        }
         let ensemble_argmax = hyprstream_decision::confidence::argmax_index(&mean);
         let matches = argmaxes
             .iter()
@@ -298,6 +310,55 @@ questions:
         assert!((avg[0] - 2.0 / 3.0).abs() < 1e-6);
         assert_eq!(out.teacher_answers.len(), 3);
         assert_eq!(out.teacher_answers[0].tos_class, TosClass::Distributable);
+    }
+
+    #[test]
+    fn ensemble_mean_preserves_f64_winner_before_narrowing() {
+        use hyprstream_decision::answer::{AnswerValue, QuestionAnswer};
+        use hyprstream_decision::arrow::AnswerRow;
+        use hyprstream_decision::confidence::{
+            argmax_index, check_distribution, PRODUCER_SUM_TOLERANCE,
+        };
+
+        let set = fixture();
+        let distributions = [
+            [0.5f32, 0.5f32],
+            [0.5f32, 0.5f32],
+            [0.49999997f32, 0.50000006f32],
+        ];
+        let sums = [
+            distributions.iter().map(|p| f64::from(p[0])).sum::<f64>(),
+            distributions.iter().map(|p| f64::from(p[1])).sum::<f64>(),
+        ];
+        assert!(sums[1] > sums[0]);
+        let narrowed: Vec<f32> = sums.iter().map(|p| (p / 3.0) as f32).collect();
+        assert_eq!(argmax_index(&narrowed), Some(0));
+
+        let answers = distributions
+            .iter()
+            .enumerate()
+            .map(|(index, probs)| {
+                check_distribution(probs, PRODUCER_SUM_TOLERANCE).unwrap();
+                TeacherAnswer {
+                    teacher_id: format!("teacher-{index}"),
+                    model_id: format!("model-{index}"),
+                    tos_class: TosClass::Distributable,
+                    row: AnswerRow {
+                        answers: std::collections::BTreeMap::from([(
+                            "tone".into(),
+                            QuestionAnswer::answered(AnswerValue::Choice {
+                                probabilities: probs.to_vec(),
+                            }),
+                        )]),
+                    },
+                }
+            })
+            .collect();
+        let out = combine(&set, answers);
+        let average = &out.average["tone"];
+        check_distribution(average, PRODUCER_SUM_TOLERANCE).unwrap();
+        assert_eq!(argmax_index(average), Some(1));
+        assert!((out.argmax_agreement["tone"] - 1.0 / 3.0).abs() < 1e-12);
     }
 
     #[tokio::test]

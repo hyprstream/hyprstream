@@ -635,7 +635,8 @@ pub fn score_bench_run(
         )));
     }
     let mut report = score_run(output, config)?;
-    let flip = flip_rate_with_observation_labels(&output.observations, true, |obs| {
+    let bench_shaped = !output.is_set_run();
+    let flip = flip_rate_with_observation_labels(&output.observations, bench_shaped, |obs| {
         by_identity
             .get(&(obs.id.as_str(), obs.question_id.as_str()))
             .map(|item| item.question.labels())

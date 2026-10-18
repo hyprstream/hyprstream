@@ -233,7 +233,7 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     }
 }
 
-fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
+pub(crate) fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
     // The caller may have selected the winner before narrowing wire f64 values.
