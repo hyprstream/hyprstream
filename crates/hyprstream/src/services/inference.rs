@@ -140,6 +140,9 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// in `Arc` and implements `Deref` so all field/method access is transparent.
 /// Streaming continuations clone the `Arc` to own the state across await points.
 pub struct InferenceServiceInner {
+    #[cfg(test)]
+    test_decision_binding:
+        parking_lot::Mutex<Option<super::clef_acceptance_control::WorkerBinding>>,
     engine: parking_lot::RwLock<TorchEngine>,
     /// Immutable base inputs, including reads deferred until after startup.
     model_path: PathBuf,
@@ -698,6 +701,8 @@ impl InferenceService {
 
         Ok(InferenceService {
             inner: Arc::new(InferenceServiceInner {
+                #[cfg(test)]
+                test_decision_binding: parking_lot::Mutex::new(None),
                 engine: parking_lot::RwLock::new(engine),
                 model_path,
                 state_path,
@@ -749,6 +754,11 @@ impl InferenceService {
             Arc::clone(&self.draining),
             crate::services::decision::resolve_deadline(data, Instant::now()),
         );
+        #[cfg(test)]
+        let cancel = match self.test_decision_binding.lock().as_ref() {
+            Some(binding) => binding.attach(_ctx, _request_id, data, cancel),
+            None => cancel,
+        };
         cancel.check()?;
 
         // Decision serving requires the retained immutable pinned artifact —
@@ -3747,6 +3757,9 @@ pub(crate) fn internal_work_audience(service_name: &str, incarnation: &str) -> S
 /// It is `Send` and can be moved to a dedicated thread via `Spawnable::run()`.
 /// The actual GPU initialization happens on the service thread.
 pub struct InferenceServiceConfig {
+    #[cfg(test)]
+    pub(crate) test_decision_control:
+        Option<std::sync::Weak<super::clef_acceptance_control::TestDecisionControl>>,
     service_name: String,
     model_path: PathBuf,
     state_path: PathBuf,
@@ -3817,6 +3830,8 @@ impl InferenceServiceConfig {
         let policy_signing_key = signing_key.clone();
         Self {
             service_name: "inference".to_owned(),
+            #[cfg(test)]
+            test_decision_control: None,
             model_path: model_path.as_ref().to_path_buf(),
             state_path: model_path.as_ref().to_path_buf(),
             pinned_artifact: None,
@@ -4346,6 +4361,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
 
             // Destructure so the (Send) config moves into the on-thread builder.
             let InferenceServiceConfig {
+                #[cfg(test)]
+                test_decision_control,
                 service_name,
                 model_path,
                 state_path,
@@ -4470,6 +4487,20 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     ]
                     .concat();
                     let incarnation = hex::encode(incarnation_bytes);
+                    #[cfg(test)]
+                    if let Some(control) = test_decision_control {
+                        let artifact = service._pinned_artifact.as_ref()
+                            .ok_or_else(|| anyhow!("T6 observer worker is not pinned"))?;
+                        let binding = super::clef_acceptance_control::WorkerBinding::bind(
+                            control, incarnation.clone(), attempt_generation,
+                            model_ref_binding.clone().ok_or_else(|| anyhow!("T6 observer model unbound"))?,
+                            service.engine.read().get_num_layers()?,
+                            &service.draining, artifact,
+                        )?;
+                        let mut slot = service.test_decision_binding.lock();
+                        anyhow::ensure!(slot.is_none(), "T6 worker bound twice");
+                        *slot = Some(binding);
+                    }
                     let instance_audience =
                         internal_work_audience(&instance_service_name, &incarnation);
                     match incarnation_handoff {
@@ -5989,6 +6020,8 @@ mod single_service_boundary_tests {
     ) -> InferenceZmqAdapter {
         let service = InferenceService {
             inner: Arc::new(InferenceServiceInner {
+                #[cfg(test)]
+                test_decision_binding: parking_lot::Mutex::new(None),
                 engine: parking_lot::RwLock::new(
                     create_engine(&RuntimeConfig::default())
                         .expect("engine construction (no weights)"),

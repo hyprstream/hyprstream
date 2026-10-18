@@ -851,6 +851,7 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
 }
 
+
 // ── W1.4: re-signed malformed-fixture negatives for the TUI profile ──────
 
 const TUI_CLIENT_ID: &str = "hyprstream-tui-staging";
@@ -1070,4 +1071,114 @@ fn w14_wrong_proof_keys_and_forbidden_services_are_denied() {
             "intended TUI scope {intended} was denied"
         );
     }
+}
+/// Causal generated Decide body -> original-holder hybrid proof consumer ->
+/// production closed-profile recognizer. The existing primary provider is a
+/// fixture: this does NOT prove OAuth mint, Policy replay commit or inference.
+#[tokio::test]
+async fn clef_generated_decide_is_holder_body_schema_and_closed_profile_bound() {
+    let (mut handle, mut record, _) = fixture();
+    let scope = "infer:model:clef-flash-fp8:main".to_owned();
+    handle.expected.scopes = vec![scope.clone()];
+    record.scopes = vec![scope];
+    let consumer = Consumer {
+        provider: Some(provider(record)),
+    };
+    let enrollments = InMemoryEnrollmentResolver::new();
+    let permits = Semaphore::new(1);
+    let policy = LocalPolicy {
+        static_enrollments: &enrollments,
+        in_flight: &permits,
+    };
+    let body=hyprstream_rpc::serialize_message(|message| {
+        let mut root=message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+        root.set_id(101);
+        let mut infer=root.init_infer();infer.set_model_ref("clef-flash-fp8:main");
+        infer.init_decide().set_clef_json(r#"{"model":"clef-flash-fp8:main","state":"ready","questions":{"ready":{"type":"noul","instructions":"Is the service ready?"}}}"#);
+    }).unwrap();
+    let schema = crate::services::model::FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID;
+    let ed = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+    let pq = ml_dsa_sk_from_seed(&[42; 32]);
+    let kids = session_primary_kids(&ed.verifying_key().to_bytes(), &ml_dsa_sk_to_vk_bytes(&pq));
+    let signer = AuthenticatedHybridProofSigner::new(ed, kids[0], pq, kids[1]).unwrap();
+    let binding = FederateRecipientBinding::from_recipients(None, None, None).unwrap();
+    let proof = build_authenticated_hybrid_request_proof(
+        &AuthenticatedRequestProofInput {
+            service_domain: "model",
+            credential: TOKEN,
+            issued_at: NOW,
+            expires_at: NOW + 20,
+            capnp_schema_id: schema,
+            capnp_body: &body,
+            response_binding: None,
+            federate_recipient_binding: Some(&binding),
+        },
+        &signer,
+    )
+    .unwrap();
+    let request = Request {
+        proof: &proof,
+        credential: TOKEN,
+        service: "model",
+        schema_id: schema,
+        body: &body,
+    };
+    consumer
+        .verify(&handle, &request, &policy, || NOW)
+        .await
+        .unwrap();
+    let decoded =
+        crate::services::generated::model_client::decode_model_request_body(&body).unwrap();
+    let pin = crate::services::model::StagingModelPin::federate_clef_startup_fixture().unwrap();
+    assert_eq!(
+        crate::services::model::federate_model_operation(&decoded, &pin).unwrap(),
+        ("model:clef-flash-fp8:main".into(), "infer".into())
+    );
+    for wrong in [
+        Request {
+            body: b"substituted-method",
+            ..request
+        },
+        Request {
+            schema_id: 1,
+            ..request
+        },
+        Request {
+            service: "registry",
+            ..request
+        },
+        Request {
+            credential: b"relay-token",
+            ..request
+        },
+    ] {
+        assert!(consumer
+            .verify(&handle, &wrong, &policy, || NOW)
+            .await
+            .is_err());
+    }
+    let mut corrupted = proof.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 1;
+    let bad_proof = Request {
+        proof: &corrupted,
+        ..request
+    };
+    assert!(consumer
+        .verify(&handle, &bad_proof, &policy, || NOW)
+        .await
+        .is_err());
+    handle.expected.ed_public = [51; 32];
+    assert!(consumer
+        .verify(&handle, &request, &policy, || NOW)
+        .await
+        .is_err());
+    assert!(crate::services::model::federate_model_operation(
+        &decoded,
+        &crate::services::model::StagingModelPin::reviewed().unwrap()
+    )
+    .is_err());
+    let unqualified =
+        crate::services::model::StagingModelPin::new(pin.model_ref.clone(), pin.commit).unwrap();
+    assert!(crate::services::model::federate_model_operation(&decoded, &unqualified).is_err());
 }

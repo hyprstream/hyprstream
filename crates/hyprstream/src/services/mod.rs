@@ -231,3 +231,6 @@ pub mod event_network;
 
 /// Native producer/Streams carrier admission and lifecycle.
 pub mod stream_network;
+
+#[cfg(test)]
+pub(crate) mod clef_acceptance_control;

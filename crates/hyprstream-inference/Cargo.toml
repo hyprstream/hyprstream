@@ -61,6 +61,8 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber.workspace = true
 
 [features]
+# Native decision boundary observation only; enabled by embedding test dev-deps.
+test-fixtures = []
 default = []
 cuda = []
 bnb = ["dep:bitsandbytes-sys"] # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
