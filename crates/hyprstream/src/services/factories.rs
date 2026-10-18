@@ -3338,9 +3338,11 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("decision outcome schema init: {e}"))?;
-                QueryOrchestrator::new(backend.clone() as Arc<dyn hyprstream_metrics::StorageBackend>)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("QueryOrchestrator init: {e}"))
+                QueryOrchestrator::new(
+                    backend.clone() as Arc<dyn hyprstream_metrics::StorageBackend>
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("QueryOrchestrator init: {e}"))
             })
         })
         .map_err(|e| anyhow::anyhow!("metrics service init: {e}"))?,

@@ -9,13 +9,13 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+use crate::metrics::decision_batch::encode_batch_ipc;
 use crate::metrics::decision_outcome::{
     create_decision_outcome_tables, mint_decision_row_id, CalibExpectation, CalibFilter,
     DecisionOutcomeQuery, DecisionPins, DecisionRowQuery, DecisionRowStore, ExpectedPins,
-    NewOutcome, OutcomeStore, TrustedTenant, DECISION_ROW_ID_COLUMN, DECISION_ROWS_TABLE,
+    NewOutcome, OutcomeStore, TrustedTenant, DECISION_ROWS_TABLE, DECISION_ROW_ID_COLUMN,
     FIELD_META_KIND, FIELD_META_LABELS, MAX_DECISION_ROWS_PER_BATCH,
 };
-use crate::metrics::decision_batch::encode_batch_ipc;
 use crate::storage::duckdb::DuckDbBackend;
 use duckdb::arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
@@ -65,10 +65,7 @@ fn decision_payload_with_calib(calib: Option<&str>) -> RecordBatch {
     );
     let mut score_meta = HashMap::new();
     score_meta.insert(FIELD_META_KIND.to_owned(), "score".to_owned());
-    score_meta.insert(
-        FIELD_META_LABELS.to_owned(),
-        r#"["0","1","2"]"#.to_owned(),
-    );
+    score_meta.insert(FIELD_META_LABELS.to_owned(), r#"["0","1","2"]"#.to_owned());
 
     let choice_values: Vec<Option<Vec<Option<f32>>>> = vec![
         Some(vec![Some(0.7), Some(0.2), Some(0.1)]),
@@ -129,7 +126,11 @@ async fn seed_two_decisions(
         .await
         .expect("put raw decision");
     let calibrated = rows
-        .put(&tenant(TENANT_A), &pins(Some("cal-1")), &calibrated_payload())
+        .put(
+            &tenant(TENANT_A),
+            &pins(Some("cal-1")),
+            &calibrated_payload(),
+        )
         .await
         .expect("put calibrated decision");
     (
@@ -153,7 +154,11 @@ async fn test_put_get_round_trip_stable_ids_and_lossless_payload() {
         .expect("decision present");
     assert_eq!(meta.decision_id, raw_id);
     assert_eq!(meta.tenant_id, TENANT_A);
-    assert_eq!(meta.pins, pins(None), "raw inference keeps calib_version None");
+    assert_eq!(
+        meta.pins,
+        pins(None),
+        "raw inference keeps calib_version None"
+    );
     assert!(meta.pins.calib_version.is_none());
     assert_eq!(meta.row_count, 3);
     assert_eq!(meta.payload_format, "arrow-ipc-stream");
@@ -196,8 +201,12 @@ async fn test_file_backed_persistence_reload() {
     let db_path = dir.path().join("outcomes.duckdb");
     let (raw_id, raw_rows, _calib_id, _calib_rows) = {
         let backend = Arc::new(
-            DuckDbBackend::new(db_path.to_string_lossy().into_owned(), Default::default(), None)
-                .expect("backend"),
+            DuckDbBackend::new(
+                db_path.to_string_lossy().into_owned(),
+                Default::default(),
+                None,
+            )
+            .expect("backend"),
         );
         let (rows, _outcomes) = stores_on_backend(backend).await;
         seed_two_decisions(&rows).await
@@ -207,8 +216,12 @@ async fn test_file_backed_persistence_reload() {
     // Reopen from disk: decision rows, stable ids, pins and distributions
     // must survive the restart unchanged.
     let backend = Arc::new(
-        DuckDbBackend::new(db_path.to_string_lossy().into_owned(), Default::default(), None)
-            .expect("backend reopen"),
+        DuckDbBackend::new(
+            db_path.to_string_lossy().into_owned(),
+            Default::default(),
+            None,
+        )
+        .expect("backend reopen"),
     );
     let (rows, outcomes) = stores_on_backend(backend).await;
 
@@ -551,7 +564,11 @@ async fn test_join_filters_calib_distinction_and_supersession() {
         .join_outcomes(&tenant(TENANT_A), &DecisionOutcomeQuery::default())
         .await
         .expect("join");
-    assert_eq!(default_join.num_rows(), 2, "correction replaces, not duplicates");
+    assert_eq!(
+        default_join.num_rows(),
+        2,
+        "correction replaces, not duplicates"
+    );
     let ids = default_join
         .column_by_name("outcome_id")
         .unwrap()
@@ -629,7 +646,10 @@ async fn test_caller_supplied_row_ids_preserved_and_minted_when_absent() {
         .put(&tenant(TENANT_A), &pins(None), &with_ids)
         .await
         .expect("put with caller ids");
-    assert_eq!(stored.row_ids, ids, "caller-supplied ids preserved verbatim");
+    assert_eq!(
+        stored.row_ids, ids,
+        "caller-supplied ids preserved verbatim"
+    );
 
     // Duplicate ids within one batch are rejected.
     let dup = vec!["row-1", "row-1", "row-3"];
@@ -655,12 +675,9 @@ async fn test_caller_supplied_row_ids_preserved_and_minted_when_absent() {
     assert!(err.message().contains("unique"));
 
     // Oversized batch is rejected before any write.
-    let big = vec![
-        decision_payload();
-        MAX_DECISION_ROWS_PER_BATCH + 1
-    ];
-    let oversized = duckdb::arrow::compute::concat_batches(&decision_payload().schema(), &big)
-        .expect("concat");
+    let big = vec![decision_payload(); MAX_DECISION_ROWS_PER_BATCH + 1];
+    let oversized =
+        duckdb::arrow::compute::concat_batches(&decision_payload().schema(), &big).expect("concat");
     let err = rows
         .put(&tenant(TENANT_A), &pins(None), &oversized)
         .await
@@ -740,11 +757,14 @@ async fn test_put_admission_rejects_bad_payload_schemas() {
     };
 
     // Duplicate field names: name-keyed question lookup must stay unambiguous.
-    let dup = Schema::new(vec![question_field(
-        "choice",
-        r#"["a","b","c"]"#,
-        DataType::Float32,
-    ); 2]);
+    let dup = Schema::new(vec![
+        question_field(
+            "choice",
+            r#"["a","b","c"]"#,
+            DataType::Float32,
+        );
+        2
+    ]);
     let batch = RecordBatch::new_empty(Arc::new(dup));
     let err = rows
         .put(&tenant(TENANT_A), &pins(None), &batch)
@@ -890,11 +910,13 @@ async fn test_score_outcome_label_canonical_membership_and_exclusivity() {
 fn payload_with_choice_values(values: Vec<Option<Vec<Option<f32>>>>) -> RecordBatch {
     let mut meta = HashMap::new();
     meta.insert(FIELD_META_KIND.to_owned(), "choice".to_owned());
-    meta.insert(FIELD_META_LABELS.to_owned(), r#"["alpha","beta","gamma"]"#.to_owned());
+    meta.insert(
+        FIELD_META_LABELS.to_owned(),
+        r#"["alpha","beta","gamma"]"#.to_owned(),
+    );
     let route = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(values, 3);
     let schema = Arc::new(Schema::new(vec![
-        Field::new("route.probabilities", route.data_type().clone(), true)
-            .with_metadata(meta),
+        Field::new("route.probabilities", route.data_type().clone(), true).with_metadata(meta),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("model_version", DataType::Utf8, false),
         Field::new("calib_version", DataType::Utf8, true),
@@ -944,7 +966,11 @@ async fn test_put_rejects_invalid_distribution_values_with_zero_inserts() {
     let mut values = base.clone();
     values[0].as_mut().unwrap()[1] = Some(f32::NAN);
     let err = rows
-        .put(&tenant(TENANT_A), &pins(None), &payload_with_choice_values(values))
+        .put(
+            &tenant(TENANT_A),
+            &pins(None),
+            &payload_with_choice_values(values),
+        )
         .await
         .expect_err("NaN component must be rejected");
     assert!(err.message().contains("not a finite probability"), "{err}");
@@ -953,7 +979,11 @@ async fn test_put_rejects_invalid_distribution_values_with_zero_inserts() {
     let mut values = base.clone();
     values[2].as_mut().unwrap()[0] = Some(-0.1);
     let err = rows
-        .put(&tenant(TENANT_A), &pins(None), &payload_with_choice_values(values))
+        .put(
+            &tenant(TENANT_A),
+            &pins(None),
+            &payload_with_choice_values(values),
+        )
         .await
         .expect_err("negative component must be rejected");
     assert!(err.message().contains("in [0, 1]"), "{err}");
@@ -962,7 +992,11 @@ async fn test_put_rejects_invalid_distribution_values_with_zero_inserts() {
     let mut values = base.clone();
     values[0].as_mut().unwrap()[2] = Some(0.05);
     let err = rows
-        .put(&tenant(TENANT_A), &pins(None), &payload_with_choice_values(values))
+        .put(
+            &tenant(TENANT_A),
+            &pins(None),
+            &payload_with_choice_values(values),
+        )
         .await
         .expect_err("beyond-consumer sum must be rejected");
     assert!(err.message().contains("sums to"), "{err}");
@@ -972,7 +1006,11 @@ async fn test_put_rejects_invalid_distribution_values_with_zero_inserts() {
     let mut values = base.clone();
     values[0].as_mut().unwrap()[1] = None;
     let err = rows
-        .put(&tenant(TENANT_A), &pins(None), &payload_with_choice_values(values))
+        .put(
+            &tenant(TENANT_A),
+            &pins(None),
+            &payload_with_choice_values(values),
+        )
         .await
         .expect_err("null component in present distribution");
     assert!(err.message().contains("null component"), "{err}");
@@ -989,7 +1027,11 @@ async fn test_put_rejects_invalid_distribution_values_with_zero_inserts() {
         Some(vec![Some(0.1), Some(0.6), Some(0.3)]),
     ];
     let stored = rows
-        .put(&tenant(TENANT_A), &pins(None), &payload_with_choice_values(band))
+        .put(
+            &tenant(TENANT_A),
+            &pins(None),
+            &payload_with_choice_values(band),
+        )
         .await
         .expect("within-consumer sum accepted unchanged");
     let (_, dist) = rows
@@ -1002,7 +1044,11 @@ async fn test_put_rejects_invalid_distribution_values_with_zero_inserts() {
     let row = flat.value(0);
     let values = row.as_any().downcast_ref::<Float32Array>().unwrap();
     assert_eq!(values.value(0), 0.80_f32, "stored value is the caller's");
-    assert_eq!(values.value(2), 0.04_f32, "0.04 preserved exactly as supplied");
+    assert_eq!(
+        values.value(2),
+        0.04_f32,
+        "0.04 preserved exactly as supplied"
+    );
 }
 
 /// Reserved provenance columns contradicting the declared pins are rejected:
@@ -1016,13 +1062,15 @@ async fn test_put_rejects_pin_provenance_mismatch() {
     // Payload claiming a DIFFERENT model than the declared pin.
     let mut meta = HashMap::new();
     meta.insert(FIELD_META_KIND.to_owned(), "choice".to_owned());
-    meta.insert(FIELD_META_LABELS.to_owned(), r#"["alpha","beta"]"#.to_owned());
+    meta.insert(
+        FIELD_META_LABELS.to_owned(),
+        r#"["alpha","beta"]"#.to_owned(),
+    );
     let wrong_model = || {
-        let route =
-            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                vec![Some(vec![Some(0.6), Some(0.4)])],
-                2,
-            );
+        let route = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vec![Some(vec![Some(0.6), Some(0.4)])],
+            2,
+        );
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("route.probabilities", route.data_type().clone(), true)
@@ -1044,7 +1092,10 @@ async fn test_put_rejects_pin_provenance_mismatch() {
         .put(&tenant(TENANT_A), &pins(None), &wrong_model())
         .await
         .expect_err("payload model contradicts the declared pin");
-    assert!(err.message().contains("contradicts the declared model pin"), "{err}");
+    assert!(
+        err.message().contains("contradicts the declared model pin"),
+        "{err}"
+    );
 
     // Calibrated payload (calib column filled) under a RAW pin.
     let err = rows
@@ -1058,7 +1109,10 @@ async fn test_put_rejects_pin_provenance_mismatch() {
         .put(&tenant(TENANT_A), &pins(Some("cal-1")), &decision_payload())
         .await
         .expect_err("raw payload under calibrated pin");
-    assert!(err.message().contains("contradicts the calibrated pin"), "{err}");
+    assert!(
+        err.message().contains("contradicts the calibrated pin"),
+        "{err}"
+    );
 
     // Calib column present but claiming a DIFFERENT version.
     let mut other_calib = calibrated_payload();
@@ -1068,18 +1122,30 @@ async fn test_put_rejects_pin_provenance_mismatch() {
         .schema()
         .index_of("calib_version")
         .expect("calib_version column");
-    columns[calib_idx] = Arc::new(StringArray::from(vec![Some("cal-9"), Some("cal-9"), Some("cal-9")]));
+    columns[calib_idx] = Arc::new(StringArray::from(vec![
+        Some("cal-9"),
+        Some("cal-9"),
+        Some("cal-9"),
+    ]));
     other_calib = RecordBatch::try_new(other_calib.schema(), columns).unwrap();
     let err = rows
         .put(&tenant(TENANT_A), &pins(Some("cal-1")), &other_calib)
         .await
         .expect_err("different calibration version must be rejected");
-    assert!(err.message().contains("contradicts the declared calibration pin"), "{err}");
+    assert!(
+        err.message()
+            .contains("contradicts the declared calibration pin"),
+        "{err}"
+    );
 
     // Consistent pairs still store: raw payload/raw pin (covered above by
     // seed), calibrated payload/calibrated pin.
     let stored = rows
-        .put(&tenant(TENANT_A), &pins(Some("cal-1")), &calibrated_payload())
+        .put(
+            &tenant(TENANT_A),
+            &pins(Some("cal-1")),
+            &calibrated_payload(),
+        )
         .await
         .expect("consistent calibrated pair");
     assert_eq!(stored.row_ids.len(), 3);

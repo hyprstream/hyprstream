@@ -27,11 +27,11 @@
 #![allow(clippy::result_large_err)]
 
 use crate::storage::StorageBackend;
-use hyprstream_decision::confidence::{check_distribution, CONSUMER_SUM_TOLERANCE};
-use hyprstream_decision::spec::QuestionKind;
 use arrow::array::FixedSizeListArray;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+use hyprstream_decision::confidence::{check_distribution, CONSUMER_SUM_TOLERANCE};
+use hyprstream_decision::spec::QuestionKind;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tonic::Status;
@@ -130,7 +130,9 @@ impl TrustedTenant {
             return Err(invalid("tenant domain must not contain control characters"));
         }
         if domain.trim() != domain {
-            return Err(invalid("tenant domain must not have leading/trailing whitespace"));
+            return Err(invalid(
+                "tenant domain must not have leading/trailing whitespace",
+            ));
         }
         Ok(Self(domain))
     }
@@ -203,7 +205,9 @@ fn validate_pin_field(name: &str, value: &str) -> Result<(), Status> {
         return Err(invalid(format!("{name} exceeds {MAX_PIN_LEN} characters")));
     }
     if value.chars().any(char::is_control) {
-        return Err(invalid(format!("{name} must not contain control characters")));
+        return Err(invalid(format!(
+            "{name} must not contain control characters"
+        )));
     }
     Ok(())
 }
@@ -214,15 +218,15 @@ fn validate_stored_id(kind: &str, id: &str) -> Result<(), Status> {
         return Err(invalid(format!("{kind} must not be empty")));
     }
     if id.len() > MAX_STORED_ID_LEN {
-        return Err(invalid(format!("{kind} exceeds {MAX_STORED_ID_LEN} characters")));
+        return Err(invalid(format!(
+            "{kind} exceeds {MAX_STORED_ID_LEN} characters"
+        )));
     }
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
     {
-        return Err(invalid(format!(
-            "{kind} may only contain [A-Za-z0-9._:/-]"
-        )));
+        return Err(invalid(format!("{kind} may only contain [A-Za-z0-9._:/-]")));
     }
     Ok(())
 }
@@ -386,7 +390,10 @@ fn decision_row_meta_row_batch(
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![meta.decision_id.as_str()])),
         Arc::new(StringArray::from(vec![meta.tenant_id.as_str()])),
-        Arc::new(StringArray::from(vec![meta.pins.schema_fingerprint.as_str()])),
+        Arc::new(StringArray::from(vec![meta
+            .pins
+            .schema_fingerprint
+            .as_str()])),
         Arc::new(StringArray::from(vec![meta.pins.model_id.as_str()])),
         Arc::new(StringArray::from(vec![meta.pins.encoding_id.as_str()])),
         Arc::new(StringArray::from(vec![meta.pins.quantization.as_str()])),
@@ -403,7 +410,9 @@ fn decision_row_meta_row_batch(
 
 /// Append the store-owned [`DECISION_ROW_ID_COLUMN`] with freshly minted ids.
 fn batch_with_minted_row_ids(batch: &RecordBatch) -> Result<(RecordBatch, Vec<String>), Status> {
-    let row_ids: Vec<String> = (0..batch.num_rows()).map(|_| mint_decision_row_id()).collect();
+    let row_ids: Vec<String> = (0..batch.num_rows())
+        .map(|_| mint_decision_row_id())
+        .collect();
     let mut fields: Vec<FieldRef> = batch.schema().fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(
         DECISION_ROW_ID_COLUMN,
@@ -427,9 +436,7 @@ fn payload_row_ids(batch: &RecordBatch) -> Result<(Option<RecordBatch>, Vec<Stri
             let arr = col
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    invalid(format!("{DECISION_ROW_ID_COLUMN} column must be Utf8"))
-                })?;
+                .ok_or_else(|| invalid(format!("{DECISION_ROW_ID_COLUMN} column must be Utf8")))?;
             let mut ids = Vec::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
@@ -483,8 +490,11 @@ fn validate_declared_labels(
             "question {question_id:?}: declared labels must be 1..=255 non-empty bounded strings"
         )));
     }
-    let distinct =
-        labels.iter().collect::<std::collections::HashSet<_>>().len() == labels.len();
+    let distinct = labels
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == labels.len();
     if !distinct {
         return Err(invalid(format!(
             "question {question_id:?}: declared labels must be distinct"
@@ -506,8 +516,7 @@ fn validate_declared_labels(
             }
         }
         QuestionKind::Score => {
-            let canonical: Vec<String> =
-                (0..labels.len()).map(|level| level.to_string()).collect();
+            let canonical: Vec<String> = (0..labels.len()).map(|level| level.to_string()).collect();
             if labels.len() < 2 || labels != canonical {
                 return Err(invalid(format!(
                     "question {question_id:?}: score labels must be the canonical levels 0..{}",
@@ -641,7 +650,10 @@ pub(crate) const CALIB_VERSION_COLUMN: &str = "calib_version";
 /// all equal to the pin otherwise. `schema_version` is deliberately NOT
 /// compared to the Arrow fingerprint — it is the question-set schema version,
 /// a different identity.
-pub(crate) fn validate_reserved_columns(batch: &RecordBatch, pins: &DecisionPins) -> Result<(), Status> {
+pub(crate) fn validate_reserved_columns(
+    batch: &RecordBatch,
+    pins: &DecisionPins,
+) -> Result<(), Status> {
     let schema = batch.schema();
     if let Ok(field) = schema.field_with_name(MODEL_VERSION_COLUMN) {
         if field.data_type() != &DataType::Utf8 {
@@ -752,9 +764,8 @@ pub(crate) fn validate_payload_values(batch: &RecordBatch) -> Result<(), Status>
                 )));
             }
             let slice: Vec<f32> = values.values().to_vec();
-            check_distribution(&slice, CONSUMER_SUM_TOLERANCE).map_err(|e| {
-                invalid(format!("question {question_id:?} row {row}: {e}"))
-            })?;
+            check_distribution(&slice, CONSUMER_SUM_TOLERANCE)
+                .map_err(|e| invalid(format!("question {question_id:?} row {row}: {e}")))?;
         }
     }
     Ok(())
@@ -886,7 +897,11 @@ impl ExpectedPins {
         };
         if let Some(want) = &self.schema_fingerprint {
             if want != &pins.schema_fingerprint {
-                return Err(mismatch("schema_fingerprint", want, &pins.schema_fingerprint));
+                return Err(mismatch(
+                    "schema_fingerprint",
+                    want,
+                    &pins.schema_fingerprint,
+                ));
             }
         }
         if let Some(want) = &self.model_id {
@@ -976,7 +991,13 @@ fn outcome_record_from_row(batch: &RecordBatch, row: usize) -> Result<OutcomeRec
     let value_at = batch
         .column_by_name("outcome_value")
         .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
-        .and_then(|arr| if arr.is_null(row) { None } else { Some(arr.value(row)) });
+        .and_then(|arr| {
+            if arr.is_null(row) {
+                None
+            } else {
+                Some(arr.value(row))
+            }
+        });
     let created_at = batch
         .column_by_name("created_at")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
@@ -1007,7 +1028,9 @@ fn outcome_record_row_batch(record: &OutcomeRecord) -> Result<RecordBatch, Statu
         Arc::new(StringArray::from(vec![record.outcome_label.as_deref()])),
         Arc::new(Float64Array::from(vec![record.outcome_value])),
         Arc::new(StringArray::from(vec![record.outcome_source.as_str()])),
-        Arc::new(StringArray::from(vec![record.supersedes_outcome_id.as_deref()])),
+        Arc::new(StringArray::from(vec![record
+            .supersedes_outcome_id
+            .as_deref()])),
         Arc::new(Int64Array::from(vec![record.created_at])),
     ];
     RecordBatch::try_new(schema, arrays)
@@ -1341,7 +1364,9 @@ impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
             )));
         }
         if outcome.outcome_source.chars().any(char::is_control) {
-            return Err(invalid("outcome_source must not contain control characters"));
+            return Err(invalid(
+                "outcome_source must not contain control characters",
+            ));
         }
         if let Some(prev) = &outcome.supersedes_outcome_id {
             validate_stored_id("supersedes_outcome_id", prev)?;
@@ -1421,7 +1446,9 @@ impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
 
         // Exact-row linkage: the id must address one row of this payload.
         let ids = payload_row_id_column(&payload)?;
-        let occurrences = (0..ids.len()).filter(|i| ids.value(*i) == outcome.decision_row_id).count();
+        let occurrences = (0..ids.len())
+            .filter(|i| ids.value(*i) == outcome.decision_row_id)
+            .count();
         match occurrences {
             0 => {
                 return Err(invalid(format!(
@@ -1435,15 +1462,12 @@ impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
 
         // Supersession must correct the SAME observation, same tenant.
         if let Some(prev_id) = &outcome.supersedes_outcome_id {
-            let prev = self
-                .fetch_outcome(tenant, prev_id)
-                .await?
-                .ok_or_else(|| {
-                    Status::not_found(format!(
-                        "superseded outcome {prev_id} not found in tenant {}",
-                        tenant.as_str()
-                    ))
-                })?;
+            let prev = self.fetch_outcome(tenant, prev_id).await?.ok_or_else(|| {
+                Status::not_found(format!(
+                    "superseded outcome {prev_id} not found in tenant {}",
+                    tenant.as_str()
+                ))
+            })?;
             if prev.decision_id != outcome.decision_id
                 || prev.decision_row_id != outcome.decision_row_id
                 || prev.question_id != outcome.question_id
@@ -1538,10 +1562,7 @@ impl<B: StorageBackend + ?Sized> OutcomeStore<B> {
         }
         if let Some(question) = &query.question_id {
             validate_question_id(question)?;
-            sql.push_str(&format!(
-                " AND o.question_id = '{}'",
-                escape_sql(question)
-            ));
+            sql.push_str(&format!(" AND o.question_id = '{}'", escape_sql(question)));
         }
         sql.push_str(&query.calib.sql_predicate("d.calib_version")?);
         if !query.include_superseded {
@@ -1622,7 +1643,9 @@ mod tests {
         assert!(validate_outcome_against_domain(&domain, "q", &Some("z".into()), &None).is_err());
         assert!(validate_outcome_against_domain(&domain, "q", &None, &None).is_err());
         assert!(validate_outcome_against_domain(&domain, "q", &None, &Some(0.5)).is_err());
-        assert!(validate_outcome_against_domain(&domain, "q", &Some("a".into()), &Some(0.5)).is_err());
+        assert!(
+            validate_outcome_against_domain(&domain, "q", &Some("a".into()), &Some(0.5)).is_err()
+        );
 
         let score = QuestionDomain {
             kind: QuestionKind::Score,
@@ -1637,7 +1660,9 @@ mod tests {
         assert!(validate_outcome_against_domain(&score, "s", &None, &Some(2.5)).is_err());
         assert!(validate_outcome_against_domain(&score, "s", &None, &Some(f64::NAN)).is_err());
         // Label+value on a score is ambiguous -> rejected (review followup).
-        assert!(validate_outcome_against_domain(&score, "s", &Some("0".into()), &Some(2.0)).is_err());
+        assert!(
+            validate_outcome_against_domain(&score, "s", &Some("0".into()), &Some(2.0)).is_err()
+        );
         // A fabricated empty label is rejected; null abstention stays null.
         assert!(validate_outcome_against_domain(&score, "s", &Some(String::new()), &None).is_err());
     }
@@ -1650,13 +1675,19 @@ mod tests {
             &["false".into(), "true".into()]
         )
         .is_ok());
-        assert!(validate_declared_labels("n", QuestionKind::Noul, &["true".into(), "false".into()])
-            .is_err());
-        assert!(validate_declared_labels("c", QuestionKind::Choice, &["a".into(), "b".into()])
-            .is_ok());
+        assert!(validate_declared_labels(
+            "n",
+            QuestionKind::Noul,
+            &["true".into(), "false".into()]
+        )
+        .is_err());
+        assert!(
+            validate_declared_labels("c", QuestionKind::Choice, &["a".into(), "b".into()]).is_ok()
+        );
         assert!(validate_declared_labels("c", QuestionKind::Choice, &["a".into()]).is_err());
-        assert!(validate_declared_labels("c", QuestionKind::Choice, &["a".into(), "a".into()])
-            .is_err());
+        assert!(
+            validate_declared_labels("c", QuestionKind::Choice, &["a".into(), "a".into()]).is_err()
+        );
         assert!(validate_declared_labels(
             "s",
             QuestionKind::Score,
@@ -1672,11 +1703,18 @@ mod tests {
         .is_err());
         assert!(validate_declared_labels("s", QuestionKind::Score, &["0".into()]).is_err());
         // Reserved v2 kinds are not storable.
-        assert!(validate_declared_labels("d", QuestionKind::Derived, &["0".into(), "1".into()])
-            .is_err());
+        assert!(
+            validate_declared_labels("d", QuestionKind::Derived, &["0".into(), "1".into()])
+                .is_err()
+        );
     }
 
-    fn question_field(name: &str, kind: &str, labels: &str, width: i32) -> arrow::datatypes::FieldRef {
+    fn question_field(
+        name: &str,
+        kind: &str,
+        labels: &str,
+        width: i32,
+    ) -> arrow::datatypes::FieldRef {
         use std::collections::HashMap;
         let mut meta = HashMap::new();
         meta.insert(FIELD_META_KIND.to_owned(), kind.to_owned());
@@ -1698,18 +1736,8 @@ mod tests {
     fn payload_schema_admission_rejects_bad_questions() {
         // Duplicate field names are rejected.
         let dup = Schema::new(vec![
-            question_field(
-                "q.probabilities",
-                "choice",
-                r#"["a","b"]"#,
-                2,
-            ),
-            question_field(
-                "q.probabilities",
-                "choice",
-                r#"["a","b"]"#,
-                2,
-            ),
+            question_field("q.probabilities", "choice", r#"["a","b"]"#, 2),
+            question_field("q.probabilities", "choice", r#"["a","b"]"#, 2),
         ]);
         let err = validate_payload_schema(&dup).unwrap_err();
         assert!(err.message().contains("duplicate field name"));
@@ -1726,10 +1754,7 @@ mod tests {
         let wrong_dtype = Schema::new(vec![Arc::new(
             Field::new(
                 "q.probabilities",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float64, true)),
-                    2,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 2),
                 true,
             )
             .with_metadata(f64_meta),
@@ -1769,16 +1794,23 @@ mod tests {
     #[test]
     fn calib_filter_sql_predicates() {
         assert_eq!(CalibFilter::All.sql_predicate("c").unwrap(), "");
-        assert_eq!(CalibFilter::RawOnly.sql_predicate("c").unwrap(), " AND c IS NULL");
+        assert_eq!(
+            CalibFilter::RawOnly.sql_predicate("c").unwrap(),
+            " AND c IS NULL"
+        );
         assert_eq!(
             CalibFilter::CalibratedOnly.sql_predicate("c").unwrap(),
             " AND c IS NOT NULL"
         );
         assert_eq!(
-            CalibFilter::Version("cal-1".into()).sql_predicate("c").unwrap(),
+            CalibFilter::Version("cal-1".into())
+                .sql_predicate("c")
+                .unwrap(),
             " AND c = 'cal-1'"
         );
-        assert!(CalibFilter::Version(String::new()).sql_predicate("c").is_err());
+        assert!(CalibFilter::Version(String::new())
+            .sql_predicate("c")
+            .is_err());
     }
 
     #[test]
@@ -1807,7 +1839,10 @@ mod tests {
 
     #[test]
     fn limit_clause_bounds_queries() {
-        assert_eq!(limit_clause(0).unwrap(), format!(" LIMIT {DEFAULT_QUERY_LIMIT}"));
+        assert_eq!(
+            limit_clause(0).unwrap(),
+            format!(" LIMIT {DEFAULT_QUERY_LIMIT}")
+        );
         assert_eq!(limit_clause(5).unwrap(), " LIMIT 5");
         assert_eq!(
             limit_clause(u32::MAX).unwrap(),
@@ -1824,11 +1859,20 @@ mod tests {
         );
         let outcomes = decision_outcomes_schema();
         assert_eq!(
-            outcomes.field_with_name("outcome_value").unwrap().data_type(),
+            outcomes
+                .field_with_name("outcome_value")
+                .unwrap()
+                .data_type(),
             &DataType::Float64
         );
-        assert!(outcomes.field_with_name("outcome_label").unwrap().is_nullable());
-        assert!(!outcomes.field_with_name("question_id").unwrap().is_nullable());
+        assert!(outcomes
+            .field_with_name("outcome_label")
+            .unwrap()
+            .is_nullable());
+        assert!(!outcomes
+            .field_with_name("question_id")
+            .unwrap()
+            .is_nullable());
     }
 
     #[test]
@@ -1859,7 +1903,9 @@ mod tests {
     fn reserved_columns_cross_check_against_pins() -> Result<(), Status> {
         let batch_with = |model: &str, calib: Option<&str>| {
             let values: Vec<Option<Vec<Option<f32>>>> = vec![Some(vec![Some(0.6), Some(0.4)])];
-            let list = FixedSizeListArray::from_iter_primitive::<arrow::datatypes::Float32Type, _, _>(values, 2);
+            let list = FixedSizeListArray::from_iter_primitive::<arrow::datatypes::Float32Type, _, _>(
+                values, 2,
+            );
             RecordBatch::try_new(
                 Arc::new(Schema::new(vec![
                     Field::new("q.probabilities", list.data_type().clone(), true),
@@ -1880,7 +1926,10 @@ mod tests {
         validate_reserved_columns(&batch_with("clef-flash@8b2e5fd1", None)?, &p)?;
         validate_reserved_columns(
             &batch_with("clef-flash@8b2e5fd1", Some("cal-1"))?,
-            &DecisionPins { calib_version: Some("cal-1".into()), ..p.clone() },
+            &DecisionPins {
+                calib_version: Some("cal-1".into()),
+                ..p.clone()
+            },
         )?;
 
         // Wrong model rejected.
@@ -1891,10 +1940,13 @@ mod tests {
         let err = validate_reserved_columns(&batch_with("clef-flash@8b2e5fd1", Some("cal-1"))?, &p)
             .unwrap_err();
         assert!(err.message().contains("contradicts the RAW pin"));
-        let err = validate_reserved_columns(&batch_with("clef-flash@8b2e5fd1", None)?, &DecisionPins {
-            calib_version: Some("cal-1".into()),
-            ..p.clone()
-        })
+        let err = validate_reserved_columns(
+            &batch_with("clef-flash@8b2e5fd1", None)?,
+            &DecisionPins {
+                calib_version: Some("cal-1".into()),
+                ..p.clone()
+            },
+        )
         .unwrap_err();
         assert!(err.message().contains("contradicts the calibrated pin"));
         Ok(())
@@ -1925,8 +1977,8 @@ mod tests {
         validate_payload_values(&build(vec![None, Some(vec![Some(0.6), Some(0.4)])])?)?;
 
         // NaN / negative / >1 rejected with the jev DistributionError text.
-        let err =
-            validate_payload_values(&build(vec![Some(vec![Some(f32::NAN), Some(0.4)])])?).unwrap_err();
+        let err = validate_payload_values(&build(vec![Some(vec![Some(f32::NAN), Some(0.4)])])?)
+            .unwrap_err();
         assert!(err.message().contains("not a finite probability"), "{err}");
         let err =
             validate_payload_values(&build(vec![Some(vec![Some(-0.2), Some(0.4)])])?).unwrap_err();
@@ -1938,8 +1990,7 @@ mod tests {
         assert!(err.message().contains("sums to"), "{err}");
 
         // Null component inside a present distribution rejected.
-        let err =
-            validate_payload_values(&build(vec![Some(vec![None, Some(0.4)])])?).unwrap_err();
+        let err = validate_payload_values(&build(vec![Some(vec![None, Some(0.4)])])?).unwrap_err();
         assert!(err.message().contains("null component"), "{err}");
 
         // Within consumer (1e-2) but outside producer (1e-6): 0.5+0.495.
@@ -1948,5 +1999,4 @@ mod tests {
         validate_payload_values(&build(vec![Some(vec![Some(0.5), Some(0.495)])])?)?;
         Ok(())
     }
-
 }

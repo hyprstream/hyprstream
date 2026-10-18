@@ -30,9 +30,9 @@ use crate::services::generated::metrics_client::{
 use crate::services::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc_std::metrics_client::{
     AggregateRow, AggregationFunc, DecisionOutcomeJoinRow, DecisionOutcomeQuery,
-    DecisionOutcomeRequest, DecisionOutcomeResult, DecisionRecordRequest, DecisionRecordResult,
-    ErrorInfo, ExpectedCalib, GroupEntry, HealthInfo, IngestRequest, MetricQuery,
-    MetricsResponseVariant, StreamInfo, ViewInfo, ViewSpec, DecisionOutcomeQueryResult,
+    DecisionOutcomeQueryResult, DecisionOutcomeRequest, DecisionOutcomeResult,
+    DecisionRecordRequest, DecisionRecordResult, ErrorInfo, ExpectedCalib, GroupEntry, HealthInfo,
+    IngestRequest, MetricQuery, MetricsResponseVariant, StreamInfo, ViewInfo, ViewSpec,
 };
 use hyprstream_rpc_std::policy_client::PolicyCheck;
 use hyprstream_rpc_std::policy_client::PolicyClient;
@@ -129,7 +129,10 @@ impl MetricsService {
 
     fn decision_stores(
         &self,
-    ) -> Result<(&DecisionRowStore<dyn StorageBackend>, &OutcomeStore<dyn StorageBackend>)> {
+    ) -> Result<(
+        &DecisionRowStore<dyn StorageBackend>,
+        &OutcomeStore<dyn StorageBackend>,
+    )> {
         match (&self.decision_rows, &self.outcomes) {
             (Some(rows), Some(outcomes)) => Ok((rows, outcomes)),
             _ => anyhow::bail!("decision store not wired on this metrics service"),
@@ -235,8 +238,7 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 
 /// Maximum decision payload accepted over the wire (the store's own bound;
 /// enforced BEFORE any Arrow parse).
-const MAX_PAYLOAD_BYTES: usize =
-    hyprstream_metrics::metrics::decision_outcome::MAX_PAYLOAD_BYTES;
+const MAX_PAYLOAD_BYTES: usize = hyprstream_metrics::metrics::decision_outcome::MAX_PAYLOAD_BYTES;
 
 fn non_empty_pin(value: &str, field: &str) -> Result<String> {
     if value.is_empty() {
@@ -255,10 +257,10 @@ fn optional_pin(value: &str, _field: &str) -> Result<Option<String>> {
 
 /// Convert a `join_outcomes` result batch into wire rows (documented column
 /// contract of `DecisionRowStore::join_outcomes`).
-fn join_rows(batch: &hyprstream_metrics::arrow::array::RecordBatch) -> Result<Vec<DecisionOutcomeJoinRow>> {
-    use hyprstream_metrics::arrow::array::{
-        Array, Float64Array, Int64Array, StringArray,
-    };
+fn join_rows(
+    batch: &hyprstream_metrics::arrow::array::RecordBatch,
+) -> Result<Vec<DecisionOutcomeJoinRow>> {
+    use hyprstream_metrics::arrow::array::{Array, Float64Array, Int64Array, StringArray};
     // Empty results may carry no columns at all (DuckDB empty-batch path);
     // zero rows means zero join output regardless of schema shape.
     if batch.num_rows() == 0 {
@@ -305,7 +307,11 @@ fn join_rows(batch: &hyprstream_metrics::arrow::array::RecordBatch) -> Result<Ve
             } else {
                 outcome_label.value(i).to_owned()
             },
-            outcome_value: if values.is_null(i) { 0.0 } else { values.value(i) },
+            outcome_value: if values.is_null(i) {
+                0.0
+            } else {
+                values.value(i)
+            },
             has_outcome_value: !values.is_null(i),
             outcome_source: outcome_source.value(i).to_owned(),
             supersedes_outcome_id: if supersedes.is_null(i) {
@@ -498,10 +504,7 @@ impl MetricsHandler for MetricsService {
                 )?,
                 model_id: optional_pin(&data.expected_model_id, "expectedModelId")?,
                 encoding_id: optional_pin(&data.expected_encoding_id, "expectedEncodingId")?,
-                quantization: optional_pin(
-                    &data.expected_quantization,
-                    "expectedQuantization",
-                )?,
+                quantization: optional_pin(&data.expected_quantization, "expectedQuantization")?,
                 compute_profile: optional_pin(
                     &data.expected_compute_profile,
                     "expectedComputeProfile",
@@ -2217,7 +2220,10 @@ mod tests {
     /// Wire a metrics service with decision stores, real PolicyService, and
     /// ClusterKeySource JWT verification on BOTH hops; mint tenant-a/tenant-b
     /// tokens. NOT spawned — spawn manually for wire tests.
-    async fn decision_store_fixture(tag: &str, policy_manager: PolicyManager) -> DecisionStoreFixture {
+    async fn decision_store_fixture(
+        tag: &str,
+        policy_manager: PolicyManager,
+    ) -> DecisionStoreFixture {
         let _ = init_global_moq_origin(MoqStreamOrigin::standalone().build());
         crate::mac::install_explicit_test_dispatch_pep();
         let _ = hyprstream_rpc::envelope::install_verify_config(
@@ -2304,7 +2310,7 @@ mod tests {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     QueryOrchestrator::new(
-                        backend.clone() as Arc<dyn hyprstream_metrics::StorageBackend>,
+                        backend.clone() as Arc<dyn hyprstream_metrics::StorageBackend>
                     )
                     .await
                 })
@@ -2388,8 +2394,7 @@ mod tests {
         }
     }
 
-    fn all_outcome_query(
-    ) -> hyprstream_rpc_std::metrics_client::DecisionOutcomeQuery {
+    fn all_outcome_query() -> hyprstream_rpc_std::metrics_client::DecisionOutcomeQuery {
         hyprstream_rpc_std::metrics_client::DecisionOutcomeQuery {
             schema_fingerprint: String::new(),
             model_id: String::new(),
@@ -2515,13 +2520,23 @@ mod tests {
             .authorize(&untenanted, "metrics:RecordDecision", "write")
             .await
             .expect_err("missing verified tenant must fail closed");
-        assert!(err.to_string().contains("no verified tenant domain"), "{err}");
+        assert!(
+            err.to_string().contains("no verified tenant domain"),
+            "{err}"
+        );
         let err = fixture
             .service
-            .handle_record_decision(&untenanted, 3, &decision_request(minimal_decision_payload()))
+            .handle_record_decision(
+                &untenanted,
+                3,
+                &decision_request(minimal_decision_payload()),
+            )
             .await
             .expect_err("handler must fail closed without verified tenant");
-        assert!(err.to_string().contains("no verified tenant domain"), "{err}");
+        assert!(
+            err.to_string().contains("no verified tenant domain"),
+            "{err}"
+        );
     }
 
     /// POSITIVE WIRE EVIDENCE: signed JWT through the generated dispatch and
@@ -2529,18 +2544,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_decision_store_wire_positive_signed_jwt() {
         let me = PolicyManager::new_in_memory().await.unwrap();
-        me.add_policy("service:metrics", "policy:Check", "check").await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
         for (res, op) in [
             ("metrics:RecordDecision", "write"),
             ("metrics:RecordOutcome", "write"),
             ("metrics:QueryOutcomes", "query"),
         ] {
-            me.add_policy_with_domain("alice", "tenant-a", res, op, "allow").await.unwrap();
+            me.add_policy_with_domain("alice", "tenant-a", res, op, "allow")
+                .await
+                .unwrap();
         }
         let fixture = decision_store_fixture("ds-wire-pos", me).await;
         let manager = InprocManager::new();
         manager.spawn(Box::new(fixture.service)).await.unwrap();
-        let client = decision_client(&fixture.endpoint, &fixture.client_key, &fixture.metrics_key, Some(fixture.token_a.clone()));
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
 
         let stored = client
             .record_decision(&decision_request(minimal_decision_payload()))
@@ -2587,20 +2611,36 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_decision_store_wire_wrong_tenant_cannot_read() {
         let me = PolicyManager::new_in_memory().await.unwrap();
-        me.add_policy("service:metrics", "policy:Check", "check").await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
         for (res, op) in [
             ("metrics:RecordDecision", "write"),
             ("metrics:RecordOutcome", "write"),
             ("metrics:QueryOutcomes", "query"),
         ] {
-            me.add_policy_with_domain("alice", "tenant-a", res, op, "allow").await.unwrap();
-            me.add_policy_with_domain("bob", "tenant-b", res, op, "allow").await.unwrap();
+            me.add_policy_with_domain("alice", "tenant-a", res, op, "allow")
+                .await
+                .unwrap();
+            me.add_policy_with_domain("bob", "tenant-b", res, op, "allow")
+                .await
+                .unwrap();
         }
         let fixture = decision_store_fixture("ds-wire-x", me).await;
         let manager = InprocManager::new();
         manager.spawn(Box::new(fixture.service)).await.unwrap();
-        let client_a = decision_client(&fixture.endpoint, &fixture.client_key, &fixture.metrics_key, Some(fixture.token_a.clone()));
-        let client_b = decision_client(&fixture.endpoint, &fixture.client_key, &fixture.metrics_key, Some(fixture.token_b.clone()));
+        let client_a = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
+        let client_b = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_b.clone()),
+        );
 
         let stored = client_a
             .record_decision(&decision_request(minimal_decision_payload()))
@@ -2612,7 +2652,11 @@ mod tests {
             .query_outcomes(&all_outcome_query())
             .await
             .expect("tenant-b join authorizes in its own domain");
-        assert_eq!(joined_b.rows.len(), 0, "tenant-b must not see tenant-a rows");
+        assert_eq!(
+            joined_b.rows.len(),
+            0,
+            "tenant-b must not see tenant-a rows"
+        );
 
         // Cross-tenant outcome linkage: authorized in tenant-b, but the store
         // scopes by the verified tenant -> not-found, never a leak.
@@ -2620,10 +2664,7 @@ mod tests {
             .record_outcome(&outcome_request(&stored.decision_id, &stored.row_ids[0]))
             .await
             .expect_err("cross-tenant outcome must be denied");
-        assert!(
-            err.to_string().contains("not found in tenant"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("not found in tenant"), "{err}");
 
         // tenant-b CAN persist and read its own rows.
         let own = client_b
@@ -2655,18 +2696,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tenant_only_decision_role_denied_legacy_sql() {
         let me = PolicyManager::new_in_memory().await.unwrap();
-        me.add_policy("service:metrics", "policy:Check", "check").await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
         for (res, op) in [
             ("metrics:RecordDecision", "write"),
             ("metrics:RecordOutcome", "write"),
             ("metrics:QueryOutcomes", "query"),
         ] {
-            me.add_policy_with_domain("alice", "tenant-a", res, op, "allow").await.unwrap();
+            me.add_policy_with_domain("alice", "tenant-a", res, op, "allow")
+                .await
+                .unwrap();
         }
         let fixture = decision_store_fixture("ds-role", me).await;
         let manager = InprocManager::new();
         manager.spawn(Box::new(fixture.service)).await.unwrap();
-        let client = decision_client(&fixture.endpoint, &fixture.client_key, &fixture.metrics_key, Some(fixture.token_a.clone()));
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
 
         // Typed surface allowed.
         client
@@ -2741,14 +2791,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_legacy_global_grant_separate_from_decision_store() {
         let me = PolicyManager::new_in_memory().await.unwrap();
-        me.add_policy("service:metrics", "policy:Check", "check").await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
         // The classic legacy shape: global-domain metrics SQL/ingest.
-        me.add_policy_with_domain("alice", "*", "metrics:Query", "query", "allow").await.unwrap();
-        me.add_policy_with_domain("alice", "*", "metrics:Ingest", "write", "allow").await.unwrap();
+        me.add_policy_with_domain("alice", "*", "metrics:Query", "query", "allow")
+            .await
+            .unwrap();
+        me.add_policy_with_domain("alice", "*", "metrics:Ingest", "write", "allow")
+            .await
+            .unwrap();
         let fixture = decision_store_fixture("ds-sep", me).await;
         let manager = InprocManager::new();
         manager.spawn(Box::new(fixture.service)).await.unwrap();
-        let client = decision_client(&fixture.endpoint, &fixture.client_key, &fixture.metrics_key, Some(fixture.token_a.clone()));
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            Some(fixture.token_a.clone()),
+        );
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2791,13 +2852,21 @@ mod tests {
         let fixture = decision_store_fixture("ds-wire-nojwt", me).await;
         let manager = InprocManager::new();
         manager.spawn(Box::new(fixture.service)).await.unwrap();
-        let client = decision_client(&fixture.endpoint, &fixture.client_key, &fixture.metrics_key, None);
+        let client = decision_client(
+            &fixture.endpoint,
+            &fixture.client_key,
+            &fixture.metrics_key,
+            None,
+        );
 
         let err = client
             .record_decision(&decision_request(minimal_decision_payload()))
             .await
             .expect_err("wire request without verified tenant must be denied");
-        assert!(err.to_string().contains("no verified tenant domain"), "{err}");
+        assert!(
+            err.to_string().contains("no verified tenant domain"),
+            "{err}"
+        );
     }
     /// recordDecision WIRE negative: a NaN distribution is rejected at the
     /// RPC boundary and inserts NOTHING (invalid input is never normalized
@@ -2805,7 +2874,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_record_decision_wire_rejects_nan_with_zero_inserts() {
         let me = PolicyManager::new_in_memory().await.unwrap();
-        me.add_policy("service:metrics", "policy:Check", "check").await.unwrap();
+        me.add_policy("service:metrics", "policy:Check", "check")
+            .await
+            .unwrap();
         me.add_policy_with_domain(
             "alice",
             "tenant-a",
@@ -2847,7 +2918,10 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new(
                     "route.probabilities",
-                    DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        2,
+                    ),
                     true,
                 )
                 .with_metadata(meta),
@@ -2863,7 +2937,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let payload = hyprstream_metrics::metrics::decision_batch::encode_batch_ipc(&batch).unwrap();
+        let payload =
+            hyprstream_metrics::metrics::decision_batch::encode_batch_ipc(&batch).unwrap();
 
         let err = client
             .record_decision(&decision_request(payload))

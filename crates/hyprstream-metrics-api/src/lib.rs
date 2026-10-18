@@ -33,7 +33,7 @@ pub use metrics::decision_outcome::{
     create_decision_outcome_tables, mint_decision_id, mint_decision_row_id, mint_outcome_id,
     CalibExpectation, CalibFilter, DecisionOutcomeQuery, DecisionPins, DecisionRowMeta,
     DecisionRowQuery, DecisionRowStore, ExpectedPins, NewOutcome, OutcomeRecord, OutcomeStore,
-    StoredDecision, TrustedTenant, DECISION_OUTCOME_SCHEMA_VERSION, DECISION_OUTCOMES_TABLE,
+    StoredDecision, TrustedTenant, DECISION_OUTCOMES_TABLE, DECISION_OUTCOME_SCHEMA_VERSION,
     DECISION_ROWS_TABLE,
 };
 pub use metrics::decision_outcome::{FIELD_META_KIND, FIELD_META_LABELS};
