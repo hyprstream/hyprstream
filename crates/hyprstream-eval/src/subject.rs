@@ -18,6 +18,7 @@ use hyprstream_decision::arrow::AnswerRow;
 use hyprstream_decision::confidence::{self, CONSUMER_SUM_TOLERANCE};
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision::spec::{QuestionBody, QuestionSet, QuestionSpec};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::error::EvalError;
@@ -233,7 +234,7 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
 }
 
 fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
-    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
+    use hyprstream_decision::confidence::{PRODUCER_SUM_TOLERANCE, check_distribution};
 
     // The caller may have selected the winner before narrowing wire f64 values.
     if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
@@ -448,10 +449,103 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     Ok(AnswerRow { answers: row })
 }
 
+/// Deserialize JSON while rejecting repeated object members at every depth.
+/// Parsing into `serde_json::Value` directly silently keeps only one value
+/// for duplicate keys, which can conceal conflicting model provenance,
+/// answers, or probability labels before their respective validators run.
+struct UniqueJsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonValueSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value with unique object member names")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(UniqueJsonValueSeed)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object member `{key}`"
+                )));
+            }
+            let value = map.next_value_seed(UniqueJsonValueSeed)?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
 /// Decode and validate the complete HTTP response envelope. This is the same
 /// client work used by [`HttpSubject`] and the wire-floor response benchmark.
 pub fn decode_response(set: &QuestionSet, text: &str) -> Result<(AnswerRow, String), EvalError> {
-    let parsed: Value = serde_json::from_str(text)
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let parsed = UniqueJsonValueSeed
+        .deserialize(&mut deserializer)
+        .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
+    deserializer
+        .end()
         .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
     let Some(resolved) = parsed
         .get("model")
@@ -1291,6 +1385,45 @@ questions:
         assert!(
             matches!(error, EvalError::InvalidAnswer { .. }),
             "undeclared answer key must be InvalidAnswer, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn decode_response_rejects_duplicate_model_answer_and_probability_members() {
+        let set = fixture();
+        let cases = [
+            (
+                "model",
+                r#"{"model":"first","model":"second","answers":{}}"#,
+            ),
+            (
+                "tone",
+                r#"{"model":"m","answers":{"tone":{"type":"choice","probabilities":{"angry":0.5,"calm":0.5}},"tone":{"type":"choice","probabilities":{"angry":0.5,"calm":0.5}}}}"#,
+            ),
+            (
+                "angry",
+                r#"{"model":"m","answers":{"tone":{"type":"choice","probabilities":{"angry":0.25,"angry":0.5,"calm":0.5}}}}"#,
+            ),
+        ];
+
+        for (member, response) in cases {
+            let error = decode_response(&set, response).unwrap_err();
+            assert!(
+                matches!(error, EvalError::Http(ref message) if message.contains(&format!("duplicate JSON object member `{member}`"))),
+                "duplicate `{member}` must be rejected during JSON parsing, got {error:?}"
+            );
+        }
+
+        // A duplicate in the answer tree is diagnosed before a missing model
+        // can be accepted/rejected by the provenance extractor.
+        let error = decode_response(
+            &set,
+            r#"{"answers":{"tone":{"type":"choice","probabilities":{"angry":0.5,"angry":0.5,"calm":0.5}}}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, EvalError::Http(ref message) if message.contains("duplicate JSON object member `angry`")),
+            "the whole response must be checked for duplicates before field extraction, got {error:?}"
         );
     }
 
