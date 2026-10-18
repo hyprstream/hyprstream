@@ -4009,17 +4009,18 @@ fn federate_registry_operation(
     pin: &crate::services::model::StagingModelPin,
 ) -> Result<(String, String)> {
     use hyprstream_rpc_std::registry_capnp::registry_request;
-    anyhow::ensure!(
-        pin == &crate::services::model::StagingModelPin::reviewed()?,
-        "Federate Registry requires the reviewed staging model pin"
-    );
+    let profile = pin.federate_profile()?;
     let request = body.root::<registry_request::Reader>()?;
     match request.which()? {
-        registry_request::Which::List(()) => Ok(("registry:List".to_owned(), "query".to_owned())),
+        registry_request::Which::List(())
+            if profile == crate::services::model::FederateModelProfile::Qwen =>
+        {
+            Ok(("registry:List".to_owned(), "query".to_owned()))
+        }
         registry_request::Which::GetByName(name) => {
             let name = name?.to_str()?;
             anyhow::ensure!(
-                name == crate::services::model::StagingModelPin::reviewed_repo_name(),
+                name == profile.repo_name(),
                 "Federate Registry lookup is not the reviewed model repository"
             );
             Ok((format!("registry:{name}"), "query".to_owned()))
@@ -4396,6 +4397,50 @@ mod xet_pointer_tests {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_clef_registry_admits_only_exact_repo_without_list() -> Result<()> {
+        let pin = crate::services::model::StagingModelPin::federate_clef_startup_fixture()?;
+        let make = |name: Option<&str>| {
+            hyprstream_rpc::serialize_message(|message| {
+                let mut request = message
+                    .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>(
+                );
+                request.set_id(91);
+                if let Some(name) = name {
+                    request.set_get_by_name(name);
+                } else {
+                    request.set_list(());
+                }
+            })
+        };
+        let bytes = make(Some("clef-flash-fp8"))?;
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert_eq!(
+            federate_registry_operation(&body, &pin)?,
+            ("registry:clef-flash-fp8".into(), "query".into())
+        );
+        for name in [
+            None,
+            Some(""),
+            Some("clef-flash-fp8:main"),
+            Some("qwen2.5-0.5b-instruct"),
+            Some("other"),
+        ] {
+            let bytes = make(name)?;
+            let body =
+                crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+            assert!(federate_registry_operation(&body, &pin).is_err());
+        }
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        let unqualified =
+            crate::services::model::StagingModelPin::new(pin.model_ref.clone(), pin.commit)?;
+        assert!(federate_registry_operation(&body, &unqualified).is_err());
+        Ok(())
+    }
 
     #[cfg(feature = "postgres")]
     #[test]

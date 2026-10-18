@@ -358,14 +358,10 @@ impl AdmissionService {
         collision_inventory: CollisionInventory,
         session_pool: Option<deadpool_postgres::Pool>,
         host: crate::services::oauth::federate_source::FederateHost,
+        model_profile: crate::services::model::FederateModelProfile,
     ) -> Self {
         let inventory_id = collision_inventory.id();
-        let scopes = BTreeSet::from([
-            "infer:model:qwen2.5-0.5b-instruct:main".to_owned(),
-            "query:model:Status".to_owned(),
-            "query:registry:qwen2.5-0.5b-instruct".to_owned(),
-            "write:model:Load".to_owned(),
-        ]);
+        let scopes = model_profile.scopes();
         Self {
             authority: Some(Authorities {
                 policy,

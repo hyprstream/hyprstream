@@ -313,6 +313,7 @@ serde_json.workspace = true  # JSON output for metadata
 hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 
 [dev-dependencies]
+hyprstream-inference = { path = "../hyprstream-inference", features = ["test-fixtures"] }
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 hyprstream-discovery = { path = "../hyprstream-discovery", features = ["test-fixtures"] }
 hyprstream-pds = { path = "../hyprstream-pds", features = ["postgres-test-connect"] }  # scratch-DB live tests (NoTls, test-only)

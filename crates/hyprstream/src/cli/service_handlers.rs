@@ -2234,6 +2234,125 @@ mod offline_policy_provision_tests {
     }
 
     #[tokio::test]
+    async fn clef_owner_templates_persist_exact_closed_grants_and_are_idempotent() {
+        for (name, did, other_owner) in [
+            (
+                "cyberdione-staging-clef-e2e",
+                "did:plc:3f7ldey5bivhfjapwqi2sljy",
+                "did:plc:rjqczurevrpoz4mcnax2kgw4",
+            ),
+            (
+                "cyberdione-staging-clef-operator",
+                "did:plc:rjqczurevrpoz4mcnax2kgw4",
+                "did:plc:3f7ldey5bivhfjapwqi2sljy",
+            ),
+        ] {
+            let root = tempfile::tempdir().expect("temporary closed Clef policy root");
+            let names = vec![name.to_owned()];
+            handle_service_provision_policy_templates(root.path(), &names)
+                .await
+                .expect("persist actual built-in Clef owner template");
+            let manager = PolicyManager::new(root.path().join(".registry/policies"))
+                .await
+                .expect("reopen actual persisted Clef policy");
+            let rules = [
+                ("registry:clef-flash-fp8", "query"),
+                ("model:Load", "write"),
+                ("model:Status", "query"),
+                ("model:clef-flash-fp8:main", "infer"),
+            ];
+            let expected: std::collections::BTreeSet<Vec<String>> = rules
+                .iter()
+                .map(|(resource, action)| {
+                    vec![
+                        did.to_owned(),
+                        "local".to_owned(),
+                        (*resource).to_owned(),
+                        (*action).to_owned(),
+                        "allow".to_owned(),
+                    ]
+                })
+                .collect();
+            let actual_rows: Vec<Vec<String>> = manager
+                .get_policy()
+                .await
+                .into_iter()
+                .filter(|rule| rule.first().map(String::as_str) == Some(did))
+                .collect();
+            assert_eq!(actual_rows.len(), 4, "exact raw owner row cardinality");
+            let actual: std::collections::BTreeSet<Vec<String>> = actual_rows.into_iter().collect();
+            assert_eq!(actual, expected, "owner gets exactly four persisted rows");
+            for (resource, action) in rules {
+                assert!(
+                    manager
+                        .check_with_domain(did, "local", resource, action)
+                        .await
+                );
+                assert!(
+                    !manager
+                        .check_with_domain(did, "other", resource, action)
+                        .await
+                );
+                for denied in [other_owner, "anonymous", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"] {
+                    assert!(
+                        !manager
+                            .check_with_domain(denied, "local", resource, action)
+                            .await
+                    );
+                }
+            }
+            for (resource, action) in [
+                ("registry:qwen2.5-0.5b-instruct", "query"),
+                ("model:qwen2.5-0.5b-instruct:main", "infer"),
+                ("registry:clef-flash-fp8", "write"),
+                ("registry:other", "query"),
+                ("model:clef-flash-fp8:other", "infer"),
+                ("model:other:main", "infer"),
+                ("model:clef-flash-fp8:main", "infer.generate"),
+                ("model:Unload", "write"),
+            ] {
+                assert!(
+                    !manager
+                        .check_with_domain(did, "local", resource, action)
+                        .await,
+                    "unexpected Clef owner authority: {resource} {action}"
+                );
+            }
+            let persisted = std::fs::read(root.path().join(".registry/policies/policy.csv"))
+                .expect("read actual policy bytes before repeat");
+            drop(manager);
+            handle_service_provision_policy_templates(root.path(), &names)
+                .await
+                .expect("idempotent actual Clef owner provisioning");
+            assert_eq!(
+                persisted,
+                std::fs::read(root.path().join(".registry/policies/policy.csv"))
+                    .expect("read policy after repeat")
+            );
+            let reopened = PolicyManager::new(root.path().join(".registry/policies"))
+                .await
+                .expect("reopen after actual repeated Clef provisioning");
+            let repeated_rows: Vec<Vec<String>> = reopened
+                .get_policy()
+                .await
+                .into_iter()
+                .filter(|rule| rule.first().map(String::as_str) == Some(did))
+                .collect();
+            assert_eq!(
+                repeated_rows.len(),
+                4,
+                "exact repeated raw owner row cardinality"
+            );
+            let repeated: std::collections::BTreeSet<Vec<String>> =
+                repeated_rows.into_iter().collect();
+            assert_eq!(
+                repeated, expected,
+                "repeat retains exactly the canonical owner rows"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn fresh_and_repeat_public_staging_policy_is_canonical() {
         let root = tempfile::tempdir().expect("temporary models root");
         handle_service_provision_policy_templates(root.path(), &public_templates())

@@ -1,0 +1,136 @@
+{
+  "repo": "kurcontko/clef-flash-FP8-Dynamic",
+  "revision": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+  "parent_contract_commit": "e13d88e4123a97cf9a957118755fedff7f457d80",
+  "parent_manifest_sha256": "d267856b7211041ac70f156f8dbf3cc297da8cce57a502346d7e3ace75ebdaa3",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+      "verified": true
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 11544,
+      "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+      "verified": true
+    },
+    {
+      "path": "README.md",
+      "bytes": 10972,
+      "sha256": "c35620be0d17ed8aa21a7ad2ea742a876b87440f7afb04b3da7ff185dcd9d2f3",
+      "verified": true
+    },
+    {
+      "path": "chat_template.jinja",
+      "bytes": 7756,
+      "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+      "verified": true
+    },
+    {
+      "path": "clef_head/joint_head.safetensors",
+      "bytes": 243538016,
+      "sha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+      "verified": true
+    },
+    {
+      "path": "clef_head/joint_head_config.json",
+      "bytes": 119,
+      "sha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+      "verified": true
+    },
+    {
+      "path": "config.json",
+      "bytes": 11917,
+      "sha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+      "verified": true
+    },
+    {
+      "path": "generation_config.json",
+      "bytes": 116,
+      "sha256": "45707f8467bf4e54e112c6095a1b2d1f2d63651cf86816344cfff21f02dda0d4",
+      "verified": true
+    },
+    {
+      "path": "joint_schema_model.py",
+      "bytes": 23263,
+      "sha256": "0e304cf7c6500e8bb59bef7e2afd2c6373f82596dfb3b57d1aa93c175e2dc3a3",
+      "verified": true
+    },
+    {
+      "path": "model.safetensors",
+      "bytes": 11910387016,
+      "sha256": "7799d5c3a47b8f249d667a040e3fd538ccbf47bd958dc6f2aa52af8346aefa6b",
+      "verified": true
+    },
+    {
+      "path": "processor_config.json",
+      "bytes": 1191,
+      "sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+      "verified": true
+    },
+    {
+      "path": "recipe.yaml",
+      "bytes": 294,
+      "sha256": "bd47c67257ddb6b5e831fe879e33e828124e0bd0c2b91d7076cdd6e11e341865",
+      "verified": true
+    },
+    {
+      "path": "scripts/build_data.py",
+      "bytes": 4707,
+      "sha256": "80b5e5856723b6459e9451de9545e40eba37d93feec61c8943c5f66fec6c90a4",
+      "verified": true
+    },
+    {
+      "path": "scripts/quantize.py",
+      "bytes": 3130,
+      "sha256": "c52e14f2e86ca6d6d857061dc69e74f91c6974f76fa922a88f954a10c7ffc8b3",
+      "verified": true
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 19989325,
+      "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+      "verified": true
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 1075,
+      "sha256": "91a08f825d370d085d692e04cf117cdd7faad7bf18e996f1e6031b6dab03db72",
+      "verified": true
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/__init__.py",
+      "bytes": 436,
+      "sha256": "726f8a367a7268299c90b3e06cebc56013391ebe078e5874f9395602d930624b",
+      "verified": true
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/model.py",
+      "bytes": 7771,
+      "sha256": "23a3932d446386c92836aa30e2de1ffbc0d88cb4a4056cf7612881dddeae2a89",
+      "verified": true
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/schema.py",
+      "bytes": 404,
+      "sha256": "d01f99de1262e91f0ab04e65248e177cbeb6046c964f3f4bd1ccde31789c3d04",
+      "verified": true
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/server.py",
+      "bytes": 7592,
+      "sha256": "f1b50a1bf1d0ca7adf7d88e0a7d1b061920bbf6000af084f0ac95dd39f606ffa",
+      "verified": true
+    },
+    {
+      "path": "vllm_plugin/pyproject.toml",
+      "bytes": 500,
+      "sha256": "15c00d5c6d03b69524c52ccfeb3a3d8a63add29844e3bc96c20c533844c2a5a3",
+      "verified": true
+    }
+  ],
+  "all_verified": true,
+  "scope": "Normalized SHA256 view of reviewed R0 artifact provenance; verify destination bytes before execution; no numerical parity claim"
+}

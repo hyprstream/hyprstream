@@ -1267,8 +1267,13 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     ctx.signing_key(),
                     &required_services,
                 )?;
-            policy_service =
-                policy_service.with_federate_runtime(enrollment, collision_inventory, host);
+            let model_profile = crate::services::model::FederateModelProfile::from_env()?;
+            policy_service = policy_service.with_federate_runtime(
+                enrollment,
+                collision_inventory,
+                host,
+                model_profile,
+            );
             info!("Federate stateless Policy and request-use authorities installed");
         } else {
             tracing::warn!("Federate Policy runtime disabled: service enrollment or canonical HTTPS OAuth origin is unavailable");
@@ -1725,6 +1730,9 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
             model_config.inference_deployment =
                 crate::runtime::inference_profile::InferenceDeploymentProfile::from_env()?;
             model_config.staging_model_pin = crate::services::StagingModelPin::from_env()?;
+            if let Some(pin) = &model_config.staging_model_pin {
+                pin.validate_deployment(&model_config.inference_deployment)?;
+            }
             ModelService::new(
                 model_config,
                 sk.clone(),

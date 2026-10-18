@@ -157,6 +157,26 @@ pub fn preflight_body(body: &str) -> Result<ClefRequest, ClefDecisionError> {
     Ok(request)
 }
 
+/// Test-only observation of the existing engine/backbone cancellation checks.
+/// Returning unit prevents observers from replacing the real cancellation result.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DecisionBackboneObserver(Arc<dyn Fn(usize, Option<Instant>) + Send + Sync>);
+#[cfg(any(test, feature = "test-fixtures"))]
+impl std::fmt::Debug for DecisionBackboneObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DecisionBackboneObserver(<redacted>)")
+    }
+}
+#[cfg(any(test, feature = "test-fixtures"))]
+impl DecisionBackboneObserver {
+    /// In-process fixture wiring only; no request field or environment toggle.
+    pub fn new(observer: Arc<dyn Fn(usize, Option<Instant>) + Send + Sync>) -> Self {
+        Self(observer)
+    }
+}
+
 /// Cooperative cancellation + deadline for one decision request.
 ///
 /// The checker closure passed to the engine runs before admission, between
@@ -168,21 +188,34 @@ pub fn preflight_body(body: &str) -> Result<ClefRequest, ClefDecisionError> {
 pub struct DecisionCancel {
     flag: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    observer: Option<DecisionBackboneObserver>,
 }
 
 impl DecisionCancel {
     /// New checker: external cancel flag (e.g. service drain) plus optional
     /// absolute deadline.
     pub fn new(flag: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
-        Self { flag, deadline }
+        Self {
+            flag,
+            deadline,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            observer: None,
+        }
     }
 
     /// A never-firing checker for tooling/tests on the default path.
     pub fn none() -> Self {
-        Self {
-            flag: Arc::new(AtomicBool::new(false)),
-            deadline: None,
-        }
+        Self::new(Arc::new(AtomicBool::new(false)), None)
+    }
+
+    /// Attach a request-local fixture observer. Counts restart for EACH
+    /// decide_encoded call, even when the cancel value or observer is cloned.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[doc(hidden)]
+    pub fn with_backbone_observer(mut self, observer: DecisionBackboneObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Fail with the typed cancellation error when tripped. Called before
@@ -902,8 +935,21 @@ pub fn decide_encoded(
 
     // One unpadded record, fresh call-local state, model lock + no_grad held
     // by the engine; the checker bounds admitted work cooperatively.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    let backbone_checks = std::cell::Cell::new(0usize);
+    let check_backbone = || {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some(observer) = &cancel.observer {
+            let next = backbone_checks.get() + 1;
+            backbone_checks.set(next);
+            (observer.0)(next, cancel.deadline);
+        }
+        // Observer is unit-only. The existing flag/deadline check remains the
+        // sole source of typed cancellation, AFTER any boundary barrier.
+        cancel.check()
+    };
     let logits = engine
-        .with_decision_backbone_checked(&encoded.input_ids, &|| cancel.check(), |hidden, gather| {
+        .with_decision_backbone_checked(&encoded.input_ids, &check_backbone, |hidden, gather| {
             // OBSERVED compute kind: recorded from the actual successful
             // hidden tensor the head validated (dtype+device), not from
             // load-time policy. Used for response provenance.
@@ -1792,6 +1838,211 @@ mod tests {
         .expect("fresh after cancel");
         for (a, b) in distributions.iter().zip(&fresh) {
             assert_eq!(a.probabilities, b.probabilities);
+        }
+    }
+
+    /// Tiny complete TWO-layer Qwen backbone. The original four-layer fixture
+    /// stays unchanged; only the first two real GDN layers are admitted here.
+    fn two_layer_observer_bundle() -> tempfile::TempDir {
+        let dir = t5_bundle_dir();
+        let mut config = tiny_qwen_config_json();
+        config["num_hidden_layers"] = json!(2);
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut weights = tiny_qwen_weights();
+        weights.retain(|name, _| {
+            !name.starts_with("model.layers.2.") && !name.starts_with("model.layers.3.")
+        });
+        write_safetensors(&dir.path().join("model.safetensors"), &weights);
+        dir
+    }
+
+    #[derive(Default)]
+    struct BoundaryGate {
+        entered: parking_lot::Mutex<Option<(usize, Option<Instant>)>>,
+        entered_changed: parking_lot::Condvar,
+        released: parking_lot::Mutex<bool>,
+        released_changed: parking_lot::Condvar,
+        watchdog_fired: AtomicBool,
+    }
+    impl BoundaryGate {
+        fn release(&self) {
+            *self.released.lock() = true;
+            self.released_changed.notify_all();
+        }
+        fn observe(&self, count: usize, deadline: Option<Instant>) {
+            if count != 5 {
+                return;
+            }
+            *self.entered.lock() = Some((count, deadline));
+            self.entered_changed.notify_all();
+            let mut released = self.released.lock();
+            let until = Instant::now() + std::time::Duration::from_secs(5);
+            while !*released {
+                if self
+                    .released_changed
+                    .wait_until(&mut released, until)
+                    .timed_out()
+                    && !*released
+                {
+                    self.watchdog_fired.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+        fn wait_entered(&self) -> (usize, Option<Instant>) {
+            let mut entered = self.entered.lock();
+            let until = Instant::now() + std::time::Duration::from_secs(5);
+            while entered.is_none() {
+                if self
+                    .entered_changed
+                    .wait_until(&mut entered, until)
+                    .timed_out()
+                    && entered.is_none()
+                {
+                    panic!("real backbone fifth check was never reached");
+                }
+            }
+            entered.expect("entered boundary")
+        }
+    }
+    struct BoundaryReleaseOnDrop(Arc<BoundaryGate>);
+    impl Drop for BoundaryReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[tokio::test]
+    async fn tiny_two_layer_midforward_flag_deadline_and_observer_scope() {
+        use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine};
+        let dir = two_layer_observer_bundle();
+        let config = RuntimeConfig {
+            precision_mode: Some("fp32".into()),
+            ..RuntimeConfig::default()
+        };
+        let mut engine = create_engine(&config).expect("tiny engine");
+        RuntimeEngine::load_model(&mut engine, dir.path())
+            .await
+            .expect("two layer load");
+        assert_eq!(engine.get_num_layers().unwrap(), 2);
+        let runtime = ClefDecisionRuntime::load(
+            dir.path(),
+            Some(T5_HIDDEN as u32),
+            Some(Kind::Float),
+            Some("fp32"),
+        )
+        .unwrap();
+        let tokenizer = tiny_wordlevel_tokenizer();
+        let request = t5_record("one two three");
+        let (encoded, _) =
+            encode_request(&tokenizer, &request, None, 256, &DecisionCancel::none()).unwrap();
+        let (baseline, _) = decide_encoded(
+            &runtime,
+            &engine,
+            &request,
+            &encoded,
+            &DecisionCancel::none(),
+        )
+        .unwrap();
+
+        // Observer count is restricted to the actual engine callback, not
+        // generic admission/encoding checks, and is local per forward/clone.
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let probe =
+            DecisionBackboneObserver::new(Arc::new(move |count, _| captured.lock().push(count)));
+        assert_eq!(format!("{probe:?}"), "DecisionBackboneObserver(<redacted>)");
+        let cancel = DecisionCancel::none().with_backbone_observer(probe);
+        cancel.check().unwrap();
+        encode_request(&tokenizer, &request, None, 256, &cancel).unwrap();
+        assert!(
+            observed.lock().is_empty(),
+            "generic admission must not advance backbone checks"
+        );
+        for repeated in [&cancel, &cancel.clone()] {
+            let (result, _) =
+                decide_encoded(&runtime, &engine, &request, &encoded, repeated).unwrap();
+            assert_eq!(result[0].probabilities, baseline[0].probabilities);
+        }
+        assert_eq!(
+            *observed.lock(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+
+        for deadline_case in [false, true] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let deadline =
+                deadline_case.then(|| Instant::now() + std::time::Duration::from_secs(1));
+            let gate = Arc::new(BoundaryGate::default());
+            let counts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let hook_gate = Arc::clone(&gate);
+            let hook_counts = Arc::clone(&counts);
+            let cancel = DecisionCancel::new(Arc::clone(&flag), deadline).with_backbone_observer(
+                DecisionBackboneObserver::new(Arc::new(move |n, d| {
+                    hook_counts.lock().push(n);
+                    hook_gate.observe(n, d);
+                })),
+            );
+            let controlled_gate = Arc::clone(&gate);
+            let controller = std::thread::spawn(move || {
+                let _release_on_drop = BoundaryReleaseOnDrop(Arc::clone(&controlled_gate));
+                let (count, actual_deadline) = controlled_gate.wait_entered();
+                // Engine admission1, post-lock2, model admission3,
+                // beforelayer0=4, beforelayer1=5: real layer0 completed.
+                assert_eq!(count, 5);
+                assert_eq!(actual_deadline, deadline);
+                if let Some(deadline) = actual_deadline {
+                    assert!(
+                        Instant::now() < deadline,
+                        "deadline expired before boundary witness"
+                    );
+                    while Instant::now() < deadline {
+                        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    }
+                } else {
+                    flag.store(true, Ordering::Release); // REAL passed cancel flag
+                }
+            });
+            let result = decide_encoded(&runtime, &engine, &request, &encoded, &cancel);
+            controller.join().expect("boundary controller");
+            assert!(
+                !gate.watchdog_fired.load(Ordering::Acquire),
+                "barrier timed out"
+            );
+            assert_eq!(*counts.lock(), [1, 2, 3, 4, 5]);
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<ClefDecisionError>(),
+                    Some(ClefDecisionError::Cancelled(_))
+                ),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains(if deadline_case {
+                "deadline exceeded"
+            } else {
+                "cancel flag set"
+            }));
+            let (recovered, _) = decide_encoded(
+                &runtime,
+                &engine,
+                &request,
+                &encoded,
+                &DecisionCancel::none(),
+            )
+            .unwrap();
+            for (actual, expected) in recovered.iter().zip(&baseline) {
+                assert_eq!(actual.question_id, expected.question_id);
+                assert_eq!(actual.canonical_ids, expected.canonical_ids);
+                assert_eq!(
+                    actual.probabilities, expected.probabilities,
+                    "tiny fixture recovery must be exact"
+                );
+            }
         }
     }
 
