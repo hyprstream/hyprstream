@@ -234,6 +234,12 @@ pub struct EncodedClefRecord {
     pub record_id: String,
     pub input_ids: Vec<i64>,
     pub questions: Vec<EncodedClefQuestion>,
+    /// State token count before either state cap or total-input truncation.
+    pub state_tokens_before_truncation: usize,
+    /// State tokens actually present in input_ids (excludes prompt and schema).
+    pub state_tokens_admitted: usize,
+    /// True exactly when at least one original state token was removed.
+    pub state_truncated: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ClefEncodingLimits {
@@ -419,13 +425,16 @@ impl ClefEncoder {
             )));
         }
         let mut state = tokens(&clef_render(&record.state))?;
+        let state_tokens_before_truncation = state.len();
         state.truncate(
             limits
                 .max_state_tokens
                 .unwrap_or(usize::MAX)
                 .min(limits.max_length - fixed),
         );
-        let offset = prefix.len() + state.len();
+        let state_tokens_admitted = state.len();
+        let state_truncated = state_tokens_admitted < state_tokens_before_truncation;
+        let offset = prefix.len() + state_tokens_admitted;
         for q in &mut questions {
             q.question_span.0 += offset;
             q.question_span.1 += offset;
@@ -441,6 +450,9 @@ impl ClefEncoder {
             record_id: record.record_id.clone(),
             input_ids: prefix,
             questions,
+            state_tokens_before_truncation,
+            state_tokens_admitted,
+            state_truncated,
         })
     }
 }
@@ -592,6 +604,85 @@ mod tests {
             }
         )
         .is_err());
+    }
+    #[test]
+    fn clef_state_token_accounting_uses_admitted_encoding() {
+        let state = "stateκ数";
+        let calls = std::cell::Cell::new(0);
+        let record = ClefRecord {
+            record_id: "accounting".into(),
+            state: Value::String(state.into()),
+            questions: vec![(
+                "q".into(),
+                ClefQuestion {
+                    kind: ClefQuestionType::Noul,
+                    instructions: Value::Null,
+                    criteria: Value::Null,
+                },
+            )],
+        };
+        let encode = |limits| {
+            ClefEncoder::encode_with(&record, limits, |text| {
+                if text == state {
+                    calls.set(calls.get() + 1);
+                }
+                Ok(text.bytes().map(i64::from).collect())
+            })
+            .expect("encoding")
+        };
+        let full = encode(ClefEncodingLimits::default());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(full.state_tokens_before_truncation, state.len());
+        assert_eq!(full.state_tokens_admitted, state.len());
+        assert!(!full.state_truncated);
+        let capped = encode(ClefEncodingLimits {
+            max_length: full.input_ids.len(),
+            max_state_tokens: Some(4),
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(capped.state_tokens_before_truncation, state.len());
+        assert_eq!(capped.state_tokens_admitted, 4);
+        assert!(capped.state_truncated);
+        assert_eq!(
+            full.input_ids.len() - capped.input_ids.len(),
+            state.len() - 4
+        );
+        let budget = encode(ClefEncodingLimits {
+            max_length: full.input_ids.len() - (state.len() - 3),
+            max_state_tokens: None,
+        });
+        assert_eq!(calls.get(), 3);
+        assert_eq!(budget.state_tokens_admitted, 3);
+        assert!(budget.state_truncated);
+        let both = encode(ClefEncodingLimits {
+            max_length: budget.input_ids.len(),
+            max_state_tokens: Some(2),
+        });
+        assert_eq!(calls.get(), 4);
+        assert_eq!(both.state_tokens_admitted, 2);
+        assert_eq!(both.state_tokens_before_truncation, state.len());
+        let zero = encode(ClefEncodingLimits {
+            max_length: full.input_ids.len(),
+            max_state_tokens: Some(0),
+        });
+        assert_eq!(calls.get(), 5);
+        assert_eq!(zero.state_tokens_admitted, 0);
+        assert!(zero.state_truncated);
+        assert_eq!(
+            full.questions[0].question_span.0 - zero.questions[0].question_span.0,
+            state.len()
+        );
+        let empty = ClefRecord {
+            state: Value::String(String::new()),
+            ..record
+        };
+        let empty = ClefEncoder::encode_with(&empty, ClefEncodingLimits::default(), |text| {
+            Ok(text.bytes().map(i64::from).collect())
+        })
+        .expect("empty state");
+        assert_eq!(empty.state_tokens_before_truncation, 0);
+        assert_eq!(empty.state_tokens_admitted, 0);
+        assert!(!empty.state_truncated);
     }
     #[test]
     #[ignore = "requires CLEF_TOKENIZER_JSON pointing to the pinned release tokenizer"]
