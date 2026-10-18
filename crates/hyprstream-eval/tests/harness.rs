@@ -70,7 +70,7 @@ async fn truth_subject_scores_perfectly_on_bench_items() {
     let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
 
     assert_eq!(report.accuracy, Some(1.0));
-    assert_eq!(report.abstention_rate, 0.0);
+    assert_eq!(report.abstention_rate, Some(0.0));
     let gate = report.gate.as_ref().unwrap();
     assert!(
         gate.macro_ece.mean < 0.05,
@@ -1433,4 +1433,36 @@ async fn empty_schema_versions_fail_preflight_even_for_empty_runs() {
             set.rows.len()
         );
     }
+}
+
+#[tokio::test]
+async fn empty_runs_have_no_measured_abstention_rate() {
+    let item = noul_item();
+    let set = hyprstream_eval::EvalSet {
+        name: "empty-rate".into(),
+        schema_version: "v1".into(),
+        questions: vec![item.question.clone()],
+        rows: vec![],
+    };
+    let subject = TruthSubject::new("empty-rate-control");
+    let output = Harness.run_set(&set, &subject).await.unwrap();
+    let report = score_run(&output, &ScoreConfig::default()).unwrap();
+    assert_eq!(report.abstention_rate, None);
+    assert_eq!(report.accuracy, None);
+    assert!(report.gate.is_none());
+    assert!(report.by_family.is_empty());
+    let output = Harness.run_items(&[], &subject).await.unwrap();
+    let report = score_bench_run(&output, &[], &ScoreConfig::default()).unwrap();
+    assert_eq!(report.abstention_rate, None);
+    assert_eq!(report.accuracy, None);
+    assert!(report.gate.is_none());
+    // A real unanswered observation is measured, even with no ground truth.
+    let mut output = Harness
+        .run_items(std::slice::from_ref(&item), &subject)
+        .await
+        .unwrap();
+    output.observations[0].probabilities = None;
+    let report = score_bench_run(&output, &[item], &ScoreConfig::default()).unwrap();
+    assert_eq!(report.abstention_rate, Some(1.0));
+    assert_eq!(report.by_family[0].abstention_rate, 1.0);
 }

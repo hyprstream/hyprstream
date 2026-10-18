@@ -542,6 +542,16 @@ impl HttpSubject {
 #[async_trait]
 impl Subject for HttpSubject {
     fn preflight(&self, _set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+        if self.model.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires a non-empty model".to_owned(),
+            ));
+        }
+        if self.token.trim().is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the HTTP subject requires a non-empty bearer token".to_owned(),
+            ));
+        }
         if matches!(state, Entry::Null) {
             return Err(EvalError::InvalidInput(
                 "the legacy /v1/systemone HTTP endpoint requires a non-null state".to_owned(),
