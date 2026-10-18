@@ -328,15 +328,15 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
             None => Err(invalid(format!("answer object is missing `{key}`"))),
             Some(Value::Null) => Ok(None),
             Some(Value::Object(map)) => {
-                // The key set must be exactly the declared labels: extra keys
-                // would be silently dropped from a distribution that still
-                // sums within tolerance, hiding a schema mismatch.
-                for key in map.keys() {
-                    if !labels.contains(key) {
-                        return Err(invalid(format!(
-                            "probabilities carry undeclared label `{key}`"
-                        )));
-                    }
+                // Equal cardinality plus the per-declared-label lookups below
+                // establishes exact key equality without scanning all labels
+                // for every response key (Score cardinality is unbounded).
+                if map.len() != labels.len() {
+                    return Err(invalid(format!(
+                        "probabilities carry {} labels; expected {}",
+                        map.len(),
+                        labels.len()
+                    )));
                 }
                 let mut probabilities = Vec::with_capacity(labels.len());
                 for label in &labels {
@@ -391,6 +391,11 @@ fn parse_answer(question: &QuestionSpec, value: &Value) -> Result<QuestionAnswer
 
 /// Parse the full response envelope into an [`AnswerRow`].
 pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerRow, EvalError> {
+    // This public parser also accepts programmatic inputs without HTTP
+    // preflight. Exact key-set admission requires unique declared labels.
+    for question in &set.questions {
+        crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+    }
     let answers = body
         .get("answers")
         .and_then(Value::as_object)
@@ -628,7 +633,12 @@ impl HttpSubject {
 
 #[async_trait]
 impl Subject for HttpSubject {
-    fn preflight(&self, _set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+    fn preflight(&self, set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+        // Direct callers also require unique declared labels for exact response
+        // key admission; do not rely solely on Harness/teacher validation.
+        for question in &set.questions {
+            crate::run::validate_question_profile(question).map_err(EvalError::InvalidInput)?;
+        }
         self.budget
             .validate()
             .map_err(|message| EvalError::InvalidInput(message.to_owned()))?;
@@ -1010,6 +1020,87 @@ questions:
             &serde_json::json!({"type":"choice","probabilities":{"angry":0.5,"calm":0.4,"bored":0.1}}),
         );
         assert!(extra_label.is_err());
+    }
+
+    #[test]
+    fn wire_probability_keys_require_exact_declared_set() {
+        let set = fixture();
+        for id in ["tone", "severity"] {
+            let question = set.question(id).unwrap();
+            let labels = question.labels();
+            let mut exact = serde_json::Map::new();
+            // Opposite insertion order to the declared labels; the numeric
+            // vector must still follow the question, not response ordering.
+            for (index, label) in labels.iter().enumerate().rev() {
+                exact.insert(
+                    label.clone(),
+                    serde_json::json!(if index == labels.len() - 1 { 1.0 } else { 0.0 }),
+                );
+            }
+            let response = |probabilities: serde_json::Map<String, Value>| serde_json::json!({"type": question.kind.as_str(), "probabilities": probabilities});
+            let parsed = parse_answer(question, &response(exact.clone())).unwrap();
+            let probabilities = parsed.value.unwrap().probabilities();
+            assert_eq!(probabilities.len(), labels.len());
+            assert_eq!(probabilities[labels.len() - 1], 1.0);
+            assert!(probabilities[..labels.len() - 1].iter().all(|p| *p == 0.0));
+
+            let mut extra = exact.clone();
+            extra.insert("undeclared".to_owned(), serde_json::json!(0.0));
+            let mut missing = exact.clone();
+            missing.remove(&labels[0]);
+            let mut substituted = missing.clone();
+            substituted.insert("undeclared".to_owned(), serde_json::json!(0.0));
+            // All three retain a valid sum of one. The substitution also has
+            // equal cardinality, so only exact key membership can reject it.
+            for malformed in [extra, missing, substituted] {
+                let error = parse_answer(question, &response(malformed)).unwrap_err();
+                assert!(
+                    matches!(error, EvalError::InvalidAnswer { question_id, .. } if question_id == id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_score_wire_preserves_numeric_level_order() {
+        const LEVELS: usize = 4096;
+        const WINNER: usize = 3073;
+        let question = QuestionSpec {
+            id: "wide_score".to_owned(),
+            kind: hyprstream_decision::QuestionKind::Score,
+            instructions: None,
+            body: QuestionBody::Score {
+                levels: vec![None; LEVELS],
+            },
+        };
+        let wire: serde_json::Map<String, Value> = (0..LEVELS)
+            .rev()
+            .map(|level| {
+                (
+                    level.to_string(),
+                    serde_json::json!(if level == WINNER { 1.0 } else { 0.0 }),
+                )
+            })
+            .collect();
+        let parsed = parse_answer(
+            &question,
+            &serde_json::json!({"type": "score", "probabilities": wire}),
+        )
+        .unwrap();
+        let Some(AnswerValue::Score { probabilities }) = parsed.value else {
+            panic!("valid score must remain answered")
+        };
+        assert_eq!(probabilities.len(), LEVELS);
+        for (level, probability) in probabilities.iter().enumerate() {
+            assert_eq!(
+                probability.to_bits(),
+                if level == WINNER {
+                    1.0_f32.to_bits()
+                } else {
+                    0.0_f32.to_bits()
+                }
+            );
+        }
     }
 
     #[test]
