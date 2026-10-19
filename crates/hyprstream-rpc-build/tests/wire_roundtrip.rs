@@ -741,6 +741,7 @@ fn root_data_lists_validate_wire_shape_and_segment_bounds() {
         },
         "rejected": [
             "invalid-far-pad",
+            "invalid-outer-kind",
             "invalid-child-kind",
             "segment-list-overrun",
             "segment-payload-overrun",

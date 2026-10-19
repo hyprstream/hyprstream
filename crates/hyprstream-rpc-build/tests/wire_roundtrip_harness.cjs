@@ -155,6 +155,8 @@ function rootDataReader(kind) {
   word(8, 0, 1 << 16); // root struct: zero data words, one pointer word
   if (kind === 'invalid-far-pad') {
     word(16, (7 << 3) | 2, 0); // landing pad starts at the declared segment end
+  } else if (kind === 'invalid-outer-kind') {
+    word(16, 0, 1); // non-null struct pointer in a List(Data) slot
   } else if (kind === 'empty') {
     word(16, 0, 0);
   } else if (kind === 'composite' || kind === 'composite-shape' || kind === 'composite-body' || kind === 'composite-tag-kind' || kind === 'composite-tag-overrun') {
@@ -270,7 +272,7 @@ function main() {
       valid[kind] = rootDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
     const rejected = [];
-    for (const kind of ['invalid-far-pad', 'invalid-child-kind', 'segment-list-overrun', 'segment-payload-overrun', 'payload-before-start', 'list-before-start', 'composite-shape', 'composite-body', 'composite-tag-kind', 'composite-tag-overrun', 'far-child-payload-overrun']) {
+    for (const kind of ['invalid-far-pad', 'invalid-outer-kind', 'invalid-child-kind', 'segment-list-overrun', 'segment-payload-overrun', 'payload-before-start', 'list-before-start', 'composite-shape', 'composite-body', 'composite-tag-kind', 'composite-tag-overrun', 'far-child-payload-overrun']) {
       try { rootDataReader(kind).getDataList(0); }
       catch { rejected.push(kind); }
     }
