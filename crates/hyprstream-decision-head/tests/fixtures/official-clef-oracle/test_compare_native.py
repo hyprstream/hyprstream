@@ -31,6 +31,63 @@ def fixture():
 
 
 class ComparatorAdmissionTests(unittest.TestCase):
+    def test_tensor_inventory_is_derived_from_admitted_records_and_scope(self):
+        records = fixture()
+        required, permitted = compare.expected_tensor_inventory(records, require_backbone_inputs=False)
+        self.assertIn("r0.q0.logits", required)
+        self.assertIn("r0.q0.probabilities", required)
+        self.assertIn("r0.normalized_hidden", required)
+        self.assertNotIn("r0.hidden", required)
+        self.assertNotIn("embedding_rows", required)
+        self.assertIn("r0.hidden", permitted)
+        self.assertIn("embedding_rows", permitted)
+        compare.validate_tensor_inventory(records, required, require_backbone_inputs=False)
+        with self.assertRaisesRegex(ValueError, "missing=.*r0.q1.probabilities"):
+            compare.validate_tensor_inventory(records, required - {"r0.q1.probabilities"},
+                                              require_backbone_inputs=False)
+        with self.assertRaisesRegex(ValueError, "missing=.*embedding_rows"):
+            compare.validate_tensor_inventory(records, required, require_backbone_inputs=True)
+        with self.assertRaisesRegex(ValueError, "unexpected=.*untracked.tensor"):
+            compare.validate_tensor_inventory(records, required | {"untracked.tensor"},
+                                              require_backbone_inputs=False)
+        backbone_keys = {"r0.hidden", "embedding_rows", "embedding_token_ids"}
+        compare.validate_tensor_inventory(records, backbone_keys, require_backbone_inputs=True,
+                                          backbone_only=True)
+
+    def test_native_receipt_binds_profile_input_and_output_tensor_bytes(self):
+        profile = json.loads((HERE / "full-port-tolerances-v1.json").read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path, native_path, receipt_path = (root / "input.safetensors",
+                                                       root / "native.safetensors",
+                                                       root / "export-receipt.json")
+            input_path.write_bytes(b"native backbone input")
+            native_path.write_bytes(b"native emitted tensors")
+            receipt = {"schema_version": 1, "input_profile": "original-f32",
+                       "native_input_tensor_path": str(input_path),
+                       "native_input_tensors_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+                       "native_tensors_sha256": hashlib.sha256(native_path.read_bytes()).hexdigest(),
+                       "source_revision": profile["source_revision"],
+                       "compute_dtype": "float32", "device": "cpu"}
+            receipt_path.write_text(json.dumps(receipt))
+            admitted = compare.admit_native_receipt(receipt_path, native_path, input_path, profile)
+            self.assertEqual(admitted["input_profile"], "original-f32")
+            for field, value, message in (
+                ("input_profile", "fp8-w8a8", "input_profile does not match"),
+                ("native_tensors_sha256", "0" * 64, "tensor digest does not match"),
+                ("native_input_tensors_sha256", "f" * 64, "input digest does not match"),
+                ("source_revision", "0" * 40, "source_revision does not match"),
+                ("compute_dtype", "bfloat16", "dtype/device do not match"),
+                ("device", "cuda", "dtype/device do not match"),
+            ):
+                with self.subTest(field=field):
+                    receipt_path.write_text(json.dumps(dict(receipt, **{field: value})))
+                    with self.assertRaisesRegex(ValueError, message):
+                        compare.admit_native_receipt(receipt_path, native_path, input_path, profile)
+            receipt_path.unlink()
+            with self.assertRaisesRegex(ValueError, "requires --native-receipt"):
+                compare.admit_native_receipt(None, native_path, input_path, profile)
+
     def test_full_port_requires_native_records_with_any_tolerance_source(self):
         for include_hidden in (False, True):
             with self.subTest(include_hidden=include_hidden), self.assertRaisesRegex(ValueError, "requires --native-records"):
@@ -258,8 +315,13 @@ class FiniteReportAndProfileTests(unittest.TestCase):
             (reference / "provenance.json").write_text(json.dumps(provenance))
             safe = types.ModuleType("safetensors")
             loader = types.ModuleType("safetensors.torch")
-            key = "r0.q0.probabilities"
-            loader.load_file = lambda path: {key:SingleValueTensor(reference_value if path == tensor_path else native_value)}
+            values = {"r0.normalized_hidden": 0.0, "r0.q0.logits": 1.0,
+                      "r0.q0.probabilities": reference_value}
+            loader.load_file = lambda path: {
+                key: SingleValueTensor((reference_value if path == tensor_path else native_value)
+                                       if key == "r0.q0.probabilities" else value)
+                for key, value in values.items()
+            }
             torch = types.ModuleType("torch")
             torch.int64 = "int64"
             torch.isfinite = lambda x: SingleValueTensor(math.isfinite(x.value))
