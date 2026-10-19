@@ -1458,9 +1458,9 @@ fn conformal_set_none_and_present_empty_stay_distinct() {
 
 /// Decode-side distribution validation (r3 review probe 2 follow-up): the
 /// decoder applies the CONSUMER sum tolerance — a wire batch the producer
-/// contract would reject (sum 1.001) still decodes into IR (the Arrow
-/// consumer surface accepts it downstream), while a grossly invalid one
-/// (sum 1.8) is rejected here instead of entering the IR silently.
+/// contract would reject still decodes into IR, can be emitted through the
+/// consumer-tolerance Arrow path without changing its values, and a grossly
+/// invalid one is rejected before entering the IR.
 #[test]
 fn decode_applies_consumer_tolerance_to_distributions() {
     let version = VersionTriple {
@@ -1511,7 +1511,8 @@ fn decode_applies_consumer_tolerance_to_distributions() {
 
     // Sum 1.001: outside the producer tolerance (1e-6) — batch_to_message
     // rejects the same IR — but inside the consumer tolerance (1e-2), so the
-    // decoder accepts it. The two surfaces intentionally differ (D5).
+    // decoder accepts it. The explicit consumer Arrow path retains that D5
+    // tolerance while ordinary producer-side Arrow construction stays strict.
     let borderline = vec![0.5005f32, 0.5005f32];
     let source = row(vec![(
         "q",
@@ -1532,4 +1533,29 @@ fn decode_applies_consumer_tolerance_to_distributions() {
             probabilities: vec![0.5005, 0.5005]
         })
     );
+
+    let set = hyprstream_decision::parse_yaml(
+        r#"
+questions:
+  q:
+    type: choice
+    criteria:
+      yes: "yes"
+      no: "no"
+"#,
+    )
+    .expect("question set parses");
+    let schema = DecisionSchema::from_question_set(&set).expect("Arrow schema builds");
+    assert!(matches!(
+        schema.build_batch(&version, &rows),
+        Err(hyprstream_decision::BatchError::InvalidDistribution(
+            0,
+            _,
+            _
+        ))
+    ));
+    let batch = schema
+        .build_batch_from_consumer(&version, &rows)
+        .expect("consumer-valid decoded row emits to Arrow");
+    assert_eq!(arrow_probabilities(&batch, "q", 0), Some(borderline));
 }
