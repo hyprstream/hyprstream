@@ -294,12 +294,233 @@ pub struct ResolvedDecisionPins {
     pub arrow_fingerprint: Arc<str>,
 }
 
+const MAX_LIVE_PREPARED_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+
+fn add_retained_bytes(total: &mut usize, bytes: usize) -> Result<(), DecisionSubstrateError> {
+    *total = total.checked_add(bytes).ok_or_else(|| {
+        DecisionSubstrateError::ResourceExhausted("prepared payload size overflow".to_owned())
+    })?;
+    Ok(())
+}
+
+fn retained_capacity_bytes<T>(capacity: usize) -> Result<usize, DecisionSubstrateError> {
+    capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| {
+            DecisionSubstrateError::ResourceExhausted("prepared payload size overflow".to_owned())
+        })
+}
+
+fn entry_retained_bytes(
+    entry: &hyprstream_decision::entry::Entry,
+) -> Result<usize, DecisionSubstrateError> {
+    use hyprstream_decision::entry::Entry;
+    let mut total = std::mem::size_of::<Entry>();
+    match entry {
+        Entry::Str(value) => add_retained_bytes(&mut total, value.capacity())?,
+        Entry::Seq(values) => {
+            add_retained_bytes(
+                &mut total,
+                retained_capacity_bytes::<Entry>(values.capacity())?,
+            )?;
+            for value in values {
+                add_retained_bytes(&mut total, entry_retained_bytes(value)?)?;
+            }
+        }
+        Entry::Map(values) => {
+            add_retained_bytes(
+                &mut total,
+                retained_capacity_bytes::<(String, Entry)>(values.capacity())?,
+            )?;
+            for (key, value) in values {
+                add_retained_bytes(&mut total, key.capacity())?;
+                add_retained_bytes(&mut total, entry_retained_bytes(value)?)?;
+            }
+        }
+        Entry::Null | Entry::Bool(_) | Entry::Number(_) => {}
+    }
+    Ok(total)
+}
+
+fn question_set_retained_bytes(set: &QuestionSet) -> Result<usize, DecisionSubstrateError> {
+    use hyprstream_decision::spec::{QuestionBody, QuestionSet};
+    let mut total = std::mem::size_of::<QuestionSet>();
+    add_retained_bytes(
+        &mut total,
+        retained_capacity_bytes::<hyprstream_decision::spec::QuestionSpec>(
+            set.questions.capacity(),
+        )?,
+    )?;
+    if let Some(state) = &set.state {
+        add_retained_bytes(&mut total, entry_retained_bytes(state)?)?;
+    }
+    for question in &set.questions {
+        add_retained_bytes(&mut total, question.id.capacity())?;
+        if let Some(instructions) = &question.instructions {
+            add_retained_bytes(&mut total, entry_retained_bytes(instructions)?)?;
+        }
+        match &question.body {
+            QuestionBody::Noul { criteria } => {
+                if let Some(criteria) = criteria {
+                    add_retained_bytes(&mut total, std::mem::size_of_val(criteria))?;
+                    if let Some(value) = &criteria.on_true {
+                        add_retained_bytes(&mut total, entry_retained_bytes(value)?)?;
+                    }
+                    if let Some(value) = &criteria.on_false {
+                        add_retained_bytes(&mut total, entry_retained_bytes(value)?)?;
+                    }
+                }
+            }
+            QuestionBody::Choice { options } => {
+                add_retained_bytes(
+                    &mut total,
+                    retained_capacity_bytes::<hyprstream_decision::spec::ChoiceOption>(
+                        options.capacity(),
+                    )?,
+                )?;
+                for option in options {
+                    add_retained_bytes(&mut total, option.name.capacity())?;
+                    if let Some(rubric) = &option.rubric {
+                        add_retained_bytes(&mut total, entry_retained_bytes(rubric)?)?;
+                    }
+                }
+            }
+            QuestionBody::Score { levels } => {
+                add_retained_bytes(
+                    &mut total,
+                    retained_capacity_bytes::<Option<hyprstream_decision::entry::Entry>>(
+                        levels.capacity(),
+                    )?,
+                )?;
+                for level in levels.iter().flatten() {
+                    add_retained_bytes(&mut total, entry_retained_bytes(level)?)?;
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn prepared_payload_retained_bytes(
+    payload: &ResolvedDecisionPins,
+) -> Result<usize, DecisionSubstrateError> {
+    let mut total = std::mem::size_of::<DecisionPins>()
+        + std::mem::size_of::<RawQuestionsTemplate>()
+        + std::mem::size_of::<String>()
+        + std::mem::size_of::<QuestionSet>();
+    for pin in [
+        &payload.pins.authorization_model_ref,
+        &payload.pins.expected_artifact_commit,
+        &payload.pins.schema_version,
+        &payload.pins.model_id,
+        &payload.pins.encoding_version,
+        &payload.pins.quantization,
+        &payload.pins.admitted_compute_profile,
+        &payload.pins.head_weights_sha256,
+        &payload.pins.head_config_sha256,
+        &payload.pins.tokenizer_sha256,
+        &payload.pins.backbone_config_sha256,
+        &payload.pins.arrow_schema_identity,
+    ] {
+        add_retained_bytes(&mut total, pin.capacity())?;
+    }
+    if let Some(calibration) = &payload.pins.calibration_version {
+        add_retained_bytes(&mut total, calibration.capacity())?;
+    }
+    add_retained_bytes(&mut total, payload.raw.raw_json.len())?;
+    add_retained_bytes(
+        &mut total,
+        retained_capacity_bytes::<String>(payload.raw.question_ids.len())?,
+    )?;
+    for id in payload.raw.question_ids.iter() {
+        add_retained_bytes(&mut total, id.capacity())?;
+    }
+    add_retained_bytes(&mut total, payload.arrow_fingerprint.len())?;
+    add_retained_bytes(
+        &mut total,
+        question_set_retained_bytes(&payload.question_set)?,
+    )?;
+    // Include Arc/control-block and small metadata allocations conservatively.
+    add_retained_bytes(&mut total, 8 * std::mem::size_of::<usize>())?;
+    Ok(total)
+}
+
+fn binding_metadata_bytes(rows: usize) -> Result<usize, DecisionSubstrateError> {
+    let row_bytes = rows
+        .checked_mul(std::mem::size_of::<String>())
+        .ok_or_else(|| {
+            DecisionSubstrateError::ResourceExhausted("binding size overflow".to_owned())
+        })?;
+    row_bytes
+        .checked_add(std::mem::size_of::<ChargedBinding>())
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+        .ok_or_else(|| {
+            DecisionSubstrateError::ResourceExhausted("binding size overflow".to_owned())
+        })
+}
+
+struct LiveAllocationLease {
+    bytes: usize,
+    live: Arc<AtomicU64>,
+}
+
+impl LiveAllocationLease {
+    fn reserve(live: &Arc<AtomicU64>, bytes: usize) -> Result<Self, DecisionSubstrateError> {
+        let bytes_u64 = u64::try_from(bytes).map_err(|_| {
+            DecisionSubstrateError::ResourceExhausted("prepared payload size overflow".to_owned())
+        })?;
+        loop {
+            let current = live.load(Ordering::Relaxed);
+            let next = current.checked_add(bytes_u64).ok_or_else(|| {
+                DecisionSubstrateError::ResourceExhausted(
+                    "prepared payload accounting overflow".to_owned(),
+                )
+            })?;
+            if next > MAX_LIVE_PREPARED_PAYLOAD_BYTES as u64 {
+                return Err(DecisionSubstrateError::ResourceExhausted(
+                    "global live prepared-payload byte cap".to_owned(),
+                ));
+            }
+            if live
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(Self {
+                    bytes,
+                    live: Arc::clone(live),
+                });
+            }
+        }
+    }
+}
+
+impl Drop for LiveAllocationLease {
+    fn drop(&mut self) {
+        self.live.fetch_sub(self.bytes as u64, Ordering::AcqRel);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // limits + accounting (statement counts and aggregate bound bytes, 3 levels)
 // ---------------------------------------------------------------------------
 
 /// Hard cap on a single prepare document (bytes).
 pub const MAX_PREPARE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Lossless view of the top-level prepare document. `RawValue` retains the
+/// caller's exact ordered questions JSON, while serde's derived struct rejects
+/// duplicate `schema_version`, `questions`, `model`, or `state` fields.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallerPrepareDocument<'a> {
+    schema_version: &'a str,
+    #[serde(borrow)]
+    questions: &'a serde_json::value::RawValue,
+    #[serde(default, borrow)]
+    model: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    state: Option<&'a serde_json::value::RawValue>,
+}
 
 /// Bounded ceiling on concurrent prepares so `Semaphore::new` can never
 /// panic on an oversized value.
@@ -605,15 +826,45 @@ pub struct PreparedStatement {
     pub owner: OwnerKey,
     /// RANDOM OPAQUE per CREATE — unrelated to document bytes.
     pub handle: [u8; 32],
-    pub pins: Arc<DecisionPins>,
-    pub question_set: Arc<QuestionSet>,
-    pub raw: Arc<RawQuestionsTemplate>,
-    pub arrow_fingerprint: Arc<str>,
-    pub schema_version: Arc<str>,
-    pub binding: Arc<BindingSnapshot>,
+    payload: Arc<ChargedPreparedPayload>,
+    pub binding: BindingSnapshot,
     pub close_state: Arc<CloseState>,
     pub created_at_unix_ms: i64,
     pub generation: StatementGeneration,
+}
+
+/// Immutable model/template payload whose accounting lease lives exactly as
+/// long as every retained prepared-statement snapshot.
+struct ChargedPreparedPayload {
+    pins: DecisionPins,
+    question_set: QuestionSet,
+    raw_json: String,
+    question_ids: Vec<String>,
+    arrow_fingerprint: String,
+    schema_version: String,
+    _lease: LiveAllocationLease,
+}
+
+impl PreparedStatement {
+    pub fn pins(&self) -> &DecisionPins {
+        &self.payload.pins
+    }
+
+    pub fn question_set(&self) -> &QuestionSet {
+        &self.payload.question_set
+    }
+
+    pub fn raw_template(&self) -> (&str, &[String]) {
+        (&self.payload.raw_json, &self.payload.question_ids)
+    }
+
+    pub fn arrow_fingerprint(&self) -> &str {
+        &self.payload.arrow_fingerprint
+    }
+
+    pub fn schema_version(&self) -> &str {
+        &self.payload.schema_version
+    }
 }
 
 /// Immutable shared binding. `lease` keeps the aggregate bytes charged until
@@ -621,15 +872,16 @@ pub struct PreparedStatement {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct BindingSnapshot {
-    pub states: Arc<[String]>,
-    pub bound_bytes: usize,
-    pub generation: StatementGeneration,
-    // `lease` is the live aggregate charge (read by the deferred
-    // ExecutionControl protocol, not by S1 code paths).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) lease: Arc<ByteLease>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) close_state: Arc<CloseState>,
+    inner: Arc<ChargedBinding>,
+}
+
+struct ChargedBinding {
+    states: Box<[String]>,
+    bound_bytes: usize,
+    generation: StatementGeneration,
+    _lease: ByteLease,
+    _metadata_lease: LiveAllocationLease,
+    close_state: Arc<CloseState>,
 }
 
 impl BindingSnapshot {
@@ -637,13 +889,25 @@ impl BindingSnapshot {
     /// The deferred ExecutionControl protocol consults this before/while any
     /// future execute loop runs.
     pub fn is_closed(&self) -> bool {
-        self.close_state.is_closed()
+        self.inner.close_state.is_closed()
+    }
+
+    pub fn states(&self) -> &[String] {
+        &self.inner.states
+    }
+
+    pub fn bound_bytes(&self) -> usize {
+        self.inner.bound_bytes
+    }
+
+    pub fn generation(&self) -> StatementGeneration {
+        self.inner.generation
     }
 
     /// Charged aggregate bytes this snapshot's lease currently accounts for.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn charged_bytes(&self) -> usize {
-        self.lease.bytes
+        self.inner._lease.bytes
     }
 }
 
@@ -652,6 +916,8 @@ impl BindingSnapshot {
 pub struct PreparedDecideCounts {
     pub statements_global: u64,
     pub bound_bytes_global: u64,
+    pub live_payload_bytes_global: u64,
+    pub live_binding_metadata_bytes_global: u64,
 }
 
 #[doc(hidden)]
@@ -659,6 +925,8 @@ pub struct PreparedDecideRegistry {
     limits: PreparedDecideLimits,
     accounting: Arc<ByteAccounting>,
     stmt_global: Arc<AtomicU64>,
+    live_payload_bytes: Arc<AtomicU64>,
+    live_binding_metadata_bytes: Arc<AtomicU64>,
     stmt_tenants: Mutex<BTreeMap<String, Arc<AtomicU64>>>,
     stmt_owners: Mutex<BTreeMap<OwnerKey, Arc<AtomicU64>>>,
     entries: Mutex<BTreeMap<(OwnerKey, [u8; 32]), Arc<PreparedStatement>>>,
@@ -687,6 +955,8 @@ impl PreparedDecideRegistry {
             limits,
             accounting,
             stmt_global: Arc::new(AtomicU64::new(0)),
+            live_payload_bytes: Arc::new(AtomicU64::new(0)),
+            live_binding_metadata_bytes: Arc::new(AtomicU64::new(0)),
             stmt_tenants: Mutex::new(BTreeMap::new()),
             stmt_owners: Mutex::new(BTreeMap::new()),
             entries: Mutex::new(BTreeMap::new()),
@@ -729,10 +999,7 @@ impl PreparedDecideRegistry {
     pub(crate) fn insert(
         &self,
         owner: OwnerKey,
-        pins: DecisionPins,
-        question_set: Arc<QuestionSet>,
-        raw: Arc<RawQuestionsTemplate>,
-        arrow_fingerprint: Arc<str>,
+        resolved: ResolvedDecisionPins,
     ) -> Result<([u8; 32], StatementGeneration), DecisionSubstrateError> {
         let mut entries = self.entries.lock();
         let (stmt_tenant, stmt_owner) = (
@@ -761,7 +1028,46 @@ impl PreparedDecideRegistry {
                 "owner prepared-statement cap".to_owned(),
             ));
         }
-        let schema_version = Arc::from(pins.schema_version.as_str());
+        if Arc::strong_count(&resolved.pins) != 1
+            || Arc::strong_count(&resolved.question_set) != 1
+            || Arc::strong_count(&resolved.raw) != 1
+            || Arc::strong_count(&resolved.raw.raw_json) != 1
+            || Arc::strong_count(&resolved.raw.question_ids) != 1
+            || Arc::strong_count(&resolved.arrow_fingerprint) != 1
+        {
+            return Err(DecisionSubstrateError::InvalidArgument(
+                "resolver must transfer exclusive ownership of prepared payload data".to_owned(),
+            ));
+        }
+        let retained_bytes = prepared_payload_retained_bytes(&resolved)?;
+        let lease = LiveAllocationLease::reserve(&self.live_payload_bytes, retained_bytes)?;
+        let pins = Arc::try_unwrap(resolved.pins).map_err(|_| {
+            DecisionSubstrateError::InvalidArgument(
+                "resolver retained a prepared-payload alias".to_owned(),
+            )
+        })?;
+        let question_set = Arc::try_unwrap(resolved.question_set).map_err(|_| {
+            DecisionSubstrateError::InvalidArgument(
+                "resolver retained a question-set alias".to_owned(),
+            )
+        })?;
+        let raw = Arc::try_unwrap(resolved.raw).map_err(|_| {
+            DecisionSubstrateError::InvalidArgument(
+                "resolver retained a raw-template alias".to_owned(),
+            )
+        })?;
+        let raw_json = raw.raw_json.to_string();
+        let question_ids = raw.question_ids.iter().cloned().collect();
+        let schema_version = pins.schema_version.clone();
+        let payload = Arc::new(ChargedPreparedPayload {
+            pins,
+            question_set,
+            raw_json,
+            question_ids,
+            arrow_fingerprint: resolved.arrow_fingerprint.to_string(),
+            schema_version,
+            _lease: lease,
+        });
         // Random opaque handle, collision-checked under the lock.
         let mut handle = [0u8; 32];
         loop {
@@ -777,20 +1083,27 @@ impl PreparedDecideRegistry {
         // (including the initial one): close() must invalidate pre-rebind
         // snapshots too.
         let close_state = Arc::new(CloseState::default());
+        let metadata_lease = LiveAllocationLease::reserve(
+            &self.live_binding_metadata_bytes,
+            binding_metadata_bytes(0)?,
+        )?;
         // Zero-byte initial binding: a lease is unnecessary at zero bytes, but
         // the snapshot shape stays uniform for rebind/execute.
-        let binding = Arc::new(BindingSnapshot {
-            states: Arc::from([]),
-            bound_bytes: 0,
-            generation: StatementGeneration(1),
-            lease: Arc::new(ByteLease {
-                bytes: 0,
-                global: CountedCell::new(Arc::clone(&self.accounting.bytes_global)),
-                tenant: CountedCell::new(self.accounting.tenant_bytes_cell(owner.tenant())?),
-                owner: CountedCell::new(self.accounting.owner_bytes_cell(&owner)?),
+        let binding = BindingSnapshot {
+            inner: Arc::new(ChargedBinding {
+                states: Box::new([]),
+                bound_bytes: 0,
+                generation: StatementGeneration(1),
+                _lease: ByteLease {
+                    bytes: 0,
+                    global: CountedCell::new(Arc::clone(&self.accounting.bytes_global)),
+                    tenant: CountedCell::new(self.accounting.tenant_bytes_cell(owner.tenant())?),
+                    owner: CountedCell::new(self.accounting.owner_bytes_cell(&owner)?),
+                },
+                _metadata_lease: metadata_lease,
+                close_state: Arc::clone(&close_state),
             }),
-            close_state: Arc::clone(&close_state),
-        });
+        };
         let created_at_unix_ms = now_unix_ms();
         let generation = StatementGeneration(1);
         entries.insert(
@@ -798,11 +1111,7 @@ impl PreparedDecideRegistry {
             Arc::new(PreparedStatement {
                 owner,
                 handle,
-                pins: Arc::new(pins),
-                question_set,
-                raw,
-                arrow_fingerprint,
-                schema_version,
+                payload,
                 binding,
                 close_state,
                 created_at_unix_ms,
@@ -881,13 +1190,9 @@ impl PreparedDecideRegistry {
                 self.limits.max_bound_rows
             )));
         }
-        // Normalize into EXACT-capacity strings BEFORE accounted storage: a
-        // caller handoff with huge spare capacity must not be charged at the
-        // caller's inflated capacity (same spelling => same charge).
-        let states: Vec<String> = states
-            .into_iter()
-            .map(|state| String::from(state.as_str()))
-            .collect();
+        // Preflight caller-owned strings before making any copy. This check is
+        // intentionally before normalization so oversized input cannot force
+        // an unbounded second allocation while the registry lock is held.
         let bytes: usize = states
             .iter()
             .map(String::len)
@@ -901,17 +1206,31 @@ impl PreparedDecideRegistry {
                 self.limits.max_state_bytes_per_statement
             )));
         }
+        let metadata_lease = LiveAllocationLease::reserve(
+            &self.live_binding_metadata_bytes,
+            binding_metadata_bytes(states.len())?,
+        )?;
         // Reserve the NEW lease first (charged against the live counters,
         // including retained old snapshots — conservative by design).
         let lease = ByteLease::reserve(&self.accounting, owner, bytes)?;
+        // Normalize into EXACT-capacity strings after admission: a caller
+        // handoff with huge spare capacity must not be charged at its inflated
+        // capacity (same spelling => same content charge).
+        let states: Vec<String> = states
+            .into_iter()
+            .map(|state| String::from(state.as_str()))
+            .collect();
         let generation = StatementGeneration(entry.generation.0 + 1);
-        let binding = Arc::new(BindingSnapshot {
-            states: Arc::from(states.into_boxed_slice()),
-            bound_bytes: bytes,
-            generation,
-            lease: Arc::new(lease),
-            close_state: Arc::clone(&entry.close_state),
-        });
+        let binding = BindingSnapshot {
+            inner: Arc::new(ChargedBinding {
+                states: states.into_boxed_slice(),
+                bound_bytes: bytes,
+                generation,
+                _lease: lease,
+                _metadata_lease: metadata_lease,
+                close_state: Arc::clone(&entry.close_state),
+            }),
+        };
         let prepared = Arc::make_mut(
             entries
                 .get_mut(&(owner.clone(), key_handle))
@@ -942,6 +1261,10 @@ impl PreparedDecideRegistry {
         PreparedDecideCounts {
             statements_global: self.stmt_global.load(Ordering::Relaxed),
             bound_bytes_global: self.accounting.bytes_global.load(Ordering::Relaxed),
+            live_payload_bytes_global: self.live_payload_bytes.load(Ordering::Relaxed),
+            live_binding_metadata_bytes_global: self
+                .live_binding_metadata_bytes
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -1012,6 +1335,7 @@ fn ensure_resolution_consistent(
     resolved: &ResolvedDecisionPins,
     expected_artifact_commit: &str,
     caller_schema_version: &str,
+    caller_raw_questions: &str,
     caller_set: &hyprstream_decision::spec::QuestionSet,
 ) -> Result<(), DecisionSubstrateError> {
     resolved.pins.validate()?;
@@ -1028,6 +1352,12 @@ fn ensure_resolution_consistent(
     if resolved.raw.raw_json.is_empty() || resolved.raw.question_ids.is_empty() {
         return Err(DecisionSubstrateError::InvalidArgument(
             "resolved raw question template must be non-empty".to_owned(),
+        ));
+    }
+    if resolved.raw.raw_json.as_ref() != caller_raw_questions {
+        return Err(DecisionSubstrateError::InvalidArgument(
+            "resolved raw question template does not match the caller's original questions JSON"
+                .to_owned(),
         ));
     }
     if resolved.arrow_fingerprint.is_empty() {
@@ -1197,39 +1527,29 @@ impl DecideOperator {
         // self-consistent template that was not derived from this document
         // is rejected. `schema_version` is extracted here (the IR parser
         // accepts only `state`/`questions` at the top level).
-        let document: serde_json::Value =
+        let document: CallerPrepareDocument<'_> =
             serde_json::from_str(decide_document).map_err(|error| {
                 DecisionSubstrateError::InvalidArgument(format!(
                     "prepare document is not valid JSON: {error}"
                 ))
             })?;
-        let document_object = document.as_object().ok_or_else(|| {
-            DecisionSubstrateError::InvalidArgument(
-                "prepare document must be a JSON object".to_owned(),
-            )
+        if document.schema_version.is_empty() {
+            return Err(DecisionSubstrateError::InvalidArgument(
+                "prepare document requires a non-empty schema_version".to_owned(),
+            ));
+        }
+        // These fields are accepted by the outer contract; model pin
+        // validation remains the resolver's responsibility.
+        let _model = document.model;
+        let _state = document.state;
+        let caller_raw_questions = document.questions.get();
+        let wrapped = format!(r#"{{"questions":{caller_raw_questions}}}"#);
+        let caller_set = hyprstream_decision::author::parse_json(&wrapped).map_err(|error| {
+            DecisionSubstrateError::InvalidArgument(format!(
+                "prepare document does not parse as a question-spec document: {error}"
+            ))
         })?;
-        let caller_schema_version = document_object
-            .get("schema_version")
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                DecisionSubstrateError::InvalidArgument(
-                    "prepare document requires a non-empty schema_version".to_owned(),
-                )
-            })?
-            .to_owned();
-        let questions = document_object.get("questions").ok_or_else(|| {
-            DecisionSubstrateError::InvalidArgument(
-                "prepare document requires a `questions` map".to_owned(),
-            )
-        })?;
-        let caller_set =
-            hyprstream_decision::author::parse_json(&format!(r#"{{"questions":{questions}}}"#))
-                .map_err(|error| {
-                    DecisionSubstrateError::InvalidArgument(format!(
-                        "prepare document does not parse as a question-spec document: {error}"
-                    ))
-                })?;
+        let caller_schema_version = document.schema_version;
         let resolved = self
             .resolve
             .resolve_pins(&owner, bearer, expected_artifact_commit, decide_document)
@@ -1243,16 +1563,11 @@ impl DecideOperator {
         ensure_resolution_consistent(
             &resolved,
             expected_artifact_commit,
-            &caller_schema_version,
+            caller_schema_version,
+            caller_raw_questions,
             &caller_set,
         )?;
-        self.registry.insert(
-            owner,
-            (*resolved.pins).clone(),
-            Arc::clone(&resolved.question_set),
-            Arc::clone(&resolved.raw),
-            Arc::clone(&resolved.arrow_fingerprint),
-        )
+        self.registry.insert(owner, resolved)
     }
 
     /// CLOSE: owner-checked removal; releases aggregate bytes when the last
@@ -1443,16 +1758,7 @@ mod tests {
 
     fn insert_for(registry: &PreparedDecideRegistry, owner: &OwnerKey) -> [u8; 32] {
         let r = resolved(COMMIT);
-        registry
-            .insert(
-                owner.clone(),
-                (*r.pins).clone(),
-                Arc::clone(&r.question_set),
-                Arc::clone(&r.raw),
-                Arc::clone(&r.arrow_fingerprint),
-            )
-            .expect("insert")
-            .0
+        registry.insert(owner.clone(), r).expect("insert").0
     }
 
     #[test]
@@ -1488,16 +1794,7 @@ mod tests {
         let alice = owner(TENANT, "alice");
         let _ = insert_for(&registry, &alice);
         assert!(matches!(
-            registry.insert(
-                alice,
-                pins(COMMIT),
-                Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate {
-                    raw_json: Arc::from("{}"),
-                    question_ids: Arc::from([]),
-                }),
-                Arc::from("fp"),
-            ),
+            registry.insert(alice, resolved(COMMIT)),
             Err(DecisionSubstrateError::ResourceExhausted(m)) if m.contains("owner")
         ));
 
@@ -1508,16 +1805,7 @@ mod tests {
         let _ = insert_for(&registry, &owner(TENANT, "alice"));
         let bob = owner(TENANT, "bob");
         assert!(matches!(
-            registry.insert(
-                bob,
-                pins(COMMIT),
-                Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate {
-                    raw_json: Arc::from("{}"),
-                    question_ids: Arc::from([]),
-                }),
-                Arc::from("fp"),
-            ),
+            registry.insert(bob, resolved(COMMIT)),
             Err(DecisionSubstrateError::ResourceExhausted(m)) if m.contains("tenant")
         ));
 
@@ -1527,16 +1815,7 @@ mod tests {
         });
         let _ = insert_for(&registry, &owner("t1", "alice"));
         assert!(matches!(
-            registry.insert(
-                owner("t2", "alice"),
-                pins(COMMIT),
-                Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate {
-                    raw_json: Arc::from("{}"),
-                    question_ids: Arc::from([]),
-                }),
-                Arc::from("fp"),
-            ),
+            registry.insert(owner("t2", "alice"), resolved(COMMIT)),
             Err(DecisionSubstrateError::ResourceExhausted(m)) if m.contains("global")
         ));
     }
@@ -1561,8 +1840,8 @@ mod tests {
             "create is generation 1; first rebind is 2"
         );
         let snap = registry.binding(&alice, &handle).unwrap();
-        assert_eq!(snap.states.len(), 1);
-        assert_eq!(snap.bound_bytes, 10);
+        assert_eq!(snap.states().len(), 1);
+        assert_eq!(snap.bound_bytes(), 10);
 
         // Hold the OLD binding across a rebind: the new lease is charged on
         // top of the retained one (conservative aggregate accounting).
@@ -1572,7 +1851,7 @@ mod tests {
             .unwrap();
         assert_eq!(gen2, StatementGeneration(3));
         assert_eq!(registry.open_counts().bound_bytes_global, 20);
-        assert_eq!(held.bound_bytes, 10, "old snapshot is immutable");
+        assert_eq!(held.bound_bytes(), 10, "old snapshot is immutable");
 
         // While the old snapshot is held, a rebind that would push the
         // tenant aggregate past the cap fails WITHOUT disturbing the
@@ -1582,7 +1861,10 @@ mod tests {
             result,
             Err(DecisionSubstrateError::ResourceExhausted(_))
         ));
-        assert_eq!(registry.binding(&alice, &handle).unwrap().generation, gen2);
+        assert_eq!(
+            registry.binding(&alice, &handle).unwrap().generation(),
+            gen2
+        );
         assert_eq!(registry.open_counts().bound_bytes_global, 20);
 
         // Release the old snapshot: its bytes leave the aggregate, and the
@@ -1626,6 +1908,37 @@ mod tests {
         assert_eq!(registry.open_counts().bound_bytes_global, 0);
     }
 
+    #[test]
+    fn live_payload_and_binding_metadata_follow_retained_snapshot_lifetimes() {
+        let registry = registry();
+        let alice = owner(TENANT, "alice");
+        let handle = insert_for(&registry, &alice);
+        let held_statement = registry.snapshot(&alice, &handle).unwrap();
+        let held_binding = registry.binding(&alice, &handle).unwrap();
+        let admitted = registry.open_counts();
+        assert!(admitted.live_payload_bytes_global > 0);
+        assert!(admitted.live_binding_metadata_bytes_global > 0);
+
+        registry.close(&alice, &handle).unwrap();
+        assert_eq!(registry.open_counts().statements_global, 0);
+        assert_eq!(
+            registry.open_counts().live_payload_bytes_global,
+            admitted.live_payload_bytes_global,
+            "prepared payload stays charged while a statement snapshot retains it"
+        );
+        assert_eq!(
+            registry.open_counts().live_binding_metadata_bytes_global,
+            admitted.live_binding_metadata_bytes_global,
+            "binding storage stays charged while a binding snapshot retains it"
+        );
+
+        drop(held_statement);
+        assert_eq!(registry.open_counts().live_payload_bytes_global, 0);
+        assert!(registry.open_counts().live_binding_metadata_bytes_global > 0);
+        drop(held_binding);
+        assert_eq!(registry.open_counts().live_binding_metadata_bytes_global, 0);
+    }
+
     #[tokio::test]
     async fn rebind_rows_and_per_statement_bytes_are_capped() {
         let registry = registry_with(PreparedDecideLimits {
@@ -1648,7 +1961,7 @@ mod tests {
             Err(DecisionSubstrateError::ResourceExhausted(_))
         ));
         let binding = registry.binding(&alice, &handle).unwrap();
-        assert!(binding.states.is_empty());
+        assert!(binding.states().is_empty());
     }
 
     // -- operator + injected resolver ---------------------------------------
@@ -1739,9 +2052,37 @@ mod tests {
         let prepared = operator
             .snapshot(&caller, &handle)
             .expect("snapshot after allow");
-        assert_eq!(prepared.pins.expected_artifact_commit, COMMIT);
+        assert_eq!(prepared.pins().expected_artifact_commit, COMMIT);
         assert_eq!(prepared.owner.subject, "alice");
         assert!(!prepared.binding.is_closed());
+    }
+
+    #[tokio::test]
+    async fn create_prepared_rejects_duplicate_document_keys_before_resolution() {
+        let fake = FakeResolve::allow();
+        let counter = Arc::clone(&fake);
+        let operator = operator_with(fake, PreparedDecideLimits::default());
+        let caller = ctx(Some(TENANT), "alice", Some(now() + 600));
+        let bearer = OriginalBearer::from_authorization_header(Some("Bearer user-jwt")).unwrap();
+        let documents = [
+            r#"{"schema_version":"jev-1","schema_version":"jev-1","questions":{"q1":{"type":"noul","instructions":"The service is down."}}}"#,
+            r#"{"schema_version":"jev-1","questions":{"q1":{"type":"noul","instructions":"discarded","instructions":"The service is down."}}}"#,
+            r#"{"schema_version":"jev-1","questions":{"q1":{"type":"noul"},"q1":{"type":"noul"}}}"#,
+        ];
+        for document in documents {
+            assert!(matches!(
+                operator
+                    .create_prepared(&caller, &bearer, COMMIT, document)
+                    .await,
+                Err(DecisionSubstrateError::InvalidArgument(_))
+            ));
+        }
+        assert_eq!(
+            counter.calls(),
+            0,
+            "invalid authored JSON must fail before resolution"
+        );
+        assert_eq!(operator.registry().open_counts().statements_global, 0);
     }
 
     #[tokio::test]
@@ -2039,13 +2380,14 @@ mod tests {
         registry.rebind(&alice, &handle, vec![bloated]).unwrap();
         let binding = registry.binding(&alice, &handle).unwrap();
         assert_eq!(
-            binding.bound_bytes, 1,
+            binding.bound_bytes(),
+            1,
             "normalization must trim spare capacity"
         );
         assert_eq!(registry.open_counts().bound_bytes_global, 1);
 
         // The stored state keeps the same spelling (1 char).
-        assert_eq!(binding.states.first().map(String::len), Some(1));
+        assert_eq!(binding.states().first().map(String::len), Some(1));
     }
 
     // -- consistency: valid-shape but disagreeing resolutions ---------------
@@ -2161,7 +2503,7 @@ mod tests {
         assert!(matches!(
             operator.create_prepared(&caller, &bearer, COMMIT, document).await,
             Err(DecisionSubstrateError::InvalidArgument(m))
-                if m.contains("raw question ids")
+                if m.contains("original questions JSON")
         ));
         assert_eq!(
             operator.registry().open_counts().statements_global,
@@ -2203,7 +2545,7 @@ mod tests {
         assert!(matches!(
             operator.create_prepared(&caller, &bearer, COMMIT, r#"{"schema_version":"jev-1","questions":{"q1":{"type":"noul","instructions":"The service is down."}}}"#).await,
             Err(DecisionSubstrateError::InvalidArgument(m))
-                if m.contains("does not reproduce the resolved question set")
+                if m.contains("original questions JSON")
         ));
         assert_eq!(operator.registry().open_counts().statements_global, 0);
     }
@@ -2232,26 +2574,13 @@ mod tests {
         // identity must be rejected.
         let fresh = owner(TENANT, "principal-fresh");
         assert!(matches!(
-            registry.insert(fresh.clone(), pins(COMMIT), Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate { raw_json: Arc::from("{}"), question_ids: Arc::from([]) }),
-                Arc::from("fp")),
+            registry.insert(fresh.clone(), resolved(COMMIT)),
             Err(DecisionSubstrateError::ResourceExhausted(m)) if m.contains("identity cache full")
         ));
 
         // Release every held snapshot: cells prune and admission works.
         held.clear();
-        assert!(registry
-            .insert(
-                fresh,
-                pins(COMMIT),
-                Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate {
-                    raw_json: Arc::from("{}"),
-                    question_ids: Arc::from([])
-                }),
-                Arc::from("fp")
-            )
-            .is_ok());
+        assert!(registry.insert(fresh, resolved(COMMIT)).is_ok());
     }
 
     #[tokio::test]
@@ -2313,16 +2642,7 @@ mod tests {
         // the charged bytes are unchanged by the rejected admission.
         let fresh = owner(TENANT, "principal-fresh");
         assert!(matches!(
-            registry.insert(
-                fresh.clone(),
-                pins(COMMIT),
-                Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate {
-                    raw_json: Arc::from("{}"),
-                    question_ids: Arc::from([]),
-                }),
-                Arc::from("fp"),
-            ),
+            registry.insert(fresh.clone(), resolved(COMMIT)),
             Err(DecisionSubstrateError::ResourceExhausted(m))
                 if m.contains("identity cache full")
         ));
@@ -2342,18 +2662,7 @@ mod tests {
         drop(keeper_snapshot);
         drop(held);
 
-        assert!(registry
-            .insert(
-                fresh,
-                pins(COMMIT),
-                Arc::new(question_set()),
-                Arc::new(RawQuestionsTemplate {
-                    raw_json: Arc::from("{}"),
-                    question_ids: Arc::from([])
-                }),
-                Arc::from("fp")
-            )
-            .is_ok());
+        assert!(registry.insert(fresh, resolved(COMMIT)).is_ok());
         assert_eq!(registry.open_counts().statements_global, 1);
     }
 
@@ -2441,7 +2750,7 @@ mod tests {
         assert!(matches!(
             operator.create_prepared(&caller, &bearer, COMMIT, caller_document).await,
             Err(DecisionSubstrateError::InvalidArgument(m))
-                if m.contains("does not match the caller's prepare document")
+                if m.contains("original questions JSON")
         ));
         assert_eq!(
             counter.calls.load(Ordering::Relaxed),
