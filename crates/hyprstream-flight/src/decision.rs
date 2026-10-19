@@ -427,6 +427,9 @@ fn prepared_payload_retained_bytes(
     if let Some(calibration) = &payload.pins.calibration_version {
         add_retained_bytes(&mut total, calibration.capacity())?;
     }
+    // CREATE stores a second owned copy for the public prepared-statement
+    // snapshot API, in addition to the schema-version pin above.
+    add_retained_bytes(&mut total, payload.pins.schema_version.len())?;
     add_retained_bytes(&mut total, payload.raw.raw_json.len())?;
     add_retained_bytes(
         &mut total,
@@ -516,6 +519,8 @@ struct CallerPrepareDocument<'a> {
     schema_version: &'a str,
     #[serde(borrow)]
     questions: &'a serde_json::value::RawValue,
+    #[serde(default, borrow)]
+    calib_version: Option<&'a serde_json::value::RawValue>,
     #[serde(default, borrow)]
     model: Option<&'a serde_json::value::RawValue>,
     #[serde(default, borrow)]
@@ -1335,6 +1340,7 @@ fn ensure_resolution_consistent(
     resolved: &ResolvedDecisionPins,
     expected_artifact_commit: &str,
     caller_schema_version: &str,
+    caller_calibration_version: Option<&str>,
     caller_raw_questions: &str,
     caller_set: &hyprstream_decision::spec::QuestionSet,
 ) -> Result<(), DecisionSubstrateError> {
@@ -1342,6 +1348,11 @@ fn ensure_resolution_consistent(
     if resolved.pins.schema_version != caller_schema_version {
         return Err(DecisionSubstrateError::InvalidArgument(
             "resolved pins disagree with the prepared schema version".to_owned(),
+        ));
+    }
+    if resolved.pins.calibration_version.as_deref() != caller_calibration_version {
+        return Err(DecisionSubstrateError::InvalidArgument(
+            "resolved pins disagree with the prepared calibration version".to_owned(),
         ));
     }
     if resolved.pins.expected_artifact_commit != expected_artifact_commit {
@@ -1550,6 +1561,16 @@ impl DecideOperator {
             ))
         })?;
         let caller_schema_version = document.schema_version;
+        let caller_calibration_version: Option<String> = document
+            .calib_version
+            .map(|raw| serde_json::from_str(raw.get()))
+            .transpose()
+            .map_err(|error| {
+                DecisionSubstrateError::InvalidArgument(format!(
+                    "prepare document calib_version must be a string or null: {error}"
+                ))
+            })?
+            .flatten();
         let resolved = self
             .resolve
             .resolve_pins(&owner, bearer, expected_artifact_commit, decide_document)
@@ -1564,6 +1585,7 @@ impl DecideOperator {
             &resolved,
             expected_artifact_commit,
             caller_schema_version,
+            caller_calibration_version.as_deref(),
             caller_raw_questions,
             &caller_set,
         )?;
@@ -2038,7 +2060,7 @@ mod tests {
         let caller = ctx(Some(TENANT), "alice", Some(now() + 600));
         let bearer = OriginalBearer::from_authorization_header(Some("Bearer user-jwt")).unwrap();
 
-        let document = r#"{"schema_version":"jev-1","questions":{"q1":{"type":"noul","instructions":"The service is down."}}}"#;
+        let document = r#"{"schema_version":"jev-1","questions":{"q1":{"type":"noul","instructions":"The service is down."}},"calib_version":null}"#;
         let (handle, generation) = operator
             .create_prepared(&caller, &bearer, COMMIT, document)
             .await
@@ -2055,6 +2077,26 @@ mod tests {
         assert_eq!(prepared.pins().expected_artifact_commit, COMMIT);
         assert_eq!(prepared.owner.subject, "alice");
         assert!(!prepared.binding.is_closed());
+    }
+
+    #[tokio::test]
+    async fn create_prepared_rejects_calibration_pin_mismatch() {
+        let fake = FakeResolve::allow();
+        let counter = Arc::clone(&fake);
+        let operator = operator_with(fake, PreparedDecideLimits::default());
+        let caller = ctx(Some(TENANT), "alice", Some(now() + 600));
+        let bearer = OriginalBearer::from_authorization_header(Some("Bearer user-jwt")).unwrap();
+        let document = r#"{"schema_version":"jev-1","questions":{"q1":{"type":"noul","instructions":"The service is down."}},"calib_version":"cal-v2"}"#;
+
+        assert!(matches!(
+            operator
+                .create_prepared(&caller, &bearer, COMMIT, document)
+                .await,
+            Err(DecisionSubstrateError::InvalidArgument(message))
+                if message.contains("calibration version")
+        ));
+        assert_eq!(counter.calls(), 1);
+        assert_eq!(operator.registry().open_counts().statements_global, 0);
     }
 
     #[tokio::test]
