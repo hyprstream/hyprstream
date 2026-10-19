@@ -11,7 +11,9 @@ use hyprstream_decision::arrow::AnswerRow;
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision::spec::QuestionSet;
 use hyprstream_eval::score::ScoreConfig;
-use hyprstream_eval::{score_bench_run, score_run, EvalItem, Harness, Subject, TruthSubject};
+use hyprstream_eval::{
+    score_bench_run, score_run, EvalItem, EvalRow, EvalSet, Harness, Subject, TruthSubject,
+};
 
 fn small_items() -> Vec<hyprstream_bench::Item> {
     generate_all(&BenchConfig {
@@ -133,9 +135,10 @@ async fn unlabeled_run_reports_no_gate() {
     assert!(report.accuracy.is_none());
     assert_eq!(report.items.len(), 5);
     assert!(report.items.iter().all(|line| line.correct.is_none()));
-    // score_run has no label source: flip rate is "not computed", never a
-    // silent zero.
-    assert!(report.flip_rate.is_none());
+    // Flip rate is independent of truth labels: each observation retains the
+    // canonical option labels needed to compare semantic predictions.
+    let flip = report.flip_rate.as_ref().unwrap();
+    assert!(flip.groups > 0);
 }
 
 #[tokio::test]
@@ -657,6 +660,43 @@ async fn run_items_rejects_an_empty_question_id_before_the_subject() {
     assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn run_items_rejects_an_empty_item_id_before_the_subject() {
+    let mut item = noul_item();
+    item.id.clear();
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_items(&[item], &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "empty item id must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_set_rejects_an_empty_row_id_before_the_subject() {
+    let set = hyprstream_eval::EvalSet {
+        name: "empty-row-id".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: String::new(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::new(),
+        }],
+    };
+    let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
+    let error = Harness.run_set(&set, &subject).await.err().unwrap();
+    assert!(
+        matches!(error, hyprstream_eval::EvalError::InvalidInput(_)),
+        "empty row id must be InvalidInput, got {error:?}"
+    );
+    assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// Resolves to `v1` on the first decide and `v2` on every later one — a
 /// rolling deploy landing mid-run.
 struct VersionFlipSubject(std::sync::atomic::AtomicUsize);
@@ -1011,6 +1051,85 @@ async fn truth_subject_anchors_per_row_truths_in_set_runs() {
         Some(1.0),
         "row-keyed truth must anchor every row perfectly"
     );
+}
+
+#[tokio::test]
+async fn score_run_reports_set_option_flips_from_captured_canonical_labels() {
+    let question = noul_item().question;
+    let set = hyprstream_eval::EvalSet {
+        name: "set-flips".into(),
+        schema_version: "v1".into(),
+        questions: vec![question],
+        rows: [("g", 0usize), ("g-rotated", 1usize)]
+            .into_iter()
+            .map(|(id, truth)| hyprstream_eval::EvalRow {
+                id: id.into(),
+                family: Some("permutation".into()),
+                stratum: None,
+                group: Some("g".into()),
+                state: Entry::Null,
+                truth: std::collections::BTreeMap::from([("val_q".into(), truth)]),
+            })
+            .collect(),
+    };
+    let subject = TruthSubject::new("truth-set-flips")
+        .with_row_truth(0, "val_q", 0)
+        .with_row_truth(1, "val_q", 1);
+    let output = Harness.run_set(&set, &subject).await.unwrap();
+
+    let flip = score_run(&output, &ScoreConfig::default())
+        .unwrap()
+        .flip_rate
+        .unwrap();
+    assert_eq!(flip.groups, 1);
+    assert_eq!(flip.flip_rate, 1.0);
+}
+
+#[tokio::test]
+async fn truth_preflight_uses_the_effective_row_override_for_reused_question_ids() {
+    let question = |options: usize| hyprstream_decision::QuestionSpec {
+        id: "shared".into(),
+        kind: hyprstream_decision::QuestionKind::Choice,
+        instructions: None,
+        body: hyprstream_decision::QuestionBody::Choice {
+            options: (0..options)
+                .map(|index| hyprstream_decision::ChoiceOption {
+                    name: format!("option-{index}"),
+                    rubric: None,
+                })
+                .collect(),
+        },
+    };
+    let items = vec![
+        EvalItem {
+            id: "two-options".into(),
+            question: question(2),
+            state: Entry::Null,
+            family: None,
+            stratum: None,
+            group: None,
+            truth: None,
+        },
+        EvalItem {
+            id: "three-options".into(),
+            question: question(3),
+            state: Entry::Null,
+            family: None,
+            stratum: None,
+            group: None,
+            truth: None,
+        },
+    ];
+    // The question-level default is invalid for the first request, but both
+    // effective row overrides are valid and take precedence, matching decide.
+    let subject = TruthSubject::new("row-aware-truth")
+        .with_truth("shared", 2)
+        .with_row_truth(0, "shared", 1)
+        .with_row_truth(1, "shared", 2);
+
+    let output = Harness.run_items(&items, &subject).await.unwrap();
+    assert_eq!(output.observations[0].argmax_label_index(), Some(1));
+    assert_eq!(output.observations[1].argmax_label_index(), Some(2));
 }
 
 #[test]
@@ -1626,6 +1745,83 @@ async fn item_scoring_preserves_resolved_alias_identity_and_rejects_mutated_prov
     ));
 }
 
+struct PartialSetSubject;
+
+#[async_trait::async_trait]
+impl Subject for PartialSetSubject {
+    fn model_id(&self) -> &str {
+        "partial-set-1"
+    }
+
+    async fn decide(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        row: usize,
+    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &set.questions {
+            let answer = if row == 0 && question.id == "q1" {
+                QuestionAnswer::answered(AnswerValue::Choice {
+                    probabilities: vec![0.9, 0.1],
+                })
+            } else if row == 1 && question.id == "q2" {
+                QuestionAnswer::answered(AnswerValue::Choice {
+                    probabilities: vec![0.1, 0.9],
+                })
+            } else {
+                QuestionAnswer::abstained()
+            };
+            answers.insert(question.id.clone(), answer);
+        }
+        Ok(AnswerRow { answers })
+    }
+}
+
+#[tokio::test]
+async fn set_shaped_score_does_not_use_bench_cross_question_fallback() {
+    let questions = hyprstream_decision::author::parse_yaml(
+        "questions:\n  q1: {type: choice, criteria: {yes: null, no: null}}\n  q2: {type: choice, criteria: {yes: null, no: null}}\n",
+    )
+    .unwrap()
+    .questions;
+    let rows: Vec<_> = ["g", "g-p1"]
+        .into_iter()
+        .map(|id| EvalRow {
+            id: id.into(),
+            family: None,
+            stratum: None,
+            group: Some("g".into()),
+            state: Entry::Null,
+            truth: Default::default(),
+        })
+        .collect();
+    let set = EvalSet {
+        name: "partial-set".into(),
+        schema_version: "v1".into(),
+        questions: questions.clone(),
+        rows,
+    };
+    let output = Harness.run_set(&set, &PartialSetSubject).await.unwrap();
+    let items: Vec<_> = set
+        .rows
+        .iter()
+        .flat_map(|row| {
+            questions.iter().map(move |question| EvalItem {
+                id: row.id.clone(),
+                question: question.clone(),
+                state: row.state.clone(),
+                family: row.family.clone(),
+                stratum: row.stratum.clone(),
+                group: row.group.clone(),
+                truth: None,
+            })
+        })
+        .collect();
+    let report = score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
+    assert!(report.flip_rate.is_none());
+}
+
 #[tokio::test]
 async fn scoring_validates_every_observation_before_fit_or_breakdown_aggregation() {
     let items = vec![noul_item()];
@@ -1823,4 +2019,53 @@ async fn wide_set_truth_index_preserves_all_input_preflight() {
         .unwrap()
         .items
         .is_empty());
+}
+
+#[tokio::test]
+async fn scoring_rejects_inconsistent_batch_and_schema_fingerprint_presence() {
+    let config = ScoreConfig::default();
+    let mut item = Harness
+        .run_items(&[noul_item()], &UniformSubject)
+        .await
+        .unwrap();
+    assert!(item.batch.is_none());
+    assert!(item.schema_fingerprint.is_none());
+    score_run(&item, &config).unwrap();
+    item.schema_fingerprint = Some("detached-set-fingerprint".into());
+    assert!(matches!(
+        score_run(&item, &config),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
+            if message.contains("must either both be present or both be absent")
+    ));
+
+    let set = hyprstream_eval::EvalSet {
+        name: "run-shape-presence".into(),
+        schema_version: "v1".into(),
+        questions: vec![noul_item().question],
+        rows: vec![hyprstream_eval::EvalRow {
+            id: "row".into(),
+            family: None,
+            stratum: None,
+            group: None,
+            state: Entry::Null,
+            truth: std::collections::BTreeMap::new(),
+        }],
+    };
+    let mut output = Harness.run_set(&set, &UniformSubject).await.unwrap();
+    assert!(output.batch.is_some());
+    assert!(output.schema_fingerprint.is_some());
+    score_run(&output, &config).unwrap();
+    let batch = output.batch.take();
+    assert!(matches!(
+        score_run(&output, &config),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
+            if message.contains("must either both be present or both be absent")
+    ));
+    output.batch = batch;
+    output.schema_fingerprint = None;
+    assert!(matches!(
+        score_run(&output, &config),
+        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
+            if message.contains("must either both be present or both be absent")
+    ));
 }

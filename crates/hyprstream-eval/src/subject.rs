@@ -18,6 +18,7 @@ use hyprstream_decision::arrow::AnswerRow;
 use hyprstream_decision::confidence::{self, CONSUMER_SUM_TOLERANCE};
 use hyprstream_decision::entry::Entry;
 use hyprstream_decision::spec::{QuestionBody, QuestionSet, QuestionSpec};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::error::EvalError;
@@ -30,13 +31,27 @@ pub trait Subject: Send + Sync {
     /// as already resolved.
     fn model_id(&self) -> &str;
 
-    /// Check subject-specific input constraints without I/O, model queries,
-    /// mutable state, or other side effects. Harnesses call this for every
-    /// request before deciding any row; ensembles check every teacher first.
-    /// The default accepts inputs, including explicit null states supported
-    /// by native/in-process subjects. Transport adapters may be stricter.
+    /// Check subject-wide input constraints without I/O, model queries,
+    /// mutable state, or other side effects. The default accepts inputs,
+    /// including explicit null states supported by native/in-process
+    /// subjects. Transport adapters may be stricter. Harness execution uses
+    /// [`Subject::preflight_row`] so row-dependent subjects can check the
+    /// exact request before any row is decided.
     fn preflight(&self, _set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
         Ok(())
+    }
+
+    /// Check subject-specific constraints for one concrete request row.
+    /// Subjects with row-dependent behavior can validate the same selection
+    /// that `decide` will use. The default preserves compatibility for
+    /// subjects whose preflight does not depend on the row index.
+    fn preflight_row(
+        &self,
+        set: &QuestionSet,
+        state: &Entry,
+        _row: usize,
+    ) -> Result<(), EvalError> {
+        self.preflight(set, state)
     }
 
     /// Answer every question in `set` for one state row. `row` is the batch
@@ -232,10 +247,10 @@ pub(crate) fn normalize_distribution(probabilities: &mut [f32]) {
     }
 }
 
-fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
+pub(crate) fn normalize_distribution_with_winner(probabilities: &mut [f32], winner: usize) {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
 
-    // The caller may have selected the winner before narrowing wire f64 values.
+    // The caller may have selected the winner before narrowing f64 values.
     if hyprstream_decision::confidence::argmax_index(probabilities) != Some(winner) {
         let max = probabilities.iter().copied().fold(0.0f32, f32::max);
         probabilities[winner] = max.next_up().min(1.0);
@@ -448,10 +463,103 @@ pub fn parse_response_answers(set: &QuestionSet, body: &Value) -> Result<AnswerR
     Ok(AnswerRow { answers: row })
 }
 
+/// Deserialize JSON while rejecting repeated object members at every depth.
+/// Parsing into `serde_json::Value` directly silently keeps only one value
+/// for duplicate keys, which can conceal conflicting model provenance,
+/// answers, or probability labels before their respective validators run.
+struct UniqueJsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for UniqueJsonValueSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value with unique object member names")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(UniqueJsonValueSeed)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object member `{key}`"
+                )));
+            }
+            let value = map.next_value_seed(UniqueJsonValueSeed)?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
 /// Decode and validate the complete HTTP response envelope. This is the same
 /// client work used by [`HttpSubject`] and the wire-floor response benchmark.
 pub fn decode_response(set: &QuestionSet, text: &str) -> Result<(AnswerRow, String), EvalError> {
-    let parsed: Value = serde_json::from_str(text)
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let parsed = UniqueJsonValueSeed
+        .deserialize(&mut deserializer)
+        .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
+    deserializer
+        .end()
         .map_err(|error| EvalError::Http(format!("response is not JSON: {error}")))?;
     let Some(resolved) = parsed
         .get("model")
@@ -868,6 +976,35 @@ impl Subject for TruthSubject {
         &self.model_id
     }
 
+    fn preflight(&self, set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+        for question in &set.questions {
+            let cardinality = question.cardinality();
+            if let Some(&index) = self.truth.get(&question.id) {
+                validate_truth_index(&question.id, index, cardinality)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_row(
+        &self,
+        set: &QuestionSet,
+        _state: &Entry,
+        row: usize,
+    ) -> Result<(), EvalError> {
+        for question in &set.questions {
+            let cardinality = question.cardinality();
+            let configured = self
+                .row_truth
+                .get(&(row, question.id.clone()))
+                .or_else(|| self.truth.get(&question.id));
+            if let Some(&index) = configured {
+                validate_truth_index(&question.id, index, cardinality)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn decide(
         &self,
         set: &QuestionSet,
@@ -888,12 +1025,7 @@ impl Subject for TruthSubject {
                 // truth: silently degrading the documented perfectly
                 // accurate anchor into a uniform subject corrupts
                 // sanity-check results.
-                Some(&index) => {
-                    return Err(EvalError::InvalidInput(format!(
-                        "truth index {index} configured for question `{}` is outside its cardinality {cardinality}",
-                        question.id
-                    )));
-                }
+                Some(&index) => return Err(truth_index_error(&question.id, index, cardinality)),
                 // Uniform fallback: the rounded f32 reciprocal can violate
                 // the producer sum tolerance at high cardinalities (78
                 // options sum to ~1.0000011), so renormalize. The D6-safe
@@ -916,6 +1048,24 @@ impl Subject for TruthSubject {
         }
         Ok(AnswerRow { answers })
     }
+}
+
+fn validate_truth_index(
+    question_id: &str,
+    index: usize,
+    cardinality: usize,
+) -> Result<(), EvalError> {
+    if index >= cardinality {
+        Err(truth_index_error(question_id, index, cardinality))
+    } else {
+        Ok(())
+    }
+}
+
+fn truth_index_error(question_id: &str, index: usize, cardinality: usize) -> EvalError {
+    EvalError::InvalidInput(format!(
+        "truth index {index} configured for question `{question_id}` is outside its cardinality {cardinality}"
+    ))
 }
 
 #[cfg(test)]
@@ -1291,6 +1441,45 @@ questions:
         assert!(
             matches!(error, EvalError::InvalidAnswer { .. }),
             "undeclared answer key must be InvalidAnswer, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn decode_response_rejects_duplicate_model_answer_and_probability_members() {
+        let set = fixture();
+        let cases = [
+            (
+                "model",
+                r#"{"model":"first","model":"second","answers":{}}"#,
+            ),
+            (
+                "tone",
+                r#"{"model":"m","answers":{"tone":{"type":"choice","probabilities":{"angry":0.5,"calm":0.5}},"tone":{"type":"choice","probabilities":{"angry":0.5,"calm":0.5}}}}"#,
+            ),
+            (
+                "angry",
+                r#"{"model":"m","answers":{"tone":{"type":"choice","probabilities":{"angry":0.25,"angry":0.5,"calm":0.5}}}}"#,
+            ),
+        ];
+
+        for (member, response) in cases {
+            let error = decode_response(&set, response).unwrap_err();
+            assert!(
+                matches!(error, EvalError::Http(ref message) if message.contains(&format!("duplicate JSON object member `{member}`"))),
+                "duplicate `{member}` must be rejected during JSON parsing, got {error:?}"
+            );
+        }
+
+        // A duplicate in the answer tree is diagnosed before a missing model
+        // can be accepted/rejected by the provenance extractor.
+        let error = decode_response(
+            &set,
+            r#"{"answers":{"tone":{"type":"choice","probabilities":{"angry":0.5,"angry":0.5,"calm":0.5}}}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, EvalError::Http(ref message) if message.contains("duplicate JSON object member `angry`")),
+            "the whole response must be checked for duplicates before field extraction, got {error:?}"
         );
     }
 

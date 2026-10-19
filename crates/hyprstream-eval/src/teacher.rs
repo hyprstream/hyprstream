@@ -152,7 +152,7 @@ impl TeacherEnsemble {
         // Check every teacher before querying the first one: a stricter
         // later transport must not reject input after earlier billed calls.
         for teacher in &self.teachers {
-            teacher.subject.preflight(set, state)?;
+            teacher.subject.preflight_row(set, state, row)?;
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
@@ -225,6 +225,14 @@ fn combine(set: &QuestionSet, teacher_answers: Vec<TeacherAnswer>) -> EnsembleOu
                 None => argmaxes.push(None),
             }
         }
+        // Preserve D6 in the accumulation precision, before narrowing can
+        // merge a unique later-index winner with an earlier component.
+        let mut winner: Option<(usize, f64)> = None;
+        for (index, &total) in sum.iter().enumerate() {
+            if winner.is_none_or(|(_, best)| total > best) {
+                winner = Some((index, total));
+            }
+        }
         // Both the answered-teacher mean (f64 → f32 conversion drift) and
         // the all-abstained uniform fallback (rounded reciprocal — the same
         // high-cardinality case TruthSubject handles) must satisfy the D5
@@ -236,7 +244,11 @@ fn combine(set: &QuestionSet, teacher_answers: Vec<TeacherAnswer>) -> EnsembleOu
             let uniform = 1.0 / cardinality as f32;
             vec![uniform; cardinality]
         };
-        crate::subject::normalize_distribution(&mut mean);
+        if let Some((winner, _)) = winner {
+            crate::subject::normalize_distribution_with_winner(&mut mean, winner);
+        } else {
+            crate::subject::normalize_distribution(&mut mean);
+        }
         let ensemble_argmax = hyprstream_decision::confidence::argmax_index(&mean);
         let matches = argmaxes
             .iter()
@@ -279,6 +291,56 @@ questions:
             tos_class: TosClass::Distributable,
             subject: Box::new(TruthSubject::new(id).with_truth("tone", truth)),
         }
+    }
+
+    struct CountCalls(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Subject for CountCalls {
+        fn model_id(&self) -> &str {
+            "count-calls"
+        }
+
+        async fn decide(
+            &self,
+            set: &QuestionSet,
+            state: &Entry,
+            row: usize,
+        ) -> Result<AnswerRow, EvalError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            TruthSubject::new("count-calls")
+                .decide(set, state, row)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_later_truth_is_rejected_before_any_teacher_query() {
+        let set = fixture();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ensemble = TeacherEnsemble::new(vec![
+            Teacher {
+                id: "remote-first".to_owned(),
+                tos_class: TosClass::Unknown,
+                subject: Box::new(CountCalls(calls.clone())),
+            },
+            teacher("invalid-truth-second", 7),
+        ])
+        .unwrap();
+
+        let error = ensemble
+            .decide(&set, &Entry::Null, 0, "item")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, EvalError::InvalidInput(_)),
+            "invalid configured truth must fail preflight, got {error:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the first teacher must not be queried before later preflight fails"
+        );
     }
 
     #[tokio::test]
@@ -525,5 +587,70 @@ questions:
             .await
             .unwrap_err();
         assert!(matches!(error, EvalError::InvalidInput(_)), "{error:?}");
+    }
+    #[test]
+    fn ensemble_mean_preserves_f64_winner_before_narrowing() {
+        use hyprstream_decision::answer::{AnswerValue, QuestionAnswer};
+        use hyprstream_decision::arrow::AnswerRow;
+        use hyprstream_decision::confidence::{
+            argmax_index, check_distribution, PRODUCER_SUM_TOLERANCE,
+        };
+        let set = fixture();
+        for (biased, expected_winner, expected_matches) in [
+            ([0.49999997f32, 0.50000006f32], 1, 1),
+            ([0.50000006f32, 0.49999997f32], 0, 3),
+            ([0.5f32, 0.5f32], 0, 3),
+        ] {
+            let distributions = [[0.5f32, 0.5f32], [0.5f32, 0.5f32], biased];
+            let sums = [
+                distributions.iter().map(|p| f64::from(p[0])).sum::<f64>(),
+                distributions.iter().map(|p| f64::from(p[1])).sum::<f64>(),
+            ];
+            assert_eq!(usize::from(sums[1] > sums[0]), expected_winner);
+            if expected_winner == 1 {
+                // Causal witness: the old path discards a unique later winner.
+                let narrowed: Vec<f32> = sums.iter().map(|p| (p / 3.0) as f32).collect();
+                assert_eq!(argmax_index(&narrowed), Some(0));
+                assert!(sums[1] > sums[0]);
+            }
+            let answers = distributions
+                .iter()
+                .enumerate()
+                .map(|(index, probs)| {
+                    check_distribution(probs, PRODUCER_SUM_TOLERANCE).unwrap();
+                    TeacherAnswer {
+                        teacher_id: format!("teacher-{index}"),
+                        model_id: format!("model-{index}"),
+                        tos_class: TosClass::Distributable,
+                        row: AnswerRow {
+                            answers: std::collections::BTreeMap::from([(
+                                "tone".into(),
+                                QuestionAnswer::answered(AnswerValue::Choice {
+                                    probabilities: probs.to_vec(),
+                                }),
+                            )]),
+                        },
+                    }
+                })
+                .collect();
+            let out = combine(&set, answers);
+            let average = &out.average["tone"];
+            check_distribution(average, PRODUCER_SUM_TOLERANCE).unwrap();
+            assert_eq!(argmax_index(average), Some(expected_winner));
+            assert!(
+                (out.argmax_agreement["tone"] - f64::from(expected_matches) / 3.0).abs() < 1e-12
+            );
+            // The raw teacher targets and provenance stay untouched.
+            for (answer, expected) in out.teacher_answers.iter().zip(distributions) {
+                assert_eq!(
+                    answer.row.answers["tone"]
+                        .value
+                        .as_ref()
+                        .unwrap()
+                        .probabilities(),
+                    expected
+                );
+            }
+        }
     }
 }
