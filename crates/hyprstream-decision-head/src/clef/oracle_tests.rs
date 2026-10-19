@@ -4,57 +4,112 @@ use crate::clef::{ClefEncoder, ClefEncodingLimits, ClefRequest};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use tch::{Kind, Tensor};
 
-fn sha256_file(path: &std::path::Path) -> String {
-    let mut file = std::fs::File::open(path).expect("open file for receipt digest");
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .expect("read file for receipt digest");
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    format!("{:x}", hash.finalize())
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_file_with_stable_digest<T>(
+fn read_snapshot_with_digest<T>(
     path: &std::path::Path,
-    read: impl FnOnce(&std::path::Path) -> T,
+    parse: impl FnOnce(&[u8]) -> Result<T, String>,
 ) -> Result<(T, String), String> {
-    let before = sha256_file(path);
-    let value = read(path);
-    let after = sha256_file(path);
-    if before != after {
-        return Err(format!(
-            "input tensor file changed while it was being read: {}",
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "failed to read input tensor file {}: {error}",
             path.display()
-        ));
-    }
-    Ok((value, before))
+        )
+    })?;
+    let digest = sha256_bytes(&bytes);
+    let value = parse(&bytes)?;
+    Ok((value, digest))
+}
+
+fn read_safetensors_with_digest(
+    path: &std::path::Path,
+) -> Result<(Vec<(String, Tensor)>, String), String> {
+    // Hash and parse one snapshot so the receipt always identifies the exact
+    // bytes supplied to safetensors, even if the path changes concurrently.
+    read_snapshot_with_digest(path, |bytes| parse_safetensors(bytes, path))
+}
+
+fn parse_safetensors(
+    bytes: &[u8],
+    path: &std::path::Path,
+) -> Result<Vec<(String, Tensor)>, String> {
+    safetensors::SafeTensors::deserialize(bytes)
+        .map_err(|error| {
+            format!(
+                "failed to parse input tensor file {}: {error}",
+                path.display()
+            )
+        })?
+        .tensors()
+        .into_iter()
+        .map(|(name, view)| {
+            let kind = match view.dtype() {
+                safetensors::Dtype::BOOL => Kind::Bool,
+                safetensors::Dtype::U8 => Kind::Uint8,
+                safetensors::Dtype::I8 => Kind::Int8,
+                safetensors::Dtype::I16 => Kind::Int16,
+                safetensors::Dtype::I32 => Kind::Int,
+                safetensors::Dtype::I64 => Kind::Int64,
+                safetensors::Dtype::BF16 => Kind::BFloat16,
+                safetensors::Dtype::F16 => Kind::Half,
+                safetensors::Dtype::F32 => Kind::Float,
+                safetensors::Dtype::F64 => Kind::Double,
+                dtype => return Err(format!("unsupported safetensors dtype {dtype:?}")),
+            };
+            let shape = view
+                .shape()
+                .iter()
+                .map(|&dimension| dimension as i64)
+                .collect::<Vec<_>>();
+            let tensor = Tensor::f_from_data_size(view.data(), &shape, kind)
+                .map_err(|error| format!("failed to load tensor {name}: {error}"))?;
+            Ok((name, tensor))
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 #[test]
-fn clef_input_receipt_rejects_file_mutation_during_read() {
+fn clef_input_receipt_digest_tracks_loaded_snapshot_during_replace_and_restore() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("native-input.safetensors");
-    std::fs::write(&path, b"initial input bytes").expect("write initial input");
+    let source_tensors = vec![
+        ("embedding_token_ids", Tensor::from_slice(&[11_i64, 12_i64])),
+        (
+            "embedding_rows",
+            Tensor::from_slice(&[0.25_f32, -0.5, 1.0, 2.5]).reshape([2, 2]),
+        ),
+    ];
+    Tensor::write_safetensors(&source_tensors, &path).expect("write safetensors fixture");
+    let original = std::fs::read(&path).expect("read original safetensors fixture");
 
-    let result = read_file_with_stable_digest(&path, |path| {
-        let consumed = std::fs::read(path).expect("read simulated tensor input");
-        std::fs::write(path, b"replaced input bytes").expect("replace input during read");
-        consumed
-    });
-
-    assert!(result.is_err());
-    let error = result.expect_err("mutation during read must be rejected");
-    assert!(error.contains("changed while it was being read"));
+    let (loaded_bytes, digest) = read_snapshot_with_digest(&path, |bytes| {
+        assert_eq!(bytes, original);
+        std::fs::write(&path, b"replacement bytes").expect("replace file before parse");
+        let tensors = parse_safetensors(bytes, &path).expect("parse captured snapshot");
+        std::fs::write(&path, &original).expect("restore original file after parse");
+        Ok(tensors)
+    })
+    .expect("load one stable snapshot");
+    let tensors = loaded_bytes.into_iter().collect::<HashMap<_, _>>();
+    assert_eq!(tensors["embedding_token_ids"].kind(), Kind::Int64);
+    assert_eq!(tensors["embedding_token_ids"].size(), [2]);
+    assert_eq!(
+        Vec::<i64>::try_from(&tensors["embedding_token_ids"]).expect("loaded IDs"),
+        [11, 12]
+    );
+    assert_eq!(tensors["embedding_rows"].kind(), Kind::Float);
+    assert_eq!(tensors["embedding_rows"].size(), [2, 2]);
+    assert_eq!(
+        Vec::<f32>::try_from(tensors["embedding_rows"].reshape([-1])).expect("loaded rows"),
+        [0.25, -0.5, 1.0, 2.5]
+    );
+    assert_eq!(digest, sha256_bytes(&original));
+    assert_eq!(std::fs::read(&path).expect("read restored file"), original);
 }
 
 #[derive(Deserialize)]
@@ -296,10 +351,7 @@ fn clef_export_native_head() {
         .map(|(name, value)| (name, value.to_kind(Kind::Float)))
         .collect();
     let head = JointSchemaHead::from_named_tensors(config, weights).expect("strict native head");
-    let (input_tensors, native_input_tensors_sha256) =
-        read_file_with_stable_digest(&input, |path| {
-            Tensor::read_safetensors(path).expect("saved native backbone outputs")
-        })
+    let (input_tensors, native_input_tensors_sha256) = read_safetensors_with_digest(&input)
         .expect("native input tensors must remain stable while loaded");
     let inputs: HashMap<_, _> = input_tensors.into_iter().collect();
     let row_ids =
@@ -397,5 +449,5 @@ fn clef_export_native_head() {
     )
     .expect("write records");
     let native_tensors = output.join("native-tensors.safetensors");
-    std::fs::write(output.join("export-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"input_profile":profile,"native_input_tensor_path":input,"native_input_tensors_sha256":native_input_tensors_sha256,"native_tensors_sha256":sha256_file(&native_tensors),"reference_directory":reference,"source_revision":provenance["source_revision"],"records":corpus.records.len(),"compute_dtype":"float32","device":"cpu","scope":"native head over saved native backbone; emission success does not waive numerical gates"})).expect("receipt JSON")).expect("write receipt");
+    std::fs::write(output.join("export-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"input_profile":profile,"native_input_tensor_path":input,"native_input_tensors_sha256":native_input_tensors_sha256,"native_tensors_sha256":sha256_bytes(&std::fs::read(&native_tensors).expect("read emitted native tensors")),"reference_directory":reference,"source_revision":provenance["source_revision"],"records":corpus.records.len(),"compute_dtype":"float32","device":"cpu","scope":"native head over saved native backbone; emission success does not waive numerical gates"})).expect("receipt JSON")).expect("write receipt");
 }
