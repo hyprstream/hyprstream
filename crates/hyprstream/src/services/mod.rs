@@ -70,7 +70,6 @@ pub(crate) use hyprstream_inference::worktree_ext::WorktreeClientExt;
 // contained_root replaced by hyprstream-containedfs crate
 #[cfg(feature = "rocksdb")]
 pub mod at9p_renewal;
-pub mod at9p_verify;
 pub mod decision;
 pub mod discovery;
 pub mod editing;
@@ -167,7 +166,6 @@ pub use types::{
 };
 // Open mode constants also re-exported from hyprstream-vfs::mount for VFS consumers.
 
-pub use at9p_verify::{credential_free_router, At9pVerifyService, VerifyFaceState};
 pub use discovery::DiscoveryService;
 #[cfg(feature = "metrics")]
 pub use flight::FlightService;
