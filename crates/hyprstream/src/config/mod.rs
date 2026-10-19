@@ -1212,9 +1212,10 @@ pub struct TrustedIssuerConfig {
 /// Carries the same source-verification invariants as the hardcoded staging
 /// www pin; it only selects the pinned `client_id`/`aud` and the Dex
 /// connector pin. The `client_id` MUST NOT equal the reserved staging client
-/// (`cyberdione-www-staging`): credentials of this class fall through the
-/// reserved federate-session dispatch check into normal verification, which
-/// depends on the two classes staying disjoint.
+/// (`cyberdione-www-staging`) so the reserved-credential predicate — which
+/// matches that exact `(iss, client_id)` pair — can never fire for this
+/// class. This states predicate-level reservation behavior only; the output
+/// credential profile and dispatch are owned by W1.3/W1.4.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FederateClientClassConfig {
     /// OAuth `client_id` of the public client registered at the issuer.

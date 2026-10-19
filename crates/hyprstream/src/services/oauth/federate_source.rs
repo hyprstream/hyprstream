@@ -45,10 +45,13 @@ const MAX_CONNECTOR_TEXT: usize = 64;
 /// The staging class is the hardcoded www pin. A second class (the TUI
 /// harness) may be configured per issuer; it carries IDENTICAL source
 /// verification invariants — pinned RS256, kid-keyed JWKS, `exp - iat <=
-/// 300s`, nonce/c_hash/at_hash binding, the connector pin, and did:plc /
-/// host-form did:web validation. The class only selects the pinned
-/// identifiers, and every commitment binds its exact `client_id` in both
-/// the nonce preimage and the possession transcript.
+/// 300s`, nonce/c_hash binding (at_hash is value-checked only when an
+/// access token is supplied, otherwise encoding-only, per D8), the
+/// connector pin, and did:plc / host-form did:web validation. The class
+/// only selects the pinned identifiers, and every commitment binds its
+/// exact `client_id` in both the nonce preimage and the possession
+/// transcript. This is source-verification acceptance only: the output
+/// credential profile and its dispatch treatment are owned by W1.3/W1.4.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientClass {
     client_id: String,
@@ -67,9 +70,10 @@ impl ClientClass {
     }
 
     /// Fail-closed construction of the configured second class. The class
-    /// must stay disjoint from the reserved staging pin so its credentials
-    /// keep falling through the reserved-credential check into normal
-    /// verification instead of the fail-closed federate-session dispatch.
+    /// must stay disjoint from the reserved staging pin so the
+    /// reserved-credential predicate (`iss`, `client_id`) can never match
+    /// this class — predicate-level behavior only; the minted-profile path
+    /// and dispatch treatment are decided by later slices, not here.
     pub(crate) fn new(client_id: &str, aud: &str, connector: Option<&str>) -> Result<Self> {
         let text = |value: &str, max: usize| {
             require(!value.is_empty() && value.len() <= max)?;
@@ -470,11 +474,14 @@ impl Verifier {
         access_token: Option<&str>,
     ) -> Result<Source> {
         require(self.host()? == &commitment.host)?;
-        // The commitment's class must be one this verifier accepts; a
-        // commitment naming any other client id fails closed here.
+        // The commitment must carry EXACTLY this verifier's canonical class
+        // for its client_id: client_id, aud and connector are all compared.
+        // A caller-built class that reuses a configured client_id with a
+        // different aud or connector is rejected here, before any claim is
+        // validated against the commitment's pins. Default-deny: an
+        // unconfigured client_id resolves to an error.
         require(
-            self.resolve_client_class(commitment.client.client_id.as_str())
-                .is_ok(),
+            self.resolve_client_class(commitment.client.client_id.as_str())? == commitment.client,
         )?;
         require(token.len() <= MAX_JWS && !token.is_empty())?;
         let parts: Vec<_> = token.split('.').collect();
@@ -599,12 +606,9 @@ fn validate_claims(
     // token minted for one class cannot be replayed against another.
     let class = &c.client;
     require(text(v, "iss")? == ISSUER)?;
-    require(
-        v.get("aud").is_some_and(|a| {
-            a.as_str() == Some(class.aud.as_str())
-                || *a == serde_json::json!([class.aud.as_str()])
-        }),
-    )?;
+    require(v.get("aud").is_some_and(|a| {
+        a.as_str() == Some(class.aud.as_str()) || *a == serde_json::json!([class.aud.as_str()])
+    }))?;
     if let Some(azp) = v.get("azp") {
         require(azp.as_str() == Some(class.client_id.as_str()))?;
     }

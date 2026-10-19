@@ -702,17 +702,19 @@ fn client_class_construction_is_fail_closed() {
     );
     // The second class must stay disjoint from the reserved staging pin in
     // both identifiers; overlapping would blur the reserved-credential
-    // fall-through boundary between the classes.
-    for (client_id, aud) in [
-        (CLIENT, CLIENT),
-        (CLIENT, TUI_AUD),
-        (TUI_CLIENT, CLIENT),
-    ] {
+    // predicate boundary between the classes.
+    for (client_id, aud) in [(CLIENT, CLIENT), (CLIENT, TUI_AUD), (TUI_CLIENT, CLIENT)] {
         assert!(ClientClass::new(client_id, aud, None).is_err());
     }
     for invalid in ["", "client id", "client\nid", "\u{7f}ctl", &"x".repeat(257)] {
-        assert!(ClientClass::new(invalid, TUI_AUD, None).is_err(), "{invalid:?}");
-        assert!(ClientClass::new(TUI_CLIENT, invalid, None).is_err(), "{invalid:?}");
+        assert!(
+            ClientClass::new(invalid, TUI_AUD, None).is_err(),
+            "{invalid:?}"
+        );
+        assert!(
+            ClientClass::new(TUI_CLIENT, invalid, None).is_err(),
+            "{invalid:?}"
+        );
     }
     assert!(ClientClass::new(TUI_CLIENT, TUI_AUD, Some("")).is_err());
     assert!(ClientClass::new(TUI_CLIENT, TUI_AUD, Some(&"c".repeat(65))).is_err());
@@ -724,12 +726,12 @@ async fn configured_tui_client_class_verifies_with_identical_invariants() {
     // Positive: the exact configured class verifies end to end, with the
     // aud as a bare string or a single-element array and azp = client_id.
     let t = token(&tui_claims());
-    let verified = v.source(&t, CODE, tui_commitment(), NOW, None).await.unwrap();
+    let verified = v
+        .source(&t, CODE, tui_commitment(), NOW, None)
+        .await
+        .unwrap();
     assert_eq!(verified.subject, "opaque-sub");
-    assert_eq!(
-        verified.atproto_did,
-        "did:plc:abcdefghijklmnopqrstuvwx"
-    );
+    assert_eq!(verified.atproto_did, "did:plc:abcdefghijklmnopqrstuvwx");
     assert_eq!(verified.jti, "source-id");
     assert_eq!((verified.issued_at, verified.expires_at), (NOW, NOW + 300));
     let mut array_aud = tui_claims();
@@ -758,7 +760,10 @@ async fn configured_tui_client_class_verifies_with_identical_invariants() {
         ("aud", json!([TUI_AUD, CLIENT])),
         ("azp", json!(CLIENT)),
         ("nonce", json!(commitment().nonce())),
-        ("federated_claims", json!({"connector_id":"github","user_id":"did:plc:abcdefghijklmnopqrstuvwx"})),
+        (
+            "federated_claims",
+            json!({"connector_id":"github","user_id":"did:plc:abcdefghijklmnopqrstuvwx"}),
+        ),
         ("iat", json!(NOW - 121)),
         ("exp", json!(NOW + 301)),
     ] {
@@ -777,10 +782,7 @@ async fn configured_tui_client_class_verifies_with_identical_invariants() {
         .source(&token(&claims()), CODE, tui_commitment(), NOW, None)
         .await
         .is_err());
-    assert!(v
-        .source(&t, CODE, commitment(), NOW, None)
-        .await
-        .is_err());
+    assert!(v.source(&t, CODE, commitment(), NOW, None).await.is_err());
     // Backward compatibility: a staging-only verifier (no configured class)
     // rejects the TUI class entirely — absent config = previous behavior.
     assert!(verifier()
@@ -796,6 +798,64 @@ async fn configured_tui_client_class_verifies_with_identical_invariants() {
         tui_verifier().resolve_client_class(TUI_CLIENT).unwrap(),
         tui_class()
     );
+}
+
+#[tokio::test]
+async fn caller_built_class_with_configured_client_id_is_rejected() {
+    // Astra finding 1 regression: a caller-built class that reuses the
+    // CONFIGURED client_id with a swapped aud or connector must be
+    // rejected. The nonce preimage binds only client_id, so the spoofed
+    // commitment's nonce still matches the fixture token — only the
+    // canonical-class equality in source() rejects it.
+    for (aud, connector) in [
+        (TUI_AUD, "github"),
+        ("other-aud", "atproto"),
+        ("other-aud", "github"),
+    ] {
+        let v = tui_verifier(); // canonical pin: TUI_CLIENT / TUI_AUD / atproto
+        let mut claims = tui_claims();
+        claims["aud"] = json!(aud);
+        claims["federated_claims"]["connector_id"] = json!(connector);
+        let spoofed = ClientClass::new(TUI_CLIENT, aud, Some(connector)).unwrap();
+        // Direct field mutation on the commitment ...
+        let mut c = tui_commitment();
+        c.client = spoofed.clone();
+        assert!(
+            v.source(&token(&claims), CODE, c, NOW, None).await.is_err(),
+            "{aud}/{connector}"
+        );
+        // ... and the same substitution through the crate-visible
+        // for_class constructor.
+        let via_ctor = Commitment::for_class(
+            FederateHost::new(HOST).unwrap(),
+            &spoofed,
+            &B64.encode([1; 32]),
+            &B64.encode([2; 32]),
+            &B64.encode(sha(B64.encode([3; 32]).as_bytes())),
+            &B64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes()),
+            &B64.encode(ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[8; 32]))),
+        )
+        .unwrap();
+        assert!(
+            v.source(&token(&claims), CODE, via_ctor, NOW, None)
+                .await
+                .is_err(),
+            "{aud}/{connector} via for_class"
+        );
+    }
+    // Canonical positives after the strict comparison: the exact configured
+    // TUI class verifies, and the staging path (for_host constructs
+    // ClientClass::staging(), byte-equal to the canonical staging
+    // resolution) is unaffected.
+    let v = tui_verifier();
+    assert!(v
+        .source(&token(&tui_claims()), CODE, tui_commitment(), NOW, None)
+        .await
+        .is_ok());
+    assert!(v
+        .source(&token(&claims()), CODE, commitment(), NOW, None)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -816,9 +876,7 @@ async fn tui_connector_pin_defaults_to_atproto_and_is_configurable() {
         .unwrap()
     };
     let nonce = commitment().nonce();
-    let claims_for = |connector: &str| {
-        json!({"iss":ISSUER,"aud":"ldap-class-aud","sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":nonce,"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":connector,"user_id":"did:plc:abcdefghijklmnopqrstuvwx"}})
-    };
+    let claims_for = |connector: &str| json!({"iss":ISSUER,"aud":"ldap-class-aud","sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":nonce,"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":connector,"user_id":"did:plc:abcdefghijklmnopqrstuvwx"}});
     assert!(v
         .source(&token(&claims_for("ldap")), CODE, commitment(), NOW, None)
         .await
@@ -826,7 +884,13 @@ async fn tui_connector_pin_defaults_to_atproto_and_is_configurable() {
     // The configured pin replaces "atproto"; the default pin elsewhere is
     // untouched, and a mismatched connector still fails closed.
     assert!(v
-        .source(&token(&claims_for("atproto")), CODE, commitment(), NOW, None)
+        .source(
+            &token(&claims_for("atproto")),
+            CODE,
+            commitment(),
+            NOW,
+            None
+        )
         .await
         .is_err());
     assert!(v
@@ -837,12 +901,15 @@ async fn tui_connector_pin_defaults_to_atproto_and_is_configurable() {
 
 #[test]
 fn tui_class_credential_falls_through_the_staging_reservation() {
-    // Positive: a valid TUI-class credential — a normal at+jwt mint with no
-    // federate-session profile markers — falls through the reserved
-    // federate-credential check into normal verification. Neither the
-    // marker nor the (iss, client_id) reservation matches, so the
-    // fail-closed federate dispatch branch is skipped entirely.
-    let mut tui = hyprstream_rpc::auth::Claims::new("did:plc:abcdefghijklmnopqrstuvwx".into(), 1, 2);
+    // Positive (predicate-level): a minimal Claims fixture carrying the
+    // TUI client_id and no federate-session profile markers falls through
+    // the reserved federate-credential predicate. Neither the marker nor
+    // the (iss, client_id) reservation matches. This exercises the
+    // reservation predicates only — it performs no minting, signature
+    // verification, or dispatch, and is not evidence of an authorized TUI
+    // credential (that profile is W1.3/W1.4).
+    let mut tui =
+        hyprstream_rpc::auth::Claims::new("did:plc:abcdefghijklmnopqrstuvwx".into(), 1, 2);
     tui.iss = HOST.into();
     tui.client_id = Some(TUI_CLIENT.into());
     assert!(!tui.has_federate_profile_marker());
@@ -850,14 +917,16 @@ fn tui_class_credential_falls_through_the_staging_reservation() {
     assert!(!tui.is_reserved_federate_credential(HOST));
     // Negative: the TUI class never receives the www reservation's
     // treatment, while the www class still does.
-    let mut www = hyprstream_rpc::auth::Claims::new("did:plc:abcdefghijklmnopqrstuvwx".into(), 1, 2);
+    let mut www =
+        hyprstream_rpc::auth::Claims::new("did:plc:abcdefghijklmnopqrstuvwx".into(), 1, 2);
     www.iss = HOST.into();
     www.client_id = Some(CLIENT.into());
     assert!(www.is_reserved_federate_staging_credential());
     assert!(www.is_reserved_federate_credential(HOST));
     // A TUI-class token that smuggles a federate profile marker still hits
     // the marker check: the fall-through is for clean credentials only.
-    let mut marked = hyprstream_rpc::auth::Claims::new("did:plc:abcdefghijklmnopqrstuvwx".into(), 1, 2);
+    let mut marked =
+        hyprstream_rpc::auth::Claims::new("did:plc:abcdefghijklmnopqrstuvwx".into(), 1, 2);
     marked.iss = HOST.into();
     marked.client_id = Some(TUI_CLIENT.into());
     marked.hs_profile = Some("federate-session-v1".into());
