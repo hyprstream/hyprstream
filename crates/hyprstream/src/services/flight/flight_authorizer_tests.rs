@@ -39,6 +39,12 @@ const RESOURCE: &str = "https://resource.test";
 const TENANT: &str = "tenant.test";
 const OTHER_TENANT: &str = "other.test";
 const CLIENT_ID: &str = "hyprstream-oauth-client-1";
+/// The reserved Federate staging client (the credential profile's fixed
+/// `client_id`); any bearer carrying it denies at this boundary.
+use hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
+/// The fixed Federate upstream source issuer, used only as a marker VALUE in
+/// the deny vectors (presence of the claim is what denies).
+const FEDERATE_SOURCE_ISSUER: &str = "https://login.federate.to";
 /// Bound for every authorize call so a wedged fixture fails fast.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -656,6 +662,170 @@ async fn injected_policy_client_failure_maps_to_deny() {
         1,
         "the injected policy client must be invoked exactly once before the deny"
     );
+}
+
+/// Base claims identical to [`G1Fixture::user_bearer`] — an ordinary,
+/// otherwise-valid node-minted user `at+jwt` — so each reserved-Federate
+/// variant below differs ONLY by the marker/client under test and the denial
+/// is causally attributable to the key-bound gate, never to signature,
+/// audience, session, or client_id validation.
+fn base_user_claims(fx: &G1Fixture, now: i64) -> hyprstream_rpc::auth::Claims {
+    let hs = hyprstream_rpc::auth::service_signer_suite_b64(
+        &fx.user_ed.verifying_key().to_bytes(),
+        None,
+    );
+    hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 3600)
+        .with_issuer(ISSUER.to_owned())
+        .with_tenant(TENANT.to_owned())
+        .with_sid("sess-1".to_owned())
+        .with_client_id(CLIENT_ID.to_owned())
+        .with_scope(Some("read write".to_owned()))
+        .with_clearance(label())
+        .with_audience(Some(RESOURCE.to_owned()))
+        .with_cnf_jwk(&fx.user_ed.verifying_key().to_bytes())
+        .with_cnf_hs_signer_suite(hs)
+        .with_jti()
+}
+
+fn signed_bearer(fx: &G1Fixture, claims: &hyprstream_rpc::auth::Claims) -> String {
+    crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(claims, &fx.ml_dsa, &fx.ed)
+}
+
+/// Every reserved-Federate bearer shape is denied at the Flight boundary
+/// itself, strictly BEFORE the Policy call. These credentials are validly
+/// signed locally-issued `at+jwt`s (signature, audience, jti, session and
+/// client_id all verify — the contrast arm proves the same fixture reaches
+/// Policy), but their only admissible presentation is the deferred-Federate
+/// dispatch pipeline (holder proof, fresh Policy use, shared replay
+/// admission), which this gRPC data plane does not implement. The
+/// `policy_calls` counter stays frozen across all deny arms: a marker, the
+/// reserved client, or the reserved host/client pairing alone is enough, so
+/// stripping cannot reinterpret the credential as a generic bearer.
+#[tokio::test]
+async fn reserved_federate_bearer_is_denied_at_the_boundary_before_policy() {
+    let fx = fixture().await;
+    let now = chrono::Utc::now().timestamp();
+    register_active_session("sess-1", TENANT, now).await;
+
+    let failing = Arc::new(InjectedFailingPolicyClient::default());
+    let client = hyprstream_rpc_std::policy_client::PolicyClient::new(failing.clone());
+    let authorizer = TenantFlightAuthorizer::new(resource_state(&fx.key_set), client);
+    let key_bound_deny = FlightAuthError::Unauthenticated(
+        "Key-bound credentials are not accepted on Flight without a proof transport".to_owned(),
+    );
+
+    // Contrast arm: the ordinary user bearer (cnf-internal bindings only, no
+    // reserved-Federate marker or client) passes the boundary and reaches
+    // Policy exactly once; the injected failure maps to the policy deny.
+    let plain = fx.user_bearer(now, TENANT, "sess-1");
+    let reached_policy = tokio::time::timeout(
+        CALL_TIMEOUT,
+        authorizer.authorize_verified(Some(&format!("Bearer {plain}")), "flight", "decide"),
+    )
+    .await
+    .expect("authorize_verified must not wedge")
+    .map(|_| ());
+    assert_eq!(
+        reached_policy,
+        Err(FlightAuthError::Forbidden(
+            "Flight request denied by tenant policy".to_owned()
+        ))
+    );
+    assert_eq!(failing.policy_calls(), 1);
+
+    // Full reserved-Federate profile: cnf.jwk holder key + every hybrid
+    // signer inventory claim + the reserved staging client.
+    let mut full = base_user_claims(&fx, now);
+    full.client_id = Some(FEDERATE_STAGING_CLIENT.to_owned());
+    full.hs_profile = Some("federate-session-v1".to_owned());
+    full.hs_signer_suite_v1 = Some(URL_SAFE_NO_PAD.encode([9; 32]));
+    full.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode([8; 32]));
+    full.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode([7; 32]));
+    full.hs_source_issuer_v1 = Some(FEDERATE_SOURCE_ISSUER.to_owned());
+    full.hs_source_subject_v1 = Some("opaque-oidc-subject".to_owned());
+
+    // Each reserved marker field ALONE denies: a stripped-down credential
+    // cannot reinterpret itself as a generic bearer by removing the other
+    // six. Marker VALUES are opaque at this boundary (the profile parser
+    // behind the deferred-Federate pipeline owns their syntax); presence is
+    // the deny signal under test.
+    let marker_only = |set: fn(&mut hyprstream_rpc::auth::Claims)| {
+        let mut claims = base_user_claims(&fx, now);
+        set(&mut claims);
+        claims
+    };
+    let generation_only = marker_only(|c| {
+        c.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode([5; 32]));
+    });
+    let profile_only = marker_only(|c| c.hs_profile = Some("federate-session-v1".to_owned()));
+    let suite_only = marker_only(|c| c.hs_signer_suite_v1 = Some(URL_SAFE_NO_PAD.encode([9; 32])));
+    let pq_only = marker_only(|c| c.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode([8; 32])));
+    let inventory_only =
+        marker_only(|c| c.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode([7; 32])));
+    let source_issuer_only =
+        marker_only(|c| c.hs_source_issuer_v1 = Some(FEDERATE_SOURCE_ISSUER.to_owned()));
+    let source_subject_only =
+        marker_only(|c| c.hs_source_subject_v1 = Some("opaque-oidc-subject".to_owned()));
+
+    // Reserved client with every marker stripped. (The boundary's separate
+    // reserved host/client pairing clause is intentionally redundant for
+    // denial — the pairing requires this same reserved client, which denies
+    // on its own — and exists only so the gate stays fail-closed if the
+    // reserved-client constant or the local-issuer host forms ever diverge;
+    // it therefore adds no independent test arm here.)
+    let mut reserved_client_only = base_user_claims(&fx, now);
+    reserved_client_only.client_id = Some(FEDERATE_STAGING_CLIENT.to_owned());
+
+    // Legacy DPoP shape still denies (rule preserved from the pre-A1 gate).
+    let mut dpop = base_user_claims(&fx, now);
+    dpop.cnf = Some(hyprstream_rpc::auth::Cnf {
+        jwk: None,
+        jkt: Some(URL_SAFE_NO_PAD.encode([6; 32])),
+        hs_signer_suite: None,
+    });
+
+    for (name, claims) in [
+        ("full federate profile", &full),
+        (
+            "hs_session_authority_generation marker only",
+            &generation_only,
+        ),
+        ("hs_profile marker only", &profile_only),
+        ("hs_signer_suite_v1 marker only", &suite_only),
+        ("hs_signer_pq_key_v1 marker only", &pq_only),
+        ("hs_signer_inventory_v1 marker only", &inventory_only),
+        ("hs_source_issuer_v1 marker only", &source_issuer_only),
+        ("hs_source_subject_v1 marker only", &source_subject_only),
+        ("reserved client only", &reserved_client_only),
+        ("cnf.jkt (DPoP)", &dpop),
+    ] {
+        let token = signed_bearer(&fx, claims);
+        let denied = tokio::time::timeout(
+            CALL_TIMEOUT,
+            authorizer.authorize_verified(Some(&format!("Bearer {token}")), "flight", "decide"),
+        )
+        .await
+        .expect("authorize_verified must not wedge")
+        .map(|_| ());
+        assert_eq!(denied, Err(key_bound_deny.clone()), "{name}");
+        assert_eq!(
+            failing.policy_calls(),
+            1,
+            "{name}: the key-bound deny must happen strictly before the Policy call"
+        );
+    }
+
+    // `authorize` shares the single verification path: the full profile
+    // denies identically there too.
+    let token = signed_bearer(&fx, &full);
+    let denied = tokio::time::timeout(
+        CALL_TIMEOUT,
+        authorizer.authorize(Some(&format!("Bearer {token}")), "flight", "decide"),
+    )
+    .await
+    .expect("authorize must not wedge");
+    assert_eq!(denied, Err(key_bound_deny));
+    assert_eq!(failing.policy_calls(), 1);
 }
 
 #[tokio::test]

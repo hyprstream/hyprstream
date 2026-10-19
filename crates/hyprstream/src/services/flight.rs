@@ -89,8 +89,12 @@ impl TenantFlightAuthorizer {
     /// `authorize_verified`: identical steps, identical order, identical
     /// errors. Returns the verified identity copied from the validated JWT
     /// claims (`verified_tenant` is never inferred or taken from request
-    /// data). The tenant-policy decision is unchanged: unreachable or
-    /// denying policy fails closed.
+    /// data). Key-bound holder credentials (`cnf.jkt`, the reserved Federate
+    /// `cnf.jwk` profile) are denied at this boundary before any Policy
+    /// call: they are admissible only through the deferred-Federate dispatch
+    /// pipeline, which this gRPC data plane does not implement. The
+    /// tenant-policy decision is unchanged: unreachable or denying policy
+    /// fails closed.
     async fn verify_identity(
         &self,
         authorization: Option<&str>,
@@ -110,15 +114,35 @@ impl TenantFlightAuthorizer {
                     "Invalid access token".to_owned(),
                 )
             })?;
-        if claims.cnf_jkt().is_some() {
-            return Err(hyprstream_flight::FlightAuthError::Unauthenticated(
-                "DPoP-bound tokens are not accepted on Flight without a proof transport".to_owned(),
-            ));
-        }
         let atproto_issuer =
             crate::services::oauth::state::canonical_issuer_origin(&self.auth.oauth_issuer_url)
                 .unwrap_or_else(|| self.auth.oauth_issuer_url.clone());
         let local_issuers = [self.auth.oauth_issuer_url.as_str(), atproto_issuer.as_str()];
+        // Key-bound holder credentials must not downgrade to plain bearers on
+        // this boundary. RFC 9449 `cnf.jkt` (DPoP) has always been rejected
+        // here. The reserved Federate profile is `cnf.jwk` plus hybrid COSE
+        // request proofs and is admitted only through the deferred-Federate
+        // dispatch pipeline (holder proof, fresh Policy use, shared replay
+        // admission), which this gRPC data plane does not implement. Any
+        // reserved-Federate profile marker OR the reserved client OR the
+        // reserved host/client pairing denies, so stripping markers, the
+        // client, or the issuer cannot reinterpret the credential as a
+        // generic bearer. Ordinary node-minted user bearers carry cnf-internal
+        // bindings only and remain on the unchanged path below.
+        if claims.cnf_jkt().is_some()
+            || claims.has_federate_profile_marker()
+            || claims.client_id.as_deref().is_some_and(|client| {
+                client == hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT
+            })
+            || local_issuers
+                .iter()
+                .any(|host| claims.is_reserved_federate_credential(host))
+        {
+            return Err(hyprstream_flight::FlightAuthError::Unauthenticated(
+                "Key-bound credentials are not accepted on Flight without a proof transport"
+                    .to_owned(),
+            ));
+        }
         let subject = claims.subject(&local_issuers);
         subject.validate().map_err(|_| {
             hyprstream_flight::FlightAuthError::Unauthenticated(
