@@ -403,11 +403,15 @@ fn question_set_retained_bytes(set: &QuestionSet) -> Result<usize, DecisionSubst
 
 fn prepared_payload_retained_bytes(
     payload: &ResolvedDecisionPins,
+    owner: &OwnerKey,
 ) -> Result<usize, DecisionSubstrateError> {
     let mut total = std::mem::size_of::<DecisionPins>()
         + std::mem::size_of::<RawQuestionsTemplate>()
         + std::mem::size_of::<String>()
-        + std::mem::size_of::<QuestionSet>();
+        + std::mem::size_of::<QuestionSet>()
+        + std::mem::size_of::<OwnerKey>();
+    add_retained_bytes(&mut total, owner.tenant.capacity())?;
+    add_retained_bytes(&mut total, owner.subject.capacity())?;
     for pin in [
         &payload.pins.authorization_model_ref,
         &payload.pins.expected_artifact_commit,
@@ -828,7 +832,6 @@ impl CloseState {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct PreparedStatement {
-    pub owner: OwnerKey,
     /// RANDOM OPAQUE per CREATE — unrelated to document bytes.
     pub handle: [u8; 32],
     payload: Arc<ChargedPreparedPayload>,
@@ -841,6 +844,7 @@ pub struct PreparedStatement {
 /// Immutable model/template payload whose accounting lease lives exactly as
 /// long as every retained prepared-statement snapshot.
 struct ChargedPreparedPayload {
+    owner: OwnerKey,
     pins: DecisionPins,
     question_set: QuestionSet,
     raw_json: String,
@@ -851,6 +855,10 @@ struct ChargedPreparedPayload {
 }
 
 impl PreparedStatement {
+    pub fn owner(&self) -> &OwnerKey {
+        &self.payload.owner
+    }
+
     pub fn pins(&self) -> &DecisionPins {
         &self.payload.pins
     }
@@ -1044,8 +1052,11 @@ impl PreparedDecideRegistry {
                 "resolver must transfer exclusive ownership of prepared payload data".to_owned(),
             ));
         }
-        let retained_bytes = prepared_payload_retained_bytes(&resolved)?;
+        let retained_bytes = prepared_payload_retained_bytes(&resolved, &owner)?;
         let lease = LiveAllocationLease::reserve(&self.live_payload_bytes, retained_bytes)?;
+        // Owner identity is part of the charged payload so Arc::make_mut on a
+        // retained statement snapshot cannot duplicate unaccounted strings.
+        let payload_owner = owner.clone();
         let pins = Arc::try_unwrap(resolved.pins).map_err(|_| {
             DecisionSubstrateError::InvalidArgument(
                 "resolver retained a prepared-payload alias".to_owned(),
@@ -1065,6 +1076,7 @@ impl PreparedDecideRegistry {
         let question_ids = raw.question_ids.iter().cloned().collect();
         let schema_version = pins.schema_version.clone();
         let payload = Arc::new(ChargedPreparedPayload {
+            owner: payload_owner,
             pins,
             question_set,
             raw_json,
@@ -1114,7 +1126,6 @@ impl PreparedDecideRegistry {
         entries.insert(
             (owner.clone(), handle),
             Arc::new(PreparedStatement {
-                owner,
                 handle,
                 payload,
                 binding,
@@ -2075,7 +2086,7 @@ mod tests {
             .snapshot(&caller, &handle)
             .expect("snapshot after allow");
         assert_eq!(prepared.pins().expected_artifact_commit, COMMIT);
-        assert_eq!(prepared.owner.subject, "alice");
+        assert_eq!(prepared.owner().subject, "alice");
         assert!(!prepared.binding.is_closed());
     }
 
