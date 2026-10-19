@@ -733,6 +733,7 @@ fn root_data_lists_validate_wire_shape_and_segment_bounds() {
             "pointer": [[1, 2, 3]],
             "composite": [[1, 2, 3]],
             "far-outer-child": [[1, 2, 3]],
+            "null-child": [[]],
             "empty": [],
         },
         "rejected": [

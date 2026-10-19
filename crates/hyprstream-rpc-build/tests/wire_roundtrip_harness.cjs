@@ -159,6 +159,9 @@ function rootDataReader(kind) {
     raw.set([1, 2, 3], 48);
   } else if (kind === 'list-before-start') {
     word(16, ((-3 << 2) | 1) >>> 0, (1 << 3) | 6);
+  } else if (kind === 'null-child') {
+    word(16, 1, (1 << 3) | 6);
+    // A null List(Data) element is preserved as an empty byte vector.
   } else {
     const count = kind === 'segment-list-overrun' ? 2 : 1;
     word(16, 1, (count << 3) | 6);
@@ -257,7 +260,7 @@ function main() {
   }
   if (mode === 'root-data-lists') {
     const valid = {};
-    for (const kind of ['pointer', 'composite', 'far-outer-child', 'empty']) {
+    for (const kind of ['pointer', 'composite', 'far-outer-child', 'null-child', 'empty']) {
       valid[kind] = rootDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
     const rejected = [];
