@@ -181,15 +181,6 @@ fn build_public_routes_from_registry(
                         middleware::browser_provisioning_rate_limit_middleware,
                     ));
             }
-            PublicRouteHandler::At9pVerify => {
-                // Lives on a separate credential-free face; validate() ensures
-                // it never appears under HttpFace::MainApp. Crashing here is the
-                // fail-closed response to a misconfigured registry.
-                unreachable!(
-                    "At9pVerify belongs to a separate face; mac::public_exemptions::validate() \
-                     should have prevented it appearing on HttpFace::MainApp"
-                );
-            }
         }
     }
 
@@ -339,21 +330,6 @@ mod tests {
         assert!(
             !live.contains("/models") && !live.contains("/oai/v1"),
             "protected route roots must never appear in the public router"
-        );
-
-        let at9p = crate::services::at9p_verify::credential_free_router(
-            crate::services::at9p_verify::VerifyFaceState {
-                max_skew_seconds: 300,
-                max_challenge_bytes: 256,
-            },
-        );
-        let live_at9p = live_router_paths(&at9p);
-        let registered_at9p = for_face(HttpFace::At9pVerify)
-            .map(|exemption| exemption.path.to_owned())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            live_at9p, registered_at9p,
-            "live unmediated at9p routes diverged from PUBLIC_EXEMPTIONS"
         );
     }
 }
