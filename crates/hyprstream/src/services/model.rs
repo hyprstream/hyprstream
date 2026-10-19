@@ -2971,10 +2971,18 @@ impl InferHandler for ModelService {
         let client = self
             .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "infer"))
             .await?;
-        client
-            .decide(data)
-            .await
-            .map_err(Self::typed_decision_error)
+        let decision = if let Some(disconnected) = ctx.request_cancellation() {
+            tokio::select! {
+                biased;
+                _ = disconnected.cancelled() => {
+                    Err(anyhow!("clef-decision-cancelled: caller disconnected"))
+                }
+                result = client.decide(data) => result,
+            }
+        } else {
+            client.decide(data).await
+        };
+        decision.map_err(Self::typed_decision_error)
     }
 
     async fn handle_status(

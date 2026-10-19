@@ -267,6 +267,8 @@ struct BridgeMessage {
     /// Accept-boundary carrier classification (INV-2 #1042), forwarded
     /// verbatim to the dispatch pipeline's cleartext policy.
     carrier: crate::transport::carrier::CarrierContext,
+    /// Server-owned lifetime signal associated with this accepted stream.
+    request_cancel: CancellationToken,
     respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
 }
 
@@ -308,13 +310,14 @@ where
         let nonce_cache = Arc::clone(&nonce_cache);
         requests.spawn_local(async move {
             let signing_key = service.signing_key();
-            let result = crate::service::dispatch::process_request(
+            let result = crate::service::dispatch::process_request_with_cancel(
                 msg.request.as_ref(),
                 &*service,
                 crate::envelope::EnvelopeVerification::AnySigner,
                 &signing_key,
                 &nonce_cache,
                 msg.carrier,
+                msg.request_cancel,
             )
             .await
             .map(Bytes::from);
@@ -652,6 +655,7 @@ impl IrohRequestProcessor for LocalServiceBridge {
         &self,
         request: Bytes,
         carrier: crate::transport::carrier::CarrierContext,
+        request_cancel: CancellationToken,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
         let tx = self.tx.clone();
         Box::pin(async move {
@@ -674,6 +678,7 @@ impl IrohRequestProcessor for LocalServiceBridge {
                 permit.send(BridgeMessage {
                     request,
                     carrier,
+                    request_cancel,
                     respond: respond_tx,
                 });
             }
@@ -931,7 +936,8 @@ mod tests {
         assert!(retained
             .process(
                 Bytes::new(),
-                crate::transport::carrier::CarrierContext::iroh()
+                crate::transport::carrier::CarrierContext::iroh(),
+                CancellationToken::new(),
             )
             .await
             .is_err());
@@ -981,6 +987,7 @@ mod tests {
             tx.try_send(BridgeMessage {
                 request: Bytes::from(wire),
                 carrier: crate::transport::carrier::CarrierContext::inproc(),
+                request_cancel: CancellationToken::new(),
                 respond,
             })
             .map_err(|_| anyhow::anyhow!("queue admission failed"))?;
@@ -1086,6 +1093,7 @@ mod tests {
         tx.try_send(BridgeMessage {
             request: Bytes::from(wire),
             carrier: crate::transport::carrier::CarrierContext::inproc(),
+            request_cancel: CancellationToken::new(),
             respond,
         })
         .map_err(|_| anyhow::anyhow!("queue admission failed"))?;
@@ -1242,7 +1250,8 @@ mod tests {
         assert!(bridge
             .process(
                 Bytes::new(),
-                crate::transport::carrier::CarrierContext::inproc()
+                crate::transport::carrier::CarrierContext::inproc(),
+                CancellationToken::new(),
             )
             .await
             .is_err());
@@ -1796,6 +1805,141 @@ mod tests {
         assert_eq!(&resp[..], b"drained-ok");
 
         client.shutdown().await?;
+        Ok(())
+    }
+
+    struct DisconnectProbeProcessor {
+        started: tokio::sync::mpsc::UnboundedSender<(Bytes, CancellationToken)>,
+        finished: tokio::sync::mpsc::UnboundedSender<Bytes>,
+        release: Arc<Semaphore>,
+    }
+
+    impl crate::transport::rpc_session::sealed::Sealed for DisconnectProbeProcessor {
+        fn admits_untrusted_carrier(&self) -> bool {
+            // This processor exists only inside the transport unit test and
+            // deliberately accepts opaque test bytes so the real iroh stream
+            // closure behavior can be exercised without fabricating an
+            // application envelope. Production processors remain sealed to
+            // the canonical authenticated dispatch bridge.
+            true
+        }
+    }
+
+    impl IrohRequestProcessor for DisconnectProbeProcessor {
+        fn process(
+            &self,
+            request: Bytes,
+            _carrier: crate::transport::carrier::CarrierContext,
+            request_cancel: CancellationToken,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
+            let started = self.started.clone();
+            let finished = self.finished.clone();
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                started.send((request.clone(), request_cancel)).ok();
+                release.acquire().await?.forget();
+                finished.send(request.clone()).ok();
+                Ok(request)
+            })
+        }
+    }
+
+    /// A complete request FIN is not cancellation. STOP_SENDING on only one
+    /// response stream trips only that server-owned request token, and the
+    /// accepted processor still reaches its terminal path before the stream
+    /// handler returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_stop_sending_cancels_only_its_request_after_full_request_fin() -> Result<()> {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let processor = DisconnectProbeProcessor {
+            started: started_tx,
+            finished: finished_tx,
+            release: Arc::clone(&release),
+        };
+        let handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
+        let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let client = IrohSubstrate::new_test(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let conn = client
+            .connect(direct_addr(&server), ALPN_HYPRSTREAM_RPC)
+            .await?;
+
+        let (mut abandoned_send, mut abandoned_recv) = conn.open_bi().await?;
+        abandoned_send.write_all(b"abandoned").await?;
+        abandoned_send.finish()?;
+        let (mut retained_send, mut retained_recv) = conn.open_bi().await?;
+        retained_send.write_all(b"retained").await?;
+        retained_send.finish()?;
+
+        let mut signals = Vec::new();
+        for _ in 0..2 {
+            signals.push(
+                tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                    .await?
+                    .context("processor did not accept complete request")?,
+            );
+        }
+        let abandoned_token = signals
+            .iter()
+            .find(|(request, _)| request.as_ref() == b"abandoned")
+            .context("abandoned request missing")?
+            .1
+            .clone();
+        let retained_token = signals
+            .iter()
+            .find(|(request, _)| request.as_ref() == b"retained")
+            .context("retained request missing")?
+            .1
+            .clone();
+        assert!(!abandoned_token.is_cancelled());
+        assert!(!retained_token.is_cancelled());
+
+        // Emit an actual QUIC STOP_SENDING signal, rather than relying on
+        // wrapper Drop behavior. The request side already completed with FIN.
+        // `conn` is the raw iroh endpoint used by this fixture; send WebTransport's
+        // wire-mapped code so the server's web-transport-iroh adapter identifies
+        // this as STOP_SENDING instead of an out-of-range transport code.
+        let stop_code = iroh::endpoint::VarInt::try_from(0x52e4_a40f_a8db_u64)?;
+        abandoned_recv.stop(stop_code)?;
+        tokio::time::timeout(Duration::from_secs(5), abandoned_token.cancelled())
+            .await
+            .context("response STOP_SENDING did not cancel its accepted request")?;
+        assert!(abandoned_token.is_cancelled());
+        assert!(
+            !retained_token.is_cancelled(),
+            "disconnect signal escaped its stream/request"
+        );
+
+        release.add_permits(2);
+        let retained_response = retained_recv.read_to_end(MAX_FRAME_BYTES).await?;
+        assert_eq!(retained_response, b"retained");
+        assert!(
+            !retained_token.is_cancelled(),
+            "ordinary request FIN was misclassified as caller disconnect"
+        );
+        let mut terminal_requests = Vec::new();
+        for _ in 0..2 {
+            terminal_requests.push(
+                tokio::time::timeout(Duration::from_secs(5), finished_rx.recv())
+                    .await?
+                    .context("accepted processor did not reach terminal completion")?,
+            );
+        }
+        assert!(terminal_requests
+            .iter()
+            .any(|request| request.as_ref() == b"abandoned"));
+        assert!(terminal_requests
+            .iter()
+            .any(|request| request.as_ref() == b"retained"));
+
+        client.shutdown().await?;
+        server.shutdown().await?;
         Ok(())
     }
 }

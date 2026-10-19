@@ -103,6 +103,12 @@ impl WorkerBinding {
         drop(armed);
         expected.ticket.request_id.lock().replace(request_id);
         let ticket = expected.ticket;
+        if let Some(request_cancel) = ctx.request_cancellation() {
+            ticket
+                .worker_request_cancellation
+                .lock()
+                .replace(request_cancel.clone());
+        }
         cancel.with_backbone_observer(DecisionBackboneObserver::new(Arc::new(
             move |phase, deadline| {
                 // Never hold an observer-control lock while waiting. Bounded,
@@ -194,6 +200,7 @@ impl TestDecisionControl {
             released: Mutex::new(false),
             wake: Condvar::new(),
             request_id: Mutex::new(None),
+            worker_request_cancellation: Mutex::new(None),
         });
         let mut armed = self.armed.lock();
         ensure!(armed.is_none(), "T6 request arm already occupied");
@@ -233,6 +240,7 @@ pub(crate) struct RequestTicket {
     released: Mutex<bool>,
     wake: Condvar,
     request_id: Mutex<Option<u64>>,
+    worker_request_cancellation: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 impl RequestTicket {
     pub(crate) fn wait_partial_forward(&self) -> Result<Checkpoint> {
@@ -272,6 +280,25 @@ impl RequestTicket {
     pub(crate) fn release(&self) {
         *self.released.lock() = true;
         self.wake.notify_all();
+    }
+
+    pub(crate) fn wait_worker_request_disconnect(&self) -> Result<()> {
+        let end = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .worker_request_cancellation
+                .lock()
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < end,
+                "T6 worker request did not observe transport cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     pub(crate) fn check(&self) -> Result<()> {
         ensure!(

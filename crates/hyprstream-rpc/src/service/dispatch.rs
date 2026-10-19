@@ -72,6 +72,33 @@ pub async fn process_request<S>(
 where
     S: crate::service::RequestService,
 {
+    process_request_with_cancel(
+        raw_bytes,
+        service,
+        verification,
+        signing_key,
+        nonce_cache,
+        carrier,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+/// Process a request with a server-owned transport lifetime signal. The
+/// signal is installed only after signature, credential, method policy and
+/// MAC admission have passed, immediately before application dispatch.
+pub async fn process_request_with_cancel<S>(
+    raw_bytes: &[u8],
+    service: &S,
+    verification: EnvelopeVerification<'_>,
+    signing_key: &ed25519_dalek::SigningKey,
+    nonce_cache: &crate::envelope::InMemoryNonceCache,
+    carrier: crate::transport::carrier::CarrierContext,
+    request_cancel: tokio_util::sync::CancellationToken,
+) -> Result<Vec<u8>>
+where
+    S: crate::service::RequestService,
+{
     // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
     //    The verify policy + kid-anchored PQ trust store come from the
     //    process-global verify configuration installed at startup (Hybrid
@@ -905,6 +932,9 @@ where
 
     // 3. Handle request — from the same decoded body the policy and MAC
     //    gates consumed (v16 §5.1: signed == decoded == handler body).
+    // Only the authenticated dispatch path can attach this server-created
+    // signal. Caller-controlled envelope fields never populate it.
+    ctx.install_request_cancellation(request_cancel);
     let (response_payload, continuation) = match service.handle_request(&ctx, &decoded_body).await {
         Ok((resp, cont)) => (resp, cont),
         Err(e) => {

@@ -59,6 +59,14 @@ pub struct InMemoryTransport {
     processor: Arc<dyn IrohRequestProcessor>,
 }
 
+struct CancelRequestOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 impl InMemoryTransport {
     /// Dial a co-located service by its already-resolved request processor.
     pub fn new(processor: Arc<dyn IrohRequestProcessor>) -> Self {
@@ -86,10 +94,13 @@ impl Transport for InMemoryTransport {
         // INV-2 (#1042): the request never leaves this address space — the
         // one carrier class that is inproc by construction.
         let fut = async move {
+            let request_cancel = tokio_util::sync::CancellationToken::new();
+            let _cancel_on_drop = CancelRequestOnDrop(request_cancel.clone());
             processor
                 .process(
                     Bytes::from(payload),
                     crate::transport::carrier::CarrierContext::inproc(),
+                    request_cancel,
                 )
                 .await
         };

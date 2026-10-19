@@ -1331,7 +1331,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     t6_progress("midforward-after", started.elapsed().as_millis(), json!({}))?;
     let receipt = json!({
         "schema":"clef-t6-authenticated-cpu-service/1", "result":"AUTHENTICATED_CPU_SERVICE_CASES_PASS",
-        "t6_complete":false, "remaining":["client-disconnect cancellation R7"],
+        "t6_complete":true, "remaining":[],
         "artifact_commit":T6_PIN,"artifact_tree":T6_TREE,"model_ref":T6_MODEL,
         "model_checkout":checkout,"records_sha256":T6_RECORDS_SHA,
         "expected_fp8_json_sha256":t6_sha(T6_EXPECTED_JSON.as_bytes()),
@@ -1341,7 +1341,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "corpus_records":5,"corpus_questions":11,"max_oracle_probability_error":max_oracle_error,
         "oracle_atol":1e-5,"oracle_rtol":0.0,
         "isolation_max_abs":isolation_max_abs,"cancel_recovery_max_abs":cancel_recovery_max_abs,
-        "cancellation_scope":"real positive deadline after layer0 and actual signed unload drain; client-disconnect R7 remains open",
+        "cancellation_scope":"real positive deadline, client-disconnect cancellation, and actual signed unload drain after layer0",
         "midforward":midforward,
         "load_elapsed_ms":load_elapsed_ms,"elapsed_ms":started.elapsed().as_millis(),
         "proc_status":std::fs::read_to_string("/proc/self/status")?.lines().filter(|l| l.starts_with("VmHWM:") || l.starts_with("VmRSS:")).collect::<Vec<_>>(),
@@ -1398,6 +1398,73 @@ async fn t6_midforward_cases(
     )?;
     t6_assert_order(model, alice_key, "alice").await?;
     let initial = control.current()?;
+
+    // Exercise the actual end-user Model.Decide path with a caller task that
+    // drops its response stream after the native worker reaches layer 0. The
+    // controller waits for the server-owned worker request signal before
+    // releasing the paused checkpoint, proving propagation through Model's
+    // generated InferenceClient call and the worker RPC transport.
+    let disconnect_ticket = control.arm("alice", T6_TENANT, request)?;
+    let controller_ticket = Arc::clone(&disconnect_ticket);
+    let (checkpoint_tx, checkpoint_rx) = tokio::sync::oneshot::channel();
+    let disconnect_controller = std::thread::Builder::new()
+        .name("t6-request-disconnect".into())
+        .spawn(move || -> Result<()> {
+            let _release = ReleaseOnDrop(Arc::clone(&controller_ticket));
+            let event = controller_ticket.wait_partial_forward()?;
+            anyhow::ensure!(event.phase == 5, "disconnect witness is not after layer 0");
+            checkpoint_tx
+                .send(())
+                .map_err(|_| anyhow!("T6 disconnect checkpoint receiver dropped"))?;
+            controller_ticket.wait_worker_request_disconnect()?;
+            controller_ticket.release();
+            Ok(())
+        })?;
+    let disconnect_client = alice.clone();
+    let disconnect_request = request.clone();
+    let disconnected_request = tokio::spawn(async move {
+        disconnect_client
+            .infer(T6_MODEL)
+            .decide(&disconnect_request)
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        checkpoint_rx
+            .blocking_recv()
+            .map_err(|_| anyhow!("T6 worker never reached disconnect checkpoint"))
+    })
+    .await??;
+    disconnected_request.abort();
+    anyhow::ensure!(
+        disconnected_request.await.is_err_and(|error| error.is_cancelled()),
+        "dropping the caller task did not close its response wait"
+    );
+    tokio::task::spawn_blocking(move || {
+        disconnect_controller
+            .join()
+            .map_err(|_| anyhow!("T6 disconnect controller panicked"))?
+    })
+    .await??;
+    disconnect_ticket.check()?;
+    control.assert_consumed()?;
+    // This successful request queues behind any still-unwinding native frame;
+    // its completion proves the worker released the execution locks and can
+    // serve again on the same loaded incarnation.
+    let disconnect_recovery = alice.infer(T6_MODEL).decide(request).await?;
+    t6_check_response(&disconnect_recovery, record, request)?;
+    let disconnect_recovery_error = t6_close(
+        &t6_distributions(&disconnect_recovery)?,
+        &t6_distributions(baseline)?,
+        1e-6,
+        1e-6,
+    )?;
+    let after_disconnect = control.current()?;
+    anyhow::ensure!(
+        after_disconnect.incarnation == initial.incarnation
+            && after_disconnect.generation == initial.generation,
+        "disconnect recovery replaced the worker instead of releasing its active attempt"
+    );
+    t6_assert_order(model, alice_key, "alice").await?;
 
     let mut deadline_request = request.clone();
     deadline_request.timeout_ms = Some(10_000);
@@ -1612,7 +1679,8 @@ async fn t6_midforward_cases(
         "decision_completion_sequence":decision_completion_sequence,"unload_completion_sequence":unload_completion_sequence,
         "old_worker_artifact_weak_released":true,"reload_new_incarnation":true,
         "deadline_recovery_max_abs":deadline_recovery_error,"drain_recovery_max_abs":drain_recovery_error,
-        "recovery_atol":1e-6,"recovery_rtol":1e-6,"disconnect_cancellation_proven":false}),
+        "recovery_atol":1e-6,"recovery_rtol":1e-6,
+        "disconnect":{"checkpoint":5,"worker_signal_observed":true,"worker_terminal_before_successful_recovery":true,"same_worker":true,"recovery_max_abs":disconnect_recovery_error}}),
     )
 }
 
