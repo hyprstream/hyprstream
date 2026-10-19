@@ -37,6 +37,61 @@ const MAX_TRANSCRIPT: usize = 8 * 1024;
 const MAX_AUTHORITY_TEXT: usize = 256;
 const MAX_SCOPE_BYTES: usize = 1024;
 const KEY_TTL: Duration = Duration::from_secs(60);
+const MAX_CLIENT_TEXT: usize = 256;
+const MAX_CONNECTOR_TEXT: usize = 64;
+
+/// One accepted Federate client class (W1).
+///
+/// The staging class is the hardcoded www pin. A second class (the TUI
+/// harness) may be configured per issuer; it carries IDENTICAL source
+/// verification invariants — pinned RS256, kid-keyed JWKS, `exp - iat <=
+/// 300s`, nonce/c_hash/at_hash binding, the connector pin, and did:plc /
+/// host-form did:web validation. The class only selects the pinned
+/// identifiers, and every commitment binds its exact `client_id` in both
+/// the nonce preimage and the possession transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientClass {
+    client_id: String,
+    aud: String,
+    connector: String,
+}
+
+impl ClientClass {
+    /// The hardcoded staging www class (`aud` == `client_id`, `atproto`).
+    pub(crate) fn staging() -> Self {
+        Self {
+            client_id: CLIENT.into(),
+            aud: CLIENT.into(),
+            connector: "atproto".into(),
+        }
+    }
+
+    /// Fail-closed construction of the configured second class. The class
+    /// must stay disjoint from the reserved staging pin so its credentials
+    /// keep falling through the reserved-credential check into normal
+    /// verification instead of the fail-closed federate-session dispatch.
+    pub(crate) fn new(client_id: &str, aud: &str, connector: Option<&str>) -> Result<Self> {
+        let text = |value: &str, max: usize| {
+            require(!value.is_empty() && value.len() <= max)?;
+            require(value.bytes().all(|b| (0x21..=0x7e).contains(&b)))?;
+            Ok(())
+        };
+        text(client_id, MAX_CLIENT_TEXT)?;
+        text(aud, MAX_CLIENT_TEXT)?;
+        let connector = connector.unwrap_or("atproto");
+        text(connector, MAX_CONNECTOR_TEXT)?;
+        require(client_id != CLIENT && aud != CLIENT)?;
+        Ok(Self {
+            client_id: client_id.into(),
+            aud: aud.into(),
+            connector: connector.into(),
+        })
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Error {
@@ -152,6 +207,10 @@ fn json(bytes: &[u8]) -> Result<Value> {
 /// Validated commitment inputs. The host cannot prove browser key freshness.
 pub(crate) struct Commitment {
     host: FederateHost,
+    /// The client class this commitment is bound to (W1). Binds the nonce
+    /// preimage and the possession transcript to the exact class, so a
+    /// nonce or transcript minted for one class is useless for another.
+    client: ClientClass,
     random: [u8; 32],
     state: String,
     pkce: String,
@@ -170,8 +229,21 @@ impl Commitment {
             pq,
         )
     }
+    /// Commitment for the hardcoded staging www class.
     pub(crate) fn for_host(
         host: FederateHost,
+        random: &str,
+        state: &str,
+        pkce: &str,
+        ed: &str,
+        pq: &str,
+    ) -> Result<Self> {
+        Self::for_class(host, &ClientClass::staging(), random, state, pkce, ed, pq)
+    }
+    /// Commitment for one accepted client class (staging or configured).
+    pub(crate) fn for_class(
+        host: FederateHost,
+        client: &ClientClass,
         random: &str,
         state: &str,
         pkce: &str,
@@ -187,6 +259,7 @@ impl Commitment {
         fixed::<32>(pkce)?;
         Ok(Self {
             host,
+            client: client.clone(),
             random: fixed(random)?,
             state: state.into(),
             pkce: pkce.into(),
@@ -199,7 +272,7 @@ impl Commitment {
             "hyprstream.federate.session-primary.nonce.v1",
             &[
                 ISSUER.as_bytes(),
-                CLIENT.as_bytes(),
+                self.client.client_id.as_bytes(),
                 WEBSITE.as_bytes(),
                 CALLBACK.as_bytes(),
                 self.host.as_str().as_bytes(),
@@ -284,6 +357,10 @@ fn parse_keys(bytes: &[u8]) -> Result<BTreeMap<String, DecodingKey>> {
 #[derive(Default)]
 pub(crate) struct Verifier {
     host: Option<FederateHost>,
+    /// Optional configured second client class beside the hardcoded staging
+    /// pin (W1: the TUI harness). `None` = staging-only, exactly the
+    /// previous behavior.
+    tui_client: Option<ClientClass>,
     client: Option<reqwest::Client>,
     keys: Mutex<Option<Keys>>,
     #[cfg(test)]
@@ -305,11 +382,30 @@ impl Verifier {
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
             host: Some(host),
+            tui_client: None,
             client: Some(client),
             keys: Mutex::new(None),
             #[cfg(test)]
             responses: None,
         })
+    }
+    /// Accept an additional configured client class (W1). Both classes
+    /// verify under identical invariants.
+    pub(crate) fn with_client_class(mut self, class: ClientClass) -> Self {
+        self.tui_client = Some(class);
+        self
+    }
+    /// Resolve a wire `client_id` to the one accepted class it names.
+    /// Anything but the staging pin or the configured class fails closed
+    /// before any signature or claim work.
+    pub(crate) fn resolve_client_class(&self, client_id: &str) -> Result<ClientClass> {
+        if client_id == CLIENT {
+            return Ok(ClientClass::staging());
+        }
+        match &self.tui_client {
+            Some(class) if class.client_id == client_id => Ok(class.clone()),
+            _ => Err(Error::Invalid),
+        }
     }
     async fn fetch(&self, client: &reqwest::Client) -> Result<Vec<u8>> {
         #[cfg(test)]
@@ -374,6 +470,12 @@ impl Verifier {
         access_token: Option<&str>,
     ) -> Result<Source> {
         require(self.host()? == &commitment.host)?;
+        // The commitment's class must be one this verifier accepts; a
+        // commitment naming any other client id fails closed here.
+        require(
+            self.resolve_client_class(commitment.client.client_id.as_str())
+                .is_ok(),
+        )?;
         require(token.len() <= MAX_JWS && !token.is_empty())?;
         let parts: Vec<_> = token.split('.').collect();
         require(parts.len() == 3)?;
@@ -401,7 +503,7 @@ impl Verifier {
         validate_claims(&claims, code, &commitment, now, access_token)?;
         Ok(Source {
             subject: text(&claims, "sub")?.into(),
-            atproto_did: atproto_account_did(&claims)?,
+            atproto_did: atproto_account_did(&claims, &commitment.client.connector)?,
             jti: text(&claims, "jti")?.into(),
             issued_at: number(&claims, "iat")?,
             expires_at: number(&claims, "exp")?,
@@ -429,12 +531,12 @@ fn hash_claim(claim: &str, input: &str) -> Result<()> {
     require(equal(&fixed::<16>(claim)?, &sha(input.as_bytes())[..16]))
 }
 
-fn atproto_account_did(v: &Value) -> Result<String> {
+fn atproto_account_did(v: &Value, connector: &str) -> Result<String> {
     let claims = v
         .get("federated_claims")
         .and_then(Value::as_object)
         .ok_or(Error::Invalid)?;
-    require(claims.get("connector_id").and_then(Value::as_str) == Some("atproto"))?;
+    require(claims.get("connector_id").and_then(Value::as_str) == Some(connector))?;
     let did = claims
         .get("user_id")
         .and_then(Value::as_str)
@@ -493,16 +595,21 @@ fn validate_claims(
     now: u64,
     access: Option<&str>,
 ) -> Result<()> {
+    // The pinned identifiers come from the commitment's client class, so a
+    // token minted for one class cannot be replayed against another.
+    let class = &c.client;
     require(text(v, "iss")? == ISSUER)?;
     require(
-        v.get("aud")
-            .is_some_and(|a| a.as_str() == Some(CLIENT) || *a == serde_json::json!([CLIENT])),
+        v.get("aud").is_some_and(|a| {
+            a.as_str() == Some(class.aud.as_str())
+                || *a == serde_json::json!([class.aud.as_str()])
+        }),
     )?;
     if let Some(azp) = v.get("azp") {
-        require(azp.as_str() == Some(CLIENT))?;
+        require(azp.as_str() == Some(class.client_id.as_str()))?;
     }
     text(v, "sub")?;
-    atproto_account_did(v)?;
+    atproto_account_did(v, &class.connector)?;
     text(v, "jti")?;
     let iat = number(v, "iat")?;
     let exp = number(v, "exp")?;
@@ -642,7 +749,7 @@ impl Source {
                 self.commitment.host.as_str().as_bytes(),
                 self.commitment.host.token_endpoint().as_bytes(),
                 ISSUER.as_bytes(),
-                CLIENT.as_bytes(),
+                self.commitment.client.client_id.as_bytes(),
                 WEBSITE.as_bytes(),
                 &id,
                 &self.token_hash,

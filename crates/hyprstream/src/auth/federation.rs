@@ -793,6 +793,7 @@ mod tests {
                 jwks_uri: Some("https://trusted.example.com/jwks".to_owned()),
                 jwks_cache_ttl_secs: 300,
                 allow_http: false,
+                federate_tui_client: None,
             },
         );
         let resolver = FederationKeyResolver::new(&issuers);
@@ -1092,6 +1093,7 @@ mod tests {
                 jwks_uri: Some(jwks_uri.to_owned()),
                 jwks_cache_ttl_secs: 300,
                 allow_http: true,
+                federate_tui_client: None,
             },
         );
         issuers
@@ -1278,6 +1280,7 @@ mod tests {
                 jwks_uri: Some("https://fed.example/jwks".to_owned()),
                 jwks_cache_ttl_secs: 0,
                 allow_http: true,
+                federate_tui_client: None,
             },
         );
         let resolver = FederationKeyResolver::new(&issuers).with_jwks_fetcher(fetcher);
