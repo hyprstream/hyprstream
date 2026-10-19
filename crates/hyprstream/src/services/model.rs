@@ -2949,6 +2949,7 @@ impl InferHandler for ModelService {
         model_ref: &str,
         data: &hyprstream_rpc_std::inference_client::DecisionRequest,
     ) -> Result<hyprstream_rpc_std::inference_client::DecisionResponse> {
+        let request_started = Instant::now();
         // Cheap shared preflight FIRST (byte bound, ordered parse, media/
         // duplicate/numeric/cardinality/aggregate/deadline admission), then
         // the raw-model match and the pin gate — ALL before
@@ -2956,6 +2957,8 @@ impl InferHandler for ModelService {
         // revalidates everything after its own PEP.
         let parsed = crate::services::decision::preflight_parsed(data)
             .map_err(Self::typed_decision_error)?;
+        let deadline = crate::services::decision::resolve_deadline(data, request_started)
+            .ok_or_else(|| anyhow!("decision request is missing its bounded deadline"))?;
         crate::services::decision::ensure_model_matches(&parsed.model, Some(model_ref))
             .map_err(Self::typed_decision_error)?;
         let resolved = self.resolve_model_ref(model_ref).await?;
@@ -2968,19 +2971,48 @@ impl InferHandler for ModelService {
         crate::services::decision::ensure_pinned_for_decision(is_commit, staging_admits, model_ref)
             .map_err(Self::typed_decision_error)?;
 
+        // Reject an already exhausted (including timeoutMs=0) request before
+        // a lazy model load can start.
+        crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+            .map_err(Self::typed_decision_error)?;
         let client = self
             .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "infer"))
             .await?;
+        // Model load and routing happen between ingress and this worker call.
+        // Forward only the remaining relative budget, then bound the whole RPC
+        // wait by the same ingress deadline so dispatch cannot reset it.
+        let timeout_ms = crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+            .map_err(Self::typed_decision_error)?;
+        let forwarded = hyprstream_rpc_std::inference_client::DecisionRequest {
+            clef_json: data.clef_json.clone(),
+            max_state_tokens: data.max_state_tokens,
+            timeout_ms: Some(timeout_ms),
+        };
         let decision = if let Some(disconnected) = ctx.request_cancellation() {
             tokio::select! {
                 biased;
                 _ = disconnected.cancelled() => {
                     Err(anyhow!("clef-decision-cancelled: caller disconnected"))
                 }
-                result = client.decide(data) => result,
+                result = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    client.decide(&forwarded),
+                ) => match result {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(anyhow!(
+                        "clef-decision-cancelled: decision deadline elapsed at Model ingress"
+                    )),
+                },
             }
         } else {
-            client.decide(data).await
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                client.decide(&forwarded),
+            )
+            .await
+            .map_err(|_| {
+                anyhow!("clef-decision-cancelled: decision deadline elapsed at Model ingress")
+            })?
         };
         decision.map_err(Self::typed_decision_error)
     }
@@ -4119,6 +4151,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!err.contains("decision-not-pinned"), "{err}");
+
+        // An already-expired request must not begin a lazy load even when its
+        // pinned model reference would otherwise pass the admission gates.
+        let mut zero_timeout = wire_decide_request(&format!(
+            r#"{{"model":"{commit_ref}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#
+        ));
+        zero_timeout.timeout_ms = Some(0);
+        let err = service
+            .handle_decide(&ctx, 0, &commit_ref, &zero_timeout)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clef-decision-cancelled"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
     }
 
     #[tokio::test]
