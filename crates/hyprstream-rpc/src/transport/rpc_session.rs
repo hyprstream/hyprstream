@@ -195,6 +195,7 @@ pub trait IrohRequestProcessor: sealed::Sealed + Send + Sync + 'static {
         &self,
         request: Bytes,
         carrier: CarrierContext,
+        request_cancel: CancellationToken,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
@@ -222,6 +223,7 @@ where
             &self,
             request: Bytes,
             _carrier: CarrierContext,
+            _request_cancel: CancellationToken,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
             Box::pin((self.0)(request))
         }
@@ -442,7 +444,26 @@ async fn handle_stream<S>(
         return;
     }
 
-    let response = match processor.process(request, carrier).await {
+    // A server-created, request-local signal follows this one transport stream
+    // through the canonical dispatch bridge. The peer cannot set it in wire
+    // data. STOP_SENDING on our response half is the transport's explicit
+    // indication that the caller abandoned this request; ordinary request FIN
+    // does not trip it.
+    let request_cancel = CancellationToken::new();
+    let processing = processor.process(request, carrier, request_cancel.clone());
+    tokio::pin!(processing);
+    let response_result = tokio::select! {
+        result = &mut processing => result,
+        peer_closed = send.closed() => {
+            if peer_closed.is_err() {
+                request_cancel.cancel();
+            }
+            // Keep ownership of the accepted request until its handler reaches
+            // a terminal point. In particular, do not detach native inference.
+            processing.await
+        }
+    };
+    let response = match response_result {
         Ok(bytes) => bytes,
         Err(e) if carrier.forbids_cleartext_envelope() => {
             // Do not sign responses to input that failed canonical network

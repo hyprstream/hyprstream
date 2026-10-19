@@ -226,6 +226,11 @@ pub struct EnvelopeContext {
     /// against its pinned controller; never populated from wire data alone.
     pub(crate) internal_work: Option<crate::auth::internal_work::InternalWorkContext>,
 
+    /// Server-owned cancellation signal from the accepted transport request.
+    /// It is installed only after dispatch authorization succeeds and is
+    /// never decoded from envelope or Cap'n Proto data.
+    request_cancellation: Option<tokio_util::sync::CancellationToken>,
+
     /// Whether this request originated from a genuine in-process / IPC caller
     /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
     /// (the `AnySigner` plane used by ZMQ-QUIC / iroh / WebTransport).
@@ -388,6 +393,7 @@ impl EnvelopeContext {
             original_holder_evidence: evidence,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
         }
@@ -423,6 +429,7 @@ impl EnvelopeContext {
             original_holder_evidence: MediatedEvidence::from_envelope(envelope),
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
         }
@@ -462,6 +469,7 @@ impl EnvelopeContext {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
         }
@@ -478,6 +486,20 @@ impl EnvelopeContext {
             );
         }
         Ok(())
+    }
+
+    /// Read the server-owned request lifetime signal. This is not caller
+    /// identity or authority; handlers may use it only to stop work after the
+    /// transport confirms that this request's caller abandoned its response.
+    pub fn request_cancellation(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        self.request_cancellation.as_ref()
+    }
+
+    pub(crate) fn install_request_cancellation(
+        &mut self,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) {
+        self.request_cancellation = Some(cancellation);
     }
 
     /// Construct a test context with specific `cnf` and optional clearance
@@ -515,6 +537,7 @@ impl EnvelopeContext {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller: false,
         }
     }
@@ -675,6 +698,7 @@ impl EnvelopeContext {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller: false,
         }
     }
@@ -2319,6 +2343,7 @@ mod empty_iss_gate_tests {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller,
         }
     }
@@ -3538,6 +3563,7 @@ mod ipc_key_identity_tests {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
         }
@@ -3847,6 +3873,7 @@ mod accounting_audit_tests {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller: true,
         }
     }
@@ -3912,6 +3939,7 @@ mod accounting_audit_tests {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller: false,
         };
         let records = capture(|| {
@@ -3987,6 +4015,7 @@ mod accounting_audit_tests {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller: false,
         }
     }
@@ -4346,6 +4375,7 @@ mod internal_work_routing_tests {
             original_holder_evidence: None,
             browser_method_discriminator: None,
             internal_work: None,
+            request_cancellation: None,
             is_local_caller: false,
         }
     }
