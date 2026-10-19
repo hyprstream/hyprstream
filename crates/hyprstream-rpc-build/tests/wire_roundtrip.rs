@@ -683,3 +683,34 @@ fn choice_roundtrip_both_directions() {
         );
     }
 }
+
+#[test]
+fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+
+    let actual = wd.run("struct-data-lists", &[]);
+    let expected = json!({
+        "valid": {
+            "pointer": [[1, 2, 3]],
+            "composite": [[1, 2, 3]],
+            "far": [[1, 2, 3]],
+            "empty": [[]],
+        },
+        "rejected": [
+            "truncated",
+            "invalid",
+            "double-far",
+            "composite-shape",
+            "composite-body",
+            "composite-kind",
+            "segment-list-overrun",
+            "segment-payload-overrun",
+            "segment-payload-before-start",
+            "far-pad-overrun",
+        ],
+    });
+    assert_eq!(actual, expected, "generated StructReader accepted a malformed nested List(Data) encoding");
+}

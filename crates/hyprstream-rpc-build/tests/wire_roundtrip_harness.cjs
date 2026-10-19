@@ -24,6 +24,7 @@
 'use strict';
 
 const fs = require('fs');
+const { StructReader } = require('./capnp.js');
 const {
   buildWireRoundtrip,
   parseWireRoundtrip,
@@ -50,6 +51,44 @@ function canon(v) {
     return o;
   }
   return v;
+}
+
+function nestedDataReader(kind) {
+  const far = kind === 'far' || kind === 'double-far';
+  const segmented = kind.startsWith('segment-') || kind === 'far-pad-overrun';
+  const raw = new Uint8Array(far ? 56 : segmented ? 48 : kind === 'truncated' ? 32 : 40);
+  const view = new DataView(raw.buffer);
+  const word = (index, lo, hi) => {
+    view.setUint32(index * 8, lo >>> 0, true);
+    view.setUint32(index * 8 + 4, hi >>> 0, true);
+  };
+  if (kind.startsWith('composite')) {
+    word(0, 1, (1 << 3) | 7);
+    word(1, kind === 'composite-kind' ? 5 : (1 << 2) >>> 0, kind === 'composite-shape' ? 0 : 1 << 16);
+    word(2, 5, (3 << 3) | 2);
+    raw.set([1, 2, 3], 32);
+    if (kind === 'composite-body') word(0, 1, (2 << 3) | 7);
+  } else if (segmented) {
+    word(0, 1, ((kind === 'segment-list-overrun' ? 2 : 1) << 3) | 6);
+    if (kind === 'far-pad-overrun') word(1, 26, 1);
+    else if (kind === 'segment-payload-before-start') word(1, (1 + ((-4 << 2) >>> 0)) >>> 0, (3 << 3) | 2);
+    else word(1, 5, ((kind === 'segment-payload-overrun' ? 8 : 3) << 3) | 2);
+    raw.set([1, 2, 3], 24);
+  } else {
+    word(0, 1, (1 << 3) | 6);
+    if (kind === 'empty') return new StructReader(raw, view, 0, 0, 1, [0]);
+    if (kind === 'far') {
+      word(1, 2, 1);
+      word(4, 5, (3 << 3) | 2);
+      raw.set([1, 2, 3], 48);
+    } else if (kind === 'double-far') word(1, 6, 1);
+    else if (kind === 'invalid') word(1, 0, 1);
+    else {
+      word(1, 5, ((kind === 'truncated' ? 16 : 3) << 3) | 2);
+      raw.set([1, 2, 3], 24);
+    }
+  }
+  return new StructReader(raw, view, 0, 0, 1, far ? [0, 32] : segmented ? [0, 24] : [0]);
 }
 
 function out(obj) {
@@ -122,6 +161,19 @@ function main() {
   }
   if (mode === 'choice-rust2ts') {
     out(parseWireChoice(readBytes(arg1)));
+    return;
+  }
+  if (mode === 'struct-data-lists') {
+    const valid = {};
+    for (const kind of ['pointer', 'composite', 'far', 'empty']) {
+      valid[kind] = nestedDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
+    }
+    const rejected = [];
+    for (const kind of ['truncated', 'invalid', 'double-far', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun']) {
+      try { nestedDataReader(kind).getDataList(0); }
+      catch { rejected.push(kind); }
+    }
+    out({ valid, rejected });
     return;
   }
   if (mode === 'choice-ts2rust') {

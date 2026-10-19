@@ -1714,6 +1714,8 @@ export class StructReader {
 
   /** Resolve a pointer, following far pointers (type=2) to the target segment. */
   private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number } | null {
+    const sourceBounds = this.segmentBounds(ptrOffset);
+    if (!sourceBounds || ptrOffset + WORD_SIZE > sourceBounds.end) return null;
     let lo = this.buf.getUint32(ptrOffset, true);
     let hi = this.buf.getUint32(ptrOffset + 4, true);
     if (lo === 0 && hi === 0) return null;
@@ -1721,7 +1723,10 @@ export class StructReader {
       const farOffsetWords = lo >>> 3;
       const segmentId = hi;
       if (segmentId >= this.segmentOffsets.length) return null;
-      const targetOffset = this.segmentOffsets[segmentId] + farOffsetWords * WORD_SIZE;
+      const targetBounds = this.segmentBoundsForIndex(segmentId);
+      if (!targetBounds) return null;
+      const targetOffset = targetBounds.start + farOffsetWords * WORD_SIZE;
+      if (targetOffset < targetBounds.start || targetOffset + WORD_SIZE > targetBounds.end) return null;
       if ((lo >> 2) & 1) return null; // double-far not supported
       lo = this.buf.getUint32(targetOffset, true);
       hi = this.buf.getUint32(targetOffset + 4, true);
@@ -1730,13 +1735,22 @@ export class StructReader {
     return { lo, hi, offset: ptrOffset };
   }
 
-  /** End byte offset of the segment containing a pointer or object offset. */
-  private segmentEnd(offset: number): number {
-    let end = this.raw.length;
-    for (const start of this.segmentOffsets) {
-      if (start > offset) { end = start; break; }
+  /** Bounds of one segment, indexed by the far-pointer segment ID. */
+  private segmentBoundsForIndex(index: number): { start: number; end: number } | null {
+    const start = this.segmentOffsets[index];
+    if (start === undefined) return null;
+    const end = this.segmentOffsets[index + 1] ?? this.raw.length;
+    if (start < 0 || end < start || end > this.raw.length) return null;
+    return { start, end };
+  }
+
+  /** Bounds of the segment containing an offset. */
+  private segmentBounds(offset: number): { start: number; end: number } | null {
+    for (let i = 0; i < this.segmentOffsets.length; i++) {
+      const bounds = this.segmentBoundsForIndex(i);
+      if (bounds && offset >= bounds.start && offset < bounds.end) return bounds;
     }
-    return end;
+    return null;
   }
 
   getBool(byteOffset: number, bitIndex: number): boolean {
@@ -1884,14 +1898,16 @@ export class StructReader {
     // accept both just like CapnpReader.getDataList does.
     let elementCount: number;
     let elemBase: number;
-    const segmentEnd = this.segmentEnd(offset);
+    const bounds = this.segmentBounds(offset);
+    if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
-      if (targetOffset < 0 || targetOffset + WORD_SIZE > segmentEnd) throw new Error('Truncated List(Data) composite tag');
+      if (targetOffset < bounds.start || targetOffset + WORD_SIZE > bounds.end) throw new Error('Truncated List(Data) composite tag');
       const tagLo = this.buf.getUint32(targetOffset, true);
       const tagHi = this.buf.getUint32(targetOffset + 4, true);
+      if ((tagLo & 3) !== 0) throw new Error('Invalid List(Data) composite tag');
       elementCount = (tagLo >> 2) | 0;
       const dataWords = tagHi & 0xFFFF;
       const ptrWords = tagHi >>> 16;
@@ -1901,8 +1917,8 @@ export class StructReader {
     } else {
       return [];
     }
-    if (targetOffset < 0 || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > segmentEnd ||
-        elemBase < 0 || elemBase > segmentEnd || elementCount > Math.floor((segmentEnd - elemBase) / WORD_SIZE)) {
+    if (targetOffset < bounds.start || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > bounds.end ||
+        elemBase < bounds.start || elemBase > bounds.end || elementCount > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {
       throw new Error('Truncated List(Data) pointer list');
     }
 
@@ -1917,8 +1933,8 @@ export class StructReader {
       const elemOffsetWords = (child.lo >> 2) | 0;
       const byteCount = child.hi >>> 3;
       const dataOffset = child.offset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      const childSegmentEnd = this.segmentEnd(child.offset);
-      if (dataOffset < 0 || dataOffset > childSegmentEnd || byteCount > childSegmentEnd - dataOffset) {
+      const childBounds = this.segmentBounds(child.offset);
+      if (!childBounds || dataOffset < childBounds.start || dataOffset > childBounds.end || byteCount > childBounds.end - dataOffset) {
         throw new Error('Truncated List(Data) element');
       }
       results.push(this.raw.subarray(dataOffset, dataOffset + byteCount));
@@ -2156,15 +2172,22 @@ mod tests {
             "if (elementSize === 6)",
             "if (elementSize === 7)",
             "this.resolvePtr(elemOffset)",
-            "this.segmentEnd(offset)",
+            "this.segmentBounds(offset)",
             "bodyWords !== elementCount",
-            "this.segmentEnd(child.offset)",
+            "this.segmentBounds(child.offset)",
+            "(tagLo & 3) !== 0",
             "(child.hi & 7) !== 2",
-            "byteCount > childSegmentEnd - dataOffset",
+            "byteCount > childBounds.end - dataOffset",
             "Invalid List(Data) element pointer",
             "Invalid List(Data) composite element shape",
         ] {
             assert!(decoder.contains(required), "missing `{required}` in generated decoder");
+        }
+        for required in [
+            "this.segmentBoundsForIndex(segmentId)",
+            "targetOffset + WORD_SIZE > targetBounds.end",
+        ] {
+            assert!(struct_reader.contains(required), "missing `{required}` in generated StructReader");
         }
     }
 }
