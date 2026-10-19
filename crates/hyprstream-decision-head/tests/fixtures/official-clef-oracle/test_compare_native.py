@@ -87,6 +87,22 @@ class ComparatorAdmissionTests(unittest.TestCase):
             receipt_path.unlink()
             with self.assertRaisesRegex(ValueError, "requires --native-receipt"):
                 compare.admit_native_receipt(None, native_path, input_path, profile)
+            with self.assertRaisesRegex(ValueError, "requires --native-input-tensors"):
+                compare.admit_native_receipt(receipt_path, native_path, None, None)
+
+    def test_cli_full_port_explicit_tolerances_require_receipt_and_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "provenance.json").write_text(json.dumps({"mode": "full", "files": {}}))
+            result = subprocess.run([sys.executable, "-S", str(HERE / "compare_native.py"),
+                "--reference", str(root), "--native-tensors", str(root / "unused"),
+                "--native-records", str(root / "unread-records"), "--include-hidden",
+                "--atol", "0.001", "--rtol", "0.001", "--report", str(root / "report.json")],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("full-port comparison requires --native-receipt", result.stderr)
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
+            self.assertFalse((root / "report.json").exists())
 
     def test_full_port_requires_native_records_with_any_tolerance_source(self):
         for include_hidden in (False, True):
