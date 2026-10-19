@@ -300,28 +300,52 @@ pub(crate) fn normalize_distribution_with_winner(probabilities: &mut [f32], winn
         return;
     }
     // Correct remaining f32 summation error without lowering the original
-    // winner. Correcting another component may change loser ordering by a
-    // few ulps; it cannot change D6's selected label.
-    for _ in 0..probabilities.len().saturating_add(8) {
+    // winner. Keep the number of full-vector passes fixed: correcting one
+    // losing component at a time can take O(n) iterations for a sparse,
+    // high-cardinality vector, and each distribution check is itself O(n).
+    // Scaling the losing mass distributes a negative residual over all
+    // non-winners, while a positive residual still belongs on the winner. A
+    // fixed-precision search finds a scale whose *sequential f32 fold* meets
+    // the contract; using an f64 mass estimate here can overcorrect when a
+    // long f32 fold has accumulated rounding error. A few bounded outer
+    // passes account for the final f32 rounding without making work depend
+    // on question cardinality.
+    for _ in 0..8 {
         if check_distribution(probabilities, PRODUCER_SUM_TOLERANCE).is_ok() {
             return;
         }
         let residual = 1.0 - probabilities.iter().sum::<f32>();
         if residual > 0.0 {
             probabilities[winner] = (probabilities[winner] + residual).min(1.0);
-        } else if let Some((index, _)) = probabilities
-            .iter()
-            .enumerate()
-            .filter(|(index, value)| *index != winner && **value > 0.0)
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        {
-            let previous = probabilities[index];
-            let corrected = (previous + residual).max(0.0);
-            probabilities[index] = if corrected < previous {
-                corrected
-            } else {
-                previous.next_down().max(0.0)
-            };
+        } else if residual < 0.0 {
+            let mut low = 0.0f32;
+            let mut high = 1.0f32;
+            // Binary32 has 24 bits of precision; 32 iterations also cover
+            // endpoint rounding while keeping this correction O(n).
+            for _ in 0..32 {
+                let scale = low + (high - low) * 0.5;
+                if scale == low || scale == high {
+                    break;
+                }
+                let mut sum = 0.0f32;
+                for (index, probability) in probabilities.iter().enumerate() {
+                    sum += if index == winner {
+                        *probability
+                    } else {
+                        *probability * scale
+                    };
+                }
+                if sum <= 1.0 + PRODUCER_SUM_TOLERANCE {
+                    low = scale;
+                } else {
+                    high = scale;
+                }
+            }
+            for (index, probability) in probabilities.iter_mut().enumerate() {
+                if index != winner {
+                    *probability *= low;
+                }
+            }
         } else {
             break;
         }
@@ -1408,6 +1432,26 @@ questions:
             Some(0),
             "D6 argmax must not flip"
         );
+    }
+
+    #[test]
+    fn sparse_high_cardinality_overage_is_corrected_without_dropping_levels() {
+        const LEVELS: usize = 100_000;
+        let mut probabilities = Vec::with_capacity(LEVELS * 2 + 1);
+        probabilities.push(0.9f32);
+        probabilities.extend(std::iter::repeat_n(0.1 / LEVELS as f32, LEVELS));
+        probabilities.resize(LEVELS * 2 + 1, 0.0);
+
+        // This is consumer-valid but rounds slightly over one after f32
+        // normalization. Zero components clamp the uniform correction to
+        // zero, which used to trigger a component-at-a-time full scan.
+        confidence::check_distribution(&probabilities, confidence::CONSUMER_SUM_TOLERANCE).unwrap();
+        normalize_distribution_with_winner(&mut probabilities, 0);
+
+        confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
+        assert_eq!(confidence::argmax_index(&probabilities), Some(0));
+        assert!(probabilities[1..=LEVELS].iter().all(|p| *p > 0.0));
+        assert!(probabilities[LEVELS + 1..].iter().all(|p| *p == 0.0));
     }
 
     #[tokio::test]

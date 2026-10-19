@@ -48,8 +48,14 @@ The ignored test compares exact encoding and committed expected vectors, exports
 native tensors and per-question metrics, and uses limits fixed BEFORE comparison:
 logit absolute error <=1e-4; probability absolute error <=1e-5; relative tolerance0.
 Use compare_native.py with matching explicit bounds for a separate hashed report.
-Full-port comparisons require --native-records: exact token/span/question/label
-and truncation evidence cannot be omitted, even with explicit numeric bounds.
+Full-port comparisons require --native-records, --include-hidden,
+--native-receipt, and --native-input-tensors:
+exact token/span/question/label, truncation, backbone hidden and embedding-row
+evidence cannot be omitted, even with explicit numeric bounds. The receipt binds
+the native input/output tensor digests, input profile, source revision, dtype and
+device; the pinned original-F32 profile accepts only original-f32 CPU Float32.
+Official numeric
+question tags0/1/2 map to noul/choice/score; booleans/floats are not numeric tags.
 --head-only explicitly selects a head-mode reference and excludes --include-hidden;
 it cannot bypass record admission for a full-mode reference. --backbone-only
 remains a separate original-Float32 backbone gate with no head claim.

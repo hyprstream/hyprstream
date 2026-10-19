@@ -29,6 +29,7 @@ tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libto
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

@@ -2,9 +2,27 @@
 use super::{ClefHeadConfig, JointSchemaHead};
 use crate::clef::{ClefEncoder, ClefEncodingLimits, ClefRequest};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use tch::{Kind, Tensor};
+
+fn sha256_file(path: &std::path::Path) -> String {
+    let mut file = std::fs::File::open(path).expect("open file for receipt digest");
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .expect("read file for receipt digest");
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    format!("{:x}", hash.finalize())
+}
 
 #[derive(Deserialize)]
 struct Corpus {
@@ -343,5 +361,6 @@ fn clef_export_native_head() {
             .expect("encode records"),
     )
     .expect("write records");
-    std::fs::write(output.join("export-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"input_profile":profile,"native_input_tensor_path":input,"reference_directory":reference,"source_revision":provenance["source_revision"],"records":corpus.records.len(),"compute_dtype":"float32","device":"cpu","scope":"native head over saved native backbone; emission success does not waive numerical gates"})).expect("receipt JSON")).expect("write receipt");
+    let native_tensors = output.join("native-tensors.safetensors");
+    std::fs::write(output.join("export-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"input_profile":profile,"native_input_tensor_path":input,"native_input_tensors_sha256":sha256_file(&input),"native_tensors_sha256":sha256_file(&native_tensors),"reference_directory":reference,"source_revision":provenance["source_revision"],"records":corpus.records.len(),"compute_dtype":"float32","device":"cpu","scope":"native head over saved native backbone; emission success does not waive numerical gates"})).expect("receipt JSON")).expect("write receipt");
 }
