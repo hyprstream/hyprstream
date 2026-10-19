@@ -704,6 +704,7 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
             "truncated",
             "invalid",
             "double-far",
+            "invalid-far-segment",
             "composite-shape",
             "composite-body",
             "composite-kind",
@@ -712,6 +713,7 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
             "segment-payload-before-start",
             "far-pad-overrun",
             "segment-declared-end",
+            "segment-pointer-slot-overrun",
         ],
     });
     assert_eq!(

@@ -1468,7 +1468,7 @@ export class CapnpReader {
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) throw new Error('Invalid List(Data) pointer');
     const { lo, hi, offset } = resolved;
-    if ((lo & 3) !== 1) return [];
+    if ((lo & 3) !== 1) throw new Error('Invalid List(Data) pointer kind');
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
@@ -1939,10 +1939,15 @@ export class StructReader {
 
   getDataList(ptrIndex: number): Uint8Array[] {
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
+    const pointerBounds = this.segmentBounds(ptrOffset);
+    if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) throw new Error('List(Data) pointer is outside a segment');
+    const pointerLo = this.buf.getUint32(ptrOffset, true);
+    const pointerHi = this.buf.getUint32(ptrOffset + 4, true);
+    if (pointerLo === 0 && pointerHi === 0) return [];
     const resolved = this.resolvePtr(ptrOffset);
-    if (!resolved) return [];
+    if (!resolved) throw new Error('Invalid List(Data) pointer');
     const { lo, hi, offset } = resolved;
-    if ((lo & 3) !== 1) return [];
+    if ((lo & 3) !== 1) throw new Error('Invalid List(Data) pointer kind');
 
     const offsetWords = (lo >> 2) | 0;
     const elementSize = hi & 7;
@@ -1971,7 +1976,7 @@ export class StructReader {
       if (dataWords !== 0 || ptrWords !== 1 || bodyWords !== elementCount) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
-      return [];
+      throw new Error('Invalid List(Data) element kind');
     }
     if (targetOffset < bounds.start || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > bounds.end ||
         elemBase < bounds.start || elemBase > bounds.end || elementCount > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {

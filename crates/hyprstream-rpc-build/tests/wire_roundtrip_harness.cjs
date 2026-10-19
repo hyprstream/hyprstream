@@ -54,7 +54,7 @@ function canon(v) {
 }
 
 function nestedDataReader(kind) {
-  const far = kind === 'far' || kind === 'double-far';
+  const far = kind === 'far' || kind === 'double-far' || kind === 'invalid-far-segment';
   const segmented = kind.startsWith('segment-') || kind === 'far-pad-overrun';
   const raw = new Uint8Array(far ? 56 : segmented ? 48 : kind === 'truncated' ? 32 : 40);
   const view = new DataView(raw.buffer);
@@ -86,6 +86,8 @@ function nestedDataReader(kind) {
       word(1, 2, 1);
       word(4, 5, (3 << 3) | 2);
       raw.set([1, 2, 3], 48);
+    } else if (kind === 'invalid-far-segment') {
+      word(1, 2, 99);
     } else if (kind === 'double-far') word(1, 6, 1);
     else if (kind === 'invalid') word(1, 0, 1);
     else {
@@ -98,6 +100,9 @@ function nestedDataReader(kind) {
     word(1, 5, (3 << 3) | 2);
     raw.set([1, 2, 3], 24);
     return new StructReader(raw, view, 0, 0, 1, [0], [24]);
+  }
+  if (kind === 'segment-pointer-slot-overrun') {
+    return new StructReader(raw, view, 0, 3, 1, [0], [24]);
   }
   return new StructReader(raw, view, kind === 'segment-payload-before-start' ? 24 : 0, 0, 1, far ? [0, 32] : segmented ? [0, 24] : [0]);
 }
@@ -251,7 +256,7 @@ function main() {
     }
     valid['legacy-constructor'] = legacyStructReader().getDataList(0).map((bytes) => Array.from(bytes));
     const rejected = [];
-    for (const kind of ['truncated', 'invalid', 'double-far', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end']) {
+    for (const kind of ['truncated', 'invalid', 'double-far', 'invalid-far-segment', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end', 'segment-pointer-slot-overrun']) {
       try { nestedDataReader(kind).getDataList(0); }
       catch { rejected.push(kind); }
     }
