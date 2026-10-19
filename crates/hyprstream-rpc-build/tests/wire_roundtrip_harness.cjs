@@ -69,11 +69,16 @@ function nestedDataReader(kind) {
     raw.set([1, 2, 3], 32);
     if (kind === 'composite-body') word(0, 1, (2 << 3) | 7);
   } else if (segmented) {
-    word(0, 1, ((kind === 'segment-list-overrun' ? 2 : 1) << 3) | 6);
-    if (kind === 'far-pad-overrun') word(1, 26, 1);
-    else if (kind === 'segment-payload-before-start') word(1, (1 + ((-4 << 2) >>> 0)) >>> 0, (3 << 3) | 2);
-    else word(1, 5, ((kind === 'segment-payload-overrun' ? 8 : 3) << 3) | 2);
-    raw.set([1, 2, 3], 24);
+    if (kind === 'segment-payload-before-start') {
+      word(3, 1, (1 << 3) | 6);
+      word(4, (1 + ((-3 << 2) >>> 0)) >>> 0, (3 << 3) | 2);
+      raw.set([1, 2, 3], 16);
+    } else {
+      word(0, 1, ((kind === 'segment-list-overrun' ? 3 : 1) << 3) | 6);
+      if (kind === 'far-pad-overrun') word(1, 26, 1);
+      else word(1, 5, ((kind === 'segment-payload-overrun' ? 8 : 3) << 3) | 2);
+      raw.set([1, 2, 3], 24);
+    }
   } else {
     word(0, 1, (1 << 3) | 6);
     if (kind === 'empty') return new StructReader(raw, view, 0, 0, 1, [0]);
@@ -88,7 +93,13 @@ function nestedDataReader(kind) {
       raw.set([1, 2, 3], 24);
     }
   }
-  return new StructReader(raw, view, 0, 0, 1, far ? [0, 32] : segmented ? [0, 24] : [0]);
+  if (kind === 'segment-declared-end') {
+    word(0, 1, (1 << 3) | 6);
+    word(1, 5, (3 << 3) | 2);
+    raw.set([1, 2, 3], 24);
+    return new StructReader(raw, view, 0, 0, 1, [0], [24]);
+  }
+  return new StructReader(raw, view, kind === 'segment-payload-before-start' ? 24 : 0, 0, 1, far ? [0, 32] : segmented ? [0, 24] : [0]);
 }
 
 function out(obj) {
@@ -169,7 +180,7 @@ function main() {
       valid[kind] = nestedDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
     const rejected = [];
-    for (const kind of ['truncated', 'invalid', 'double-far', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun']) {
+    for (const kind of ['truncated', 'invalid', 'double-far', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end']) {
       try { nestedDataReader(kind).getDataList(0); }
       catch { rejected.push(kind); }
     }

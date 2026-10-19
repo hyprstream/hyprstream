@@ -1218,6 +1218,8 @@ export class CapnpReader {
   private readonly dataWords: number;
   /** Byte offsets of each segment start (for far pointer resolution) */
   private readonly segmentOffsets: number[];
+  /** Byte offsets immediately after each declared segment. */
+  private readonly segmentEnds: number[];
 
   /**
    * Parse a Cap'n Proto message from wire-format bytes.
@@ -1230,6 +1232,7 @@ export class CapnpReader {
     this.buf = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.dataWords = dataWords;
     this.segmentOffsets = [];
+    this.segmentEnds = [];
 
     // Standard Cap'n Proto format:
     //   Segment table: [num_segments-1 (u32), seg0_size (u32), seg1_size (u32), ...]
@@ -1247,6 +1250,7 @@ export class CapnpReader {
         this.segmentOffsets.push(offset);
         const segWords = this.buf.getUint32(4 + i * 4, true);
         offset += segWords * WORD_SIZE;
+        this.segmentEnds.push(offset);
       }
 
       // Root struct pointer is at segDataStart (first word of segment 0)
@@ -1370,7 +1374,7 @@ export class CapnpReader {
     if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
     const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets);
+    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets, this.segmentEnds);
   }
 
   /** Read a List(Text) pointer (supports both pointer-list and composite encodings). */
@@ -1692,7 +1696,7 @@ export class CapnpReader {
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets));
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets, this.segmentEnds));
     }
     return results;
   }
@@ -1710,6 +1714,7 @@ export class StructReader {
     private dataWords: number,
     private ptrWords: number,
     private segmentOffsets: readonly number[] = [],
+    private segmentEnds: readonly number[] = [],
   ) {}
 
   /** Resolve a pointer, following far pointers (type=2) to the target segment. */
@@ -1739,7 +1744,7 @@ export class StructReader {
   private segmentBoundsForIndex(index: number): { start: number; end: number } | null {
     const start = this.segmentOffsets[index];
     if (start === undefined) return null;
-    const end = this.segmentOffsets[index + 1] ?? this.raw.length;
+    const end = this.segmentEnds[index] ?? this.segmentOffsets[index + 1] ?? this.raw.length;
     if (start < 0 || end < start || end > this.raw.length) return null;
     return { start, end };
   }
@@ -1830,7 +1835,7 @@ export class StructReader {
     if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
     const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets);
+    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets, this.segmentEnds);
   }
 
   getTextList(ptrIndex: number): string[] {
@@ -2142,7 +2147,7 @@ export class StructReader {
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets));
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets, this.segmentEnds));
     }
     return results;
   }
@@ -2186,8 +2191,10 @@ mod tests {
         for required in [
             "this.segmentBoundsForIndex(segmentId)",
             "targetOffset + WORD_SIZE > targetBounds.end",
+            "this.segmentOffsets, this.segmentEnds",
         ] {
             assert!(struct_reader.contains(required), "missing `{required}` in generated StructReader");
         }
+        assert!(runtime.contains("this.segmentEnds.push(offset)"), "segment end tracking missing from generated CapnpReader");
     }
 }
