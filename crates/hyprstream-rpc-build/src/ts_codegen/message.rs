@@ -1867,13 +1867,26 @@ export class StructReader {
     const elementSize = hi & 7;
     const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
-    if (elementSize !== 7) return [];
-    const tagLo = this.buf.getUint32(targetOffset, true);
-    const elementCount = (tagLo >> 2) | 0;
+    // Canonical List(Data) is a pointer list (element_size=6); this codec's
+    // own writer also emits a composite list (element_size=7). Rust servers
+    // use the canonical pointer-list representation, so struct fields must
+    // accept both just like CapnpReader.getDataList does.
+    let elementCount: number;
+    let elemBase: number;
+    if (elementSize === 6) {
+      elementCount = hi >>> 3;
+      elemBase = targetOffset;
+    } else if (elementSize === 7) {
+      const tagLo = this.buf.getUint32(targetOffset, true);
+      elementCount = (tagLo >> 2) | 0;
+      elemBase = targetOffset + WORD_SIZE;
+    } else {
+      return [];
+    }
 
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
+      const elemOffset = elemBase + i * WORD_SIZE;
       const elemLo = this.buf.getUint32(elemOffset, true);
       const elemHi = this.buf.getUint32(elemOffset + 4, true);
       if (elemLo === 0 && elemHi === 0) { results.push(new Uint8Array(0)); continue; }
