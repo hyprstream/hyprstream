@@ -1900,13 +1900,10 @@ mod tests {
         assert!(!abandoned_token.is_cancelled());
         assert!(!retained_token.is_cancelled());
 
-        // Emit an actual QUIC STOP_SENDING signal, rather than relying on
-        // wrapper Drop behavior. The request side already completed with FIN.
-        // `conn` is the raw iroh endpoint used by this fixture; send WebTransport's
-        // wire-mapped code so the server's web-transport-iroh adapter identifies
-        // this as STOP_SENDING instead of an out-of-range transport code.
-        let stop_code = iroh::endpoint::VarInt::try_from(0x52e4_a40f_a8db_u64)?;
-        abandoned_recv.stop(stop_code)?;
+        // Iroh's normal RecvStream drop path sends STOP_SENDING(0). The request
+        // side already completed with FIN; reproduce that exact raw QUIC signal
+        // because the WebTransport adapter maps code 0 to `closed() == Ok(())`.
+        abandoned_recv.stop(iroh::endpoint::VarInt::from_u32(0))?;
         tokio::time::timeout(Duration::from_secs(5), abandoned_token.cancelled())
             .await
             .context("response STOP_SENDING did not cancel its accepted request")?;

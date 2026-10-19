@@ -277,6 +277,18 @@ impl RequestTicket {
         );
         self.check()
     }
+    pub(crate) fn assert_no_checkpoint_after(&self, last_phase: usize) -> Result<()> {
+        let receiver = self.receiver.lock();
+        let mut extra = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            extra.push(event.phase);
+        }
+        ensure!(
+            extra.is_empty(),
+            "T6 native inference continued beyond cancellation phase {last_phase}: {extra:?}"
+        );
+        self.check()
+    }
     pub(crate) fn release(&self) {
         *self.released.lock() = true;
         self.wake.notify_all();
