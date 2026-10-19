@@ -963,7 +963,7 @@ fn default_xet_port() -> u16 {
     6792
 }
 
-/// /// Arrow Flight SQL server configuration
+/// Arrow Flight SQL server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlightConfig {
     /// Host address for Flight SQL server
