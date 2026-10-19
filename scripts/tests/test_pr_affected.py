@@ -115,6 +115,39 @@ class ExplicitReleasePackageTests(unittest.TestCase):
             commands,
         )
 
+    def test_root_only_trigger_runs_eval_release_gates(self):
+        commands = self.run_affected(["Cargo.toml"])
+
+        self.assertIn(
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "--cargo-profile",
+                "release",
+                "--profile",
+                "ci",
+                "--no-fail-fast",
+                "-p",
+                "hyprstream-eval",
+            ],
+            commands,
+        )
+        self.assertIn(
+            [
+                "cargo",
+                "clippy",
+                "--release",
+                "-p",
+                "hyprstream-eval",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            commands,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

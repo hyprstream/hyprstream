@@ -124,7 +124,7 @@ struct InferenceRequest {
     # returns E2 decision.capnp distributions with calibration=null.
     # Pure function of (admitted weights, request body): no generation state,
     # no KV/GDN reuse, no session mutation — replay yields the same answer.
-    decide @34 :DecisionRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
+    decide @34 :DecisionRequest $scope(decide) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent");
   }
 }
 
