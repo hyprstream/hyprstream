@@ -1730,6 +1730,15 @@ export class StructReader {
     return { lo, hi, offset: ptrOffset };
   }
 
+  /** End byte offset of the segment containing a pointer or object offset. */
+  private segmentEnd(offset: number): number {
+    let end = this.raw.length;
+    for (const start of this.segmentOffsets) {
+      if (start > offset) { end = start; break; }
+    }
+    return end;
+  }
+
   getBool(byteOffset: number, bitIndex: number): boolean {
     return (this.raw[this.dataOffset + byteOffset] & (1 << bitIndex)) !== 0;
   }
@@ -1875,18 +1884,25 @@ export class StructReader {
     // accept both just like CapnpReader.getDataList does.
     let elementCount: number;
     let elemBase: number;
+    const segmentEnd = this.segmentEnd(offset);
     if (elementSize === 6) {
       elementCount = hi >>> 3;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
+      if (targetOffset < 0 || targetOffset + WORD_SIZE > segmentEnd) throw new Error('Truncated List(Data) composite tag');
       const tagLo = this.buf.getUint32(targetOffset, true);
+      const tagHi = this.buf.getUint32(targetOffset + 4, true);
       elementCount = (tagLo >> 2) | 0;
+      const dataWords = tagHi & 0xFFFF;
+      const ptrWords = tagHi >>> 16;
+      const bodyWords = hi >>> 3;
+      if (dataWords !== 0 || ptrWords !== 1 || bodyWords !== elementCount) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
-    if (targetOffset < 0 || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > this.raw.length ||
-        elemBase < 0 || elementCount > Math.floor((this.raw.length - elemBase) / WORD_SIZE)) {
+    if (targetOffset < 0 || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > segmentEnd ||
+        elemBase < 0 || elemBase > segmentEnd || elementCount > Math.floor((segmentEnd - elemBase) / WORD_SIZE)) {
       throw new Error('Truncated List(Data) pointer list');
     }
 
@@ -1901,7 +1917,8 @@ export class StructReader {
       const elemOffsetWords = (child.lo >> 2) | 0;
       const byteCount = child.hi >>> 3;
       const dataOffset = child.offset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      if (dataOffset < 0 || dataOffset > this.raw.length || byteCount > this.raw.length - dataOffset) {
+      const childSegmentEnd = this.segmentEnd(child.offset);
+      if (dataOffset < 0 || dataOffset > childSegmentEnd || byteCount > childSegmentEnd - dataOffset) {
         throw new Error('Truncated List(Data) element');
       }
       results.push(this.raw.subarray(dataOffset, dataOffset + byteCount));
@@ -2139,9 +2156,13 @@ mod tests {
             "if (elementSize === 6)",
             "if (elementSize === 7)",
             "this.resolvePtr(elemOffset)",
+            "this.segmentEnd(offset)",
+            "bodyWords !== elementCount",
+            "this.segmentEnd(child.offset)",
             "(child.hi & 7) !== 2",
-            "byteCount > this.raw.length - dataOffset",
+            "byteCount > childSegmentEnd - dataOffset",
             "Invalid List(Data) element pointer",
+            "Invalid List(Data) composite element shape",
         ] {
             assert!(decoder.contains(required), "missing `{required}` in generated decoder");
         }
