@@ -1453,7 +1453,9 @@ export class CapnpReader {
       elemBase = targetOffset;
     } else if (elementSize === 7) {
       const tagLo = this.buf.getUint32(targetOffset, true);
+      const tagHi = this.buf.getUint32(targetOffset + 4, true);
       elementCount = (tagLo >> 2) | 0;
+      if ((tagHi & 0xFFFF) !== 0 || ((tagHi >>> 16) & 0xFFFF) !== 1) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
@@ -1883,16 +1885,25 @@ export class StructReader {
     } else {
       return [];
     }
+    if (targetOffset < 0 || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > this.raw.length ||
+        elemBase < 0 || elementCount > Math.floor((this.raw.length - elemBase) / WORD_SIZE)) {
+      throw new Error('Truncated List(Data) pointer list');
+    }
 
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemOffset = elemBase + i * WORD_SIZE;
-      const elemLo = this.buf.getUint32(elemOffset, true);
-      const elemHi = this.buf.getUint32(elemOffset + 4, true);
-      if (elemLo === 0 && elemHi === 0) { results.push(new Uint8Array(0)); continue; }
-      const elemOffsetWords = (elemLo >> 2) | 0;
-      const byteCount = elemHi >>> 3;
-      const dataOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+      const rawLo = this.buf.getUint32(elemOffset, true);
+      const rawHi = this.buf.getUint32(elemOffset + 4, true);
+      if (rawLo === 0 && rawHi === 0) { results.push(new Uint8Array(0)); continue; }
+      const child = this.resolvePtr(elemOffset);
+      if (!child || (child.lo & 3) !== 1 || (child.hi & 7) !== 2) throw new Error('Invalid List(Data) element pointer');
+      const elemOffsetWords = (child.lo >> 2) | 0;
+      const byteCount = child.hi >>> 3;
+      const dataOffset = child.offset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
+      if (dataOffset < 0 || dataOffset > this.raw.length || byteCount > this.raw.length - dataOffset) {
+        throw new Error('Truncated List(Data) element');
+      }
       results.push(this.raw.subarray(dataOffset, dataOffset + byteCount));
     }
     return results;
@@ -2107,4 +2118,32 @@ export class StructReader {
 /** Backwards-compatible alias — prefer CapnpArena for new code. */
 export const CapnpMessageBuilder = CapnpArena;
 "##.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_capnp_runtime;
+
+    #[test]
+    fn struct_data_list_decoder_resolves_and_bounds_pointer_list_children() {
+        let runtime = generate_capnp_runtime();
+        let struct_reader = runtime
+            .split("export class StructReader")
+            .nth(1)
+            .expect("StructReader runtime");
+        let decoder = struct_reader
+            .split("  getDataList(ptrIndex: number): Uint8Array[] {")
+            .nth(1)
+            .expect("StructReader.getDataList runtime");
+        for required in [
+            "if (elementSize === 6)",
+            "if (elementSize === 7)",
+            "this.resolvePtr(elemOffset)",
+            "(child.hi & 7) !== 2",
+            "byteCount > this.raw.length - dataOffset",
+            "Invalid List(Data) element pointer",
+        ] {
+            assert!(decoder.contains(required), "missing `{required}` in generated decoder");
+        }
+    }
 }
