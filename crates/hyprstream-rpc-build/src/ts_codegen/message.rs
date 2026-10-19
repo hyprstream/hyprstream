@@ -2186,15 +2186,24 @@ mod tests {
             "Invalid List(Data) element pointer",
             "Invalid List(Data) composite element shape",
         ] {
-            assert!(decoder.contains(required), "missing `{required}` in generated decoder");
+            assert!(
+                decoder.contains(required),
+                "missing `{required}` in generated decoder"
+            );
         }
         for required in [
             "this.segmentBoundsForIndex(segmentId)",
             "targetOffset + WORD_SIZE > targetBounds.end",
             "this.segmentOffsets, this.segmentEnds",
         ] {
-            assert!(struct_reader.contains(required), "missing `{required}` in generated StructReader");
+            assert!(
+                struct_reader.contains(required),
+                "missing `{required}` in generated StructReader"
+            );
         }
-        assert!(runtime.contains("this.segmentEnds.push(offset)"), "segment end tracking missing from generated CapnpReader");
+        assert!(
+            runtime.contains("this.segmentEnds.push(offset)"),
+            "segment end tracking missing from generated CapnpReader"
+        );
     }
 }

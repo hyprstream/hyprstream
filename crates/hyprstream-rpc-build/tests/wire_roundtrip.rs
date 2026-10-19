@@ -713,5 +713,8 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
             "segment-declared-end",
         ],
     });
-    assert_eq!(actual, expected, "generated StructReader accepted a malformed nested List(Data) encoding");
+    assert_eq!(
+        actual, expected,
+        "generated StructReader accepted a malformed nested List(Data) encoding"
+    );
 }
