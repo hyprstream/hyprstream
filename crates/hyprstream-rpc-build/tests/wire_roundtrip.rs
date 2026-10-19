@@ -699,6 +699,7 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
             "far": [[1, 2, 3]],
             "empty": [[]],
             "legacy-constructor": [[1, 2, 3]],
+            "wrong-element-kind": [],
         },
         "rejected": [
             "truncated",

@@ -1976,7 +1976,7 @@ export class StructReader {
       if (dataWords !== 0 || ptrWords !== 1 || bodyWords !== elementCount) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
-      throw new Error('Invalid List(Data) element kind');
+      return [];
     }
     if (targetOffset < bounds.start || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > bounds.end ||
         elemBase < bounds.start || elemBase > bounds.end || elementCount > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {

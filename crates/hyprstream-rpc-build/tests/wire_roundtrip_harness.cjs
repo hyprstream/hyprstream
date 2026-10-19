@@ -81,6 +81,7 @@ function nestedDataReader(kind) {
     }
   } else {
     word(0, 1, (1 << 3) | 6);
+    if (kind === 'wrong-element-kind') word(0, 1, (3 << 3) | 2);
     if (kind === 'empty') return new StructReader(raw, view, 0, 0, 1, [0]);
     if (kind === 'far') {
       word(1, 2, 1);
@@ -251,7 +252,7 @@ function main() {
   }
   if (mode === 'struct-data-lists') {
     const valid = {};
-    for (const kind of ['pointer', 'composite', 'far', 'empty']) {
+    for (const kind of ['pointer', 'composite', 'far', 'empty', 'wrong-element-kind']) {
       valid[kind] = nestedDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
     valid['legacy-constructor'] = legacyStructReader().getDataList(0).map((bytes) => Array.from(bytes));
