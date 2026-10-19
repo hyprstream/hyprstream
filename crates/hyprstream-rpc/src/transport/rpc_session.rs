@@ -455,9 +455,13 @@ async fn handle_stream<S>(
     let response_result = tokio::select! {
         result = &mut processing => result,
         peer_closed = send.closed() => {
-            if peer_closed.is_err() {
-                request_cancel.cancel();
-            }
+            // Any closure of the response send half before processing has
+            // completed means the caller can no longer receive this result.
+            // In particular, Iroh's default RecvStream::drop sends
+            // STOP_SENDING(0), which the WebTransport adapter maps to Ok(()),
+            // not an error. Treat both adapter outcomes as abandonment.
+            let _ = peer_closed;
+            request_cancel.cancel();
             // Keep ownership of the accepted request until its handler reaches
             // a terminal point. In particular, do not detach native inference.
             processing.await

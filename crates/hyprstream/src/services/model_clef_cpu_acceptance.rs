@@ -1451,6 +1451,11 @@ async fn t6_midforward_cases(
     // its completion proves the worker released the execution locks and can
     // serve again on the same loaded incarnation.
     let disconnect_recovery = alice.infer(T6_MODEL).decide(request).await?;
+    // Recovery is serialized behind the abandoned attempt on the same loaded
+    // worker. Once it completes, any later native checkpoint from the
+    // abandoned request proves that its forward pass continued after the
+    // cancellation boundary even though the request token was set.
+    disconnect_ticket.assert_no_checkpoint_after(5)?;
     t6_check_response(&disconnect_recovery, record, request)?;
     let disconnect_recovery_error = t6_close(
         &t6_distributions(&disconnect_recovery)?,
