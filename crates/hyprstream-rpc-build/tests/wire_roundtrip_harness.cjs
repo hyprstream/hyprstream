@@ -102,6 +102,18 @@ function nestedDataReader(kind) {
   return new StructReader(raw, view, kind === 'segment-payload-before-start' ? 24 : 0, 0, 1, far ? [0, 32] : segmented ? [0, 24] : [0]);
 }
 
+function legacyStructReader() {
+  const raw = new Uint8Array(40);
+  const view = new DataView(raw.buffer);
+  view.setUint32(0, 1, true);
+  view.setUint32(4, (1 << 3) | 6, true);
+  view.setUint32(8, 5, true);
+  view.setUint32(12, (3 << 3) | 2, true);
+  raw.set([1, 2, 3], 24);
+  // segmentOffsets and segmentEnds are optional constructor arguments.
+  return new StructReader(raw, view, 0, 0, 1);
+}
+
 function out(obj) {
   process.stdout.write(JSON.stringify(canon(obj)));
   process.stdout.write('\n');
@@ -179,6 +191,7 @@ function main() {
     for (const kind of ['pointer', 'composite', 'far', 'empty']) {
       valid[kind] = nestedDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
+    valid['legacy-constructor'] = legacyStructReader().getDataList(0).map((bytes) => Array.from(bytes));
     const rejected = [];
     for (const kind of ['truncated', 'invalid', 'double-far', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end']) {
       try { nestedDataReader(kind).getDataList(0); }

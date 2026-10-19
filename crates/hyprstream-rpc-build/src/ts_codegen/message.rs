@@ -1751,6 +1751,12 @@ export class StructReader {
 
   /** Bounds of the segment containing an offset. */
   private segmentBounds(offset: number): { start: number; end: number } | null {
+    // Preserve direct construction of the exported StructReader with the
+    // optional segment table omitted: its historical single-buffer behavior
+    // treated the supplied Uint8Array as one segment.
+    if (this.segmentOffsets.length === 0) {
+      return offset >= 0 && offset < this.raw.length ? { start: 0, end: this.raw.length } : null;
+    }
     for (let i = 0; i < this.segmentOffsets.length; i++) {
       const bounds = this.segmentBoundsForIndex(i);
       if (bounds && offset >= bounds.start && offset < bounds.end) return bounds;
