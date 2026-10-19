@@ -973,6 +973,15 @@ impl TruthSubject {
         }
     }
 
+    fn validate_model_id(&self) -> Result<(), EvalError> {
+        if self.model_id.is_empty() {
+            return Err(EvalError::InvalidInput(
+                "the truth subject requires a non-empty model id".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Record the correct label index for a question id.
     pub fn with_truth(mut self, question_id: impl Into<String>, index: usize) -> Self {
         self.truth.insert(question_id.into(), index);
@@ -1001,6 +1010,7 @@ impl Subject for TruthSubject {
     }
 
     fn preflight(&self, set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+        self.validate_model_id()?;
         for question in &set.questions {
             let cardinality = question.cardinality();
             if let Some(&index) = self.truth.get(&question.id) {
@@ -1016,6 +1026,7 @@ impl Subject for TruthSubject {
         _state: &Entry,
         row: usize,
     ) -> Result<(), EvalError> {
+        self.validate_model_id()?;
         for question in &set.questions {
             let cardinality = question.cardinality();
             let configured = self

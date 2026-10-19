@@ -24,6 +24,39 @@ fn sha256_file(path: &std::path::Path) -> String {
     format!("{:x}", hash.finalize())
 }
 
+fn read_file_with_stable_digest<T>(
+    path: &std::path::Path,
+    read: impl FnOnce(&std::path::Path) -> T,
+) -> Result<(T, String), String> {
+    let before = sha256_file(path);
+    let value = read(path);
+    let after = sha256_file(path);
+    if before != after {
+        return Err(format!(
+            "input tensor file changed while it was being read: {}",
+            path.display()
+        ));
+    }
+    Ok((value, before))
+}
+
+#[test]
+fn clef_input_receipt_rejects_file_mutation_during_read() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("native-input.safetensors");
+    std::fs::write(&path, b"initial input bytes").expect("write initial input");
+
+    let result = read_file_with_stable_digest(&path, |path| {
+        let consumed = std::fs::read(path).expect("read simulated tensor input");
+        std::fs::write(path, b"replaced input bytes").expect("replace input during read");
+        consumed
+    });
+
+    assert!(result.is_err());
+    let error = result.expect_err("mutation during read must be rejected");
+    assert!(error.contains("changed while it was being read"));
+}
+
 #[derive(Deserialize)]
 struct Corpus {
     records: Vec<Record>,
@@ -263,10 +296,12 @@ fn clef_export_native_head() {
         .map(|(name, value)| (name, value.to_kind(Kind::Float)))
         .collect();
     let head = JointSchemaHead::from_named_tensors(config, weights).expect("strict native head");
-    let inputs: HashMap<_, _> = Tensor::read_safetensors(&input)
-        .expect("saved native backbone outputs")
-        .into_iter()
-        .collect();
+    let (input_tensors, native_input_tensors_sha256) =
+        read_file_with_stable_digest(&input, |path| {
+            Tensor::read_safetensors(path).expect("saved native backbone outputs")
+        })
+        .expect("native input tensors must remain stable while loaded");
+    let inputs: HashMap<_, _> = input_tensors.into_iter().collect();
     let row_ids =
         Vec::<i64>::try_from(&inputs["embedding_token_ids"]).expect("native embedding IDs");
     assert_eq!(
@@ -362,5 +397,5 @@ fn clef_export_native_head() {
     )
     .expect("write records");
     let native_tensors = output.join("native-tensors.safetensors");
-    std::fs::write(output.join("export-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"input_profile":profile,"native_input_tensor_path":input,"native_input_tensors_sha256":sha256_file(&input),"native_tensors_sha256":sha256_file(&native_tensors),"reference_directory":reference,"source_revision":provenance["source_revision"],"records":corpus.records.len(),"compute_dtype":"float32","device":"cpu","scope":"native head over saved native backbone; emission success does not waive numerical gates"})).expect("receipt JSON")).expect("write receipt");
+    std::fs::write(output.join("export-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema_version":1,"input_profile":profile,"native_input_tensor_path":input,"native_input_tensors_sha256":native_input_tensors_sha256,"native_tensors_sha256":sha256_file(&native_tensors),"reference_directory":reference,"source_revision":provenance["source_revision"],"records":corpus.records.len(),"compute_dtype":"float32","device":"cpu","scope":"native head over saved native backbone; emission success does not waive numerical gates"})).expect("receipt JSON")).expect("write receipt");
 }

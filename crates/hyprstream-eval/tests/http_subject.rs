@@ -732,6 +732,56 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
     }
 }
 
+#[tokio::test]
+async fn empty_truth_subject_model_id_preflights_before_remote_teacher_query() {
+    use hyprstream_eval::{EvalError, Teacher, TeacherEnsemble, TosClass, TruthSubject};
+    use tokio::time::Duration;
+
+    let body = r#"{"model":"remote-v1","answers":{"q":{"type":"noul","noul":0.5}}}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes();
+    let (address, server, mut witnessed) = serve_budget_reply(response, false).await;
+    let ensemble = TeacherEnsemble::new(vec![
+        Teacher {
+            id: "remote-first".into(),
+            tos_class: TosClass::Unknown,
+            subject: Box::new(HttpSubject::new(
+                format!("http://{address}"),
+                "remote",
+                "token",
+            )),
+        },
+        Teacher {
+            id: "truth-second".into(),
+            tos_class: TosClass::Unknown,
+            subject: Box::new(TruthSubject::new("")),
+        },
+    ])
+    .unwrap();
+    let set =
+        hyprstream_decision::author::parse_yaml("questions:\n  q:\n    type: noul\n").unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        ensemble.decide(&set, &Entry::Str("valid state".into()), 0, "empty-model"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(EvalError::InvalidInput(_))));
+    assert!(
+        matches!(
+            witnessed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "empty truth model id must reject before opening the earlier remote teacher connection"
+    );
+    server.abort();
+}
+
 async fn serve_budget_reply(
     reply: Vec<u8>,
     hold_open: bool,
