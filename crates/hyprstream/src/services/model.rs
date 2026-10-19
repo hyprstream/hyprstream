@@ -2941,7 +2941,7 @@ impl InferHandler for ModelService {
     /// raw JSON/media/duplicate-ID/cardinality/aggregate-budget/oversized
     /// bodies can never allocate a model. The worker revalidates after its
     /// own authorization PEP. No unauthenticated admission is created: this
-    /// handler runs after the generated Model dispatch PEP (infer scope).
+    /// handler runs after the generated Model dispatch PEP (`decide` scope).
     async fn handle_decide(
         &self,
         ctx: &EnvelopeContext,
@@ -2976,7 +2976,7 @@ impl InferHandler for ModelService {
         crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
             .map_err(Self::typed_decision_error)?;
         let client = self
-            .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "infer"))
+            .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "decide"))
             .await?;
         // Model load and routing happen between ingress and this worker call.
         // Forward only the remaining relative budget, then bound the whole RPC
@@ -3514,7 +3514,7 @@ pub(crate) fn federate_model_operation(
                 "unsupported Federate inference method"
             );
             let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
-            (model_ref.clone(), format!("model:{model_ref}"), "infer")
+            (model_ref.clone(), format!("model:{model_ref}"), "decide")
         }
         _ => anyhow::bail!("unsupported Federate Model method"),
     };
@@ -3855,7 +3855,7 @@ mod tests {
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
         assert_eq!(
             federate_model_operation(&body, &pin)?,
-            (format!("model:{model_ref}"), "infer".into())
+            (format!("model:{model_ref}"), "decide".into())
         );
         let wrong_oid = StagingModelPin::new(
             model_ref,
@@ -3964,7 +3964,7 @@ mod tests {
             })
         };
         for (method, resource, operation) in [
-            (0, format!("model:{}", pin.model_ref), "infer"),
+            (0, format!("model:{}", pin.model_ref), "decide"),
             (2, "model:Load".into(), "write"),
             (3, "model:Status".into(), "query"),
         ] {
@@ -4238,14 +4238,14 @@ mod tests {
             }
         }
         let policy_manager = Arc::new(crate::auth::PolicyManager::new_in_memory().await?);
-        // No permissive policy: admission proves the ORIGINAL delegated user,
-        // exact tenant/resource/action. No rule grants service:model infer.
+        // Only the typed decision operation is granted to the original holder;
+        // generation and embedding keep the separate generic `infer` action.
         policy_manager
             .add_policy_with_domain(
                 "alice",
                 "fixture-tenant",
                 "model:nonexistent-model:main",
-                "infer",
+                "decide",
                 "allow",
             )
             .await?;
@@ -4292,7 +4292,7 @@ mod tests {
             &service,
             &boundary_caller_ctx(chrono::Utc::now().timestamp() + 300),
             "model:nonexistent-model:main",
-            "infer"
+            "decide"
         )
         .await
         .is_err());
@@ -4366,6 +4366,36 @@ mod tests {
             .expect("real generated Model client preserves typed ErrorInfo");
         assert_eq!(typed.code, "DECISION_INPUT");
         assert!(typed.message.contains("clef-decision-input"));
+
+        // The same key-bound holder and policy grant can decide, but cannot
+        // use the Model RPC to generate or embed through generic `infer`.
+        use hyprstream_rpc_std::model_client::InferRpc;
+        let generation = hyprstream_rpc_std::inference_client::GenerationRequest {
+            prompt: "blocked generation".to_owned(),
+            ..Default::default()
+        };
+        let infer_client = alice.infer("nonexistent-model:main");
+        let generated = match InferRpc::generate_stream(&infer_client, &generation).await {
+            Ok(_) => panic!("decide-only policy must reject generateStream"),
+            Err(error) => error,
+        };
+        assert!(
+            generated.to_string().contains("Unauthorized"),
+            "expected generateStream policy denial, got: {generated:#}"
+        );
+        let embedded = match InferRpc::embed(
+            &infer_client,
+            &hyprstream_rpc_std::inference_client::EmbedImagesRequest { images: Vec::new() },
+        )
+        .await
+        {
+            Ok(_) => panic!("decide-only policy must reject embed"),
+            Err(error) => error,
+        };
+        assert!(
+            embedded.to_string().contains("Unauthorized"),
+            "expected embed policy denial, got: {embedded:#}"
+        );
         assert!(service.loaded_models.read().await.is_empty());
         assert!(service.take_test_work_order().await.is_none());
         Ok(())

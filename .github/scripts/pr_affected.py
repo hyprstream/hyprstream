@@ -162,7 +162,11 @@ def main() -> int:
     full = any(f.startswith(trigger) or f == trigger for f in files for trigger in FULL_SET_TRIGGERS)
     members = workspace_members()
     seeds = seed_packages(files, members)
-    explicit_release_packages = sorted(set(EXPLICIT_FULL_SET_PACKAGES) & seeds)
+    explicit_release_packages = sorted(
+        set(EXPLICIT_FULL_SET_PACKAGES)
+        if full
+        else set(EXPLICIT_FULL_SET_PACKAGES) & seeds
+    )
 
     if full:
         print("root-level input changed; running the full default-members set")

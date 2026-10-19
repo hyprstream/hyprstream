@@ -6560,7 +6560,7 @@ mod single_service_boundary_tests {
             &controller,
             &instance.service_name(),
             crate::services::model::ModelService::inference_dispatch_resource("decide"),
-            "infer",
+            "decide",
         )
         .await
         .expect("work order must pass the real verify_claims routing");
@@ -6609,7 +6609,7 @@ mod single_service_boundary_tests {
             &controller,
             &instance.service_name(),
             crate::services::model::ModelService::inference_dispatch_resource("decide"),
-            "infer",
+            "decide",
         )
         .await
         .expect("admission");
@@ -6651,7 +6651,7 @@ mod single_service_boundary_tests {
             &controller,
             &instance.service_name(),
             "inference:hasLora".to_owned(),
-            "infer",
+            "decide",
         )
         .await
         .expect("admission is coordinate-agnostic; the PEP compares");
@@ -6666,6 +6666,27 @@ mod single_service_boundary_tests {
         assert!(
             error.to_string().contains("does not authorize"),
             "expected exact-match PEP denial, got: {error:#}"
+        );
+
+        // Correct resource but generic inference authority must still fail
+        // the method-specific decide PEP.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("decide"),
+            "infer",
+        )
+        .await
+        .expect("generic inference work order is structurally valid");
+        let error = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(_) => panic!("generic inference authority must not authorize decide"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "expected method-specific PEP denial, got: {error:#}"
         );
 
         // Wrong MODEL binding: the internal-work verifier denies before the
@@ -6687,7 +6708,7 @@ mod single_service_boundary_tests {
             &controller,
             &other_instance.service_name(),
             crate::services::model::ModelService::inference_dispatch_resource("decide"),
-            "infer",
+            "decide",
         )
         .await
         .expect_err("foreign-model work order must fail admission");
@@ -6717,7 +6738,7 @@ mod single_service_boundary_tests {
             &controller,
             &instance.service_name(),
             crate::services::model::ModelService::inference_dispatch_resource("decide"),
-            "infer",
+            "decide",
         )
         .await
         .expect("work order admission");
