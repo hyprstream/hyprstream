@@ -857,7 +857,7 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
 #[tokio::test]
 async fn clef_generated_decide_is_holder_body_schema_and_closed_profile_bound() {
     let (mut handle, mut record, _) = fixture();
-    let scope = "infer:model:clef-flash-fp8:main".to_owned();
+    let scope = "decide:model:clef-flash-fp8:main".to_owned();
     handle.expected.scopes = vec![scope.clone()];
     record.scopes = vec![scope];
     let consumer = Consumer {
@@ -911,7 +911,7 @@ async fn clef_generated_decide_is_holder_body_schema_and_closed_profile_bound() 
     let pin = crate::services::model::StagingModelPin::federate_clef_startup_fixture().unwrap();
     assert_eq!(
         crate::services::model::federate_model_operation(&decoded, &pin).unwrap(),
-        ("model:clef-flash-fp8:main".into(), "infer".into())
+        ("model:clef-flash-fp8:main".into(), "decide".into())
     );
     for wrong in [
         Request {

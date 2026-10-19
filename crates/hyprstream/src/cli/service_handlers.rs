@@ -2259,7 +2259,7 @@ mod offline_policy_provision_tests {
                 ("registry:clef-flash-fp8", "query"),
                 ("model:Load", "write"),
                 ("model:Status", "query"),
-                ("model:clef-flash-fp8:main", "infer"),
+                ("model:clef-flash-fp8:main", "decide"),
             ];
             let expected: std::collections::BTreeSet<Vec<String>> = rules
                 .iter()
@@ -2308,6 +2308,7 @@ mod offline_policy_provision_tests {
                 ("registry:other", "query"),
                 ("model:clef-flash-fp8:other", "infer"),
                 ("model:other:main", "infer"),
+                ("model:clef-flash-fp8:main", "infer"),
                 ("model:clef-flash-fp8:main", "infer.generate"),
                 ("model:Unload", "write"),
             ] {

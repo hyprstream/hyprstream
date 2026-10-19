@@ -3503,18 +3503,13 @@ pub(crate) fn federate_model_operation(
         ),
         model_request::Which::Infer(inner) => {
             let infer = inner?;
-            anyhow::ensure!(
-                matches!(
-                    (profile, infer.which()?),
-                    (
-                        FederateModelProfile::Qwen,
-                        infer_request::Which::GenerateStream(_)
-                    ) | (FederateModelProfile::Clef, infer_request::Which::Decide(_))
-                ),
-                "unsupported Federate inference method"
-            );
+            let operation = match (profile, infer.which()?) {
+                (FederateModelProfile::Qwen, infer_request::Which::GenerateStream(_)) => "infer",
+                (FederateModelProfile::Clef, infer_request::Which::Decide(_)) => "decide",
+                _ => anyhow::bail!("unsupported Federate inference method"),
+            };
             let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
-            (model_ref.clone(), format!("model:{model_ref}"), "decide")
+            (model_ref.clone(), format!("model:{model_ref}"), operation)
         }
         _ => anyhow::bail!("unsupported Federate Model method"),
     };
@@ -3855,7 +3850,7 @@ mod tests {
         let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
         assert_eq!(
             federate_model_operation(&body, &pin)?,
-            (format!("model:{model_ref}"), "decide".into())
+            (format!("model:{model_ref}"), "infer".into())
         );
         let wrong_oid = StagingModelPin::new(
             model_ref,
