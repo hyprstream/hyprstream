@@ -139,8 +139,8 @@ pub struct ScoreReport {
     /// Per-stratum breakdown.
     pub by_stratum: Vec<BreakdownMetrics>,
     /// Option-order flip rate over permutation groups. `None` = **not
-    /// computed** (labels were not available to the scorer, or no group
-    /// contributed a base/member pair — see [`flip_rate_with_labels`]);
+    /// measured** (no group contributed a base/member pair — see
+    /// [`flip_rate_with_labels`]);
     /// `Some` with `flip_rate == 0.0` = computed, no flips. The distinction
     /// matters: an uncomputed rate must never be misread as
     /// permutation-robustness.
@@ -250,6 +250,11 @@ fn field_metrics(
 fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
     use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
     let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
+    if output.batch.is_some() != output.schema_fingerprint.is_some() {
+        return Err(invalid(
+            "run batch and schema fingerprint must either both be present or both be absent",
+        ));
+    }
     for obs in &output.observations {
         crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
         if obs.truth.is_some_and(|truth| truth >= obs.labels.len()) {
@@ -383,7 +388,18 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
             Some(family_identity(obs.family.as_deref()))
         })?,
         by_stratum: breakdown(&output.observations, by_question, |obs| obs.stratum.clone())?,
-        flip_rate: None,
+        flip_rate: {
+            // Observation labels are captured with each prediction, so the
+            // score path can measure semantic option flips without an
+            // external bench manifest. Set runs repeat question ids across
+            // rows; item runs may rotate question ids and labels.
+            let flip = flip_rate_with_observation_labels(
+                &output.observations,
+                output.batch.is_none(),
+                |obs| Some(obs.labels.clone()),
+            );
+            (flip.groups > 0).then_some(flip)
+        },
         abstention_rate,
         accuracy,
         nll_by_field,
@@ -576,11 +592,11 @@ fn flip_rate_with_observation_labels(
     }
 }
 
-/// Score a bench-shaped run: [`score_run`] plus the exact flip rate computed
-/// with each item's own labels. (`score_run` cannot reconstruct labels from
-/// observations alone — indices rotate under permutation, so index comparison
-/// would report spurious flips, S6b1 — and therefore reports `flip_rate:
-/// None`, "not computed".) The flip rate stays `None` when no permutation
+/// Score a bench-shaped run: [`score_run`] plus validation against each item's
+/// canonical labels before accepting its flip rate. [`score_run`] can compute
+/// flips from the labels captured in each observation; this boundary also
+/// verifies those labels against the supplied benchmark items. The flip rate
+/// stays `None` when no permutation
 /// group contributed a base/member pair (no groups, all-abstained bases, …)
 /// — an unmeasured robustness result must never look like a computed
 /// zero-flip result. Requires exactly one observation for every supplied
@@ -635,7 +651,8 @@ pub fn score_bench_run(
         )));
     }
     let mut report = score_run(output, config)?;
-    let flip = flip_rate_with_observation_labels(&output.observations, true, |obs| {
+    let bench_shaped = !output.is_set_run();
+    let flip = flip_rate_with_observation_labels(&output.observations, bench_shaped, |obs| {
         by_identity
             .get(&(obs.id.as_str(), obs.question_id.as_str()))
             .map(|item| item.question.labels())

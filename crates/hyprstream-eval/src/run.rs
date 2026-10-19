@@ -267,7 +267,7 @@ impl Harness {
             validate_entry(&row.state).map_err(EvalError::InvalidInput)?;
             if row.id.is_empty() {
                 return Err(EvalError::InvalidInput(
-                    "evaluation row ID must be nonempty".to_owned(),
+                    "eval row id must be nonempty".to_owned(),
                 ));
             }
             if !row_ids.insert(&row.id) {
@@ -294,8 +294,8 @@ impl Harness {
         }
         // Subject-specific checks must also complete for ALL requests before
         // any decide call (e.g. the legacy HTTP endpoint rejects null state).
-        for row in &set.rows {
-            subject.preflight(&question_set, &row.state)?;
+        for (row_index, row) in set.rows.iter().enumerate() {
+            subject.preflight_row(&question_set, &row.state, row_index)?;
         }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
@@ -408,6 +408,11 @@ impl Harness {
         let mut identities = std::collections::HashSet::with_capacity(items.len());
         for item in items {
             validate_entry(&item.state).map_err(EvalError::InvalidInput)?;
+            if item.id.is_empty() {
+                return Err(EvalError::InvalidInput(
+                    "eval item id must be nonempty".to_owned(),
+                ));
+            }
             if !identities.insert((&item.id, &item.question.id)) {
                 return Err(EvalError::InvalidInput(format!(
                     "duplicate eval item identity ({:?}, {:?})",
@@ -426,12 +431,12 @@ impl Harness {
                 }
             }
         }
-        for item in items {
+        for (row_index, item) in items.iter().enumerate() {
             let set = QuestionSet {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
             };
-            subject.preflight(&set, &item.state)?;
+            subject.preflight_row(&set, &item.state, row_index)?;
         }
         let mut observations = Vec::with_capacity(items.len());
         let mut pinned_model: Option<String> = None;
@@ -712,7 +717,7 @@ fn validate_one_answer(
     check_distribution(&probabilities, PRODUCER_SUM_TOLERANCE)
         .map_err(|error| format!("distribution violates producer tolerance (D5): {error}"))?;
     if let Some(set) = &answer.conformal_set {
-        let labels = question.labels();
+        let labels: std::collections::HashSet<_> = question.labels().into_iter().collect();
         for label in set {
             if !labels.contains(label) {
                 return Err(format!(
@@ -769,7 +774,7 @@ pub(crate) fn question_from_labels(
 #[cfg(test)]
 mod row_identity_tests {
     use super::*;
-    use hyprstream_decision::answer::QuestionAnswer;
+    use hyprstream_decision::answer::{AnswerValue, QuestionAnswer};
     use hyprstream_decision::arrow::AnswerRow;
     use hyprstream_decision::author;
 
@@ -807,6 +812,37 @@ mod row_identity_tests {
         assert!(
             matches!(validate_set_answer_row(&set, &missing), Err(ref message) if message.contains("missing an answer for question `right`"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conformal_members_validate_against_high_cardinality_labels() -> Result<(), String> {
+        use hyprstream_decision::spec::{QuestionBody, QuestionKind, QuestionSpec};
+
+        let labels: Vec<String> = (0..4096).map(|index| format!("level-{index:04}")).collect();
+        let question = QuestionSpec {
+            id: "score".into(),
+            kind: QuestionKind::Score,
+            instructions: None,
+            body: QuestionBody::Score {
+                levels: vec![None; labels.len()],
+            },
+        };
+        let conformal_set = question.labels();
+        assert_eq!(conformal_set.len(), labels.len());
+        let row = AnswerRow {
+            answers: [(
+                question.id.clone(),
+                QuestionAnswer {
+                    value: Some(AnswerValue::Score {
+                        probabilities: vec![1.0 / labels.len() as f32; labels.len()],
+                    }),
+                    conformal_set: Some(conformal_set),
+                },
+            )]
+            .into(),
+        };
+        validate_answer_row(&question, &row)?;
         Ok(())
     }
 }
