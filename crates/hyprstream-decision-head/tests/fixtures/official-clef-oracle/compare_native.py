@@ -79,7 +79,11 @@ def admit_native_receipt(receipt_path, native_tensors_path, native_input_tensors
     if tolerance_profile is not None and receipt_path is None:
         raise ValueError("predeclared full-port profile requires --native-receipt")
     if receipt_path is None:
+        if native_input_tensors_path is not None:
+            raise ValueError("--native-input-tensors requires --native-receipt")
         return None
+    if native_input_tensors_path is None:
+        raise ValueError("--native-receipt requires --native-input-tensors for verification")
     receipt = json.loads(receipt_path.read_text())
     if not isinstance(receipt, dict) or type(receipt.get("schema_version")) is not int or receipt["schema_version"] != 1:
         raise ValueError("native export receipt must use schema_version 1")
@@ -88,13 +92,10 @@ def admit_native_receipt(receipt_path, native_tensors_path, native_input_tensors
         raise ValueError("native export input_profile does not match tolerance profile")
     if receipt.get("native_tensors_sha256") != digest(native_tensors_path):
         raise ValueError("native export receipt tensor digest does not match --native-tensors")
-    if tolerance_profile is not None and native_input_tensors_path is None:
-        raise ValueError("predeclared full-port profile requires --native-input-tensors")
-    input_digest = digest(native_input_tensors_path) if native_input_tensors_path else None
-    if input_digest is not None and receipt.get("native_input_tensors_sha256") != input_digest:
+    input_digest = digest(native_input_tensors_path)
+    if receipt.get("native_input_tensors_sha256") != input_digest:
         raise ValueError("native export receipt input digest does not match --native-input-tensors")
-    if input_digest is not None and (not isinstance(receipt.get("native_input_tensor_path"), str)
-                                     or not receipt["native_input_tensor_path"]):
+    if not isinstance(receipt.get("native_input_tensor_path"), str) or not receipt["native_input_tensor_path"]:
         raise ValueError("native export receipt must record native_input_tensor_path")
     if tolerance_profile is not None:
         if not isinstance(expected_profile, str):
@@ -251,6 +252,11 @@ def main():
                                        tolerance_profile=tolerance_profile)
     except ValueError as error:
         raise SystemExit(str(error)) from error
+    if provenance["mode"] == "full" and not a.head_only and not a.backbone_only:
+        if a.native_receipt is None:
+            raise SystemExit("full-port comparison requires --native-receipt")
+        if a.native_input_tensors is None:
+            raise SystemExit("full-port comparison requires --native-input-tensors")
     records = json.loads((a.reference / "records.json").read_text())
     try:
         native_receipt = admit_native_receipt(a.native_receipt, a.native_tensors,
@@ -318,7 +324,7 @@ def main():
             winners.append(winner)
         entries[key] = entry
         passed = passed and entry["pass"]
-    report = {"pass": passed, "scope": "backbone-only-original-f32" if a.backbone_only else provenance["mode"], "tolerance_profile": tolerance_profile, "tolerance_profile_sha256": digest(a.tolerance_file) if a.tolerance_file else None, "source_revision": provenance["source_revision"], "reference_provenance_sha256": digest(a.reference / "provenance.json"), "native_tensors_sha256": digest(a.native_tensors), "native_receipt_sha256": digest(a.native_receipt) if a.native_receipt else None, "native_input_profile": native_receipt.get("input_profile") if native_receipt else None, "native_input_tensor_path": native_receipt.get("native_input_tensor_path") if native_receipt else None, "native_input_tensors_sha256": native_receipt.get("native_input_tensors_sha256") if native_receipt else None, "atol": a.atol, "rtol": a.rtol, "probability_atol": a.probability_atol, "exact_encoded_record_match": record_match, "tensors": entries, "limitation": "Head-only parity is not full backbone/FP8/calibration/CPU serving qualification."}
+    report = {"pass": passed, "scope": "backbone-only-original-f32" if a.backbone_only else provenance["mode"], "tolerance_profile": tolerance_profile, "tolerance_profile_sha256": digest(a.tolerance_file) if a.tolerance_file else None, "source_revision": provenance["source_revision"], "reference_provenance_sha256": digest(a.reference / "provenance.json"), "native_tensors_sha256": digest(a.native_tensors), "native_receipt_sha256": digest(a.native_receipt) if a.native_receipt else None, "native_input_profile": native_receipt.get("input_profile") if native_receipt else None, "native_input_tensor_path": native_receipt.get("native_input_tensor_path") if native_receipt else None, "native_input_tensors_sha256": digest(a.native_input_tensors) if native_receipt else None, "atol": a.atol, "rtol": a.rtol, "probability_atol": a.probability_atol, "exact_encoded_record_match": record_match, "tensors": entries, "limitation": "Head-only parity is not full backbone/FP8/calibration/CPU serving qualification."}
     report["argmax"] = summarize_winners(winners)
     a.report.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(json.dumps({"pass": passed, "tensor_count": len(entries), "exact_encoded_record_match": record_match, "report": str(a.report)}))
