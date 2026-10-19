@@ -24,7 +24,7 @@
 'use strict';
 
 const fs = require('fs');
-const { StructReader } = require('./capnp.js');
+const { CapnpReader, StructReader } = require('./capnp.js');
 const {
   buildWireRoundtrip,
   parseWireRoundtrip,
@@ -114,6 +114,61 @@ function legacyStructReader() {
   return new StructReader(raw, view, 0, 0, 1);
 }
 
+function rootDataReader(kind) {
+  if (kind === 'far-outer-child' || kind === 'far-child-payload-overrun') {
+    const raw = new Uint8Array(64);
+    const view = new DataView(raw.buffer);
+    const word = (offset, lo, hi) => {
+      view.setUint32(offset, lo >>> 0, true);
+      view.setUint32(offset + 4, hi >>> 0, true);
+    };
+    // Three segments: root struct, far landing pad + list body, and far child
+    // landing pad + payload. The table occupies 16 bytes.
+    view.setUint32(0, 2, true);
+    view.setUint32(4, 2, true);
+    view.setUint32(8, 2, true);
+    view.setUint32(12, 2, true);
+    word(16, 0, 1 << 16); // root struct: zero data words, one pointer word
+    word(24, 2, 1); // far pointer to segment 1's landing pad at byte 32
+    word(32, 1, (1 << 3) | 6); // near List(Data) pointer, body at byte 40
+    word(40, 2, 2); // far child pointer to segment 2's landing pad at byte 48
+    word(48, 1, ((kind === 'far-child-payload-overrun' ? 9 : 3) << 3) | 2);
+    raw.set([1, 2, 3], 56);
+    return new CapnpReader(raw, 0, 1);
+  }
+  const raw = new Uint8Array(64);
+  const view = new DataView(raw.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  // One segment begins after the 8-byte segment table. Its declared end can
+  // be shorter than the backing buffer to exercise segment-bound checks.
+  view.setUint32(0, 0, true);
+  view.setUint32(4, kind === 'composite-tag-overrun' ? 2 : kind === 'segment-list-overrun' ? 3 : kind === 'segment-payload-overrun' ? 4 : 7, true);
+  word(8, 0, 1 << 16); // root struct: zero data words, one pointer word
+  if (kind === 'invalid-far-pad') {
+    word(16, (7 << 3) | 2, 0); // landing pad starts at the declared segment end
+  } else if (kind === 'empty') {
+    word(16, 0, 0);
+  } else if (kind === 'composite' || kind === 'composite-shape' || kind === 'composite-body' || kind === 'composite-tag-kind' || kind === 'composite-tag-overrun') {
+    const bodyWords = kind === 'composite-body' ? 2 : 1;
+    word(16, 1, (bodyWords << 3) | 7);
+    word(24, kind === 'composite-tag-kind' ? 5 : 1 << 2, kind === 'composite-shape' ? 0 : 1 << 16);
+    word(32, 5, (3 << 3) | 2);
+    raw.set([1, 2, 3], 48);
+  } else if (kind === 'list-before-start') {
+    word(16, ((-3 << 2) | 1) >>> 0, (1 << 3) | 6);
+  } else {
+    const count = kind === 'segment-list-overrun' ? 2 : 1;
+    word(16, 1, (count << 3) | 6);
+    const childOffsetWords = kind === 'payload-before-start' ? -4 : kind === 'invalid-child-kind' ? 1 : 1;
+    word(24, ((childOffsetWords << 2) | (kind === 'invalid-child-kind' ? 0 : 1)) >>> 0, (3 << 3) | 2);
+    raw.set([1, 2, 3], 40);
+  }
+  return new CapnpReader(raw, 0, 1);
+}
+
 function out(obj) {
   process.stdout.write(JSON.stringify(canon(obj)));
   process.stdout.write('\n');
@@ -195,6 +250,19 @@ function main() {
     const rejected = [];
     for (const kind of ['truncated', 'invalid', 'double-far', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end']) {
       try { nestedDataReader(kind).getDataList(0); }
+      catch { rejected.push(kind); }
+    }
+    out({ valid, rejected });
+    return;
+  }
+  if (mode === 'root-data-lists') {
+    const valid = {};
+    for (const kind of ['pointer', 'composite', 'far-outer-child', 'empty']) {
+      valid[kind] = rootDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
+    }
+    const rejected = [];
+    for (const kind of ['invalid-far-pad', 'invalid-child-kind', 'segment-list-overrun', 'segment-payload-overrun', 'payload-before-start', 'list-before-start', 'composite-shape', 'composite-body', 'composite-tag-kind', 'composite-tag-overrun', 'far-child-payload-overrun']) {
+      try { rootDataReader(kind).getDataList(0); }
       catch { rejected.push(kind); }
     }
     out({ valid, rejected });

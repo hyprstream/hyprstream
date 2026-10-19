@@ -719,3 +719,38 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
         "generated StructReader accepted a malformed nested List(Data) encoding"
     );
 }
+
+#[test]
+fn root_data_lists_validate_wire_shape_and_segment_bounds() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+
+    let actual = wd.run("root-data-lists", &[]);
+    let expected = json!({
+        "valid": {
+            "pointer": [[1, 2, 3]],
+            "composite": [[1, 2, 3]],
+            "far-outer-child": [[1, 2, 3]],
+            "empty": [],
+        },
+        "rejected": [
+            "invalid-far-pad",
+            "invalid-child-kind",
+            "segment-list-overrun",
+            "segment-payload-overrun",
+            "payload-before-start",
+            "list-before-start",
+            "composite-shape",
+            "composite-body",
+            "composite-tag-kind",
+            "composite-tag-overrun",
+            "far-child-payload-overrun",
+        ],
+    });
+    assert_eq!(
+        actual, expected,
+        "generated CapnpReader accepted a malformed root List(Data) encoding"
+    );
+}
