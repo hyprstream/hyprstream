@@ -16,6 +16,22 @@ pub fn generate_capnp_runtime() -> String {
 // Text/Data:      List(UInt8) with NUL terminator for Text
 
 const WORD_SIZE = 8;
+// Decoding lists materializes JS arrays. Bound counts even when the wire body
+// is empty or shorter than the declared element count.
+const MAX_LIST_ELEMENTS = 65_536;
+
+function listBodyFitsSegment(
+  targetOffset: number,
+  bounds: { start: number; end: number } | null,
+  bodyWords: number,
+  tagWords = 0,
+): boolean {
+  return bounds !== null
+    && targetOffset >= bounds.start
+    && targetOffset <= bounds.end
+    && Number.isSafeInteger(bodyWords)
+    && bodyWords + tagWords <= Math.floor((bounds.end - targetOffset) / WORD_SIZE);
+}
 
 /** Check that the shape declared by a double-far tag fits its target segment. */
 function doubleFarObjectFits(
@@ -58,6 +74,7 @@ function doubleFarObjectFits(
   const compositeTagHi = buf.getUint32(objectOffset + 4, true);
   if ((compositeTagLo & 3) !== 0) return false;
   const structCount = compositeTagLo >>> 2;
+  if (structCount > MAX_LIST_ELEMENTS) return false;
   const structWords = (compositeTagHi & 0xFFFF) + (compositeTagHi >>> 16);
   return structCount * structWords <= listWords;
 }
@@ -1488,6 +1505,10 @@ export class CapnpReader {
     if (elementSize === 6) {
       // Pointer list: each element is a pointer to a text blob
       const elementCount = hi >>> 3;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (elementCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, elementCount)) {
+        throw new Error('Invalid List(Text) pointer-list shape');
+      }
       const results: string[] = [];
       for (let i = 0; i < elementCount; i++) {
         const elemOffset = targetOffset + i * WORD_SIZE;
@@ -1507,11 +1528,21 @@ export class CapnpReader {
 
     // Composite list: tag word + elements
     const tagLo = this.buf.getUint32(targetOffset, true);
-    const elementCount = (tagLo >> 2) | 0;
+    const tagHi = this.buf.getUint32(targetOffset + 4, true);
+    if ((tagLo & 3) !== 0) throw new Error('Invalid List(Text) composite tag');
+    const elementCount = tagLo >>> 2;
+    const dataWords = tagHi & 0xFFFF;
+    const pointerWords = tagHi >>> 16;
+    const strideWords = dataWords + pointerWords;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (elementCount > MAX_LIST_ELEMENTS || pointerWords < 1 || elementCount > Math.floor((hi >>> 3) / strideWords)
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid List(Text) composite element shape');
+    }
 
     const results: string[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
+      const elemOffset = targetOffset + WORD_SIZE + (i * strideWords + dataWords) * WORD_SIZE;
       const elemLo = this.buf.getUint32(elemOffset, true);
       const elemHi = this.buf.getUint32(elemOffset + 4, true);
 
@@ -1560,6 +1591,7 @@ export class CapnpReader {
     if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
+      if (elementCount > MAX_LIST_ELEMENTS) throw new Error('List(Data) element count exceeds limit');
       bodyWords = elementCount;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
@@ -1576,7 +1608,7 @@ export class CapnpReader {
       // Schema evolution can widen each element with data or more pointers.
       // The old List(Data) view reads its first pointer and skips the full
       // element stride. Like capnp-rust, allow unused declared body words.
-      if (ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
+      if (elementCount > MAX_LIST_ELEMENTS || ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
@@ -1636,6 +1668,15 @@ export class CapnpReader {
     if (elementSize !== expectedElemSize) return [];
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
     const count = hi >>> 3;
+    const bodyWords = elementSize === 1 ? Math.ceil(count / 64)
+      : elementSize === 2 ? Math.ceil(count / 8)
+      : elementSize === 3 ? Math.ceil(count / 4)
+      : elementSize === 4 ? Math.ceil(count / 2)
+      : count;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (count > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, bodyWords)) {
+      throw new Error('Invalid primitive-list shape');
+    }
 
     const results: T[] = [];
     for (let i = 0; i < count; i++) {
@@ -1720,20 +1761,39 @@ export class CapnpReader {
 
     let outerCount: number;
     let outerBase: number;
+    let outerStrideWords = 1;
+    let outerFirstPointerWords = 0;
     if (outerElementSize === 6) {
       outerCount = hi >>> 3;
       outerBase = targetOffset;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (outerCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, outerCount)) {
+        throw new Error('Invalid nested-list pointer-list shape');
+      }
     } else if (outerElementSize === 7) {
       const tagLo = this.buf.getUint32(targetOffset, true);
-      outerCount = (tagLo >> 2) | 0;
+      const tagHi = this.buf.getUint32(targetOffset + 4, true);
+      if ((tagLo & 3) !== 0) throw new Error('Invalid nested-list composite tag');
+      outerCount = tagLo >>> 2;
+      const dataWords = tagHi & 0xFFFF;
+      const pointerWords = tagHi >>> 16;
+      const strideWords = dataWords + pointerWords;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (outerCount > MAX_LIST_ELEMENTS || pointerWords < 1 || outerCount > Math.floor((hi >>> 3) / strideWords)
+        || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+        throw new Error('Invalid nested-list composite element shape');
+      }
+      outerStrideWords = strideWords;
+      outerFirstPointerWords = dataWords;
       outerBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
 
     const results: T[][] = [];
+    let totalCount = outerCount;
     for (let i = 0; i < outerCount; i++) {
-      const elemPtrOffset = outerBase + i * WORD_SIZE;
+      const elemPtrOffset = outerBase + (i * outerStrideWords + outerFirstPointerWords) * WORD_SIZE;
       const elemResolved = this.resolvePtr(elemPtrOffset);
       if (!elemResolved) { results.push([]); continue; }
       const { lo: iLo, hi: iHi, offset: iOffset } = elemResolved;
@@ -1741,6 +1801,13 @@ export class CapnpReader {
       const iOffsetWords = (iLo >> 2) | 0;
       const innerTarget = elemResolved.targetOffset ?? (iOffset + WORD_SIZE + iOffsetWords * WORD_SIZE);
       const innerCount = iHi >>> 3;
+      const innerBodyWords = innerElemSize === 1 ? Math.ceil(innerCount / 64) : Math.ceil(innerCount * innerByteWidth / WORD_SIZE);
+      const innerBounds = elemResolved.targetBounds ?? this.segmentBounds(iOffset);
+      if (innerCount > MAX_LIST_ELEMENTS || totalCount + innerCount > MAX_LIST_ELEMENTS
+        || !listBodyFitsSegment(innerTarget, innerBounds, innerBodyWords)) {
+        throw new Error('Nested primitive-list total count exceeds limit');
+      }
+      totalCount += innerCount;
       const inner: T[] = [];
       for (let j = 0; j < innerCount; j++) {
         inner.push(
@@ -1815,10 +1882,16 @@ export class CapnpReader {
     // Read tag word — struct pointer encoding element shape
     const tagLo = this.buf.getUint32(targetOffset, true);
     const tagHi = this.buf.getUint32(targetOffset + 4, true);
-    const elementCount = (tagLo >> 2) | 0;
+    if ((tagLo & 3) !== 0) throw new Error('Invalid composite list tag');
+    const elementCount = tagLo >>> 2;
     const tagDataWords = tagHi & 0xFFFF;
-    const tagPtrWords = (tagHi >> 16) & 0xFFFF;
+    const tagPtrWords = (tagHi >>> 16) & 0xFFFF;
     const elementWords = tagDataWords + tagPtrWords;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (elementCount > MAX_LIST_ELEMENTS || (elementWords > 0 && elementCount > Math.floor((hi >>> 3) / elementWords))
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid composite list element shape');
+    }
 
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
@@ -2035,6 +2108,10 @@ export class StructReader {
 
     if (elementSize === 6) {
       const elementCount = hi >>> 3;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (elementCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, elementCount)) {
+        throw new Error('Invalid List(Text) pointer-list shape');
+      }
       const results: string[] = [];
       for (let i = 0; i < elementCount; i++) {
         const elemOffset = targetOffset + i * WORD_SIZE;
@@ -2053,11 +2130,21 @@ export class StructReader {
     if (elementSize !== 7) return [];
 
     const tagLo = this.buf.getUint32(targetOffset, true);
-    const elementCount = (tagLo >> 2) | 0;
+    const tagHi = this.buf.getUint32(targetOffset + 4, true);
+    if ((tagLo & 3) !== 0) throw new Error('Invalid List(Text) composite tag');
+    const elementCount = tagLo >>> 2;
+    const dataWords = tagHi & 0xFFFF;
+    const pointerWords = tagHi >>> 16;
+    const strideWords = dataWords + pointerWords;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (elementCount > MAX_LIST_ELEMENTS || pointerWords < 1 || elementCount > Math.floor((hi >>> 3) / strideWords)
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid List(Text) composite element shape');
+    }
 
     const results: string[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
+      const elemOffset = targetOffset + WORD_SIZE + (i * strideWords + dataWords) * WORD_SIZE;
       const elemLo = this.buf.getUint32(elemOffset, true);
       const elemHi = this.buf.getUint32(elemOffset + 4, true);
       if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
@@ -2100,6 +2187,7 @@ export class StructReader {
     if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
+      if (elementCount > MAX_LIST_ELEMENTS) throw new Error('List(Data) element count exceeds limit');
       bodyWords = elementCount;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
@@ -2116,7 +2204,7 @@ export class StructReader {
       // Schema evolution can widen each element with data or more pointers.
       // The old List(Data) view reads its first pointer and skips the full
       // element stride. Like capnp-rust, allow unused declared body words.
-      if (ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
+      if (elementCount > MAX_LIST_ELEMENTS || ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
@@ -2169,6 +2257,15 @@ export class StructReader {
     if (elementSize !== expectedElemSize) return [];
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
     const count = hi >>> 3;
+    const bodyWords = elementSize === 1 ? Math.ceil(count / 64)
+      : elementSize === 2 ? Math.ceil(count / 8)
+      : elementSize === 3 ? Math.ceil(count / 4)
+      : elementSize === 4 ? Math.ceil(count / 2)
+      : count;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (count > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, bodyWords)) {
+      throw new Error('Invalid primitive-list shape');
+    }
 
     const results: T[] = [];
     for (let i = 0; i < count; i++) {
@@ -2248,20 +2345,39 @@ export class StructReader {
 
     let outerCount: number;
     let outerBase: number;
+    let outerStrideWords = 1;
+    let outerFirstPointerWords = 0;
     if (outerElementSize === 6) {
       outerCount = hi >>> 3;
       outerBase = targetOffset;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (outerCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, outerCount)) {
+        throw new Error('Invalid nested-list pointer-list shape');
+      }
     } else if (outerElementSize === 7) {
       const tagLo = this.buf.getUint32(targetOffset, true);
-      outerCount = (tagLo >> 2) | 0;
+      const tagHi = this.buf.getUint32(targetOffset + 4, true);
+      if ((tagLo & 3) !== 0) throw new Error('Invalid nested-list composite tag');
+      outerCount = tagLo >>> 2;
+      const dataWords = tagHi & 0xFFFF;
+      const pointerWords = tagHi >>> 16;
+      const strideWords = dataWords + pointerWords;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (outerCount > MAX_LIST_ELEMENTS || pointerWords < 1 || outerCount > Math.floor((hi >>> 3) / strideWords)
+        || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+        throw new Error('Invalid nested-list composite element shape');
+      }
+      outerStrideWords = strideWords;
+      outerFirstPointerWords = dataWords;
       outerBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
 
     const results: T[][] = [];
+    let totalCount = outerCount;
     for (let i = 0; i < outerCount; i++) {
-      const elemPtrOffset = outerBase + i * WORD_SIZE;
+      const elemPtrOffset = outerBase + (i * outerStrideWords + outerFirstPointerWords) * WORD_SIZE;
       const elemResolved = this.resolvePtr(elemPtrOffset);
       if (!elemResolved) { results.push([]); continue; }
       const { lo: iLo, hi: iHi, offset: iOffset } = elemResolved;
@@ -2269,6 +2385,13 @@ export class StructReader {
       const iOffsetWords = (iLo >> 2) | 0;
       const innerTarget = elemResolved.targetOffset ?? (iOffset + WORD_SIZE + iOffsetWords * WORD_SIZE);
       const innerCount = iHi >>> 3;
+      const innerBodyWords = innerElemSize === 1 ? Math.ceil(innerCount / 64) : Math.ceil(innerCount * innerByteWidth / WORD_SIZE);
+      const innerBounds = elemResolved.targetBounds ?? this.segmentBounds(iOffset);
+      if (innerCount > MAX_LIST_ELEMENTS || totalCount + innerCount > MAX_LIST_ELEMENTS
+        || !listBodyFitsSegment(innerTarget, innerBounds, innerBodyWords)) {
+        throw new Error('Nested primitive-list total count exceeds limit');
+      }
+      totalCount += innerCount;
       const inner: T[] = [];
       for (let j = 0; j < innerCount; j++) {
         inner.push(
@@ -2341,10 +2464,16 @@ export class StructReader {
     if (elementSize !== 7) return [];
     const tagLo = this.buf.getUint32(targetOffset, true);
     const tagHi = this.buf.getUint32(targetOffset + 4, true);
-    const elementCount = (tagLo >> 2) | 0;
+    if ((tagLo & 3) !== 0) throw new Error('Invalid composite list tag');
+    const elementCount = tagLo >>> 2;
     const tagDataWords = tagHi & 0xFFFF;
-    const tagPtrWords = (tagHi >> 16) & 0xFFFF;
+    const tagPtrWords = (tagHi >>> 16) & 0xFFFF;
     const elementWords = tagDataWords + tagPtrWords;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (elementCount > MAX_LIST_ELEMENTS || (elementWords > 0 && elementCount > Math.floor((hi >>> 3) / elementWords))
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid composite list element shape');
+    }
 
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {

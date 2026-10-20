@@ -1025,9 +1025,51 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
     assert_eq!(
         wd.run("double-far-composite-lists", &[]),
         json!({
-            "root": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0},
-            "nested": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0}
+            "root": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0, "oversizedZeroWordCount": 0},
+            "nested": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0, "oversizedZeroWordCount": 0}
         }),
         "double-far composite tags must validate tag-word and body bounds"
+    );
+}
+
+#[test]
+fn zero_word_composite_lists_bound_materialized_elements() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    assert_eq!(
+        wd.run("zero-word-struct-list-limit", &[]),
+        json!({"rejected": true}),
+        "zero-word structs must not allocate an attacker-sized JS object array"
+    );
+    assert_eq!(
+        wd.run("far-zero-word-struct-list-limit", &[]),
+        json!({"rejected": true}),
+        "single-far pointers must preserve zero-word composite count limits"
+    );
+    assert_eq!(
+        wd.run("zero-word-composite-reader-limits", &[]),
+        json!({
+            "rootNestedPrimitive": true,
+            "structNestedPrimitive": true,
+            "rootText": true,
+            "structText": true,
+            "rootNestedPointer": true,
+            "structNestedPointer": true,
+            "rootBoolean": true,
+            "structBoolean": true
+        }),
+        "all composite readers must reject oversized zero-word lists before iterating"
+    );
+    assert_eq!(
+        wd.run("strided-composite-readers", &[]),
+        json!({
+            "rootText": ["one", "two"],
+            "structText": ["one", "two"],
+            "rootNested": [[7, 8, 9], [4, 5, 6]],
+            "structNested": [[7, 8, 9], [4, 5, 6]]
+        }),
+        "Text and nested-list readers must honor data words before pointer fields"
     );
 }
