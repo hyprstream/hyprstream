@@ -145,15 +145,16 @@ fn request_digest(request: &DecisionRequest) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update((request.clef_json.len() as u64).to_le_bytes());
     digest.update(request.clef_json.as_bytes());
-    for value in [request.max_state_tokens, request.timeout_ms] {
-        match value {
-            Some(value) => {
-                digest.update([1]);
-                digest.update(value.to_le_bytes());
-            }
-            None => digest.update([0]),
+    match request.max_state_tokens {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_le_bytes());
         }
+        None => digest.update([0]),
     }
+    // Model ingress forwards only the remaining relative timeout to the
+    // worker. Bind the observer to the unchanged decision body/state cap;
+    // the checkpoint's actual deadline is verified independently.
     digest.finalize().into()
 }
 
@@ -330,5 +331,36 @@ pub(crate) struct ReleaseOnDrop(pub(crate) Arc<RequestTicket>);
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
         self.0.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_identity_allows_gateway_to_shorten_worker_timeout() {
+        let caller = DecisionRequest {
+            clef_json: r#"{"model":"clef-flash-fp8:main","questions":{}}"#.into(),
+            max_state_tokens: Some(512),
+            timeout_ms: Some(10_000),
+        };
+        let forwarded = DecisionRequest {
+            timeout_ms: Some(9_997),
+            ..caller.clone()
+        };
+        assert_eq!(request_digest(&caller), request_digest(&forwarded));
+
+        let changed_body = DecisionRequest {
+            clef_json: format!("{} ", caller.clef_json),
+            ..forwarded.clone()
+        };
+        assert_ne!(request_digest(&caller), request_digest(&changed_body));
+
+        let changed_state_cap = DecisionRequest {
+            max_state_tokens: Some(256),
+            ..forwarded
+        };
+        assert_ne!(request_digest(&caller), request_digest(&changed_state_cap));
     }
 }
