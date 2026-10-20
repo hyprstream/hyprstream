@@ -1314,7 +1314,7 @@ export class CapnpReader {
         const objectSegment = this.buf.getUint32(targetOffset + 4, true);
         if ((objectLo & 7) !== 2) return null;
         const objectBounds = this.segmentBoundsForIndex(objectSegment);
-        if (!objectBounds || objectBounds.start === objectBounds.end) return null;
+        if (!objectBounds) return null;
         const objectOffset = objectBounds.start + (objectLo >>> 3) * WORD_SIZE;
         if (objectOffset < objectBounds.start || objectOffset > objectBounds.end) return null;
         const tagLo = this.buf.getUint32(targetOffset + WORD_SIZE, true);
@@ -1812,7 +1812,7 @@ export class StructReader {
         const objectSegment = this.buf.getUint32(targetOffset + 4, true);
         if ((objectLo & 7) !== 2) return null;
         const objectBounds = this.segmentBoundsForIndex(objectSegment);
-        if (!objectBounds || objectBounds.start === objectBounds.end) return null;
+        if (!objectBounds) return null;
         const objectOffset = objectBounds.start + (objectLo >>> 3) * WORD_SIZE;
         if (objectOffset < objectBounds.start || objectOffset > objectBounds.end) return null;
         const tagLo = this.buf.getUint32(targetOffset + WORD_SIZE, true);
