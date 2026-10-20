@@ -1,0 +1,48 @@
+{
+  "origin_candidate": "7b857d831d6ede1d32a2846acf687b01341db866",
+  "origin_receipt_sha256": "70e32ddc7bb745b83f94d6c1fc568131b54dc32e703b616a557b5d9a9ebd3662",
+  "corpus_records": 5,
+  "corpus_questions": 11,
+  "orders": [
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/decide",
+      "verified": true
+    }
+  ]
+}
