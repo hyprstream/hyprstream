@@ -17,6 +17,51 @@ pub fn generate_capnp_runtime() -> String {
 
 const WORD_SIZE = 8;
 
+/** Check that the shape declared by a double-far tag fits its target segment. */
+function doubleFarObjectFits(
+  buf: DataView,
+  objectOffset: number,
+  bounds: { start: number; end: number },
+  tagLo: number,
+  tagHi: number,
+): boolean {
+  if (objectOffset < bounds.start || objectOffset > bounds.end) return false;
+  const availableWords = Math.floor((bounds.end - objectOffset) / WORD_SIZE);
+  const kind = tagLo & 3;
+  if (kind === 0) {
+    const dataWords = tagHi & 0xFFFF;
+    const pointerWords = tagHi >>> 16;
+    return dataWords + pointerWords <= availableWords;
+  }
+  if (kind !== 1) return false;
+
+  const elementSize = tagHi & 7;
+  const elementCount = tagHi >>> 3;
+  let listWords: number;
+  switch (elementSize) {
+    case 0: listWords = 0; break;
+    case 1: listWords = Math.ceil(elementCount / 64); break;
+    case 2: listWords = Math.ceil(elementCount / 8); break;
+    case 3: listWords = Math.ceil(elementCount / 4); break;
+    case 4: listWords = Math.ceil(elementCount / 2); break;
+    case 5:
+    case 6: listWords = elementCount; break;
+    case 7: listWords = elementCount; break;
+    default: return false;
+  }
+  if (listWords > availableWords) return false;
+  if (elementSize !== 7) return true;
+
+  // A composite list begins with a struct tag, followed by its declared body.
+  if (listWords + 1 > availableWords) return false;
+  const compositeTagLo = buf.getUint32(objectOffset, true);
+  const compositeTagHi = buf.getUint32(objectOffset + 4, true);
+  if ((compositeTagLo & 3) !== 0) return false;
+  const structCount = compositeTagLo >>> 2;
+  const structWords = (compositeTagHi & 0xFFFF) + (compositeTagHi >>> 16);
+  return structCount * structWords <= listWords;
+}
+
 // Module-level singletons — avoid per-call allocation
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -1314,12 +1359,13 @@ export class CapnpReader {
         const objectSegment = this.buf.getUint32(targetOffset + 4, true);
         if ((objectLo & 7) !== 2) return null;
         const objectBounds = this.segmentBoundsForIndex(objectSegment);
-        if (!objectBounds || objectBounds.start === objectBounds.end) return null;
+        if (!objectBounds) return null;
         const objectOffset = objectBounds.start + (objectLo >>> 3) * WORD_SIZE;
         if (objectOffset < objectBounds.start || objectOffset > objectBounds.end) return null;
         const tagLo = this.buf.getUint32(targetOffset + WORD_SIZE, true);
         const tagHi = this.buf.getUint32(targetOffset + WORD_SIZE + 4, true);
         if ((tagLo & 3) > 1) return null;
+        if (!doubleFarObjectFits(this.buf, objectOffset, objectBounds, tagLo, tagHi)) return null;
         return { lo: tagLo, hi: tagHi, offset: targetOffset + WORD_SIZE,
                  targetOffset: objectOffset, targetBounds: objectBounds };
       }
@@ -1812,12 +1858,13 @@ export class StructReader {
         const objectSegment = this.buf.getUint32(targetOffset + 4, true);
         if ((objectLo & 7) !== 2) return null;
         const objectBounds = this.segmentBoundsForIndex(objectSegment);
-        if (!objectBounds || objectBounds.start === objectBounds.end) return null;
+        if (!objectBounds) return null;
         const objectOffset = objectBounds.start + (objectLo >>> 3) * WORD_SIZE;
         if (objectOffset < objectBounds.start || objectOffset > objectBounds.end) return null;
         const tagLo = this.buf.getUint32(targetOffset + WORD_SIZE, true);
         const tagHi = this.buf.getUint32(targetOffset + WORD_SIZE + 4, true);
         if ((tagLo & 3) > 1) return null;
+        if (!doubleFarObjectFits(this.buf, objectOffset, objectBounds, tagLo, tagHi)) return null;
         return { lo: tagLo, hi: tagHi, offset: targetOffset + WORD_SIZE,
                  targetOffset: objectOffset, targetBounds: objectBounds };
       }

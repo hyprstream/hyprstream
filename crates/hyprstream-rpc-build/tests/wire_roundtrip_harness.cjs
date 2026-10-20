@@ -118,7 +118,8 @@ function nestedDataReader(kind) {
 function doubleFarDataReader(kind, nested) {
   const container = kind === 'container';
   const rootWords = nested ? 4 : 3;
-  const objectWords = container ? 2 : 1;
+  const zeroWordObject = kind === 'zero-word-object' || kind === 'zero-word-nonempty-list';
+  const objectWords = zeroWordObject ? 0 : container ? 2 : 1;
   const bytes = new Uint8Array(16 + (rootWords + 2 + objectWords) * 8);
   const view = new DataView(bytes.buffer);
   const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
@@ -134,9 +135,32 @@ function doubleFarDataReader(kind, nested) {
   const pad = 16 + rootWords * 8;
   const object = pad + 16;
   word(pad, kind === 'pad-kind' ? 0 : kind === 'pad-double' ? 6 : (kind === 'object-overrun' || kind === 'empty-object') ? 10 : 2, kind === 'object-segment' ? 99 : 2);
-  word(pad + 8, kind === 'tag-kind' ? 2 : 1, container ? (1 << 3) | 6 : ((kind === 'empty-object' ? 0 : kind === 'payload-overrun' ? 9 : 3) << 3) | 2);
+  word(pad + 8, kind === 'tag-kind' ? 2 : 1, container ? (1 << 3) | 6 : ((kind === 'empty-object' || kind === 'zero-word-object' ? 0 : kind === 'zero-word-nonempty-list' ? 1 : kind === 'payload-overrun' ? 9 : 3) << 3) | 2);
   if (container) { word(object, 1, (3 << 3) | 2); bytes.set([1, 2, 3], object + 8); }
-  else bytes.set([1, 2, 3], object);
+  else if (!zeroWordObject) bytes.set([1, 2, 3], object);
+  const root = new CapnpReader(bytes, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
+function doubleFarStructReader(nested, nonempty) {
+  const rootWords = nested ? 3 : 2;
+  const bytes = new Uint8Array(16 + (rootWords + 2) * 8);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
+  view.setUint32(0, 2, true);
+  view.setUint32(4, rootWords, true);
+  view.setUint32(8, 0, true);
+  view.setUint32(12, 2, true);
+  word(16, 0, 1 << 16);
+  if (nested) {
+    word(24, 0, 1 << 16);
+    word(32, 6, 2);
+  } else {
+    word(24, 6, 2);
+  }
+  const pad = 16 + rootWords * 8;
+  word(pad, 2, 1);
+  word(pad + 8, 0, nonempty ? 1 : 0);
   const root = new CapnpReader(bytes, 0, 1);
   return nested ? root.getStruct(0, 0, 1) : root;
 }
@@ -297,12 +321,22 @@ function main() {
     const output = {};
     for (const nested of [false, true]) {
       const valid = {};
-      for (const kind of ['child', 'container', 'empty-object']) valid[kind] = canon(doubleFarDataReader(kind, nested).getDataList(0));
+      for (const kind of ['child', 'container', 'empty-object', 'zero-word-object']) valid[kind] = canon(doubleFarDataReader(kind, nested).getDataList(0));
       const rejected = [];
-      for (const kind of ['pad-overrun', 'pad-kind', 'pad-double', 'object-segment', 'tag-kind', 'object-overrun', 'payload-overrun', 'object-declared-end']) {
+      for (const kind of ['pad-overrun', 'pad-kind', 'pad-double', 'object-segment', 'tag-kind', 'object-overrun', 'payload-overrun', 'object-declared-end', 'zero-word-nonempty-list']) {
         try { doubleFarDataReader(kind, nested).getDataList(0); } catch { rejected.push(kind); }
       }
       output[nested ? 'nested' : 'root'] = { valid, rejected };
+    }
+    out(output);
+    return;
+  }
+  if (mode === 'double-far-zero-word-structs') {
+    const output = {};
+    for (const nested of [false, true]) {
+      const empty = doubleFarStructReader(nested, false).getStruct(0, 0, 0);
+      const nonempty = doubleFarStructReader(nested, true).getStruct(0, 1, 0);
+      output[nested ? 'nested' : 'root'] = { validEmpty: empty !== null, rejectsNonempty: nonempty === null };
     }
     out(output);
     return;

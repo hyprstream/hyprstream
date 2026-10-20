@@ -993,7 +993,7 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
     for shape in ["root", "nested"] {
         assert_eq!(
             output[shape]["valid"],
-            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]]})
+            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]],"zero-word-object":[[]]})
         );
         assert_eq!(
             output[shape]["rejected"],
@@ -1005,8 +1005,16 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
                 "tag-kind",
                 "object-overrun",
                 "payload-overrun",
-                "object-declared-end"
+                "object-declared-end",
+                "zero-word-nonempty-list"
             ])
         );
     }
+    assert_eq!(
+        wd.run("double-far-zero-word-structs", &[]),
+        json!({
+            "root": {"validEmpty": true, "rejectsNonempty": true},
+            "nested": {"validEmpty": true, "rejectsNonempty": true}
+        })
+    );
 }
