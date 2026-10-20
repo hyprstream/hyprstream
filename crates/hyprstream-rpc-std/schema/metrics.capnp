@@ -110,6 +110,20 @@ struct MetricsRequest {
 
     health       @7 :Void
       $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Check service health and row count");
+
+    # R6 durable decision/outcome surface. Tenant authority never travels on
+    # the wire: handlers derive the tenant domain from the VERIFIED envelope
+    # context (ctx.domain()) and authorize in that domain — a global metrics
+    # grant never implies tenant-store permission. Payload is bounded and
+    # schema-validated before any durable write.
+    recordDecision @8 :DecisionRecordRequest
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Store one decision batch durably with full identity pins and stable per-row ids; append-only");
+
+    recordOutcome @9 :DecisionOutcomeRequest
+      $scope(write) $mutationSemantics("idempotency-key-required") $dispatchMac("internal:pq-hybrid") $mcpDescription("Record one realized outcome linked to an exact decision row and question; append-only, corrections supersede");
+
+    queryOutcomes @10 :DecisionOutcomeQuery
+      $scope(query) $dispatchMac("internal:pq-hybrid") $mcpDescription("Join realized outcomes with decision pins for the caller tenant under bounded SQL limits");
   }
 }
 
@@ -125,5 +139,99 @@ struct MetricsResponse {
     dropViewResult    @6 :Void;
     healthResult      @7 :HealthInfo;
     error             @8 :ErrorInfo;
+    recordDecisionResult @9 :DecisionRecordResult;
+    recordOutcomeResult  @10 :DecisionOutcomeResult;
+    queryOutcomesResult  @11 :DecisionOutcomeQueryResult;
   }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R6 durable decision/outcome types (hyprstream-metrics-api decision_outcome)
+# ═══════════════════════════════════════════════════════════════════════════
+
+struct DecisionRecordRequest {
+  schemaFingerprint @0 :Text;
+  modelId           @1 :Text;
+  encodingId        @2 :Text;
+  quantization      @3 :Text;
+  computeProfile    @4 :Text;
+  calibVersion      @5 :Text;   # empty = raw (uncalibrated) inference
+  payload           @6 :Data;   # Arrow IPC stream; bounded decode server-side
+}
+
+struct DecisionRecordResult {
+  decisionId @0 :Text;
+  rowIds     @1 :List(Text);  # stable per-input-row ids, payload order
+}
+
+enum ExpectedCalib {
+  any     @0;   # no calibration assertion
+  raw     @1;   # decision row must be uncalibrated (calibVersion NULL)
+  version @2;   # exact calibVersion match
+}
+
+struct DecisionOutcomeRequest {
+  decisionId             @0 :Text;
+  decisionRowId          @1 :Text;
+  questionId             @2 :Text;
+  # Complete-identity assertions (R6B); empty text = not asserted.
+  expectedSchemaFingerprint @3 :Text;
+  expectedModelId           @4 :Text;
+  expectedEncodingId        @5 :Text;
+  expectedQuantization      @6 :Text;
+  expectedComputeProfile    @7 :Text;
+  expectedCalib             @8 :ExpectedCalib;
+  expectedCalibVersion      @9 :Text;
+  # Realized outcome; empty label = absent, hasValue gates the numeric score
+  # channel (0.0 is a legitimate value and must be distinguishable from
+  # absent).
+  outcomeLabel           @10 :Text;
+  outcomeValue           @11 :Float64;
+  hasOutcomeValue        @12 :Bool;
+  outcomeSource          @13 :Text;
+  supersedesOutcomeId    @14 :Text;  # empty = new observation, not a correction
+}
+
+struct DecisionOutcomeResult {
+  outcomeId @0 :Text;
+}
+
+struct DecisionOutcomeQuery {
+  schemaFingerprint @0 :Text;   # empty = all
+  modelId           @1 :Text;   # empty = all
+  questionId        @2 :Text;   # empty = all
+  calibFilter       @3 :ExpectedCalib;
+  calibVersion      @4 :Text;   # only for calibFilter = version
+  includeSuperseded @5 :Bool;
+  limit             @6 :UInt32; # 0 = server default; hard-capped server-side
+  afterCreatedAt    @7 :Int64;  # ASC keyset; zero + empty id = first page
+  afterOutcomeId    @8 :Text;   # bounded stored id; cursor is not authority
+}
+
+struct DecisionOutcomeJoinRow {
+  outcomeId          @0 :Text;
+  tenantId           @1 :Text;
+  decisionId         @2 :Text;
+  decisionRowId      @3 :Text;
+  questionId         @4 :Text;
+  outcomeLabel       @5 :Text;   # empty = none
+  outcomeValue       @6 :Float64;
+  hasOutcomeValue    @7 :Bool;
+  outcomeSource      @8 :Text;
+  supersedesOutcomeId @9 :Text;  # empty = none
+  createdAt          @10 :Int64;
+  schemaFingerprint  @11 :Text;
+  modelId            @12 :Text;
+  encodingId         @13 :Text;
+  quantization       @14 :Text;
+  computeProfile     @15 :Text;
+  calibVersion       @16 :Text;  # empty = raw decision row
+  decisionCreatedAt  @17 :Int64;
+}
+
+struct DecisionOutcomeQueryResult {
+  rows @0 :List(DecisionOutcomeJoinRow);
+  hasMore @1 :Bool;
+  nextCreatedAt @2 :Int64;     # zero when hasMore = false
+  nextOutcomeId @3 :Text;     # empty when hasMore = false
 }

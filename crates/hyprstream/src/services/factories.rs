@@ -3307,9 +3307,18 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
                 hyprstream_metrics::create_schema_v2_tables(backend.as_ref())
                     .await
                     .map_err(|e| anyhow::anyhow!("metrics schema v2 init: {e}"))?;
-                QueryOrchestrator::new(backend as Arc<dyn hyprstream_metrics::StorageBackend>)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("QueryOrchestrator init: {e}"))
+                // R6 durable decision/outcome tables (idempotent CREATE TABLE
+                // IF NOT EXISTS; existing tables are never migrated).
+                hyprstream_metrics::metrics::decision_outcome::create_decision_outcome_tables(
+                    backend.as_ref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("decision outcome schema init: {e}"))?;
+                QueryOrchestrator::new(
+                    backend.clone() as Arc<dyn hyprstream_metrics::StorageBackend>
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("QueryOrchestrator init: {e}"))
             })
         })
         .map_err(|e| anyhow::anyhow!("metrics service init: {e}"))?,
@@ -3331,7 +3340,10 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
         ctx.transport("metrics", SocketKind::Rep),
         sk,
         policy_client,
-    );
+    )
+    // R6 producer seam: decision/outcome stores over the same backend. The
+    // R4 native serving producer hookup is coordinated separately.
+    .with_decision_stores(backend.clone());
     if let Some(issuer) = ctx.oauth_issuer_url() {
         metrics_service = metrics_service.with_expected_audience(issuer.to_owned());
     }

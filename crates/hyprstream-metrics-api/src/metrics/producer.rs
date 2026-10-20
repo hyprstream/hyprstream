@@ -11,6 +11,7 @@
 
 use super::calibration::CalibrationStore;
 use super::decision_batch::DecisionBatchStore;
+use super::decision_outcome::{DecisionRowStore, OutcomeStore};
 use super::{create_record_batch, MetricRecord, METRICS_TABLE};
 use crate::storage::StorageBackend;
 use std::collections::BTreeMap;
@@ -59,9 +60,13 @@ impl<B: StorageBackend> MetricsProducer<B> {
     }
 
     /// Create all schema-v2 tables (`metrics`, `calibration_params`,
-    /// `decision_batches`) and migrate pre-v2 `metrics` tables in place.
+    /// `decision_batches`), migrate pre-v2 `metrics` tables in place, and
+    /// create the R6 decision/outcome tables — so lifecycle-faithful callers
+    /// can use [`Self::decision_rows`] / [`Self::outcomes`] right after
+    /// [`Self::init`].
     pub async fn init(&self) -> Result<(), Status> {
-        super::create_schema_v2_tables(&*self.backend).await
+        super::create_schema_v2_tables(&*self.backend).await?;
+        super::decision_outcome::create_decision_outcome_tables(&*self.backend).await
     }
 
     /// Build a point-sample record (window of one: sum == avg == value) with
@@ -134,5 +139,15 @@ impl<B: StorageBackend> MetricsProducer<B> {
     /// Arrow-native decision-batch store on the same backend.
     pub fn decision_batches(&self) -> DecisionBatchStore<B> {
         DecisionBatchStore::new(Arc::clone(&self.backend))
+    }
+
+    /// Durable decision-row store on the same backend (R6 outcome linkage).
+    pub fn decision_rows(&self) -> DecisionRowStore<B> {
+        DecisionRowStore::new(Arc::clone(&self.backend))
+    }
+
+    /// Realized-outcome store on the same backend (R6 outcome linkage).
+    pub fn outcomes(&self) -> OutcomeStore<B> {
+        OutcomeStore::new(Arc::clone(&self.backend))
     }
 }

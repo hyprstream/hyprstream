@@ -13,8 +13,25 @@ path = "src/lib.rs"
 [dependencies]
 # Arrow must stay on the SAME major as the engine crate's duckdb/datafusion
 # pair (arrow 56 for duckdb =1.4.3 + datafusion 50) — RecordBatch crosses the
-# api/engine boundary by type identity.
-arrow = "56.2.0"
+# api/engine boundary by type identity. ipc_compression enables the arrow-ipc
+# LZ4/ZSTD read/write surface: the R6 bounded-decode path verifies compressed
+# decision payloads (root-authorized narrow dependency change; lz4_flex/zstd
+# below reuse the exact versions already in Cargo.lock via arrow-ipc).
+arrow = { version = "56.2.0", features = ["ipc_compression"] }
+
+# Direct codec decoders for the BOUNDED streaming verification of compressed
+# IPC buffers (measures ACTUAL decompressed expansion with a hard cap before
+# the Arrow decoder allocates; arrow-ipc's own decoders are unbounded
+# read_to_end). Same versions already resolved in Cargo.lock — no new
+# packages, two existing-version edges.
+lz4_flex = "0.11"
+zstd = "0.13"
+
+# jev-1 decision/question schema contract: canonical `jev.kind`/`jev.labels`
+# Arrow field-metadata keys, `QuestionKind`, and profile limits for the R6
+# decision/outcome stores. Apache-2.0 leaf (acyclic; arrow 56.2.0 matches the
+# boundary version above, so Arrow types unify by identity).
+hyprstream-decision = { path = "../hyprstream-decision", version = "0.1.0" }
 
 # Server/RPC
 tonic = { version = "0.13", features = ["transport"] }
@@ -33,5 +50,7 @@ uuid = { version = "1.0", features = ["v4"] }
 workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+[dev-dependencies]
+# Existing locked Arrow-generated FlatBuffer fixture builder, no new version/node.
+flatbuffers = "=25.9.23"

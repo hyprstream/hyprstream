@@ -6890,6 +6890,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
  "fastrand 2.3.0",
+ "flatbuffers",
  "fred",
  "futures",
  "git2",
@@ -7406,11 +7407,15 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "flatbuffers",
+ "hyprstream-decision",
+ "lz4_flex",
  "serde",
  "serde_json",
  "tonic 0.13.1",
  "uuid 1.18.1",
  "workspace-hack",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -19554,6 +19559,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "arrayvec",
+ "arrow-ipc",
  "axum 0.7.9",
  "axum-core 0.4.5",
  "base64ct",
@@ -19601,6 +19607,7 @@ dependencies = [
  "event-listener 5.4.1",
  "event-listener-strategy",
  "fastrand 2.3.0",
+ "flatbuffers",
  "flate2",
  "fnv",
  "form_urlencoded",
@@ -19649,6 +19656,7 @@ dependencies = [
  "linux-raw-sys 0.4.15",
  "log",
  "lru 0.16.4",
+ "lz4_flex",
  "memchr",
  "minimal-lexical",
  "miniz_oxide",
@@ -19754,6 +19762,8 @@ dependencies = [
  "winnow 0.7.13",
  "zerocopy",
  "zeroize",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.1",
  "zstd-sys",
 ]
 

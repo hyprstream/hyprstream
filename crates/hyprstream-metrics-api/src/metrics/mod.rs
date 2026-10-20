@@ -3,6 +3,9 @@
 
 pub mod calibration;
 pub mod decision_batch;
+mod decision_ipc_metadata;
+mod decision_ipc_representation;
+pub mod decision_outcome;
 pub mod producer;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
