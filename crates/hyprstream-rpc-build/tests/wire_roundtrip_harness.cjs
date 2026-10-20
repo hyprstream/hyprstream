@@ -136,7 +136,7 @@ function doubleFarDataReader(kind, nested) {
   word(pad, kind === 'pad-kind' ? 0 : kind === 'pad-double' ? 6 : (kind === 'object-overrun' || kind === 'empty-object') ? 10 : 2, kind === 'object-segment' ? 99 : 2);
   word(pad + 8, kind === 'tag-kind' ? 2 : 1, container ? (1 << 3) | 6 : ((kind === 'empty-object' || kind === 'zero-word-object' ? 0 : kind === 'payload-overrun' ? 9 : 3) << 3) | 2);
   if (container) { word(object, 1, (3 << 3) | 2); bytes.set([1, 2, 3], object + 8); }
-  else bytes.set([1, 2, 3], object);
+  else if (kind !== 'zero-word-object') bytes.set([1, 2, 3], object);
   const root = new CapnpReader(bytes, 0, 1);
   return nested ? root.getStruct(0, 0, 1) : root;
 }
