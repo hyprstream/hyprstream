@@ -369,7 +369,7 @@ function main() {
         validEmpty: empty !== null,
         absentDataDefaults: empty?.getUint32(0) === 0,
         absentPointerDefaults: empty?.getDataList(0).length === 0,
-        undersizedDataDefaults: undersized?.getUint32(4) === 0,
+        undersizedDataDefaults: undersized?.getUint32(8) === 0,
         rejectsNonempty: nonempty === null,
       };
     }
