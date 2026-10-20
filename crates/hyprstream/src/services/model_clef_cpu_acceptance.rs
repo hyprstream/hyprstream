@@ -1335,7 +1335,10 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "DECISION_CANCELLED",
         "timeout_zero",
     )?;
-    orders.push(t6_assert_order(&model, &alice_key, "alice").await?);
+    anyhow::ensure!(
+        model.take_test_work_order().await.is_none(),
+        "zero-timeout decision must not mint an internal work order"
+    );
     let recovery = alice.infer(T6_MODEL).decide(&requests[0]).await?;
     let cancel_recovery_max_abs = t6_close(
         &t6_distributions(&recovery)?,
