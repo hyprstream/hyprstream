@@ -1,0 +1,721 @@
+//! Scoring: observations → the pinned measurement protocol's numbers.
+//!
+//! Fields are the macro rule's unit. For [`EvalSet`](crate::run::EvalSet)
+//! runs a field is a declared question; for item runs (the bench shape, where
+//! every item carries its own question id) fields are **family × kind ×
+//! cardinality** groups — calibration metrics consume probability vectors and
+//! truth indices, so items with different label sets still pool correctly,
+//! while cardinality stays fixed inside a field so the ordinal metrics (SCE /
+//! ACE / RPS) are well-defined.
+//!
+//! Everything numeric goes through [`hyprstream_calibration`]: ECE/Brier/NLL
+//! under the 15 equal-mass bin gate protocol, SCE/ACE + RPS for the `score`
+//! primitive, macro averages with bootstrap CIs, all assembled into the
+//! protocol's [`GateReport`]. Abstained observations are excluded from
+//! calibration (there is no distribution to score) and counted in the
+//! abstention rate — selective prediction is downstream's job.
+
+use std::collections::BTreeMap;
+
+use hyprstream_calibration::metrics;
+use hyprstream_calibration::protocol::{FieldMetrics, GateReport, ShiftSplit, GATE_BIN_COUNT};
+use hyprstream_decision::spec::QuestionKind;
+
+use crate::error::EvalError;
+use crate::run::RunOutput;
+use crate::teacher::EnsembleOutput;
+
+/// Scoring knobs.
+#[derive(Debug, Clone)]
+pub struct ScoreConfig {
+    /// Bootstrap seed for all CIs (gate reports pin theirs; a run report pins
+    /// its own so numbers are reproducible).
+    pub bootstrap_seed: u64,
+    /// The split name recorded on the gate report (e.g. `"deterministic"`,
+    /// `"shift"`, `"zero-shot"`).
+    pub split_name: &'static str,
+    /// Fit families for the report's shift split: families whose items were
+    /// synthesized into training data, used for distillation targets, or used
+    /// to fit calibration parameters. Observed families NOT in this list are
+    /// classified as held-out evaluation families, and observations tagged
+    /// with a declared fit family are excluded from the gate's field rows
+    /// entirely — they are training data, and silently macro-averaging them
+    /// into a purported held-out gate would corrupt the measurement. Defaults
+    /// to none — a pure-eval report. Inputs are raw family tags; missing
+    /// families never match a declared string. Report identities use the
+    /// injective encoding documented on [`ScoreReport::by_family`].
+    pub fit_families: Vec<String>,
+}
+
+impl Default for ScoreConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_seed: 0xE4A1,
+            split_name: "eval",
+            fit_families: Vec::new(),
+        }
+    }
+}
+
+impl ScoreConfig {
+    /// Declare the fit families (see [`ScoreConfig::fit_families`]).
+    pub fn with_fit_families(
+        mut self,
+        families: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.fit_families = families.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// Per-field metrics for one breakdown dimension (family or stratum).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakdownMetrics {
+    /// The dimension value (e.g. `arith`, `nearmiss`).
+    pub key: String,
+    /// Rows scored in this bucket.
+    pub n: usize,
+    /// Macro-averaged ECE over the bucket's fields (equal field weights).
+    /// `None` when the bucket has no scored rows — an unmeasured calibration
+    /// value is never reported as a perfect `0.0`.
+    pub macro_ece: Option<f64>,
+    /// Argmax accuracy over the bucket's scored rows. `None` when the bucket
+    /// has no labeled, answered rows — unavailable, not zero accuracy.
+    pub accuracy: Option<f64>,
+    /// Abstention rate over the bucket's rows.
+    pub abstention_rate: f64,
+}
+
+/// Option-order robustness over a permutation group (S6b1): the fraction of
+/// group members whose subject argmax **label** differs from the base
+/// member's. Labels are compared as canonical label indices mapped through
+/// each member's own label list — for cyclic rotations of one choice item the
+/// correct option keeps its name while its index rotates, so label comparison
+/// is the semantics ("the same answer"), index comparison is not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlipRate {
+    /// Groups that contributed (≥ 2 answered members).
+    pub groups: usize,
+    /// Fraction of non-base members disagreeing with their base's argmax label.
+    pub flip_rate: f64,
+}
+
+/// Teacher-ensemble agreement summary for a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnsembleAgreement {
+    /// Mean per-item argmax agreement (fraction of teachers matching the
+    /// ensemble argmax), averaged over items and questions. `None` when
+    /// there are no samples (an empty outputs slice) — unmeasured, never a
+    /// fake 0.0 (which would read as measured total disagreement).
+    pub mean_argmax_agreement: Option<f64>,
+    /// Per-item agreement values (reporting/distribution input).
+    pub per_item: Vec<(String, f64)>,
+}
+
+/// One item's score line (the smallest report unit).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemScore {
+    /// Item/row id.
+    pub id: String,
+    /// Question id.
+    pub question_id: String,
+    /// Whether the subject abstained.
+    pub abstained: bool,
+    /// Whether the argmax matched truth (`None` when unlabeled or abstained).
+    pub correct: Option<bool>,
+}
+
+/// A scored run.
+#[derive(Debug)]
+pub struct ScoreReport {
+    /// The gate-protocol report (per-field metrics + macro CIs). `None` when
+    /// no held-out labeled, answered observations exist.
+    pub gate: Option<GateReport>,
+    /// Per-family breakdown. Missing family is `~untagged`; a raw tag
+    /// starting `~` gains one leading `~`. The same injective identities
+    /// appear in gate fields, NLL keys and the fit/eval split. Ordinary
+    /// family strings (including literal `unknown`) are unchanged.
+    pub by_family: Vec<BreakdownMetrics>,
+    /// Per-stratum breakdown.
+    pub by_stratum: Vec<BreakdownMetrics>,
+    /// Option-order flip rate over permutation groups. `None` = **not
+    /// measured** (no group contributed a base/member pair — see
+    /// [`flip_rate_with_labels`]);
+    /// `Some` with `flip_rate == 0.0` = computed, no flips. The distinction
+    /// matters: an uncomputed rate must never be misread as
+    /// permutation-robustness.
+    pub flip_rate: Option<FlipRate>,
+    /// Overall abstention rate. `None` when no observations were made;
+    /// `Some(0.0)` means a measured run answered every request.
+    pub abstention_rate: Option<f64>,
+    /// Argmax accuracy over labeled, answered observations.
+    pub accuracy: Option<f64>,
+    /// Per-field negative log-likelihood, aligned with the gate report's
+    /// field rows. (P0.2's `FieldMetrics` type has no NLL slot and is owned
+    /// by the calibration crate, so NLL rides alongside the gate report here
+    /// rather than inside it.) A field whose realized labels ever sit at
+    /// zero probability reports `f64::INFINITY` — a legitimate measurement,
+    /// not a scoring failure.
+    pub nll_by_field: Vec<(String, f64)>,
+    /// Per-item lines.
+    pub items: Vec<ItemScore>,
+}
+
+/// Preserve the actual optional family in grouping keys. A missing tag is
+/// not the caller's literal `"unknown"` family (or any other string).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FieldKey {
+    family: Option<String>,
+    field: String,
+}
+
+/// Injective report identity: ordinary family tags remain unchanged; missing
+/// is `~untagged`, and raw tags starting `~` gain one leading `~`.
+fn family_identity(family: Option<&str>) -> String {
+    match family {
+        None => "~untagged".to_owned(),
+        Some(tag) if tag.starts_with('~') => format!("~{tag}"),
+        Some(tag) => tag.to_owned(),
+    }
+}
+
+fn field_key(obs: &crate::run::Observation, by_question: bool) -> FieldKey {
+    let field = if by_question {
+        obs.question_id.clone()
+    } else {
+        let cardinality = obs.probabilities.as_ref().map_or(0, std::vec::Vec::len);
+        format!("{}:{cardinality}", obs.kind)
+    };
+    FieldKey {
+        family: obs.family.clone(),
+        field,
+    }
+}
+
+fn field_identity(key: &FieldKey, by_question: bool, multi_family: bool) -> String {
+    if by_question && !multi_family {
+        key.field.clone()
+    } else {
+        format!("{}/{}", family_identity(key.family.as_deref()), key.field)
+    }
+}
+
+fn is_fit_family(family: Option<&str>, config: &ScoreConfig) -> bool {
+    family.is_some_and(|tag| config.fit_families.iter().any(|fit| fit == tag))
+}
+
+/// Number of distinct family tags, retaining None separately from Some.
+fn family_count(observations: &[crate::run::Observation]) -> usize {
+    observations
+        .iter()
+        .map(|obs| obs.family.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Per-field metrics plus the field's NLL (returned separately because
+/// P0.2's `FieldMetrics` has no NLL slot — see [`ScoreReport::nll_by_field`]).
+fn field_metrics(
+    field: &str,
+    family: &str,
+    kind: QuestionKind,
+    probs: &[&[f64]],
+    labels: &[usize],
+) -> Result<(FieldMetrics, f64), EvalError> {
+    let ordinal = kind == QuestionKind::Score;
+    // A valid distribution may assign zero probability to the realized label
+    // (an imperfect one-hot classifier): NLL is then legitimately infinite,
+    // not a scoring failure — the rest of the report must still assemble.
+    let nll = metrics::nll(probs, labels).unwrap_or(f64::INFINITY);
+    Ok((
+        FieldMetrics {
+            field: field.to_owned(),
+            family: family.to_owned(),
+            n: labels.len(),
+            ece: metrics::ece(probs, labels, GATE_BIN_COUNT)?,
+            brier: metrics::brier(probs, labels)?,
+            sce: ordinal
+                .then(|| metrics::sce(probs, labels, GATE_BIN_COUNT))
+                .transpose()?,
+            ace: ordinal
+                .then(|| metrics::ace(probs, labels, GATE_BIN_COUNT))
+                .transpose()?,
+            rps: ordinal.then(|| metrics::rps(probs, labels)).transpose()?,
+        },
+        nll,
+    ))
+}
+
+/// Validate every input before fit/eval splitting or any metric aggregation.
+fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
+    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
+    use hyprstream_metrics_api::arrow::array::{Array, FixedSizeListArray, Float32Array};
+    let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
+    if output.batch.is_some() != output.schema_fingerprint.is_some() {
+        return Err(invalid(
+            "run batch and schema fingerprint must either both be present or both be absent",
+        ));
+    }
+    for obs in &output.observations {
+        crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
+        if obs.truth.is_some_and(|truth| truth >= obs.labels.len()) {
+            return Err(invalid("observation truth is outside its declared labels"));
+        }
+        if let Some(probabilities) = &obs.probabilities {
+            if probabilities.len() != obs.labels.len() {
+                return Err(invalid(
+                    "observation probability width differs from its labels",
+                ));
+            }
+            check_distribution(probabilities, PRODUCER_SUM_TOLERANCE)
+                .map_err(|_| invalid("observation has an invalid probability distribution"))?;
+        }
+    }
+    if let Some(batch) = &output.batch {
+        let fingerprint = output
+            .schema_fingerprint
+            .as_deref()
+            .ok_or_else(|| invalid("set run has no schema fingerprint"))?;
+        let schema = crate::persist::validate_provenance(output, batch, fingerprint)?;
+        let expected = batch
+            .num_rows()
+            .checked_mul(schema.questions().len())
+            .ok_or_else(|| invalid("set observation count overflow"))?;
+        if output.observations.len() != expected {
+            return Err(invalid(
+                "set observation count differs from its Arrow batch",
+            ));
+        }
+        for (question_index, question) in schema.questions().iter().enumerate() {
+            let probabilities = batch
+                .column_by_name(&format!("{}.probabilities", question.id))
+                .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
+                .ok_or_else(|| invalid("set run has an invalid probability column"))?;
+            let labels = question.labels();
+            for row in 0..batch.num_rows() {
+                let obs = &output.observations[row * schema.questions().len() + question_index];
+                if obs.question_id != question.id
+                    || obs.kind != question.kind
+                    || obs.labels != labels
+                {
+                    return Err(invalid(
+                        "set observation profile/order differs from its Arrow batch",
+                    ));
+                }
+                if probabilities.is_null(row) {
+                    if obs.probabilities.is_some() {
+                        return Err(invalid(
+                            "set observation abstention differs from its Arrow batch",
+                        ));
+                    }
+                } else {
+                    let values = probabilities.value(row);
+                    let values = values
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or_else(|| invalid("set run has invalid probability values"))?;
+                    if obs.probabilities.as_deref() != Some(values.values().as_ref()) {
+                        return Err(invalid(
+                            "set observation probabilities differ from its Arrow batch",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Score a run's observations under the pinned protocol.
+pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport, EvalError> {
+    output.validate_model_provenance()?;
+    validate_observations(output)?;
+    let by_question = output.batch.is_some();
+    let multi_family = family_count(&output.observations) > 1;
+    // Group labeled, answered observations into fields.
+    let mut fields: BTreeMap<FieldKey, (QuestionKind, Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
+    let mut items = Vec::with_capacity(output.observations.len());
+    let mut abstained = 0usize;
+    let mut correct = 0usize;
+    let mut labeled_answered = 0usize;
+    for obs in &output.observations {
+        let (is_abstained, is_correct) = match (&obs.probabilities, obs.truth) {
+            (Some(probs), Some(truth)) => {
+                let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
+                let hit = metrics::argmax(&probs64) == truth;
+                let key = field_key(obs, by_question);
+                let entry = fields
+                    .entry(key)
+                    .or_insert_with(|| (obs.kind, Vec::new(), Vec::new()));
+                entry.1.push(probs64);
+                entry.2.push(truth);
+                labeled_answered += 1;
+                if hit {
+                    correct += 1;
+                }
+                (false, Some(hit))
+            }
+            (Some(_), None) => (false, None),
+            (None, _) => {
+                abstained += 1;
+                (true, None)
+            }
+        };
+        items.push(ItemScore {
+            id: obs.id.clone(),
+            question_id: obs.question_id.clone(),
+            abstained: is_abstained,
+            correct: is_correct,
+        });
+    }
+
+    let mut field_rows = Vec::with_capacity(fields.len());
+    let mut nll_by_field = Vec::with_capacity(fields.len());
+    for (key, (kind, probs, labels)) in &fields {
+        // Declared fit families are training data: their observations must
+        // not enter the held-out gate's macro average (the split metadata
+        // alone does not exclude them).
+        if is_fit_family(key.family.as_deref(), config) {
+            continue;
+        }
+        let refs: Vec<&[f64]> = probs.iter().map(std::vec::Vec::as_slice).collect();
+        let field = field_identity(key, by_question, multi_family);
+        let family = family_identity(key.family.as_deref());
+        let (metrics_row, nll) = field_metrics(&field, &family, *kind, &refs, labels)?;
+        field_rows.push(metrics_row);
+        nll_by_field.push((field, nll));
+    }
+
+    // Match fit tags against actual Some(rawtag), then encode identities
+    // consistently for both sides of the reported split.
+    let eval_families: Vec<String> = output
+        .observations
+        .iter()
+        .map(|obs| obs.family.as_deref())
+        .filter(|family| !is_fit_family(*family, config))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(family_identity)
+        .collect();
+    let fit_families: Vec<String> = config
+        .fit_families
+        .iter()
+        .map(|family| family_identity(Some(family)))
+        .collect();
+    let gate = if field_rows.is_empty() {
+        None
+    } else {
+        Some(GateReport::assemble(
+            output.model_id.clone(),
+            config.split_name,
+            ShiftSplit::new(fit_families, eval_families)?,
+            field_rows,
+            config.bootstrap_seed,
+        )?)
+    };
+
+    #[allow(clippy::cast_precision_loss)]
+    let total = output.observations.len();
+    let abstention_rate = (total > 0).then(|| abstained as f64 / total as f64);
+    #[allow(clippy::cast_precision_loss)]
+    let accuracy = (labeled_answered > 0).then(|| correct as f64 / labeled_answered as f64);
+
+    Ok(ScoreReport {
+        gate,
+        by_family: breakdown(&output.observations, by_question, |obs| {
+            Some(family_identity(obs.family.as_deref()))
+        })?,
+        by_stratum: breakdown(&output.observations, by_question, |obs| obs.stratum.clone())?,
+        flip_rate: {
+            // Observation labels are captured with each prediction, so the
+            // score path can measure semantic option flips without an
+            // external bench manifest. Set runs repeat question ids across
+            // rows; item runs may rotate question ids and labels.
+            let flip = flip_rate_with_observation_labels(
+                &output.observations,
+                output.batch.is_none(),
+                |obs| Some(obs.labels.clone()),
+            );
+            (flip.groups > 0).then_some(flip)
+        },
+        abstention_rate,
+        accuracy,
+        nll_by_field,
+        items,
+    })
+}
+
+/// Macro-ECE + accuracy + abstention for one breakdown dimension. Field
+/// keying inside a bucket follows the same rule as the top-level fields
+/// (question id for set runs — two same-kind questions never merge into one
+/// field — family × kind × cardinality for item runs).
+fn breakdown(
+    observations: &[crate::run::Observation],
+    by_question: bool,
+    key_of: impl Fn(&crate::run::Observation) -> Option<String>,
+) -> Result<Vec<BreakdownMetrics>, EvalError> {
+    let mut buckets: BTreeMap<String, Vec<&crate::run::Observation>> = BTreeMap::new();
+    for obs in observations {
+        if let Some(key) = key_of(obs) {
+            buckets.entry(key).or_default().push(obs);
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(key, bucket)| {
+            let mut fields: BTreeMap<FieldKey, (Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
+            let mut correct = 0usize;
+            let mut labeled = 0usize;
+            let mut abstained = 0usize;
+            for obs in &bucket {
+                match (&obs.probabilities, obs.truth) {
+                    (Some(probs), Some(truth)) => {
+                        let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
+                        if metrics::argmax(&probs64) == truth {
+                            correct += 1;
+                        }
+                        labeled += 1;
+                        let field = field_key(obs, by_question);
+                        let entry = fields.entry(field).or_default();
+                        entry.0.push(probs64);
+                        entry.1.push(truth);
+                    }
+                    (Some(_), None) => {}
+                    (None, _) => abstained += 1,
+                }
+            }
+            let eces: Vec<f64> = fields
+                .values()
+                .map(|(probs, labels)| {
+                    let refs: Vec<&[f64]> = probs.iter().map(std::vec::Vec::as_slice).collect();
+                    metrics::ece(&refs, labels, GATE_BIN_COUNT)
+                })
+                .collect::<Result<_, _>>()?;
+            #[allow(clippy::cast_precision_loss)]
+            let n = bucket.len();
+            Ok(BreakdownMetrics {
+                key,
+                n,
+                macro_ece: hyprstream_calibration::protocol::macro_average(&eces),
+                #[allow(clippy::cast_precision_loss)]
+                accuracy: (labeled > 0).then(|| correct as f64 / labeled as f64),
+                #[allow(clippy::cast_precision_loss)]
+                abstention_rate: if n == 0 {
+                    0.0
+                } else {
+                    abstained as f64 / n as f64
+                },
+            })
+        })
+        .collect()
+}
+
+/// Option-order flip rate across permutation groups. Within a group the base
+/// member is the one whose id equals the group id; every other member's
+/// argmax **label** must equal its base's. A multi-question `EvalSet` answers
+/// EVERY question on the base row, so the group holds one base observation
+/// per question — each member is then compared against the base observation
+/// of its OWN question (comparing against another question's base label
+/// would report spurious flips). A single-question (bench item) group has
+/// exactly one base; cyclic rotations carry their own question ids and
+/// label orders, and compare against that one base. Members without labels
+/// resolvable through their question are skipped — the caller supplies each
+/// observation's canonical labels via `labels_of`.
+pub fn flip_rate_with_labels(
+    observations: &[crate::run::Observation],
+    labels_of: impl Fn(&str) -> Option<Vec<String>>,
+) -> FlipRate {
+    flip_rate_with_observation_labels(observations, false, |obs| labels_of(&obs.question_id))
+}
+
+fn flip_rate_with_observation_labels(
+    observations: &[crate::run::Observation],
+    known_bench: bool,
+    labels_of: impl Fn(&crate::run::Observation) -> Option<Vec<String>>,
+) -> FlipRate {
+    let mut groups: BTreeMap<&str, Vec<&crate::run::Observation>> = BTreeMap::new();
+    // Legacy observation-only shape inference uses ALL observations (abstained included):
+    // bench-shaped groups (cyclic rotations of one choice item) give every
+    // rotation its own question id, so observation count == distinct
+    // question count. Set-shaped groups repeat question ids across rows —
+    // counting only ANSWERED observations would misread a partial set
+    // response (base answered q1 only, rotation answered q2 only) as
+    // bench-shaped and enable the cross-question fallback.
+    let mut shapes: BTreeMap<&str, (usize, std::collections::BTreeSet<&str>)> = BTreeMap::new();
+    for obs in observations {
+        if let Some(group) = &obs.group {
+            let shape = shapes.entry(group.as_str()).or_default();
+            shape.0 += 1;
+            shape.1.insert(obs.question_id.as_str());
+            if obs.probabilities.is_some() {
+                groups.entry(group.as_str()).or_default().push(obs);
+            }
+        }
+    }
+    let label_of = |obs: &crate::run::Observation| -> Option<String> {
+        let labels = labels_of(obs)?;
+        let index = obs.argmax_label_index()?;
+        labels.get(index).cloned()
+    };
+    let mut used = 0usize;
+    let mut flips = 0usize;
+    let mut counted_groups = 0usize;
+    for (base_id, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let bases: Vec<&crate::run::Observation> = members
+            .iter()
+            .filter(|obs| obs.id == base_id)
+            .copied()
+            .collect();
+        if bases.is_empty() {
+            continue;
+        }
+        // Bench-shaped groups (cyclic rotations of one choice item) give
+        // every rotation its own question id and label order, so the
+        // observation count equals the distinct question count and the
+        // single base is the only possible comparison. Set-shaped groups
+        // repeat question ids across rows — there, only a same-question
+        // base is a valid comparison.
+        // score_bench_run knows the shape even when some rotations reuse IDs.
+        // Retain inference only for the legacy observation-only public helper.
+        let bench_shaped = known_bench
+            || shapes
+                .get(base_id)
+                .is_some_and(|(observations, questions)| *observations == questions.len());
+        let mut counted = false;
+        for member in members.iter().filter(|member| member.id != base_id) {
+            // The base for THIS member: match the member's own question —
+            // pooling across questions compares against another question's
+            // label space and reports spurious flips (e.g. when the base row
+            // answered q1 but abstained on q2, an answered rotated q2 member
+            // has no base prediction and must be SKIPPED, not compared
+            // against the q1 base). The single-base fallback applies only to
+            // bench-shaped groups, where rotations carry their own question
+            // ids and label orders.
+            let base = if let Some(base) = bases
+                .iter()
+                .find(|base| base.question_id == member.question_id)
+            {
+                base
+            } else if bench_shaped && bases.len() == 1 {
+                &bases[0]
+            } else {
+                continue;
+            };
+            let Some(base_label) = label_of(base) else {
+                continue;
+            };
+            if let Some(label) = label_of(member) {
+                used += 1;
+                counted = true;
+                if label != base_label {
+                    flips += 1;
+                }
+            }
+        }
+        if counted {
+            counted_groups += 1;
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    FlipRate {
+        groups: counted_groups,
+        flip_rate: if used == 0 {
+            0.0
+        } else {
+            flips as f64 / used as f64
+        },
+    }
+}
+
+/// Score a bench-shaped run: [`score_run`] plus validation against each item's
+/// canonical labels before accepting its flip rate. [`score_run`] can compute
+/// flips from the labels captured in each observation; this boundary also
+/// verifies those labels against the supplied benchmark items. The flip rate
+/// stays `None` when no permutation
+/// group contributed a base/member pair (no groups, all-abstained bases, …)
+/// — an unmeasured robustness result must never look like a computed
+/// zero-flip result. Requires exactly one observation for every supplied
+/// (item id, question id), with no extra or duplicate identities.
+pub fn score_bench_run(
+    output: &RunOutput,
+    items: &[crate::run::EvalItem],
+    config: &ScoreConfig,
+) -> Result<ScoreReport, EvalError> {
+    let mut by_identity = BTreeMap::new();
+    for item in items {
+        let identity = (item.id.as_str(), item.question.id.as_str());
+        if by_identity.insert(identity, item).is_some() {
+            return Err(EvalError::InvalidInput(format!(
+                "duplicate eval item identity {identity:?}"
+            )));
+        }
+    }
+    let mut observed = std::collections::BTreeSet::new();
+    for obs in &output.observations {
+        let identity = (obs.id.as_str(), obs.question_id.as_str());
+        if !observed.insert(identity) {
+            return Err(EvalError::InvalidInput(format!(
+                "duplicate observation identity {identity:?}"
+            )));
+        }
+        if !by_identity.contains_key(&identity) {
+            return Err(EvalError::InvalidInput(format!(
+                "observation identity ({:?}, {:?}) has no matching eval item",
+                obs.id, obs.question_id
+            )));
+        }
+        let item = by_identity[&identity];
+        if obs.kind != item.question.kind
+            || obs.labels != item.question.labels()
+            || obs.truth != item.truth
+            || obs.family != item.family
+            || obs.stratum != item.stratum
+            || obs.group != item.group
+        {
+            return Err(EvalError::InvalidInput(format!(
+                "observation identity {identity:?} differs from its benchmark item metadata"
+            )));
+        }
+    }
+    if let Some(identity) = by_identity
+        .keys()
+        .find(|identity| !observed.contains(*identity))
+    {
+        return Err(EvalError::InvalidInput(format!(
+            "eval item identity {identity:?} has no matching observation"
+        )));
+    }
+    let mut report = score_run(output, config)?;
+    let flip = flip_rate_with_observation_labels(&output.observations, true, |obs| {
+        by_identity
+            .get(&(obs.id.as_str(), obs.question_id.as_str()))
+            .map(|item| item.question.labels())
+    });
+    report.flip_rate = (flip.groups > 0).then_some(flip);
+    Ok(report)
+}
+
+/// Summarize teacher-ensemble agreement over per-item outputs. The mean is
+/// `None` when `outputs` is empty (no agreement samples — e.g. every
+/// candidate item was filtered or failed): unmeasured must never read as
+/// measured total disagreement.
+pub fn agreement_summary(outputs: &[(String, EnsembleOutput)]) -> EnsembleAgreement {
+    let per_item: Vec<(String, f64)> = outputs
+        .iter()
+        .map(|(id, out)| {
+            let values: Vec<f64> = out.argmax_agreement.values().copied().collect();
+            let mean = hyprstream_calibration::protocol::macro_average(&values).unwrap_or(0.0);
+            (id.clone(), mean)
+        })
+        .collect();
+    let mean_argmax_agreement = hyprstream_calibration::protocol::macro_average(
+        &per_item.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+    );
+    EnsembleAgreement {
+        mean_argmax_agreement,
+        per_item,
+    }
+}
