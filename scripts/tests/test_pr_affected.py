@@ -27,7 +27,10 @@ class ExplicitReleasePackageTests(unittest.TestCase):
             patch.object(
                 PR_AFFECTED,
                 "workspace_members",
-                return_value={"hyprstream-eval": "hyprstream-eval"},
+                return_value={
+                    name: name
+                    for name in (*PR_AFFECTED.EXPLICIT_FULL_SET_PACKAGES, "hyprstream")
+                },
             ),
             patch.object(PR_AFFECTED, "prepare_guest_artifacts", return_value=0),
             patch.object(PR_AFFECTED.subprocess, "run", side_effect=run),
@@ -133,6 +136,7 @@ class ExplicitReleasePackageTests(unittest.TestCase):
             ],
             commands,
         )
+
         self.assertIn(
             [
                 "cargo",
@@ -147,6 +151,44 @@ class ExplicitReleasePackageTests(unittest.TestCase):
             ],
             commands,
         )
+
+    def test_root_fallback_tests_every_nondefault_system_one_package(self):
+        for changes in [
+            ["Cargo.lock"],
+            ["Cargo.toml", "crates/hyprstream-decision-head/src/lib.rs"],
+            [".github/scripts/pr_affected.py", "crates/hyprstream-decision/src/lib.rs"],
+        ]:
+            with self.subTest(changes=changes):
+                commands = self.run_affected(changes)
+                for package in PR_AFFECTED.EXPLICIT_FULL_SET_PACKAGES:
+                    self.assertIn(
+                        ["cargo", "nextest", "run", "--cargo-profile", "release",
+                         "--profile", "ci", "--no-fail-fast", "-p", package],
+                        commands,
+                    )
+                    self.assertIn(
+                        ["cargo", "clippy", "--release", "-p", package,
+                         "--all-targets", "--", "-D", "warnings"],
+                        commands,
+                    )
+
+    def test_narrow_decision_changes_do_not_expand_to_unrelated_packages(self):
+        for package in ["hyprstream-decision", "hyprstream-decision-head"]:
+            with self.subTest(package=package):
+                commands = self.run_affected([f"crates/{package}/src/lib.rs"])
+                self.assertEqual(len(commands), 2)
+                self.assertTrue(all(command[command.index("-p") + 1] == package
+                                    for command in commands))
+
+    def test_native_change_keeps_native_and_nondefault_gates(self):
+        commands = self.run_affected([
+            "crates/hyprstream/src/services/model.rs",
+            "crates/hyprstream-decision-head/src/lib.rs",
+        ])
+        packages = [command[command.index("-p") + 1] for command in commands]
+        self.assertCountEqual(packages, ["hyprstream", "hyprstream",
+                                        "hyprstream-decision-head", "hyprstream-decision-head"])
+
 
 
 if __name__ == "__main__":
