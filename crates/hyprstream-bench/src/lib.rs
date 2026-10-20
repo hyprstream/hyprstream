@@ -38,6 +38,7 @@
 //! the pre-committed disclosure language that accompanies every published
 //! result.
 
+pub mod content;
 pub mod family;
 pub mod gen;
 pub mod item;

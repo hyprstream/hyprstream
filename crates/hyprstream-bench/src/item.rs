@@ -183,6 +183,11 @@ impl Item {
         Some(item)
     }
 
+    /// Shared typed content identity; does not change the frozen artifact hash.
+    pub fn content_fingerprint(&self) -> Result<String, crate::content::ContentFingerprintError> {
+        crate::content::content_fingerprint(&self.state, &self.question)
+    }
+
     /// Canonical byte form — the exact input the manifest hashes.
     ///
     /// `FROZEN (vob-item/1)`: length-prefixed fields, one per line, so the

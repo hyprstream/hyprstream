@@ -110,6 +110,8 @@ jobs:
             # coverage continues in metrics-profile-nightly.yml), so the workspace-wide
             # lint would pull the whole DuckDB/DataFusion tree into every PR check.
             cargo clippy --all-targets -- -D warnings
+            # Program leaf stays outside default-members; select it explicitly.
+            bash .github/scripts/synthesis-ci.sh lint
             # The workspace lint builds default features only, so the
             # RDS-backed PDS record store (#1257, `pds-postgres`) is cfg-gated
             # out of it. Lint it explicitly so the module and its tests
@@ -168,6 +170,9 @@ jobs:
             python3 scripts/check_rust_workflow_matrix.py
             python3 -m unittest discover -s scripts/tests -p "test_check_license_boundary.py"
             python3 scripts/check_license_boundary.py
+            python3 -m unittest discover -s scripts/tests -p "test_check_program_boundaries.py"
+            python3 scripts/check_program_boundaries.py
+            python3 -m unittest discover -s scripts/tests -p "test_synthesis_ci.py"
             python3 scripts/check_build_matrix.py
             python3 -m unittest discover -s scripts/tests -p "test_check_build_matrix.py"
           '
