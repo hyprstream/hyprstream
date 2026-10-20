@@ -135,6 +135,22 @@ run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
 # for almost no runtime win on doc examples. Parity with the nextest profile.
 run_phase "doctests" cargo test --profile ci-test --doc
 
+# Decision/evaluation crates deliberately stay outside default-members. Select
+# them explicitly so workspace membership cannot give a false green result.
+# Use the same CPU libtorch and ci-test profile as the native production test
+# lane; no download-libtorch or alternative device profile is introduced.
+decision_packages=(
+  -p hyprstream-decision
+  -p hyprstream-calibration
+  -p hyprstream-decision-head
+  -p hyprstream-decision-stub
+  -p hyprstream-eval
+)
+run_phase "decision and evaluation nextest" cargo nextest run --locked \
+  --cargo-profile ci-test --profile ci --no-default-features "${decision_packages[@]}"
+run_phase "decision and evaluation doctests" cargo test --locked \
+  --profile ci-test --no-default-features "${decision_packages[@]}" --doc
+
 # RELEASE / FEATURE LANES moved to the parallel build-release job
 # (.github/scripts/graviton-release-lanes.sh) on 2026-09-15: the native
 # release build, pds-postgres lanes, and credential-pds negative gate
