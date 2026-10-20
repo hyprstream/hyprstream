@@ -1017,4 +1017,17 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
             "nested": {"validEmpty": true, "rejectsNonempty": true}
         })
     );
+    assert_eq!(
+        wd.run("double-far-object-shape", &[]),
+        json!({"root": true, "nested": true}),
+        "a nonempty target segment must reject a struct shape that overruns it"
+    );
+    assert_eq!(
+        wd.run("double-far-composite-lists", &[]),
+        json!({
+            "root": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0},
+            "nested": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0}
+        }),
+        "double-far composite tags must validate tag-word and body bounds"
+    );
 }

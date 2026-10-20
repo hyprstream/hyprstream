@@ -142,14 +142,15 @@ function doubleFarDataReader(kind, nested) {
   return nested ? root.getStruct(0, 0, 1) : root;
 }
 
-function doubleFarStructReader(nested, nonempty) {
+function doubleFarStructReader(nested, nonempty, overrun = false) {
   const rootWords = nested ? 3 : 2;
-  const bytes = new Uint8Array(16 + (rootWords + 2) * 8);
+  const objectWords = overrun ? 1 : 0;
+  const bytes = new Uint8Array(16 + (rootWords + objectWords + 2) * 8);
   const view = new DataView(bytes.buffer);
   const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
   view.setUint32(0, 2, true);
   view.setUint32(4, rootWords, true);
-  view.setUint32(8, 0, true);
+  view.setUint32(8, objectWords, true);
   view.setUint32(12, 2, true);
   word(16, 0, 1 << 16);
   if (nested) {
@@ -158,9 +159,36 @@ function doubleFarStructReader(nested, nonempty) {
   } else {
     word(24, 6, 2);
   }
-  const pad = 16 + rootWords * 8;
+  const pad = 16 + (rootWords + objectWords) * 8;
   word(pad, 2, 1);
-  word(pad + 8, 0, nonempty ? 1 : 0);
+  word(pad + 8, 0, overrun ? 2 : nonempty ? 1 : 0);
+  const root = new CapnpReader(bytes, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
+function doubleFarCompositeReader(kind, nested) {
+  const rootWords = nested ? 3 : 2;
+  const objectWords = kind === 'tag-overrun' ? 1 : 2;
+  const bytes = new Uint8Array(16 + (rootWords + objectWords + 2) * 8);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
+  view.setUint32(0, 2, true);
+  view.setUint32(4, rootWords, true);
+  view.setUint32(8, objectWords, true);
+  view.setUint32(12, 2, true);
+  word(16, 0, 1 << 16);
+  if (nested) {
+    word(24, 0, 1 << 16);
+    word(32, 6, 2);
+  } else {
+    word(24, 6, 2);
+  }
+  const object = 16 + rootWords * 8;
+  const pad = object + objectWords * 8;
+  word(pad, 2, 1);
+  word(pad + 8, 1, (1 << 3) | 7); // one body word in a composite list
+  const structCount = kind === 'body-mismatch' ? 2 : 1;
+  word(object, structCount << 2, 1); // one data word per element
   const root = new CapnpReader(bytes, 0, 1);
   return nested ? root.getStruct(0, 0, 1) : root;
 }
@@ -337,6 +365,27 @@ function main() {
       const empty = doubleFarStructReader(nested, false).getStruct(0, 0, 0);
       const nonempty = doubleFarStructReader(nested, true).getStruct(0, 1, 0);
       output[nested ? 'nested' : 'root'] = { validEmpty: empty !== null, rejectsNonempty: nonempty === null };
+    }
+    out(output);
+    return;
+  }
+  if (mode === 'double-far-object-shape') {
+    const output = {};
+    for (const nested of [false, true]) {
+      const reader = doubleFarStructReader(nested, false, true);
+      output[nested ? 'nested' : 'root'] = reader.getStruct(0, 2, 0) === null;
+    }
+    out(output);
+    return;
+  }
+  if (mode === 'double-far-composite-lists') {
+    const output = {};
+    for (const nested of [false, true]) {
+      output[nested ? 'nested' : 'root'] = {
+        valid: doubleFarCompositeReader('valid', nested).getStructList(0, 1, 0).length,
+        tagOverrun: doubleFarCompositeReader('tag-overrun', nested).getStructList(0, 1, 0).length,
+        bodyMismatch: doubleFarCompositeReader('body-mismatch', nested).getStructList(0, 1, 0).length,
+      };
     }
     out(output);
     return;
