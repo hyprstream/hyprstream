@@ -55,6 +55,8 @@ const T6_TREE: &str = "6684c66f43cf413bccd48025380a69ebe2e428a9";
 const T6_MODEL: &str = "clef-flash-fp8:main";
 const T6_TENANT: &str = "clef-t6-tenant";
 const T6_FOREIGN_TENANT: &str = "clef-t6-foreign";
+const T6_OTHER_OWNER: &str = "did:plc:cleft6unconfigured";
+const T6_LIFECYCLE: &str = "clef-t6-lifecycle";
 const T6_RECORDS_SHA: &str = "8ea59075e4fe69703375277d3180f92929744f0f43d8a25c925742d394120c0b";
 
 fn t6_jwt(
@@ -86,8 +88,95 @@ fn t6_jwt(
     ))
 }
 
+async fn t6_seed_selected_owner_rules(
+    policy: &crate::auth::PolicyManager,
+    selected: &crate::config::model_admission::ValidatedModelAdmission,
+) -> Result<()> {
+    anyhow::ensure!(selected.owner_subjects.len() == 1);
+    for (resource, action) in selected.owner_rules() {
+        policy
+            .add_policy_with_domain(
+                &selected.owner_subjects[0],
+                T6_TENANT,
+                &resource,
+                action,
+                "allow",
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_model_admission_owner_controls_primary_auth_without_literal_fallback(
+) -> Result<()> {
+    use crate::services::policy::PrimaryEnrollmentResolver as _;
+    for owner in [
+        "did:plc:firstconfiguredowner",
+        "did:plc:secondconfiguredowner",
+    ] {
+        let (_root, config) = crate::config::model_admission::tiny_fixture(
+            crate::config::model_admission::ModelOperation::Decisions,
+            T6_MODEL,
+            owner,
+        )?;
+        let selected = config
+            .selected_model_admission()?
+            .context("selected owner record")?;
+        let resolver = T6PrimaryResolver {
+            owner: owner.to_owned(),
+        };
+        let group = resolver
+            .primary_group(owner, T6_TENANT)
+            .context("configured owner enrollment")?;
+        anyhow::ensure!(
+            group.ordered_component_keys[0]
+                == SigningKey::from_bytes(&[0xA1; 32])
+                    .verifying_key()
+                    .to_bytes()
+        );
+        anyhow::ensure!(resolver.primary_group("alice", T6_TENANT).is_none());
+        anyhow::ensure!(
+            resolver.primary_group(T6_OTHER_OWNER, T6_TENANT).is_some(),
+            "negative DID must be independently enrolled"
+        );
+        let policy = crate::auth::PolicyManager::new_in_memory().await?;
+        t6_seed_selected_owner_rules(&policy, selected).await?;
+        for (resource, action) in selected.owner_rules() {
+            anyhow::ensure!(
+                policy
+                    .check_with_domain(owner, T6_TENANT, &resource, action)
+                    .await
+            );
+            for denied in ["alice", T6_OTHER_OWNER] {
+                anyhow::ensure!(
+                    !policy
+                        .check_with_domain(denied, T6_TENANT, &resource, action)
+                        .await
+                );
+            }
+        }
+        anyhow::ensure!(
+            !policy
+                .check_with_domain(owner, T6_TENANT, "model:Unload", "write")
+                .await
+        );
+    }
+    Ok(())
+}
+
 impl RestartAuthServices {
-    async fn clef_t6_new(repo: &std::path::Path, model_name: &str) -> Result<Self> {
+    async fn clef_t6_new(
+        repo: &std::path::Path,
+        model_name: &str,
+        selected: &crate::config::model_admission::ValidatedModelAdmission,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            selected.owner_subjects.len() == 1,
+            "CPU fixture exercises one configured deployment owner"
+        );
+        let owner = selected.owner_subjects[0].as_str();
+        anyhow::ensure!(owner != T6_OTHER_OWNER);
         use hyprstream_service::ServiceManager as _;
 
         let tag = hex::encode(hyprstream_rpc::envelope::generate_nonce());
@@ -106,6 +195,7 @@ impl RestartAuthServices {
             SigningKey::from_bytes(&[0xB1; 32]),
             SigningKey::from_bytes(&[0xC1; 32]),
             SigningKey::from_bytes(&[0xD1; 32]),
+            SigningKey::from_bytes(&[0xE1; 32]),
         ])?;
         let ca =
             hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
@@ -174,15 +264,8 @@ impl RestartAuthServices {
                 "allow",
             )
             .await?;
-        policy_manager
-            .add_policy_with_domain(
-                "alice",
-                T6_TENANT,
-                "model:clef-flash-fp8:main",
-                "decide",
-                "allow",
-            )
-            .await?;
+        // The primary signed caller is the exact protected configuration owner.
+        t6_seed_selected_owner_rules(&policy_manager, selected).await?;
         policy_manager
             .add_policy_with_domain(
                 "eve",
@@ -194,22 +277,18 @@ impl RestartAuthServices {
             .await?;
         policy_manager
             .add_policy_with_domain(
-                "alice",
+                owner,
                 T6_FOREIGN_TENANT,
                 "model:clef-flash-fp8:main",
                 "decide",
                 "deny",
             )
             .await?;
-        for (resource, action) in [
-            ("model:Load", "write"),
-            ("model:Status", "query"),
-            ("model:Unload", "write"),
-        ] {
-            policy_manager
-                .add_policy_with_domain("alice", T6_TENANT, resource, action, "allow")
-                .await?;
-        }
+        // Separate bounded development-only controller; deployment owners gain
+        // no Unload grant merely to support this cancellation fixture.
+        policy_manager
+            .add_policy_with_domain(T6_LIFECYCLE, T6_TENANT, "model:Unload", "write", "allow")
+            .await?;
         let (policy_transport, policy_endpoint) =
             restart_acceptance_inproc_endpoint("policy", &tag);
         let policy_service = crate::services::PolicyService::new(
@@ -221,7 +300,9 @@ impl RestartAuthServices {
         )
         .with_default_audience(RESTART_FIXTURE_ISSUER.to_owned())
         .with_jwt_key_source(jwt_source.clone())
-        .with_primary_enrollment_resolver(Arc::new(T6PrimaryResolver));
+        .with_primary_enrollment_resolver(Arc::new(T6PrimaryResolver {
+            owner: owner.to_owned(),
+        }));
         crate::services::restart_diag::phase("policy.spawn.enter");
         let manager = hyprstream_service::InprocManager::new();
         let policy_handle = manager.spawn(Box::new(policy_service)).await?;
@@ -576,7 +657,9 @@ async fn t6_assert_order(
         "original holder DID lost"
     );
     // Never serialize the order, JWT, jti, key material or full claims.
-    Ok(json!({"verified":true,"coordinate":"inference:Decide/decide", "incarnation":incarnation}))
+    Ok(
+        json!({"verified":true,"coordinate":"inference:Decide/decide", "incarnation":incarnation,"subject":subject}),
+    )
 }
 fn t6_progress(step: &'static str, elapsed_ms: u128, details: Value) -> Result<()> {
     anyhow::ensure!(
@@ -614,7 +697,9 @@ fn t6_typed_error(error: &anyhow::Error, code: &str, step: &'static str) -> Resu
     Ok(())
 }
 
-struct T6PrimaryResolver;
+struct T6PrimaryResolver {
+    owner: String,
+}
 impl crate::services::policy::PrimaryEnrollmentResolver for T6PrimaryResolver {
     fn primary_group(
         &self,
@@ -622,9 +707,11 @@ impl crate::services::policy::PrimaryEnrollmentResolver for T6PrimaryResolver {
         tenant: &str,
     ) -> Option<crate::services::policy::PrimaryGroup> {
         let byte = match (principal, tenant) {
-            ("alice", T6_TENANT | T6_FOREIGN_TENANT) => 0xA1,
+            (subject, T6_TENANT | T6_FOREIGN_TENANT) if subject == self.owner => 0xA1,
             ("bob", T6_TENANT) => 0xB1,
             ("eve", T6_TENANT) => 0xC1,
+            (T6_LIFECYCLE, T6_TENANT) => 0xD1,
+            (T6_OTHER_OWNER, T6_TENANT) => 0xE1,
             _ => return None,
         };
         let key = SigningKey::from_bytes(&[byte; 32]);
@@ -1040,15 +1127,26 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     let expected_json: Value = serde_json::from_str(T6_EXPECTED_JSON)?;
     // Exercise the production startup selector before any auth/model setup.
     // No direct reviewed_clef_flash(map) injection or arbitrary hydration JSON.
-    let (mut pin, deployment, lfs_directory) = t6_production_startup_profile()?;
-    // Production consumes a source-owned directory-derived map, not the former
-    // arbitrary hydration JSON. Bind these deterministic map bytes to the exact
-    // policy captured by from_env before moving that pin into ModelService.
-    let hydration = clef_profile::local_lfs(&lfs_directory)?;
+    let (mut pin, deployment, lfs_directory, startup_config_sha256) =
+        t6_production_startup_profile()?;
+    // Bind the selected config inventory to the exact production capture policy
+    // before moving its qualified pin into ModelService.
+    let selected = pin
+        .admission
+        .as_ref()
+        .context("production config selection missing")?
+        .clone();
+    anyhow::ensure!(
+        selected.owner_subjects.len() == 1,
+        "CPU fixture requires one configured owner"
+    );
+    let owner = selected.owner_subjects[0].as_str();
+    anyhow::ensure!(owner != T6_OTHER_OWNER);
+    let hydration = selected.local_lfs()?;
     anyhow::ensure!(
         pin.capture_policy()?
             == git2db::pinned_disk::ProjectionPolicy::from_trusted_contract(
-                clef_profile::EXPANDED_BYTES,
+                selected.manifest.expanded_bytes,
                 hydration.clone(),
             )?,
         "receipt hydration map differs from the production startup policy"
@@ -1066,7 +1164,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     anyhow::ensure!(
         hyprstream_rpc::registry::global().mode() == hyprstream_rpc::registry::EndpointMode::Inproc
     );
-    let auth = RestartAuthServices::clef_t6_new(&repo, "clef-flash-fp8").await?;
+    let auth = RestartAuthServices::clef_t6_new(&repo, "clef-flash-fp8", &selected).await?;
     let mut config = ModelServiceConfig::default();
     config.max_models = 1;
     config.max_context = Some(1024);
@@ -1095,7 +1193,9 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     let alice_key = SigningKey::from_bytes(&[0xA1; 32]);
     let bob_key = SigningKey::from_bytes(&[0xB1; 32]);
     let eve_key = SigningKey::from_bytes(&[0xC1; 32]);
-    let alice_token = t6_user_jwt("alice", &alice_key, Some(T6_TENANT), 3600).await?;
+    let lifecycle_key = SigningKey::from_bytes(&[0xD1; 32]);
+    let other_key = SigningKey::from_bytes(&[0xE1; 32]);
+    let alice_token = t6_user_jwt(owner, &alice_key, Some(T6_TENANT), 3600).await?;
     let bob_token = t6_user_jwt("bob", &bob_key, Some(T6_TENANT), 3600).await?;
     let client = |key: &SigningKey, token: Option<String>| {
         ModelClient::for_local_endpoint_bootstrap(
@@ -1107,6 +1207,28 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     };
     let alice = client(&alice_key, Some(alice_token.clone()))?;
     let bob = client(&bob_key, Some(bob_token))?;
+    let lifecycle = client(
+        &lifecycle_key,
+        Some(t6_user_jwt(T6_LIFECYCLE, &lifecycle_key, Some(T6_TENANT), 3600).await?),
+    )?;
+    let other = client(
+        &other_key,
+        Some(t6_user_jwt(T6_OTHER_OWNER, &other_key, Some(T6_TENANT), 3600).await?),
+    )?;
+    t6_typed_error(
+        &other
+            .infer(T6_MODEL)
+            .decide(&requests[0])
+            .await
+            .err()
+            .context("unconfigured owner unexpectedly admitted")?,
+        "UNAUTHORIZED",
+        "unconfigured_owner",
+    )?;
+    anyhow::ensure!(
+        model.loaded_models.read().await.is_empty() && model.take_test_work_order().await.is_none(),
+        "unconfigured owner caused model initialization or work mint"
+    );
     // All negatives travel the real signed client/verifier path. No model
     // may be resident until a legitimate caller's signed load request.
     let missing = client(&alice_key, None)?
@@ -1134,7 +1256,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     )?;
     let foreign = client(
         &alice_key,
-        Some(t6_user_jwt("alice", &alice_key, Some(T6_FOREIGN_TENANT), 3600).await?),
+        Some(t6_user_jwt(owner, &alice_key, Some(T6_FOREIGN_TENANT), 3600).await?),
     )?;
     t6_typed_error(
         &foreign
@@ -1148,7 +1270,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     )?;
     let absent_tenant = client(
         &alice_key,
-        Some(t6_user_jwt("alice", &alice_key, None, 3600).await?),
+        Some(t6_user_jwt(owner, &alice_key, None, 3600).await?),
     )?;
     anyhow::ensure!(absent_tenant
         .infer(T6_MODEL)
@@ -1157,7 +1279,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         .is_err());
     let expired = client(
         &alice_key,
-        Some(t6_user_jwt("alice", &alice_key, Some(T6_TENANT), -60).await?),
+        Some(t6_user_jwt(owner, &alice_key, Some(T6_TENANT), -60).await?),
     )?;
     anyhow::ensure!(expired.infer(T6_MODEL).decide(&requests[0]).await.is_err());
     anyhow::ensure!(
@@ -1242,7 +1364,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             1e-5,
             0.0,
         )?);
-        orders.push(t6_assert_order(&model, &alice_key, "alice").await?);
+        orders.push(t6_assert_order(&model, &alice_key, owner).await?);
         responses.push(
             json!({"record_index":i,"id":record["id"],"response":t6_response_json(&response)?}),
         );
@@ -1266,7 +1388,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     )?;
     t6_progress("repeat-before", started.elapsed().as_millis(), json!({}))?;
     let baseline = alice.infer(T6_MODEL).decide(&requests[0]).await?;
-    orders.push(t6_assert_order(&model, &alice_key, "alice").await?);
+    orders.push(t6_assert_order(&model, &alice_key, owner).await?);
     let _interleaved = bob.infer(T6_MODEL).decide(&requests[1]).await?;
     orders.push(t6_assert_order(&model, &bob_key, "bob").await?);
     let repeated = alice.infer(T6_MODEL).decide(&requests[0]).await?;
@@ -1276,7 +1398,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         1e-6,
         1e-6,
     )?;
-    orders.push(t6_assert_order(&model, &alice_key, "alice").await?);
+    orders.push(t6_assert_order(&model, &alice_key, owner).await?);
 
     t6_progress(
         "repeat-after",
@@ -1305,7 +1427,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "DECISION_INPUT",
         "oversized_schema",
     )?;
-    orders.push(t6_assert_order(&model, &alice_key, "alice").await?);
+    orders.push(t6_assert_order(&model, &alice_key, owner).await?);
 
     t6_progress(
         "oversized-after",
@@ -1343,7 +1465,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         1e-6,
         1e-6,
     )?;
-    orders.push(t6_assert_order(&model, &alice_key, "alice").await?);
+    orders.push(t6_assert_order(&model, &alice_key, owner).await?);
 
     t6_progress(
         "timeout-zero-after",
@@ -1363,12 +1485,14 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         records.first().context("missing first record")?,
         &baseline,
         &alice_key,
+        owner,
+        &lifecycle,
     )
     .await?;
     t6_progress("midforward-after", started.elapsed().as_millis(), json!({}))?;
     // A PASS receipt is published only after the fallible service stop joins.
     handle.stop().await?;
-    let receipt = json!({
+    let mut receipt = json!({
         "schema":"clef-t6-authenticated-cpu-service/1", "result":"AUTHENTICATED_CPU_SERVICE_CASES_PASS",
         "t6_complete":true, "model_service_stop_complete":true, "remaining":[],
         "artifact_commit":T6_PIN,"artifact_tree":T6_TREE,"model_ref":T6_MODEL,
@@ -1383,7 +1507,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "expected_fp8_json_sha256":t6_sha(T6_EXPECTED_JSON.as_bytes()),
         "hydration_mapping_canonical_json_sha256":t6_sha(&mapping_bytes),"threads":4,
         "caller_path":"signed end-user at+jwt -> generated Model dispatch -> real delegated-bearer PolicyService -> minted internal work -> real worker/native CPU/head",
-        "policy":"deny-by-default; explicit alice/bob same-tenant allows, eve/foreign tenant deny",
+        "policy":"deny-by-default; configured owner four rules; explicit development-only isolation peer and lifecycle controller; unconfigured DID/foreign tenant deny",
         "corpus_records":5,"corpus_questions":11,"max_oracle_probability_error":max_oracle_error,
         "oracle_atol":1e-5,"oracle_rtol":0.0,
         "isolation_max_abs":isolation_max_abs,"cancel_recovery_max_abs":cancel_recovery_max_abs,
@@ -1393,12 +1517,18 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "proc_status":std::fs::read_to_string("/proc/self/status")?.lines().filter(|l| l.starts_with("VmHWM:") || l.starts_with("VmRSS:")).collect::<Vec<_>>(),
         "orders":orders,"responses":responses,"encoding_preflight":encoding_preflight,
         "startup_profile":{"profile":"clef-flash-fp8-cpu-v1",
-            "source":"production StagingModelPin::from_env and validate_deployment",
+            "source":"production pinned HyprConfig model_admission and validate_deployment",
+            "manifest_sha256":selected.manifest_sha256,
+            "config_sha256":startup_config_sha256,
             "model_ref":T6_MODEL,"commit":T6_PIN,
             "hydration":"three fixed SHA256-named local objects; owned capture verifies full bytes"},
         "build_identity":"coordinator must bind executable/source/library SHA256 externally; no self-verification via declared CLI metadata",
         "scope":"five synthetic development records; no task accuracy/calibration/SLA/GPU/lab deployment acceptance"
     });
+    receipt["configured_owner_subject"] = json!(owner);
+    receipt["configured_owner_authenticated"] = json!(true);
+    receipt["unconfigured_owner_denied"] = json!(true);
+    receipt["fixture_only_principals"] = json!({"isolation":"bob","lifecycle":T6_LIFECYCLE});
     // All private work orders have been consumed; no bearer enters receipt.
     let mut output = std::fs::OpenOptions::new()
         .write(true)
@@ -1420,6 +1550,8 @@ async fn t6_midforward_cases(
     record: &Value,
     baseline: &DecisionResponse,
     alice_key: &SigningKey,
+    owner: &str,
+    lifecycle: &ModelClient,
 ) -> Result<Value> {
     use crate::services::clef_acceptance_control::ReleaseOnDrop;
     use std::sync::atomic::Ordering;
@@ -1429,7 +1561,7 @@ async fn t6_midforward_cases(
     t6_progress("partial-deadline-before", 0, json!({}))?;
     // Warm successful real request proves actual layers+6 callbacks, including head,
     // without adding a pause. Arm consumption is one-shot and request-local.
-    let warm = control.arm("alice", T6_TENANT, request)?;
+    let warm = control.arm(owner, T6_TENANT, request)?;
     warm.release();
     let warmed = alice.infer(T6_MODEL).decide(request).await?;
     warm.completed_success()?;
@@ -1441,7 +1573,7 @@ async fn t6_midforward_cases(
         1e-6,
         1e-6,
     )?;
-    t6_assert_order(model, alice_key, "alice").await?;
+    t6_assert_order(model, alice_key, owner).await?;
     let initial = control.current()?;
 
     // Exercise the actual end-user Model.Decide path with a caller task that
@@ -1449,7 +1581,7 @@ async fn t6_midforward_cases(
     // controller waits for the server-owned worker request signal before
     // releasing the paused checkpoint, proving propagation through Model's
     // generated InferenceClient call and the worker RPC transport.
-    let disconnect_ticket = control.arm("alice", T6_TENANT, request)?;
+    let disconnect_ticket = control.arm(owner, T6_TENANT, request)?;
     let controller_ticket = Arc::clone(&disconnect_ticket);
     let (checkpoint_tx, checkpoint_rx) = tokio::sync::oneshot::channel();
     let disconnect_controller = std::thread::Builder::new()
@@ -1516,11 +1648,11 @@ async fn t6_midforward_cases(
             && after_disconnect.generation == initial.generation,
         "disconnect recovery replaced the worker instead of releasing its active attempt"
     );
-    t6_assert_order(model, alice_key, "alice").await?;
+    t6_assert_order(model, alice_key, owner).await?;
 
     let mut deadline_request = request.clone();
     deadline_request.timeout_ms = Some(10_000);
-    let deadline_ticket = control.arm("alice", T6_TENANT, &deadline_request)?;
+    let deadline_ticket = control.arm(owner, T6_TENANT, &deadline_request)?;
     let controller_ticket = Arc::clone(&deadline_ticket);
     let deadline_controller = std::thread::Builder::new().name("t6-real-deadline".into()).spawn(move || -> Result<Value> {
         let _release = ReleaseOnDrop(Arc::clone(&controller_ticket));
@@ -1556,7 +1688,7 @@ async fn t6_midforward_cases(
         deadline_started.elapsed() < Duration::from_secs(30),
         "T6 exceeded production RPC30s timeout"
     );
-    t6_assert_order(model, alice_key, "alice").await?;
+    t6_assert_order(model, alice_key, owner).await?;
     let deadline_recovery = alice.infer(T6_MODEL).decide(request).await?;
     t6_check_response(&deadline_recovery, record, request)?;
     let deadline_recovery_error = t6_close(
@@ -1570,7 +1702,7 @@ async fn t6_midforward_cases(
         same.incarnation == initial.incarnation && same.generation == initial.generation,
         "T6 deadline recovery replaced worker instead of recovering same worker"
     );
-    t6_assert_order(model, alice_key, "alice").await?;
+    t6_assert_order(model, alice_key, owner).await?;
 
     t6_progress(
         "partial-deadline-after",
@@ -1584,7 +1716,7 @@ async fn t6_midforward_cases(
     )?;
     let mut drain_request = request.clone();
     drain_request.timeout_ms = Some(25_000);
-    let drain_ticket = control.arm("alice", T6_TENANT, &drain_request)?;
+    let drain_ticket = control.arm(owner, T6_TENANT, &drain_request)?;
     let controller_ticket = Arc::clone(&drain_ticket);
     let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
     let drain_controller = std::thread::Builder::new().name("t6-signed-unload-drain".into()).spawn(move || -> Result<Value> {
@@ -1628,8 +1760,8 @@ async fn t6_midforward_cases(
             }
         }
         // Verify original mint before actual unload removes old loaded binding.
-        t6_assert_order(model, alice_key, "alice").await?;
-        let unload_client = alice.clone();
+        t6_assert_order(model, alice_key, owner).await?;
+        let unload_client = lifecycle.clone();
         let unload_sequence = Arc::clone(&completions);
         let unload = tokio::spawn(async move {
             let request = hyprstream_rpc_std::model_client::UnloadModelRequest {
@@ -1717,7 +1849,7 @@ async fn t6_midforward_cases(
         1e-6,
         1e-6,
     )?;
-    t6_assert_order(model, alice_key, "alice").await?;
+    t6_assert_order(model, alice_key, owner).await?;
     control.check()?;
     t6_progress(
         "signed-drain-after",
@@ -2016,11 +2148,29 @@ fn clef_raw_corpus_encoder_matches_official_ids_and_spans() -> Result<()> {
 
 /// Use exactly the production configuration path. All supplied paths/settings
 /// remain trusted operator inputs, never request fields or fake CLI metadata.
-fn t6_production_startup_profile() -> Result<(StagingModelPin, InferenceDeploymentProfile, PathBuf)>
-{
+fn t6_production_startup_profile(
+) -> Result<(StagingModelPin, InferenceDeploymentProfile, PathBuf, String)> {
+    let config_path = t6_env_path("HYPRSTREAM_CONFIG")?;
+    use std::io::Read as _;
+    let mut config_bytes = Vec::new();
+    std::fs::File::open(&config_path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut config_bytes)?;
     anyhow::ensure!(
-        std::env::var("HYPRSTREAM_MODEL_ADMISSION_PROFILE")?.as_str() == "clef-flash-fp8-cpu-v1",
-        "full acceptance requires the explicit production Clef profile"
+        config_bytes.len() <= 1024 * 1024,
+        "acceptance config exceeds bound"
+    );
+    let startup_config_sha256 = t6_sha(&config_bytes);
+    let config: crate::config::HyprConfig =
+        match config_path.extension().and_then(|value| value.to_str()) {
+            Some("json") => serde_json::from_slice(&config_bytes)?,
+            Some("yaml" | "yml") => serde_yaml::from_slice(&config_bytes)?,
+            _ => toml::from_str(std::str::from_utf8(&config_bytes)?)?,
+        };
+    config.validate()?;
+    anyhow::ensure!(
+        crate::config::install_pinned_config(config.clone()),
+        "acceptance requires a fresh pinned config snapshot"
     );
     anyhow::ensure!(
         std::env::var("HYPRSTREAM_INFERENCE_COMPUTE")?.as_str() == "cpu"
@@ -2029,23 +2179,25 @@ fn t6_production_startup_profile() -> Result<(StagingModelPin, InferenceDeployme
     );
     let deployment = InferenceDeploymentProfile::from_env()?;
     let pin =
-        StagingModelPin::from_env()?.context("production Clef startup did not select a pin")?;
+        StagingModelPin::from_config(&config)?.context("production config did not select a pin")?;
     pin.validate_deployment(&deployment)?;
     anyhow::ensure!(
         pin.model_ref == T6_MODEL && pin.commit == git2::Oid::from_str(T6_PIN)?,
         "production startup selected a different model identity"
     );
-    let directory = t6_env_path("HYPRSTREAM_CLEF_LFS_DIRECTORY")?;
-    // from_env already requires exactly three fixed-size, canonical regular
-    // SHA-named files. Preserve its raw configured path, not canonicalize a
-    // bad symlink input into a silently admitted one.
-    Ok((pin, deployment, directory))
+    let directory = config
+        .selected_model_admission()?
+        .context("selected model missing")?
+        .local_lfs_directory
+        .clone();
+    // Preserve the raw configured path; startup validation rejects symlinks.
+    Ok((pin, deployment, directory, startup_config_sha256))
 }
 
 #[test]
 #[ignore = "requires the actual production Clef profile and fixed three-object cache; metadata-only, no inference"]
 fn clef_production_startup_profile_admits_real_cache_metadata() -> Result<()> {
-    let (pin, deployment, directory) = t6_production_startup_profile()?;
+    let (pin, deployment, directory, _startup_config_sha256) = t6_production_startup_profile()?;
     anyhow::ensure!(pin.model_ref == T6_MODEL && pin.commit == git2::Oid::from_str(T6_PIN)?);
     anyhow::ensure!(deployment.compute == InferenceCompute::Cpu);
     anyhow::ensure!(directory.is_absolute());

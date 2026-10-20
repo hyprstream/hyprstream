@@ -49,6 +49,15 @@ def validate(receipt, build, source, candidate, run_result, receipt_sha256):
             or run_result.get("executable_sha256") != build["executable_sha256"]
             or run_result.get("service_receipt_sha256") != receipt_sha256):
         raise ValueError("actual run result does not bind this candidate, executable and receipt")
+    startup = receipt.get("startup_profile", {})
+    for field in ["config_sha256", "manifest_sha256"]:
+        digest_value = startup.get(field, "")
+        if (len(digest_value) != 64 or any(c not in "0123456789abcdef" for c in digest_value)
+                or digest_value != run_result.get(field)):
+            raise ValueError("runtime selected config/manifest does not match actual run")
+    if (run_result.get("config_unchanged_after") is not True
+            or run_result.get("manifest_unchanged_after") is not True):
+        raise ValueError("selected config/manifest changed during execution")
     if run_result.get("exit") != 0 or run_result.get("controller_exit") != 0:
         raise ValueError("actual native/controller execution did not exit successfully")
     if (run_result.get("native_samples", 0) < 1
@@ -66,6 +75,14 @@ def validate(receipt, build, source, candidate, run_result, receipt_sha256):
     if len(orders) != 10 or any(order.get("verified") is not True or
                               order.get("coordinate") != "inference:Decide/decide" for order in orders):
         raise ValueError("expected ten verified Decide/decide work orders")
+    owner = run_result.get("configured_owner_subject", "")
+    if (not owner.startswith("did:") or receipt.get("configured_owner_subject") != owner
+            or receipt.get("configured_owner_authenticated") is not True
+            or receipt.get("unconfigured_owner_denied") is not True):
+        raise ValueError("configured owner was not authenticated and independently denied against other DID")
+    if ([order.get("subject") for order in orders].count(owner) != 9
+            or [order.get("subject") for order in orders].count("bob") != 1):
+        raise ValueError("work-order subjects do not bind configured owner and explicit isolation fixture")
     if receipt.get("corpus_records") != 5 or receipt.get("corpus_questions") != 11:
         raise ValueError("unexpected development corpus")
     return {"candidate": candidate, "executable_sha256": build["executable_sha256"],

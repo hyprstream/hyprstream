@@ -4013,7 +4013,8 @@ fn federate_registry_operation(
     let request = body.root::<registry_request::Reader>()?;
     match request.which()? {
         registry_request::Which::List(())
-            if profile == crate::services::model::FederateModelProfile::Qwen =>
+            if profile.operation()
+                == crate::config::model_admission::ModelOperation::Generation =>
         {
             Ok(("registry:List".to_owned(), "query".to_owned()))
         }
@@ -4061,8 +4062,10 @@ impl RequestService for RegistryService {
                 .federate_dispatch
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Federate dispatch is disabled"))?;
-            let pin = crate::services::model::StagingModelPin::from_env()?
-                .ok_or_else(|| anyhow::anyhow!("Federate Registry requires a staging model pin"))?;
+            let pin = crate::services::model::StagingModelPin::from_config(
+                &crate::config::HyprConfig::load()?,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("Federate Registry requires a staging model pin"))?;
             let (resource, operation) = federate_registry_operation(body, &pin)?;
             let (verified, holder, replay_key, replay_expiry) = adapter
                 .admit(

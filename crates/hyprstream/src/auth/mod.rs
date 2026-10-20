@@ -57,6 +57,7 @@ pub use op_log::{
 };
 #[cfg(feature = "pglite")]
 pub use pglite_store::PgliteUserStore;
+pub(crate) use policy_manager::DEFAULT_MODEL_CONF;
 pub use policy_manager::{
     federation_registration_resource, global_policy_manager, set_global_policy_manager,
     write_policy_file, PolicyError, PolicyManager,
