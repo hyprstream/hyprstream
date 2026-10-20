@@ -31,8 +31,11 @@
 //! - Canonical answer order: noul [false,true] (model order [true,false] is
 //!   remapped explicitly), choice = sorted option IDs (the model's own
 //!   option_ids order), score = ascending indices 0..N-1 (criteria array
-//!   positions, NOT legacy typed-IR "levels"). Legacy typed IR authored-order
-//!   projections are a distinct versioned adapter and must remap by label.
+//!   positions, NOT legacy typed-IR "levels"). Authored-order projections
+//!   (E2: option insertion order is canonical, answer vectors unlabeled) are
+//!   a distinct adapter and remap by label through
+//!   [`authored_labels`]/`ClefQuestion::authored_choice_order` — the
+//!   service layer does that remap in `build_answer_row`.
 
 use crate::runtime::channel_fp8::ChannelFp8Profile;
 use crate::runtime::TorchEngine;
@@ -177,6 +180,29 @@ impl DecisionBackboneObserver {
     }
 }
 
+/// Test-only ordered observation of the head-load stage checks (see
+/// [`ClefDecisionRuntime::load`]). Like [`DecisionBackboneObserver`] it
+/// observes and returns unit; the real flag/deadline check remains the sole
+/// source of typed cancellation. Used by fixtures to trip the cancel flag at
+/// an exact numbered stage for deterministic mid-load cancellation tests.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DecisionLoadObserver(Arc<dyn Fn(usize) + Send + Sync>);
+#[cfg(any(test, feature = "test-fixtures"))]
+impl std::fmt::Debug for DecisionLoadObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DecisionLoadObserver(<redacted>)")
+    }
+}
+#[cfg(any(test, feature = "test-fixtures"))]
+impl DecisionLoadObserver {
+    /// In-process fixture wiring only; no request field or environment toggle.
+    pub fn new(observer: Arc<dyn Fn(usize) + Send + Sync>) -> Self {
+        Self(observer)
+    }
+}
+
 /// Cooperative cancellation + deadline for one decision request.
 ///
 /// The checker closure passed to the engine runs before admission, between
@@ -191,6 +217,8 @@ pub struct DecisionCancel {
     request_disconnect: Option<tokio_util::sync::CancellationToken>,
     #[cfg(any(test, feature = "test-fixtures"))]
     observer: Option<DecisionBackboneObserver>,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    load_observer: Option<DecisionLoadObserver>,
 }
 
 impl DecisionCancel {
@@ -203,6 +231,8 @@ impl DecisionCancel {
             request_disconnect: None,
             #[cfg(any(test, feature = "test-fixtures"))]
             observer: None,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            load_observer: None,
         }
     }
 
@@ -229,6 +259,27 @@ impl DecisionCancel {
     pub fn with_backbone_observer(mut self, observer: DecisionBackboneObserver) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    /// Attach a request-local head-load stage observer (fixture only). Stage
+    /// numbers are stable checkpoints of [`ClefDecisionRuntime::load`]; counts
+    /// restart for each load call.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[doc(hidden)]
+    pub fn with_load_observer(mut self, observer: DecisionLoadObserver) -> Self {
+        self.load_observer = Some(observer);
+        self
+    }
+
+    /// Cooperative check at one numbered head-load stage. Fixtures observe
+    /// the stage number BEFORE the real flag/deadline result, exactly like
+    /// the backbone checker; the observation never replaces cancellation.
+    pub(crate) fn check_load(&self, _stage: usize) -> Result<()> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some(observer) = &self.load_observer {
+            (observer.0)(_stage);
+        }
+        self.check()
     }
 
     /// Fail with the typed cancellation error when tripped. Called before
@@ -348,17 +399,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-fn sha256_file(path: &Path) -> Result<Option<String>> {
+/// Digest a large mapped region in 1 MiB chunks with a cooperative
+/// cancellation check BETWEEN chunks (stage 200+chunk). A cancelled or
+/// expired load aborts here instead of hashing the whole ~232 MiB mapping;
+/// one chunk's hashing (the non-interruptible span) still completes.
+fn sha256_bytes_staged(bytes: &[u8], cancel: &DecisionCancel) -> Result<String> {
+    let mut h = Sha256::new();
+    for (chunk, part) in bytes.chunks(1 << 20).enumerate() {
+        cancel.check_load(200 + chunk)?;
+        h.update(part);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
+/// Digest a file in 1 MiB reads with a cooperative cancellation check between
+/// reads (stage 300+chunk). Same cooperative bound as
+/// [`sha256_bytes_staged`].
+fn sha256_file_staged(path: &Path, cancel: &DecisionCancel) -> Result<Option<String>> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut h = Sha256::new();
     let mut buf = [0u8; 1 << 20];
+    let mut chunk = 0usize;
     loop {
+        cancel.check_load(300 + chunk)?;
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
+        chunk += 1;
     }
     Ok(Some(hex::encode(h.finalize())))
 }
@@ -563,13 +633,30 @@ fn head_metadata_admission(
 /// Materialize the admitted tensors (copy out of the mapped file; one
 /// explicit dtype conversion when the profile differs). Only called AFTER
 /// [`head_metadata_admission`] succeeded.
+///
+/// The loop is COOPERATIVELY cancellation/deadline aware: a check runs
+/// between each tensor materialization (stage 100+index), before the copy
+/// and dtype conversion of that tensor. This bounds a cancelled load's
+/// remaining work to ONE in-flight native tensor operation — an active
+/// libtorch copy/conversion is never forcibly interrupted (it completes,
+/// then the next check aborts) — and a materialization failure drops the
+/// partial weights without caching anything.
 fn materialize_head(
     metadata: &AdmittedHeadMetadata,
     tensors: &SafeTensors<'_>,
     kind: Kind,
+    cancel: &DecisionCancel,
 ) -> Result<HashMap<String, Tensor>, ClefDecisionError> {
     let mut weights = HashMap::with_capacity(metadata.tensors.len());
-    for (name, shape, dtype) in &metadata.tensors {
+    for (index, (name, shape, dtype)) in metadata.tensors.iter().enumerate() {
+        cancel
+            .check_load(100 + index)
+            .map_err(|e| match e.downcast::<ClefDecisionError>() {
+                Ok(typed) => typed,
+                Err(other) => {
+                    ClefDecisionError::Runtime(format!("head load stage check: {other:#}"))
+                }
+            })?;
         let view = tensors.tensor(name).map_err(|_| {
             ClefDecisionError::Bundle(format!(
                 "head tensor {name} missing after admission (internal invariant)"
@@ -608,12 +695,24 @@ impl ClefDecisionRuntime {
     /// engine before the weights are even mapped. `kind_hint` overrides the
     /// file-derived head dtype (tests with tiny FP32 backbones); production
     /// passes `None`.
+    ///
+    /// COOPERATIVE cancellation/deadline awareness (the lazy first-load runs
+    /// inside a request's budget): `cancel` is checked at every meaningful
+    /// stage — numbered checkpoints 1..=7, per-tensor materialization
+    /// 100+index, large-digest chunks 200+/300+ — so an expired or cancelled
+    /// request aborts the load, drops its partial tensors, and never caches a
+    /// runtime. These checks are BETWEEN bounded native operations: one hash
+    /// chunk or one libtorch tensor copy/conversion that is already in flight
+    /// completes first; no synchronous native operation is forcibly
+    /// interrupted (the residual blocking bound is a single such operation).
     pub fn load(
         model_path: &Path,
         engine_hidden: Option<u32>,
         kind_hint: Option<Kind>,
         precision_mode: Option<&str>,
+        cancel: &DecisionCancel,
     ) -> Result<Self> {
+        cancel.check_load(1)?;
         let head_dir = Self::detect(model_path)
             .ok_or_else(|| ClefDecisionError::Bundle("not a Clef bundle".into()))?;
         let config_meta = std::fs::metadata(head_dir.join(CLEF_HEAD_CONFIG_FILE))
@@ -629,6 +728,7 @@ impl ClefDecisionRuntime {
         let config: ClefHeadConfig = serde_json::from_slice(&config_bytes).map_err(|e| {
             ClefDecisionError::Bundle(format!("invalid {CLEF_HEAD_CONFIG_FILE}: {e}"))
         })?;
+        cancel.check_load(2)?;
 
         let weights_path = head_dir.join(CLEF_HEAD_WEIGHTS_FILE);
         // File-size bound BEFORE any mapping or parsing (ordering matters:
@@ -651,6 +751,7 @@ impl ClefDecisionRuntime {
         let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
             ClefDecisionError::Bundle(format!("invalid {CLEF_HEAD_WEIGHTS_FILE}: {e}"))
         })?;
+        cancel.check_load(3)?;
 
         // Backbone config identity: REQUIRED (fail closed — incomplete
         // provenance is never attested), length-bounded via metadata before
@@ -670,6 +771,7 @@ impl ClefDecisionRuntime {
         let backbone_config: Value = serde_json::from_slice(&backbone_bytes)
             .map_err(|e| ClefDecisionError::Bundle(format!("invalid backbone config.json: {e}")))?;
         let kind = kind_hint.unwrap_or(default_head_kind(model_path, precision_mode)?);
+        cancel.check_load(4)?;
 
         // Metadata admission BEFORE any tensor materialization. The
         // admitted metadata is LOAD-BEARING here: the summed data-region
@@ -693,10 +795,12 @@ impl ClefDecisionRuntime {
             ))
             .to_string()
         );
-        let weights = materialize_head(&metadata, &tensors, kind)?;
+        cancel.check_load(5)?;
+        let weights = materialize_head(&metadata, &tensors, kind, cancel)?;
         let head_tensor_count = weights.len() as u32;
         let head = JointSchemaHead::from_named_tensors(config, weights)
             .map_err(|e| ClefDecisionError::Bundle(format!("joint head validation: {e}")))?;
+        cancel.check_load(6)?;
 
         // compute_profile reports the OBSERVED compute kind/device and the
         // execution path; artifact quantization is reported separately in
@@ -705,22 +809,31 @@ impl ClefDecisionRuntime {
         let fp8 = channel_fp8_present(model_path)?;
         let compute_profile = compute_profile_string(kind, fp8);
 
+        // Identity digests from THIS mapping — the same bytes the head
+        // tensors were materialized from — computed in cancellation-aware
+        // chunks: the ~232 MiB weights digest is never a single
+        // non-interruptible sweep.
+        let head_config_sha256 = sha256_hex(&config_bytes);
+        let head_weights_sha256 = sha256_bytes_staged(&mmap, cancel)?;
+        // The bundle tokenizer is REQUIRED for decision serving: fail closed
+        // rather than attesting incomplete provenance.
+        let tokenizer_sha256 = Some(
+            sha256_file_staged(&model_path.join("tokenizer.json"), cancel)?.ok_or_else(|| {
+                ClefDecisionError::Bundle("decision bundle is missing tokenizer.json".into())
+            })?,
+        );
+        let backbone_config_sha256 = Some(sha256_hex(&backbone_bytes));
+        let quantization =
+            quant_profile(&backbone_config).map(|p| p.trim_start_matches("cpu-").to_owned());
+        cancel.check_load(7)?;
+
         Ok(Self {
             identity: ClefBundleIdentity {
-                head_config_sha256: sha256_hex(&config_bytes),
-                head_weights_sha256: sha256_hex(&mmap[..]),
-                // The bundle tokenizer is REQUIRED for decision serving:
-                // fail closed rather than attesting incomplete provenance.
-                tokenizer_sha256: Some(
-                    sha256_file(&model_path.join("tokenizer.json"))?.ok_or_else(|| {
-                        ClefDecisionError::Bundle(
-                            "decision bundle is missing tokenizer.json".into(),
-                        )
-                    })?,
-                ),
-                backbone_config_sha256: Some(sha256_hex(&backbone_bytes)),
-                quantization: quant_profile(&backbone_config)
-                    .map(|p| p.trim_start_matches("cpu-").to_owned()),
+                head_config_sha256,
+                head_weights_sha256,
+                tokenizer_sha256,
+                backbone_config_sha256,
+                quantization,
                 head_tensor_count,
             },
             head,
@@ -744,6 +857,44 @@ pub fn canonical_labels(question: &ClefQuestion) -> Result<Vec<String>, ClefDeci
             let mut ids: Vec<String> = map.keys().cloned().collect();
             ids.sort();
             Ok(ids)
+        }
+        ClefQuestionType::Score => {
+            let n = question.criteria.as_array().ok_or_else(|| {
+                ClefDecisionError::Input("score criteria must be an array".into())
+            })?;
+            Ok((0..n.len()).map(|i| i.to_string()).collect())
+        }
+    }
+}
+
+/// Authored (spec-order) labels for one admitted question: choice criteria
+/// key order exactly as the author wrote it (captured by the ordered wire
+/// parser in `hyprstream-decision-head`; the model itself is queried in
+/// sorted order), noul [false,true], score ascending indices. The E2
+/// adapter (`services::decision::build_answer_row`) remaps canonical —
+/// sorted — distributions into this order BY LABEL before emitting the
+/// unlabeled answer vector (E2 D6: option insertion order is canonical).
+pub fn authored_labels(question: &ClefQuestion) -> Result<Vec<String>, ClefDecisionError> {
+    match question.kind {
+        ClefQuestionType::Noul => Ok(vec!["false".to_owned(), "true".to_owned()]),
+        ClefQuestionType::Choice => {
+            let map = question.criteria.as_object().ok_or_else(|| {
+                ClefDecisionError::Input("choice criteria must be an object".into())
+            })?;
+            let order = question.authored_choice_order.clone();
+            // Invariant: the captured order is exactly the criteria key set.
+            // A question constructed in Rust (bypassing the wire deserializer)
+            // fails closed here instead of silently mis-ordering an answer.
+            if order.len() != map.len()
+                || order.iter().collect::<std::collections::HashSet<_>>().len() != map.len()
+            {
+                return Err(ClefDecisionError::Input(format!(
+                    "authored choice order ({} entries) does not match the {} criteria keys",
+                    order.len(),
+                    map.len()
+                )));
+            }
+            Ok(order)
         }
         ClefQuestionType::Score => {
             let n = question.criteria.as_array().ok_or_else(|| {
@@ -1054,10 +1205,19 @@ mod tests {
     use serde_json::json;
 
     fn question(kind: ClefQuestionType, criteria: Value) -> ClefQuestion {
+        let authored_choice_order = if kind == ClefQuestionType::Choice {
+            criteria
+                .as_object()
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         ClefQuestion {
             kind,
             instructions: Value::Null,
             criteria,
+            authored_choice_order,
         }
     }
 
@@ -1443,8 +1603,14 @@ mod tests {
         let weights = tiny_head_tensors(&config);
         write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
 
-        let runtime =
-            ClefDecisionRuntime::load(dir.path(), Some(8), Some(Kind::Float), None).unwrap();
+        let runtime = ClefDecisionRuntime::load(
+            dir.path(),
+            Some(8),
+            Some(Kind::Float),
+            None,
+            &DecisionCancel::none(),
+        )
+        .unwrap();
         assert_eq!(runtime.identity.head_tensor_count, weights.len() as u32);
         assert_eq!(runtime.compute_profile, "cpu-float32");
         assert_eq!(runtime.encoding_version, CLEF_ENCODING_VERSION);
@@ -1466,7 +1632,13 @@ mod tests {
             Some(SIMPLE_BACKBONE_CONFIG),
         );
         std::fs::remove_file(no_tok.path().join("tokenizer.json")).unwrap();
-        let err = match ClefDecisionRuntime::load(no_tok.path(), None, Some(Kind::Float), None) {
+        let err = match ClefDecisionRuntime::load(
+            no_tok.path(),
+            None,
+            Some(Kind::Float),
+            None,
+            &DecisionCancel::none(),
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("missing tokenizer must fail closed"),
         };
@@ -1474,7 +1646,13 @@ mod tests {
 
         // Engine hidden mismatch fails closed.
         // (unwrap_err would need Debug on the Ok type; match instead)
-        let err = match ClefDecisionRuntime::load(dir.path(), Some(4096), Some(Kind::Float), None) {
+        let err = match ClefDecisionRuntime::load(
+            dir.path(),
+            Some(4096),
+            Some(Kind::Float),
+            None,
+            &DecisionCancel::none(),
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("hidden-size mismatch must fail closed"),
         };
@@ -1486,7 +1664,13 @@ mod tests {
         broken.remove(&key);
         let dir2 = tempfile::tempdir().unwrap();
         write_bundle(dir2.path(), &config, &broken, Some(SIMPLE_BACKBONE_CONFIG));
-        let err = match ClefDecisionRuntime::load(dir2.path(), None, Some(Kind::Float), None) {
+        let err = match ClefDecisionRuntime::load(
+            dir2.path(),
+            None,
+            Some(Kind::Float),
+            None,
+            &DecisionCancel::none(),
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("missing tensor must fail closed"),
         };
@@ -1495,6 +1679,123 @@ mod tests {
         // A non-Clef directory is not a bundle.
         let plain = tempfile::tempdir().unwrap();
         assert!(ClefDecisionRuntime::detect(plain.path()).is_none());
+    }
+
+    #[test]
+    fn authored_labels_preserve_wire_order_and_fail_closed_on_drift() {
+        let request = preflight_body(
+            r#"{"model":"tiny","state":null,"questions":{"pick":{"type":"choice","criteria":{"zeta":null,"alpha":"first","mid":null}}}}"#,
+        )
+        .unwrap();
+        let q = &request.record.questions[0].1;
+        // The model/prompt order stays sorted; the authored order is carried
+        // separately for the E2 spec-order projection.
+        assert_eq!(canonical_labels(q).unwrap(), ["alpha", "mid", "zeta"]);
+        assert_eq!(authored_labels(q).unwrap(), ["zeta", "alpha", "mid"]);
+
+        // Noul/score authored orders are exactly their canonical orders.
+        let request = preflight_body(
+            r#"{"model":"tiny","state":null,"questions":{"n":{"type":"noul"},"s":{"type":"score","criteria":["lo","hi"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            authored_labels(&request.record.questions[0].1).unwrap(),
+            ["false", "true"]
+        );
+        assert_eq!(
+            authored_labels(&request.record.questions[1].1).unwrap(),
+            ["0", "1"]
+        );
+
+        // A hand-built question whose captured order disagrees with its
+        // criteria keys fails closed (never a silently mis-ordered vector).
+        let mut bad = question(ClefQuestionType::Choice, json!({"a": null, "b": null}));
+        bad.authored_choice_order = vec!["a".into()];
+        let err = authored_labels(&bad).unwrap_err().to_string();
+        assert!(err.contains("authored choice order"), "{err}");
+    }
+
+    #[test]
+    fn bundle_load_is_cooperatively_cancelled_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tiny_head_config(8);
+        let weights = tiny_head_tensors(&config);
+        write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
+        assert!(
+            weights.len() >= 2,
+            "fixture must have >=2 tensors for the mid-loop trip"
+        );
+
+        // Observer that records the highest observed stage and trips the
+        // cancel flag at/after a chosen stage, BEFORE that stage's real
+        // flag/deadline check runs.
+        let trip_at = |stage: usize| {
+            let flag = Arc::new(AtomicBool::new(false));
+            let max_stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cancel = DecisionCancel::new(Arc::clone(&flag), None).with_load_observer(
+                DecisionLoadObserver::new({
+                    let flag = Arc::clone(&flag);
+                    let max_stage = Arc::clone(&max_stage);
+                    Arc::new(move |seen| {
+                        max_stage.fetch_max(seen, Ordering::SeqCst);
+                        if seen >= stage {
+                            flag.store(true, Ordering::Release);
+                        }
+                    })
+                }),
+            );
+            (cancel, max_stage)
+        };
+        let load_err = |cancel: &DecisionCancel| match ClefDecisionRuntime::load(
+            dir.path(),
+            Some(8),
+            Some(Kind::Float),
+            None,
+            cancel,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("cancelled load must not succeed"),
+        };
+
+        // Entry trip: the first stage check aborts before any bundle work.
+        let (cancel, max_stage) = trip_at(1);
+        let err = load_err(&cancel);
+        assert!(err.starts_with("clef-decision-cancelled"), "{err}");
+        assert_eq!(max_stage.load(Ordering::SeqCst), 1);
+
+        // Trip after metadata admission (stage 5): the per-tensor
+        // materialization (100+) and digest stages (200+/300+) never run —
+        // the load provably stops mid-flight instead of completing and
+        // handing its caller a cached runtime.
+        let (cancel, max_stage) = trip_at(5);
+        let err = load_err(&cancel);
+        assert!(err.starts_with("clef-decision-cancelled"), "{err}");
+        assert_eq!(
+            max_stage.load(Ordering::SeqCst),
+            5,
+            "no stage after admission may run"
+        );
+
+        // Trip inside the materialization loop (second tensor's check): the
+        // remaining tensors are never admitted.
+        let (cancel, max_stage) = trip_at(101);
+        let err = load_err(&cancel);
+        assert!(err.starts_with("clef-decision-cancelled"), "{err}");
+        assert_eq!(
+            max_stage.load(Ordering::SeqCst),
+            101,
+            "materialization must stop at the second tensor"
+        );
+
+        // A healthy retry on the same bundle succeeds and observes the
+        // digest-chunk stages plus the final checkpoint (the tokenizer file
+        // digest fires stage 300 on its single chunk).
+        let (cancel, max_stage) = trip_at(usize::MAX); // never trips
+        ClefDecisionRuntime::load(dir.path(), Some(8), Some(Kind::Float), None, &cancel)
+            .expect("healthy retry loads the same bundle");
+        // Tokenizer digest observes its sole data chunk and the terminating
+        // EOF check (300, 301).
+        assert_eq!(max_stage.load(Ordering::SeqCst), 301);
     }
 
     // ── T5b: tiny native end-to-end decide() through a REAL engine ─────────
@@ -1732,6 +2033,7 @@ mod tests {
             Some(T5_HIDDEN as u32),
             Some(Kind::Float),
             Some("fp32"),
+            &DecisionCancel::none(),
         )
         .expect("runtime");
         let tokenizer = tiny_wordlevel_tokenizer();
@@ -1819,6 +2121,7 @@ mod tests {
             Some(T5_HIDDEN as u32),
             Some(Kind::BFloat16),
             None,
+            &DecisionCancel::none(),
         )
         .expect("bf16 head loads");
         let mismatch = decide(
@@ -1954,6 +2257,7 @@ mod tests {
             Some(T5_HIDDEN as u32),
             Some(Kind::Float),
             Some("fp32"),
+            &DecisionCancel::none(),
         )
         .unwrap();
         let tokenizer = tiny_wordlevel_tokenizer();
@@ -2161,6 +2465,7 @@ mod tests {
             Some(T5_HIDDEN as u32),
             Some(Kind::Float),
             Some("fp32"),
+            &DecisionCancel::none(),
         )
         .expect("runtime");
         let tokenizer = tiny_wordlevel_tokenizer();
@@ -2218,6 +2523,7 @@ mod tests {
             Some(T5_HIDDEN as u32),
             Some(Kind::Float),
             Some("fp32"),
+            &DecisionCancel::none(),
         )
         .expect("runtime");
         let tokenizer = tiny_wordlevel_tokenizer();
@@ -2310,12 +2616,25 @@ mod tests {
         let weights = tiny_head_tensors(&config);
         write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
         let runtime =
-            ClefDecisionRuntime::load(dir.path(), None, None, None).expect("auto loads BF16 head");
+            ClefDecisionRuntime::load(dir.path(), None, None, None, &DecisionCancel::none())
+                .expect("auto loads BF16 head");
         assert_eq!(runtime.compute_kind, Kind::BFloat16);
-        let runtime = ClefDecisionRuntime::load(dir.path(), None, None, Some("fp32"))
-            .expect("explicit fp32 head");
+        let runtime = ClefDecisionRuntime::load(
+            dir.path(),
+            None,
+            None,
+            Some("fp32"),
+            &DecisionCancel::none(),
+        )
+        .expect("explicit fp32 head");
         assert_eq!(runtime.compute_kind, Kind::Float);
-        let err = match ClefDecisionRuntime::load(dir.path(), None, None, Some("fp8e4m3")) {
+        let err = match ClefDecisionRuntime::load(
+            dir.path(),
+            None,
+            None,
+            Some("fp8e4m3"),
+            &DecisionCancel::none(),
+        ) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("unsupported precision must fail closed"),
         };
