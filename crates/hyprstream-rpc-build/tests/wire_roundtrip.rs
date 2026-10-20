@@ -1005,8 +1005,16 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
                 "tag-kind",
                 "object-overrun",
                 "payload-overrun",
-                "object-declared-end"
+                "object-declared-end",
+                "zero-word-nonempty-list"
             ])
         );
     }
+    assert_eq!(
+        wd.run("double-far-zero-word-structs", &[]),
+        json!({
+            "root": {"validEmpty": true, "rejectsNonempty": true},
+            "nested": {"validEmpty": true, "rejectsNonempty": true}
+        })
+    );
 }
