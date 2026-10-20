@@ -1916,6 +1916,11 @@ fn extract_all_structs(
             }
         }
 
+        // Imported definitions enter the emitted Vec in this order. HashSet
+        // iteration is randomized between generator processes.
+        let mut referenced_names: Vec<_> = referenced_names.into_iter().collect();
+        referenced_names.sort();
+
         // Add any referenced types not yet in the known set.
         let mut added = false;
         for ref_name in &referenced_names {
@@ -2053,6 +2058,9 @@ fn extract_all_enums(
         collect_struct_type_refs(s, &mut referenced_names);
     }
 
+    // Match imported struct ordering so identical CGRs produce identical SDKs.
+    let mut referenced_names: Vec<_> = referenced_names.into_iter().collect();
+    referenced_names.sort();
     for ref_name in &referenced_names {
         if local_enum_names.contains(ref_name)
             || local_struct_names.contains(ref_name)
