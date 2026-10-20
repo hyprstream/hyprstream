@@ -65,21 +65,24 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
         };
         match components {
             ["pds"] => Some(pds_account_label()),
-            ["pds", tenant] if valid_tenant_component(tenant) => Some(pds_account_label()),
+            ["pds", tenant] if crate::auth::valid_tenant_component(tenant) => {
+                Some(pds_account_label())
+            }
             ["pds", tenant, accounts]
-                if valid_tenant_component(tenant) && *accounts == PDS_ACCOUNTS_DIRECTORY =>
+                if crate::auth::valid_tenant_component(tenant)
+                    && *accounts == PDS_ACCOUNTS_DIRECTORY =>
             {
                 Some(pds_account_label())
             }
             ["pds", tenant, accounts, account]
-                if valid_tenant_component(tenant)
+                if crate::auth::valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
                     && valid_account_component(account) =>
             {
                 Some(pds_account_label())
             }
             ["pds", tenant, accounts, account, file]
-                if valid_tenant_component(tenant)
+                if crate::auth::valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
                     && valid_account_component(account)
                     && matches!(
@@ -93,7 +96,7 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
                 Some(pds_account_label())
             }
             ["pds", tenant, accounts, account, "repo", file]
-                if valid_tenant_component(tenant)
+                if crate::auth::valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
                     && valid_account_component(account)
                     && matches!(*file, "commit.cbor" | "public-commit.cbor") =>
@@ -103,17 +106,6 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
             _ => None,
         }
     }
-}
-
-fn valid_tenant_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 253
-        && value != "."
-        && value != ".."
-        && value != "*"
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn valid_account_component(value: &str) -> bool {

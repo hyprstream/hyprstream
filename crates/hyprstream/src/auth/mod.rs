@@ -5,6 +5,22 @@
 //!
 //! Also provides JWT token authentication with Ed25519 signatures.
 
+/// The canonical tenant-component syntax (D4): the HTTP authorization-domain
+/// middleware, the MAC PDS PEP, and the federate admission/mint/consumption
+/// paths all enforce exactly this rule, so a tenant Policy can carry is never
+/// one the HTTP middleware would reject. Non-empty, at most 253 bytes, never
+/// ".", ".." or "*", ASCII alphanumeric plus '.', '_' and '-' only.
+pub(crate) fn valid_tenant_component(tenant: &str) -> bool {
+    !tenant.is_empty()
+        && tenant.len() <= 253
+        && tenant != "."
+        && tenant != ".."
+        && tenant != "*"
+        && tenant
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 pub(crate) mod age_seal;
 #[cfg(any(feature = "pglite", feature = "postgres"))]
 mod cipher_glue;

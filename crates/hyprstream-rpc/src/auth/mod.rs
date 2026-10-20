@@ -47,8 +47,8 @@ pub use crate::identity::{
     Ed25519Vk, IdentityKeyCandidate, IdentityKeys, IdentityResolver, MlDsaVk,
 };
 pub use claims::{
-    compute_jkt, is_local_iss, ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany,
-    SessionClaimError,
+    compute_jkt, federate_tui_class_client, install_federate_tui_class_client, is_local_iss,
+    ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, SessionClaimError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use composite::{

@@ -205,6 +205,10 @@ struct PrepareFederateSession {
   # Keys committed by the verified source nonce before the challenge exists.
   edPublic @4 :Data $maxLen(32);
   pqPublic @5 :Data $maxLen(1952);
+  # Verified client-class selector (W1.2): the exact client_id whose class
+  # OAuth resolved and signature-verified the source under. Policy selects
+  # the per-client grant/profile table entry with it; unknown = deny.
+  client @6 :Text $maxLen(256);
 }
 
 struct PreparedFederateSession {
@@ -226,6 +230,10 @@ struct CommitFederateSession {
   challengeExpiresAt @4 :Int64;
   edPublic @5 :Data $maxLen(32);
   pqPublic @6 :Data $maxLen(1952);
+  # Verified client-class selector (W1.2): must equal the client bound to
+  # the pending prepare decision, or the one-use handle is consumed and
+  # denied.
+  client @7 :Text $maxLen(256);
 }
 
 # Exact durable session receipt returned by Policy after PostgreSQL commit.

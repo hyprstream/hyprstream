@@ -410,6 +410,7 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
         "opaque-sub",
         &hybrid_resolver,
         &host,
+        None,
     )?;
     let authority_clearance = hybrid_policy.clearance_for(DID).unwrap();
     assert_eq!(
@@ -447,6 +448,7 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             Assurance::PqHybrid,
         ))),
         &host,
+        None,
     )?;
     assert!(!insufficient
         .security_context(VerifiedKeyMaterial::PqHybrid)
@@ -465,6 +467,7 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             Assurance::PqHybrid,
         ))),
         &host,
+        None,
     )?;
     let mut unknown = session.clone();
     unknown.subject = "did:plc:abcdefghijklmnopqrstuvwx".into();
@@ -478,6 +481,7 @@ async fn federate_minted_token_reaches_real_model_authorization() -> Result<()> 
             Assurance::PqHybrid,
         ))),
         &host,
+        None,
     )
     .is_err());
     let body = hyprstream_rpc::serialize_message(|message| {

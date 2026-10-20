@@ -92,9 +92,18 @@ pub struct TokenRequest {
     pub resource: Option<String>,
 }
 
-fn reserved_federate_form(raw: &[u8]) -> bool {
+/// `hs_profile` (either class's profile string) and the two reserved client
+/// ids always take the dedicated Federate exchange parser. A configured TUI
+/// client id is reserved even with the profile field stripped, so a TUI
+/// form can never fall through to the generic RFC 8693 dispatcher; an
+/// UNCONFIGURED client id is not reserved and the generic dispatcher
+/// denies it (default-deny, W1.1 invariant).
+fn reserved_federate_form(raw: &[u8], tui_client: Option<&str>) -> bool {
     url::form_urlencoded::parse(raw).any(|(key, value)| {
-        key == "hs_profile" || (key == "client_id" && value == super::federate_source::CLIENT)
+        key == "hs_profile"
+            || (key == "client_id"
+                && (value == super::federate_source::CLIENT
+                    || tui_client.is_some_and(|tui| value == tui)))
     })
 }
 
@@ -104,10 +113,20 @@ pub async fn exchange_token(
     req_headers: HeaderMap,
     RawForm(raw): RawForm,
 ) -> Response {
-    // Reserve the exact Federate client/profile before the generic RFC 8693
+    // Reserve the exact Federate clients/profiles before the generic RFC 8693
     // dispatcher. The dedicated parser rejects duplicate and unknown fields;
     // removing hs_profile cannot fall through to generic ID-token exchange.
-    if reserved_federate_form(&raw) {
+    // The TUI class joins the reservation only when configured.
+    #[cfg(feature = "postgres")]
+    let reserved_tui_client = state
+        .federate_issuer
+        .as_ref()
+        .and_then(|issuer| issuer.tui_client_id());
+    // The Federate issuer exists only under the postgres feature; without it
+    // no TUI class can be configured (default-deny, W1.1 invariant).
+    #[cfg(not(feature = "postgres"))]
+    let reserved_tui_client: Option<&str> = None;
+    if reserved_federate_form(&raw, reserved_tui_client) {
         return super::federate_host::exchange(&state, &req_headers, &raw).await;
     }
     let params: TokenRequest = match serde_urlencoded::from_bytes(&raw) {
@@ -1711,27 +1730,51 @@ fn token_error_body(error: &str, description: Option<&str>) -> serde_json::Value
 mod tests {
     use super::*;
 
+    const TUI_CLIENT: &str = "hyprstream-tui-staging";
+
     #[test]
     fn federate_form_cannot_downgrade_to_generic_exchange() {
         assert!(super::reserved_federate_form(
-            b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&hs_profile=federate-session-v1"
+            b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&hs_profile=federate-session-v1",
+            None
         ));
         assert!(super::reserved_federate_form(
             format!(
             "client_id={}&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token",
             super::super::federate_source::CLIENT
         )
-            .as_bytes()
+            .as_bytes(),
+            None
         ));
         assert!(super::reserved_federate_form(
             format!(
                 "client_id=ordinary&client_id={}",
                 super::super::federate_source::CLIENT
             )
-            .as_bytes()
+            .as_bytes(),
+            None
+        ));
+        // The TUI class joins the reservation only when configured, by exact
+        // client id, with or without the profile field present.
+        assert!(super::reserved_federate_form(
+            format!("client_id={TUI_CLIENT}").as_bytes(),
+            Some(TUI_CLIENT)
+        ));
+        assert!(super::reserved_federate_form(
+            format!("client_id={TUI_CLIENT}&hs_profile=federate-tui-v1").as_bytes(),
+            Some(TUI_CLIENT)
         ));
         assert!(!super::reserved_federate_form(
-            b"client_id=ordinary&grant_type=refresh_token"
+            format!("client_id={TUI_CLIENT}").as_bytes(),
+            None
+        ));
+        assert!(!super::reserved_federate_form(
+            b"grant_type=authorization_code&client_id=ordinary",
+            None
+        ));
+        assert!(!super::reserved_federate_form(
+            b"client_id=ordinary&grant_type=refresh_token",
+            Some(TUI_CLIENT)
         ));
     }
 
