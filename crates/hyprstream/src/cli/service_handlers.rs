@@ -361,35 +361,35 @@ async fn verify_selected_owner_rules(
 }
 
 /// Exact legacy owner grants written before the Clef staging templates were
-/// removed from the built-in template set. Migration is limited to an owner
-/// explicitly selected for this exact model; provisioning any other model or
-/// template cannot alter these rows.
+/// removed from the built-in template set. Any selected Clef admission
+/// normalizes these exact legacy rows for every known staging owner; Decisions
+/// admission must remove generation authority because admission does not gate
+/// ordinary generation dispatch. Provisioning another model cannot alter them.
 const LEGACY_CLEF_STAGING_INFER_SUBJECTS: [&str; 2] = [
     "did:plc:3f7ldey5bivhfjapwqi2sljy",
     "did:plc:rjqczurevrpoz4mcnax2kgw4",
 ];
+const LEGACY_CLEF_STAGING_INFER_ACTIONS: [&str; 3] = ["infer", "infer.generate", "infer.embed"];
 
 async fn migrate_legacy_clef_inference_grants(
     manager: &crate::auth::PolicyManager,
     selected: &crate::config::model_admission::ValidatedModelAdmission,
 ) -> Result<()> {
-    if selected.model_ref != "clef-flash-fp8:main"
-        || selected.operation != crate::config::model_admission::ModelOperation::Decisions
-    {
+    if selected.model_ref != "clef-flash-fp8:main" {
         return Ok(());
     }
     for subject in LEGACY_CLEF_STAGING_INFER_SUBJECTS {
-        if selected.owner_subjects.iter().any(|owner| owner == subject) {
+        for action in LEGACY_CLEF_STAGING_INFER_ACTIONS {
             manager
                 .remove_policy_with_domain(
                     subject,
                     "local",
                     "model:clef-flash-fp8:main",
-                    "infer",
+                    action,
                     "allow",
                 )
                 .await
-                .context("remove selected owner's legacy Clef infer grant")?;
+                .context("remove legacy Clef inference grant")?;
         }
     }
     Ok(())
@@ -402,20 +402,24 @@ async fn verify_legacy_clef_inference_grants_removed(
     use anyhow::ensure;
 
     let policies = manager.get_policy().await;
-    if selected.model_ref == "clef-flash-fp8:main"
-        && selected.operation == crate::config::model_admission::ModelOperation::Decisions
-    {
+    if selected.model_ref == "clef-flash-fp8:main" {
         for subject in LEGACY_CLEF_STAGING_INFER_SUBJECTS {
-            if selected.owner_subjects.iter().any(|owner| owner == subject) {
+            let selected_generation_owner = selected.operation
+                == crate::config::model_admission::ModelOperation::Generation
+                && selected.owner_subjects.iter().any(|owner| owner == subject);
+            for action in LEGACY_CLEF_STAGING_INFER_ACTIONS {
+                if selected_generation_owner && action == "infer" {
+                    continue;
+                }
                 ensure!(
                     !policies.contains(&vec![
                         subject.to_owned(),
                         "local".to_owned(),
                         "model:clef-flash-fp8:main".to_owned(),
-                        "infer".to_owned(),
+                        action.to_owned(),
                         "allow".to_owned(),
                     ]),
-                    "selected Clef owner retains a legacy infer grant"
+                    "legacy Clef owner retains a legacy inference grant"
                 );
             }
         }
@@ -2872,6 +2876,24 @@ mod offline_policy_provision_tests {
                         "allow",
                     )
                     .await?;
+                legacy
+                    .add_policy_with_domain(
+                        owner,
+                        "local",
+                        "model:clef-flash-fp8:main",
+                        "infer.embed",
+                        "allow",
+                    )
+                    .await?;
+                legacy
+                    .add_policy_with_domain(
+                        owner,
+                        "local",
+                        "model:clef-flash-fp8:main",
+                        "infer.generate",
+                        "allow",
+                    )
+                    .await?;
             }
             let unrelated = vec![
                 "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -2945,29 +2967,31 @@ mod offline_policy_provision_tests {
                     )
                     .await
             );
-            for action in ["infer", "infer.generate", "infer.embed"] {
-                assert!(
-                    !upgraded
-                        .check_with_domain(
-                            selected_owner,
-                            "local",
-                            "model:clef-flash-fp8:main",
-                            action
-                        )
-                        .await,
-                    "selected owner must not retain legacy action {action}"
-                );
+            for subject in [selected_owner, retained_owner] {
+                for action in ["infer", "infer.generate", "infer.embed"] {
+                    assert!(
+                        !upgraded
+                            .check_with_domain(
+                                subject,
+                                "local",
+                                "model:clef-flash-fp8:main",
+                                action
+                            )
+                            .await,
+                        "decision-only admission must remove {action} for {subject}"
+                    );
+                }
             }
             assert!(
-                upgraded
+                !upgraded
                     .check_with_domain(
                         retained_owner,
                         "local",
                         "model:clef-flash-fp8:main",
-                        "infer"
+                        "decide"
                     )
                     .await,
-                "unselected legacy owner must remain unchanged"
+                "unselected legacy owner must not receive the decision grant"
             );
             assert!(upgraded.get_policy().await.contains(&unrelated));
             let selected_rows: Vec<Vec<String>> = upgraded
@@ -3003,18 +3027,39 @@ mod offline_policy_provision_tests {
         use crate::config::model_admission::{tiny_fixture, ModelOperation};
 
         let owner = "did:plc:3f7ldey5bivhfjapwqi2sljy";
+        let other_owner = "did:plc:rjqczurevrpoz4mcnax2kgw4";
         let root = tempfile::tempdir()?;
         let policies_dir = root.path().join(".registry/policies");
         let legacy = PolicyManager::new(&policies_dir).await?;
-        legacy
-            .add_policy_with_domain(
-                owner,
-                "local",
-                "model:clef-flash-fp8:main",
-                "infer",
-                "allow",
-            )
-            .await?;
+        for subject in [owner, other_owner] {
+            legacy
+                .add_policy_with_domain(
+                    subject,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer",
+                    "allow",
+                )
+                .await?;
+            legacy
+                .add_policy_with_domain(
+                    subject,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer.embed",
+                    "allow",
+                )
+                .await?;
+            legacy
+                .add_policy_with_domain(
+                    subject,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer.generate",
+                    "allow",
+                )
+                .await?;
+        }
         legacy.save().await?;
         drop(legacy);
 
@@ -3043,6 +3088,46 @@ mod offline_policy_provision_tests {
         assert!(
             !provisioned
                 .check_with_domain(owner, "local", "model:clef-flash-fp8:main", "decide")
+                .await
+        );
+        assert!(
+            !provisioned
+                .check_with_domain(other_owner, "local", "model:clef-flash-fp8:main", "infer")
+                .await
+        );
+        assert!(
+            !provisioned
+                .check_with_domain(
+                    other_owner,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer.generate"
+                )
+                .await
+        );
+        assert!(
+            !provisioned
+                .check_with_domain(
+                    owner,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer.generate"
+                )
+                .await
+        );
+        assert!(
+            !provisioned
+                .check_with_domain(
+                    other_owner,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer.embed"
+                )
+                .await
+        );
+        assert!(
+            !provisioned
+                .check_with_domain(owner, "local", "model:clef-flash-fp8:main", "infer.embed")
                 .await
         );
         Ok(())
