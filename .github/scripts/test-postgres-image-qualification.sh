@@ -25,6 +25,7 @@ cat > "${test_root}/cargo" <<'EOF'
 set -euo pipefail
 # libtest must expose stderr even for passing tests that return early.
 [[ " $* " == *' --show-output '* ]] || exit 65
+[[ " $* " == *' test --release '* ]] || exit 71
 if [[ " $* " == *' -p hyprstream '* ]]; then
   [[ " $* " == *' --features '*pglite* ]] || exit 70
 fi
