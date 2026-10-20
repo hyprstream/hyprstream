@@ -293,9 +293,9 @@
       }
     },
     "oci-runtime-validate.yml": {
-      "build-runtime-and-smoke-test-deferred": {
+      "build-runtime-and-smoke-test": {
         "target_class": "amd64-canary",
-        "reason": "seconds-long required-check placeholder (echo only: no build, no checkout, no credentials); arch-neutral, migrates trivially with any pinned container"
+        "reason": "PR source checks and a short merge-group result assertion stay on GitHub-hosted runners to keep untrusted code off persistent self-hosted hosts; the assertion requires native amd64 and arm64 OCI jobs to pass"
       }
     },
     "pr-affected.yml": {

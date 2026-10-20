@@ -188,6 +188,291 @@ class BuildMatrixFixtures(unittest.TestCase):
         (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
         self.expect_fail("cannot classify")
 
+    def test_json_matrix_runner_arrays_are_classified(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64","merge-gate"]'
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64","release"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_ok()
+
+    def test_json_matrix_runner_rejects_mixed_hosted_classes(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+          - architecture: amd64
+            runner: '["ubuntu-latest","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("matrix runner rows mix hosted, self-hosted")
+
+    def test_json_matrix_runner_rejects_architecture_mismatch(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("labels do not match declared architecture arm64")
+
+    def test_json_matrix_runner_rejects_runner_outside_include(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    env:
+      runner: '["self-hosted","linux","arm64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("without supported strategy.matrix.include rows")
+
+    def test_json_matrix_runner_requires_both_architectures(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64","release"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("must contain exactly one arm64 and one amd64")
+
+    def test_json_matrix_runner_rejects_duplicate_architecture(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64","merge-gate"]'
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64","release"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("must contain exactly one arm64 and one amd64")
+
+    def test_json_matrix_runner_rejects_static_label_mixed_with_expression(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: [self-hosted, ${{ fromJSON(matrix.runner) }}]
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+          - architecture: amd64
+            runner: '["ubuntu-latest","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("cannot classify matrix runner expression")
+
+    def test_json_matrix_runner_rejects_modified_expression(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: [self-hosted, ${{ fromJSON(matrix.runner) || 'linux' }}]
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+          - architecture: amd64
+            runner: '["ubuntu-latest","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("cannot classify matrix runner expression")
+
+    def test_json_matrix_runner_rejects_bracket_wrapped_expression(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: [${{ fromJSON(matrix.runner) }}]
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("cannot classify matrix runner expression")
+
+    def test_json_matrix_runner_rejects_additional_matrix_dimensions(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        runner:
+          - '["ubuntu-latest","arm64"]'
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("unsupported strategy.matrix key 'runner'")
+
+    def test_json_matrix_runner_rejects_duplicate_include_mapping(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+        include:
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats strategy.matrix.include mapping")
+
+    def test_json_matrix_runner_rejects_quoted_duplicate_include_mapping(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+        "include":
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats strategy.matrix.include mapping")
+
+    def test_job_rejects_duplicate_runs_on_mapping(self) -> None:
+        wf = HOSTED_WF + """\
+  duplicate-runner:
+    runs-on: [self-hosted, linux, amd64]
+    "runs-on" : ubuntu-latest
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats runs-on mapping")
+
+    def test_json_matrix_runner_rejects_duplicate_matrix_mapping(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+      matrix:
+        include:
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats strategy.matrix mapping")
+
+    def test_json_matrix_runner_rejects_duplicate_strategy_mapping(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+    strategy:
+      matrix:
+        include:
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats strategy mapping")
+
+    def test_json_matrix_runner_rejects_duplicate_architecture_field(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats field 'architecture'")
+
+    def test_json_matrix_runner_rejects_duplicate_runner_field(self) -> None:
+        wf = HOSTED_WF + """\
+  native-matrix:
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    strategy:
+      matrix:
+        include:
+          - architecture: arm64
+            runner: '["self-hosted","linux","arm64"]'
+            runner: '["ubuntu-latest","amd64"]'
+          - architecture: amd64
+            runner: '["self-hosted","linux","amd64"]'
+    steps:
+    - run: true
+"""
+        (self.root / ".github" / "workflows" / "wf.yml").write_text(wf, encoding="utf-8")
+        self.expect_fail("repeats field 'runner'")
+
     def test_yaml_workflow_extension_is_scanned(self) -> None:
         (self.root / ".github" / "workflows" / "wf.yaml").write_text(
             HOSTED_WF, encoding="utf-8"

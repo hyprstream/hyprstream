@@ -144,6 +144,156 @@ def _job_blocks(text: str) -> dict[str, list[str]]:
     return blocks
 
 
+def _matrix_runner_rows(lines: list[str], job: str) -> list[tuple[str, list[str]]]:
+    """Extract runner labels only from strategy.matrix.include rows.
+
+    This narrow parser supports the OCI validation job's explicit
+    `architecture` + JSON `runner` row shape. Other dynamic runs-on schemes
+    remain rejected until they receive an equally explicit contract.
+    """
+    in_strategy = False
+    in_matrix = False
+    in_include = False
+    seen_strategy = False
+    seen_matrix = False
+    seen_include = False
+    current: dict[str, str] | None = None
+    raw_rows: list[dict[str, str]] = []
+
+    def set_field(key: str, value: str) -> None:
+        if current is None:
+            return
+        normalized_key = _strip_key(key)
+        if normalized_key in current:
+            fail(
+                f"job `{job}` matrix runner row repeats field "
+                f"{normalized_key!r}"
+            )
+        current[normalized_key] = _strip_key(value)
+
+    def finish_row() -> None:
+        nonlocal current
+        if current is not None:
+            raw_rows.append(current)
+            current = None
+
+    def mapping_entry(line: str) -> tuple[str, str]:
+        key, separator, value = line.partition(":")
+        if not separator:
+            return "", ""
+        return _strip_key(key.strip()), _strip_key(value)
+
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent == 4:
+            finish_row()
+            key, value = mapping_entry(stripped)
+            if key == "strategy":
+                if value:
+                    fail(f"job `{job}` uses an unsupported inline strategy mapping")
+                if seen_strategy:
+                    fail(f"job `{job}` repeats strategy mapping")
+                seen_strategy = True
+            in_strategy = key == "strategy"
+            in_matrix = False
+            in_include = False
+            continue
+        if in_strategy and indent == 6:
+            finish_row()
+            key, value = mapping_entry(stripped)
+            if key == "matrix":
+                if value:
+                    fail(f"job `{job}` uses an unsupported inline strategy.matrix mapping")
+                if seen_matrix:
+                    fail(f"job `{job}` repeats strategy.matrix mapping")
+                seen_matrix = True
+            in_matrix = key == "matrix"
+            in_include = False
+            continue
+        if in_strategy and in_matrix and indent == 8:
+            finish_row()
+            key, value = mapping_entry(stripped)
+            if key and key != "include":
+                fail(
+                    f"job `{job}` uses unsupported strategy.matrix key "
+                    f"{key!r}; only the include-only runner matrix is supported"
+                )
+            if key == "include":
+                if value:
+                    fail(
+                        f"job `{job}` uses an unsupported inline "
+                        "strategy.matrix.include mapping"
+                    )
+                if seen_include:
+                    fail(f"job `{job}` repeats strategy.matrix.include mapping")
+                seen_include = True
+            in_include = key == "include"
+            continue
+        if not (in_strategy and in_matrix and in_include):
+            continue
+        if indent == 10 and stripped.startswith("-"):
+            finish_row()
+            current = {}
+            value = stripped[1:].strip()
+            if ":" in value:
+                key, field_value = value.split(":", 1)
+                set_field(key, field_value)
+            continue
+        if indent == 12 and current is not None and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            set_field(key, value)
+    finish_row()
+
+    if not raw_rows:
+        fail(
+            f"job `{job}` uses fromJSON(matrix.runner) without supported"
+            " strategy.matrix.include rows"
+        )
+
+    result = []
+    for row in raw_rows:
+        architecture = row.get("architecture")
+        if architecture not in {"arm64", "amd64"}:
+            fail(
+                f"job `{job}` matrix runner row must declare architecture"
+                " `arm64` or `amd64`"
+            )
+        raw_runner = row.get("runner")
+        if raw_runner is None:
+            fail(f"job `{job}` matrix row for {architecture} has no runner array")
+        try:
+            labels = json.loads(raw_runner)
+        except json.JSONDecodeError as exc:
+            fail(f"job `{job}` has an invalid matrix runner JSON array: {exc}")
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or any(not isinstance(label, str) or not label for label in labels)
+        ):
+            fail(
+                f"job `{job}` matrix runner rows must be non-empty arrays"
+                " of non-empty labels"
+            )
+        expected = "arm64" if architecture == "arm64" else "amd64"
+        wrong_arch = "amd64" if architecture == "arm64" else "arm64"
+        if expected not in labels or wrong_arch in labels:
+            fail(
+                f"job `{job}` matrix runner labels do not match declared"
+                f" architecture {architecture}"
+            )
+        result.append((architecture, labels))
+    architectures = [architecture for architecture, _ in result]
+    if len(architectures) != 2 or set(architectures) != {"arm64", "amd64"}:
+        fail(
+            f"job `{job}` matrix runner rows must contain exactly one arm64"
+            " and one amd64 architecture"
+        )
+    return result
+
+
 def _job_runs_on(text: str) -> dict[str, list[str]]:
     """Return {job_name: static_runs_on_labels} for every job.
 
@@ -155,12 +305,18 @@ def _job_runs_on(text: str) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for job, lines in _job_blocks(text).items():
         raw = None
+        raw_seen = False
         for line in lines:
+            if len(line) - len(line.lstrip()) != 4:
+                continue
             stripped = line.strip()
-            if stripped.startswith("runs-on:"):
-                raw = stripped.split(":", 1)[1]
-                break
-            if stripped.startswith("- runs-on:") or stripped.startswith(
+            key, separator, value = stripped.partition(":")
+            if separator and _strip_key(key.strip()) == "runs-on":
+                if raw_seen:
+                    fail(f"job `{job}` repeats runs-on mapping")
+                raw = value
+                raw_seen = True
+            elif stripped.startswith("- runs-on:") or stripped.startswith(
                 "runs-on ="
             ):
                 fail(
@@ -176,6 +332,18 @@ def _job_runs_on(text: str) -> dict[str, list[str]]:
         value = _strip_key(raw)
         if not value:
             fail(f"job `{job}` has an empty runs-on value")
+        matrix_runner_expression = "${{ fromJSON(matrix.runner) }}"
+        mentions_matrix_runner = (
+            "${{" in value
+            and "matrix" in value.lower()
+            and "runner" in value.lower()
+        )
+        if mentions_matrix_runner and value != matrix_runner_expression:
+            fail(
+                f"job `{job}` cannot classify matrix runner expression; "
+                "the gate only supports the exact unwrapped "
+                "`${{ fromJSON(matrix.runner) }}` form"
+            )
         if value.startswith("["):
             if not value.endswith("]"):
                 fail(
@@ -190,10 +358,28 @@ def _job_runs_on(text: str) -> dict[str, list[str]]:
                 continue  # dynamic expression tokens carry no static label
             labels.append(_strip_key(token))
         if not labels:
-            fail(
-                f"job `{job}` runs-on resolves to no static labels;"
-                " cannot classify"
-            )
+            # A bounded exception for native architecture matrices that store
+            # each complete GitHub runner-label array in `matrix.runner` and
+            # select it with fromJSON. Validate every row and require one
+            # runner class across the matrix; never treat an arbitrary dynamic
+            # expression as evidence of a safe runner.
+            if value != "${{ fromJSON(matrix.runner) }}":
+                fail(
+                    f"job `{job}` runs-on resolves to no static labels;"
+                    " cannot classify"
+                )
+            runner_rows = _matrix_runner_rows(lines, job)
+            runner_classes = {_classify(labels) for _, labels in runner_rows}
+            if len(runner_classes) != 1:
+                fail(
+                    f"job `{job}` matrix runner rows mix hosted, self-hosted,"
+                    " or unknown runner classes"
+                )
+            if "unknown" in runner_classes:
+                fail(
+                    f"job `{job}` matrix runner labels cannot be classified"
+                )
+            labels = runner_rows[0][1]
         result[job] = labels
     return result
 
