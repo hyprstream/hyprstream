@@ -455,6 +455,28 @@ impl AdmissionService {
 /// commitment inputs, and the device-flow variant (W1b) does not pin the
 /// nonce claim at all. The commitment/possession check remains a separate
 /// gate.
+/// The pre-D2 replay identity (nonce included). Retained ONLY for the
+/// upgrade transition: a source token consumed by a pre-D2 instance is
+/// recorded under this key, and a still-valid token must not be consumed
+/// again by a post-D2 instance (or vice versa) in a mixed fleet.
+fn legacy_source_credential_replay_key(source: &Source, client_id: &str) -> CredentialReplayKey {
+    let current = source_credential_replay_key(source, client_id);
+    let mut digest = Sha256::new();
+    digest.update(b"hyprstream-source-credential-identity-v1 ");
+    for field in [
+        source.jti.as_bytes(),
+        source.nonce.as_bytes(),
+        &source.token_hash,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    CredentialReplayKey {
+        issuer_client_namespace: current.issuer_client_namespace,
+        credential_identity: digest.finalize().into(),
+    }
+}
+
 fn source_credential_replay_key(source: &Source, client_id: &str) -> CredentialReplayKey {
     fn digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         let mut digest = Sha256::new();
@@ -970,16 +992,31 @@ impl AdmissionService {
             .source_replay
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("source credential replay admission disabled"))?;
+        // D2 transition: consume under BOTH the legacy (nonce-bearing) and
+        // the current (nonce-free) identity. On this code-flow path the
+        // nonce is the verified signed claim, so the legacy key is equally
+        // token-stable, and a mixed-version fleet cannot consume one token
+        // twice in either direction. Legacy first: it serializes
+        // mixed-version consumers. The device-flow variant (W1b) does not
+        // pin the nonce and must drop the legacy write when it lands; the
+        // legacy read can be dropped once every pre-D2 token has expired
+        // (source tokens live at most 300s past issue).
+        let legacy = legacy_source_credential_replay_key(source, client_id);
         let key = source_credential_replay_key(source, client_id);
-        match replay.admit_source_credential(&key, expires_at) {
-            ProofAdmissionResult::Admitted => Ok(()),
-            ProofAdmissionResult::Replayed => {
-                Err(anyhow::anyhow!("source credential already consumed"))
+        for candidate in [&legacy, &key] {
+            match replay.admit_source_credential(candidate, expires_at) {
+                ProofAdmissionResult::Admitted => {}
+                ProofAdmissionResult::Replayed => {
+                    return Err(anyhow::anyhow!("source credential already consumed"));
+                }
+                ProofAdmissionResult::Failed => {
+                    return Err(anyhow::anyhow!(
+                        "source credential replay admission unavailable"
+                    ));
+                }
             }
-            ProofAdmissionResult::Failed => Err(anyhow::anyhow!(
-                "source credential replay admission unavailable"
-            )),
         }
+        Ok(())
     }
 
     async fn prepare(

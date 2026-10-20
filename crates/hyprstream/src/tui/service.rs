@@ -265,16 +265,21 @@ impl TuiService {
 
     /// Whether a credential is TUI-CLASSIFIED at this service: it carries
     /// any TUI federate marker, or its (iss, client_id) equals this
-    /// service's audience and the configured TUI client id — the
-    /// marker-independent class pin, mirroring the www reserved
-    /// (iss, client_id) predicate, so a class-shaped credential with every
-    /// marker stripped still cannot fall through to generic handling.
+    /// service's audience and the authority-owned class pin — the configured
+    /// TUI client id from this service's wiring OR the process-global
+    /// reservation installed from the deployment config at startup. The pin
+    /// mirrors the www reserved (iss, client_id) predicate, so a
+    /// class-shaped credential with every marker stripped still cannot fall
+    /// through to generic handling — including on a TuiService instance the
+    /// class was not wired into (the gate then denies: no configured class
+    /// to verify against).
     fn is_federate_tui_classified(&self, claims: &hyprstream_rpc::auth::Claims) -> bool {
         claims.has_federate_tui_profile_marker()
-            || self.federate_tui_client.as_deref().is_some_and(|client| {
-                claims.client_id.as_deref() == Some(client)
-                    && self.expected_audience.as_deref() == Some(claims.iss.as_str())
-            })
+            || (self.expected_audience.as_deref() == Some(claims.iss.as_str())
+                && claims.client_id.as_deref().is_some_and(|id| {
+                    Some(id) == self.federate_tui_client.as_deref()
+                        || Some(id) == hyprstream_rpc::auth::federate_tui_class_client()
+                }))
     }
 
     /// W1.3 consumer gate: admit a TUI-class federate credential for exactly
@@ -3010,9 +3015,11 @@ mod tests {
         let mut wrong_iss = stripped.clone();
         wrong_iss.iss = "https://other-cell.example".into();
         assert!(!service.is_federate_tui_classified(&wrong_iss));
-        // Unconfigured service: the pin never fires; markers still classify.
+        // Unconfigured service: the marker set still classifies. (The
+        // stripped-shape behavior without the per-service wiring depends on
+        // the process-global class reservation, which the dispatch fixture
+        // w13 covers with the reservation installed.)
         let unconfigured = gate_service(false);
-        assert!(!unconfigured.is_federate_tui_classified(&stripped));
         assert!(unconfigured.is_federate_tui_classified(&gate_claims("connect:tui:session")));
     }
 

@@ -599,6 +599,24 @@ fn replay_identity_ignores_commitment_nonce_and_pins_the_client_class() {
     );
 }
 
+#[test]
+fn legacy_replay_key_differs_by_nonce_for_mixed_version_consumption() {
+    // D2 transition: the legacy derivation includes the nonce so pre-upgrade
+    // consumption records are recognized by post-upgrade consumers (the
+    // consume path admits both keys); the current derivation ignores it.
+    let a = source();
+    let mut b = source();
+    b.nonce = "another-commitment-nonce".into();
+    assert_ne!(
+        super::legacy_source_credential_replay_key(&a, "client"),
+        super::legacy_source_credential_replay_key(&b, "client")
+    );
+    assert_eq!(
+        super::source_credential_replay_key(&a, "client"),
+        super::source_credential_replay_key(&b, "client")
+    );
+}
+
 #[tokio::test]
 async fn malformed_policy_tenant_rejects_the_federate_decision() {
     // D4: a Policy grant carrying a tenant the HTTP middleware syntax would

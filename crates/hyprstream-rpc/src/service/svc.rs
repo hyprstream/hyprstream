@@ -168,6 +168,11 @@ pub struct EnvelopeContext {
     /// A signature-verified reserved Federate JWT awaiting its original-holder
     /// proof and Policy admission. It confers no identity before commit.
     deferred_federate: Option<(crate::auth::Claims, Subject)>,
+    /// Set by `verify_claims()`: the credential is of the Federate TUI client
+    /// class (marker set, or the authority-owned deployment class pin).
+    /// Dispatch fences classified credentials (see dispatch.rs); evidence
+    /// verification never sets this on the REQUEST context.
+    federate_tui_class: bool,
     /// Installed only after the H3b hybrid proof and durable Policy admission.
     /// The envelope signer may be a relay and is never the caller's assurance.
     federate_holder_ed: Option<[u8; 32]>,
@@ -371,6 +376,7 @@ impl EnvelopeContext {
             jwt_token: envelope.jwt_token().map(ToOwned::to_owned),
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: envelope.delegation_token.clone(),
@@ -406,6 +412,7 @@ impl EnvelopeContext {
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: envelope.envelope.delegation_token.clone(),
@@ -445,6 +452,7 @@ impl EnvelopeContext {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -498,6 +506,7 @@ impl EnvelopeContext {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -658,6 +667,7 @@ impl EnvelopeContext {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -814,6 +824,18 @@ impl EnvelopeContext {
     /// For an authorized relay this is the delegated bearer, allowing a
     /// downstream service to preserve the original user's verified identity
     /// across another local service boundary.
+    /// Whether the verified credential is of the Federate TUI client class
+    /// (set by `verify_claims`; never caller-supplied).
+    pub fn is_federate_tui_class(&self) -> bool {
+        self.federate_tui_class
+    }
+
+    /// Whether this request's identity came from a delegated bearer token
+    /// (an authenticated service mediator presented the holder's token).
+    pub fn is_delegated_bearer(&self) -> bool {
+        self.jwt_token.is_none() && self.delegation_token.is_some()
+    }
+
     pub fn jwt_token(&self) -> Option<&str> {
         self.jwt_token
             .as_deref()
@@ -1713,19 +1735,6 @@ pub trait RequestService: 'static {
             return Ok(());
         }
 
-        // Federate TUI-class fence (W1.3): a credential carrying TUI markers
-        // authenticates through this normal path but dispatches ONLY on the
-        // tui service. The class carries no registry|model consumer
-        // authority, and the per-service Casbin layer does not intersect
-        // credential scopes — without this fence a TUI credential would act
-        // as a generic identity credential for its DID wherever that DID has
-        // independent grants and clearance. Marker-stripped class-shaped
-        // credentials (unmintable; the mint stamps the markers
-        // unconditionally) are the consumer's class pin to reject.
-        if verified.has_federate_tui_profile_marker() && self.name() != "tui" {
-            anyhow::bail!("Federate TUI credentials dispatch only on the tui service");
-        }
-
         // Credential/session checks. The local-issuer set is resolved first:
         // the credential profile makes `jti` REQUIRED on locally issued
         // tokens, and the session registry is a local authority — both
@@ -1734,6 +1743,16 @@ pub trait RequestService: 'static {
         let local_issuers = key_source.local_issuers();
         let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
         let token_is_local = crate::auth::is_local_iss(&verified.iss, &local_issuers_refs);
+
+        // W1.3: classify Federate TUI-class credentials — marker set, or the
+        // authority-owned class pin (deployment-configured client id at a
+        // local issuer). This flag is routing metadata only; ENFORCEMENT
+        // happens at dispatch (dispatch.rs fences classified credentials to
+        // the tui service and policy's read-only delegated check) and at the
+        // TUI consumer gate. Verification itself must stay class-blind here:
+        // this method also runs for evidence verification (e.g. Policy
+        // verifying a mediated holder), which is not dispatch.
+        ctx.federate_tui_class = verified.is_federate_tui_class(&local_issuers_refs);
 
         // v16 §3.1/§3.3: issuer-scoped credential and session enforcement
         // applies only to tokens carrying a real authoritative issuer. An
@@ -2315,6 +2334,7 @@ mod empty_iss_gate_tests {
             jwt_token: Some(token),
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -3534,6 +3554,7 @@ mod ipc_key_identity_tests {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -3843,6 +3864,7 @@ mod accounting_audit_tests {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -3908,6 +3930,7 @@ mod accounting_audit_tests {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -3983,6 +4006,7 @@ mod accounting_audit_tests {
             jwt_token: None,
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,
@@ -4342,6 +4366,7 @@ mod internal_work_routing_tests {
             jwt_token: Some(token),
             direct_jwt_verified: false,
             deferred_federate: None,
+            federate_tui_class: false,
             federate_holder_ed: None,
             federate_request_use: None,
             delegation_token: None,

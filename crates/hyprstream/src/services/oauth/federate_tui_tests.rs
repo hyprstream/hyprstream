@@ -184,6 +184,10 @@ async fn w14_tui_credential_dispatch_intended_and_forbidden_services() -> Result
             hyprstream_rpc::auth::mac::MacDecision::Permit
         }
     }
+    // The deployment-configured class reservation, as startup installs it:
+    // stripped class-shaped credentials are classified by pin even without
+    // markers, and the dispatch fence denies them pre-handler.
+    hyprstream_rpc::auth::install_federate_tui_class_client(Some(TUI_CLIENT))?;
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(Arc::new(FixturePep));
     assert!(
         hyprstream_rpc::proof::policy::set_global_method_policy(Box::new(
@@ -348,27 +352,31 @@ async fn w14_tui_credential_dispatch_intended_and_forbidden_services() -> Result
     );
     assert_eq!(tui.calls.load(Ordering::SeqCst), 1);
 
-    // Malformed re-signed fixtures against the same boundary. Two distinct
-    // denial layers, both proven per variant:
-    // * pre-handler (svc.rs): a www marker OR the reserved www client id
-    //   forces the deferred federate branch, which this boundary never
-    //   accepts — the handler is never invoked;
-    // * handler: a validly signed TUI-shaped credential with stripped or
-    //   wrong TUI markers reaches the handler and is denied by the TUI
-    //   consumer check (`verify_tui_credential_claims`).
+    // Malformed re-signed fixtures against the same boundary. Distinct
+    // denial layers, each proven per variant:
+    // * pre-handler deferred branch (svc.rs): a www marker OR the reserved
+    //   www client id, which this boundary never accepts;
+    // * pre-handler class fence (dispatch.rs): a marker-stripped but
+    //   class-pinned credential (incomplete marker set is never legitimate);
+    // * handler: a complete-marker-set credential with a wrong profile
+    //   string reaches the handler and is denied by the TUI consumer check
+    //   (`verify_tui_credential_claims`).
     for variant in 0..6 {
         let mut bad = claims.clone();
         let denied_pre_handler = match variant {
             0 => {
                 bad.hs_tui_profile = None;
-                false
+                // Classified by the authority-owned pin (markers stripped,
+                // client_id intact) and denied by the dispatch fence: the
+                // marker set is incomplete and the mint never produces that.
+                true
             }
             1 => {
                 bad.hs_tui_profile = None;
                 bad.hs_tui_signer_pq_key_v1 = None;
                 bad.hs_tui_source_issuer_v1 = None;
                 bad.hs_tui_source_subject_v1 = None;
-                false
+                true
             }
             2 => {
                 bad.hs_profile = Some("federate-session-v1".into());
@@ -477,37 +485,46 @@ async fn w14_tui_credential_dispatch_intended_and_forbidden_services() -> Result
             calls: AtomicUsize::new(0),
             authorization_errors: Mutex::new(Vec::new()),
         };
-        let token = signer.sign(&forbidden_claims).await?;
-        // The envelope names the forbidden service domain, so only the class
-        // fence stands between the credential and that service's handler.
-        let bytes = signed_tui_request_bytes(
-            token.as_bytes(),
-            &body,
-            &holder,
-            &holder_pq,
-            &server,
-            service_name,
-        )
-        .await?;
-        process_request(
-            &bytes,
-            &boundary,
-            hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
-            &boundary.server,
-            &envelope::InMemoryNonceCache::new(),
-            CarrierContext::iroh(),
-        )
-        .await?;
-        assert_eq!(
-            boundary.attempts.load(Ordering::SeqCst),
-            0,
-            "the class fence must deny the TUI credential before the {service_name} handler"
-        );
-        assert_eq!(boundary.calls.load(Ordering::SeqCst), 0);
-        assert!(
-            boundary.authorization_errors.lock().is_empty(),
-            "the {service_name} authorization path must never run"
-        );
+        // The complete-marker credential AND the all-stripped class-pinned
+        // shape (the W1.4 all-stripped forbidden-service case) both deny.
+        let mut stripped_claims = forbidden_claims.clone();
+        stripped_claims.hs_tui_profile = None;
+        stripped_claims.hs_tui_signer_pq_key_v1 = None;
+        stripped_claims.hs_tui_source_issuer_v1 = None;
+        stripped_claims.hs_tui_source_subject_v1 = None;
+        for case in [&forbidden_claims, &stripped_claims] {
+            let token = signer.sign(case).await?;
+            // The envelope names the forbidden service domain, so only the
+            // class fence stands between the credential and that handler.
+            let bytes = signed_tui_request_bytes(
+                token.as_bytes(),
+                &body,
+                &holder,
+                &holder_pq,
+                &server,
+                service_name,
+            )
+            .await?;
+            process_request(
+                &bytes,
+                &boundary,
+                hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                &boundary.server,
+                &envelope::InMemoryNonceCache::new(),
+                CarrierContext::iroh(),
+            )
+            .await?;
+            assert_eq!(
+                boundary.attempts.load(Ordering::SeqCst),
+                0,
+                "the class fence must deny the TUI credential before the {service_name} handler"
+            );
+            assert_eq!(boundary.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                boundary.authorization_errors.lock().is_empty(),
+                "the {service_name} authorization path must never run"
+            );
+        }
     }
     Ok(())
 }
@@ -590,11 +607,13 @@ impl hyprstream_rpc::auth::mac::MacDispatchPep for PermitAllPep {
     }
 }
 
-/// Process-global fixture setup shared by the real-service consumer test.
-/// Every global is install-once; the test re-execs itself for isolation.
+/// Process-global fixture setup shared by the real-service consumer tests.
+/// Every global is install-once; the tests re-exec themselves for isolation.
+/// All envelope signer keys used by the fixture are trust-anchored here so
+/// rejections are attributable to the layer under test, never to an
+/// unanchored envelope.
 fn install_real_service_fixture_globals(
-    holder: &SigningKey,
-    holder_pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    signers: &[(&SigningKey, &hyprstream_rpc::crypto::pq::MlDsaSigningKey)],
 ) -> Result<()> {
     hyprstream_rpc::auth::mac::install_mac_dispatch_pep(Arc::new(PermitAllPep));
     assert!(
@@ -604,10 +623,12 @@ fn install_real_service_fixture_globals(
         .is_ok()
     );
     let mut store = envelope::KeyedPqTrustStore::new();
-    store.bind(
-        holder.verifying_key().to_bytes(),
-        &hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(holder_pq))?,
-    );
+    for (signer, signer_pq) in signers {
+        store.bind(
+            signer.verifying_key().to_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(signer_pq))?,
+        );
+    }
     envelope::install_verify_config(envelope::EnvelopeVerifyConfig {
         policy: CryptoPolicy::Hybrid,
         pq_store: Some(Arc::new(store)),
@@ -736,7 +757,11 @@ async fn w13_tui_credential_drives_the_real_tui_service() -> Result<()> {
     let server = SigningKey::from_bytes(&[72; 32]);
     let holder = SigningKey::from_bytes(&[75; 32]);
     let holder_pq = ml_dsa_sk_from_seed(&[76; 32]);
-    install_real_service_fixture_globals(&holder, &holder_pq)?;
+    // The deployment-configured class reservation, as startup installs it:
+    // the consumer gate classifies marker-stripped credentials by pin even
+    // on a TuiService instance the class was not wired into.
+    hyprstream_rpc::auth::install_federate_tui_class_client(Some(TUI_CLIENT))?;
+    install_real_service_fixture_globals(&[(&holder, &holder_pq)])?;
     let pair = super::tests::oauth_signing_pair(71);
     let (_dir, key_set) = super::tests::composite_signer_fixture(1, vec![pair.clone()]);
     let signer = super::HybridFederateSigner::new(key_set)?;
@@ -840,6 +865,48 @@ async fn w13_tui_credential_drives_the_real_tui_service() -> Result<()> {
                 "unconfigured TUI class must default-deny at the consumer"
             );
 
+            // Negative: the ALL-STRIPPED class-pinned credential against the
+            // unconfigured service. The global reservation pin classifies it
+            // even without markers and even without the service wiring, and
+            // the dispatch fence denies the incomplete marker set outright
+            // (the gate would also deny: no configured class to verify).
+            let mut stripped = mint_real_service_claims(
+                &host,
+                &holder,
+                &holder_pq,
+                "tui-unconfigured-sid",
+                &["connect:tui:session"],
+            )
+            .await?;
+            stripped.hs_tui_profile = None;
+            stripped.hs_tui_signer_pq_key_v1 = None;
+            stripped.hs_tui_source_issuer_v1 = None;
+            stripped.hs_tui_source_subject_v1 = None;
+            let token = signer.sign(&stripped).await?;
+            let bytes = signed_tui_request_bytes(
+                token.as_bytes(),
+                &body,
+                &holder,
+                &holder_pq,
+                &server,
+                "tui",
+            )
+            .await?;
+            process_request(
+                &bytes,
+                &tui_unconfigured,
+                hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                &server,
+                &envelope::InMemoryNonceCache::new(),
+                CarrierContext::iroh(),
+            )
+            .await?;
+            assert_eq!(
+                tui_unconfigured.test_session_count().await,
+                0,
+                "all-stripped TUI-class credential must deny on an unconfigured service"
+            );
+
             // Negatives through the REAL service: re-signed malformed
             // fixtures (the class pin and gate deny each; no session is
             // ever created). The session for this sid is registered, so the
@@ -938,5 +1005,317 @@ async fn w13_tui_credential_drives_the_real_tui_service() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         })
         .await?;
+    Ok(())
+}
+
+/// A boundary wrapping the REAL PolicyService, recording check results so
+/// the dispatch fixtures can observe what the inner service decided.
+struct PolicyBoundary {
+    host: FederateHost,
+    policy: crate::services::policy::PolicyService,
+    server: SigningKey,
+    transport: TransportConfig,
+    keys: Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    revocations: hyprstream_rpc::auth::InMemoryCredentialRevocationStore,
+    attempts: AtomicUsize,
+    check_results: Mutex<Vec<bool>>,
+}
+
+#[async_trait(?Send)]
+impl RequestService for PolicyBoundary {
+    fn name(&self) -> &str {
+        "policy"
+    }
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+    fn signing_key(&self) -> SigningKey {
+        self.server.clone()
+    }
+    fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
+        Some(hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&self.server))
+    }
+    fn jwt_key_source(&self) -> Option<Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        Some(self.keys.clone())
+    }
+    fn expected_audience(&self) -> Option<&str> {
+        Some(self.host.as_str())
+    }
+    fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+        // Delegate the mediator-admission decision to the real PolicyService.
+        RequestService::accept_delegated_bearer(&self.policy, signer_pubkey)
+    }
+    fn credential_revocation_store(
+        &self,
+    ) -> Option<&dyn hyprstream_rpc::auth::CredentialRevocationStore> {
+        Some(&self.revocations)
+    }
+    fn decode_request_body(&self, bytes: &[u8]) -> Result<DecodedRequestBody> {
+        RequestService::decode_request_body(&self.policy, bytes)
+    }
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &DecodedRequestBody,
+    ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        let (bytes, cont) = self.policy.handle_request(ctx, body).await?;
+        // Record the check verdict from the raw policy_response payload.
+        let message = capnp::serialize::read_message(
+            &mut Cursor::new(&bytes),
+            hyprstream_rpc::service::body::bounded_reader_options(),
+        )?;
+        let response = message.get_root::<hyprstream_rpc_std::policy_capnp::policy_response::Reader<'_>>()?;
+        if let Ok(hyprstream_rpc_std::policy_capnp::policy_response::Which::CheckResult(allowed)) =
+            response.which()
+        {
+            self.check_results.lock().push(allowed);
+        }
+        Ok((bytes, cont))
+    }
+}
+
+/// Build a policy_request body: `check` leaf or the `issueToken` leaf.
+fn policy_request_body(check: bool, resource: &str, operation: &str) -> Result<Vec<u8>> {
+    hyprstream_rpc::serialize_message(|message| {
+        let mut req =
+            message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder<'_>>();
+        req.set_id(1);
+        if check {
+            let mut c = req.reborrow().init_check();
+            c.set_subject("did:plc:abcdefghijklmnopqrstuvwx");
+            c.set_domain("tenant-a");
+            c.set_resource(resource);
+            c.set_operation(operation);
+        } else {
+            req.reborrow().init_issue_token();
+        }
+    })
+}
+
+/// Sign an envelope carrying the TUI credential as a delegated bearer (the
+/// TUI service's authorize path shape), or — when `direct` — as the direct
+/// envelope JWT.
+async fn signed_policy_request_bytes(
+    token: &str,
+    body: &[u8],
+    mediator: &SigningKey,
+    mediator_pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    server: &SigningKey,
+    direct: bool,
+) -> Result<Vec<u8>> {
+    let suite = hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768;
+    let response = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
+    let stream = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(suite)?;
+    let request = RequestEnvelope::new(body.to_vec()).with_service_domain("policy")?;
+    let request = if direct {
+        request.with_jwt_token(token.to_owned())
+    } else {
+        request.with_delegation_token(token.to_owned())
+    };
+    let request = request
+        .with_client_dh_public([61; 32])
+        .with_response_kem_recipient(response.public())
+        .with_client_kem_public(stream.public())?;
+    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+        request,
+        mediator,
+        mediator_pq,
+        &derive_mesh_kem_recipient(server)?.public(),
+    )?;
+    let mut message = capnp::message::Builder::new_default();
+    signed.write_to(
+        &mut message
+            .init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+    );
+    let mut bytes = vec![];
+    capnp::serialize::write_message(&mut bytes, &message)?;
+    Ok(bytes)
+}
+
+/// W1.3 mediated authorization: a TUI-class credential reaches Policy's
+/// read-only check ONLY as the delegated subject of an enrolled service
+/// mediator (the TUI service's authorize path) — never directly, never for
+/// Policy's mutation/issuance leaves, never via an unenrolled mediator.
+#[tokio::test]
+async fn w13_tui_credential_reaches_policy_check_only_delegated() -> Result<()> {
+    const CHILD: &str = "HYPRSTREAM_TUI_POLICY_FIXTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "services::oauth::state::federate_tui_tests::w13_tui_credential_reaches_policy_check_only_delegated", "--nocapture"])
+            .env(CHILD, "1")
+            .status()?;
+        anyhow::ensure!(status.success(), "isolated TUI-to-Policy regression failed");
+        return Ok(());
+    }
+    // The deployment-configured class reservation, as startup installs it.
+    hyprstream_rpc::auth::install_federate_tui_class_client(Some(TUI_CLIENT))?;
+    let host = FederateHost::new(HOST)?;
+    let server = SigningKey::from_bytes(&[72; 32]);
+    let holder = SigningKey::from_bytes(&[75; 32]);
+    let holder_pq = ml_dsa_sk_from_seed(&[76; 32]);
+    // The mediator (the tui service's own key pair).
+    let mediator = SigningKey::from_bytes(&[77; 32]);
+    let mediator_pq = ml_dsa_sk_from_seed(&[78; 32]);
+    // The unenrolled-mediator negative anchors its envelope too: the denial
+    // must come from delegated-bearer admission, never from an unanchored
+    // envelope.
+    let stranger = SigningKey::from_bytes(&[90; 32]);
+    let stranger_pq = ml_dsa_sk_from_seed(&[91; 32]);
+    install_real_service_fixture_globals(&[(&mediator, &mediator_pq), (&stranger, &stranger_pq)])?;
+    let pair = super::tests::oauth_signing_pair(71);
+    let (_dir, key_set) = super::tests::composite_signer_fixture(1, vec![pair.clone()]);
+    let signer = super::HybridFederateSigner::new(key_set)?;
+    // The mediator is an enrolled service in the global trust store.
+    hyprstream_service::global_trust_store().insert(
+        mediator.verifying_key(),
+        hyprstream_service::Attestation {
+            scopes: ["tui".to_owned()].into_iter().collect(),
+            subject: None,
+            jwt: None,
+            expires_at: 0,
+            attested_by: None,
+        },
+    );
+    // The real PolicyService with one exact grant for the DID.
+    let manager = Arc::new(crate::auth::PolicyManager::new_in_memory().await?);
+    manager
+        .add_policy_with_domain(DID, "tenant-a", "tui:session", "write", "allow")
+        .await?;
+    let git_root = tempfile::tempdir()?;
+    let git2db = Arc::new(tokio::sync::RwLock::new(
+        git2db::Git2DB::open(git_root.path()).await?,
+    ));
+    let policy_transport = TransportConfig::ipc(_dir.path().join("policy-fixture.sock"));
+    let policy = crate::services::policy::PolicyService::new(
+        manager,
+        Arc::new(server.clone()),
+        crate::config::TokenConfig::default(),
+        git2db,
+        policy_transport.clone(),
+    )
+    .with_jwt_key_source(Arc::new(
+        ClusterKeySource::new(*pair.ed25519(), host.as_str().into())
+            .with_ca_composite_key(pair.ml_dsa().clone()),
+    ))
+    .with_default_audience(host.as_str().to_owned());
+    let boundary = PolicyBoundary {
+        host: host.clone(),
+        policy,
+        server: server.clone(),
+        transport: policy_transport,
+        keys: Arc::new(
+            ClusterKeySource::new(*pair.ed25519(), host.as_str().into())
+                .with_ca_composite_key(pair.ml_dsa().clone()),
+        ),
+        revocations: hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        attempts: AtomicUsize::new(0),
+        check_results: Mutex::new(Vec::new()),
+    };
+    let token = signed_real_service_credential(
+        &signer,
+        &host,
+        &holder,
+        &holder_pq,
+        "tui-policy-sid",
+        &["write:tui:session"],
+    )
+    .await?;
+
+    // Positive: delegated check for the granted TUI operation.
+    let body = policy_request_body(true, "tui:session", "write")?;
+    let bytes =
+        signed_policy_request_bytes(&token, &body, &mediator, &mediator_pq, &server, false).await?;
+    process_request(
+        &bytes,
+        &boundary,
+        hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+        &boundary.server,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await?;
+    assert_eq!(boundary.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        boundary.check_results.lock().as_slice(),
+        &[true],
+        "the granted TUI operation must pass the real Policy check"
+    );
+
+    // The real check runs: a non-granted resource returns false (the fence
+    // admits the check; Casbin decides it).
+    let body = policy_request_body(true, "model:qwen2.5-0.5b-instruct:main", "infer")?;
+    let bytes =
+        signed_policy_request_bytes(&token, &body, &mediator, &mediator_pq, &server, false).await?;
+    process_request(
+        &bytes,
+        &boundary,
+        hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+        &boundary.server,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await?;
+    assert_eq!(boundary.check_results.lock().as_slice(), &[true, false]);
+
+    // Negative: the same credential as a DIRECT (non-delegated) bearer is
+    // fenced out of policy.check.
+    let body = policy_request_body(true, "tui:session", "write")?;
+    let bytes =
+        signed_policy_request_bytes(&token, &body, &mediator, &mediator_pq, &server, true).await?;
+    process_request(
+        &bytes,
+        &boundary,
+        hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+        &boundary.server,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await?;
+    assert_eq!(
+        boundary.attempts.load(Ordering::SeqCst),
+        2,
+        "a direct TUI credential must not reach the policy handler"
+    );
+
+    // Negative: delegated TUI credential at a Policy mutation leaf
+    // (issueToken) is fenced out.
+    let body = policy_request_body(false, "tui:session", "write")?;
+    let bytes =
+        signed_policy_request_bytes(&token, &body, &mediator, &mediator_pq, &server, false).await?;
+    process_request(
+        &bytes,
+        &boundary,
+        hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+        &boundary.server,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await?;
+    assert_eq!(
+        boundary.attempts.load(Ordering::SeqCst),
+        2,
+        "a TUI credential must not reach Policy mutation leaves"
+    );
+
+    // Negative: an unenrolled mediator cannot present the credential at all
+    // (delegated-bearer admission, before the class fence).
+    let body = policy_request_body(true, "tui:session", "write")?;
+    let bytes =
+        signed_policy_request_bytes(&token, &body, &stranger, &stranger_pq, &server, false).await?;
+    process_request(
+        &bytes,
+        &boundary,
+        hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+        &boundary.server,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await?;
+    assert_eq!(
+        boundary.attempts.load(Ordering::SeqCst),
+        2,
+        "an unenrolled mediator must not carry a TUI credential to Policy"
+    );
     Ok(())
 }

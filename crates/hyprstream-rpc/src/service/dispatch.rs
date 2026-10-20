@@ -563,6 +563,41 @@ where
         }
     };
 
+    // Federate TUI-class dispatch fence (W1.3). A TUI-classified credential
+    // (marker set, or the authority-owned deployment class pin — classified
+    // by verify_claims, never caller-supplied) dispatches only on:
+    //   * the tui service — the consumer gate there enforces the exact
+    //     class and the per-operation scope map; and
+    //   * the policy service's read-only check leaf (policy.capnp
+    //     `check @1`, union discriminant 0) and only as the delegated
+    //     subject of an authenticated
+    //     service mediator — the TUI service's per-operation Casbin
+    //     authorization. Mutation/issuance leaves and direct holder calls
+    //     are never admitted.
+    // A classified credential with the marker set stripped is denied
+    // unconditionally: the mint stamps all four markers, so that shape is
+    // never legitimate. The class carries no registry|model consumer
+    // authority, and per-service Casbin checks do not intersect credential
+    // scopes — without this fence a TUI credential would act as a generic
+    // identity credential for its DID wherever that DID has independent
+    // grants and clearance.
+    if ctx.is_federate_tui_class() {
+        let complete = ctx
+            .claims()
+            .is_some_and(crate::auth::Claims::has_complete_federate_tui_profile);
+        // policy.capnp: `check @1` is union discriminant 0 (the leaf path is
+        // the discriminant, per the generated decoder).
+        const POLICY_CHECK_LEAF: &[u16] = &[0u16];
+        let allowed = complete
+            && (actual_service_domain == "tui"
+                || (actual_service_domain == "policy"
+                    && decoded_body.leaf_path() == Some(POLICY_CHECK_LEAF)
+                    && ctx.is_delegated_bearer()));
+        if !allowed {
+            return dispatch_denied("federate TUI credential class not dispatchable here");
+        }
+    }
+
     let mut deferred_federate_replay = None;
     if deferred_federate {
         let Some(proof) = parsed_proof.as_ref() else {

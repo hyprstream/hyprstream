@@ -302,6 +302,37 @@ pub struct Claims {
 pub const FEDERATE_STAGING_HOST: &str = "https://discovery.staging.lab.hyprstream.com";
 pub const FEDERATE_STAGING_CLIENT: &str = "cyberdione-www-staging";
 
+/// The deployment-configured Federate TUI client class id (W1.3), installed
+/// once per process from the trusted-issuer configuration at service
+/// startup (before any service factory runs). This is the authority-owned,
+/// marker-independent class reservation: the RPC layer classifies a
+/// credential naming this client id at a local issuer as TUI-class even with
+/// every TUI marker stripped, so the stripped shape can never fall through
+/// to generic handling. `None` (unconfigured deployment) leaves only the
+/// marker-set classification; nothing can mint the class then.
+static FEDERATE_TUI_CLASS_CLIENT: std::sync::OnceLock<Option<String>> =
+    std::sync::OnceLock::new();
+
+/// Install the TUI class reservation. Idempotent when the value matches a
+/// previous install (startup paths may run more than once); a conflicting
+/// re-install is an error (the class is an authority pin, never reseated).
+pub fn install_federate_tui_class_client(client_id: Option<&str>) -> anyhow::Result<()> {
+    let value = client_id.map(str::to_owned);
+    match FEDERATE_TUI_CLASS_CLIENT.get() {
+        Some(existing) if *existing == value => Ok(()),
+        Some(_) => anyhow::bail!("federate TUI class client already installed with a different id"),
+        None => FEDERATE_TUI_CLASS_CLIENT
+            .set(value)
+            .map_err(|_| anyhow::anyhow!("federate TUI class client install raced")),
+    }
+}
+
+/// The configured TUI class client id, or `None` when the class is
+/// unconfigured (or startup never installed the reservation).
+pub fn federate_tui_class_client() -> Option<&'static str> {
+    FEDERATE_TUI_CLASS_CLIENT.get().and_then(Option::as_deref)
+}
+
 /// Server-configured Federate API identity. Accept only an exact canonical
 /// HTTPS origin; never construct this authority from a request or JWT claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -683,6 +714,29 @@ impl Claims {
             || self.hs_tui_signer_pq_key_v1.is_some()
             || self.hs_tui_source_issuer_v1.is_some()
             || self.hs_tui_source_subject_v1.is_some()
+    }
+
+    /// The COMPLETE TUI-consumer marker set. The mint stamps all four
+    /// unconditionally, so a classified credential with any marker missing
+    /// is never legitimate.
+    pub fn has_complete_federate_tui_profile(&self) -> bool {
+        self.hs_tui_profile.is_some()
+            && self.hs_tui_signer_pq_key_v1.is_some()
+            && self.hs_tui_source_issuer_v1.is_some()
+            && self.hs_tui_source_subject_v1.is_some()
+    }
+
+    /// Whether this credential is of the Federate TUI client class (W1.3):
+    /// it carries any TUI marker, OR it names the deployment-configured TUI
+    /// client id at a local issuer — the authority-owned, marker-independent
+    /// class pin, mirroring the www reserved (iss, client_id) predicate so a
+    /// class-shaped credential with every marker stripped still cannot fall
+    /// through to generic handling.
+    pub fn is_federate_tui_class(&self, local_issuers: &[&str]) -> bool {
+        self.has_federate_tui_profile_marker()
+            || (crate::auth::is_local_iss(&self.iss, local_issuers)
+                && federate_tui_class_client()
+                    .is_some_and(|client| self.client_id.as_deref() == Some(client)))
     }
 
     /// Stamp the TUI-consumer Federate profile marker set. Every claim is

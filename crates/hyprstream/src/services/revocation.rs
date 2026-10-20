@@ -343,6 +343,38 @@ pub async fn init_process_authority_stores(
     hosts_policy: bool,
     defer_policy_probe: bool,
 ) -> anyhow::Result<()> {
+    // W1.3: install the authority-owned Federate TUI class reservation BEFORE
+    // any factory runs, so the RPC dispatch fence classifies TUI-class
+    // credentials (including marker-stripped shapes) identically in every
+    // service process. The reservation comes from the deployment's
+    // trusted-issuer config — never from a caller. A configured-but-invalid
+    // class leaves the reservation uninstalled (fail-closed: only the
+    // marker set classifies, and nothing can mint the class).
+    {
+        let config = super::factories::load_config()?;
+        let tui_client = config
+            .oauth
+            .trusted_issuers
+            .get(crate::services::oauth::federate_source::ISSUER)
+            .and_then(|issuer| issuer.federate_tui_client.as_ref())
+            .and_then(|class| {
+                match crate::services::oauth::federate_source::ClientClass::new(
+                    &class.client_id,
+                    &class.aud,
+                    class.connector_id.as_deref(),
+                ) {
+                    Ok(class) => Some(class.client_id().to_owned()),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "Federate TUI class reservation not installed: invalid trusted-issuer configuration"
+                        );
+                        None
+                    }
+                }
+            });
+        hyprstream_rpc::auth::install_federate_tui_class_client(tui_client.as_deref())?;
+    }
     if hosts_policy {
         let data_dir = ctx.deployment_data_dir()?;
         let credentials_path = data_dir.join("credential-revocations.jsonl");

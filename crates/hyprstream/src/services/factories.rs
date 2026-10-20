@@ -50,7 +50,7 @@ use hyprstream_rpc_std::registry_client::RegistryClient;
 /// configured RDS binding would flip an RDS-bound node back to the local
 /// RocksDB backend while its AZ peers run Postgres. A missing config file is
 /// not an error (the loader treats it as optional); parse/IO failures are.
-fn load_config() -> anyhow::Result<HyprConfig> {
+pub(crate) fn load_config() -> anyhow::Result<HyprConfig> {
     HyprConfig::load().map_err(|e| anyhow::anyhow!("failed to load hyprstream configuration: {e}"))
 }
 
