@@ -612,6 +612,28 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
             groupings: None,
         },
         PolicyTemplate {
+            name: "cyberdione-staging-clef-e2e",
+            description: "One existing staging test owner DID in the local tenant, limited to the closed Clef Registry and Model calls",
+            policies: Some(&[
+                ServicePolicyRule { subject: "did:plc:3f7ldey5bivhfjapwqi2sljy", domain: "local", resource: "registry:clef-flash-fp8", action: "query", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:3f7ldey5bivhfjapwqi2sljy", domain: "local", resource: "model:Load", action: "write", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:3f7ldey5bivhfjapwqi2sljy", domain: "local", resource: "model:Status", action: "query", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:3f7ldey5bivhfjapwqi2sljy", domain: "local", resource: "model:clef-flash-fp8:main", action: "decide", effect: "allow" },
+            ]),
+            groupings: None,
+        },
+        PolicyTemplate {
+            name: "cyberdione-staging-clef-operator",
+            description: "One existing staging operator owner DID in the local tenant, limited to the closed Clef Registry and Model calls",
+            policies: Some(&[
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "registry:clef-flash-fp8", action: "query", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "model:Load", action: "write", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "model:Status", action: "query", effect: "allow" },
+                ServicePolicyRule { subject: "did:plc:rjqczurevrpoz4mcnax2kgw4", domain: "local", resource: "model:clef-flash-fp8:main", action: "decide", effect: "allow" },
+            ]),
+            groupings: None,
+        },
+        PolicyTemplate {
             name: "public-inference",
             description: "Anonymous users can infer and query models",
             policies: Some(&[
@@ -741,4 +763,29 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
 /// Get a template by name
 pub fn get_template(name: &str) -> Option<&'static PolicyTemplate> {
     get_templates().iter().find(|t| t.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_template;
+
+    #[test]
+    fn clef_staging_templates_grant_decide_without_generic_inference() -> Result<(), &'static str> {
+        for name in [
+            "cyberdione-staging-clef-e2e",
+            "cyberdione-staging-clef-operator",
+        ] {
+            let template = get_template(name).ok_or("Clef staging template is missing")?;
+            let policies = template
+                .policies
+                .ok_or("Clef staging template has no policies")?;
+            assert!(policies.iter().any(|policy| {
+                policy.resource == "model:clef-flash-fp8:main" && policy.action == "decide"
+            }));
+            assert!(!policies.iter().any(|policy| {
+                policy.resource == "model:clef-flash-fp8:main" && policy.action == "infer"
+            }));
+        }
+        Ok(())
+    }
 }

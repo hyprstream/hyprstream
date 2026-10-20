@@ -85,7 +85,7 @@ pub use valkey::ValkeyUserStore;
 /// values come from the generated schema enum rather than a hand-written MAC
 /// mirror, so adding or reordering a schema action cannot silently change the
 /// action understood by the policy compiler.
-pub const SCHEMA_SCOPE_ACTIONS: [ScopeAction; 14] = [
+pub const SCHEMA_SCOPE_ACTIONS: [ScopeAction; 15] = [
     ScopeAction::Query,
     ScopeAction::Subscribe,
     ScopeAction::Write,
@@ -100,6 +100,7 @@ pub const SCHEMA_SCOPE_ACTIONS: [ScopeAction; 14] = [
     ScopeAction::MeshInvoke,
     ScopeAction::MeshStage,
     ScopeAction::MeshDelta,
+    ScopeAction::Decide,
 ];
 
 /// Return the canonical capability token for a generated schema action.
@@ -122,6 +123,7 @@ pub const fn scope_action_name(action: ScopeAction) -> &'static str {
         ScopeAction::MeshInvoke => "meshInvoke",
         ScopeAction::MeshStage => "meshStage",
         ScopeAction::MeshDelta => "meshDelta",
+        ScopeAction::Decide => "decide",
     }
 }
 
@@ -136,7 +138,7 @@ pub fn scope_action_from_name(action: &str) -> Option<ScopeAction> {
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 //
-// VARIANT ORDER IS LOAD-BEARING (S3, #569): the first 14 variants are kept 1:1
+// VARIANT ORDER IS LOAD-BEARING (S3, #569): the first 15 variants are kept 1:1
 // (in order) with the `ScopeAction` enum ordinals in
 // `crates/hyprstream-rpc/schema/annotations.capnp`. The semantic blocks are:
 //   Block A read-class:        Query @0, Subscribe @1
@@ -144,7 +146,8 @@ pub fn scope_action_from_name(action: &str) -> Option<ScopeAction> {
 //                              Train @6, Context @7, Serve @8, Spawn @9
 //   Block C admin authority:   Manage @10
 //   Block D mesh authority:    MeshInvoke @11, MeshStage @12, MeshDelta @13
-// `MeshStatus` is appended AFTER the 14 ScopeAction-mirrored variants: it is NOT a
+//   Block E inference-method: Decide @14 (method-specific model authority)
+// `MeshStatus` is appended AFTER the 15 ScopeAction-mirrored variants: it is NOT a
 // distinct ScopeAction (it shares the `query`/`query.status` wire action), so it has
 // no ordinal in the schema enum and is excluded from the exact-inverse round-trip.
 pub enum Operation {
@@ -195,6 +198,8 @@ pub enum Operation {
     MeshStage,
     /// Submit a TTT delta to a peer/aggregator host (authority).
     MeshDelta,
+    /// Run typed decision inference without granting generation or embedding.
+    Decide,
     /// Read a peer host's mesh job/pipeline status (read-only).
     MeshStatus,
 }
@@ -221,6 +226,7 @@ impl Operation {
             ScopeAction::MeshInvoke => Self::MeshInvoke,
             ScopeAction::MeshStage => Self::MeshStage,
             ScopeAction::MeshDelta => Self::MeshDelta,
+            ScopeAction::Decide => Self::Decide,
         }
     }
 
@@ -243,6 +249,7 @@ impl Operation {
             Self::MeshInvoke => ScopeAction::MeshInvoke,
             Self::MeshStage => ScopeAction::MeshStage,
             Self::MeshDelta => ScopeAction::MeshDelta,
+            Self::Decide => ScopeAction::Decide,
             Self::MeshStatus => return None,
         })
     }
@@ -266,6 +273,7 @@ impl Operation {
             Operation::MeshInvoke => 'e',
             Operation::MeshStage => 'g',
             Operation::MeshDelta => 'd',
+            Operation::Decide => 'z',
             Operation::MeshStatus => 'u',
         }
     }
@@ -342,6 +350,7 @@ impl Operation {
             Operation::MeshInvoke => "mesh.rpc",
             Operation::MeshStage => "infer.stage",
             Operation::MeshDelta => "delta.submit",
+            Operation::Decide => "decide",
         }
     }
 
@@ -369,6 +378,7 @@ impl Operation {
             "mesh.rpc" | "mesh:rpc" | "inference:peer-call" => Some(Self::MeshInvoke),
             "infer.stage" => Some(Self::MeshStage),
             "delta.submit" => Some(Self::MeshDelta),
+            "decide" => Some(Self::Decide),
             _ => None,
         }
     }
@@ -391,6 +401,7 @@ impl Operation {
             'e' => Some(Operation::MeshInvoke),
             'g' => Some(Operation::MeshStage),
             'd' => Some(Operation::MeshDelta),
+            'z' => Some(Operation::Decide),
             'u' => Some(Operation::MeshStatus),
             _ => None,
         }
@@ -415,6 +426,7 @@ impl Operation {
             Operation::MeshInvoke,
             Operation::MeshStage,
             Operation::MeshDelta,
+            Operation::Decide,
             Operation::MeshStatus,
         ]
     }
@@ -615,6 +627,7 @@ mod tests {
             Operation::MeshInvoke,
             Operation::MeshStage,
             Operation::MeshDelta,
+            Operation::Decide,
             Operation::MeshStatus,
         ] {
             assert_eq!(Operation::from_code(op.code()), Some(op));
@@ -624,6 +637,7 @@ mod tests {
             Operation::MeshInvoke,
             Operation::MeshStage,
             Operation::MeshDelta,
+            Operation::Decide,
             Operation::MeshStatus,
         ] {
             assert!(Operation::all().contains(op));
@@ -652,6 +666,7 @@ mod tests {
             Operation::MeshInvoke,
             Operation::MeshStage,
             Operation::MeshDelta,
+            Operation::Decide,
         ];
         for op in ops {
             assert_eq!(
@@ -687,7 +702,7 @@ mod tests {
     #[test]
     fn test_operation_all() {
         let all = Operation::all();
-        // All 15 variants: 11 core + 4 mesh (#319). Regression guard for #1096 —
+        // All 16 variants: 11 core + 3 mesh + Decide + MeshStatus. Regression guard for #1096 —
         // `all()` omitted 8 variants, so `check_all` could never report them.
         let expected = [
             Operation::Infer,
@@ -704,6 +719,7 @@ mod tests {
             Operation::MeshInvoke,
             Operation::MeshStage,
             Operation::MeshDelta,
+            Operation::Decide,
             Operation::MeshStatus,
         ];
         assert_eq!(all.len(), expected.len());
@@ -715,6 +731,8 @@ mod tests {
     #[test]
     fn test_operation_from_dot_str() {
         // New dot-namespaced strings
+        assert_eq!(Operation::from_dot_str("decide"), Some(Operation::Decide));
+        assert_eq!(Operation::from_dot_str("infer"), Some(Operation::Infer));
         assert_eq!(
             Operation::from_dot_str("infer.generate"),
             Some(Operation::Infer)

@@ -1,4 +1,9 @@
-//! # hyprstream-decision-head — question/criteria encoder + shared option-scorer
+//! # hyprstream-decision-head — native Clef and legacy anchor inference heads
+//!
+//! [`clef`] owns the versioned Cloudflare Clef encoder and joint-schema head,
+//! which conditions decisions jointly and includes question IDs in its input.
+//! Its tokenization and two-logit noul readout are distinct from the legacy
+//! anchor architecture described below. The two contracts are never substituted.
 //!
 //! System One program, DAG node **P1.1** (Wave 1). This crate owns the model-side
 //! contract between the pinned jev-1 serialization ([`hyprstream-decision`], P0.1a)
@@ -8,7 +13,7 @@
 //! one hidden state per anchor position and produces a typed, per-question probability
 //! distribution in a single forward pass.
 //!
-//! ## The generalist contract
+//! ## The legacy anchor generalist contract
 //!
 //! One shared scorer, one forward pass, no cross-question conditioning: every question
 //! is scored **only** from its own anchor positions. Question ids never reach the model
@@ -53,6 +58,7 @@
 //! converted backbone, and the same fork provides the torch-native GDN path pinned for
 //! ROCm/MI210 training (S6c).
 
+pub mod clef;
 pub mod encoder;
 pub mod error;
 pub mod scorer;

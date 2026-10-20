@@ -48,6 +48,14 @@ EXTERNAL_INPUT_CRATES: dict[str, tuple[str, ...]] = {
 # exist the tests' deny-on-missing CI guard is armed via CI=true, matching the
 # merge gate (graviton-build-test.sh builds the same two guests unconditionally).
 GUEST_ARTIFACT_PACKAGES = ("hyprstream-workers-python", "hyprstream-workers-wasmtime")
+# These System One packages are deliberately outside default-members. A root
+# trigger must still execute their own tests: compiling them as dependencies
+# does not exercise their encoder, head, Arrow or measurement regressions.
+EXPLICIT_FULL_SET_PACKAGES = (
+    "hyprstream-decision",
+    "hyprstream-decision-head",
+    "hyprstream-eval",
+)
 GUEST_BUILDS = (
     ("crates/hyprstream-workers-python-guest", "wasm32-unknown-unknown",
      "hyprstream_workers_python_guest.wasm", "HYPRSTREAM_PYGUEST_WASM"),
@@ -157,13 +165,22 @@ def main() -> int:
     full = any(f.startswith(trigger) or f == trigger for f in files for trigger in FULL_SET_TRIGGERS)
     members = workspace_members()
     seeds = seed_packages(files, members)
+    explicit_release_packages = sorted(
+        set(EXPLICIT_FULL_SET_PACKAGES)
+        if full
+        else set(EXPLICIT_FULL_SET_PACKAGES) & seeds
+    )
 
     if full:
         print("root-level input changed; running the full default-members set")
         pkgs: list[str] = []
     elif seeds:
-        pkgs = sorted(seeds)
-        print(f"affected crates: {' '.join(pkgs)}")
+        # Non-default packages have their own release gate below.
+        pkgs = sorted(seeds - set(explicit_release_packages))
+        if pkgs:
+            print(f"affected crates: {' '.join(pkgs)}")
+        else:
+            print("no default-members packages affected; explicit release gates will run")
     else:
         ignored = [f for f in files if not f.startswith((".github/", CRATES_DIR))]
         print(f"no workspace crates affected ({len(ignored)} non-crate files changed); nothing to run")
@@ -176,33 +193,56 @@ def main() -> int:
         if rc != 0:
             return rc
 
-    args: list[str] = []
-    for p in pkgs:
-        args += ["-p", p]
+    if full or pkgs:
+        args: list[str] = []
+        for p in pkgs:
+            args += ["-p", p]
 
-    print(f"::group::cargo nextest run {' '.join(args)}")
-    # Mirror the merge gate's invocation exactly (--cargo-profile ci-test,
-    # --profile ci: the ci profile carries the flake quarantine, slow-timeout
-    # caps, and test-group scheduling; ci-test compiles far lighter than dev).
-    # --no-fail-fast: one load-sensitive deadline test must not cancel the
-    # remaining thousands of results; the full signal is the point here.
-    rc = subprocess.run(
-        ["cargo", "nextest", "run", "--cargo-profile", "ci-test", "--profile", "ci",
-         "--no-fail-fast", *args]
-    ).returncode
-    print("::endgroup::")
-    if rc != 0:
-        print(f"cargo nextest run failed with exit {rc}", file=sys.stderr)
-        return rc
+        print(f"::group::cargo nextest run {' '.join(args)}")
+        # Mirror the merge gate's invocation exactly (--cargo-profile ci-test,
+        # --profile ci: the ci profile carries the flake quarantine, slow-timeout
+        # caps, and test-group scheduling; ci-test compiles far lighter than dev).
+        # --no-fail-fast: one load-sensitive deadline test must not cancel the
+        # remaining thousands of results; the full signal is the point here.
+        rc = subprocess.run(
+            ["cargo", "nextest", "run", "--cargo-profile", "ci-test", "--profile", "ci",
+             "--no-fail-fast", *args]
+        ).returncode
+        print("::endgroup::")
+        if rc != 0:
+            print(f"cargo nextest run failed with exit {rc}", file=sys.stderr)
+            return rc
 
-    print(f"::group::cargo clippy {' '.join(args)} --all-targets")
-    rc = subprocess.run(
-        ["cargo", "clippy", *args, "--all-targets", "--", "-D", "warnings"]
-    ).returncode
-    print("::endgroup::")
-    if rc != 0:
-        print(f"cargo clippy failed with exit {rc}", file=sys.stderr)
-        return rc
+        print(f"::group::cargo clippy {' '.join(args)} --all-targets")
+        rc = subprocess.run(
+            ["cargo", "clippy", *args, "--all-targets", "--", "-D", "warnings"]
+        ).returncode
+        print("::endgroup::")
+        if rc != 0:
+            print(f"cargo clippy failed with exit {rc}", file=sys.stderr)
+            return rc
+
+    # Cargo's default-members omit these packages. Root-only changes (such as
+    # lockfile or toolchain updates) can affect them too, so run all explicit
+    # gates on fallback, and only the touched gates for a narrow change.
+    for package in explicit_release_packages:
+        print(f"::group::cargo nextest run --package {package} (release)")
+        rc = subprocess.run(
+            ["cargo", "nextest", "run", "--cargo-profile", "release", "--profile", "ci",
+             "--no-fail-fast", "-p", package]
+        ).returncode
+        print("::endgroup::")
+        if rc != 0:
+            print(f"cargo nextest run failed for {package} with exit {rc}", file=sys.stderr)
+            return rc
+        print(f"::group::cargo clippy --package {package} --all-targets (release)")
+        rc = subprocess.run(
+            ["cargo", "clippy", "--release", "-p", package, "--all-targets", "--", "-D", "warnings"]
+        ).returncode
+        print("::endgroup::")
+        if rc != 0:
+            print(f"cargo clippy failed for {package} with exit {rc}", file=sys.stderr)
+            return rc
     return 0
 
 

@@ -61,6 +61,12 @@ use zeroize::Zeroizing;
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
 
+mod clef_profile;
+#[cfg(feature = "postgres")]
+mod federate_profile;
+#[cfg(feature = "postgres")]
+pub(crate) use federate_profile::FederateModelProfile;
+
 // ============================================================================
 // Latched load terminal (EV7/#649) — host-side retained load outcome
 // ============================================================================
@@ -176,6 +182,11 @@ pub struct StagingModelPin {
     pub model_ref: String,
     pub commit: git2::Oid,
     projection_policy: git2db::pinned_disk::ProjectionPolicy,
+    // Never parsed from RPC. Clef is set only after explicit startup selection
+    // validates the reviewed local artifact inventory; direct constructors do
+    // not upgrade an arbitrary pin into a browser capability.
+    #[cfg(feature = "postgres")]
+    federate_profile: Option<FederateModelProfile>,
     #[cfg(test)]
     projection_parent: Option<std::path::PathBuf>,
 }
@@ -205,10 +216,16 @@ impl StagingModelPin {
                 && parsed.to_string() == model_ref,
             "bounded staging modelRef must be a canonical local branch ref"
         );
+        #[cfg(feature = "postgres")]
+        let federate_profile = (model_ref == REVIEWED_STAGING_MODEL_REF
+            && commit == git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?)
+        .then_some(FederateModelProfile::Qwen);
         Ok(Self {
             model_ref,
             commit,
             projection_policy: Default::default(),
+            #[cfg(feature = "postgres")]
+            federate_profile,
             #[cfg(test)]
             projection_parent: None,
         })
@@ -221,12 +238,12 @@ impl StagingModelPin {
         local_lfs: std::collections::BTreeMap<String, std::path::PathBuf>,
     ) -> Result<Self> {
         let mut pin = Self::new(
-            "clef-flash-fp8:main",
-            git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
+            clef_profile::MODEL_REF,
+            git2::Oid::from_str(clef_profile::COMMIT)?,
         )?;
         // R0 normalized complete 21-file pinned tree (head + backbone + metadata).
         pin.projection_policy = git2db::pinned_disk::ProjectionPolicy::from_trusted_contract(
-            12_174_008_714,
+            clef_profile::EXPANDED_BYTES,
             local_lfs,
         )?;
         Ok(pin)
@@ -262,7 +279,112 @@ impl StagingModelPin {
         };
         let model_ref = read_optional(REF)?;
         let oid = read_optional(OID)?;
-        Self::from_settings(&profile, model_ref.as_deref(), oid.as_deref())
+        let directory = read_optional("HYPRSTREAM_CLEF_LFS_DIRECTORY")?;
+        Self::from_startup_settings(
+            &profile,
+            model_ref.as_deref(),
+            oid.as_deref(),
+            directory.as_deref(),
+        )
+    }
+
+    /// Select only reviewed server-owned expanded admission; a request cannot
+    /// supply a local hydration map, profile or projection byte ceiling.
+    fn from_startup_settings(
+        profile: &str,
+        model_ref: Option<&str>,
+        oid: Option<&str>,
+        directory: Option<&str>,
+    ) -> Result<Option<Self>> {
+        Self::select_startup_pin(profile, model_ref, oid, directory, clef_profile::local_lfs)
+    }
+
+    // Private selection core. Tests provide a tiny directory validator closure
+    // here; no runtime setting/public API overrides production object pins.
+    fn select_startup_pin(
+        profile: &str,
+        model_ref: Option<&str>,
+        oid: Option<&str>,
+        directory: Option<&str>,
+        resolve: impl FnOnce(
+            &std::path::Path,
+        ) -> Result<std::collections::BTreeMap<String, std::path::PathBuf>>,
+    ) -> Result<Option<Self>> {
+        if profile != clef_profile::PROFILE {
+            anyhow::ensure!(
+                directory.is_none(),
+                "HYPRSTREAM_CLEF_LFS_DIRECTORY requires the explicit Clef CPU admission profile"
+            );
+            return Self::from_settings(profile, model_ref, oid);
+        }
+        Self::validate_clef_overrides(model_ref, oid)?;
+        let directory = directory
+            .context("HYPRSTREAM_CLEF_LFS_DIRECTORY is required for the Clef CPU profile")?;
+        let local_lfs = resolve(std::path::Path::new(directory))?;
+        let pin = Self::reviewed_clef_flash(local_lfs)?;
+        #[cfg(feature = "postgres")]
+        let pin = Self {
+            federate_profile: Some(FederateModelProfile::Clef),
+            ..pin
+        };
+        info!(profile = clef_profile::PROFILE, model_ref = clef_profile::MODEL_REF,
+            commit = clef_profile::COMMIT, tree = clef_profile::TREE,
+            manifest_sha256 = clef_profile::MANIFEST_SHA256,
+            expanded_bytes = clef_profile::EXPANDED_BYTES,
+            "selected reviewed native Clef contract; payload verification is deferred to owned capture");
+        Ok(Some(pin))
+    }
+
+    fn validate_clef_overrides(model_ref: Option<&str>, oid: Option<&str>) -> Result<()> {
+        match (model_ref, oid) {
+            (None, None) => {}
+            (Some(name), Some(commit)) => anyhow::ensure!(
+                name == clef_profile::MODEL_REF && commit == clef_profile::COMMIT,
+                "Clef overrides must match the complete reviewed alias and commit"
+            ),
+            _ => {
+                anyhow::bail!("Clef model reference and OID must be absent together or both fixed")
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn federate_profile(&self) -> Result<FederateModelProfile> {
+        let profile = self
+            .federate_profile
+            .ok_or_else(|| anyhow!("pin has no reviewed Federate model capability"))?;
+        anyhow::ensure!(
+            self.model_ref == profile.model_ref()
+                && self.commit == git2::Oid::from_str(profile.commit())?,
+            "Federate model pin identity changed"
+        );
+        let policy = self.capture_policy()?;
+        anyhow::ensure!(
+            (profile == FederateModelProfile::Qwen) == (policy == Default::default()),
+            "Federate model projection policy does not match the selected profile"
+        );
+        Ok(profile)
+    }
+
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn federate_clef_startup_fixture() -> Result<Self> {
+        Self::select_startup_pin(
+            clef_profile::PROFILE,
+            None,
+            None,
+            Some("/fixture/clef-cache"),
+            |_| Ok(Default::default()),
+        )?
+        .context("Clef startup fixture pin missing")
+    }
+
+    pub(crate) fn validate_deployment(&self, profile: &InferenceDeploymentProfile) -> Result<()> {
+        if self.projection_policy != Default::default() {
+            self.capture_policy()?;
+            clef_profile::validate_deployment(profile)?;
+        }
+        Ok(())
     }
 
     fn from_settings(
@@ -403,6 +525,9 @@ pub struct ModelServiceInner {
     /// environment value merely to support restart acceptance coverage.
     #[cfg(test)]
     test_work_order_capture: Mutex<Option<Zeroizing<String>>>,
+    #[cfg(test)]
+    test_decision_control:
+        parking_lot::Mutex<Option<Arc<super::clef_acceptance_control::TestDecisionControl>>>,
     /// Test-only ordering witness: successful unload clears admission before
     /// making its `model.unloaded` event visible.
     #[cfg(test)]
@@ -739,6 +864,8 @@ impl ModelService {
                 moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
                 #[cfg(test)]
                 test_work_order_capture: Mutex::new(None),
+                #[cfg(test)]
+                test_decision_control: parking_lot::Mutex::new(None),
                 #[cfg(test)]
                 before_unloaded_event: Mutex::new(None),
             }),
@@ -1520,6 +1647,10 @@ impl ModelService {
                 Arc::clone(&self.producer_reach_config),
                 Arc::clone(&self.moq_origin),
             );
+        #[cfg(test)]
+        if let Some(control) = self.test_decision_control.lock().as_ref() {
+            service_config.test_decision_control = Some(Arc::downgrade(control));
+        }
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
         }
@@ -2082,6 +2213,21 @@ impl ModelService {
                 format!("inference:{}{}", first.to_ascii_uppercase(), chars.as_str())
             }
             None => "inference:".to_owned(),
+        }
+    }
+
+    /// Re-wrap decision-serving failures as [`hyprstream_rpc::TypedRpcError`]
+    /// so the generated scoped dispatcher re-emits the typed wire code
+    /// instead of collapsing to INTERNAL (S9). Generic errors pass through.
+    fn typed_decision_error(e: impl Into<anyhow::Error>) -> anyhow::Error {
+        let e = e.into();
+        let message = e.to_string();
+        match crate::services::decision::error_code_for(&message) {
+            Some(code) => anyhow::Error::new(hyprstream_rpc::TypedRpcError {
+                code: code.to_owned(),
+                message,
+            }),
+            None => e,
         }
     }
 
@@ -2790,6 +2936,71 @@ impl InferHandler for ModelService {
         client.embed(data).await
     }
 
+    /// Typed Clef decision gateway (R4). The SHARED cheap preflight runs HERE,
+    /// BEFORE `get_inference_client` — which loads the backbone — so invalid
+    /// raw JSON/media/duplicate-ID/cardinality/aggregate-budget/oversized
+    /// bodies can never allocate a model. The worker revalidates after its
+    /// own authorization PEP. No unauthenticated admission is created: this
+    /// handler runs after the generated Model dispatch PEP (`decide` scope).
+    async fn handle_decide(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &hyprstream_rpc_std::inference_client::DecisionRequest,
+    ) -> Result<hyprstream_rpc_std::inference_client::DecisionResponse> {
+        let request_started = Instant::now();
+        // Cheap shared preflight FIRST (byte bound, ordered parse, media/
+        // duplicate/numeric/cardinality/aggregate/deadline admission), then
+        // the raw-model match and the pin gate — ALL before
+        // get_inference_client, which loads the backbone. The worker
+        // revalidates everything after its own PEP.
+        let parsed = crate::services::decision::preflight_parsed(data)
+            .map_err(Self::typed_decision_error)?;
+        let deadline = crate::services::decision::resolve_deadline(data, request_started)
+            .ok_or_else(|| anyhow!("decision request is missing its bounded deadline"))?;
+        crate::services::decision::ensure_model_matches(&parsed.model, Some(model_ref))
+            .map_err(Self::typed_decision_error)?;
+        let resolved = self.resolve_model_ref(model_ref).await?;
+        let is_commit = matches!(resolved.git_ref, crate::storage::GitRef::Commit(_));
+        let staging_admits = self
+            .config
+            .staging_model_pin
+            .as_ref()
+            .is_some_and(|pin| pin.admits(model_ref));
+        crate::services::decision::ensure_pinned_for_decision(is_commit, staging_admits, model_ref)
+            .map_err(Self::typed_decision_error)?;
+
+        // Reject an already exhausted (including timeoutMs=0) request before
+        // a lazy model load can start.
+        crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+            .map_err(Self::typed_decision_error)?;
+        let client = self
+            .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "decide"))
+            .await?;
+        // Model load and routing happen between ingress and this worker call.
+        // Forward only the remaining relative budget, then bound the whole RPC
+        // wait by the same ingress deadline so dispatch cannot reset it.
+        let timeout_ms = crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+            .map_err(Self::typed_decision_error)?;
+        let forwarded = hyprstream_rpc_std::inference_client::DecisionRequest {
+            clef_json: data.clef_json.clone(),
+            max_state_tokens: data.max_state_tokens,
+            timeout_ms: Some(timeout_ms),
+        };
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            client.decide(&forwarded),
+        )
+        .await
+        .map_err(|_| {
+            Self::typed_decision_error(anyhow!(
+                "clef-decision-cancelled: decision deadline elapsed at Model ingress"
+            ))
+        })?
+        .map_err(Self::typed_decision_error)
+    }
+
     async fn handle_status(
         &self,
         ctx: &EnvelopeContext,
@@ -3272,11 +3483,12 @@ pub(crate) const FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID: u64 =
     <hyprstream_rpc_std::model_capnp::model_request::Reader<'static> as capnp::traits::HasTypeId>::TYPE_ID;
 
 #[cfg(feature = "postgres")]
-fn federate_model_operation(
+pub(crate) fn federate_model_operation(
     body: &hyprstream_rpc::service::DecodedRequestBody,
     pin: &StagingModelPin,
 ) -> Result<(String, String)> {
     use hyprstream_rpc_std::model_capnp::{infer_request, model_request};
+    let profile = pin.federate_profile()?;
     let request = body.root::<model_request::Reader>()?;
     let (model_ref, resource, operation) = match request.which()? {
         model_request::Which::Load(inner) => (
@@ -3291,17 +3503,18 @@ fn federate_model_operation(
         ),
         model_request::Which::Infer(inner) => {
             let infer = inner?;
-            anyhow::ensure!(
-                matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
-                "unsupported Federate inference method"
-            );
+            let operation = match (profile, infer.which()?) {
+                (FederateModelProfile::Qwen, infer_request::Which::GenerateStream(_)) => "infer",
+                (FederateModelProfile::Clef, infer_request::Which::Decide(_)) => "decide",
+                _ => anyhow::bail!("unsupported Federate inference method"),
+            };
             let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
-            (model_ref.clone(), format!("model:{model_ref}"), "infer")
+            (model_ref.clone(), format!("model:{model_ref}"), operation)
         }
         _ => anyhow::bail!("unsupported Federate Model method"),
     };
     anyhow::ensure!(
-        pin == &StagingModelPin::reviewed()? && pin.admits(&model_ref),
+        pin.admits(&model_ref) && model_ref == profile.model_ref(),
         "Federate Model request is not the reviewed pinned staging model"
     );
     Ok((resource, operation.to_owned()))
@@ -3563,9 +3776,12 @@ impl crate::services::RequestService for ModelService {
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        // Typed decision-serving failures carry their pinned code; every
+        // other error keeps the generic INTERNAL code.
+        let code = crate::services::decision::error_code_for(error).unwrap_or("INTERNAL");
         let variant = ModelResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_owned(),
+            code: code.to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
@@ -3608,6 +3824,10 @@ mod tests {
 
     use super::*;
     use hyprstream_rpc::registry::{global as registry, SocketKind};
+
+    mod clef_cpu_acceptance {
+        include!("model_clef_cpu_acceptance.rs");
+    }
 
     #[cfg(feature = "postgres")]
     #[test]
@@ -3708,6 +3928,92 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_clef_requires_startup_qualification_and_exact_decide_only() -> Result<()> {
+        let pin = StagingModelPin::federate_clef_startup_fixture()?;
+        assert_eq!(pin.federate_profile()?, FederateModelProfile::Clef);
+        let make = |model_ref: &str, method: u8| {
+            hyprstream_rpc::serialize_message(|message| {
+                let mut request =
+                    message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                request.set_id(81);
+                match method {
+                    0 => {
+                        let mut infer = request.init_infer();
+                        infer.set_model_ref(model_ref);
+                        infer.init_decide().set_clef_json("{}");
+                    }
+                    1 => {
+                        let mut infer = request.init_infer();
+                        infer.set_model_ref(model_ref);
+                        infer.init_generate_stream();
+                    }
+                    2 => {
+                        request.init_load().set_model_ref(model_ref);
+                    }
+                    _ => {
+                        request.init_status().set_model_ref(model_ref);
+                    }
+                }
+            })
+        };
+        for (method, resource, operation) in [
+            (0, format!("model:{}", pin.model_ref), "decide"),
+            (2, "model:Load".into(), "write"),
+            (3, "model:Status".into(), "query"),
+        ] {
+            let bytes = make(&pin.model_ref, method)?;
+            let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+            assert_eq!(
+                federate_model_operation(&body, &pin)?,
+                (resource, operation.into())
+            );
+        }
+        for alias in [
+            "",
+            "clef-flash-fp8:other",
+            "clef-flash-fp8:refs/heads/main",
+            REVIEWED_STAGING_MODEL_REF,
+        ] {
+            for method in [0, 2, 3] {
+                let bytes = make(alias, method)?;
+                let body =
+                    crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+                assert!(federate_model_operation(&body, &pin).is_err());
+            }
+        }
+        let bytes = make(&pin.model_ref, 1)?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(
+            federate_model_operation(&body, &pin).is_err(),
+            "Clef never admits generation"
+        );
+        let bytes = make(&pin.model_ref, 0)?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        for other in [
+            StagingModelPin::reviewed()?,
+            StagingModelPin::new(pin.model_ref.clone(), pin.commit)?,
+            StagingModelPin::reviewed_clef_flash(Default::default())?,
+        ] {
+            assert!(
+                federate_model_operation(&body, &other).is_err(),
+                "identity alone is not explicit Clef startup"
+            );
+        }
+        let mut changed = pin.clone();
+        changed.commit = StagingModelPin::reviewed()?.commit;
+        assert!(federate_model_operation(&body, &changed).is_err());
+        let mut changed = pin.clone();
+        changed.model_ref = "clef-flash-fp8:other".into();
+        assert!(federate_model_operation(&body, &changed).is_err());
+        // A generated Decide method cannot enter the preserved Qwen branch.
+        let bytes = make(REVIEWED_STAGING_MODEL_REF, 0)?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(federate_model_operation(&body, &StagingModelPin::reviewed()?).is_err());
+        Ok(())
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = ModelServiceConfig::default();
@@ -3734,6 +4040,391 @@ mod tests {
         }
         assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
         Ok(())
+    }
+
+    // ── R4 decide ingress: cheap gates run BEFORE any backbone load ────────
+
+    fn wire_decide_request(
+        clef_json: &str,
+    ) -> hyprstream_rpc_std::inference_client::DecisionRequest {
+        hyprstream_rpc_std::inference_client::DecisionRequest {
+            clef_json: clef_json.to_owned(),
+            max_state_tokens: None,
+            timeout_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_ingress_preflight_rejects_before_load() {
+        let service = selector_model_service().await;
+        let ctx = boundary_caller_ctx(3600);
+
+        // Invalid body (media field): the shared preflight error surfaces,
+        // never a model-load error — no load may be attempted.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clef-decision-input"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+
+        // Model mismatch vs the route ref: rejected before load.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"some-other-model","state":null,"questions":{"q":{"type":"noul"}}}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decision-model-mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_ingress_rejects_mutable_refs_before_load() {
+        let service = selector_model_service().await;
+        let ctx = boundary_caller_ctx(3600);
+        // Valid body, branch ref: pin gate rejects BEFORE load_model.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}}}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decision-not-pinned"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+
+        // A commit ref passes the pin gate and reaches the load, which then
+        // fails on the missing worktree — proving gate ORDER, not absence.
+        let commit_ref = format!("nonexistent-model:{}", "0".repeat(40));
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                &commit_ref,
+                &wire_decide_request(&format!(
+                    r#"{{"model":"{commit_ref}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#
+                )),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("decision-not-pinned"), "{err}");
+
+        // An already-expired request must not begin a lazy load even when its
+        // pinned model reference would otherwise pass the admission gates.
+        let mut zero_timeout = wire_decide_request(&format!(
+            r#"{{"model":"{commit_ref}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#
+        ));
+        zero_timeout.timeout_ms = Some(0);
+        let err = service
+            .handle_decide(&ctx, 0, &commit_ref, &zero_timeout)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clef-decision-cancelled"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // authenticated wire fixture assertions
+    async fn real_model_scoped_dispatch_carries_typed_decision_code() -> Result<()> {
+        use hyprstream_rpc::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+        use hyprstream_service::ServiceManager as _;
+
+        // A real holder-authenticated Model request, followed by real delegated
+        // Policy admission. This test requires its own process (nextest default),
+        // because envelope verification/replay/session stores are first-write.
+        let policy_key = SigningKey::from_bytes(&[0x77; 32]);
+        let model_key = SigningKey::from_bytes(&[0x41; 32]);
+        let alice_key = SigningKey::from_bytes(&[0x43; 32]);
+        install_restart_fixture_auth(&[policy_key.clone(), model_key.clone(), alice_key.clone()])?;
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ))?;
+        }
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
+        let tag = hex::encode(hyprstream_rpc::envelope::generate_nonce());
+        let ca =
+            hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let oauth = SigningKey::from_bytes(&[0x76; 32]);
+        let oauth_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&oauth);
+        let oauth_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&oauth_pq);
+        let keys = Arc::new(CompositeKeySet::default());
+        keys.publish(
+            1,
+            format!("decide-typed-{tag}"),
+            vec![CompositeKeyPair::verifying(
+                hyprstream_rpc::auth::composite_kid(&oauth_vk, &oauth.verifying_key()),
+                oauth_vk,
+                oauth.verifying_key(),
+                CompositePairRole::OAuth,
+                CompositePairState::Active,
+                0,
+                i64::MAX,
+            )],
+        )?;
+        let jwt_source = Arc::new(
+            hyprstream_rpc::auth::ClusterKeySource::new(
+                ca.verifying_key(),
+                RESTART_FIXTURE_ISSUER.to_owned(),
+            )
+            .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq))
+            .with_composite_key_set(keys),
+        );
+        let credentials = tempfile::TempDir::new()?;
+        let model_token = restart_fixture_service_jwt(&credentials, "model", &ca, &model_key)?;
+        hyprstream_service::global_trust_store().insert(
+            model_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: ["model".to_owned()].into_iter().collect(),
+                subject: Some("service:model".to_owned()),
+                jwt: Some(model_token.clone()),
+                expires_at: chrono::Utc::now().timestamp() + 300,
+                attested_by: Some(ca.verifying_key().to_bytes()),
+            },
+        );
+
+        struct AlicePrimary(SigningKey);
+        impl crate::services::policy::PrimaryEnrollmentResolver for AlicePrimary {
+            fn primary_group(
+                &self,
+                principal: &str,
+                tenant: &str,
+            ) -> Option<crate::services::policy::PrimaryGroup> {
+                if principal != "alice" || tenant != "fixture-tenant" {
+                    return None;
+                }
+                let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&self.0);
+                Some(crate::services::policy::PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65.to_owned(),
+                    ordered_component_keys: vec![
+                        self.0.verifying_key().to_bytes().to_vec(),
+                        hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+                    ],
+                })
+            }
+        }
+        let policy_manager = Arc::new(crate::auth::PolicyManager::new_in_memory().await?);
+        // Only the typed decision operation is granted to the original holder;
+        // generation and embedding keep the separate generic `infer` action.
+        policy_manager
+            .add_policy_with_domain(
+                "alice",
+                "fixture-tenant",
+                "model:nonexistent-model:main",
+                "decide",
+                "allow",
+            )
+            .await?;
+        let policy_base = tempfile::TempDir::new()?;
+        let (policy_transport, policy_endpoint) =
+            restart_acceptance_inproc_endpoint("policy", &format!("decide-typed-{tag}"));
+        let policy_service = crate::services::PolicyService::new(
+            policy_manager,
+            Arc::new(policy_key.clone()),
+            crate::config::TokenConfig::default(),
+            Arc::new(RwLock::new(git2db::Git2DB::open(policy_base.path()).await?)),
+            policy_transport.clone(),
+        )
+        .with_default_audience(RESTART_FIXTURE_ISSUER.to_owned())
+        .with_jwt_key_source(jwt_source.clone())
+        .with_primary_enrollment_resolver(Arc::new(AlicePrimary(alice_key.clone())));
+        let manager = hyprstream_service::InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await?;
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap(
+            &policy_endpoint,
+            model_key.clone(),
+            policy_key.verifying_key(),
+            Some(model_token),
+        )?;
+        let infrastructure = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc(format!("decide-typed-registry-{tag}")),
+            Arc::new(BoundaryDialState::default()),
+        ));
+        let (model_transport, model_endpoint) =
+            restart_acceptance_inproc_endpoint("model", &format!("decide-typed-{tag}"));
+        let service = ModelService::new(
+            ModelServiceConfig::default(),
+            model_key.clone(),
+            policy_client,
+            RegistryClient::new(infrastructure),
+            model_transport,
+            policy_transport,
+        )
+        .await?
+        .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
+        .with_jwt_key_source(jwt_source);
+        // Historical synthetic claims without the original token MUST deny.
+        assert!(ModelHandler::authorize(
+            &service,
+            &boundary_caller_ctx(chrono::Utc::now().timestamp() + 300),
+            "model:nonexistent-model:main",
+            "decide"
+        )
+        .await
+        .is_err());
+        let _model_handle = manager.spawn(Box::new(service.clone())).await?;
+
+        let now = chrono::Utc::now().timestamp();
+        let sid = format!("decide-typed-{tag}");
+        hyprstream_rpc::auth::global_session_registry()
+            .expect("session store installed")
+            .register_session(
+                hyprstream_rpc::auth::SessionKey::oidc(RESTART_FIXTURE_ISSUER, &sid),
+                hyprstream_rpc::auth::SessionState {
+                    subject: "alice".to_owned(),
+                    tenant: "fixture-tenant".to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                    created_at: now,
+                    expires_at: now + 300,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                },
+            )
+            .await?;
+        let alice_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&alice_key);
+        let alice_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&alice_pq);
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+            .with_issuer(RESTART_FIXTURE_ISSUER.to_owned())
+            .with_audience(Some(RESTART_FIXTURE_ISSUER.to_owned()))
+            .with_tenant("fixture-tenant".to_owned())
+            .with_sid(&sid)
+            .with_client_id("decide-typed-native-test")
+            .with_scope(Some("read write".to_owned()))
+            .with_jti()
+            .with_cnf_jwk(&alice_key.verifying_key().to_bytes())
+            .with_cnf_hs_signer_suite(hyprstream_rpc::auth::service_signer_suite_b64(
+                &alice_key.verifying_key().to_bytes(),
+                Some(&alice_pq_vk),
+            ))
+            .with_clearance(crate::services::inference::inference_object_label());
+        let token =
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &oauth_pq, &oauth);
+        let request = wire_decide_request(
+            r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+        );
+        let missing = hyprstream_rpc_std::model_client::ModelClient::for_local_endpoint_bootstrap(
+            &model_endpoint,
+            alice_key.clone(),
+            model_key.verifying_key(),
+            None,
+        )?;
+        assert_restart_dispatch_denied(
+            missing
+                .infer("nonexistent-model:main")
+                .decide(&request)
+                .await,
+            "missing original user credential",
+        )?;
+        let alice = hyprstream_rpc_std::model_client::ModelClient::for_local_endpoint_bootstrap(
+            &model_endpoint,
+            alice_key,
+            model_key.verifying_key(),
+            Some(token),
+        )?;
+        let error = alice
+            .infer("nonexistent-model:main")
+            .decide(&request)
+            .await
+            .expect_err("authenticated invalid input must produce typed preflight failure");
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<hyprstream_rpc::TypedRpcError>())
+            .expect("real generated Model client preserves typed ErrorInfo");
+        assert_eq!(typed.code, "DECISION_INPUT");
+        assert!(typed.message.contains("clef-decision-input"));
+
+        // The same key-bound holder and policy grant can decide, but cannot
+        // use the Model RPC to generate or embed through generic `infer`.
+        use hyprstream_rpc_std::model_client::InferRpc;
+        let generation = hyprstream_rpc_std::inference_client::GenerationRequest {
+            prompt: "blocked generation".to_owned(),
+            ..Default::default()
+        };
+        let infer_client = alice.infer("nonexistent-model:main");
+        let generated = match InferRpc::generate_stream(&infer_client, &generation).await {
+            Ok(_) => panic!("decide-only policy must reject generateStream"),
+            Err(error) => error,
+        };
+        assert!(
+            generated.to_string().contains("Unauthorized"),
+            "expected generateStream policy denial, got: {generated:#}"
+        );
+        let embedded = match InferRpc::embed(
+            &infer_client,
+            &hyprstream_rpc_std::inference_client::EmbedImagesRequest { images: Vec::new() },
+        )
+        .await
+        {
+            Ok(_) => panic!("decide-only policy must reject embed"),
+            Err(error) => error,
+        };
+        assert!(
+            embedded.to_string().contains("Unauthorized"),
+            "expected embed policy denial, got: {embedded:#}"
+        );
+        assert!(service.loaded_models.read().await.is_empty());
+        assert!(service.take_test_work_order().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_gateway_typed_error_codes_reach_model_wire() {
+        let service = selector_model_service().await;
+        // The Model gateway's own error payload carries decision typed codes
+        // (scoped dispatcher failures would otherwise land in INTERNAL).
+        for (message, code) in [
+            ("decision-not-pinned: x", "DECISION_NOT_PINNED"),
+            ("decision-model-mismatch: y", "DECISION_MODEL_MISMATCH"),
+            ("clef-decision-input: z", "DECISION_INPUT"),
+        ] {
+            let payload = service.build_error_payload(9, message);
+            let parsed = hyprstream_rpc_std::model_client::ModelClient::parse_response(&payload)
+                .expect("parse model error payload");
+            match parsed {
+                ModelResponseVariant::Error(info) => {
+                    assert_eq!(info.code, code, "message {message}");
+                    assert_eq!(info.message, message);
+                }
+                other => panic!("expected Error variant, got {other:?}"),
+            }
+        }
+        let payload = service.build_error_payload(9, "unrelated");
+        let parsed =
+            hyprstream_rpc_std::model_client::ModelClient::parse_response(&payload).expect("parse");
+        match parsed {
+            ModelResponseVariant::Error(info) => assert_eq!(info.code, "INTERNAL"),
+            other => panic!("expected Error variant, got {other:?}"),
+        }
     }
 
     #[tokio::test]

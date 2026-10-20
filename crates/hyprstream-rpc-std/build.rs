@@ -36,6 +36,9 @@ fn main() {
         "service_events",
         "chat_core",
         "oauth",
+        // System One decision surface data contract (P0.1b). Pure struct
+        // schema; the InferenceService registration that carries it is P3.1.
+        "decision",
         // Cross-crate service contracts.  These schemas are canonical here;
         // AGPL implementation crates consume the generated server-only mode
         // from hyprstream-rpc-derive instead of compiling local copies.
@@ -48,7 +51,9 @@ fn main() {
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
 
-    // Copy CGR files to stable codegen-out/ for TypeScript codegen
+    // Copy every canonical CGR to the stable TypeScript catalog, including
+    // data-only decision. The generator supports standalone struct/union
+    // builders and parsers; public_ts_consumer checks the actual catalog.
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
     for name in &schemas {

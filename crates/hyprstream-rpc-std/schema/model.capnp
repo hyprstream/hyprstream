@@ -29,6 +29,10 @@ using import "/inference.capnp".ModuleNormRatio;
 using import "/inference.capnp".ChatTemplateRequest;
 using import "/inference.capnp".EmbedImagesRequest;
 using import "/inference.capnp".EmbedImagesResponse;
+# Typed decision serving (P3.1): request/response wrappers live in
+# inference.capnp so Model and Inference share ONE generated type.
+using import "/inference.capnp".DecisionRequest;
+using import "/inference.capnp".DecisionResponse;
 using import "/inference.capnp".LoraConfig;
 using import "/inference.capnp".MergeLoraRequest;
 using Opt = import "/optional.capnp";
@@ -195,6 +199,8 @@ struct InferRequest {
       $mcpDescription("Get detailed status information about a model including online training configuration");
     embed @4 :EmbedImagesRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
       $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
+    decide @5 :DecisionRequest $scope(decide) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
+      $mcpDescription("Run native Clef joint-schema decision inference on one text/JSON record for this model. Returns typed per-question probability distributions with encoding/compute provenance and calibration=null. Pure function of the admitted weights and request body.");
   }
 }
 
@@ -258,6 +264,7 @@ struct InferResponse {
     applyChatTemplate @2 :Text;
     status @3 :ModelStatusResponse;
     embed @4 :EmbedImagesResponse;
+    decide @5 :DecisionResponse;
   }
 }
 

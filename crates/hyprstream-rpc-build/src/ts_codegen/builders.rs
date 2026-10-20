@@ -445,7 +445,7 @@ fn find_inner_struct_name(
 /// Skips Option* wrapper structs and service request/response structs.
 pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
     for sd in &schema.structs {
-        if sd.option_inner_type().is_some() {
+        if super::ts_option_inner(sd).is_some() {
             continue;
         }
         // Skip service request/response structs (handled by generate_builders)
@@ -465,7 +465,9 @@ pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
 
         for variant in &union_fields {
             let is_void = variant.type_name == "Void";
-            let is_prim = is_primitive(&variant.type_name) && !is_void;
+            let is_prim = (is_primitive(&variant.type_name)
+                || schema.enums.iter().any(|ed| ed.name == variant.type_name))
+                && !is_void;
             let payload_struct = if !is_void && !is_prim {
                 schema.structs.iter().find(|s| s.name == variant.type_name)
             } else {
@@ -694,6 +696,13 @@ fn emit_field_setter(
                 // Claim a unique ID from the per-function counter so nested lists at
                 // the same capnp pointer slot never shadow each other (TDZ collision).
                 else if let Some(sd) = structs.iter().find(|s| s.name == inner) {
+                    if super::is_recursive_struct(&sd.name, structs) {
+                        out.push_str(&format!(
+                            "{indent}{builder_var}.initStructList({}, {value_expr}.length, {}, {}).forEach((_el, _i) => _write{}(_el, {value_expr}[_i]));\n",
+                            field.slot_offset, sd.data_words, sd.pointer_words, sd.name
+                        ));
+                        return;
+                    }
                     let id = *counter;
                     *counter += 1;
                     let sl = format!("_sl{id}");
@@ -754,9 +763,22 @@ fn emit_field_setter(
                     );
                 }
             } else if let Some(sd) = structs.iter().find(|s| s.name == field.type_name) {
-                if let Some(inner_name) = sd.option_inner_type() {
+                if let Some(inner_name) = super::ts_option_inner(sd) {
                     emit_option_setter(out, field, sd, inner_name, builder_var, value_expr, indent);
                 } else {
+                    // Capture asserted/nested expressions exactly once. TypeScript
+                    // cannot narrow repeated `(union.data as T).nullable` reads;
+                    // the stable local preserves strict-null safety and evaluates
+                    // a property getter only once before the existing null guard.
+                    let value_id = *counter;
+                    *counter += 1;
+                    let stable_value = format!("_pv{value_id}");
+                    out.push_str(&format!("{indent}const {stable_value} = {value_expr};\n"));
+                    let value_expr = stable_value.as_str();
+                    if super::is_recursive_struct(&sd.name, structs) {
+                        out.push_str(&format!("{indent}if ({value_expr} != null) _write{}({builder_var}.initStruct({}, {}, {}), {value_expr});\n", sd.name, field.slot_offset, sd.data_words, sd.pointer_words));
+                        return;
+                    }
                     // Non-option struct pointer — init and set fields.
                     // Use gensym counter for the local variable to avoid TDZ collisions
                     // when the same slot_offset appears in nested or sibling struct pointers.
@@ -809,7 +831,36 @@ fn emit_field_setter(
                 );
             }
         }
-        FieldSection::Group => {} // groups are inlined, not handled here
+        FieldSection::Group => {
+            if let Some(group) = &field.named_group {
+                // Named group fields occupy this builder's own data/pointer
+                // sections; never allocate an extra child struct for the group.
+                for leaf in group.non_union_fields() {
+                    emit_field_setter(
+                        out,
+                        builder_var,
+                        leaf,
+                        &format!("({value_expr}).{}", to_camel_case(&leaf.name)),
+                        indent,
+                        enums,
+                        structs,
+                        counter,
+                    );
+                }
+                if group.has_union {
+                    emit_union_element_setter(
+                        out,
+                        group,
+                        builder_var,
+                        &format!("({value_expr})"),
+                        indent,
+                        enums,
+                        structs,
+                        counter,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -832,6 +883,14 @@ fn emit_struct_init(
         ptr_field.slot_offset, struct_def.data_words, struct_def.pointer_words
     ));
 
+    if super::is_recursive_struct(&struct_def.name, &schema.structs) {
+        out.push_str(&format!(
+            "{indent}_write{}(_ps, {param_name});\n",
+            struct_def.name
+        ));
+        return;
+    }
+
     for f in &struct_def.fields {
         if f.discriminant_value != 0xFFFF {
             continue;
@@ -843,6 +902,18 @@ fn emit_struct_init(
             "_ps",
             f,
             &value_expr,
+            indent,
+            &schema.enums,
+            &schema.structs,
+            counter,
+        );
+    }
+    if struct_def.has_union {
+        emit_union_element_setter(
+            out,
+            struct_def,
+            "_ps",
+            param_name,
             indent,
             &schema.enums,
             &schema.structs,
@@ -937,6 +1008,16 @@ fn emit_option_setter(
         out.push_str(&format!("{indent}  _opt.setText(0, {value_expr});\n"));
     } else if inner_type_name == "Data" {
         out.push_str(&format!("{indent}  _opt.setData(0, {value_expr});\n"));
+    } else if inner_type_name == "List(Text)" {
+        let some_field = opt_struct
+            .fields
+            .iter()
+            .find(|f| f.name == "some")
+            .expect("validated option wrapper has a some field");
+        out.push_str(&format!(
+            "{indent}  _opt.setTextList({}, {value_expr});\n",
+            some_field.slot_offset
+        ));
     } else if let Some(method) = super::setter_method(inner_type_name) {
         // Find the 'some' field slot offset for computing the byte offset
         let some_field = opt_struct.fields.iter().find(|f| f.name == "some");
@@ -1007,61 +1088,65 @@ fn emit_union_element_setter(
                 counter,
             );
             out.push_str(&format!("{bi}}}\n"));
-        } else if uf.type_name == "Void" {
-            // Nothing to set
-        } else if uf.section == FieldSection::Data && is_data_scalar(&uf.type_name) {
-            let byte_off = data_byte_offset(uf);
-            if let Some(method) = super::setter_method(&uf.type_name) {
-                out.push_str(&format!(
-                    "{bi}{builder_var}.{method}({byte_off}, {value_var}.data as {});\n",
-                    capnp_to_ts_type(&uf.type_name)
-                ));
-            }
-        } else if uf.type_name == "Text" {
-            out.push_str(&format!(
-                "{bi}{builder_var}.setText({}, {value_var}.data as string);\n",
-                uf.slot_offset
-            ));
-        } else if uf.type_name == "Data" {
-            out.push_str(&format!(
-                "{bi}{builder_var}.setData({}, {value_var}.data as Uint8Array);\n",
-                uf.slot_offset
-            ));
-        } else if let Some(ps) = structs.iter().find(|s| s.name == uf.type_name) {
-            // Struct variant — init sub-struct and set its non-union fields
-            out.push_str(&format!("{bi}{{\n"));
-            out.push_str(&format!(
-                "{bi}  const _ups = {builder_var}.initStruct({}, {}, {});\n",
-                uf.slot_offset, ps.data_words, ps.pointer_words
-            ));
-            out.push_str(&format!(
-                "{bi}  const _upd = {value_var}.data as {};\n",
-                ps.name
-            ));
-            for sf in &ps.fields {
-                if sf.discriminant_value != 0xFFFF {
-                    continue;
-                }
-                let raw_val_expr = format!("_upd.{}", to_camel_case(&sf.name));
-                let val_expr = value_expr_for_field(sf, &raw_val_expr, enums);
-                emit_field_setter(
-                    out,
-                    "_ups",
-                    sf,
-                    &val_expr,
-                    &format!("{bi}  "),
-                    enums,
-                    structs,
-                    counter,
-                );
-            }
-            out.push_str(&format!("{bi}}}\n"));
+        } else if uf.type_name != "Void" {
+            // Reuse the complete field dispatch: enum data, bool bit offsets,
+            // recursive/list pointers, and nested noncyclic union structs.
+            emit_field_setter(
+                out,
+                builder_var,
+                uf,
+                &format!("({value_var}.data as {})", capnp_to_ts_type(&uf.type_name)),
+                &bi,
+                enums,
+                structs,
+                counter,
+            );
         }
 
         out.push_str(&format!("{bi}break;\n"));
     }
     out.push_str(&format!("{indent}  default: break;\n"));
     out.push_str(&format!("{indent}}}\n"));
+}
+
+/// Runtime recursion is represented by ordinary private TS functions, using
+/// the same field/union writers as finite inline schemas.
+pub fn generate_recursive_writers(out: &mut String, schema: &ParsedSchema) {
+    for sd in &schema.structs {
+        if !super::is_recursive_struct(&sd.name, &schema.structs) {
+            continue;
+        }
+        out.push_str(&format!(
+            "function _write{}(_builder: StructBuilder, _value: {}): void {{\n",
+            sd.name, sd.name
+        ));
+        let mut counter = 0;
+        for field in sd.non_union_fields() {
+            emit_field_setter(
+                out,
+                "_builder",
+                field,
+                &format!("_value.{}", to_camel_case(&field.name)),
+                "  ",
+                &schema.enums,
+                &schema.structs,
+                &mut counter,
+            );
+        }
+        if sd.has_union {
+            emit_union_element_setter(
+                out,
+                sd,
+                "_builder",
+                "_value",
+                "  ",
+                &schema.enums,
+                &schema.structs,
+                &mut counter,
+            );
+        }
+        out.push_str("}\n\n");
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1277,7 @@ struct EmbedImagesResponse {
             discriminant_value: 0xFFFF,
             serde_rename: None,
             domain_type: None,
+            named_group: None,
         };
         let sd = StructDef {
             name: "Haunted".to_owned(),

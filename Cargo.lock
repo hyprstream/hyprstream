@@ -6903,6 +6903,8 @@ dependencies = [
  "hyprstream-compositor",
  "hyprstream-containedfs",
  "hyprstream-crypto",
+ "hyprstream-decision",
+ "hyprstream-decision-head",
  "hyprstream-discovery",
  "hyprstream-flight",
  "hyprstream-inference",
@@ -7148,6 +7150,11 @@ name = "hyprstream-decision-head"
 version = "0.1.0"
 dependencies = [
  "hyprstream-decision",
+ "ryu",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tch",
  "tempfile",
  "thiserror 1.0.69",
@@ -7227,6 +7234,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-eval"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "criterion",
+ "hyprstream-bench",
+ "hyprstream-calibration",
+ "hyprstream-decision",
+ "hyprstream-decision-stub",
+ "hyprstream-metrics-api",
+ "parking_lot 0.12.4",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic 0.13.1",
+ "workspace-hack",
+]
+
+[[package]]
 name = "hyprstream-flight"
 version = "0.1.0"
 dependencies = [
@@ -7279,6 +7308,8 @@ dependencies = [
  "futures",
  "git2db",
  "hex",
+ "hyprstream-decision",
+ "hyprstream-decision-head",
  "hyprstream-rpc",
  "hyprstream-rpc-std",
  "image",
@@ -7298,6 +7329,7 @@ dependencies = [
  "sha2 0.10.9",
  "tch",
  "tempfile",
+ "thiserror 1.0.69",
  "tokenizers",
  "tokio",
  "toml 0.8.23",
@@ -7654,6 +7686,8 @@ name = "hyprstream-rpc-std"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array 56.2.0",
+ "arrow-schema 56.2.0",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -7664,6 +7698,7 @@ dependencies = [
  "getrandom 0.3.3",
  "hex",
  "hyprstream-9p",
+ "hyprstream-decision",
  "hyprstream-pay",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
@@ -7679,6 +7714,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subsecond",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "url",
@@ -19568,6 +19604,8 @@ dependencies = [
  "cc",
  "chrono",
  "cipher",
+ "clap",
+ "clap_builder",
  "compact_str 0.9.0",
  "concurrent-queue",
  "const-oid 0.10.2",

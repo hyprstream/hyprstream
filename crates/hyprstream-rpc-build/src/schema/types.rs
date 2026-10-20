@@ -135,7 +135,7 @@ pub struct UnionArm {
     pub payload: ArmPayload,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
@@ -193,6 +193,10 @@ pub struct FieldDef {
     /// uses this type; ToCapnp writes via `.as_str()` and FromCapnp reads via `Type::new(...)`.
     #[serde(default)]
     pub domain_type: Option<String>,
+    /// Inline named non-union group metadata. The flat field remains `Group`
+    /// with its original wire offsets, for existing TS/wire consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_group: Option<Box<StructDef>>,
 }
 
 /// Which section of a Cap'n Proto struct a field resides in.

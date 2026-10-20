@@ -1,0 +1,12 @@
+{
+  "version": "cpython-json-float/1",
+  "generator_sha256": "08ccdaa97c5c8c31968e928ca9eaf4e0448f3511deb13cb66b1f44cfe729b24d",
+  "runtime": "3.11.2 (main, Oct  7 2026, 12:35:07) [GCC 12.2.0]",
+  "implementation": "CPython",
+  "runtime_executable_sha256": "9bee109da0dce17a7c9eeaca9f420cc6770a9fe143b9382d73bd22fe59b21a5f",
+  "finite_cases": 10608,
+  "expected_sha256": "85027d30237b2c7cd8c22f6bdb7314067f4095861e2a7c45bce5789064cf93fb",
+  "seed": "0x434c45465f463634",
+  "scope": "IEEE bits -> exact CPython json.dumps; same strings also test native JSON parse -> bits/render. No nonfinite acceptance, model, tokenizer, or tensor oracle.",
+  "command": "python3 crates/hyprstream-decision-head/tests/fixtures/python-json-float-v1/generate.py"
+}
