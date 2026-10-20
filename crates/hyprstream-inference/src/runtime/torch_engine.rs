@@ -250,8 +250,7 @@ impl TorchEngine {
         self.device
     }
 
-    /// CPU-device admission helper: the Clef v1 serving profile is CPU-only,
-    /// and `tch::Device` has no `is_cpu()` predicate.
+    /// Whether this engine is using CPU. `tch::Device` has no `is_cpu()` predicate.
     pub fn is_cpu_device(&self) -> bool {
         self.device == Device::Cpu
     }
@@ -2398,10 +2397,22 @@ impl TorchEngine {
             token_ids.len() <= limit,
             "decision input exceeds context limit"
         );
-        anyhow::ensure!(
-            self.device == tch::Device::Cpu,
-            "decision backbone is CPU-only pending CPU acceptance"
-        );
+        match self.device {
+            tch::Device::Cpu => {}
+            tch::Device::Cuda(index)
+                if tch::utils::has_hip()
+                    && tch::Cuda::is_available()
+                    && usize::try_from(tch::Cuda::device_count())
+                        .is_ok_and(|count| index < count)
+                    && self.device_pool.is_none() => {}
+            tch::Device::Cuda(_) if self.device_pool.is_some() => {
+                anyhow::bail!("Clef decision inference does not support multi-device placement")
+            }
+            tch::Device::Cuda(_) if !tch::utils::has_hip() => {
+                anyhow::bail!("Clef decision GPU inference requires a ROCm/HIP libtorch build")
+            }
+            _ => anyhow::bail!("Clef decision inference supports CPU and single-device ROCm only"),
+        }
         let model = self
             .persistent_model
             .as_ref()

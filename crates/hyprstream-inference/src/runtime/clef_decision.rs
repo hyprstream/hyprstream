@@ -4,7 +4,7 @@
 //! loading of the original Clef joint head from the admitted model directory;
 //! shared cheap request preflight (raw-byte bound + ordered Clef JSON parse +
 //! per-question and AGGREGATE budget admission); encoding through the
-//! head-lane [`ClefEncoder`]; ONE fresh-state unpadded CPU forward through
+//! head-lane [`ClefEncoder`]; ONE fresh-state unpadded device-local forward through
 //! [`TorchEngine::with_decision_backbone_checked`]; softmax and canonical
 //! label remapping. The service-facing half (auth context, pinned-artifact
 //! requirement, E2 marshalling, wire response assembly) lives in
@@ -183,7 +183,7 @@ impl DecisionBackboneObserver {
 /// decoder layers, and around head evaluation. An active libtorch kernel
 /// completes before the next check; a cancelled or failed forward drops its
 /// call-local state, so nothing persists. Disconnecting a client alone does
-/// not stop a running CPU forward — the deadline and drain flag bound it.
+/// not stop a running CPU or GPU forward — the deadline and drain flag bound it.
 #[derive(Clone, Debug)]
 pub struct DecisionCancel {
     flag: Arc<AtomicBool>,
@@ -261,6 +261,10 @@ pub struct ClefDecisionRuntime {
     /// Kind the head tensors were converted to (must equal the engine's
     /// compute kind; mismatch fails closed inside `JointSchemaHead::forward`).
     pub compute_kind: Kind,
+    /// Device on which the backbone and materialized joint head execute.
+    /// CPU remains the default; non-CPU placement is admitted only by the
+    /// device-specific serving profile below.
+    pub device: tch::Device,
     /// ADMITTED compute profile (policy-derived at load: same ChannelFp8
     /// detector and precision mapping the engine applies), validated at
     /// forward time by JointSchemaHead's own actual hidden/row dtype+device
@@ -284,31 +288,136 @@ pub fn resolve_serving_kind(
     model_path: &Path,
     precision_mode: Option<&str>,
 ) -> Result<Kind, ClefDecisionError> {
-    let kind = default_head_kind(model_path, precision_mode)?;
-    // Clef v1 serving gate (R0 section 5): CPU Float32 ONLY. Explicit
-    // BF16/FP16 and non-channel auto/fp8 resolve (BFloat16/Half) but are
-    // NOT qualified for serving — typed rejection, no silent downgrade or
-    // promotion.
-    if kind != Kind::Float {
-        return Err(ClefDecisionError::Profile(format!(
-            "clef v1 serving profile admits cpu-float32 compute only; got {kind:?} (R0 section 5)"
+    resolve_serving_kind_for_device(model_path, precision_mode, tch::Device::Cpu)
+}
+
+/// Resolve the Clef serving precision qualified for an observed device.
+/// CPU Float32 remains the accepted default. The initial ROCm slice admits
+/// only single-device BF16 with no quantization config; channel-FP8 remains
+/// CPU-only until its activation-QDQ/matmul implementation is qualified there.
+pub fn resolve_serving_kind_for_device(
+    model_path: &Path,
+    precision_mode: Option<&str>,
+    device: tch::Device,
+) -> Result<Kind, ClefDecisionError> {
+    let channel_fp8 = channel_fp8_present(model_path)?;
+    let kind = default_head_kind_for_device(model_path, precision_mode, device)?;
+    match device {
+        tch::Device::Cpu if kind == Kind::Float => Ok(kind),
+        tch::Device::Cpu => Err(ClefDecisionError::Profile(format!(
+            "clef v1 CPU serving profile admits float32 compute only; got {kind:?} (R0 section 5)"
+        ))),
+        tch::Device::Cuda(index)
+            if tch::utils::has_hip()
+                && tch::Cuda::is_available()
+                && usize::try_from(tch::Cuda::device_count()).is_ok_and(|count| index < count)
+                && !channel_fp8
+                && !quantization_config_present(model_path)?
+                && kind == Kind::BFloat16 =>
+        {
+            Ok(kind)
+        }
+        tch::Device::Cuda(_) if !tch::utils::has_hip() => Err(ClefDecisionError::Profile(
+            "Clef GPU serving currently requires a ROCm/HIP libtorch build".into(),
+        )),
+        tch::Device::Cuda(_) if channel_fp8 => Err(ClefDecisionError::Profile(
+            "channel FP8 Clef serving is CPU-only until ROCm activation-QDQ parity is qualified"
+                .into(),
+        )),
+        tch::Device::Cuda(_) if quantization_config_present(model_path)? => {
+            Err(ClefDecisionError::Profile(
+                "Clef ROCm serving currently admits unquantized BF16 checkpoints only".into(),
+            ))
+        }
+        tch::Device::Cuda(_) => Err(ClefDecisionError::Profile(format!(
+            "Clef ROCm BF16 serving requires bfloat16 compute; got {kind:?}"
+        ))),
+        _ => Err(ClefDecisionError::Profile(
+            "Clef serving supports CPU and qualified ROCm devices only".into(),
+        )),
+    }
+}
+
+fn quantization_config_present(model_path: &Path) -> Result<bool, ClefDecisionError> {
+    let path = model_path.join("config.json");
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| ClefDecisionError::Bundle(format!("stat backbone config.json: {e}")))?;
+    if metadata.len() > MAX_HEAD_CONFIG_BYTES as u64 {
+        return Err(ClefDecisionError::Bundle(format!(
+            "backbone config.json {} bytes exceeds bound {MAX_HEAD_CONFIG_BYTES}",
+            metadata.len()
         )));
     }
-    Ok(kind)
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ClefDecisionError::Bundle(format!("reading backbone config.json: {e}")))?;
+    let config: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ClefDecisionError::Bundle(format!("invalid backbone config.json: {e}")))?;
+    Ok(config
+        .get("quantization_config")
+        .is_some_and(|value| !value.is_null()))
+}
+
+/// Require the loader-selected backbone shards to contain floating-point
+/// tensors only. This catches quantized artifacts whose safetensors encode
+/// FP8/integers and scale companions without declaring `quantization_config`.
+/// Metadata parsing mmap-touches headers only, not the model data regions.
+fn validate_dense_float_checkpoint(model_path: &Path) -> Result<(), ClefDecisionError> {
+    let selected_shards = crate::runtime::model_factory::ModelFactory::find_shard_files(model_path)
+        .map_err(|e| ClefDecisionError::Bundle(format!("select backbone safetensors: {e:#}")))?;
+    // Match ModelFactory::create + load_weights exactly: a lone index entry
+    // does not win over a coexisting model.safetensors because load_weights
+    // takes the single-file fast path first.
+    let single_file = model_path.join("model.safetensors");
+    let shards = if selected_shards.len() <= 1 && single_file.exists() {
+        vec![single_file]
+    } else {
+        selected_shards
+    };
+    if shards.is_empty() {
+        return Err(ClefDecisionError::Bundle(
+            "backbone has no safetensors shards".into(),
+        ));
+    }
+    for shard in shards {
+        let file = std::fs::File::open(&shard).map_err(|e| {
+            ClefDecisionError::Bundle(format!("open backbone shard {}: {e}", shard.display()))
+        })?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+            ClefDecisionError::Bundle(format!("map backbone shard {}: {e}", shard.display()))
+        })?;
+        let (_, metadata) = SafeTensors::read_metadata(&mmap)
+            .map_err(|e| ClefDecisionError::Bundle(format!("read backbone shard metadata: {e}")))?;
+        for (name, info) in metadata.tensors() {
+            if !matches!(
+                info.dtype,
+                safetensors::Dtype::F16
+                    | safetensors::Dtype::BF16
+                    | safetensors::Dtype::F32
+                    | safetensors::Dtype::F64
+            ) {
+                return Err(ClefDecisionError::Profile(format!(
+                    "ROCm Clef serving requires floating-point backbone tensors; {name} has {:?}",
+                    info.dtype
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Head dtype from the AUTHORITATIVE shared policy
 /// (`torch_engine::resolve_inference_compute_kind`): case-insensitive
 /// aliases, CPU-device binding, channel-FP8 auto/fp8 -> Float. No duplicated
 /// mapping in this crate; drift is impossible by construction.
-fn default_head_kind(
+fn default_head_kind_for_device(
     model_path: &Path,
     precision_mode: Option<&str>,
+    device: tch::Device,
 ) -> Result<Kind, ClefDecisionError> {
     let channel_fp8 = channel_fp8_present(model_path)?;
     crate::runtime::torch_engine::resolve_inference_compute_kind(
         precision_mode,
-        tch::Device::Cpu,
+        device,
         channel_fp8,
     )
     .map_err(|e| ClefDecisionError::Bundle(format!("precision policy: {e}")))
@@ -353,16 +462,34 @@ pub type ComputeKind = tch::Kind;
 /// `kind` CPU matmuls (the accepted target is Float32). No hardware-FP8
 /// kernel or performance claim.
 pub fn compute_profile_string(kind: Kind, channel_fp8: bool) -> String {
+    compute_profile_string_for_device(kind, channel_fp8, tch::Device::Cpu)
+}
+
+/// Compute profile derived from the actual successful-forward device and
+/// dtype. On a ROCm libtorch build tch exposes HIP through `Device::Cuda`;
+/// report that backend explicitly so a GPU result cannot be mislabeled CPU.
+pub fn compute_profile_string_for_device(
+    kind: Kind,
+    channel_fp8: bool,
+    device: tch::Device,
+) -> String {
     let dtype = match kind {
         Kind::Float => "float32",
         Kind::BFloat16 => "bfloat16",
         Kind::Half => "float16",
         _ => "other",
     };
+    let backend = match device {
+        tch::Device::Cpu => "cpu",
+        tch::Device::Cuda(_) if tch::utils::has_hip() => "rocm",
+        tch::Device::Cuda(_) => "cuda",
+        tch::Device::Mps => "mps",
+        tch::Device::Vulkan => "vulkan",
+    };
     if channel_fp8 {
-        format!("cpu-{dtype}-fp8ch-w8a8-dynact")
+        format!("{backend}-{dtype}-fp8ch-w8a8-dynact")
     } else {
-        format!("cpu-{dtype}")
+        format!("{backend}-{dtype}")
     }
 }
 
@@ -547,6 +674,7 @@ fn materialize_head(
     metadata: &AdmittedHeadMetadata,
     tensors: &SafeTensors<'_>,
     kind: Kind,
+    device: tch::Device,
 ) -> Result<HashMap<String, Tensor>, ClefDecisionError> {
     let mut weights = HashMap::with_capacity(metadata.tensors.len());
     for (name, shape, dtype) in &metadata.tensors {
@@ -565,7 +693,8 @@ fn materialize_head(
             tensor
         } else {
             tensor.to_kind(kind)
-        };
+        }
+        .to_device(device);
         weights.insert(name.clone(), tensor);
     }
     Ok(weights)
@@ -594,8 +723,39 @@ impl ClefDecisionRuntime {
         kind_hint: Option<Kind>,
         precision_mode: Option<&str>,
     ) -> Result<Self> {
+        Self::load_on_device(
+            model_path,
+            engine_hidden,
+            kind_hint,
+            precision_mode,
+            tch::Device::Cpu,
+        )
+    }
+
+    /// Strict head load with explicit placement matching the admitted
+    /// backbone device. The default [`Self::load`] intentionally remains CPU.
+    pub fn load_on_device(
+        model_path: &Path,
+        engine_hidden: Option<u32>,
+        kind_hint: Option<Kind>,
+        precision_mode: Option<&str>,
+        device: tch::Device,
+    ) -> Result<Self> {
         let head_dir = Self::detect(model_path)
             .ok_or_else(|| ClefDecisionError::Bundle("not a Clef bundle".into()))?;
+        if device != tch::Device::Cpu {
+            let admitted_kind =
+                resolve_serving_kind_for_device(model_path, precision_mode, device)?;
+            if let Some(kind_hint) = kind_hint {
+                if kind_hint != admitted_kind {
+                    return Err(ClefDecisionError::Profile(format!(
+                        "head kind hint {kind_hint:?} does not match admitted device profile {admitted_kind:?}"
+                    ))
+                    .into());
+                }
+            }
+            validate_dense_float_checkpoint(model_path)?;
+        }
         let config_meta = std::fs::metadata(head_dir.join(CLEF_HEAD_CONFIG_FILE))
             .with_context(|| "stat Clef head config")?;
         if config_meta.len() > MAX_HEAD_CONFIG_BYTES as u64 {
@@ -649,7 +809,10 @@ impl ClefDecisionRuntime {
             std::fs::read(&config_path).with_context(|| "reading backbone config.json")?;
         let backbone_config: Value = serde_json::from_slice(&backbone_bytes)
             .map_err(|e| ClefDecisionError::Bundle(format!("invalid backbone config.json: {e}")))?;
-        let kind = kind_hint.unwrap_or(default_head_kind(model_path, precision_mode)?);
+        let kind = match kind_hint {
+            Some(kind) => kind,
+            None => default_head_kind_for_device(model_path, precision_mode, device)?,
+        };
 
         // Metadata admission BEFORE any tensor materialization. The
         // admitted metadata is LOAD-BEARING here: the summed data-region
@@ -673,7 +836,7 @@ impl ClefDecisionRuntime {
             ))
             .to_string()
         );
-        let weights = materialize_head(&metadata, &tensors, kind)?;
+        let weights = materialize_head(&metadata, &tensors, kind, device)?;
         let head_tensor_count = weights.len() as u32;
         let head = JointSchemaHead::from_named_tensors(config, weights)
             .map_err(|e| ClefDecisionError::Bundle(format!("joint head validation: {e}")))?;
@@ -683,7 +846,7 @@ impl ClefDecisionRuntime {
         // identity.quantization (T3: identical quantized artifacts under
         // different supported compute modes must yield DISTINCT profiles).
         let fp8 = channel_fp8_present(model_path)?;
-        let compute_profile = compute_profile_string(kind, fp8);
+        let compute_profile = compute_profile_string_for_device(kind, fp8, device);
 
         Ok(Self {
             identity: ClefBundleIdentity {
@@ -707,6 +870,7 @@ impl ClefDecisionRuntime {
             encoding_version: CLEF_ENCODING_VERSION,
             channel_fp8: fp8,
             compute_kind: kind,
+            device,
             compute_profile,
         })
     }
@@ -839,7 +1003,7 @@ pub fn map_question_probabilities(
     let probs = logits.softmax(-1, Kind::Float);
     let numel = probs.numel();
     let mut buf = vec![0f32; numel];
-    probs.copy_data(&mut buf, numel);
+    probs.to_device(tch::Device::Cpu).copy_data(&mut buf, numel);
     let mapped = permutation
         .iter()
         .map(|&i| buf[i as usize])
@@ -912,7 +1076,7 @@ pub fn encode_request(
 }
 
 /// Run one admitted, already-encoded record through the cached runtime:
-/// fresh-state CPU forward → per-question softmax → canonical remap.
+/// fresh-state device-local forward → per-question softmax → canonical remap.
 pub fn decide_encoded(
     runtime: &ClefDecisionRuntime,
     engine: &TorchEngine,
@@ -950,6 +1114,22 @@ pub fn decide_encoded(
     };
     let logits = engine
         .with_decision_backbone_checked(&encoded.input_ids, &check_backbone, |hidden, gather| {
+            anyhow::ensure!(
+                hidden.device() == runtime.device,
+                ClefDecisionError::Runtime(format!(
+                    "backbone hidden device {:?} does not match admitted profile {:?}",
+                    hidden.device(),
+                    runtime.device
+                ))
+            );
+            anyhow::ensure!(
+                hidden.kind() == runtime.compute_kind,
+                ClefDecisionError::Runtime(format!(
+                    "backbone hidden kind {:?} does not match admitted profile {:?}",
+                    hidden.kind(),
+                    runtime.compute_kind
+                ))
+            );
             // OBSERVED compute kind: recorded from the actual successful
             // hidden tensor the head validated (dtype+device), not from
             // load-time policy. Used for response provenance.
@@ -1427,6 +1607,7 @@ mod tests {
             ClefDecisionRuntime::load(dir.path(), Some(8), Some(Kind::Float), None).unwrap();
         assert_eq!(runtime.identity.head_tensor_count, weights.len() as u32);
         assert_eq!(runtime.compute_profile, "cpu-float32");
+        assert_eq!(runtime.device, tch::Device::Cpu);
         assert_eq!(runtime.encoding_version, CLEF_ENCODING_VERSION);
         assert_eq!(runtime.identity.head_weights_sha256.len(), 64);
         // Required identity material: the bundle tokenizer digest is present.
@@ -2065,6 +2246,88 @@ mod tests {
     }
 
     #[test]
+    fn rocm_profile_rejects_any_declared_quantization_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Value = serde_json::from_str(SIMPLE_BACKBONE_CONFIG).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(!quantization_config_present(dir.path()).unwrap());
+
+        // Unknown quantization methods are still quantized artifacts and must
+        // not pass the initial ROCm BF16 profile merely because the FP8 parser
+        // does not recognize them.
+        config["quantization_config"] = json!({"quant_method": "other-format"});
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(quantization_config_present(dir.path()).unwrap());
+        if tch::utils::has_hip() && tch::Cuda::is_available() {
+            let err = resolve_serving_kind_for_device(dir.path(), None, tch::Device::Cuda(0))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("admits unquantized BF16"), "{err}");
+        }
+        config["quantization_config"] = Value::Null;
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(!quantization_config_present(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn rocm_checkpoint_admission_rejects_undeclared_fp8_tensor_shards() {
+        use safetensors::tensor::{serialize, TensorView};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dense_bytes = [0u8; 4];
+        let dense = TensorView::new(safetensors::Dtype::F32, vec![1], &dense_bytes).unwrap();
+        let dense_bytes_serialized = serialize([("layer.weight", dense)], &None).unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), dense_bytes_serialized).unwrap();
+        assert!(validate_dense_float_checkpoint(dir.path()).is_ok());
+
+        // FP8 plus its inverse-scale companion is supported by the generic
+        // loader even when config.json has no quantization_config declaration.
+        let fp8_bytes = [0u8; 2];
+        let fp8 = TensorView::new(safetensors::Dtype::F8_E4M3, vec![2], &fp8_bytes).unwrap();
+        let scale_bytes = [0u8; 4];
+        let scale = TensorView::new(safetensors::Dtype::F32, vec![1], &scale_bytes).unwrap();
+        let quantized = serialize(
+            [("layer.weight", fp8), ("layer.weight_scale_inv", scale)],
+            &None,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), quantized).unwrap();
+        let err = validate_dense_float_checkpoint(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("floating-point backbone tensors"));
+        assert!(err.to_string().contains("F8_E4M3"));
+
+        // Match a loader corner case: an index naming one dense shard does
+        // not override a coexisting model.safetensors in the single-file
+        // fast path. The verifier must inspect the same FP8 file the loader
+        // will actually consume.
+        let dense = TensorView::new(safetensors::Dtype::F32, vec![1], &dense_bytes).unwrap();
+        let dense_shard = serialize([("layer.weight", dense)], &None).unwrap();
+        std::fs::write(dir.path().join("dense-shard.safetensors"), dense_shard).unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&json!({
+                "weight_map": {"layer.weight": "dense-shard.safetensors"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let err = validate_dense_float_checkpoint(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("F8_E4M3"));
+    }
+
+    #[test]
     fn serving_profile_rejects_bf16_and_accepts_fp32_or_auto_fp8() {
         // Causal controls at the resolver level: non-FP8 bundle (no channel
         // profile) — auto resolves BF16 and is REJECTED for v1 serving;
@@ -2085,13 +2348,13 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("explicit bf16 must be rejected for v1 serving"),
         };
-        assert!(err.contains("cpu-float32 compute only"), "{err}");
+        assert!(err.contains("CPU serving profile admits float32"), "{err}");
         // fp16/half alias: resolves Half, still rejected for serving.
         let err = match resolve_serving_kind(dir.path(), Some("FP16")) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("explicit fp16 must be rejected for v1 serving"),
         };
-        assert!(err.contains("cpu-float32 compute only"), "{err}");
+        assert!(err.contains("CPU serving profile admits float32"), "{err}");
         // Case-insensitive fp32 alias accepted.
         assert_eq!(
             resolve_serving_kind(dir.path(), Some("Float32")).unwrap(),
@@ -2112,7 +2375,22 @@ mod tests {
             Kind::Float
         );
         // The generic engine path (diagnostics) still resolves BF16.
-        assert_eq!(default_head_kind(dir.path(), None).unwrap(), Kind::BFloat16);
+        assert_eq!(
+            default_head_kind_for_device(dir.path(), None, tch::Device::Cpu).unwrap(),
+            Kind::BFloat16
+        );
+        let gpu_err = match resolve_serving_kind_for_device(dir.path(), None, tch::Device::Cuda(0))
+        {
+            Err(e) => e.to_string(),
+            Ok(kind) if tch::utils::has_hip() && tch::Cuda::is_available() => {
+                assert_eq!(kind, Kind::BFloat16);
+                String::new()
+            }
+            Ok(kind) => panic!("unqualified GPU unexpectedly admitted {kind:?}"),
+        };
+        if !gpu_err.is_empty() {
+            assert!(gpu_err.starts_with("clef-decision-profile"), "{gpu_err}");
+        }
     }
 
     #[tokio::test]
@@ -2270,6 +2548,109 @@ mod tests {
         );
         // Unquantized artifacts carry no execution-path suffix.
         assert_eq!(compute_profile_string(Kind::Float, false), "cpu-float32");
+        assert_eq!(
+            compute_profile_string_for_device(Kind::BFloat16, false, tch::Device::Cpu),
+            "cpu-bfloat16"
+        );
+        let gpu_profile = if tch::utils::has_hip() {
+            "rocm-bfloat16"
+        } else {
+            "cuda-bfloat16"
+        };
+        assert_eq!(
+            compute_profile_string_for_device(Kind::BFloat16, false, tch::Device::Cuda(0)),
+            gpu_profile
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ROCm/HIP libtorch and a visible GPU; run explicitly on Jensen"]
+    fn rocm_head_materialization_uses_the_backbone_device() {
+        assert!(tch::utils::has_hip(), "test requires ROCm/HIP libtorch");
+        assert!(
+            tch::Cuda::is_available(),
+            "test requires a visible ROCm GPU"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config = tiny_head_config(8);
+        let weights = tiny_head_tensors(&config);
+        write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
+        with_head_safetensors(dir.path(), |tensors, len| {
+            let metadata = head_metadata_admission(&config, Some(8), tensors, len).unwrap();
+            let placed =
+                materialize_head(&metadata, tensors, Kind::BFloat16, tch::Device::Cuda(0)).unwrap();
+            assert!(placed
+                .values()
+                .all(|tensor| tensor.device() == tch::Device::Cuda(0)));
+            assert!(placed
+                .values()
+                .all(|tensor| tensor.kind() == Kind::BFloat16));
+        });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ROCm/HIP libtorch and a visible GPU; run explicitly on Jensen"]
+    async fn rocm_tiny_decide_reports_profile_and_probabilities() {
+        use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine};
+
+        assert!(tch::utils::has_hip(), "test requires ROCm/HIP libtorch");
+        assert!(
+            tch::Cuda::is_available(),
+            "test requires a visible ROCm GPU"
+        );
+        let dir = t5_bundle_dir();
+        let mut engine = create_engine(&RuntimeConfig {
+            use_gpu: true,
+            gpu_device_id: Some(0),
+            precision_mode: None,
+            ..RuntimeConfig::default()
+        })
+        .expect("single-device ROCm engine");
+        RuntimeEngine::load_model(&mut engine, dir.path())
+            .await
+            .expect("tiny BF16 backbone load on ROCm");
+        assert_eq!(engine.device(), tch::Device::Cuda(0));
+
+        let serving_kind = resolve_serving_kind_for_device(dir.path(), None, tch::Device::Cuda(0))
+            .expect("ROCm BF16 profile admission");
+        assert_eq!(serving_kind, Kind::BFloat16);
+        let runtime = ClefDecisionRuntime::load_on_device(
+            dir.path(),
+            Some(T5_HIDDEN as u32),
+            None,
+            None,
+            tch::Device::Cuda(0),
+        )
+        .expect("unquantized BF16 Clef head on ROCm");
+        assert_eq!(runtime.compute_profile, "rocm-bfloat16");
+        assert!(runtime.identity.quantization.is_none());
+
+        let tokenizer = tiny_wordlevel_tokenizer();
+        let request = t5_record("one two three");
+        let (encoded, _) = encode_request(
+            &tokenizer,
+            &request,
+            Some(DEFAULT_MAX_STATE_TOKENS as usize),
+            256,
+            &DecisionCancel::none(),
+        )
+        .expect("encode tiny decision request");
+        let (distributions, observed_kind) = decide_encoded(
+            &runtime,
+            &engine,
+            &request,
+            &encoded,
+            &DecisionCancel::none(),
+        )
+        .expect("ROCm decision inference");
+        assert_eq!(observed_kind, Kind::BFloat16);
+        assert_eq!(distributions.len(), 3);
+        for distribution in &distributions {
+            assert!(!distribution.canonical_ids.is_empty());
+            assert!(distribution.probabilities.iter().all(|p| p.is_finite()));
+            let sum: f32 = distribution.probabilities.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "{sum}");
+        }
     }
 
     #[test]

@@ -403,9 +403,10 @@ pub fn build_response(
             // forward's hidden kind (validated == admitted head kind inside
             // decide_encoded) + device/path; artifact quantization stays in
             // the separate quantization field.
-            compute_profile: crate::runtime::clef_decision::compute_profile_string(
+            compute_profile: crate::runtime::clef_decision::compute_profile_string_for_device(
                 observed_kind,
                 runtime.channel_fp8,
+                runtime.device,
             ),
             model_ref: model_ref.to_owned(),
             artifact_commit: artifact_commit.to_owned(),
