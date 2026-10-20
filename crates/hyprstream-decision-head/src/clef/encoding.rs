@@ -29,15 +29,171 @@ impl ClefQuestionType {
         }
     }
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ClefQuestion {
-    #[serde(rename = "type")]
     pub kind: ClefQuestionType,
-    #[serde(default)]
     pub instructions: Value,
     /// Noul: null or object overriding true/false descriptions; choice: object; score: array.
-    #[serde(default)]
     pub criteria: Value,
+    /// Authored choice-criteria key order (insertion order from the raw wire
+    /// JSON, captured by the ordered deserializer below). The encoder still
+    /// renders options in SORTED id order (Cloudflare Clef prompt parity), so
+    /// this vector is the ONLY surviving record of the author's option order.
+    /// Spec-order projections (E2: option insertion order is canonical, answer
+    /// vectors carry no labels) remap from sorted model order through it.
+    /// Empty for noul/score questions — [false,true] and ascending array
+    /// positions are already the authored orders.
+    pub authored_choice_order: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ClefQuestion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct QuestionVisitor;
+        impl<'de> serde::de::Visitor<'de> for QuestionVisitor {
+            type Value = ClefQuestion;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Clef question object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut kind = None;
+                let mut instructions = None;
+                let mut criteria = None;
+                let mut order = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate question field {key}"
+                        )));
+                    }
+                    match key.as_str() {
+                        "type" => kind = Some(map.next_value()?),
+                        "instructions" => instructions = Some(map.next_value()?),
+                        "criteria" => {
+                            let OrderedCriteria(value, keys) = map.next_value()?;
+                            criteria = Some(value);
+                            order = keys;
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let kind = kind.ok_or_else(|| serde::de::Error::missing_field("type"))?;
+                Ok(ClefQuestion {
+                    kind,
+                    instructions: instructions.unwrap_or(Value::Null),
+                    criteria: criteria.unwrap_or(Value::Null),
+                    // Only choice answers have a spec-order projection that
+                    // differs from the canonical order.
+                    authored_choice_order: match kind {
+                        ClefQuestionType::Choice => order,
+                        _ => Vec::new(),
+                    },
+                })
+            }
+        }
+        deserializer.deserialize_map(QuestionVisitor)
+    }
+}
+
+/// Criteria payload plus its authored top-level key order. `serde_json` maps
+/// are key-sorted (no `preserve_order`), so the order is captured here by the
+/// ordered visitor — duplicate criteria keys are rejected instead of being
+/// silently collapsed by a last-wins map.
+struct OrderedCriteria(Value, Vec<String>);
+impl<'de> Deserialize<'de> for OrderedCriteria {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CriteriaVisitor;
+        impl<'de> serde::de::Visitor<'de> for CriteriaVisitor {
+            type Value = OrderedCriteria;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Clef criteria (null, object, or array)")
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(Value::Null, Vec::new()))
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(Value::Null, Vec::new()))
+            }
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                OrderedCriteria::deserialize(deserializer)
+            }
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(Value::Bool(value), Vec::new()))
+            }
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(
+                    Value::Number(serde_json::Number::from(value)),
+                    Vec::new(),
+                ))
+            }
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(
+                    Value::Number(serde_json::Number::from(value)),
+                    Vec::new(),
+                ))
+            }
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // serde_json only emits finite f64 for JSON text; a foreign
+                // deserializer producing non-finite floats is rejected rather
+                // than silently nulled.
+                match serde_json::Number::from_f64(value) {
+                    Some(number) => Ok(OrderedCriteria(Value::Number(number), Vec::new())),
+                    None => Err(serde::de::Error::custom(
+                        "non-finite numbers are not representable in Clef criteria",
+                    )),
+                }
+            }
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(Value::String(value.to_owned()), Vec::new()))
+            }
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(OrderedCriteria(Value::String(value), Vec::new()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(OrderedCriteria(Value::Array(items), Vec::new()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                let mut order = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate criteria key {key}"
+                        )));
+                    }
+                    order.push(key.clone());
+                    pairs.push((key, value));
+                }
+                Ok(OrderedCriteria(
+                    Value::Object(serde_json::Map::from_iter(pairs)),
+                    order,
+                ))
+            }
+        }
+        deserializer.deserialize_any(CriteriaVisitor)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ClefRecord {
@@ -556,6 +712,52 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn clef_choice_authored_order_is_preserved_and_duplicates_rejected() {
+        // Non-lexicographic authored order survives parsing while the encoder
+        // keeps rendering options in sorted id order (model/prompt parity).
+        let request: ClefRequest = serde_json::from_str(
+            r#"{"model":"clef","state":null,"questions":{"q":{"type":"choice","criteria":{"zeta":null,"alpha":"first","mid":null}}}}"#,
+        )
+        .expect("request");
+        let q = &request.record.questions[0].1;
+        assert_eq!(
+            q.authored_choice_order,
+            ["zeta".to_owned(), "alpha".to_owned(), "mid".to_owned()]
+        );
+        assert_eq!(
+            q.criteria
+                .as_object()
+                .expect("choice criteria object")
+                .keys()
+                .collect::<Vec<_>>(),
+            ["alpha", "mid", "zeta"] // Value map stays key-sorted
+        );
+
+        // Duplicate choice labels make the authored order ill-defined: the
+        // ordered parser rejects them instead of last-wins collapsing.
+        let err = serde_json::from_str::<ClefRequest>(
+            r#"{"model":"clef","state":null,"questions":{"q":{"type":"choice","criteria":{"a":null,"a":1}}}}"#,
+        )
+        .expect_err("duplicate criteria keys must be rejected")
+        .to_string();
+        assert!(err.contains("duplicate criteria key a"), "{err}");
+
+        // Noul/score carry no authored-order projection (empty vector), even
+        // when their criteria objects/arrays carry entries.
+        let request: ClefRequest = serde_json::from_str(
+            r#"{"model":"clef","state":null,"questions":{"n":{"type":"noul","criteria":{"false":"nope"}},"s":{"type":"score","criteria":["lo","hi"]}}}"#,
+        )
+        .expect("request");
+        assert!(request.record.questions[0]
+            .1
+            .authored_choice_order
+            .is_empty());
+        assert!(request.record.questions[1]
+            .1
+            .authored_choice_order
+            .is_empty());
+    }
+    #[test]
     fn clef_wire_numeric_domain_and_escaping() {
         let parse = |state: &str| {
             serde_json::from_str::<ClefRequest>(&format!(
@@ -591,6 +793,7 @@ mod tests {
                     kind: ClefQuestionType::Choice,
                     instructions: Value::Null,
                     criteria: serde_json::json!({"z":null,"a":{"β":2,"a":1}}),
+                    authored_choice_order: vec!["z".into(), "a".into()],
                 },
             )],
         };
@@ -651,6 +854,7 @@ mod tests {
                     kind: ClefQuestionType::Noul,
                     instructions: Value::Null,
                     criteria: Value::Null,
+                    authored_choice_order: Vec::new(),
                 },
             )],
         };
@@ -732,6 +936,7 @@ mod tests {
                         kind: ClefQuestionType::Choice,
                         instructions: Value::String("Select α".into()),
                         criteria: serde_json::json!({"z":null,"a":"first"}),
+                        authored_choice_order: vec!["z".into(), "a".into()],
                     },
                 ),
                 (
@@ -740,6 +945,7 @@ mod tests {
                         kind: ClefQuestionType::Noul,
                         instructions: Value::Null,
                         criteria: Value::Null,
+                        authored_choice_order: Vec::new(),
                     },
                 ),
             ],
@@ -795,6 +1001,7 @@ mod tests {
                         kind: ClefQuestionType::Noul,
                         instructions: Value::String("".into()),
                         criteria: serde_json::json!({"false":null}),
+                        authored_choice_order: Vec::new(),
                     },
                 ),
                 (
@@ -803,6 +1010,7 @@ mod tests {
                         kind: ClefQuestionType::Score,
                         instructions: serde_json::json!({"query":"数"}),
                         criteria: Value::Array(vec![Value::Null; 11]),
+                        authored_choice_order: Vec::new(),
                     },
                 ),
             ],
