@@ -558,3 +558,283 @@ impl RequestService for ModelForbiddenBoundary {
         Ok((b"forbidden".to_vec(), None))
     }
 }
+
+/// Permit-all MAC dispatch PEP for the consumer fixtures (the outer dispatch
+/// PEP stays a fixture; the class gate and Casbin layer are what's tested).
+struct PermitAllPep;
+impl hyprstream_rpc::auth::mac::MacDispatchPep for PermitAllPep {
+    fn check(
+        &self,
+        _: &EnvelopeContext,
+        _: &str,
+        _: Option<&[u16]>,
+    ) -> hyprstream_rpc::auth::mac::MacDecision {
+        hyprstream_rpc::auth::mac::MacDecision::Permit
+    }
+}
+
+/// Process-global fixture setup shared by the real-service consumer test.
+/// Every global is install-once; the test re-execs itself for isolation.
+fn install_real_service_fixture_globals(
+    holder: &SigningKey,
+    holder_pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+) -> Result<()> {
+    hyprstream_rpc::auth::mac::install_mac_dispatch_pep(Arc::new(PermitAllPep));
+    assert!(
+        hyprstream_rpc::proof::policy::set_global_method_policy(Box::new(
+            hyprstream_rpc::proof::policy::InMemoryMethodPolicy::new(),
+        ))
+        .is_ok()
+    );
+    let mut store = envelope::KeyedPqTrustStore::new();
+    store.bind(
+        holder.verifying_key().to_bytes(),
+        &hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(holder_pq))?,
+    );
+    envelope::install_verify_config(envelope::EnvelopeVerifyConfig {
+        policy: CryptoPolicy::Hybrid,
+        pq_store: Some(Arc::new(store)),
+    })?;
+    let _ = hyprstream_rpc::proof::admission::set_global_proof_replay_store(Box::new(
+        hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(128),
+    ));
+    // TuiService consumes the process-global revocation/session authorities
+    // (the RequestService defaults), exactly as in production.
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
+    if hyprstream_rpc::auth::credential::global_session_registry().is_none() {
+        let _ = hyprstream_rpc::auth::credential::set_global_session_registry(Arc::new(
+            hyprstream_rpc::auth::credential::InMemorySessionRegistry::new(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mint and sign a TUI-class credential for `scopes`, publishing its session
+/// exactly as the production mint path does (federate_host exchange).
+async fn signed_real_service_credential(
+    signer: &super::HybridFederateSigner,
+    host: &FederateHost,
+    holder: &SigningKey,
+    holder_pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    sid: &str,
+    scopes: &[&str],
+) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let session = hyprstream_session_store::Session {
+        host: host.as_str().into(),
+        sid: sid.into(),
+        account_id: "fixture-account".into(),
+        subject: DID.into(),
+        tenant: "tenant-a".into(),
+        client_id: TUI_CLIENT.into(),
+        resource: host.as_str().into(),
+        scopes: scopes.iter().map(ToString::to_string).collect(),
+        grant_revision: "revision-1".into(),
+        ed_public: holder.verifying_key().to_bytes(),
+        pq_public: ml_dsa_sk_to_vk_bytes(holder_pq),
+        generation: [7; 32],
+        collision_inventory_id: [7; 32],
+        proof_epoch: 1,
+        expires_at: now + 120,
+    };
+    let registry = hyprstream_rpc::auth::credential::global_session_registry()
+        .expect("session registry installed")
+        .clone();
+    hyprstream_rpc::auth::SessionRegistry::register_session(
+        registry.as_ref(),
+        hyprstream_rpc::auth::SessionKey::oidc(host.as_str(), sid),
+        hyprstream_rpc::auth::SessionState {
+            subject: DID.into(),
+            tenant: "tenant-a".into(),
+            kind: hyprstream_rpc::auth::SessionKind::Interactive,
+            created_at: now,
+            expires_at: session.expires_at,
+            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        },
+    )
+    .await?;
+    let claims = federate_exchange::committed_claims_for_class(
+        &session,
+        now,
+        ISSUER,
+        "opaque-sub",
+        host,
+        Some(TUI_CLIENT),
+    )?;
+    signer.sign(&claims).await
+}
+
+/// The Connect request body the real TuiService decodes and dispatches.
+fn connect_request_body() -> Result<Vec<u8>> {
+    hyprstream_rpc::serialize_message(|message| {
+        let mut req =
+            message.init_root::<hyprstream_rpc_std::tui_capnp::tui_request::Builder<'_>>();
+        req.set_id(1);
+        let mut connect = req.reborrow().init_connect();
+        connect.set_session_id(0);
+        connect.set_display_mode(hyprstream_rpc_std::tui_capnp::DisplayMode::Ansi);
+        connect.set_cols(80);
+        connect.set_rows(24);
+    })
+}
+
+/// W1.3 consumer proof: the TUI-class federate credential drives the REAL
+/// TuiService dispatch end to end — the class gate and scope map run in the
+/// production handler, observed through real service state.
+#[tokio::test]
+async fn w13_tui_credential_drives_the_real_tui_service() -> Result<()> {
+    const CHILD: &str = "HYPRSTREAM_TUI_REAL_SERVICE_FIXTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "services::oauth::state::federate_tui_tests::w13_tui_credential_drives_the_real_tui_service", "--nocapture"])
+            .env(CHILD, "1")
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "isolated TUI real-service regression failed"
+        );
+        return Ok(());
+    }
+    let host = FederateHost::new(HOST)?;
+    let server = SigningKey::from_bytes(&[72; 32]);
+    let holder = SigningKey::from_bytes(&[75; 32]);
+    let holder_pq = ml_dsa_sk_from_seed(&[76; 32]);
+    install_real_service_fixture_globals(&holder, &holder_pq)?;
+    let pair = super::tests::oauth_signing_pair(71);
+    let (_dir, key_set) = super::tests::composite_signer_fixture(1, vec![pair.clone()]);
+    let signer = super::HybridFederateSigner::new(key_set)?;
+    let transport = TransportConfig::ipc(_dir.path().join("unused-tui-infrastructure.sock"));
+    let keys: Arc<dyn hyprstream_rpc::auth::JwtKeySource> = Arc::new(
+        ClusterKeySource::new(*pair.ed25519(), host.as_str().into())
+            .with_ca_composite_key(pair.ml_dsa().clone()),
+    );
+    let build_service = |client: Option<&str>| {
+        crate::tui::service::TuiService::new(
+            Arc::new(tokio::sync::RwLock::new(crate::tui::TuiState::new(
+                80, 24, 1000,
+            ))),
+            transport.clone(),
+            server.clone(),
+        )
+        .with_expected_audience(host.as_str().to_owned())
+        .with_jwt_key_source(keys.clone())
+        .with_federate_tui_client(client.map(str::to_owned))
+    };
+    let tui = build_service(Some(TUI_CLIENT));
+    let tui_unconfigured = build_service(None);
+
+    let full = signed_real_service_credential(
+        &signer,
+        &host,
+        &holder,
+        &holder_pq,
+        "tui-real-sid",
+        &[
+            "connect:tui:session",
+            "query:tui:session",
+            "write:tui:session",
+        ],
+    )
+    .await?;
+    let watcher = signed_real_service_credential(
+        &signer,
+        &host,
+        &holder,
+        &holder_pq,
+        "tui-watcher-sid",
+        &["query:tui:session"],
+    )
+    .await?;
+    let body = connect_request_body()?;
+
+    // The Connect continuation spawns the frame loop via spawn_local.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Negative: a query-only credential cannot attach (the class gate
+            // denies before the handler runs — no session is created).
+            let bytes = signed_tui_request_bytes(
+                watcher.as_bytes(),
+                &body,
+                &holder,
+                &holder_pq,
+                &server,
+                "tui",
+            )
+            .await?;
+            process_request(
+                &bytes,
+                &tui,
+                hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                &server,
+                &envelope::InMemoryNonceCache::new(),
+                CarrierContext::iroh(),
+            )
+            .await?;
+            assert_eq!(
+                tui.test_session_count().await,
+                0,
+                "query-only TUI credential must not attach a viewer"
+            );
+
+            // Negative: the same full-scope credential against a service
+            // without the configured class default-denies (W1.1 invariant).
+            let bytes = signed_tui_request_bytes(
+                full.as_bytes(),
+                &body,
+                &holder,
+                &holder_pq,
+                &server,
+                "tui",
+            )
+            .await?;
+            process_request(
+                &bytes,
+                &tui_unconfigured,
+                hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                &server,
+                &envelope::InMemoryNonceCache::new(),
+                CarrierContext::iroh(),
+            )
+            .await?;
+            assert_eq!(
+                tui_unconfigured.test_session_count().await,
+                0,
+                "unconfigured TUI class must default-deny at the consumer"
+            );
+
+            // Positive: the full-scope TUI credential attaches a viewer to a
+            // real session on the real TuiService.
+            let bytes = signed_tui_request_bytes(
+                full.as_bytes(),
+                &body,
+                &holder,
+                &holder_pq,
+                &server,
+                "tui",
+            )
+            .await?;
+            process_request(
+                &bytes,
+                &tui,
+                hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                &server,
+                &envelope::InMemoryNonceCache::new(),
+                CarrierContext::iroh(),
+            )
+            .await?;
+            assert_eq!(
+                tui.test_session_count().await,
+                1,
+                "the TUI-class credential must attach a viewer session"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}

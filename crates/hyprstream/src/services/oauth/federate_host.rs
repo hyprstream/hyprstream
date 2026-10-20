@@ -227,6 +227,18 @@ impl FederateIssuer {
             return Err(federate_source::Error::Unavailable);
         }
         let now = i64::try_from(now).map_err(|_| federate_source::Error::Invalid)?;
+        // TUI-class credentials take NORMAL JWT verification at dispatch,
+        // where svc.rs (v16 §3.3) fails closed on an unknown `sid` for a
+        // local sid-carrying token. Publish the committed session to the
+        // session authority BEFORE minting, or every TUI credential would
+        // deny at dispatch. Fail-closed: no registry or failed registration,
+        // no token. The www class never takes the normal path (it dispatches
+        // through the deferred branch) and is deliberately not registered.
+        if Some(committed.client_id.as_str()) == self.verifier.tui_client_id() {
+            let registry = hyprstream_rpc::auth::global_session_registry()
+                .ok_or(federate_source::Error::Unavailable)?;
+            register_tui_session(registry.as_ref(), &committed, now).await?;
+        }
         let claims = super::federate_exchange::authorized_committed_claims_for_host(
             &committed,
             now,
@@ -251,6 +263,32 @@ impl FederateIssuer {
             self.verifier.tui_client_id(),
         )
     }
+}
+
+/// Publish a committed TUI-class session to the session authority (W1.3).
+/// Interactive kind, active, expiring with the session; fail-closed on any
+/// registration error (no session record, no minted credential).
+#[cfg(feature = "postgres")]
+async fn register_tui_session(
+    registry: &dyn hyprstream_rpc::auth::SessionRegistry,
+    committed: &Session,
+    now: i64,
+) -> Result<(), federate_source::Error> {
+    registry
+        .register_session(
+            hyprstream_rpc::auth::SessionKey::oidc(committed.host.clone(), committed.sid.clone()),
+            hyprstream_rpc::auth::SessionState {
+                subject: committed.subject.clone(),
+                tenant: committed.tenant.clone(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now,
+                expires_at: committed.expires_at,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await
+        .map_err(|_| federate_source::Error::Unavailable)
 }
 
 #[derive(Serialize)]
@@ -380,7 +418,7 @@ pub(crate) async fn exchange(state: &OAuthState, headers: &HeaderMap, body: &[u8
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -430,5 +468,49 @@ mod tests {
             axum::http::HeaderValue::from_static(federate_source::WEBSITE),
         );
         assert!(origin_for_class(&www, federate_source::CLIENT, None).unwrap());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn tui_session_registration_is_interactive_active_and_fail_closed() {
+        use hyprstream_rpc::auth::SessionRegistry as _;
+        let registry = hyprstream_rpc::auth::InMemorySessionRegistry::new();
+        let now = chrono::Utc::now().timestamp();
+        let session = hyprstream_session_store::Session {
+            host: "https://tui-host.test".into(),
+            sid: "tui-sid-1".into(),
+            account_id: "account".into(),
+            subject: "did:plc:abcdefghijklmnopqrstuvwx".into(),
+            tenant: "tenant-a".into(),
+            client_id: TUI_CLIENT.into(),
+            resource: "https://tui-host.test".into(),
+            scopes: vec!["connect:tui:session".into()],
+            grant_revision: "revision-1".into(),
+            ed_public: [3; 32],
+            pq_public: vec![4; 1952],
+            generation: [5; 32],
+            collision_inventory_id: [5; 32],
+            proof_epoch: 1,
+            expires_at: now + 120,
+        };
+        register_tui_session(&registry, &session, now)
+            .await
+            .expect("TUI session registration");
+        let key = hyprstream_rpc::auth::SessionKey::oidc("https://tui-host.test", "tui-sid-1");
+        assert!(
+            !registry.is_revoked(&key).await,
+            "registered session is active"
+        );
+        let state = registry.session_state(&key).await.expect("session state");
+        assert_eq!(state.subject, "did:plc:abcdefghijklmnopqrstuvwx");
+        assert_eq!(state.tenant, "tenant-a");
+        assert_eq!(state.kind, hyprstream_rpc::auth::SessionKind::Interactive);
+        assert_eq!(state.expires_at, now + 120);
+        // A duplicate sid registration fails closed (session identifiers are
+        // never reassigned, v16 §3.3) and surfaces as Unavailable (no mint).
+        assert!(matches!(
+            register_tui_session(&registry, &session, now).await,
+            Err(federate_source::Error::Unavailable)
+        ));
     }
 }

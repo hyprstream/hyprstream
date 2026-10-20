@@ -3058,6 +3058,32 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     }
     tui_service = tui_service.with_jwt_key_source(ctx.cluster_key_source());
 
+    // W1.3: the configured Federate TUI client class for the consumer gate.
+    // A configured-but-invalid class leaves the gate fail-closed (never
+    // widening), mirroring the oauth/policy factory wiring.
+    let federate_tui_client = config
+        .oauth
+        .trusted_issuers
+        .get(crate::services::oauth::federate_source::ISSUER)
+        .and_then(|issuer| issuer.federate_tui_client.as_ref())
+        .and_then(|class| {
+            match crate::services::oauth::federate_source::ClientClass::new(
+                &class.client_id,
+                &class.aud,
+                class.connector_id.as_deref(),
+            ) {
+                Ok(class) => Some(class.client_id().to_owned()),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Federate TUI consumer gate disabled: invalid trusted-issuer configuration"
+                    );
+                    None
+                }
+            }
+        });
+    tui_service = tui_service.with_federate_tui_client(federate_tui_client);
+
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }
 
