@@ -265,6 +265,10 @@ pub struct AuthorizeBinding {
 #[path = "federate_model_tests.rs"]
 mod federate_model_tests;
 
+#[cfg(all(test, feature = "postgres"))]
+#[path = "federate_tui_tests.rs"]
+mod federate_tui_tests;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1555,15 +1559,20 @@ impl super::federate_host::FederateSigner for HybridFederateSigner {
 }
 
 impl OAuthState {
-    /// Install the FederateIssuer for the Federate login path.
+    /// Install the FederateIssuer for the Federate login path. The optional
+    /// configured TUI client class (W1.3) joins the verifier's accepted
+    /// classes; `None` keeps staging-only behavior (default-deny for the
+    /// TUI class).
     #[cfg(feature = "postgres")]
     pub(crate) fn install_federate_issuer(
         &mut self,
         admission: std::sync::Arc<dyn super::federate_host::FederateAdmission>,
         signer: std::sync::Arc<dyn super::federate_host::FederateSigner>,
+        tui_client: Option<super::federate_source::ClientClass>,
     ) -> anyhow::Result<()> {
         let host = super::federate_source::FederateHost::new(&self.issuer_url)?;
-        let issuer = super::federate_host::FederateIssuer::new(admission, signer, host)?;
+        let issuer =
+            super::federate_host::FederateIssuer::new(admission, signer, host, tui_client)?;
         self.federate_issuer = Some(std::sync::Arc::new(issuer));
         Ok(())
     }

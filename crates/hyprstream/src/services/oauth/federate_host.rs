@@ -99,21 +99,40 @@ impl FederateIssuer {
         admission: Arc<dyn FederateAdmission>,
         signer: Arc<dyn FederateSigner>,
         host: federate_source::FederateHost,
+        tui_client: Option<federate_source::ClientClass>,
     ) -> Result<Self, federate_source::Error> {
+        let mut verifier = Verifier::for_host(host)?;
+        if let Some(class) = tui_client {
+            verifier = verifier.with_client_class(class);
+        }
         Ok(Self {
-            verifier: Verifier::for_host(host)?,
+            verifier,
             admission,
             signer,
             pending: Mutex::new(BTreeMap::new()),
         })
     }
 
+    /// The configured TUI client id, for the `/oauth/token` federate form
+    /// reservation (W1.3). `None` = staging-only routing, previous behavior.
+    pub(crate) fn tui_client_id(&self) -> Option<&str> {
+        self.verifier.tui_client_id()
+    }
+
     async fn challenge(
         &self,
+        headers: &HeaderMap,
         body: &[u8],
         now: u64,
     ) -> Result<ChallengeResponse, federate_source::Error> {
-        let request = ChallengeRequest::parse_for_host(body, self.verifier.host()?)?;
+        let request = ChallengeRequest::parse_for_host(
+            body,
+            self.verifier.host()?,
+            self.verifier.tui_client(),
+        )?;
+        if !origin_for_class(headers, request.client_id(), self.verifier.tui_client_id())? {
+            return Err(federate_source::Error::Invalid);
+        }
         let source = request.verify_source(&self.verifier, now).await?;
         let mut id = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut id);
@@ -157,10 +176,18 @@ impl FederateIssuer {
 
     async fn exchange(
         &self,
+        headers: &HeaderMap,
         body: &[u8],
         now: u64,
     ) -> Result<super::federate_exchange::ExchangeResponse, federate_source::Error> {
-        let request = ExchangeRequest::parse_for_host(body, self.verifier.host()?)?;
+        let request = ExchangeRequest::parse_for_host(
+            body,
+            self.verifier.host()?,
+            self.verifier.tui_client(),
+        )?;
+        if !origin_for_class(headers, request.client_id(), self.verifier.tui_client_id())? {
+            return Err(federate_source::Error::Invalid);
+        }
         let id = request.challenge_id()?;
         // Remove before network calls: a duplicate or uncertain retry cannot
         // race the same challenge to a second Policy commit.
@@ -207,6 +234,7 @@ impl FederateIssuer {
             &source_subject,
             crate::mac::exchange_enrollment_resolver().as_ref(),
             self.verifier.host()?,
+            self.verifier.tui_client_id(),
         )?;
         let token = tokio::time::timeout(Duration::from_secs(2), self.signer.sign(&claims))
             .await
@@ -220,6 +248,7 @@ impl FederateIssuer {
             &source_issuer,
             &source_subject,
             self.verifier.host()?,
+            self.verifier.tui_client_id(),
         )
     }
 }
@@ -233,12 +262,33 @@ struct ChallengeResponse {
     transcript_b64u: String,
 }
 
-fn origin(headers: &HeaderMap) -> bool {
-    headers.get_all(header::ORIGIN).iter().count() == 1
-        && headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            == Some(federate_source::WEBSITE)
+/// Class-aware origin rule (W1.3 native-client HTTP contract).
+///
+/// * www staging class (browser): exactly one `Origin` header, byte-equal
+///   to the pinned website origin — unchanged from the browser-only rule.
+/// * TUI class (native client): the www `Origin` header must be ABSENT.
+///   A native TUI client never sends a browser `Origin`; if any `Origin`
+///   is present the request is denied, so a web page cannot pose as the
+///   native TUI client (defense in depth under the mandatory holder
+///   possession proof — the origin check is a context pin, not the auth).
+/// * Any other client id: denied (no accepted class resolved).
+fn origin_for_class(
+    headers: &HeaderMap,
+    client_id: &str,
+    tui_client: Option<&str>,
+) -> Result<bool, federate_source::Error> {
+    let origin_count = headers.get_all(header::ORIGIN).iter().count();
+    if client_id == federate_source::CLIENT {
+        return Ok(origin_count == 1
+            && headers
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok())
+                == Some(federate_source::WEBSITE));
+    }
+    if Some(client_id) == tui_client {
+        return Ok(origin_count == 0);
+    }
+    Err(federate_source::Error::Invalid)
 }
 
 fn content_type(headers: &HeaderMap, expected: &str) -> bool {
@@ -272,14 +322,17 @@ pub(crate) async fn challenge(
 ) -> Response {
     #[cfg(feature = "postgres")]
     if let Some(issuer) = &state.federate_issuer {
-        if !origin(&headers) || !content_type(&headers, "application/json") {
+        // Content type stays a route-level format pin for both classes; the
+        // class-aware origin rule is applied inside the issuer after the
+        // wire client_id resolves to an accepted class.
+        if !content_type(&headers, "application/json") {
             return denied();
         }
         let now = chrono::Utc::now().timestamp();
         let Ok(now) = u64::try_from(now) else {
             return denied();
         };
-        return match issuer.challenge(&body, now).await {
+        return match issuer.challenge(&headers, &body, now).await {
             Ok(response) => (
                 [
                     (header::CACHE_CONTROL, "no-store"),
@@ -299,14 +352,17 @@ pub(crate) async fn challenge(
 pub(crate) async fn exchange(state: &OAuthState, headers: &HeaderMap, body: &[u8]) -> Response {
     #[cfg(feature = "postgres")]
     if let Some(issuer) = &state.federate_issuer {
-        if !origin(headers) || !content_type(headers, "application/x-www-form-urlencoded") {
+        // Content type stays a route-level format pin for both classes; the
+        // class-aware origin rule is applied inside the issuer after the
+        // wire client_id resolves to an accepted class.
+        if !content_type(headers, "application/x-www-form-urlencoded") {
             return denied();
         }
         let now = chrono::Utc::now().timestamp();
         let Ok(now) = u64::try_from(now) else {
             return denied();
         };
-        return match issuer.exchange(body, now).await {
+        return match issuer.exchange(headers, body, now).await {
             Ok(response) => (
                 [
                     (header::CACHE_CONTROL, "no-store"),
@@ -324,8 +380,11 @@ pub(crate) async fn exchange(state: &OAuthState, headers: &HeaderMap, body: &[u8
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    const TUI_CLIENT: &str = "hyprstream-tui-staging";
 
     #[test]
     fn exact_origin_and_content_type() {
@@ -338,12 +397,38 @@ mod tests {
             header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
         );
-        assert!(origin(&headers));
         assert!(content_type(&headers, "application/json"));
+        // www class: the exact single website origin, and nothing else.
+        assert!(origin_for_class(&headers, federate_source::CLIENT, Some(TUI_CLIENT)).unwrap());
         headers.append(
             header::ORIGIN,
             axum::http::HeaderValue::from_static("https://attacker.invalid"),
         );
-        assert!(!origin(&headers));
+        assert!(!origin_for_class(&headers, federate_source::CLIENT, Some(TUI_CLIENT)).unwrap());
+        // TUI class: no Origin header at all; any Origin (including the
+        // website's own) is denied, and an unconfigured client is denied.
+        let mut native = HeaderMap::new();
+        assert!(origin_for_class(&native, TUI_CLIENT, Some(TUI_CLIENT)).unwrap());
+        native.insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static(federate_source::WEBSITE),
+        );
+        assert!(!origin_for_class(&native, TUI_CLIENT, Some(TUI_CLIENT)).unwrap());
+        native.clear();
+        native.insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://attacker.invalid"),
+        );
+        assert!(!origin_for_class(&native, TUI_CLIENT, Some(TUI_CLIENT)).unwrap());
+        let none = HeaderMap::new();
+        assert!(origin_for_class(&none, "unknown-client", Some(TUI_CLIENT)).is_err());
+        assert!(origin_for_class(&none, TUI_CLIENT, None).is_err());
+        // The www origin pin still holds with no TUI class configured.
+        let mut www = HeaderMap::new();
+        www.insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static(federate_source::WEBSITE),
+        );
+        assert!(origin_for_class(&www, federate_source::CLIENT, None).unwrap());
     }
 }

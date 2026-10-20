@@ -171,6 +171,11 @@ impl CredentialHandle {
             || claims.cap.is_some()
             || cnf.jkt.is_some()
             || cnf.hs_signer_suite.is_some()
+            // Mixed-marker defense (W1.3/W1.4): the www consumer accepts
+            // ONLY the exact www class. Any TUI-consumer marker on a
+            // www-class credential is rejected here — www and TUI marker
+            // sets may never coexist on one accepted credential.
+            || claims.has_federate_tui_profile_marker()
             || claims.hs_profile.as_deref() != Some(PROFILE)
             || jwk.kty != "OKP"
             || jwk.crv != "Ed25519"
@@ -238,6 +243,115 @@ impl CredentialHandle {
             issued_at: claims.iat,
         })
     }
+}
+
+/// Verified facts of a TUI-consumer Federate credential. Constructed only
+/// from an already signature-verified local JWT; never a client DTO.
+pub(crate) struct TuiCredentialFacts {
+    pub(crate) subject: String,
+    pub(crate) tenant: String,
+    pub(crate) sid: String,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) ed_public: [u8; 32],
+    pub(crate) pq_public: Vec<u8>,
+}
+
+/// Consumer check for the TUI client class (W1.3): the class-aware
+/// counterpart of the www `CredentialHandle` profile checks. Called only
+/// with claims the RPC layer already signature-verified through NORMAL
+/// JWT verification — the TUI credential never enters the deferred
+/// federate branch, so there is no `deferred_federate` handle for it.
+///
+/// Rejects, fail-closed:
+/// * a client other than the exact configured TUI client (including the
+///   www staging client — cross-class substitution);
+/// * any www `federate-session-v1` marker (mixed markers), or a missing /
+///   incomplete TUI marker set (stripped markers);
+/// * any scope whose resource is not `tui` (registry|model consumer
+///   authority can never ride a TUI credential);
+/// * a missing/malformed `cnf.jwk` Ed25519 holder binding or PQ key half.
+pub(crate) fn verify_tui_credential_claims(
+    claims: &Claims,
+    host: &FederateHost,
+    tui_client: &str,
+) -> Result<TuiCredentialFacts> {
+    use super::federate_source;
+    let cnf = claims.cnf.as_ref().ok_or(Error::Denied)?;
+    let jwk = cnf.jwk.as_ref().ok_or(Error::Denied)?;
+    let ed = claims.cnf_key_bytes().ok_or(Error::Denied)?;
+    let pq_encoded = claims
+        .hs_tui_signer_pq_key_v1
+        .as_deref()
+        .ok_or(Error::Denied)?;
+    let pq_public = URL_SAFE_NO_PAD
+        .decode(pq_encoded)
+        .map_err(|_| Error::Denied)?;
+    let sid = claims.sid.as_deref().ok_or(Error::Denied)?;
+    let subject = claims.sub.as_str();
+    let tenant = claims.tenant.as_deref().ok_or(Error::Denied)?;
+    let jti = claims.jti.as_deref().ok_or(Error::Denied)?;
+    let scope = claims.scope.as_deref().ok_or(Error::Denied)?;
+    let scopes: Vec<String> = scope.split(' ').map(str::to_owned).collect();
+    if claims.iss != host.as_str()
+        || claims.aud.as_deref() != Some(host.as_str())
+        || claims.client_id.as_deref() != Some(tui_client)
+        || claims.workload_session_id.is_some()
+        || claims.act.is_some()
+        || claims.cap.is_some()
+        || cnf.jkt.is_some()
+        || cnf.hs_signer_suite.is_some()
+        // The complete TUI marker set, exactly this class's profile string.
+        || claims.hs_tui_profile.as_deref() != Some(federate_source::TUI_PROFILE)
+        || claims.hs_tui_source_issuer_v1.as_deref() != Some(federate_source::ISSUER)
+        || claims.hs_tui_source_subject_v1.as_deref().is_none()
+        // Mixed markers: no www federate-session marker may coexist.
+        || claims.has_federate_profile_marker()
+        // Wrong proof keys / malformed holder binding.
+        || jwk.kty != "OKP"
+        || jwk.crv != "Ed25519"
+        || URL_SAFE_NO_PAD.encode(ed) != jwk.x
+        || pq_public.len() != 1952
+        || URL_SAFE_NO_PAD.encode(&pq_public) != pq_encoded
+        || ml_dsa_vk_from_bytes(&pq_public).is_err()
+        || claims
+            .session_authority_generation()
+            .map_err(|_| Error::Denied)?
+            .is_some()
+        || !bounded(&claims.hs_tui_source_subject_v1.clone().unwrap_or_default(), 256)
+        || !bounded(sid, 128)
+        || !bounded(subject, 256)
+        || subject == "anonymous"
+        || subject.starts_with("service:")
+        || !bounded(tenant, 256)
+        || tenant == "*"
+        || !bounded(jti, 256)
+        || claims.iat < 0
+        || claims.exp <= claims.iat
+        || claims.exp - claims.iat > 300
+        || scopes.is_empty()
+        || scopes.len() > 64
+        || scopes.windows(2).any(|window| window[0] >= window[1])
+        || scopes.iter().any(|text| {
+            !bounded(text, 256)
+                || !text.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                || match Scope::parse(text) {
+                    // Intended-vs-forbidden services (W1.4): only the `tui`
+                    // service resource is consumer authority for this class.
+                    Ok(parsed) => parsed.resource != "tui" || parsed.identifier.is_empty(),
+                    Err(_) => true,
+                }
+        })
+    {
+        return Err(Error::Denied);
+    }
+    Ok(TuiCredentialFacts {
+        subject: subject.into(),
+        tenant: tenant.into(),
+        sid: sid.into(),
+        scopes,
+        ed_public: ed,
+        pq_public,
+    })
 }
 
 /// Resolve proof keys from the already verified, host-signed credential. This

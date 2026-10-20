@@ -24,6 +24,10 @@ use tokio::sync::Mutex;
 
 pub(crate) const ISSUER: &str = "https://login.federate.to";
 pub(crate) const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
+/// Session profile string of the second (TUI) client class. Distinct from
+/// the www `federate-session-v1` suite/inventory markers: a credential of
+/// this class takes NORMAL JWT verification, not the deferred branch.
+pub(crate) const TUI_PROFILE: &str = "federate-tui-v1";
 pub(crate) const WEBSITE: &str = "https://www.staging.lab.hyprstream.com";
 pub(crate) const CALLBACK: &str = "https://www.staging.lab.hyprstream.com/federate/callback";
 #[cfg(test)]
@@ -94,6 +98,17 @@ impl ClientClass {
 
     pub(crate) fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// The session profile string this class mints and accepts on the wire.
+    /// The staging class keeps `federate-session-v1` byte-for-byte; the
+    /// configured second class uses its own distinct TUI profile string.
+    pub(crate) fn profile(&self) -> &'static str {
+        if self.client_id == CLIENT {
+            "federate-session-v1"
+        } else {
+            TUI_PROFILE
+        }
     }
 }
 
@@ -411,6 +426,20 @@ impl Verifier {
             _ => Err(Error::Invalid),
         }
     }
+
+    /// The configured second client class, if any. `None` means
+    /// staging-only: the exact previous behavior (W1.1 default-deny).
+    pub(crate) fn tui_client(&self) -> Option<&ClientClass> {
+        self.tui_client.as_ref()
+    }
+
+    /// The configured second client class's `client_id`, if any. `None`
+    /// means staging-only: the exact previous behavior (W1.1 default-deny).
+    pub(crate) fn tui_client_id(&self) -> Option<&str> {
+        self.tui_client
+            .as_ref()
+            .map(|class| class.client_id.as_str())
+    }
     async fn fetch(&self, client: &reqwest::Client) -> Result<Vec<u8>> {
         #[cfg(test)]
         if let Some(responses) = &self.responses {
@@ -660,6 +689,15 @@ impl Source {
         (&self.commitment.ed, &self.commitment.pq)
     }
 
+    /// The verified client class's exact `client_id`. This is authenticated
+    /// data: the verifier resolved the wire `client_id` to an accepted class
+    /// and the signed `aud`/`azp` claims were checked against that class
+    /// before this `Source` existed. Policy uses it as the per-client
+    /// grant/profile table selector (W1.2); it is never browser-chosen.
+    pub(crate) fn client_id(&self) -> &str {
+        self.commitment.client.client_id.as_str()
+    }
+
     #[cfg(feature = "postgres")]
     pub(crate) fn store_source(&self) -> hyprstream_session_store::Source {
         hyprstream_session_store::Source {
@@ -861,6 +899,14 @@ impl Challenge {
 }
 
 impl VerifiedPossession {
+    /// The verified client class's exact `client_id` (authenticated data —
+    /// see [`Source::client_id`]). Used by the Policy adapter as the wire
+    /// client selector for the per-client grant/profile table (W1.2).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn client_id(&self) -> &str {
+        self.source.commitment.client.client_id.as_str()
+    }
+
     /// Consumed only by the authenticated Policy admission adapter. The
     /// verified keys/source are never reconstructed from the exchange form.
     #[cfg(feature = "postgres")]

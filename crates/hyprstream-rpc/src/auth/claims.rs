@@ -188,6 +188,26 @@ pub struct Claims {
     pub hs_source_issuer_v1: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hs_source_subject_v1: Option<String>,
+    /// TUI-consumer Federate profile (W1.3), deliberately namespaced
+    /// `hs_tui_*` and DISTINCT from every www `federate-session-v1`
+    /// suite/inventory marker above. A credential of the TUI client class
+    /// must NOT enter the deferred federate-session dispatch branch, so
+    /// none of these claims may ever appear in
+    /// [`Claims::has_federate_profile_marker`]: the TUI credential
+    /// authenticates through normal JWT verification with `cnf.jwk` holder
+    /// binding instead. The exact profile string pins the class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_profile: Option<String>,
+    /// The public ML-DSA-65 half of the TUI holder's COSE proof key pair
+    /// (TUI-namespaced analogue of `hs_signer_pq_key_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_signer_pq_key_v1: Option<String>,
+    /// Signed login provenance for the TUI class (TUI-namespaced analogue
+    /// of `hs_source_issuer_v1`/`hs_source_subject_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_source_issuer_v1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_source_subject_v1: Option<String>,
     /// Workload credential family session ID (`workload_session_id`) — a
     /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
     /// credentials of an enrolled workload family (e.g. a service-JWT
@@ -334,6 +354,10 @@ impl std::fmt::Debug for Claims {
             .field("hs_signer_inventory_v1", &self.hs_signer_inventory_v1)
             .field("hs_source_issuer_v1", &self.hs_source_issuer_v1)
             .field("hs_source_subject_v1", &self.hs_source_subject_v1)
+            .field("hs_tui_profile", &self.hs_tui_profile)
+            .field("hs_tui_signer_pq_key_v1", &self.hs_tui_signer_pq_key_v1)
+            .field("hs_tui_source_issuer_v1", &self.hs_tui_source_issuer_v1)
+            .field("hs_tui_source_subject_v1", &self.hs_tui_source_subject_v1)
             .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
             .field("client_id", &self.client_id)
@@ -443,6 +467,10 @@ impl FromCapnp for Claims {
             hs_signer_inventory_v1: None,
             hs_source_issuer_v1: None,
             hs_source_subject_v1: None,
+            hs_tui_profile: None,
+            hs_tui_signer_pq_key_v1: None,
+            hs_tui_source_issuer_v1: None,
+            hs_tui_source_subject_v1: None,
             workload_session_id: None,
             aud,
             client_id: None,
@@ -510,6 +538,10 @@ impl Claims {
             hs_signer_inventory_v1: None,
             hs_source_issuer_v1: None,
             hs_source_subject_v1: None,
+            hs_tui_profile: None,
+            hs_tui_signer_pq_key_v1: None,
+            hs_tui_source_issuer_v1: None,
+            hs_tui_source_subject_v1: None,
             workload_session_id: None,
             aud: None,
             client_id: None,
@@ -625,6 +657,14 @@ impl Claims {
 
     /// Any signed Federate-only marker takes the deferred, fail-closed path;
     /// stripping one marker cannot reinterpret the remaining token as generic.
+    ///
+    /// The TUI-consumer markers (`hs_tui_*`, W1.3) are deliberately NOT in
+    /// this set: a TUI-class credential authenticates through normal JWT
+    /// verification (with `cnf.jwk` holder binding), never through the
+    /// deferred federate-session dispatch branch. A TUI credential carrying
+    /// any www marker below still trips this check and is rejected in that
+    /// branch (it is not the reserved staging class); a www credential
+    /// carrying any TUI marker is rejected by the www proof consumer.
     pub fn has_federate_profile_marker(&self) -> bool {
         self.hs_session_authority_generation.is_some()
             || self.hs_profile.is_some()
@@ -633,6 +673,33 @@ impl Claims {
             || self.hs_signer_inventory_v1.is_some()
             || self.hs_source_issuer_v1.is_some()
             || self.hs_source_subject_v1.is_some()
+    }
+
+    /// Any signed TUI-consumer marker. Used by the TUI profile consumer to
+    /// reject www-class credentials that smuggle TUI markers (mixed-marker
+    /// defense) and to require the complete TUI marker set.
+    pub fn has_federate_tui_profile_marker(&self) -> bool {
+        self.hs_tui_profile.is_some()
+            || self.hs_tui_signer_pq_key_v1.is_some()
+            || self.hs_tui_source_issuer_v1.is_some()
+            || self.hs_tui_source_subject_v1.is_some()
+    }
+
+    /// Stamp the TUI-consumer Federate profile marker set. Every claim is
+    /// TUI-namespaced and disjoint from the www `federate-session-v1`
+    /// suite/inventory markers, so the credential never enters the deferred
+    /// federate dispatch branch; the marker alone is never authority.
+    pub fn with_federate_tui_markers(
+        mut self,
+        pq_key_b64url: String,
+        source_issuer: String,
+        source_subject: String,
+    ) -> Self {
+        self.hs_tui_profile = Some("federate-tui-v1".to_owned());
+        self.hs_tui_signer_pq_key_v1 = Some(pq_key_b64url);
+        self.hs_tui_source_issuer_v1 = Some(source_issuer);
+        self.hs_tui_source_subject_v1 = Some(source_subject);
+        self
     }
 
     /// Stamp the exact Federate profile and its ordered hybrid-suite digest.

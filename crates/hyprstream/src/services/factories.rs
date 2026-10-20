@@ -1267,8 +1267,37 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     ctx.signing_key(),
                     &required_services,
                 )?;
-            policy_service =
-                policy_service.with_federate_runtime(enrollment, collision_inventory, host);
+            // W1.2: the optional second (TUI) client class from the
+            // trusted-issuer config joins Policy's per-client grant/profile
+            // table. A configured-but-invalid class disables the TUI entry
+            // (fail closed) rather than widening the staging pin.
+            let federate_tui_client = config
+                .oauth
+                .trusted_issuers
+                .get(crate::services::oauth::federate_source::ISSUER)
+                .and_then(|issuer| issuer.federate_tui_client.as_ref())
+                .and_then(|class| {
+                    match crate::services::oauth::federate_source::ClientClass::new(
+                        &class.client_id,
+                        &class.aud,
+                        class.connector_id.as_deref(),
+                    ) {
+                        Ok(class) => Some(class.client_id().to_owned()),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "Federate TUI client class disabled: invalid trusted-issuer configuration"
+                            );
+                            None
+                        }
+                    }
+                });
+            policy_service = policy_service.with_federate_runtime(
+                enrollment,
+                collision_inventory,
+                host,
+                federate_tui_client.as_deref(),
+            );
             info!("Federate stateless Policy and request-use authorities installed");
         } else {
             tracing::warn!("Federate Policy runtime disabled: service enrollment or canonical HTTPS OAuth origin is unavailable");

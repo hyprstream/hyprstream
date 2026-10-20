@@ -850,3 +850,203 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
         .unwrap();
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
 }
+
+// ── W1.4: re-signed malformed-fixture negatives for the TUI profile ──────
+
+const TUI_CLIENT_ID: &str = "hyprstream-tui-staging";
+
+fn tui_claims() -> Claims {
+    let ed = ed25519_dalek::SigningKey::from_bytes(&[61; 32])
+        .verifying_key()
+        .to_bytes();
+    let pq = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[62; 32]));
+    let mut claims = Claims::new(
+        "did:plc:abcdefghijklmnopqrstuvwx".into(),
+        NOW as i64,
+        NOW as i64 + 60,
+    )
+    .with_issuer(HOST.into())
+    .with_audience(Some(HOST.into()))
+    .with_client_id(TUI_CLIENT_ID)
+    .with_tenant("tenant-a".into())
+    .with_sid("tui-sid")
+    .with_scope(Some("connect:tui:session query:tui:session".into()))
+    .with_cnf_jwk(&ed)
+    .with_federate_tui_markers(
+        URL_SAFE_NO_PAD.encode(&pq),
+        super::super::federate_source::ISSUER.into(),
+        "opaque-oidc-subject".into(),
+    );
+    claims.jti = Some("tui-jti".into());
+    claims
+}
+
+#[test]
+fn w14_tui_consumer_accepts_exactly_the_tui_profile() {
+    let host = FederateHost::new(HOST).unwrap();
+    let claims = tui_claims();
+    let facts =
+        verify_tui_credential_claims(&claims, &host, TUI_CLIENT_ID).expect("clean TUI credential");
+    assert_eq!(facts.subject, "did:plc:abcdefghijklmnopqrstuvwx");
+    assert_eq!(facts.tenant, "tenant-a");
+    assert_eq!(facts.sid, "tui-sid");
+    assert_eq!(facts.scopes, ["connect:tui:session", "query:tui:session"]);
+    assert_eq!(facts.ed_public.len(), 32);
+    assert_eq!(facts.pq_public.len(), 1952);
+    // Wrong configured client: denied (cross-class and unknown clients).
+    assert!(verify_tui_credential_claims(&claims, &host, "other-tui-client").is_err());
+}
+
+#[test]
+fn w14_absent_and_stripped_tui_markers_are_denied() {
+    let host = FederateHost::new(HOST).unwrap();
+    // Absent profile marker alone.
+    let mut bad = tui_claims();
+    bad.hs_tui_profile = None;
+    assert!(verify_tui_credential_claims(&bad, &host, TUI_CLIENT_ID).is_err());
+    // All TUI markers stripped: the residual credential must not pass as a
+    // marker-less generic TUI grant.
+    let mut stripped = tui_claims();
+    stripped.hs_tui_profile = None;
+    stripped.hs_tui_signer_pq_key_v1 = None;
+    stripped.hs_tui_source_issuer_v1 = None;
+    stripped.hs_tui_source_subject_v1 = None;
+    assert!(verify_tui_credential_claims(&stripped, &host, TUI_CLIENT_ID).is_err());
+    // Each remaining single-marker omission is denied too.
+    for omit in [
+        (false, true, true, true),
+        (true, false, true, true),
+        (true, true, false, true),
+        (true, true, true, false),
+    ] {
+        let mut bad = tui_claims();
+        if !omit.0 {
+            bad.hs_tui_profile = None;
+        }
+        if !omit.1 {
+            bad.hs_tui_signer_pq_key_v1 = None;
+        }
+        if !omit.2 {
+            bad.hs_tui_source_issuer_v1 = None;
+        }
+        if !omit.3 {
+            bad.hs_tui_source_subject_v1 = None;
+        }
+        assert!(
+            verify_tui_credential_claims(&bad, &host, TUI_CLIENT_ID).is_err(),
+            "marker omission {omit:?} was accepted"
+        );
+    }
+}
+
+#[test]
+fn w14_mixed_markers_are_denied_in_both_consumer_directions() {
+    let host = FederateHost::new(HOST).unwrap();
+    // A TUI credential carrying any www marker is denied by the TUI check.
+    for (field, value) in [
+        ("hs_profile", Some("federate-session-v1")),
+        ("hs_signer_suite_v1", Some("suite-digest")),
+        ("hs_signer_inventory_v1", Some("inventory-digest")),
+        ("hs_source_issuer_v1", Some("https://login.federate.to")),
+        ("hs_source_subject_v1", Some("subject")),
+        ("hs_session_authority_generation", Some("generation")),
+    ] {
+        let mut mixed = tui_claims();
+        match field {
+            "hs_profile" => mixed.hs_profile = value.map(str::to_owned),
+            "hs_signer_suite_v1" => mixed.hs_signer_suite_v1 = value.map(str::to_owned),
+            "hs_signer_pq_key_v1" => mixed.hs_signer_pq_key_v1 = value.map(str::to_owned),
+            "hs_signer_inventory_v1" => mixed.hs_signer_inventory_v1 = value.map(str::to_owned),
+            "hs_source_issuer_v1" => mixed.hs_source_issuer_v1 = value.map(str::to_owned),
+            "hs_source_subject_v1" => mixed.hs_source_subject_v1 = value.map(str::to_owned),
+            "hs_session_authority_generation" => {
+                mixed.hs_session_authority_generation = value.map(str::to_owned);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_tui_credential_claims(&mixed, &host, TUI_CLIENT_ID).is_err(),
+            "mixed marker {field} was accepted by the TUI check"
+        );
+    }
+    // A www credential carrying any TUI marker is denied by the www
+    // CredentialHandle (mixed markers in the other direction).
+    for tui_marker in ["profile", "pq", "source_issuer", "source_subject"] {
+        let mut mixed = host_claims();
+        match tui_marker {
+            "profile" => mixed.hs_tui_profile = Some("federate-tui-v1".into()),
+            "pq" => mixed.hs_tui_signer_pq_key_v1 = Some("pq".into()),
+            "source_issuer" => mixed.hs_tui_source_issuer_v1 = Some("iss".into()),
+            "source_subject" => mixed.hs_tui_source_subject_v1 = Some("sub".into()),
+            _ => unreachable!(),
+        }
+        assert!(
+            CredentialHandle::from_claims_snapshot(&mixed, "fixture-token").is_err(),
+            "www credential with TUI marker {tui_marker} was accepted"
+        );
+    }
+    // The clean www credential still parses for the www consumer.
+    assert!(CredentialHandle::from_claims_snapshot(&host_claims(), "fixture-token").is_ok());
+}
+
+#[test]
+fn w14_cross_class_substitution_is_denied_in_both_directions() {
+    let host = FederateHost::new(HOST).unwrap();
+    // A www credential presented to the TUI consumer: denied (client,
+    // markers, and scopes all mismatch the TUI class).
+    assert!(verify_tui_credential_claims(&host_claims(), &host, TUI_CLIENT_ID).is_err());
+    // A TUI credential presented to the www CredentialHandle: denied.
+    let tui = tui_claims();
+    assert!(CredentialHandle::from_claims_snapshot(&tui, "fixture-token").is_err());
+    // The www-class marker values swapped onto the TUI shape are denied:
+    // the TUI profile string is exact.
+    let mut swapped = tui_claims();
+    swapped.hs_tui_profile = Some("federate-session-v1".into());
+    assert!(verify_tui_credential_claims(&swapped, &host, TUI_CLIENT_ID).is_err());
+    let mut swapped = tui_claims();
+    swapped.hs_tui_source_issuer_v1 = Some("https://attacker.invalid".into());
+    assert!(verify_tui_credential_claims(&swapped, &host, TUI_CLIENT_ID).is_err());
+}
+
+#[test]
+fn w14_wrong_proof_keys_and_forbidden_services_are_denied() {
+    let host = FederateHost::new(HOST).unwrap();
+    // Wrong holder binding: the cnf.jwk does not decode to the claimed PQ
+    // half's suite shape, or the PQ key is malformed.
+    let mut bad = tui_claims();
+    bad.hs_tui_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode([9u8; 64]));
+    assert!(verify_tui_credential_claims(&bad, &host, TUI_CLIENT_ID).is_err());
+    let mut bad = tui_claims();
+    bad.cnf = None;
+    assert!(verify_tui_credential_claims(&bad, &host, TUI_CLIENT_ID).is_err());
+    let mut bad = tui_claims();
+    bad.hs_tui_signer_pq_key_v1 = Some("noncanonical".into());
+    assert!(verify_tui_credential_claims(&bad, &host, TUI_CLIENT_ID).is_err());
+
+    // Intended vs forbidden services (W1.4): only `tui`-resource scopes are
+    // consumer authority for this class.
+    for forbidden in [
+        "query:registry:List",
+        "infer:model:qwen2.5-0.5b-instruct:main",
+        "write:model:Load",
+    ] {
+        let mut bad = tui_claims();
+        bad.scope = Some(forbidden.into());
+        assert!(
+            verify_tui_credential_claims(&bad, &host, TUI_CLIENT_ID).is_err(),
+            "forbidden service scope {forbidden} was accepted"
+        );
+    }
+    for intended in [
+        "connect:tui:session",
+        "query:tui:session",
+        "write:tui:session",
+    ] {
+        let mut good = tui_claims();
+        good.scope = Some(intended.into());
+        assert!(
+            verify_tui_credential_claims(&good, &host, TUI_CLIENT_ID).is_ok(),
+            "intended TUI scope {intended} was denied"
+        );
+    }
+}

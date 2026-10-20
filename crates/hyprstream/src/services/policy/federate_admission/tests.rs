@@ -194,6 +194,7 @@ async fn fixture() -> (AdmissionService, EnvelopeContext) {
             client_scopes: scopes.clone(),
             resource_scopes: scopes,
         },
+        tui_profile: None,
         serving_generation: inventory_id,
         local_collision_inventory_id: inventory_id,
         collision_inventory,
@@ -344,6 +345,7 @@ async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<
             .to_bytes()
             .to_vec(),
         pq_public: vec![31; 1952],
+        client: "client".into(),
     };
     let prepared = client.prepare_federate_session(&request).await?;
     assert_eq!(prepared.subject, ATPROTO_DID);
@@ -355,6 +357,7 @@ async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<
         challenge_expires_at: now + 60,
         ed_public: request.ed_public.clone(),
         pq_public: request.pq_public.clone(),
+        client: "client".into(),
     };
     let committed = client.commit_federate_session(&commit).await?;
     assert_eq!(committed.subject, ATPROTO_DID);
@@ -492,6 +495,7 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
         service
             .prepare_rpc(
                 &ctx,
+                "client",
                 source.clone(),
                 requested.clone(),
                 [11; 32],
@@ -507,6 +511,7 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
         service
             .prepare_rpc(
                 &ctx,
+                "client",
                 source.clone(),
                 requested.clone(),
                 [12; 32],
@@ -525,6 +530,7 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
     let prepared = service
         .prepare_rpc(
             &ctx,
+            "client",
             source.clone(),
             requested,
             challenge_id,
@@ -551,6 +557,7 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
             .commit_rpc(
                 &ctx,
                 prepared.handle,
+                "client",
                 source,
                 challenge_id,
                 now,
@@ -564,6 +571,226 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
     );
 }
 
+// ── W1.2: the per-client grant/profile table beside the fixed www pin ─────
+
+const TUI_CLIENT_ID: &str = "hyprstream-tui-staging";
+const TUI_CONNECT_SCOPE: &str = "connect:tui:session";
+const TUI_QUERY_SCOPE: &str = "query:tui:session";
+
+/// Fixture variant whose Authorities carries the configured TUI table entry
+/// (the same fixed shape `AdmissionService::configured` builds from the
+/// trusted-issuer `federate_tui_client` class) plus a Casbin grant of the
+/// TUI session resource to the verified DID.
+async fn tui_fixture() -> (AdmissionService, EnvelopeContext) {
+    let (mut service, ctx) = fixture().await;
+    let authority = service.authority.as_mut().unwrap();
+    authority.tui_profile = Some(Profile {
+        issuer: "https://issuer.test".into(),
+        host: "https://host.test".into(),
+        client: TUI_CLIENT_ID.into(),
+        resource: "https://host.test".into(),
+        client_scopes: BTreeSet::from([TUI_CONNECT_SCOPE.into(), TUI_QUERY_SCOPE.into()]),
+        resource_scopes: BTreeSet::from([TUI_CONNECT_SCOPE.into(), TUI_QUERY_SCOPE.into()]),
+    });
+    authority
+        .policy
+        .add_policy_with_domain(ATPROTO_DID, "tenant", "tui:session", "connect", "allow")
+        .await
+        .unwrap();
+    authority
+        .policy
+        .add_policy_with_domain(ATPROTO_DID, "tenant", "tui:session", "query", "allow")
+        .await
+        .unwrap();
+    (service, ctx)
+}
+
+#[tokio::test]
+async fn w12_tui_class_prepares_and_commits_under_its_own_profile_table_entry() {
+    let (service, ctx) = tui_fixture().await;
+    let now = chrono::Utc::now().timestamp();
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            TUI_CLIENT_ID,
+            source(),
+            vec![TUI_CONNECT_SCOPE.into()],
+            [21; 32],
+            now,
+            [51; 32],
+            vec![52; 1952],
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.subject, ATPROTO_DID);
+    assert_eq!(prepared.granted, [TUI_CONNECT_SCOPE.to_owned()]);
+    let session = service
+        .commit_rpc(
+            &ctx,
+            prepared.handle,
+            TUI_CLIENT_ID,
+            source(),
+            [21; 32],
+            now,
+            now + 60,
+            [51; 32],
+            vec![52; 1952],
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.client_id, TUI_CLIENT_ID);
+    assert_eq!(session.scopes, [TUI_CONNECT_SCOPE.to_owned()]);
+    // A commit naming any other client consumes the one-use handle.
+    let prepared = service
+        .prepare_rpc(
+            &ctx,
+            TUI_CLIENT_ID,
+            source(),
+            vec![TUI_CONNECT_SCOPE.into()],
+            [22; 32],
+            now,
+            [51; 32],
+            vec![52; 1952],
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .commit_rpc(
+                &ctx,
+                prepared.handle,
+                "client",
+                source(),
+                [22; 32],
+                now,
+                now + 60,
+                [51; 32],
+                vec![52; 1952]
+            )
+            .await
+            .is_err(),
+        "a www-class commit must not redeem a TUI-class challenge"
+    );
+    assert!(service.pending.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn w12_per_client_scope_ceilings_do_not_intersect() {
+    let (service, ctx) = tui_fixture().await;
+    // The TUI class cannot be granted any www staging scope, even with a
+    // live Casbin grant for it: the TUI table entry's ceiling excludes it.
+    for www_scope in [STAGING_SCOPE, REGISTRY_LIST_SCOPE] {
+        assert!(
+            service
+                .prepare_rpc(
+                    &ctx,
+                    TUI_CLIENT_ID,
+                    source(),
+                    vec![www_scope.into()],
+                    [23; 32],
+                    chrono::Utc::now().timestamp(),
+                    [51; 32],
+                    vec![52; 1952]
+                )
+                .await
+                .is_err(),
+            "TUI class granted the www scope {www_scope}"
+        );
+    }
+    // Symmetrically the www class cannot be granted a TUI session scope
+    // even though the fixture just installed a live tui:session grant.
+    assert!(
+        service
+            .prepare_rpc(
+                &ctx,
+                "client",
+                source(),
+                vec![TUI_CONNECT_SCOPE.into()],
+                [24; 32],
+                chrono::Utc::now().timestamp(),
+                [51; 32],
+                vec![52; 1952]
+            )
+            .await
+            .is_err(),
+        "www class granted the TUI scope"
+    );
+}
+
+#[tokio::test]
+async fn w12_unconfigured_tui_class_default_denies_at_admission() {
+    // fixture() builds Authorities with tui_profile: None — the exact
+    // default-deny state when `federate_tui_client` is unconfigured.
+    let (service, ctx) = fixture().await;
+    assert!(
+        service
+            .prepare_rpc(
+                &ctx,
+                TUI_CLIENT_ID,
+                source(),
+                vec![TUI_CONNECT_SCOPE.into()],
+                [25; 32],
+                chrono::Utc::now().timestamp(),
+                [51; 32],
+                vec![52; 1952]
+            )
+            .await
+            .is_err(),
+        "unconfigured TUI class must default-deny before any grant work"
+    );
+    // The www pin still resolves and admits exactly as before.
+    let decision = service
+        .prepare(&ctx, "client", &source(), &[STAGING_SCOPE.to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(decision.scopes, [STAGING_SCOPE]);
+}
+
+#[tokio::test]
+async fn w12_deferred_request_use_reader_is_www_only() {
+    let (service, _) = tui_fixture().await;
+    let authority = service.authority.as_ref().unwrap();
+    let mut request = AdmitFederateRequest {
+        issuer: "https://host.test".into(),
+        profile: hyprstream_session_store::PROFILE.into(),
+        sid: "correlation-only".into(),
+        subject: ATPROTO_DID.into(),
+        tenant: "tenant".into(),
+        client: TUI_CLIENT_ID.into(),
+        audience: "https://host.test".into(),
+        scopes: vec![TUI_CONNECT_SCOPE.into()],
+        ed_public: vec![1; 32],
+        suite_thumbprint: vec![2; 32],
+        generation: authority.serving_generation.to_vec(),
+        collision_inventory_id: authority.local_collision_inventory_id.to_vec(),
+        expires_at: chrono::Utc::now().timestamp() + 60,
+        proof_epoch: 1,
+        verified_namespace: vec![4; 32],
+        request_id: vec![5; 16],
+        resource: "tui:session".into(),
+        operation: "connect".into(),
+    };
+    let reader = RequestUseReader::new(Arc::new(service), None);
+    let model_ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+        Subject::new("service:model"),
+        "*",
+        SigningKey::from_bytes(&[25; 32]).verifying_key(),
+        hyprstream_rpc::auth::Claims::new("service:model".into(), 0, i64::MAX),
+    );
+    assert!(
+        reader.admit(&model_ctx, &request).await.is_err(),
+        "the Registry/Model deferred consumer must reject a TUI-class session"
+    );
+    request.client = "client".into();
+    // The www-class shape still fails on the tui resource/scope ceiling
+    // (TUI scopes are outside the www ceiling), then succeeds for its own.
+    assert!(reader.admit(&model_ctx, &request).await.is_err());
+    request.scopes = vec![STAGING_SCOPE.into()];
+    request.resource = format!("model:{STAGING_MODEL_REF}");
+    request.operation = "infer".into();
+    reader.admit(&model_ctx, &request).await.unwrap();
+}
+
 #[tokio::test]
 async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     let (service, ctx) = fixture().await;
@@ -573,6 +800,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     let prepared = service
         .prepare_rpc(
             &ctx,
+            "client",
             verified_source.clone(),
             requested,
             [9; 32],
@@ -588,6 +816,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
         .commit_rpc(
             &ctx,
             prepared.handle,
+            "client",
             verified_source.clone(),
             [9; 32],
             now,
@@ -602,6 +831,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
         .commit_rpc(
             &ctx,
             prepared.handle,
+            "client",
             verified_source,
             [9; 32],
             now,
@@ -615,6 +845,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     let prepared = service
         .prepare_rpc(
             &ctx,
+            "client",
             source(),
             vec![STAGING_SCOPE.into()],
             [10; 32],
@@ -630,6 +861,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
         .commit_rpc(
             &ctx,
             prepared.handle,
+            "client",
             substituted_source,
             [10; 32],
             now,
@@ -644,6 +876,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     let prepared = service
         .prepare_rpc(
             &ctx,
+            "client",
             source(),
             vec![STAGING_SCOPE.into()],
             [11; 32],
@@ -657,6 +890,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
         .commit_rpc(
             &ctx,
             prepared.handle,
+            "client",
             source(),
             [12; 32],
             now,
@@ -671,6 +905,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     let prepared = service
         .prepare_rpc(
             &ctx,
+            "client",
             source(),
             vec![STAGING_SCOPE.into()],
             [13; 32],
@@ -684,6 +919,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
         .commit_rpc(
             &ctx,
             prepared.handle,
+            "client",
             source(),
             [13; 32],
             now,
@@ -701,6 +937,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
     let prepared_again = service
         .prepare_rpc(
             &ctx,
+            "client",
             replayed.clone(),
             vec![STAGING_SCOPE.into()],
             [14; 32],
@@ -715,6 +952,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             .commit_rpc(
                 &ctx,
                 prepared_again.handle,
+                "client",
                 replayed,
                 [14; 32],
                 now,
@@ -829,6 +1067,7 @@ async fn configured_host_policy_admits_only_its_exact_issuer_and_resource() {
             authority.collision_inventory,
             None,
             crate::services::oauth::federate_source::FederateHost::new(local).unwrap(),
+            None,
         );
         let authority = service.authority.as_ref().unwrap();
         assert_eq!(authority.profile.host, local);
@@ -874,10 +1113,13 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
     let (service, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into(), "read:model:other".into()];
     assert!(AdmissionService::default()
-        .prepare(&ctx, &source(), &requested)
+        .prepare(&ctx, "client", &source(), &requested)
         .await
         .is_err());
-    let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    let decision = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
     assert_eq!(decision.scopes, [STAGING_SCOPE]);
     for who in [
         Subject::new("alice"),
@@ -889,7 +1131,7 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
             SigningKey::from_bytes(&[24; 32]).verifying_key(),
         );
         assert!(service
-            .prepare(&wrong, &source(), &requested)
+            .prepare(&wrong, "client", &source(), &requested)
             .await
             .is_err());
     }
@@ -900,11 +1142,11 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
         hyprstream_rpc::auth::Claims::new("service:oauth".into(), 0, i64::MAX),
     );
     assert!(service
-        .prepare(&wrong, &source(), &requested)
+        .prepare(&wrong, "client", &source(), &requested)
         .await
         .is_err());
     assert!(service
-        .prepare(&ctx, &source(), &["read:model:other".into()])
+        .prepare(&ctx, "client", &source(), &["read:model:other".into()])
         .await
         .is_err());
     for nonmatching in [
@@ -915,7 +1157,7 @@ async fn h2_admission_disabled_caller_and_scope_boundaries() {
     ] {
         assert!(
             service
-                .prepare(&ctx, &source(), &[nonmatching.into()])
+                .prepare(&ctx, "client", &source(), &[nonmatching.into()])
                 .await
                 .is_err(),
             "nonmatching scope unexpectedly intersected: {nonmatching}"
@@ -944,7 +1186,10 @@ async fn h2_exact_model_ref_grant_matches_model_dispatch_resource() {
     let dispatch_resource = format!("model:{STAGING_MODEL_REF}");
     assert_eq!(parsed.policy_resource(), dispatch_resource);
 
-    let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    let decision = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
     assert_eq!(decision.subject, ATPROTO_DID);
     assert_eq!(decision.scopes, [STAGING_SCOPE]);
     assert_eq!(decision.scopes[0], STAGING_SCOPE);
@@ -969,7 +1214,12 @@ async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
         .unwrap();
     let source_record = source();
     let decision = service
-        .prepare(&ctx, &source_record, &[REGISTRY_LIST_SCOPE.into()])
+        .prepare(
+            &ctx,
+            "client",
+            &source_record,
+            &[REGISTRY_LIST_SCOPE.into()],
+        )
         .await
         .unwrap();
     assert_eq!(decision.scopes, [REGISTRY_LIST_SCOPE]);
@@ -1013,8 +1263,14 @@ async fn h2_registry_only_session_admits_list_but_not_model_infer_or_get() {
 async fn h2_admission_uses_verified_did_without_a_local_account() {
     let (service, ctx) = fixture().await;
     let requested = vec![STAGING_SCOPE.into()];
-    let first = service.prepare(&ctx, &source(), &requested).await.unwrap();
-    let again = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    let first = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
+    let again = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
     assert!(first == again);
     assert_eq!(first.subject, ATPROTO_DID);
     assert_eq!(
@@ -1032,7 +1288,10 @@ async fn h2_admission_uses_verified_did_without_a_local_account() {
         )
         .await
         .unwrap());
-    assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
+    assert!(service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .is_err());
     policy
         .add_policy_with_domain(
             ATPROTO_DID,
@@ -1043,11 +1302,17 @@ async fn h2_admission_uses_verified_did_without_a_local_account() {
         )
         .await
         .unwrap();
-    let decision = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    let decision = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
     assert_eq!(decision.subject, ATPROTO_DID);
     assert_eq!(decision.account_id, first.account_id);
     let _permit = service.capacity.as_ref().unwrap().try_acquire().unwrap();
-    assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
+    assert!(service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -1068,7 +1333,7 @@ async fn h2_ambiguous_did_tenant_grants_fail_closed() {
         .await
         .unwrap();
     assert!(service
-        .prepare(&ctx, &source(), &[STAGING_SCOPE.into()])
+        .prepare(&ctx, "client", &source(), &[STAGING_SCOPE.into()])
         .await
         .is_err());
 }
@@ -1089,6 +1354,7 @@ async fn connect(socket: &str, database: &str) -> tokio_postgres::Client {
 fn evidence(challenge: Decision, id: &str) -> PossessionEvidence {
     let source = source();
     PossessionEvidence {
+        client: "client".into(),
         created_at: source.issued_at,
         expires_at: source.issued_at + 60,
         session_expires_at: source.expires_at,
@@ -1126,7 +1392,7 @@ async fn h2_current_use_is_fresh_scoped_and_revocation_denies_next_boundary() {
     let (service, ctx) = fixture().await;
     let source_record = source();
     let decision = service
-        .prepare(&ctx, &source_record, &[STAGING_SCOPE.into()])
+        .prepare(&ctx, "client", &source_record, &[STAGING_SCOPE.into()])
         .await
         .unwrap();
     let session = session(&decision);
@@ -1349,6 +1615,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     let prepared = service
         .prepare_rpc(
             &ctx,
+            "client",
             rpc_source.clone(),
             requested.clone(),
             [10; 32],
@@ -1361,6 +1628,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
     let parallel = service
         .prepare_rpc(
             &ctx,
+            "client",
             rpc_source.clone(),
             requested.clone(),
             [11; 32],
@@ -1374,6 +1642,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .commit_rpc(
             &ctx,
             prepared.handle,
+            "client",
             rpc_source.clone(),
             [10; 32],
             created_at,
@@ -1398,6 +1667,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
             .commit_rpc(
                 &ctx,
                 prepared.handle,
+                "client",
                 rpc_source.clone(),
                 [10; 32],
                 created_at,
@@ -1414,6 +1684,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
             .commit_rpc(
                 &ctx,
                 parallel.handle,
+                "client",
                 rpc_source,
                 [11; 32],
                 created_at,
@@ -1425,7 +1696,10 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
             .is_err(),
         "PostgreSQL must reject the same source through a second handle"
     );
-    let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    let challenge = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
     let mut stale = challenge.clone();
     stale.tenant = "other".into();
     assert!(service
@@ -1469,7 +1743,10 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         )
         .await
         .unwrap();
-    let challenge = service.prepare(&ctx, &source(), &requested).await.unwrap();
+    let challenge = service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .unwrap();
     // Hold the H1 row lock to causally place a grant revocation AFTER the
     // Policy read and BEFORE admission commit. This lock is fixture-only.
     let tx = control.transaction().await.unwrap();
@@ -1532,7 +1809,10 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .unwrap()
         .is_some());
     // The NEXT authority read denies. This is not a Registry/Model dispatch test.
-    assert!(service.prepare(&ctx, &source(), &requested).await.is_err());
+    assert!(service
+        .prepare(&ctx, "client", &source(), &requested)
+        .await
+        .is_err());
     race_policy
         .add_policy_with_domain(
             ATPROTO_DID,

@@ -73,6 +73,9 @@ pub(super) struct PreparedDecision {
 }
 
 struct PendingDecision {
+    /// The verified client class selector this challenge was prepared under.
+    /// The commit must name the same class or the one-use handle is denied.
+    client: String,
     source: Source,
     requested: Vec<String>,
     decision: Decision,
@@ -126,6 +129,8 @@ impl CredentialReplayAdmission for GlobalCredentialReplay {
 /// OAuth's FederateIssuer constructs it only after strict source-token
 /// validation and both signatures over the exact challenge have verified.
 struct PossessionEvidence {
+    /// The verified client class this redemption belongs to (W1.2).
+    client: String,
     source: Source,
     ed_public: [u8; 32],
     pq_public: Vec<u8>,
@@ -140,7 +145,12 @@ struct PossessionEvidence {
 struct Authorities {
     policy: Arc<PolicyManager>,
     enrollment: Arc<ServiceEnrollmentManifest>,
+    /// The www staging client's fixed profile. Preserved verbatim (W1.2).
     profile: Profile,
+    /// The configured TUI client's fixed profile, from the trusted-issuer
+    /// `federate_tui_client` class. `None` = staging-only: the TUI class
+    /// default-denies at admission (W1.1 invariant).
+    tui_profile: Option<Profile>,
     /// Server-owned serving tuple from a complete trusted inventory/profile
     /// loader.
     serving_generation: [u8; 32],
@@ -148,6 +158,22 @@ struct Authorities {
     /// Public keys remain in Policy so issuance can reject cross-protocol
     /// proof-key reuse without persisting session rows or sharing root keys.
     collision_inventory: CollisionInventory,
+}
+
+impl Authorities {
+    /// Resolve the per-client grant/profile table entry for an authenticated
+    /// client selector. Only the hardcoded www pin and the configured TUI
+    /// class resolve; anything else — including the TUI class when
+    /// unconfigured — fails closed.
+    fn profile_for(&self, client_id: &str) -> Result<&Profile> {
+        if client_id == self.profile.client {
+            return Ok(&self.profile);
+        }
+        match &self.tui_profile {
+            Some(profile) if profile.client == client_id => Ok(profile),
+            _ => Err(anyhow::anyhow!("unconfigured Federate client class")),
+        }
+    }
 }
 
 /// Default denies before any authority or DB access. The verified ATProto DID
@@ -225,6 +251,12 @@ impl RequestUseReader {
         let request_id: [u8; 16] = data.request_id.as_slice().try_into()?;
         let ed: [u8; 32] = data.ed_public.as_slice().try_into()?;
         let suite_thumbprint: [u8; 32] = data.suite_thumbprint.as_slice().try_into()?;
+        // The deferred consumer path is www-only BY DESIGN: the request-use
+        // reader serves Registry/Model dispatch of `federate-session-v1`
+        // credentials. A TUI-class session (`federate-tui-v1`) can never
+        // satisfy this binding — its credential dispatches through normal
+        // JWT verification and carries no registry|model consumer
+        // authority (W1.3), so it is denied here even if presented.
         ensure!(
             data.issuer == authority.profile.host
                 && data.profile == hyprstream_session_store::PROFILE
@@ -348,16 +380,32 @@ impl RequestUseReader {
     }
 }
 
+/// Fixed, authority-owned TUI scope ceiling: the TUI-consumer authority of
+/// the second client class. Deliberately disjoint from the www staging
+/// ceiling — a TUI-class session can never be granted registry|model
+/// consumer authority, and a www session can never be granted TUI
+/// session authority.
+fn tui_scopes() -> BTreeSet<String> {
+    BTreeSet::from([
+        "connect:tui:session".to_owned(),
+        "query:tui:session".to_owned(),
+        "write:tui:session".to_owned(),
+    ])
+}
+
 impl AdmissionService {
     /// Construct the exact configured-host profile from host-owned configuration.
     /// The policy factory must separately qualify the TLS pool and active
-    /// profile generation before installing this authority.
+    /// profile generation before installing this authority. The www staging
+    /// client and its four scope ceilings are preserved verbatim; the
+    /// optional configured TUI class gets its own fixed table entry.
     pub(super) fn configured(
         policy: Arc<PolicyManager>,
         enrollment: Arc<ServiceEnrollmentManifest>,
         collision_inventory: CollisionInventory,
         session_pool: Option<deadpool_postgres::Pool>,
         host: crate::services::oauth::federate_source::FederateHost,
+        tui_client: Option<&str>,
     ) -> Self {
         let inventory_id = collision_inventory.id();
         let scopes = BTreeSet::from([
@@ -366,6 +414,14 @@ impl AdmissionService {
             "query:registry:qwen2.5-0.5b-instruct".to_owned(),
             "write:model:Load".to_owned(),
         ]);
+        let tui_profile = tui_client.map(|client| Profile {
+            issuer: crate::services::oauth::federate_source::ISSUER.into(),
+            host: host.as_str().into(),
+            client: client.into(),
+            resource: host.as_str().into(),
+            client_scopes: tui_scopes(),
+            resource_scopes: tui_scopes(),
+        });
         Self {
             authority: Some(Authorities {
                 policy,
@@ -378,6 +434,7 @@ impl AdmissionService {
                     client_scopes: scopes.clone(),
                     resource_scopes: scopes,
                 },
+                tui_profile,
                 serving_generation: inventory_id,
                 local_collision_inventory_id: inventory_id,
                 collision_inventory,
@@ -535,8 +592,18 @@ fn candidate_tenants(
 }
 
 impl Authorities {
-    async fn decision(&self, source: &Source, requested: &[String]) -> Result<Decision> {
-        ensure!(source.issuer == self.profile.issuer, "issuer mismatch");
+    /// The per-client grant/profile decision. `client_id` is the VERIFIED
+    /// client class selector relayed by OAuth (never a browser-chosen
+    /// value): it selects the table entry whose issuer/host/resource and
+    /// scope ceilings govern this admission.
+    async fn decision(
+        &self,
+        client_id: &str,
+        source: &Source,
+        requested: &[String],
+    ) -> Result<Decision> {
+        let profile = self.profile_for(client_id)?;
+        ensure!(source.issuer == profile.issuer, "issuer mismatch");
         canonical_requested(requested)?;
         let did = &source.atproto_did;
         ensure!(
@@ -545,7 +612,7 @@ impl Authorities {
         );
         // Internal join identifier only; the verified DID remains the
         // authorization principal and no local account is created or read.
-        let account_id = federate_account_id(&self.profile.host, did);
+        let account_id = federate_account_id(&profile.host, did);
         let policies = self.policy.get_policy().await;
         let domain_groups = self.policy.get_domain_grouping_policy().await;
         let tenants = candidate_tenants(did, &policies, &domain_groups)?;
@@ -553,8 +620,7 @@ impl Authorities {
         for tenant in tenants {
             let mut scopes = Vec::new();
             for text in requested {
-                if !self.profile.client_scopes.contains(text)
-                    || !self.profile.resource_scopes.contains(text)
+                if !profile.client_scopes.contains(text) || !profile.resource_scopes.contains(text)
                 {
                     continue;
                 }
@@ -582,12 +648,12 @@ impl Authorities {
         // change after these reads is accepted; use-time authorization is vital.
         let bytes = serde_json::to_vec(&(
             "federate-policy-decision-v1",
-            &self.profile.issuer,
-            &self.profile.host,
-            &self.profile.client,
-            &self.profile.resource,
-            &self.profile.client_scopes,
-            &self.profile.resource_scopes,
+            &profile.issuer,
+            &profile.host,
+            &profile.client,
+            &profile.resource,
+            &profile.client_scopes,
+            &profile.resource_scopes,
             &source.subject,
             &account_id,
             did,
@@ -707,6 +773,7 @@ impl AdmissionService {
     pub(super) async fn prepare_rpc(
         &self,
         ctx: &EnvelopeContext,
+        client_id: &str,
         source: Source,
         requested: Vec<String>,
         challenge_id: [u8; 32],
@@ -715,6 +782,10 @@ impl AdmissionService {
         pq_public: Vec<u8>,
     ) -> Result<PreparedDecision> {
         let authority = self.authority(ctx)?;
+        // Fail closed on the client selector BEFORE any time, replay or
+        // capacity work: only a configured table entry resolves. When the
+        // TUI class is unconfigured this is the admission-side default-deny.
+        authority.profile_for(client_id)?;
         let now = chrono::Utc::now().timestamp();
         ensure!(challenge_id != [0; 32], "invalid challenge ID");
         ensure!(
@@ -741,7 +812,7 @@ impl AdmissionService {
             .min(source.expires_at)
             .min(source.issued_at + 120);
         ensure!(expires_at > now, "challenge already expired");
-        let decision = self.prepare(ctx, &source, &requested).await?;
+        let decision = self.prepare(ctx, client_id, &source, &requested).await?;
         let mut pending = self.pending.lock().await;
         pending.retain(|_, entry| entry.expires_at > now);
         ensure!(pending.len() < 128, "Federate challenge capacity exhausted");
@@ -763,6 +834,7 @@ impl AdmissionService {
         pending.insert(
             handle,
             PendingDecision {
+                client: client_id.to_owned(),
                 source,
                 requested,
                 decision,
@@ -782,6 +854,7 @@ impl AdmissionService {
         &self,
         ctx: &EnvelopeContext,
         handle: [u8; 32],
+        client_id: &str,
         source: Source,
         challenge_id: [u8; 32],
         created_at: i64,
@@ -796,9 +869,14 @@ impl AdmissionService {
             .await
             .remove(&handle)
             .ok_or_else(|| anyhow::anyhow!("unknown or consumed challenge"))?;
+        // The committing client class must resolve to a configured table
+        // entry AND equal the class the pending decision was prepared under.
+        // The handle is already removed above, so any mismatch consumes it.
+        authority.profile_for(client_id)?;
         let now = chrono::Utc::now().timestamp();
         ensure!(
             now < pending.expires_at
+                && client_id == pending.client
                 && source == pending.source
                 && challenge_id == pending.challenge_id
                 && created_at == pending.created_at
@@ -821,6 +899,7 @@ impl AdmissionService {
                     ctx,
                     &mut client,
                     PossessionEvidence {
+                        client: client_id.to_owned(),
                         source,
                         ed_public,
                         pq_public,
@@ -834,23 +913,24 @@ impl AdmissionService {
                 )
                 .await;
         }
+        let profile = authority.profile_for(client_id)?;
         let current = tokio::time::timeout(
             Duration::from_secs(2),
-            authority.decision(&source, &pending.requested),
+            authority.decision(client_id, &source, &pending.requested),
         )
         .await??;
         ensure!(current == pending.decision, "challenge decision changed");
         let session_expires_at = pending.source.expires_at.min(now + 300);
         ensure!(session_expires_at > now, "source credential expired");
-        self.consume_source_credential(&source, &authority.profile.client)?;
+        self.consume_source_credential(&source, &profile.client)?;
         Ok(Session {
-            host: authority.profile.host.clone(),
+            host: profile.host.clone(),
             sid: uuid::Uuid::new_v4().to_string(),
             account_id: current.account_id,
             subject: current.subject,
             tenant: current.tenant,
-            client_id: authority.profile.client.clone(),
-            resource: authority.profile.resource.clone(),
+            client_id: profile.client.clone(),
+            resource: profile.resource.clone(),
             scopes: current.scopes,
             grant_revision: current.revision,
             ed_public,
@@ -894,6 +974,7 @@ impl AdmissionService {
     async fn prepare(
         &self,
         ctx: &EnvelopeContext,
+        client_id: &str,
         source: &Source,
         requested: &[String],
     ) -> Result<Decision> {
@@ -903,7 +984,11 @@ impl AdmissionService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("disabled"))?
             .try_acquire()?;
-        tokio::time::timeout(Duration::from_secs(2), a.decision(source, requested)).await?
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            a.decision(client_id, source, requested),
+        )
+        .await?
     }
 
     async fn redeem(
@@ -919,17 +1004,20 @@ impl AdmissionService {
             .ok_or_else(|| anyhow::anyhow!("disabled"))?
             .try_acquire()?;
         tokio::time::timeout(Duration::from_secs(2), async {
-            let current = a.decision(&evidence.source, &evidence.requested).await?;
+            let profile = a.profile_for(&evidence.client)?;
+            let current = a
+                .decision(&evidence.client, &evidence.source, &evidence.requested)
+                .await?;
             ensure!(current == evidence.challenge, "challenge decision changed");
-            self.consume_source_credential(&evidence.source, &a.profile.client)?;
+            self.consume_source_credential(&evidence.source, &profile.client)?;
             let session = PendingSession {
-                host: a.profile.host.clone(),
+                host: profile.host.clone(),
                 sid: evidence.sid,
                 account_id: current.account_id,
                 subject: current.subject,
                 tenant: current.tenant,
-                client_id: a.profile.client.clone(),
-                resource: a.profile.resource.clone(),
+                client_id: profile.client.clone(),
+                resource: profile.resource.clone(),
                 scopes: current.scopes,
                 grant_revision: current.revision,
                 ed_public: evidence.ed_public,

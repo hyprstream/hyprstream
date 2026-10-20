@@ -80,12 +80,19 @@ fn prepared_binding(
 fn committed_session(
     receipt: FederateCommittedSession,
     expected_subject: &str,
+    expected_client: &str,
     ed: [u8; 32],
     pq: &[u8],
 ) -> Result<Session> {
     ensure!(
         receipt.subject == expected_subject,
         "Policy committed principal does not match verified ATProto DID"
+    );
+    // The committed session must stay in the exact client class OAuth
+    // verified: a Policy receipt naming any other client is rejected here.
+    ensure!(
+        receipt.client == expected_client,
+        "Policy committed client class does not match the verified source"
     );
     ensure!(
         receipt.ed_public.as_slice() == ed && receipt.pq_public == pq && receipt.proof_epoch > 0,
@@ -124,6 +131,11 @@ impl FederateAdmission for PolicyFederateAdmission {
         ensure!(pq.len() == 1952, "invalid committed signer suite");
         let store_source = source.store_source();
         let verified_did = store_source.atproto_did.clone();
+        // The client selector is the VERIFIED class's client_id (the wire
+        // client_id OAuth resolved and signature-bound), never a raw
+        // request field. Policy selects its per-client grant/profile table
+        // entry with it (W1.2).
+        let verified_client = source.client_id().to_owned();
         let data = PrepareFederateSession {
             source: source_wire(store_source),
             requested: requested.split(' ').map(str::to_owned).collect(),
@@ -131,6 +143,7 @@ impl FederateAdmission for PolicyFederateAdmission {
             challenge_created_at: i64::try_from(created_at)?,
             ed_public: ed.to_vec(),
             pq_public: pq.to_vec(),
+            client: verified_client,
         };
         prepared_binding(
             self.client.prepare_federate_session(&data).await?,
@@ -145,6 +158,7 @@ impl FederateAdmission for PolicyFederateAdmission {
         policy_handle: Vec<u8>,
     ) -> Result<Session> {
         ensure!(policy_handle.len() == 32, "invalid Policy handle");
+        let verified_client = evidence.client_id().to_owned();
         let (source, ed, pq, binding, challenge_id, created_at, expires_at) =
             evidence.into_admission_parts();
         ensure!(
@@ -159,9 +173,10 @@ impl FederateAdmission for PolicyFederateAdmission {
             challenge_expires_at: i64::try_from(expires_at)?,
             ed_public: ed.to_vec(),
             pq_public: pq.clone(),
+            client: verified_client.clone(),
         };
         let receipt = self.client.commit_federate_session(&data).await?;
-        committed_session(receipt, &binding.subject, ed, &pq)
+        committed_session(receipt, &binding.subject, &verified_client, ed, &pq)
     }
 }
 
@@ -226,12 +241,17 @@ mod tests {
             expires_at: chrono::Utc::now().timestamp() + 60,
         };
         let did = "did:plc:abcdefghijklmnopqrstuvwx";
-        assert!(committed_session(receipt.clone(), did, [1; 32], &[2; 1952]).is_ok());
-        assert!(committed_session(receipt.clone(), did, [5; 32], &[2; 1952]).is_err());
-        assert!(committed_session(receipt.clone(), did, [1; 32], &[6; 1952]).is_err());
+        let client = federate_source::CLIENT;
+        assert!(committed_session(receipt.clone(), did, client, [1; 32], &[2; 1952]).is_ok());
+        assert!(
+            committed_session(receipt.clone(), did, "other-client", [1; 32], &[2; 1952]).is_err()
+        );
+        assert!(committed_session(receipt.clone(), did, client, [5; 32], &[2; 1952]).is_err());
+        assert!(committed_session(receipt.clone(), did, client, [1; 32], &[6; 1952]).is_err());
         assert!(committed_session(
             receipt,
             "did:plc:bcdefghijklmnopqrstuvwxy2",
+            client,
             [1; 32],
             &[2; 1952]
         )
