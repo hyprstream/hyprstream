@@ -48,11 +48,14 @@ EXTERNAL_INPUT_CRATES: dict[str, tuple[str, ...]] = {
 # exist the tests' deny-on-missing CI guard is armed via CI=true, matching the
 # merge gate (graviton-build-test.sh builds the same two guests unconditionally).
 GUEST_ARTIFACT_PACKAGES = ("hyprstream-workers-python", "hyprstream-workers-wasmtime")
-# `hyprstream-eval` is deliberately outside the broad default-members set, but
-# it owns the System One measurement protocol and must be tested whenever its
-# source changes, independently of whether a root-triggered full-set run is
-# also required.
-EXPLICIT_FULL_SET_PACKAGES = ("hyprstream-eval",)
+# These System One packages are deliberately outside default-members. A root
+# trigger must still execute their own tests: compiling them as dependencies
+# does not exercise their encoder, head, Arrow or measurement regressions.
+EXPLICIT_FULL_SET_PACKAGES = (
+    "hyprstream-decision",
+    "hyprstream-decision-head",
+    "hyprstream-eval",
+)
 GUEST_BUILDS = (
     ("crates/hyprstream-workers-python-guest", "wasm32-unknown-unknown",
      "hyprstream_workers_python_guest.wasm", "HYPRSTREAM_PYGUEST_WASM"),
@@ -172,13 +175,12 @@ def main() -> int:
         print("root-level input changed; running the full default-members set")
         pkgs: list[str] = []
     elif seeds:
-        # Run the eval package in its explicit release gate below, since it is
-        # intentionally absent from default-members and must not use ci-test.
+        # Non-default packages have their own release gate below.
         pkgs = sorted(seeds - set(explicit_release_packages))
         if pkgs:
             print(f"affected crates: {' '.join(pkgs)}")
         else:
-            print("no default-members packages affected; eval release gate will run")
+            print("no default-members packages affected; explicit release gates will run")
     else:
         ignored = [f for f in files if not f.startswith((".github/", CRATES_DIR))]
         print(f"no workspace crates affected ({len(ignored)} non-crate files changed); nothing to run")
@@ -220,10 +222,9 @@ def main() -> int:
             print(f"cargo clippy failed with exit {rc}", file=sys.stderr)
             return rc
 
-    # A full-set invocation uses Cargo's default-members, which intentionally
-    # omits the eval crate. When that crate is touched alongside a root-level
-    # trigger, run its focused release tests and all-targets release Clippy
-    # explicitly instead of broadening the repository's default build set.
+    # Cargo's default-members omit these packages. Root-only changes (such as
+    # lockfile or toolchain updates) can affect them too, so run all explicit
+    # gates on fallback, and only the touched gates for a narrow change.
     for package in explicit_release_packages:
         print(f"::group::cargo nextest run --package {package} (release)")
         rc = subprocess.run(
