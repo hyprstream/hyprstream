@@ -6152,6 +6152,64 @@ mod single_service_boundary_tests {
         .unwrap();
     }
 
+    /// Load-stage probe for the deterministic lazy-head-load cancellation
+    /// fixtures: records the LAST observed stage, the numeric MAXIMUM, and
+    /// the count of validation checks (the 1000+ family); trips the cancel
+    /// flag at one EXACT checkpoint. Equality, not a threshold: the 100/150
+    /// materialization stages interleave temporally (150+index of tensor 0
+    /// runs before 100+index of tensor 1), so a `>=` predicate would fire at
+    /// whichever higher-numbered stage arrives next, not the intended
+    /// checkpoint. Stage numbering is a namespace, not a timeline.
+    struct ClefLoadProbe {
+        flag: Arc<AtomicBool>,
+        last: std::sync::atomic::AtomicUsize,
+        max: std::sync::atomic::AtomicUsize,
+        validation_checks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ClefLoadProbe {
+        fn last(&self) -> usize {
+            self.last.load(Ordering::SeqCst)
+        }
+        fn max(&self) -> usize {
+            self.max.load(Ordering::SeqCst)
+        }
+        fn validation_checks(&self) -> usize {
+            self.validation_checks.load(Ordering::SeqCst)
+        }
+    }
+
+    fn clef_load_probe(
+        trip: usize,
+    ) -> (
+        hyprstream_inference::runtime::clef_decision::DecisionCancel,
+        Arc<ClefLoadProbe>,
+    ) {
+        use hyprstream_inference::runtime::clef_decision::{DecisionCancel, DecisionLoadObserver};
+        let probe = Arc::new(ClefLoadProbe {
+            flag: Arc::new(AtomicBool::new(false)),
+            last: std::sync::atomic::AtomicUsize::new(0),
+            max: std::sync::atomic::AtomicUsize::new(0),
+            validation_checks: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cancel = DecisionCancel::new(Arc::clone(&probe.flag), None).with_load_observer(
+            DecisionLoadObserver::new({
+                let probe = Arc::clone(&probe);
+                Arc::new(move |stage| {
+                    probe.last.store(stage, Ordering::SeqCst);
+                    probe.max.fetch_max(stage, Ordering::SeqCst);
+                    if (1000..2000).contains(&stage) {
+                        probe.validation_checks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if stage == trip {
+                        probe.flag.store(true, Ordering::Release);
+                    }
+                })
+            }),
+        );
+        (cancel, probe)
+    }
+
     /// Service instance whose ONLY decision-relevant state is the bundle at
     /// `model_path` and the empty lazy head cache (the lazy-load path touches
     /// nothing else).
@@ -6199,9 +6257,7 @@ mod single_service_boundary_tests {
 
     #[tokio::test]
     async fn lazy_clef_head_load_is_cancellation_aware_and_leaves_cache_empty() {
-        use hyprstream_inference::runtime::clef_decision::{
-            ClefDecisionRuntime, DecisionCancel, DecisionLoadObserver,
-        };
+        use hyprstream_inference::runtime::clef_decision::{ClefDecisionRuntime, DecisionCancel};
 
         let dir = tempfile::tempdir().unwrap();
         write_tiny_clef_bundle(dir.path());
@@ -6223,35 +6279,28 @@ mod single_service_boundary_tests {
             "expired request must not cache the lazy head"
         );
 
-        // Deterministic MID-MATERIALIZATION cancellation: stage 100 (the
-        // first tensor's check) passes with the flag clear and that tensor is
-        // materialized; the flag trips for stage 101 (the second tensor's
-        // check), aborting the load BEFORE the second tensor's work. No later
-        // stage (102+, head build 6, digests 200+/300+, final 7) may run.
-        let flag = Arc::new(AtomicBool::new(false));
-        let max_stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mid = DecisionCancel::new(Arc::clone(&flag), None).with_load_observer(
-            DecisionLoadObserver::new({
-                let flag = Arc::clone(&flag);
-                let max_stage = Arc::clone(&max_stage);
-                Arc::new(move |stage| {
-                    max_stage.fetch_max(stage, Ordering::SeqCst);
-                    if stage >= 101 {
-                        flag.store(true, Ordering::Release);
-                    }
-                })
-            }),
-        );
+        // Deterministic MID-MATERIALIZATION cancellation at the EXACT
+        // checkpoint 101 (tensor 1's pre-copy check): tensor 0 fully
+        // materialized — stages 100 (pre-copy) and 150 (copy→conversion)
+        // both observed, 150 being the numeric max — and the load aborts
+        // before tensor 1's copy. No validation stage (1000+) is reached.
+        let (mid, probe) = clef_load_probe(101);
         let err = match service.clef_runtime_or_load(8, &mid) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("cancelled mid-load must not publish the lazy head"),
         };
         assert!(err.starts_with("clef-decision-cancelled"), "{err}");
         assert_eq!(
-            max_stage.load(Ordering::SeqCst),
+            probe.last(),
             101,
-            "first tensor (stage 100) completes; the second tensor's check aborts"
+            "abort lands exactly on tensor 1's pre-copy check"
         );
+        assert_eq!(
+            probe.max(),
+            150,
+            "tensor 0's conversion (150) ran; nothing later numerically"
+        );
+        assert_eq!(probe.validation_checks(), 0, "validation never starts");
         assert!(
             service.inner.clef_runtime.read().is_none(),
             "cancelled mid-materialization must not publish a cached runtime"
@@ -6259,6 +6308,60 @@ mod single_service_boundary_tests {
 
         // A later healthy request retries the same lazy load successfully,
         // populates the cache exactly once, and a second call reuses it.
+        let healthy = DecisionCancel::none();
+        let rt: Arc<parking_lot::Mutex<ClefDecisionRuntime>> = service
+            .clef_runtime_or_load(8, &healthy)
+            .expect("healthy retry loads");
+        assert!(service.inner.clef_runtime.read().is_some());
+        let again = service
+            .clef_runtime_or_load(8, &healthy)
+            .expect("cached path");
+        assert!(
+            Arc::ptr_eq(&rt, &again),
+            "second call must reuse the cached runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_clef_head_load_cancelled_after_one_tensor_validation() {
+        use hyprstream_inference::runtime::clef_decision::{ClefDecisionRuntime, DecisionCancel};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_clef_bundle(dir.path());
+        let service = clef_lazy_load_service(dir.path());
+
+        // Deterministic cancellation AFTER ONE TENSOR VALIDATION at the
+        // EXACT checkpoint 1001 (tensor 1's pre-scan check): materialization
+        // fully completes, tensor 0's validation check (1000) passes with
+        // the flag clear and its finite-value scan runs, then the trip fires
+        // at 1001 — aborting the load before the second scan. No later stage
+        // (1002+, checkpoint 6, digests 200+/300+, final 7) may run.
+        let (mid, probe) = clef_load_probe(1001);
+        let err = match service.clef_runtime_or_load(8, &mid) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("cancelled validation must not publish the lazy head"),
+        };
+        // Cancellation stays TYPED through the constructor seam — never a
+        // spurious bundle/validation failure.
+        assert!(err.starts_with("clef-decision-cancelled"), "{err}");
+        assert_eq!(
+            probe.last(),
+            1001,
+            "abort lands exactly on tensor 1's pre-scan check"
+        );
+        assert_eq!(
+            probe.validation_checks(),
+            2,
+            "exactly two validation checks observed: one completed scan plus the aborting check"
+        );
+        assert_eq!(probe.max(), 1001);
+        assert!(
+            service.inner.clef_runtime.read().is_none(),
+            "cancelled validation must not publish a cached runtime"
+        );
+
+        // A later healthy request retries the same load successfully and the
+        // cache is then reused (exactly one published runtime).
         let healthy = DecisionCancel::none();
         let rt: Arc<parking_lot::Mutex<ClefDecisionRuntime>> = service
             .clef_runtime_or_load(8, &healthy)

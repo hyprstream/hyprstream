@@ -614,13 +614,14 @@ fn head_metadata_admission(
 /// explicit dtype conversion when the profile differs). Only called AFTER
 /// [`head_metadata_admission`] succeeded.
 ///
-/// The loop is COOPERATIVELY cancellation/deadline aware: a check runs
-/// between each tensor materialization (stage 100+index), before the copy
-/// and dtype conversion of that tensor. This bounds a cancelled load's
-/// remaining work to ONE in-flight native tensor operation — an active
-/// libtorch copy/conversion is never forcibly interrupted (it completes,
-/// then the next check aborts) — and a materialization failure drops the
-/// partial weights without caching anything.
+/// The loop is COOPERATIVELY cancellation/deadline aware at BOTH halves of
+/// each tensor's materialization: a check runs before the copy (stage
+/// 100+index) and BETWEEN the copy and the dtype conversion (stage
+/// 150+index). This bounds a cancelled load's remaining work to ONE
+/// in-flight native tensor operation — an active libtorch copy or conversion
+/// is never forcibly interrupted (it completes, then the next check aborts)
+/// — and a materialization failure drops the partial weights without
+/// caching anything.
 fn materialize_head(
     metadata: &AdmittedHeadMetadata,
     tensors: &SafeTensors<'_>,
@@ -629,14 +630,19 @@ fn materialize_head(
 ) -> Result<HashMap<String, Tensor>, ClefDecisionError> {
     let mut weights = HashMap::with_capacity(metadata.tensors.len());
     for (index, (name, shape, dtype)) in metadata.tensors.iter().enumerate() {
-        cancel
-            .check_load(100 + index)
-            .map_err(|e| match e.downcast::<ClefDecisionError>() {
-                Ok(typed) => typed,
-                Err(other) => {
-                    ClefDecisionError::Runtime(format!("head load stage check: {other:#}"))
-                }
-            })?;
+        // Typed cancellation survives the explicit-E signature; anything
+        // else from the checker is an internal runtime failure.
+        let stage = |stage_no: usize| -> Result<(), ClefDecisionError> {
+            cancel
+                .check_load(stage_no)
+                .map_err(|e| match e.downcast::<ClefDecisionError>() {
+                    Ok(typed) => typed,
+                    Err(other) => {
+                        ClefDecisionError::Runtime(format!("head load stage check: {other:#}"))
+                    }
+                })
+        };
+        stage(100 + index)?;
         let view = tensors.tensor(name).map_err(|_| {
             ClefDecisionError::Bundle(format!(
                 "head tensor {name} missing after admission (internal invariant)"
@@ -648,6 +654,9 @@ fn materialize_head(
             _ => Kind::Float,
         };
         let tensor = Tensor::from_data_size(view.data(), shape, raw_kind);
+        // Between the copy out of the mapping and the dtype conversion: the
+        // two native halves of this tensor's materialization cost.
+        stage(150 + index)?;
         let tensor = if tensor.kind() == kind {
             tensor
         } else {
@@ -679,12 +688,19 @@ impl ClefDecisionRuntime {
     /// COOPERATIVE cancellation/deadline awareness (the lazy first-load runs
     /// inside a request's budget): `cancel` is checked at every meaningful
     /// stage — numbered checkpoints 1..=7, per-tensor materialization
-    /// 100+index, large-digest chunks 200+/300+ — so an expired or cancelled
+    /// 100+index (pre-copy) and 150+index (copy→conversion boundary),
+    /// per-tensor head validation 1000+index (before each finite-value
+    /// scan), large-digest chunks 200+/300+ — so an expired or cancelled
     /// request aborts the load, drops its partial tensors, and never caches a
     /// runtime. These checks are BETWEEN bounded native operations: one hash
-    /// chunk or one libtorch tensor copy/conversion that is already in flight
-    /// completes first; no synchronous native operation is forcibly
-    /// interrupted (the residual blocking bound is a single such operation).
+    /// chunk, one libtorch tensor copy/conversion, or one finite-value scan
+    /// that is already in flight completes first; no synchronous native
+    /// operation is forcibly interrupted (the residual blocking bound is a
+    /// single such operation). Stage numbering is a NAMESPACE, not a
+    /// timeline: execution order is materialization (100+/150+), then
+    /// validation (1000+), then checkpoint 6, then the digest families
+    /// (200+/300+), then checkpoint 7 — the 1000-family numerically
+    /// dominates stages that run later.
     pub fn load(
         model_path: &Path,
         engine_hidden: Option<u32>,
@@ -778,8 +794,28 @@ impl ClefDecisionRuntime {
         cancel.check_load(5)?;
         let weights = materialize_head(&metadata, &tensors, kind, cancel)?;
         let head_tensor_count = weights.len() as u32;
-        let head = JointSchemaHead::from_named_tensors(config, weights)
-            .map_err(|e| ClefDecisionError::Bundle(format!("joint head validation: {e}")))?;
+        // Head validation (name/shape/dtype admission plus the per-tensor
+        // finite-value scans) runs through the cancellation-aware
+        // constructor seam: a staged check fires before EACH admitted
+        // tensor's scan (1000+index). A tripped cancel surfaces as the
+        // TYPED cancellation error — never a spurious bundle failure —
+        // while genuine validation failures keep their bundle typing.
+        let head =
+            match JointSchemaHead::from_named_tensors_checked(config, weights, &mut |index| {
+                cancel
+                    .check_load(1000 + index)
+                    .map_err(|e| ClefError::Head(format!("{e:#}")))
+            }) {
+                Ok(head) => head,
+                Err(e) => {
+                    // Cancellation dominates constructor aborts: re-derive the
+                    // typed error from the live checker state.
+                    cancel.check()?;
+                    return Err(
+                        ClefDecisionError::Bundle(format!("joint head validation: {e}")).into(),
+                    );
+                }
+            };
         cancel.check_load(6)?;
 
         // compute_profile reports the OBSERVED compute kind/device and the
@@ -1706,25 +1742,32 @@ mod tests {
             "fixture must have >=2 tensors for the mid-loop trip"
         );
 
-        // Observer that records the highest observed stage and trips the
-        // cancel flag at/after a chosen stage, BEFORE that stage's real
-        // flag/deadline check runs.
+        // Observer fixture: records the LAST observed stage and the numeric
+        // MAXIMUM, and trips the cancel flag at one EXACT checkpoint
+        // (equality, not a threshold: the 100/150 materialization stages
+        // interleave temporally — 150+index of tensor 0 runs before 100+
+        // of tensor 1 — so a `>=` predicate would fire at whichever
+        // higher-numbered stage comes next, not the intended checkpoint).
+        // Stage numbering is a namespace, not a timeline.
         let trip_at = |stage: usize| {
             let flag = Arc::new(AtomicBool::new(false));
-            let max_stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let last = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let max = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let cancel = DecisionCancel::new(Arc::clone(&flag), None).with_load_observer(
                 DecisionLoadObserver::new({
                     let flag = Arc::clone(&flag);
-                    let max_stage = Arc::clone(&max_stage);
+                    let last = Arc::clone(&last);
+                    let max = Arc::clone(&max);
                     Arc::new(move |seen| {
-                        max_stage.fetch_max(seen, Ordering::SeqCst);
-                        if seen >= stage {
+                        last.store(seen, Ordering::SeqCst);
+                        max.fetch_max(seen, Ordering::SeqCst);
+                        if seen == stage {
                             flag.store(true, Ordering::Release);
                         }
                     })
                 }),
             );
-            (cancel, max_stage)
+            (cancel, last, max)
         };
         let load_err = |cancel: &DecisionCancel| match ClefDecisionRuntime::load(
             dir.path(),
@@ -1738,44 +1781,66 @@ mod tests {
         };
 
         // Entry trip: the first stage check aborts before any bundle work.
-        let (cancel, max_stage) = trip_at(1);
+        let (cancel, last, max) = trip_at(1);
         let err = load_err(&cancel);
         assert!(err.starts_with("clef-decision-cancelled"), "{err}");
-        assert_eq!(max_stage.load(Ordering::SeqCst), 1);
+        assert_eq!(last.load(Ordering::SeqCst), 1);
+        assert_eq!(max.load(Ordering::SeqCst), 1);
 
         // Trip after metadata admission (stage 5): the per-tensor
-        // materialization (100+) and digest stages (200+/300+) never run —
-        // the load provably stops mid-flight instead of completing and
+        // materialization (100+/150+) and digest stages (200+/300+) never
+        // run — the load provably stops mid-flight instead of completing and
         // handing its caller a cached runtime.
-        let (cancel, max_stage) = trip_at(5);
+        let (cancel, last, max) = trip_at(5);
         let err = load_err(&cancel);
         assert!(err.starts_with("clef-decision-cancelled"), "{err}");
+        assert_eq!(last.load(Ordering::SeqCst), 5);
         assert_eq!(
-            max_stage.load(Ordering::SeqCst),
+            max.load(Ordering::SeqCst),
             5,
             "no stage after admission may run"
         );
 
-        // Trip inside the materialization loop (second tensor's check): the
-        // remaining tensors are never admitted.
-        let (cancel, max_stage) = trip_at(101);
+        // Trip inside the materialization loop at the SECOND tensor's
+        // pre-copy check (exact stage 101): tensor 0 fully materialized
+        // (100 then 150 observed — that is the numeric max), and the load
+        // aborts before tensor 1's copy. No validation stage (1000+) is
+        // ever reached.
+        let (cancel, last, max) = trip_at(101);
         let err = load_err(&cancel);
         assert!(err.starts_with("clef-decision-cancelled"), "{err}");
         assert_eq!(
-            max_stage.load(Ordering::SeqCst),
+            last.load(Ordering::SeqCst),
             101,
-            "materialization must stop at the second tensor"
+            "abort lands exactly on tensor 1's pre-copy check"
+        );
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            150,
+            "tensor 0's conversion (150) ran; nothing later numerically"
         );
 
         // A healthy retry on the same bundle succeeds and observes the
-        // digest-chunk stages plus the final checkpoint (the tokenizer file
-        // digest fires stage 300 on its single chunk).
-        let (cancel, max_stage) = trip_at(usize::MAX); // never trips
+        // materialization, validation (1000+index: before each finite-value
+        // scan), and digest-chunk stage families through to the final
+        // checkpoint. The LAST stage is 7; the numeric MAX is the last
+        // validation check (1000+index) because 1000+ numerically dominates
+        // the later-running digest families (200+/300+) — numbering is a
+        // namespace, not a timeline.
+        let tensor_count = weights.len();
+        let (cancel, last, max) = trip_at(usize::MAX); // never equal: never trips
         ClefDecisionRuntime::load(dir.path(), Some(8), Some(Kind::Float), None, &cancel)
             .expect("healthy retry loads the same bundle");
-        // Tokenizer digest observes its sole data chunk and the terminating
-        // EOF check (300, 301).
-        assert_eq!(max_stage.load(Ordering::SeqCst), 301);
+        assert_eq!(
+            last.load(Ordering::SeqCst),
+            7,
+            "the final checkpoint (7) is the last observed stage"
+        );
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            1000 + tensor_count - 1,
+            "per-tensor validation is the numerically highest stage family"
+        );
     }
 
     // ── T5b: tiny native end-to-end decide() through a REAL engine ─────────

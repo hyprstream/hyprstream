@@ -14,8 +14,9 @@
 //! - the pinned-artifact requirement for decision serving and the immutable
 //!   provenance assembly (commit OID + content digests, never names/echoes);
 //! - the versioned question-schema identity (a content hash over the
-//!   canonical question set EXCLUDING state, so label/type/instruction
-//!   changes change identity while state-only changes do not);
+//!   canonical question set EXCLUDING state, so label/type/instruction and
+//!   authored choice-order changes change identity while state-only changes
+//!   do not);
 //! - the RESOLVED versioned model id for `DecisionBatch.version.model`
 //!   (authorized ref @ pinned commit — never a bare branch alias);
 //! - IR answer assembly and E2 `decision.capnp` marshalling
@@ -267,6 +268,18 @@ fn hash_question_schema(hasher: &mut Sha256, question: &ClefQuestion) {
                     hash_field(hasher, id.as_bytes());
                     hash_field(hasher, clef_render(v).as_bytes());
                 }
+            }
+            // The model sees sorted labels, but the E2 AnswerValue vector is
+            // unlabeled and its positions follow the authored spec order.
+            // Bind that order into the schema identity so two requests with
+            // the same label set but different vector-index meanings cannot
+            // share an identity.
+            hash_field(
+                hasher,
+                &(question.authored_choice_order.len() as u64).to_le_bytes(),
+            );
+            for id in &question.authored_choice_order {
+                hash_field(hasher, id.as_bytes());
             }
         }
         ClefQuestionType::Score => {
@@ -571,14 +584,15 @@ mod tests {
         );
         assert_ne!(identity, question_schema_identity(&reordered));
 
-        // Choice label order in the AUTHOR body does not change identity
-        // (canonical sorted rendering), but descriptions do.
+        // Reordering choice labels leaves model/prompt order canonical, but
+        // changes E2's unlabeled vector positions and therefore the schema
+        // identity.
         let reordered_criteria = parsed(
             r#"{"model":"m","state":{"a":1},"questions":{
                 "z":{"type":"choice","criteria":{"a":"y","b":"x"}},
                 "n":{"type":"noul","instructions":"Ask"},"q2":{"type":"score","criteria":["lo","hi"]}}}"#,
         );
-        assert_eq!(identity, question_schema_identity(&reordered_criteria));
+        assert_ne!(identity, question_schema_identity(&reordered_criteria));
     }
 
     #[test]
