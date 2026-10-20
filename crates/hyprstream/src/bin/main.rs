@@ -3262,9 +3262,8 @@ fn main() -> Result<()> {
         if let Some(("provision-policy-templates", provision_m)) = sub_m.subcommand() {
             let templates = provision_m
                 .get_many::<String>("template")
-                .context("at least one policy template is required")?
-                .cloned()
-                .collect::<Vec<_>>();
+                .map(|values| values.cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
             let models_dir = config.models_dir().clone();
             return with_runtime(
                 RuntimeConfig {
@@ -4770,7 +4769,7 @@ mod resolver_startup_controls {
     use clap::FromArgMatches as _;
 
     #[test]
-    fn offline_policy_provision_cli_requires_and_preserves_templates() {
+    fn offline_policy_provision_cli_accepts_optional_and_preserves_templates() {
         let matches = super::build_cli()
             .try_get_matches_from([
                 "hyprstream",
@@ -4791,9 +4790,18 @@ mod resolver_startup_controls {
             panic!("wrong service action");
         };
         assert_eq!(template, ["public-inference", "public-read"]);
-        assert!(super::build_cli()
-            .try_get_matches_from(["hyprstream", "service", "provision-policy-templates",])
-            .is_err());
+        let matches = super::build_cli()
+            .try_get_matches_from(["hyprstream", "service", "provision-policy-templates"])
+            .expect("configured model owner can provision without templates");
+        let service = matches.subcommand_matches("service").expect("service");
+        let action = hyprstream_core::cli::commands::ServiceAction::from_arg_matches(service)
+            .expect("service action");
+        let hyprstream_core::cli::commands::ServiceAction::ProvisionPolicyTemplates { template } =
+            action
+        else {
+            panic!("wrong service action");
+        };
+        assert!(template.is_empty());
     }
 
     #[test]

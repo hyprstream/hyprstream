@@ -319,7 +319,7 @@ pub enum ServiceAction {
     /// Policy or Registry starts. It does not contact a service or load credentials.
     ProvisionPolicyTemplates {
         /// Built-in template name; repeat for each template to provision
-        #[arg(long, required = true, action = clap::ArgAction::Append)]
+        #[arg(long, action = clap::ArgAction::Append)]
         template: Vec<String>,
     },
 }
