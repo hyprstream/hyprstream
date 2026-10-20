@@ -1356,6 +1356,12 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "schema":"clef-t6-authenticated-cpu-service/1", "result":"AUTHENTICATED_CPU_SERVICE_CASES_PASS",
         "t6_complete":true, "remaining":[],
         "artifact_commit":T6_PIN,"artifact_tree":T6_TREE,"model_ref":T6_MODEL,
+        "source_identity":{
+            "git_sha":env!("GIT_SHA"),
+            "git_dirty":env!("GIT_DIRTY"),
+            "build_version":env!("BUILD_VERSION"),
+            "acceptance_source_sha256":t6_sha(include_bytes!("model_clef_cpu_acceptance.rs"))
+        },
         "model_checkout":checkout,"records_sha256":T6_RECORDS_SHA,
         "expected_fp8_json_sha256":t6_sha(T6_EXPECTED_JSON.as_bytes()),
         "hydration_mapping_canonical_json_sha256":t6_sha(&mapping_bytes),"threads":4,

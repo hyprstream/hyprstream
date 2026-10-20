@@ -129,6 +129,7 @@ jobs:
             chown -R ci:ci /build
             runuser -u ci -- cargo fmt --all -- --check
             runuser -u ci -- python3 -B -m unittest discover -s scripts/tests -p test_pr_affected.py
+            runuser -u ci -- python3 -B -m unittest discover -s scripts/tests -p test_clef_cpu_receipt.py
             runuser -u ci -- python3 -B .github/scripts/pr_affected.py
             if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
               runuser -u ci -- cargo clippy --all-targets -- -D warnings
