@@ -170,7 +170,7 @@ impl RestartAuthServices {
                 "bob",
                 T6_TENANT,
                 "model:clef-flash-fp8:main",
-                "infer",
+                "decide",
                 "allow",
             )
             .await?;
@@ -179,7 +179,7 @@ impl RestartAuthServices {
                 "alice",
                 T6_TENANT,
                 "model:clef-flash-fp8:main",
-                "infer",
+                "decide",
                 "allow",
             )
             .await?;
@@ -188,7 +188,7 @@ impl RestartAuthServices {
                 "eve",
                 T6_TENANT,
                 "model:clef-flash-fp8:main",
-                "infer",
+                "decide",
                 "deny",
             )
             .await?;
@@ -197,7 +197,7 @@ impl RestartAuthServices {
                 "alice",
                 T6_FOREIGN_TENANT,
                 "model:clef-flash-fp8:main",
-                "infer",
+                "decide",
                 "deny",
             )
             .await?;
@@ -521,7 +521,7 @@ async fn t6_assert_order(
     )?;
     anyhow::ensure!(claims.sub == subject && claims.caller.sub == subject);
     anyhow::ensure!(claims.tenant == T6_TENANT && claims.model == T6_MODEL);
-    anyhow::ensure!(claims.resource == "inference:Decide" && claims.operation == "infer");
+    anyhow::ensure!(claims.resource == "inference:Decide" && claims.operation == "decide");
     anyhow::ensure!(
         claims.caller.tenant.as_deref() == Some(T6_TENANT),
         "original caller tenant changed"
@@ -562,7 +562,7 @@ async fn t6_assert_order(
         "original holder DID lost"
     );
     // Never serialize the order, JWT, jti, key material or full claims.
-    Ok(json!({"verified":true,"coordinate":"inference:Decide/infer", "incarnation":incarnation}))
+    Ok(json!({"verified":true,"coordinate":"inference:Decide/decide", "incarnation":incarnation}))
 }
 fn t6_progress(step: &'static str, elapsed_ms: u128, details: Value) -> Result<()> {
     anyhow::ensure!(

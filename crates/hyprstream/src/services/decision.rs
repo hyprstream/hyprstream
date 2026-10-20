@@ -153,6 +153,19 @@ pub fn resolve_deadline(data: &DecisionRequest, now: Instant) -> Option<Instant>
     Some(now + Duration::from_millis(ms))
 }
 
+/// Return the remaining wire timeout for a request admitted at Model ingress.
+/// The relative timeout sent to Inference must account for time spent loading
+/// and routing the model, rather than starting the caller's full budget again.
+pub fn remaining_timeout_ms(deadline: Instant, now: Instant) -> Result<u32, DecisionServeError> {
+    let remaining_ms = deadline.saturating_duration_since(now).as_millis();
+    if remaining_ms == 0 {
+        return Err(DecisionServeError::Clef(ClefDecisionError::Cancelled(
+            "decision deadline elapsed before inference dispatch".to_owned(),
+        )));
+    }
+    Ok(u32::try_from(remaining_ms).unwrap_or(u32::MAX))
+}
+
 /// Effective total sequence budget: min(reference default, engine context).
 pub fn resolve_max_length(engine_context_length: u32) -> usize {
     DEFAULT_CLEF_MAX_LENGTH.min(engine_context_length as usize)
@@ -425,6 +438,34 @@ mod tests {
 
     use super::*;
     use hyprstream_rpc_std::inference_client::DecisionRequest as WireDecisionRequest;
+
+    #[test]
+    fn remaining_timeout_ms_decreases_and_expires_at_ingress_deadline() {
+        let start = Instant::now();
+        let request = WireDecisionRequest {
+            clef_json: String::new(),
+            max_state_tokens: None,
+            timeout_ms: Some(1_000),
+        };
+        let deadline = resolve_deadline(&request, start).expect("decision deadline is bounded");
+
+        assert_eq!(remaining_timeout_ms(deadline, start).unwrap(), 1_000);
+        assert_eq!(
+            remaining_timeout_ms(deadline, start + Duration::from_millis(375)).unwrap(),
+            625
+        );
+        let err = remaining_timeout_ms(deadline, deadline).unwrap_err();
+        assert!(err.to_string().contains("clef-decision-cancelled"));
+
+        let zero_timeout = WireDecisionRequest {
+            clef_json: String::new(),
+            max_state_tokens: None,
+            timeout_ms: Some(0),
+        };
+        let zero_deadline = resolve_deadline(&zero_timeout, start).expect("bounded deadline");
+        let err = remaining_timeout_ms(zero_deadline, start).unwrap_err();
+        assert!(err.to_string().contains("clef-decision-cancelled"));
+    }
 
     fn parsed(body: &str) -> ClefRequest {
         let wire = WireDecisionRequest {

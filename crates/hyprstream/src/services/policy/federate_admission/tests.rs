@@ -1831,7 +1831,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
         profile.scopes()
     );
     let resource = format!("model:{}", profile.model_ref());
-    let scope = format!("infer:{resource}");
+    let scope = format!("decide:{resource}");
     {
         let authority = service.authority.as_mut().unwrap();
         authority.profile.client_scopes = profile.scopes();
@@ -1840,7 +1840,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
         // than a missing rule, must reject cross-profile issuance and use.
         authority
             .policy
-            .add_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "allow")
+            .add_policy_with_domain(ATPROTO_DID, "tenant", &resource, "decide", "allow")
             .await
             .unwrap();
         authority
@@ -1860,7 +1860,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
     for scope in [
         STAGING_SCOPE,
         REGISTRY_LIST_SCOPE,
-        "infer:model:clef-flash-fp8:other",
+        "decide:model:clef-flash-fp8:other",
     ] {
         assert!(service
             .prepare(&ctx, &source_record, &[scope.into()])
@@ -1876,7 +1876,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
             &source_record.issuer,
             &source_record.atproto_did,
             &resource,
-            "infer",
+            "decide",
             now,
         )
         .await
@@ -1906,7 +1906,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
             &source_record.issuer,
             &source_record.atproto_did,
             &resource,
-            "infer",
+            "decide",
             now
         )
         .await
@@ -1917,14 +1917,14 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
             &source_record.issuer,
             "did:plc:wrongholder",
             &resource,
-            "infer",
+            "decide",
             now
         )
         .await
         .is_err());
     assert!(authority
         .policy
-        .remove_policy_with_domain(ATPROTO_DID, "tenant", &resource, "infer", "allow")
+        .remove_policy_with_domain(ATPROTO_DID, "tenant", &resource, "decide", "allow")
         .await
         .unwrap());
     assert!(
@@ -1934,7 +1934,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
                 &source_record.issuer,
                 &source_record.atproto_did,
                 &resource,
-                "infer",
+                "decide",
                 now
             )
             .await

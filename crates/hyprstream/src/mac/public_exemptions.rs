@@ -17,8 +17,8 @@
 //!    ([`crate::mac`] is fail-closed per #547); "public" is an opt-in,
 //!    reviewed exemption, never a default.
 //! 2. **The public routers are built from this registry.** [`crate::server`]
-//!    and [`crate::services::at9p_verify`] construct their public route sets by
-//!    iterating [`PUBLIC_EXEMPTIONS`] for their face, so adding an unmediated
+//!    constructs its public route set by
+//!    iterating [`PUBLIC_EXEMPTIONS`] for its face, so adding an unmediated
 //!    route requires adding a reviewed [`PublicExemption`] entry plus a handler
 //!    arm — two review surfaces, no silent addition.
 //! 3. **The drift test pins the live set to the registry.**
@@ -28,8 +28,8 @@
 //!
 //! # Scope and dependencies
 //! This registry covers genuinely no-auth public routes: health metadata,
-//! `.well-known` discovery, pre-credential browser provisioning, and the
-//! stateless at9p verification face. OAuth2.1 protocol endpoints (token,
+//! `.well-known` discovery, and pre-credential browser provisioning.
+//! OAuth2.1 protocol endpoints (token,
 //! authorize, jwks, device, SCIM …) are the *credential-issuance control
 //! plane* that MAC sits beneath, not tenant-object access; they remain out of
 //! scope here and are tracked separately. Real MAC enforcement remains dormant
@@ -75,9 +75,6 @@ pub enum ExemptionCategory {
 pub enum HttpFace {
     /// The main Axum app ([`crate::server::create_app`]).
     MainApp,
-    /// The standalone credential-free at9p verification face
-    /// ([`crate::services::at9p_verify`]).
-    At9pVerify,
 }
 
 /// Tag identifying which handler serves an exempt route. The public-router
@@ -98,8 +95,6 @@ pub enum PublicRouteHandler {
     NinepWebSocket,
     /// `GET /.well-known/hyprstream/browser-provisioning/:service` — bootstrap.
     BrowserProvisioning,
-    /// `POST /at9p/verify` — stateless login-assertion verification (own face).
-    At9pVerify,
 }
 
 /// One reviewed public/declassifier exemption. Every field is `&'static` so the
@@ -196,15 +191,6 @@ pub static PUBLIC_EXEMPTIONS: &[PublicExemption] = &[
         handler: PublicRouteHandler::BrowserProvisioning,
         justification: "Pre-credential browser bootstrap before any identity exists; independently rate-limited, carries no tenant object.",
     },
-    PublicExemption {
-        id: "at9p-verify",
-        face: HttpFace::At9pVerify,
-        method: RouteMethod::Post,
-        path: "/at9p/verify",
-        category: ExemptionCategory::CryptographicVerification,
-        handler: PublicRouteHandler::At9pVerify,
-        justification: "Stateless login-assertion verification on a credential-free face; returns only verified/did/assurance, never echoes attacker bytes past the check.",
-    },
 ];
 
 impl PublicExemption {
@@ -289,8 +275,8 @@ pub fn validate() -> Result<(), RegistryError> {
     Ok(())
 }
 
-/// `true` if `handler` is wired by the builder that owns `face`. Keeps the
-/// at9p-verify handler from leaking into the main-app builder (or vice versa).
+/// `true` if `handler` is wired by the builder that owns `face`. Keeps a
+/// face's handler from leaking into another face's builder.
 pub(crate) const fn handler_belongs_to_face(handler: PublicRouteHandler, face: HttpFace) -> bool {
     match face {
         HttpFace::MainApp => matches!(
@@ -302,7 +288,6 @@ pub(crate) const fn handler_belongs_to_face(handler: PublicRouteHandler, face: H
                 | PublicRouteHandler::NinepWebSocket
                 | PublicRouteHandler::BrowserProvisioning
         ),
-        HttpFace::At9pVerify => matches!(handler, PublicRouteHandler::At9pVerify),
     }
 }
 
@@ -330,7 +315,6 @@ mod tests {
             PublicRouteHandler::WirePlanesMetadata,
             PublicRouteHandler::NinepWebSocket,
             PublicRouteHandler::BrowserProvisioning,
-            PublicRouteHandler::At9pVerify,
         ];
         for h in all {
             let referenced = PUBLIC_EXEMPTIONS.iter().any(|e| e.handler == h);
@@ -372,45 +356,11 @@ mod tests {
         );
     }
 
-    /// The at9p-verify face owns exactly its single verification route.
-    #[test]
-    fn at9p_verify_face_snapshot_is_pinned() {
-        let verify: Vec<(&'static str, RouteMethod, &'static str)> = for_face(HttpFace::At9pVerify)
-            .map(|e| (e.id, e.method, e.path))
-            .collect();
-        let expected = [("at9p-verify", RouteMethod::Post, "/at9p/verify")];
-        assert_eq!(
-            verify, expected,
-            "at9p-verify public face drifted from the reviewed snapshot"
-        );
-    }
-
-    /// The two faces are disjoint: no route id or (method, path) is claimed by
-    /// both faces — a route is owned by exactly one reviewed exemption.
-    #[test]
-    fn faces_are_disjoint() {
-        let main: std::collections::HashSet<_> = for_face(HttpFace::MainApp)
-            .map(|e| (e.method, e.path))
-            .collect();
-        let verify: std::collections::HashSet<_> = for_face(HttpFace::At9pVerify)
-            .map(|e| (e.method, e.path))
-            .collect();
-        let overlap: Vec<_> = main.intersection(&verify).collect();
-        assert!(
-            overlap.is_empty(),
-            "faces overlap on routes {overlap:?}; each route belongs to exactly one face"
-        );
-    }
-
     /// `require` must resolve every id the builders reference, and reject an
     /// unregistered id — the startup gate that blocks an unregistered route.
     #[test]
     fn require_resolves_registered_and_rejects_unknown() {
         assert_eq!(require(HttpFace::MainApp, "health").path, "/health");
-        assert_eq!(
-            require(HttpFace::At9pVerify, "at9p-verify").path,
-            "/at9p/verify"
-        );
     }
 
     #[test]
