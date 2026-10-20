@@ -42,14 +42,21 @@ class ReceiptProvenanceTests(unittest.TestCase):
                                 "acceptance_source_sha256": identity["acceptance_source_sha256"]},
             "result": "AUTHENTICATED_CPU_SERVICE_CASES_PASS", "t6_complete": True,
             "model_service_stop_complete": True,
+            "configured_owner_subject": "did:plc:configuredowner",
+            "configured_owner_authenticated": True, "unconfigured_owner_denied": True,
+            "startup_profile": {"config_sha256": "a" * 64, "manifest_sha256": "b" * 64},
             "corpus_records": 5, "corpus_questions": 11,
             "orders": json.loads((SCRIPTS / "tests/fixtures/clef_cpu_order_summary.json").read_text())["orders"],
         }
 
+        for index, order in enumerate(self.receipt["orders"]):
+            order["subject"] = "bob" if index == 6 else "did:plc:configuredowner"
         self.receipt["source_identity"]["executable_sha256"] = self.build["executable_sha256"]
-        self.run_result = {"candidate": COMMIT, "executable_sha256": self.build["executable_sha256"],
+        self.run_result = {"configured_owner_subject": "did:plc:configuredowner", "candidate": COMMIT, "executable_sha256": self.build["executable_sha256"],
                            "exit": 0, "controller_exit": 0, "native_samples": 1,
-                           "peak_native_swap_kib": 0, "peak_group_swap_kib": 0}
+                           "peak_native_swap_kib": 0, "peak_group_swap_kib": 0,
+                           "config_sha256": "a" * 64, "manifest_sha256": "b" * 64,
+                           "config_unchanged_after": True, "manifest_unchanged_after": True}
 
     def run_validator(self):
         def git(command, **kwargs):
@@ -130,6 +137,38 @@ class ReceiptProvenanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "lacks native/group observations"):
                     self.run_validator()
                 self.run_result[field] = original
+
+    def test_selected_config_or_manifest_mismatch_is_rejected(self):
+        for field in ["config_sha256", "manifest_sha256"]:
+            with self.subTest(field=field):
+                original = self.run_result[field]
+                self.run_result[field] = "c" * 64
+                with self.assertRaisesRegex(ValueError, "selected config/manifest does not match"):
+                    self.run_validator()
+                self.run_result[field] = original
+
+    def test_selected_config_or_manifest_replacement_is_rejected(self):
+        for field in ["config_unchanged_after", "manifest_unchanged_after"]:
+            with self.subTest(field=field):
+                self.run_result[field] = False
+                with self.assertRaisesRegex(ValueError, "changed during execution"):
+                    self.run_validator()
+                self.run_result[field] = True
+
+    def test_configured_owner_mismatch_or_unproven_other_did_denial_is_rejected(self):
+        for field, value in [("configured_owner_subject", "did:plc:otherowner"),
+                             ("configured_owner_authenticated", False), ("unconfigured_owner_denied", False)]:
+            with self.subTest(field=field):
+                original = self.receipt[field]
+                self.receipt[field] = value
+                with self.assertRaisesRegex(ValueError, "configured owner was not authenticated"):
+                    self.run_validator()
+                self.receipt[field] = original
+
+    def test_old_literal_primary_subject_is_rejected(self):
+        self.receipt["orders"][0]["subject"] = "alice"
+        with self.assertRaisesRegex(ValueError, "work-order subjects do not bind"):
+            self.run_validator()
 
     def test_changed_executable_is_rejected(self):
         Path(self.build["executable"]).write_bytes(b"overwritten shared target")

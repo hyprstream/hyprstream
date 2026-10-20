@@ -206,6 +206,38 @@ fn canonical_rpc_schemas_are_consumable_by_typescript() {
         "canonical schema TypeScript generation failed"
     );
 
+    // A fresh process has a fresh randomized HashSet seed. Regenerate the same
+    // immutable CGRs and compare every emitted file before fixture augmentation.
+    let repeated_output = root.join("generated-repeat");
+    let status = Command::new(codegen_binary())
+        .arg("--input-dir")
+        .arg(&cgr_dir)
+        .arg("--output-dir")
+        .arg(&repeated_output)
+        .status()
+        .expect("repeat generator in an independent process");
+    assert!(status.success(), "repeated canonical generation failed");
+    let emitted = |directory: &Path| {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(directory).expect("list generated SDK") {
+            let entry = entry.expect("generated SDK entry");
+            assert!(entry
+                .file_type()
+                .expect("generated SDK file type")
+                .is_file());
+            files.insert(
+                entry.file_name(),
+                fs::read(entry.path()).expect("SDK file bytes"),
+            );
+        }
+        files
+    };
+    assert_eq!(
+        emitted(&output_dir),
+        emitted(&repeated_output),
+        "separate generator processes must emit byte-identical SDKs"
+    );
+
     // Only the rebuilt production binary emits actual ModelClient/RegistryClient
     // and their shared runtime. Test-only response builders reuse those exact
     // emitter sources after canonical extraction, with service classification

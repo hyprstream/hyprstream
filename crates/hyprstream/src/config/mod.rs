@@ -5,6 +5,7 @@
 //! - `ServerConfig`: HTTP server configuration (network, CORS, TLS)
 //! - Model and runtime configs for ML inference
 
+pub mod model_admission;
 pub mod server;
 
 // Re-export main configuration types
@@ -94,6 +95,10 @@ pub struct HyprConfig {
     /// Model configuration
     #[serde(default)]
     pub model: ModelConfig,
+
+    /// Protected selection for one deployed native model and exact owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_admission: Option<model_admission::ModelAdmissionConfig>,
 
     /// Standalone CPU inference service configuration (#1236/#1247).
     #[serde(default)]
@@ -2457,6 +2462,7 @@ impl Default for LoraAppConfig {
 pub struct HyprConfigBuilder {
     server_builder: ServerConfigBuilder,
     model: ModelConfig,
+    model_admission: Option<model_admission::ModelAdmissionConfig>,
     inference: InferenceServerConfig,
     runtime: RuntimeConfig,
     generation: GenerationConfig,
@@ -2492,6 +2498,7 @@ impl HyprConfigBuilder {
         Self {
             server_builder: ServerConfigBuilder::new(),
             model: ModelConfig::default(),
+            model_admission: None,
             inference: InferenceServerConfig::default(),
             runtime: RuntimeConfig::default(),
             generation: GenerationConfig::default(),
@@ -2527,6 +2534,7 @@ impl HyprConfigBuilder {
         Self {
             server_builder: config.server.to_builder(),
             model: config.model,
+            model_admission: config.model_admission,
             inference: config.inference,
             runtime: config.runtime,
             generation: config.generation,
@@ -2574,6 +2582,7 @@ impl HyprConfigBuilder {
         HyprConfig {
             server: self.server_builder.build(),
             model: self.model,
+            model_admission: self.model_admission,
             inference: self.inference,
             runtime: self.runtime,
             generation: self.generation,
@@ -2710,6 +2719,25 @@ impl HyprConfig {
         Ok(config)
     }
 
+    /// All native services consume this captured selection from the startup snapshot.
+    pub(crate) fn selected_model_admission(
+        &self,
+    ) -> anyhow::Result<Option<&model_admission::ValidatedModelAdmission>> {
+        for key in [
+            "HYPRSTREAM_MODEL_ADMISSION_PROFILE",
+            "HYPRSTREAM_STAGING_MODEL_REF",
+            "HYPRSTREAM_STAGING_MODEL_OID",
+            "HYPRSTREAM_CLEF_LFS_DIRECTORY",
+        ] {
+            anyhow::ensure!(std::env::var_os(key).is_none(),
+                "legacy {key} selector requires migration to protected [model_admission] configuration");
+        }
+        self.model_admission
+            .as_ref()
+            .map(model_admission::ModelAdmissionConfig::validated)
+            .transpose()
+    }
+
     /// Save configuration to file
     pub fn to_file(&self, path: &Path) -> anyhow::Result<()> {
         let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("toml");
@@ -2726,6 +2754,7 @@ impl HyprConfig {
 
     /// Validate the entire configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.selected_model_admission()?;
         // #1652: name-keyed native admission policy must reference real
         // factory services. Checked before anything else so a stale
         // DID-valued event publisher list fails at startup, not as silent

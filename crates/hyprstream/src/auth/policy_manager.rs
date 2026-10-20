@@ -247,7 +247,7 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
 /// - Wildcards for domain and action
 /// - Global-service role access via g() in the explicit `*` domain
 /// - Tenant-scoped role access via g2()
-const DEFAULT_MODEL_CONF: &str = r#"[request_definition]
+pub(crate) const DEFAULT_MODEL_CONF: &str = r#"[request_definition]
 r = sub, dom, obj, act
 
 [policy_definition]

@@ -829,7 +829,7 @@ async fn configured_host_policy_admits_only_its_exact_issuer_and_resource() {
             authority.collision_inventory,
             None,
             crate::services::oauth::federate_source::FederateHost::new(local).unwrap(),
-            crate::services::model::FederateModelProfile::Qwen,
+            crate::services::model::FederateModelProfile::qwen_fixture(),
         );
         let authority = service.authority.as_ref().unwrap();
         assert_eq!(authority.profile.host, local);
@@ -1813,7 +1813,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
 #[tokio::test]
 async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary() {
     let (mut service, ctx) = fixture().await;
-    let profile = crate::services::model::FederateModelProfile::Clef;
+    let profile = crate::services::model::FederateModelProfile::clef_fixture();
     let (mut configured_fixture, _) = fixture().await;
     let prior = configured_fixture.authority.take().unwrap();
     let configured = AdmissionService::configured(
@@ -1822,7 +1822,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
         prior.collision_inventory,
         None,
         crate::services::oauth::federate_source::FederateHost::new("https://clef.example").unwrap(),
-        profile,
+        profile.clone(),
     );
     let configured_authority = configured.authority.as_ref().unwrap();
     assert_eq!(configured_authority.profile.client_scopes, profile.scopes());

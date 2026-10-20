@@ -1,74 +1,64 @@
-//! One closed, server-owned Federate model capability. This is a scope ceiling,
-//! not a credential, model activation, filesystem permission or browser option.
-use super::{
-    clef_profile, StagingModelPin, REVIEWED_STAGING_MODEL_OID, REVIEWED_STAGING_MODEL_REF,
-};
+//! Exact selected-model scope ceiling, derived from protected startup config.
+use crate::config::model_admission::{ModelOperation, ValidatedModelAdmission};
 use anyhow::Result;
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FederateModelProfile {
-    Qwen,
-    Clef,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FederateModelProfile {
+    model_ref: String,
+    commit: String,
+    repository_name: String,
+    operation: ModelOperation,
 }
 impl FederateModelProfile {
-    pub(crate) fn model_ref(self) -> &'static str {
-        match self {
-            Self::Qwen => REVIEWED_STAGING_MODEL_REF,
-            Self::Clef => clef_profile::MODEL_REF,
+    pub(crate) fn from_admission(admission: &ValidatedModelAdmission) -> Self {
+        Self {
+            model_ref: admission.model_ref.clone(),
+            commit: admission.commit.to_string(),
+            repository_name: admission.repository_name.clone(),
+            operation: admission.operation,
         }
     }
-    pub(crate) fn commit(self) -> &'static str {
-        match self {
-            Self::Qwen => REVIEWED_STAGING_MODEL_OID,
-            Self::Clef => clef_profile::COMMIT,
-        }
+    pub(crate) fn from_config(config: &crate::config::HyprConfig) -> Result<Option<Self>> {
+        Ok(config.selected_model_admission()?.map(Self::from_admission))
     }
-    pub(crate) fn repo_name(self) -> &'static str {
-        match self {
-            Self::Qwen => StagingModelPin::reviewed_repo_name(),
-            Self::Clef => "clef-flash-fp8",
-        }
+    pub(crate) fn model_ref(&self) -> &str {
+        &self.model_ref
     }
-    pub(crate) fn scopes(self) -> BTreeSet<String> {
-        let inference_action = match self {
-            Self::Qwen => "infer",
-            Self::Clef => "decide",
-        };
+    pub(crate) fn commit(&self) -> &str {
+        &self.commit
+    }
+    pub(crate) fn repo_name(&self) -> &str {
+        &self.repository_name
+    }
+    pub(crate) fn operation(&self) -> ModelOperation {
+        self.operation
+    }
+    pub(crate) fn scopes(&self) -> BTreeSet<String> {
         BTreeSet::from([
-            format!("{inference_action}:model:{}", self.model_ref()),
-            "query:model:Status".to_owned(),
-            format!("query:registry:{}", self.repo_name()),
-            "write:model:Load".to_owned(),
+            format!("{}:model:{}", self.operation.action(), self.model_ref),
+            "query:model:Status".into(),
+            format!("query:registry:{}", self.repository_name),
+            "write:model:Load".into(),
         ])
     }
-    /// Policy needs the trusted selector and fixed identity, never the model
-    /// payload/cache or inference compute permissions. Model/Registry separately
-    /// require the startup-qualified StagingModelPin marker for actual use.
-    pub(crate) fn from_env() -> Result<Self> {
-        fn optional(name: &str) -> Result<Option<String>> {
-            match std::env::var(name) {
-                Ok(value) => Ok(Some(value)),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(error) => Err(anyhow::anyhow!("read {name}: {error}")),
-            }
+    #[cfg(test)]
+    pub(crate) fn qwen_fixture() -> Self {
+        Self {
+            model_ref: super::REVIEWED_STAGING_MODEL_REF.into(),
+            commit: super::REVIEWED_STAGING_MODEL_OID.into(),
+            repository_name: super::StagingModelPin::reviewed_repo_name().into(),
+            operation: ModelOperation::Generation,
         }
-        let profile =
-            optional("HYPRSTREAM_MODEL_ADMISSION_PROFILE")?.unwrap_or_else(|| "default".to_owned());
-        let model_ref = optional("HYPRSTREAM_STAGING_MODEL_REF")?;
-        let oid = optional("HYPRSTREAM_STAGING_MODEL_OID")?;
-        Self::from_settings(&profile, model_ref.as_deref(), oid.as_deref())
     }
-    fn from_settings(profile: &str, model_ref: Option<&str>, oid: Option<&str>) -> Result<Self> {
-        if profile == clef_profile::PROFILE {
-            StagingModelPin::validate_clef_overrides(model_ref, oid)?;
-            return Ok(Self::Clef);
+    #[cfg(test)]
+    pub(crate) fn clef_fixture() -> Self {
+        Self {
+            model_ref: super::clef_profile::MODEL_REF.into(),
+            commit: super::clef_profile::COMMIT.into(),
+            repository_name: "clef-flash-fp8".into(),
+            operation: ModelOperation::Decisions,
         }
-        // Preserve existing default/staging configuration validation and Qwen
-        // ceiling. An arbitrary custom default pin still gains NO Federate
-        // capability: the serving recognizers reject its absent marker.
-        let _ = StagingModelPin::from_settings(profile, model_ref, oid)?;
-        Ok(Self::Qwen)
     }
 }
 
@@ -76,63 +66,26 @@ impl FederateModelProfile {
 mod tests {
     use super::*;
     #[test]
-    fn closed_scope_selection_preserves_default_and_rejects_cross_profile_overrides() -> Result<()>
-    {
-        for name in ["default", "staging"] {
-            assert_eq!(
-                FederateModelProfile::from_settings(name, None, None)?,
-                FederateModelProfile::Qwen
-            );
+    fn scope_ceiling_tracks_identity_and_closed_operation() {
+        for operation in [ModelOperation::Generation, ModelOperation::Decisions] {
+            for name in ["first:main", "second:main"] {
+                let profile = FederateModelProfile {
+                    model_ref: name.into(),
+                    commit: "a".repeat(40),
+                    repository_name: name.split(':').next().unwrap_or_default().into(),
+                    operation,
+                };
+                let scopes = profile.scopes();
+                assert_eq!(scopes.len(), 4);
+                assert!(scopes.contains(&format!("{}:model:{name}", operation.action())));
+                let other = if operation == ModelOperation::Decisions {
+                    "infer"
+                } else {
+                    "decide"
+                };
+                assert!(!scopes.contains(&format!("{other}:model:{name}")));
+                assert!(!scopes.contains("query:registry:List"));
+            }
         }
-        let qwen = FederateModelProfile::Qwen.scopes();
-        assert_eq!(
-            qwen,
-            BTreeSet::from([
-                "infer:model:qwen2.5-0.5b-instruct:main".to_owned(),
-                "query:model:Status".to_owned(),
-                "query:registry:qwen2.5-0.5b-instruct".to_owned(),
-                "write:model:Load".to_owned(),
-            ])
-        );
-        let clef = FederateModelProfile::from_settings(clef_profile::PROFILE, None, None)?;
-        assert_eq!(clef, FederateModelProfile::Clef);
-        assert_eq!(clef.scopes().len(), 4);
-        assert!(clef.scopes().contains("decide:model:clef-flash-fp8:main"));
-        assert!(!clef.scopes().contains("infer:model:clef-flash-fp8:main"));
-        assert!(!clef.scopes().contains("query:registry:List"));
-        assert!(!clef
-            .scopes()
-            .contains("infer:model:qwen2.5-0.5b-instruct:main"));
-        for (profile, name, oid) in [
-            ("unknown", None, None),
-            (
-                "staging",
-                Some(clef_profile::MODEL_REF),
-                Some(clef_profile::COMMIT),
-            ),
-            (
-                clef_profile::PROFILE,
-                Some(REVIEWED_STAGING_MODEL_REF),
-                Some(REVIEWED_STAGING_MODEL_OID),
-            ),
-            (
-                clef_profile::PROFILE,
-                Some("clef-flash-fp8:other"),
-                Some(clef_profile::COMMIT),
-            ),
-            (clef_profile::PROFILE, Some(clef_profile::MODEL_REF), None),
-            (clef_profile::PROFILE, None, Some(clef_profile::COMMIT)),
-        ] {
-            assert!(FederateModelProfile::from_settings(profile, name, oid).is_err());
-        }
-        assert_eq!(
-            FederateModelProfile::from_settings(
-                clef_profile::PROFILE,
-                Some(clef_profile::MODEL_REF),
-                Some(clef_profile::COMMIT)
-            )?,
-            clef
-        );
-        Ok(())
     }
 }

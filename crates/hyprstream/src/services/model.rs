@@ -61,6 +61,7 @@ use zeroize::Zeroizing;
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
 
+#[cfg(test)]
 mod clef_profile;
 #[cfg(feature = "postgres")]
 mod federate_profile;
@@ -182,6 +183,7 @@ pub struct StagingModelPin {
     pub model_ref: String,
     pub commit: git2::Oid,
     projection_policy: git2db::pinned_disk::ProjectionPolicy,
+    admission: Option<std::sync::Arc<crate::config::model_admission::ValidatedModelAdmission>>,
     // Never parsed from RPC. Clef is set only after explicit startup selection
     // validates the reviewed local artifact inventory; direct constructors do
     // not upgrade an arbitrary pin into a browser capability.
@@ -191,18 +193,27 @@ pub struct StagingModelPin {
     projection_parent: Option<std::path::PathBuf>,
 }
 
+#[cfg(test)]
 const REVIEWED_STAGING_MODEL_REF: &str = "qwen2.5-0.5b-instruct:main";
+#[cfg(test)]
 const REVIEWED_STAGING_MODEL_OID: &str = "18c562db6830c2ef6636b8eaf42fb479272052f7";
 
 impl StagingModelPin {
+    #[cfg(test)]
     pub(crate) fn reviewed() -> Result<Self> {
-        Self::new(
+        let pin = Self::new(
             REVIEWED_STAGING_MODEL_REF,
             git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?,
-        )
+        )?;
+        #[cfg(feature = "postgres")]
+        let pin = Self {
+            federate_profile: Some(FederateModelProfile::qwen_fixture()),
+            ..pin
+        };
+        Ok(pin)
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(all(test, feature = "postgres"))]
     pub(crate) fn reviewed_repo_name() -> &'static str {
         "qwen2.5-0.5b-instruct"
     }
@@ -216,16 +227,13 @@ impl StagingModelPin {
                 && parsed.to_string() == model_ref,
             "bounded staging modelRef must be a canonical local branch ref"
         );
-        #[cfg(feature = "postgres")]
-        let federate_profile = (model_ref == REVIEWED_STAGING_MODEL_REF
-            && commit == git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?)
-        .then_some(FederateModelProfile::Qwen);
         Ok(Self {
             model_ref,
             commit,
             projection_policy: Default::default(),
+            admission: None,
             #[cfg(feature = "postgres")]
-            federate_profile,
+            federate_profile: None,
             #[cfg(test)]
             projection_parent: None,
         })
@@ -234,6 +242,7 @@ impl StagingModelPin {
     /// Reviewed Clef complete-tree contract; preserves the ordinary 2 GiB
     /// default and A0 allowlist. This is trusted startup wiring, never RPC data.
     /// Local objects are independently verified against captured LFS oid/size.
+    #[cfg(test)]
     pub fn reviewed_clef_flash(
         local_lfs: std::collections::BTreeMap<String, std::path::PathBuf>,
     ) -> Result<Self> {
@@ -250,19 +259,43 @@ impl StagingModelPin {
     }
 
     fn capture_policy(&self) -> Result<git2db::pinned_disk::ProjectionPolicy> {
-        if self.projection_policy != Default::default() {
+        if let Some(admission) = &self.admission {
             anyhow::ensure!(
-                self.model_ref == "clef-flash-fp8:main"
-                    && self.commit
-                        == git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
-                "Clef projection policy pin identity changed"
+                self.model_ref == admission.model_ref && self.commit == admission.commit,
+                "configured model identity changed after validation"
+            );
+        }
+        #[cfg(test)]
+        if self.admission.is_none() && self.projection_policy != Default::default() {
+            anyhow::ensure!(
+                self.model_ref == clef_profile::MODEL_REF
+                    && self.commit == git2::Oid::from_str(clef_profile::COMMIT)?,
+                "fixture projection pin changed"
             );
         }
         Ok(self.projection_policy.clone())
     }
 
+    pub(crate) fn from_config(config: &crate::config::HyprConfig) -> Result<Option<Self>> {
+        let Some(admission) = config.selected_model_admission()? else {
+            return Ok(None);
+        };
+        let mut pin = Self::new(admission.model_ref.clone(), admission.commit)?;
+        pin.projection_policy = git2db::pinned_disk::ProjectionPolicy::from_trusted_contract(
+            admission.manifest.expanded_bytes,
+            admission.local_lfs()?,
+        )?;
+        pin.admission = Some(std::sync::Arc::new(admission.clone()));
+        #[cfg(feature = "postgres")]
+        {
+            pin.federate_profile = Some(FederateModelProfile::from_admission(admission));
+        }
+        Ok(Some(pin))
+    }
+
     /// `staging` selects the code-reviewed A0 identity. Optional explicit values
     /// must match it; incomplete/invalid profiles fail closed at startup.
+    #[cfg(test)]
     pub fn from_env() -> Result<Option<Self>> {
         const PROFILE: &str = "HYPRSTREAM_MODEL_ADMISSION_PROFILE";
         const REF: &str = "HYPRSTREAM_STAGING_MODEL_REF";
@@ -290,6 +323,7 @@ impl StagingModelPin {
 
     /// Select only reviewed server-owned expanded admission; a request cannot
     /// supply a local hydration map, profile or projection byte ceiling.
+    #[cfg(test)]
     fn from_startup_settings(
         profile: &str,
         model_ref: Option<&str>,
@@ -301,6 +335,7 @@ impl StagingModelPin {
 
     // Private selection core. Tests provide a tiny directory validator closure
     // here; no runtime setting/public API overrides production object pins.
+    #[cfg(test)]
     fn select_startup_pin(
         profile: &str,
         model_ref: Option<&str>,
@@ -324,7 +359,7 @@ impl StagingModelPin {
         let pin = Self::reviewed_clef_flash(local_lfs)?;
         #[cfg(feature = "postgres")]
         let pin = Self {
-            federate_profile: Some(FederateModelProfile::Clef),
+            federate_profile: Some(FederateModelProfile::clef_fixture()),
             ..pin
         };
         info!(profile = clef_profile::PROFILE, model_ref = clef_profile::MODEL_REF,
@@ -335,6 +370,7 @@ impl StagingModelPin {
         Ok(Some(pin))
     }
 
+    #[cfg(test)]
     fn validate_clef_overrides(model_ref: Option<&str>, oid: Option<&str>) -> Result<()> {
         match (model_ref, oid) {
             (None, None) => {}
@@ -353,17 +389,14 @@ impl StagingModelPin {
     pub(crate) fn federate_profile(&self) -> Result<FederateModelProfile> {
         let profile = self
             .federate_profile
+            .clone()
             .ok_or_else(|| anyhow!("pin has no reviewed Federate model capability"))?;
         anyhow::ensure!(
             self.model_ref == profile.model_ref()
                 && self.commit == git2::Oid::from_str(profile.commit())?,
             "Federate model pin identity changed"
         );
-        let policy = self.capture_policy()?;
-        anyhow::ensure!(
-            (profile == FederateModelProfile::Qwen) == (policy == Default::default()),
-            "Federate model projection policy does not match the selected profile"
-        );
+        self.capture_policy()?;
         Ok(profile)
     }
 
@@ -380,13 +413,24 @@ impl StagingModelPin {
     }
 
     pub(crate) fn validate_deployment(&self, profile: &InferenceDeploymentProfile) -> Result<()> {
-        if self.projection_policy != Default::default() {
-            self.capture_policy()?;
+        self.capture_policy()?;
+        if self.admission.as_ref().is_some_and(|a| {
+            a.operation == crate::config::model_admission::ModelOperation::Decisions
+        }) {
+            anyhow::ensure!(
+                profile.compute == InferenceCompute::Cpu
+                    && profile.isolation == InferenceIsolationProfile::InProcess,
+                "decision model currently requires native CPU in-process execution"
+            );
+        }
+        #[cfg(test)]
+        if self.admission.is_none() && self.projection_policy != Default::default() {
             clef_profile::validate_deployment(profile)?;
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn from_settings(
         profile: &str,
         model_ref: Option<&str>,
@@ -1799,6 +1843,11 @@ impl ModelService {
                 model_ref_str == pin.model_ref,
                 "staging modelRef changed after admission"
             );
+            if let Some(admission) = &pin.admission {
+                let admission = admission.clone();
+                let checkout = model_path.clone();
+                tokio::task::spawn_blocking(move || admission.verify_tree(&checkout)).await??;
+            }
             let policy = pin.capture_policy()?;
             #[cfg(test)]
             let artifact = if let Some(parent) = pin.projection_parent.as_deref() {
@@ -3847,9 +3896,15 @@ pub(crate) fn federate_model_operation(
         ),
         model_request::Which::Infer(inner) => {
             let infer = inner?;
-            let operation = match (profile, infer.which()?) {
-                (FederateModelProfile::Qwen, infer_request::Which::GenerateStream(_)) => "infer",
-                (FederateModelProfile::Clef, infer_request::Which::Decide(_)) => "decide",
+            let operation = match (profile.operation(), infer.which()?) {
+                (
+                    crate::config::model_admission::ModelOperation::Generation,
+                    infer_request::Which::GenerateStream(_),
+                ) => "infer",
+                (
+                    crate::config::model_admission::ModelOperation::Decisions,
+                    infer_request::Which::Decide(_),
+                ) => "decide",
                 _ => anyhow::bail!("unsupported Federate inference method"),
             };
             let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
@@ -4251,7 +4306,10 @@ mod tests {
     #[test]
     fn federate_clef_requires_startup_qualification_and_exact_decide_only() -> Result<()> {
         let pin = StagingModelPin::federate_clef_startup_fixture()?;
-        assert_eq!(pin.federate_profile()?, FederateModelProfile::Clef);
+        assert_eq!(
+            pin.federate_profile()?,
+            FederateModelProfile::clef_fixture()
+        );
         let make = |model_ref: &str, method: u8| {
             hyprstream_rpc::serialize_message(|message| {
                 let mut request =
