@@ -284,6 +284,20 @@ fn t6_env_path(name: &str) -> Result<PathBuf> {
 fn t6_sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+fn t6_executable_sha256() -> Result<String> {
+    use std::io::Read as _;
+    let mut executable = std::fs::File::open("/proc/self/exe")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = executable.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
 fn t6_git(repo: &Path, args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/git")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
@@ -1329,14 +1343,17 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     )
     .await?;
     t6_progress("midforward-after", started.elapsed().as_millis(), json!({}))?;
+    // A PASS receipt is published only after the fallible service stop joins.
+    handle.stop().await?;
     let receipt = json!({
         "schema":"clef-t6-authenticated-cpu-service/1", "result":"AUTHENTICATED_CPU_SERVICE_CASES_PASS",
-        "t6_complete":true, "remaining":[],
+        "t6_complete":true, "model_service_stop_complete":true, "remaining":[],
         "artifact_commit":T6_PIN,"artifact_tree":T6_TREE,"model_ref":T6_MODEL,
         "source_identity":{
             "git_sha":env!("GIT_SHA"),
             "git_dirty":env!("GIT_DIRTY"),
             "build_version":env!("BUILD_VERSION"),
+            "executable_sha256":t6_executable_sha256()?,
             "acceptance_source_sha256":t6_sha(include_bytes!("model_clef_cpu_acceptance.rs"))
         },
         "model_checkout":checkout,"records_sha256":T6_RECORDS_SHA,
@@ -1367,7 +1384,6 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     use std::io::Write as _;
     output.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
     output.write_all(b"\n")?;
-    handle.stop().await?;
     Ok(())
 }
 

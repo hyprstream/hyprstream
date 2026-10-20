@@ -14,7 +14,7 @@ import subprocess
 from clef_cpu_build import SOURCE, TEST, sha
 
 
-def validate(receipt, build, source, candidate):
+def validate(receipt, build, source, candidate, run_result, receipt_sha256):
     def git(*args):
         return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
 
@@ -43,17 +43,34 @@ def validate(receipt, build, source, candidate):
     # Existing build_info.rs deliberately shortens HYPRSTREAM_SOURCE_COMMIT.
     if revision != candidate[:7] or identity.get("git_dirty") != "false":
         raise ValueError("runtime build identity does not match the clean candidate")
+    if identity.get("executable_sha256") != build["executable_sha256"]:
+        raise ValueError("runtime executable does not match the captured Release artifact")
+    if (run_result.get("candidate") != candidate
+            or run_result.get("executable_sha256") != build["executable_sha256"]
+            or run_result.get("service_receipt_sha256") != receipt_sha256):
+        raise ValueError("actual run result does not bind this candidate, executable and receipt")
+    if run_result.get("exit") != 0 or run_result.get("controller_exit") != 0:
+        raise ValueError("actual native/controller execution did not exit successfully")
+    if (run_result.get("native_samples", 0) < 1
+            or run_result.get("peak_native_swap_kib") != 0
+            or run_result.get("peak_group_swap_kib") != 0):
+        raise ValueError("CPU execution lacks native/group observations without swapping")
     if receipt.get("result") != "AUTHENTICATED_CPU_SERVICE_CASES_PASS" or receipt.get("t6_complete") is not True:
         raise ValueError("native acceptance did not complete")
+    if receipt.get("model_service_stop_complete") is not True:
+        raise ValueError("receipt does not report completed model service stop")
     orders = receipt.get("orders", [])
-    if len(orders) != 11 or any(order.get("verified") is not True or
+    # Eleven questions are served by ten externally recorded work orders:
+    # 5 oracle + 3 repeat/isolation + oversized + timeout recovery. Premint
+    # timeout-zero rejection and internally consumed midforward orders add none.
+    if len(orders) != 10 or any(order.get("verified") is not True or
                               order.get("coordinate") != "inference:Decide/decide" for order in orders):
-        raise ValueError("expected eleven verified Decide/decide work orders")
+        raise ValueError("expected ten verified Decide/decide work orders")
     if receipt.get("corpus_records") != 5 or receipt.get("corpus_questions") != 11:
         raise ValueError("unexpected development corpus")
     return {"candidate": candidate, "executable_sha256": build["executable_sha256"],
             "source_digest": digest, "records": 5, "questions": 11,
-            "scope": "Source-bound native CPU development gate; lab validation remains separate"}
+            "scope": "Native CPU development evidence for this source and completed run; lab validation remains separate"}
 
 
 def main():
@@ -62,9 +79,11 @@ def main():
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--candidate", required=True)
+    parser.add_argument("--run-result", type=Path, required=True)
     args = parser.parse_args()
     report = validate(json.loads(args.receipt.read_text()), json.loads(args.build.read_text()),
-                      args.source.resolve(), args.candidate)
+                      args.source.resolve(), args.candidate,
+                      json.loads(args.run_result.read_text()), sha(args.receipt))
     report["service_receipt_sha256"] = sha(args.receipt)
     report["build_manifest_sha256"] = sha(args.build)
     print(json.dumps(report, indent=2))
