@@ -14,13 +14,18 @@
 //! - the pinned-artifact requirement for decision serving and the immutable
 //!   provenance assembly (commit OID + content digests, never names/echoes);
 //! - the versioned question-schema identity (a content hash over the
-//!   canonical question set EXCLUDING state, so label/type/instruction
-//!   changes change identity while state-only changes do not);
+//!   canonical question set EXCLUDING state, so label/type/instruction and
+//!   authored choice-order changes change identity while state-only changes
+//!   do not);
 //! - the RESOLVED versioned model id for `DecisionBatch.version.model`
 //!   (authorized ref @ pinned commit — never a bare branch alias);
 //! - IR answer assembly and E2 `decision.capnp` marshalling
 //!   (`batch_to_message`, producer-validated) into the generated
-//!   `decision_client` owned types for the wire response.
+//!   `decision_client` owned types for the wire response. Choice
+//!   distributions arrive in sorted canonical order and are remapped BY
+//!   LABEL into the question spec's authored option order (E2 D6: answer
+//!   vectors are unlabeled; consumers derive labels from the spec) in
+//!   [`build_answer_row`].
 //!
 //! Wire-decoding note (accurate scope): the generated dispatch performs a
 //! BOUNDED generic Cap'n Proto decode of the request body (including the
@@ -36,7 +41,8 @@ use crate::runtime::clef_decision::{
 };
 use hyprstream_decision::{AnswerRow, AnswerValue, QuestionAnswer, VersionTriple};
 use hyprstream_decision_head::clef::{
-    clef_render, ClefQuestion, ClefQuestionType, ClefRequest, CLEF_ENCODING_VERSION,
+    clef_label_permutation, clef_render, ClefQuestion, ClefQuestionType, ClefRequest,
+    CLEF_ENCODING_VERSION,
 };
 use hyprstream_rpc_std::decision_client;
 use hyprstream_rpc_std::inference_client::{
@@ -263,6 +269,18 @@ fn hash_question_schema(hasher: &mut Sha256, question: &ClefQuestion) {
                     hash_field(hasher, clef_render(v).as_bytes());
                 }
             }
+            // The model sees sorted labels, but the E2 AnswerValue vector is
+            // unlabeled and its positions follow the authored spec order.
+            // Bind that order into the schema identity so two requests with
+            // the same label set but different vector-index meanings cannot
+            // share an identity.
+            hash_field(
+                hasher,
+                &(question.authored_choice_order.len() as u64).to_le_bytes(),
+            );
+            for id in &question.authored_choice_order {
+                hash_field(hasher, id.as_bytes());
+            }
         }
         ClefQuestionType::Score => {
             let arr = question.criteria.as_array();
@@ -334,17 +352,66 @@ pub fn version_triple(
 
 /// Assemble the IR answer row from canonical distributions. Every declared
 /// question is answered (this runtime never abstains: raw native output).
-pub fn build_answer_row(distributions: &[ClefQuestionDistribution]) -> AnswerRow {
+///
+/// ORDER CONTRACT (E2 D6): the runtime emits choice distributions in sorted
+/// canonical order (the model's own prompt order), but E2 answer vectors are
+/// UNLABELED and canonical in the question spec's AUTHORED option order —
+/// consumers derive labels from the spec. Choice probabilities are remapped
+/// BY LABEL into the authored order here, at the service boundary; noul
+/// ([false,true]) and score (ascending array positions) authored orders
+/// equal their canonical orders and pass through unchanged.
+pub fn build_answer_row(
+    distributions: &[ClefQuestionDistribution],
+    request: &ClefRequest,
+) -> Result<AnswerRow, DecisionServeError> {
     let mut answers = std::collections::BTreeMap::new();
-    for d in distributions {
+    for (index, d) in distributions.iter().enumerate() {
+        let (authored_id, question) = request.record.questions.get(index).ok_or_else(|| {
+            DecisionServeError::Marshal(format!(
+                "distribution {} ({}) has no matching authored question",
+                index, d.question_id
+            ))
+        })?;
+        if authored_id != &d.question_id {
+            return Err(DecisionServeError::Marshal(format!(
+                "question {}: distribution does not match authored question {authored_id} at index {index}",
+                d.question_id
+            )));
+        }
+        if question.kind != d.kind {
+            return Err(DecisionServeError::Marshal(format!(
+                "question {}: distribution kind {:?} != authored kind {:?}",
+                d.question_id, d.kind, question.kind
+            )));
+        }
+        if d.probabilities.len() != d.canonical_ids.len() {
+            return Err(DecisionServeError::Clef(ClefDecisionError::Runtime(
+                format!(
+                    "question {}: distribution cardinality {} != {} canonical labels",
+                    d.question_id,
+                    d.probabilities.len(),
+                    d.canonical_ids.len()
+                ),
+            )));
+        }
         let value = match d.kind {
             // Canonical order is [false,true]: p(true) is component 1.
             ClefQuestionType::Noul => AnswerValue::Noul {
                 p_true: d.probabilities[1],
             },
-            ClefQuestionType::Choice => AnswerValue::Choice {
-                probabilities: d.probabilities.clone(),
-            },
+            ClefQuestionType::Choice => {
+                // Remap sorted-canonical probabilities into the authored
+                // criteria order by label (fail-closed permutation check).
+                let authored = clef::authored_labels(question)?;
+                let permutation = clef_label_permutation(&d.canonical_ids, &authored)
+                    .map_err(ClefDecisionError::from)?;
+                AnswerValue::Choice {
+                    probabilities: permutation
+                        .iter()
+                        .map(|&i| d.probabilities[i as usize])
+                        .collect(),
+                }
+            }
             ClefQuestionType::Score => AnswerValue::Score {
                 probabilities: d.probabilities.clone(),
             },
@@ -354,7 +421,7 @@ pub fn build_answer_row(distributions: &[ClefQuestionDistribution]) -> AnswerRow
             QuestionAnswer::answered(value), // no conformal set, ever
         );
     }
-    AnswerRow { answers }
+    Ok(AnswerRow { answers })
 }
 
 /// Marshal through the E2 producer path (`batch_to_message` — enforces the
@@ -517,14 +584,130 @@ mod tests {
         );
         assert_ne!(identity, question_schema_identity(&reordered));
 
-        // Choice label order in the AUTHOR body does not change identity
-        // (canonical sorted rendering), but descriptions do.
+        // Reordering choice labels leaves model/prompt order canonical, but
+        // changes E2's unlabeled vector positions and therefore the schema
+        // identity.
         let reordered_criteria = parsed(
             r#"{"model":"m","state":{"a":1},"questions":{
                 "z":{"type":"choice","criteria":{"a":"y","b":"x"}},
                 "n":{"type":"noul","instructions":"Ask"},"q2":{"type":"score","criteria":["lo","hi"]}}}"#,
         );
-        assert_eq!(identity, question_schema_identity(&reordered_criteria));
+        assert_ne!(identity, question_schema_identity(&reordered_criteria));
+    }
+
+    #[test]
+    fn answer_row_aligns_choice_probabilities_with_authored_spec_order() {
+        // Authored order is deliberately non-lexicographic: z, a, b. The
+        // runtime distribution is in sorted canonical order (a, b, z — the
+        // model/prompt parity order). E2 answer vectors are unlabeled, so
+        // they must align with the AUTHORED spec order.
+        let request = parsed(
+            r#"{"model":"m","state":null,"questions":{
+                "pick":{"type":"choice","criteria":{"z":"third","a":"first","b":"second"}}}}"#,
+        );
+        let distribution = |probabilities: Vec<f32>| ClefQuestionDistribution {
+            question_id: "pick".into(),
+            kind: ClefQuestionType::Choice,
+            canonical_ids: vec!["a".into(), "b".into(), "z".into()],
+            probabilities,
+        };
+
+        // Winner scan over the unlabeled vector. E2 D6 breaks argmax ties
+        // toward the EARLIEST authored option, and `Iterator::max_by`
+        // returns the LAST equal maximum — so the winner is computed with an
+        // explicit first-max scan, the contract consumers implement.
+        let first_argmax = |probs: &[f32]| -> usize {
+            let mut best = 0;
+            for (index, p) in probs.iter().enumerate() {
+                if *p > probs[best] {
+                    best = index;
+                }
+            }
+            best
+        };
+
+        // Distinct probabilities with the maximum on "a": the sorted vector
+        // [0.5, 0.3, 0.2] would put the winner at index 0, which a consumer
+        // reading the authored spec (z, a, b) would attribute to "z".
+        let row = build_answer_row(&[distribution(vec![0.5, 0.3, 0.2])], &request).unwrap();
+        let value = row.answers["pick"].value.as_ref().unwrap();
+        let AnswerValue::Choice { probabilities } = value else {
+            panic!("choice answer expected")
+        };
+        // Authored positions: z=0 (third-authored), a=1 (first), b=2.
+        assert_eq!(probabilities, &[0.2, 0.5, 0.3]);
+        assert_eq!(
+            first_argmax(probabilities),
+            1,
+            "winner must be authored option 'a' at index 1"
+        );
+
+        // Tie between "z" and "a": identical maxima stay attached to their
+        // authored positions, so the earliest-authored winner is "z"
+        // (index 0) — the sorted vector's index-0 maximum would misattribute
+        // the tie-break to "a".
+        let row = build_answer_row(&[distribution(vec![0.4, 0.2, 0.4])], &request).unwrap();
+        let value = row.answers["pick"].value.as_ref().unwrap();
+        let AnswerValue::Choice { probabilities } = value else {
+            panic!("choice answer expected")
+        };
+        // Authored positions: z=0.4 at 0, a=0.4 at 1, b=0.2 at 2.
+        assert_eq!(probabilities, &[0.4, 0.4, 0.2]);
+        assert_eq!(
+            first_argmax(probabilities),
+            0,
+            "tie-break winner must be earliest-authored 'z'"
+        );
+
+        // Noul and score authored orders equal their canonical orders and
+        // pass through unchanged (p(true) still component 1 of [false,true]).
+        let request = parsed(
+            r#"{"model":"m","state":null,"questions":{
+                "n":{"type":"noul"},"s":{"type":"score","criteria":["lo","hi"]}}}"#,
+        );
+        let distributions = vec![
+            ClefQuestionDistribution {
+                question_id: "n".into(),
+                kind: ClefQuestionType::Noul,
+                canonical_ids: vec!["false".into(), "true".into()],
+                probabilities: vec![0.25, 0.75],
+            },
+            ClefQuestionDistribution {
+                question_id: "s".into(),
+                kind: ClefQuestionType::Score,
+                canonical_ids: vec!["0".into(), "1".into()],
+                probabilities: vec![0.6, 0.4],
+            },
+        ];
+        let row = build_answer_row(&distributions, &request).unwrap();
+        let noul = row.answers["n"].value.as_ref().unwrap();
+        assert!(matches!(
+            noul,
+            AnswerValue::Noul { p_true } if (*p_true - 0.75).abs() < f32::EPSILON
+        ));
+        let score = row.answers["s"].value.as_ref().unwrap();
+        assert!(matches!(
+            score,
+            AnswerValue::Score { probabilities } if *probabilities == vec![0.6, 0.4]
+        ));
+
+        // A drifted runtime distribution (cardinality mismatch) fails closed
+        // instead of mis-ordering or truncating the vector.
+        let err = build_answer_row(
+            &[ClefQuestionDistribution {
+                question_id: "pick".into(),
+                kind: ClefQuestionType::Choice,
+                canonical_ids: vec!["a".into(), "b".into(), "z".into()],
+                probabilities: vec![1.0],
+            }],
+            &parsed(
+                r#"{"model":"m","state":null,"questions":{
+                    "pick":{"type":"choice","criteria":{"z":"third","a":"first","b":"second"}}}}"#,
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cardinality"), "{err}");
     }
 
     #[test]

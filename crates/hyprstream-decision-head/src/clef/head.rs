@@ -116,6 +116,26 @@ impl JointSchemaHead {
         config: ClefHeadConfig,
         weights: HashMap<String, Tensor>,
     ) -> Result<Self, ClefError> {
+        Self::from_named_tensors_checked(config, weights, &mut |_| Ok(()))
+    }
+
+    /// Cancellation-aware constructor with the SAME validation contract as
+    /// [`Self::from_named_tensors`]. `check` runs BEFORE each expected
+    /// tensor's admission — including its finite-value scan — with the
+    /// tensor's index in the strict expected order; an `Err` aborts
+    /// validation with that error. Checks are per-tensor only, never
+    /// per-element: one in-flight finite-value scan (a single libtorch
+    /// reduction over one tensor) completes before the next check, so a
+    /// cancelled caller bounds its remaining validation work to ONE scan
+    /// plus the already-in-flight staging work.
+    pub fn from_named_tensors_checked<F>(
+        config: ClefHeadConfig,
+        weights: HashMap<String, Tensor>,
+        check: &mut F,
+    ) -> Result<Self, ClefError>
+    where
+        F: FnMut(usize) -> Result<(), ClefError>,
+    {
         let expected = Self::expected_shapes(&config)?;
         if expected.len() != weights.len() {
             return Err(ClefError::Head(format!(
@@ -125,7 +145,8 @@ impl JointSchemaHead {
             )));
         }
         let mut profile = None;
-        for (name, shape) in expected {
+        for (index, (name, shape)) in expected.into_iter().enumerate() {
+            check(index)?;
             let t = weights
                 .get(&name)
                 .ok_or_else(|| ClefError::Head(format!("missing {name}")))?;
