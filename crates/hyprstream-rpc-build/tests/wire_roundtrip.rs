@@ -713,7 +713,7 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
         "rejected": [
             "truncated",
             "invalid",
-            "double-far",
+            "malformed-double-far",
             "invalid-far-segment",
             "composite-shape",
             "composite-body",
@@ -886,6 +886,127 @@ fn evolved_struct_lists_remain_readable_as_root_and_nested_data_lists() {
         assert_eq!(
             wd.run(mode, &[file.to_str().expect("fixture path")]),
             expected
+        );
+    }
+}
+
+#[test]
+fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    use capnp::message::{AllocationStrategy, HeapAllocator};
+    use wire_data_evolution_capnp::{new_outer, new_root, old_outer, old_root};
+    for nested in [false, true] {
+        // Fill the first segment exactly. Widening List(Data) to List(Item)
+        // transfers its near Data pointers into a new segment. The full old
+        // segment cannot hold a one-word landing pad, forcing Rust's actual
+        // transfer_pointer_split double-far path for both values.
+        let allocator = HeapAllocator::new()
+            .first_segment_words(if nested { 7 } else { 6 })
+            .allocation_strategy(AllocationStrategy::FixedSize);
+        let mut message = capnp::message::Builder::new(allocator);
+        {
+            let mut values = if nested {
+                message
+                    .init_root::<old_outer::Builder<'_>>()
+                    .init_nested()
+                    .init_values(2)
+            } else {
+                message.init_root::<old_root::Builder<'_>>().init_values(2)
+            };
+            values.set(0, &[1, 2, 3]);
+            values.set(1, &[4, 5]);
+        }
+        if nested {
+            let _ = message
+                .get_root::<new_outer::Builder<'_>>()
+                .expect("new outer")
+                .get_nested()
+                .expect("new nested")
+                .get_values()
+                .expect("upgrade nested values");
+        } else {
+            let _ = message
+                .get_root::<new_root::Builder<'_>>()
+                .expect("new root")
+                .get_values()
+                .expect("upgrade root values");
+        }
+        let segments = message.get_segments_for_output();
+        let double_far_count = segments
+            .iter()
+            .flat_map(|segment| segment.chunks_exact(8))
+            .filter(|word| word[0] & 7 == 6)
+            .count();
+        assert!(
+            segments.len() >= 3 && double_far_count >= 2,
+            "actual Rust upgrade must emit double-far child pointers"
+        );
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        let reader = capnp::serialize::read_message(
+            &mut bytes.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read Rust double-far message");
+        let values = if nested {
+            reader
+                .get_root::<old_outer::Reader<'_>>()
+                .expect("old outer")
+                .get_nested()
+                .expect("old nested")
+                .get_values()
+                .expect("old values")
+        } else {
+            reader
+                .get_root::<old_root::Reader<'_>>()
+                .expect("old root")
+                .get_values()
+                .expect("old values")
+        };
+        let expected = json!([[1, 2, 3], [4, 5]]);
+        assert_eq!(
+            data_list_json(values),
+            expected,
+            "reference Rust reader accepts its actual transfer output"
+        );
+        let file = wd.dir.join(if nested {
+            "double-far-nested.bin"
+        } else {
+            "double-far-root.bin"
+        });
+        fs::write(&file, bytes).expect("write actual Rust transfer output");
+        assert_eq!(
+            wd.run(
+                if nested {
+                    "evolved-nested-data-rust2ts"
+                } else {
+                    "evolved-root-data-rust2ts"
+                },
+                &[file.to_str().expect("fixture path")]
+            ),
+            expected
+        );
+    }
+    let output = wd.run("double-far-data-lists", &[]);
+    for shape in ["root", "nested"] {
+        assert_eq!(
+            output[shape]["valid"],
+            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]]})
+        );
+        assert_eq!(
+            output[shape]["rejected"],
+            json!([
+                "pad-overrun",
+                "pad-kind",
+                "pad-double",
+                "object-segment",
+                "tag-kind",
+                "object-overrun",
+                "payload-overrun",
+                "object-declared-end"
+            ])
         );
     }
 }
