@@ -1,0 +1,453 @@
+{
+  "artifact_commit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+  "artifact_tree": "6684c66f43cf413bccd48025380a69ebe2e428a9",
+  "build_identity": "coordinator must bind executable/source/library SHA256 externally; no self-verification via declared CLI metadata",
+  "caller_path": "signed end-user at+jwt -> generated Model dispatch -> real delegated-bearer PolicyService -> minted internal work -> real worker/native CPU/head",
+  "cancel_recovery_max_abs": 0.0,
+  "cancellation_scope": "real positive deadline after layer0 and actual signed unload drain; client-disconnect R7 remains open",
+  "corpus_questions": 11,
+  "corpus_records": 5,
+  "elapsed_ms": 249665,
+  "encoding_preflight": {
+    "historical_value_roundtrip_mismatch_records": [
+      "text-joint-three",
+      "json-numeric-unicode",
+      "question-order-z-a"
+    ],
+    "records": [
+      {
+        "exact_ids_and_ordered_spans": true,
+        "id": "text-joint-three",
+        "input_ids_sha256": "8fd83a20f6e9cbb1cf27faa87a3adb981beec9cdb0a68d8c2902fc90fb7642e6",
+        "ordinal": 0,
+        "token_count": 333
+      },
+      {
+        "exact_ids_and_ordered_spans": true,
+        "id": "json-numeric-unicode",
+        "input_ids_sha256": "d3e2569b0a8573e5f535e57e59501913e37e7dcddaa3dca3a7a64a079f25357a",
+        "ordinal": 1,
+        "token_count": 496
+      },
+      {
+        "exact_ids_and_ordered_spans": true,
+        "id": "question-order-a-z",
+        "input_ids_sha256": "25e38eddad30714fde52eb41c904bc65d39d965ea832f3740e21ff8eaf1d53dc",
+        "ordinal": 2,
+        "token_count": 229
+      },
+      {
+        "exact_ids_and_ordered_spans": true,
+        "id": "question-order-z-a",
+        "input_ids_sha256": "d98e980374a71f455e2abd352a429ed9f5e8a75809b9d044629f8dda4e933099",
+        "ordinal": 3,
+        "token_count": 229
+      },
+      {
+        "exact_ids_and_ordered_spans": true,
+        "id": "explicit-state-truncation",
+        "input_ids_sha256": "0e120883909103f4866dd5b071b3eb7853ec14b1601ee5e1ef099f3073bf56ee",
+        "ordinal": 4,
+        "token_count": 154
+      }
+    ],
+    "scope": "metadata/tokenizer only before any model load"
+  },
+  "expected_fp8_json_sha256": "75e4a24353ec1a71b19b4cf5689bf87b2e4677d0e77a569b921343dd9946b33f",
+  "hydration_mapping_canonical_json_sha256": "5698f88b26670fb434b5be62b550004057922cfe7199105435cb6214e970b868",
+  "isolation_max_abs": 0.0,
+  "load_elapsed_ms": 14768,
+  "max_oracle_probability_error": 5.681067705154419e-8,
+  "midforward": {
+    "actual_loaded_layer_count": 32,
+    "deadline": {
+      "checkpoint": 5,
+      "deadline_margin_ms": 9396,
+      "real_deadline_elapsed": true
+    },
+    "deadline_recovery_max_abs": 0.0,
+    "deadline_same_worker": true,
+    "decision_completion_sequence": 0,
+    "disconnect_cancellation_proven": false,
+    "drain": {
+      "actual_drain_observed": true,
+      "checkpoint": 5,
+      "deadline_unexpired_at_release": true
+    },
+    "drain_recovery_max_abs": 0.0,
+    "old_worker_artifact_weak_released": true,
+    "recovery_atol": 1e-6,
+    "recovery_rtol": 1e-6,
+    "reload_new_incarnation": true,
+    "successful_checkpoints": 38,
+    "typed_reply_before_unload_complete": true,
+    "unload_completion_sequence": 1
+  },
+  "model_checkout": "/home/birdetta/.cache/hyprstream-clef-oracle/20261018/production-v4-f2a82911-cd1a91985d586f1d/data/hyprstream/instances/restart-acceptance-clef-t6-production-v4-cd1a91985d586f1d/models/clef-flash-fp8/worktrees/main",
+  "model_ref": "clef-flash-fp8:main",
+  "oracle_atol": 0.00001,
+  "oracle_rtol": 0.0,
+  "orders": [
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    },
+    {
+      "coordinate": "inference:Decide/infer",
+      "incarnation": "9aa0cd74eb852eebd72fd9b042bbd3400901320e413444373b6134ee09574b0d",
+      "verified": true
+    }
+  ],
+  "policy": "deny-by-default; explicit alice/bob same-tenant allows, eve/foreign tenant deny",
+  "proc_status": [
+    "VmHWM:\t31202696 kB",
+    "VmRSS:\t19441596 kB"
+  ],
+  "records_sha256": "8ea59075e4fe69703375277d3180f92929744f0f43d8a25c925742d394120c0b",
+  "remaining": [
+    "client-disconnect cancellation R7"
+  ],
+  "responses": [
+    {
+      "id": "text-joint-three",
+      "record_index": 0,
+      "response": {
+        "batch": {
+          "rows": [
+            {
+              "answers": [
+                {
+                  "questionId": "a:color",
+                  "value": {
+                    "choice": [
+                      0.9669883251190186,
+                      0.015790339559316635,
+                      0.017221396788954735
+                    ]
+                  }
+                },
+                {
+                  "questionId": "score/quality",
+                  "value": {
+                    "score": [
+                      0.014088977128267288,
+                      0.026265818625688553,
+                      0.9596452116966248
+                    ]
+                  }
+                },
+                {
+                  "questionId": "z proposition",
+                  "value": {
+                    "noul": 0.9497929215431213
+                  }
+                }
+              ]
+            }
+          ],
+          "version": {
+            "model": "clef-flash-fp8@7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+            "schema": "clef-raw-cloudflare-clef-8b2e5fd-1-qe8064021af1c636dd5a8fb72c6f33e4b3207afff0293db07ae6289ada2f2d96c"
+          }
+        },
+        "limits": {
+          "maxLength": 1024,
+          "maxStateTokens": 8192,
+          "sequenceTokens": 333,
+          "stateTokensAdmitted": 14,
+          "stateTruncated": false
+        },
+        "provenance": {
+          "artifactCommit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+          "backboneConfigSha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+          "computeProfile": "cpu-float32-fp8ch-w8a8-dynact",
+          "encodingVersion": "cloudflare-clef-8b2e5fd-1",
+          "headConfigSha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+          "headTensorCount": 122,
+          "headWeightsSha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+          "modelRef": "clef-flash-fp8:main",
+          "quantization": "float-quantized-channel-w8-dynact",
+          "tokenizerSha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+        }
+      }
+    },
+    {
+      "id": "json-numeric-unicode",
+      "record_index": 1,
+      "response": {
+        "batch": {
+          "rows": [
+            {
+              "answers": [
+                {
+                  "questionId": "11-level-score",
+                  "value": {
+                    "score": [
+                      0.026923619210720062,
+                      0.8953655362129211,
+                      0.010898243635892868,
+                      0.011845584958791733,
+                      0.008007189258933067,
+                      0.006248554680496454,
+                      0.006461209151893854,
+                      0.006167278625071049,
+                      0.005318357143551111,
+                      0.008176658302545547,
+                      0.014587870799005032
+                    ]
+                  }
+                },
+                {
+                  "questionId": "2 / choice",
+                  "value": {
+                    "choice": [
+                      0.9962393045425415,
+                      0.001467884168960154,
+                      0.002292834222316742
+                    ]
+                  }
+                },
+                {
+                  "questionId": "κ?",
+                  "value": {
+                    "noul": 0.6950230002403259
+                  }
+                }
+              ]
+            }
+          ],
+          "version": {
+            "model": "clef-flash-fp8@7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+            "schema": "clef-raw-cloudflare-clef-8b2e5fd-1-q4b0910b7df0840359524fe217c6f87f73355c1e9264229898d3fbcb18dce0833"
+          }
+        },
+        "limits": {
+          "maxLength": 1024,
+          "maxStateTokens": 8192,
+          "sequenceTokens": 496,
+          "stateTokensAdmitted": 65,
+          "stateTruncated": false
+        },
+        "provenance": {
+          "artifactCommit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+          "backboneConfigSha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+          "computeProfile": "cpu-float32-fp8ch-w8a8-dynact",
+          "encodingVersion": "cloudflare-clef-8b2e5fd-1",
+          "headConfigSha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+          "headTensorCount": 122,
+          "headWeightsSha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+          "modelRef": "clef-flash-fp8:main",
+          "quantization": "float-quantized-channel-w8-dynact",
+          "tokenizerSha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+        }
+      }
+    },
+    {
+      "id": "question-order-a-z",
+      "record_index": 2,
+      "response": {
+        "batch": {
+          "rows": [
+            {
+              "answers": [
+                {
+                  "questionId": "a",
+                  "value": {
+                    "choice": [
+                      0.03529614210128784,
+                      0.02825433947145939,
+                      0.9364495277404785
+                    ]
+                  }
+                },
+                {
+                  "questionId": "z",
+                  "value": {
+                    "noul": 0.006929726339876652
+                  }
+                }
+              ]
+            }
+          ],
+          "version": {
+            "model": "clef-flash-fp8@7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+            "schema": "clef-raw-cloudflare-clef-8b2e5fd-1-qcc8434686ca815888462f1ea59ed4d72db932a45a2fa09b06b33f3973e1b2363"
+          }
+        },
+        "limits": {
+          "maxLength": 1024,
+          "maxStateTokens": 8192,
+          "sequenceTokens": 229,
+          "stateTokensAdmitted": 10,
+          "stateTruncated": false
+        },
+        "provenance": {
+          "artifactCommit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+          "backboneConfigSha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+          "computeProfile": "cpu-float32-fp8ch-w8a8-dynact",
+          "encodingVersion": "cloudflare-clef-8b2e5fd-1",
+          "headConfigSha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+          "headTensorCount": 122,
+          "headWeightsSha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+          "modelRef": "clef-flash-fp8:main",
+          "quantization": "float-quantized-channel-w8-dynact",
+          "tokenizerSha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+        }
+      }
+    },
+    {
+      "id": "question-order-z-a",
+      "record_index": 3,
+      "response": {
+        "batch": {
+          "rows": [
+            {
+              "answers": [
+                {
+                  "questionId": "a",
+                  "value": {
+                    "choice": [
+                      0.03516070917248726,
+                      0.028327174484729767,
+                      0.9365121126174927
+                    ]
+                  }
+                },
+                {
+                  "questionId": "z",
+                  "value": {
+                    "noul": 0.004500643815845251
+                  }
+                }
+              ]
+            }
+          ],
+          "version": {
+            "model": "clef-flash-fp8@7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+            "schema": "clef-raw-cloudflare-clef-8b2e5fd-1-qe5eae5e5e3020b4c3e8fbe26deb056dec7436346cde0782e5ec398bce302243e"
+          }
+        },
+        "limits": {
+          "maxLength": 1024,
+          "maxStateTokens": 8192,
+          "sequenceTokens": 229,
+          "stateTokensAdmitted": 10,
+          "stateTruncated": false
+        },
+        "provenance": {
+          "artifactCommit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+          "backboneConfigSha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+          "computeProfile": "cpu-float32-fp8ch-w8a8-dynact",
+          "encodingVersion": "cloudflare-clef-8b2e5fd-1",
+          "headConfigSha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+          "headTensorCount": 122,
+          "headWeightsSha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+          "modelRef": "clef-flash-fp8:main",
+          "quantization": "float-quantized-channel-w8-dynact",
+          "tokenizerSha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+        }
+      }
+    },
+    {
+      "id": "explicit-state-truncation",
+      "record_index": 4,
+      "response": {
+        "batch": {
+          "rows": [
+            {
+              "answers": [
+                {
+                  "questionId": "truncated?",
+                  "value": {
+                    "noul": 0.008832397870719433
+                  }
+                }
+              ]
+            }
+          ],
+          "version": {
+            "model": "clef-flash-fp8@7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+            "schema": "clef-raw-cloudflare-clef-8b2e5fd-1-q23052c4b7e54585ca356589787b2748398594e77317e0a450cd3c55081ff45ac"
+          }
+        },
+        "limits": {
+          "maxLength": 1024,
+          "maxStateTokens": 8,
+          "sequenceTokens": 154,
+          "stateTokensAdmitted": 8,
+          "stateTruncated": true
+        },
+        "provenance": {
+          "artifactCommit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+          "backboneConfigSha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+          "computeProfile": "cpu-float32-fp8ch-w8a8-dynact",
+          "encodingVersion": "cloudflare-clef-8b2e5fd-1",
+          "headConfigSha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+          "headTensorCount": 122,
+          "headWeightsSha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+          "modelRef": "clef-flash-fp8:main",
+          "quantization": "float-quantized-channel-w8-dynact",
+          "tokenizerSha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+        }
+      }
+    }
+  ],
+  "result": "AUTHENTICATED_CPU_SERVICE_CASES_PASS",
+  "schema": "clef-t6-authenticated-cpu-service/1",
+  "scope": "five synthetic development records; no task accuracy/calibration/SLA/GPU/lab deployment acceptance",
+  "startup_profile": {
+    "commit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+    "hydration": "three fixed SHA256-named local objects; owned capture verifies full bytes",
+    "model_ref": "clef-flash-fp8:main",
+    "profile": "clef-flash-fp8-cpu-v1",
+    "source": "production StagingModelPin::from_env and validate_deployment"
+  },
+  "t6_complete": false,
+  "threads": 4
+}

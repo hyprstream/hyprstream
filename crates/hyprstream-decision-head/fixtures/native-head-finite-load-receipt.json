@@ -1,0 +1,42 @@
+{
+  "actual_archived_exit": 0,
+  "actual_service_result": "AUTHENTICATED_CPU_SERVICE_CASES_PASS",
+  "checked_source_sha256": {
+    "crates/hyprstream-decision-head/src/clef/head.rs": "bd00449629868f0d8de82ca0ec8e76ee00215adc677f68912d009cb2c2158aed",
+    "crates/hyprstream-inference/src/runtime/clef_decision.rs": "544daf1ff3f50fc1f318e80da3c3576ed65d84b4a4402946ffeb34ae2384c745"
+  },
+  "derivation": "python3 derive-native-head-finite-load.py --evidence-root <retained-public-evidence> --source-root <frozen-f2a82911-source> --output <new-receipt.json>",
+  "exclusions": [
+    "No tensor/model execution performed by receipt derivation.",
+    "200-scale audit covers only scales and cannot prove head finiteness.",
+    "Not whole-backbone finiteness, standalone raw head scan, accuracy/calibration, current-main or new-candidate qualification.",
+    "Executable digest comes from mutually bound archived build/review/setup/run/audit receipts; executable bytes are not freshly hashed here."
+  ],
+  "executable_rehashed_by_this_procedure": false,
+  "executable_sha256_recorded": "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5",
+  "finite_load_basis": [
+    "Production Clef loader propagates checked JointSchemaHead constructor failure.",
+    "Constructor rejects cardinality/name/shape/dtype mismatches and checks isfinite().all() on EVERY expected head tensor before returning Ok.",
+    "Successful executed source-bound service receipt reports122 tensors for exact19cd artifact."
+  ],
+  "head_provenance": {
+    "headConfigSha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+    "headTensorCount": 122,
+    "headWeightsSha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0"
+  },
+  "model_commit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+  "model_tree": "6684c66f43cf413bccd48025380a69ebe2e428a9",
+  "observed_matching_head_provenance_records": 5,
+  "public_evidence_sha256": {
+    "clef-production-full-native-source-manifest.json": "15174f668985e29a7875df297e5034680c0a336f9698061a7bc537d4c4e8f49f",
+    "clef-production-profile-native-build-manifest.json": "5a43593f1334e51f4c83330a1fae8c11882eee98c72579e9cea7f7b05a5234e9",
+    "clef-production-profile-root-build-review.json": "b01b2a0bdd1288fc595229a837ce080d806fc6da3d06e9d772bce5f0a12556b1",
+    "clef-production-v4-audit.json": "aa3513c14e8c2f388b536cb02360d8f921251d22ccb2f6e9abc987fb3383e63e",
+    "clef-production-v4-receipts/run-result.json": "ca78f4ebfacf10eab640f23c30e5e512ff163fea90c3a332c035c27105a66e2a",
+    "clef-production-v4-receipts/service-receipt.json": "c0c855ff0229fdd83cfaf4684f909f74d15c6f7a78dda239db2d9819369ee72a",
+    "clef-production-v4-receipts/setup-receipt.json": "4020d118a35f00e59d3da39d29ed8f20807b4712d0f94e985ae0f611409bbcb9"
+  },
+  "schema": "clef-archived-native-head-finite-load-evidence/1",
+  "scope": "ARCHIVED DEVELOPMENT LOAD-TIME EVIDENCE; not standalone head scan or current release qualification",
+  "source_composition_identity": "f2a82911ea8b6344db43ee1587760376a795832d74728edca0341ae3deb42a0b"
+}

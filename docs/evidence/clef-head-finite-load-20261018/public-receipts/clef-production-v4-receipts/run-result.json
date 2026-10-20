@@ -1,0 +1,19 @@
+{
+  "schema": "clef-t6-final-cpu-run-result/1",
+  "state": "EXECUTION_TERMINAL_REQUIRES_ROOT_RECEIPT_REVIEW",
+  "observed_at": "2026-10-18T16:08:48.481434+00:00",
+  "binary_sha256": "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5",
+  "composition_identity": "f2a82911ea8b6344db43ee1587760376a795832d74728edca0341ae3deb42a0b",
+  "elapsed_seconds": 250.2182599779917,
+  "actual_exit": 0,
+  "controller_error_type": null,
+  "timeout_exit": false,
+  "service_receipt_exists": true,
+  "service_receipt_sha256": "c0c855ff0229fdd83cfaf4684f909f74d15c6f7a78dda239db2d9819369ee72a",
+  "private_log_bytes": 220,
+  "private_log_sha256": "b1e8775f9d6bd2fd44f865b5f9dd9bbc1d13c9b45a11dcb456480ee3c5b31ee4",
+  "resource_receipt_sha256": "01ed61d090fb9de1ac424ef5432e6047234319345b9e14b65f872d0d6354a87c",
+  "acceptance_pass": null,
+  "root_review_required": true,
+  "scope": "Root must inspect actual service receipt oracle/provenance/cancellation/lifecycle/recovery gates; no fullPASS inferred from exit0 or receipt existence; noGPU/R7/lab claim"
+}

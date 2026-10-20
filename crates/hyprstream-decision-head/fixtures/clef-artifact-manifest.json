@@ -1,0 +1,368 @@
+{
+  "schema_version": 1,
+  "manifest_kind": "clef-native-v1-artifact-pin",
+  "contract": "docs/contracts/clef-native-v1.md",
+  "status": "provenance-verified; no numerical-parity claim",
+  "artifact": {
+    "producer_repo": "kurcontko/clef-flash-FP8-Dynamic",
+    "producer_revision": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+    "producer_url": "https://huggingface.co/kurcontko/clef-flash-FP8-Dynamic/tree/7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+    "producer_statement": "Per producer README: an unofficial FP8_DYNAMIC quantization of Cloudflare/clef-flash built with llm-compressor; not affiliated with or endorsed by Cloudflare.",
+    "license": "Apache-2.0 (upstream terms retained; see docs/contracts/clef-native-v1.md licensing)",
+    "total_bytes": 12174008714,
+    "storage_note": "safetensors files are consumed unchanged; packed FP8 weights stay packed at load (no full-model FP32 expansion)"
+  },
+  "upstream_original": {
+    "repo": "Cloudflare/clef-flash",
+    "revision": "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+    "url": "https://huggingface.co/Cloudflare/clef-flash/tree/8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+    "license": "Apache-2.0",
+    "frozen": "main HEAD observed 2026-10-18; equals the revision observed by plan v2.4 on 2026-10-17",
+    "note": "head/tokenizer/schema provenance carried by hash equality in the files below; the original shard bytes are not part of this manifest"
+  },
+  "quantization_profile": {
+    "quant_method": "compressed-tensors",
+    "format": "float-quantized (vLLM compressed-tensors scheme)",
+    "weights": {
+      "dtype": "float8_e4m3fn (F8_E4M3)",
+      "num_bits": 8,
+      "strategy": "channel (per-output-channel static scale)",
+      "symmetric": true,
+      "dynamic": false,
+      "observer": "memoryless_minmax",
+      "scale_tensor_suffix": ".weight_scale",
+      "scale_dtype_in_file": "BF16"
+    },
+    "input_activations": {
+      "dtype": "float8_e4m3fn",
+      "num_bits": 8,
+      "strategy": "token (per-token dynamic scale)",
+      "symmetric": true,
+      "dynamic": true
+    },
+    "ignored_floating_layers": {
+      "lm_head": "kept BF16; rows are read for lexical priors by the head",
+      "linear_attention_in_proj": "model.language_model.layers.{0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30}.linear_attn.in_proj_a and .in_proj_b kept BF16 (24 GDN layers x 2 = 48 tensors; the 8 full-attention layers 3,7,11,15,19,23,27,31 are quantized)",
+      "vision": "all model.visual.* Linear layers and merger kept BF16 (110 tensors); untested upstream and rejected by the native v1 media policy",
+      "count_total": 159
+    },
+    "kv_cache_scheme": null,
+    "runtime_profile_admission": {
+      "compressed_tensors_pin": "0.19.0 @ 525a7a7b84ebccdbc0db07956338b6f8c851d58f (producer tag)",
+      "calculate_qparams": "https://github.com/vllm-project/compressed-tensors/blob/525a7a7b84ebccdbc0db07956338b6f8c851d58f/src/compressed_tensors/quantization/utils/helpers.py#L80 \u2014 scale = amax / (bit_range/2); lines 114-139 replace ONLY scales == 0 with dtype epsilon (zero-only epsilon; no small-amax clamp in this pinned path)",
+      "activation_qdq": "https://github.com/vllm-project/compressed-tensors/blob/525a7a7b84ebccdbc0db07956338b6f8c851d58f/src/compressed_tensors/quantization/lifecycle/forward_helpers.py#L168 \u2014 _quantize_dequantize divides by scale, clamps/rounds, multiplies back",
+      "policy": "other profile versions require explicit audit before admission (producer pin is intentional)",
+      "fp32_note": "CPU Float32 is an explicit compute profile; it does not claim bitwise BF16 producer-arithmetic parity or upstream full-model port parity"
+    }
+  },
+  "tensor_inventory": {
+    "model.safetensors": {
+      "tensors": 960,
+      "F8_E4M3": 200,
+      "BF16": 760,
+      "weight_scale_tensors": 200,
+      "joint_head_tensors": 0
+    },
+    "clef_head/joint_head.safetensors": {
+      "tensors": 122,
+      "dtype": "BF16",
+      "groups": {
+        "layers.{0..3}": "decoder layers: self_attn + multihead_attn (in_proj [3072,1024], out_proj [1024,1024]), linear1 [4096,1024], linear2 [1024,4096], norm1/norm2/norm3 [1024]",
+        "evidence_layers.{0..1}": "routing layers: query_norm/memory_norm/attention/feedforward_norm [1024], attention in_proj [3072,1024] out_proj [1024,1024], feedforward [4096,1024]+[1024,4096]",
+        "projections_4096_to_1024": [
+          "global_projection.weight",
+          "memory_projection.weight",
+          "question_projection.weight",
+          "option_context_projection.weight",
+          "option_lexical_projection.weight",
+          "option_question_projection.weight"
+        ],
+        "lexical_prior": [
+          "option_lexical_projection.weight",
+          "prior_logit_scale (scalar)"
+        ],
+        "scalars": [
+          "joint_logit_scale",
+          "prior_logit_scale",
+          "residual_gate"
+        ],
+        "other": [
+          "residual_scorer.0 [1024,4096]",
+          "residual_scorer.3 [1,1024]",
+          "type_embedding [3,1024]",
+          "head biases per attention/linear layers"
+        ],
+        "layernorms": [
+          "hidden_norm [4096]",
+          "field_norm [1024]",
+          "option_norm [1024]",
+          "option_summary_norm [1024]",
+          "evidence_layers.*.query_norm/memory_norm/feedforward_norm [1024]",
+          "layers.*.norm1/norm2/norm3 [1024]"
+        ]
+      },
+      "head_completeness": "inventory matches joint_head_config.json geometry (width 1024, routing_layers 2, layers 4, heads 16, feedforward 4096) and the upstream schema source module structure; verified bit-identical to the upstream original head file"
+    }
+  },
+  "verification": {
+    "durable_pins": "sha256 per file (this manifest)",
+    "provenance_evidence": {
+      "lfs_files": "local sha256 equals the Hugging Face LFS oid (published content sha256) at the pinned producer revision; LFS-equality vs upstream also uses LFS sha256 (tree oids of LFS entries are pointer-file hashes and are NOT compared)",
+      "regular_files": "git blob sha1 (blob <size> + NUL + content) equals the tree entry oid at the pinned producer revision; upstream-equality for regular files uses git blob sha1",
+      "classification": "per-file provenance.classification is authoritative; exactly 10 files are bit-identical to upstream (2 by LFS sha256, 8 by git blob sha1, including the path-remapped head weights/config), 3 have counterparts that differ by construction (quantized backbone pack, extended root config, producer README), and 8 are producer-specific with no upstream counterpart"
+    },
+    "receipts": [
+      {
+        "scope": "developmental (not a permanent source/commit identity)",
+        "date": "2026-10-18",
+        "result": "21/21 files matched at pinned producer revision by the per-file algorithms above; 10/21 bit-identical to Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3 (head safetensors + tokenizer by LFS sha256; head config, schema source, chat template, tokenizer/processor/generation configs, LICENSE, .gitattributes by git blob sha1). Backbone root config.json is NOT identical (producer quantization config) and no equality is claimed for it.",
+        "method": "offline content hashing; no model code executed"
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+      "role": "HF LFS tracking attributes",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": ".gitattributes",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 11544,
+      "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+      "role": "Apache-2.0 license text, bit-identical to upstream original",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "LICENSE",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "README.md",
+      "bytes": 10972,
+      "sha256": "c35620be0d17ed8aa21a7ad2ea742a876b87440f7afb04b3da7ff185dcd9d2f3",
+      "role": "producer documentation incl. published aggregate eval claims and usage constraints",
+      "provenance": {
+        "classification": "differs-from-upstream-counterpart",
+        "upstream_counterpart": "README.md",
+        "note": "producer documentation; differs from upstream README"
+      }
+    },
+    {
+      "path": "chat_template.jinja",
+      "bytes": 7756,
+      "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+      "role": "chat template (bit-identical to upstream)",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "chat_template.jinja",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "clef_head/joint_head.safetensors",
+      "bytes": 243538016,
+      "sha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+      "role": "joint decision head weights (BF16), bit-identical to upstream original release head",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "joint_head.safetensors",
+        "method": "lfs-sha256-equality",
+        "evidence": "lfs-sha256-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+        "note": "head weights; upstream path remapped from repo root to clef_head/"
+      }
+    },
+    {
+      "path": "clef_head/joint_head_config.json",
+      "bytes": 119,
+      "sha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+      "role": "head geometry: hidden 4096, width 1024, routing_layers 2, layers 4, heads 16, feedforward 4096",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "joint_head_config.json",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+        "note": "head geometry config; upstream path remapped from repo root to clef_head/; verified by explicit blob-sha1 comparison"
+      }
+    },
+    {
+      "path": "config.json",
+      "bytes": 11917,
+      "sha256": "0978bfcc5d6da6d51fa25051d792258a61e99a493c0172d26457630564d80131",
+      "role": "backbone + vision + text config; quantization_config (compressed-tensors FP8 scheme + ignore list)",
+      "provenance": {
+        "classification": "differs-from-upstream-counterpart",
+        "upstream_counterpart": "config.json",
+        "note": "producer-extended backbone config (adds quantization_config, image/video token ids, vision blocks); root config equality is NOT claimed"
+      }
+    },
+    {
+      "path": "generation_config.json",
+      "bytes": 116,
+      "sha256": "45707f8467bf4e54e112c6095a1b2d1f2d63651cf86816344cfff21f02dda0d4",
+      "role": "generation defaults (eos token id); not used by the native decision path",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "generation_config.json",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "joint_schema_model.py",
+      "bytes": 23263,
+      "sha256": "0e304cf7c6500e8bb59bef7e2afd2c6373f82596dfb3b57d1aa93c175e2dc3a3",
+      "role": "upstream encoding/head reference source (evidence only; never executed or copied into this repository)",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "joint_schema_model.py",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "model.safetensors",
+      "bytes": 11910387016,
+      "sha256": "7799d5c3a47b8f249d667a040e3fd538ccbf47bd958dc6f2aa52af8346aefa6b",
+      "role": "FP8-quantized backbone + vision tower + lm_head weights (safetensors, single file)",
+      "provenance": {
+        "classification": "differs-from-upstream-counterpart",
+        "upstream_counterpart": "model-0000X-of-00004.safetensors (4 shards)",
+        "note": "producer-specific quantized re-pack; upstream original is four unquantized BF16 shards; equality neither expected nor claimed"
+      }
+    },
+    {
+      "path": "processor_config.json",
+      "bytes": 1191,
+      "sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+      "role": "media processor config (v1 native path rejects media; file pinned for provenance only)",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "processor_config.json",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "recipe.yaml",
+      "bytes": 294,
+      "sha256": "bd47c67257ddb6b5e831fe879e33e828124e0bd0c2b91d7076cdd6e11e341865",
+      "role": "llm-compressor QuantizationModifier recipe (FP8_DYNAMIC, ignore list) \u2014 producer toolchain evidence",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "llm-compressor recipe; absent upstream"
+      }
+    },
+    {
+      "path": "scripts/build_data.py",
+      "bytes": 4707,
+      "sha256": "80b5e5856723b6459e9451de9545e40eba37d93feec61c8943c5f66fec6c90a4",
+      "role": "producer evaluation-record builder referencing public datasets (inputs only; no published outputs)",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer eval-record builder (public dataset inputs only); absent upstream"
+      }
+    },
+    {
+      "path": "scripts/quantize.py",
+      "bytes": 3130,
+      "sha256": "c52e14f2e86ca6d6d857061dc69e74f91c6974f76fa922a88f954a10c7ffc8b3",
+      "role": "producer quantization script (producer toolchain evidence)",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer quantization script; absent upstream"
+      }
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 19989325,
+      "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+      "role": "tokenizer (bit-identical to upstream original release tokenizer)",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "tokenizer.json",
+        "method": "lfs-sha256-equality",
+        "evidence": "lfs-sha256-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3",
+        "note": "tokenizer; HF tree oids for LFS files are pointer-file hashes, so equality is asserted by LFS content sha256 only"
+      }
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 1075,
+      "sha256": "91a08f825d370d085d692e04cf117cdd7faad7bf18e996f1e6031b6dab03db72",
+      "role": "tokenizer special tokens and pretokenization regex",
+      "provenance": {
+        "classification": "bit-identical",
+        "upstream_path": "tokenizer_config.json",
+        "method": "git-blob-sha1-equality",
+        "evidence": "git-blob-sha1-equality vs Cloudflare/clef-flash@8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3"
+      }
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/__init__.py",
+      "bytes": 436,
+      "sha256": "726f8a367a7268299c90b3e06cebc56013391ebe078e5874f9395602d930624b",
+      "role": "producer repository file",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer vLLM plugin; absent upstream"
+      }
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/model.py",
+      "bytes": 7771,
+      "sha256": "23a3932d446386c92836aa30e2de1ffbc0d88cb4a4056cf7612881dddeae2a89",
+      "role": "producer repository file",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer vLLM plugin; absent upstream"
+      }
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/schema.py",
+      "bytes": 404,
+      "sha256": "d01f99de1262e91f0ab04e65248e177cbeb6046c964f3f4bd1ccde31789c3d04",
+      "role": "producer repository file",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer vLLM plugin; absent upstream"
+      }
+    },
+    {
+      "path": "vllm_plugin/clef_vllm/server.py",
+      "bytes": 7592,
+      "sha256": "f1b50a1bf1d0ca7adf7d88e0a7d1b061920bbf6000af084f0ac95dd39f606ffa",
+      "role": "producer repository file",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer vLLM plugin; absent upstream"
+      }
+    },
+    {
+      "path": "vllm_plugin/pyproject.toml",
+      "bytes": 500,
+      "sha256": "15c00d5c6d03b69524c52ccfeb3a3d8a63add29844e3bc96c20c533844c2a5a3",
+      "role": "producer repository file",
+      "provenance": {
+        "classification": "producer-specific-no-upstream-counterpart",
+        "note": "producer vLLM plugin; absent upstream"
+      }
+    }
+  ],
+  "not_established": [
+    "hash/provenance identity does NOT establish numerical parity of the FP8 port against the upstream original",
+    "no numerical parity fixtures were found in the inspected pinned trees of either repository (external fixtures may exist elsewhere; none are pinned or admitted here). Aggregate README tables are producer claims, not fixtures; tiny oracle fixture production is a separate authorized task",
+    "label accuracy, calibration, and performance characteristics are unmeasured by this manifest; calibration is null (raw, uncalibrated) by contract",
+    "the attached fp8-scale-audit-receipt.json covers only the 200 weight-scale tensors (1,425,408 scale values: zero 0, negative 0, nonfinite 0; producer zero-amax uses positive epsilon). Separate native-head-finite-load-receipt.json binds archived development native load-time checks of all 122 head tensors to the checked constructor, source composition f2a82911, executable e90affaa and pinned head sha256 19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0. This is not a standalone head scan or current-main/new-candidate qualification. Head content hashes alone do not prove finiteness; whole-backbone weight finite-load verification and an implementation PASS are not claimed here",
+    "CPU full-model execution/PASS is not claimed by this manifest"
+  ]
+}

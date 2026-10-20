@@ -1,0 +1,38 @@
+{
+  "schema": "clef-t6-final-jensen-setup/1",
+  "state": "PREPARED_NOT_RUN",
+  "observed_at": "2026-10-18T16:03:25.684868+00:00",
+  "task": "/home/birdetta/.cache/hyprstream-clef-oracle/20261018/production-v4-f2a82911-cd1a91985d586f1d",
+  "instance": "restart-acceptance-clef-t6-production-v4-cd1a91985d586f1d",
+  "executable_sha256": "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5",
+  "composition_identity": "f2a82911ea8b6344db43ee1587760376a795832d74728edca0341ae3deb42a0b",
+  "build_manifest_sha256": "5a43593f1334e51f4c83330a1fae8c11882eee98c72579e9cea7f7b05a5234e9",
+  "reviewed_build_sha256": "b01b2a0bdd1288fc595229a837ce080d806fc6da3d06e9d772bce5f0a12556b1",
+  "run_env_sha256": "3af9b7e084f818a54aa61999e9ff2df152014a0336b3782a7e1aafd185aa5783",
+  "model_commit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+  "model_tree": "6684c66f43cf413bccd48025380a69ebe2e428a9",
+  "metadata_bundle_sha256": "b88ed98ede7461842f15e4a835e106bb84fba9aa4a2ad4f0e99fff71ed8aebe0",
+  "normalized_manifest_sha256": "1053bacfc8d9017ec27ea43172571e81ff6b77735874bbf1fc38cbdf4d8c851c",
+  "records_sha256": "8ea59075e4fe69703375277d3180f92929744f0f43d8a25c925742d394120c0b",
+  "startup_profile": "clef-flash-fp8-cpu-v1",
+  "lfs_directory": "/home/birdetta/.cache/hyprstream-clef-oracle/20261018/production-v4-f2a82911-cd1a91985d586f1d/clef-lfs",
+  "lfs_objects": {
+    "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0": 243538016,
+    "7799d5c3a47b8f249d667a040e3fd538ccbf47bd958dc6f2aa52af8346aefa6b": 11910387016,
+    "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523": 19989325
+  },
+  "verified_snapshot_files": 21,
+  "expanded_bytes": 12174008714,
+  "canonical_metadata_repo": "/home/birdetta/.cache/hyprstream-clef-oracle/20261018/production-v4-f2a82911-cd1a91985d586f1d/data/hyprstream/instances/restart-acceptance-clef-t6-production-v4-cd1a91985d586f1d/models/clef-flash-fp8/clef-flash-fp8.git",
+  "libdir": "/home/birdetta/.cache/hyprstream-clef-oracle/20261018/native/lib",
+  "cpu_libraries": {
+    "libtorch_cpu.so": "5d87419bc35e2486ebd87b64db09dd728026817fbcad2aa5e36e5f2b814bcc47",
+    "libc10.so": "69781230f027449a6ba5449a2ca70bf1518b332831cb19c167144e1b56a261f9",
+    "libgomp-98b21ff3.so.1": "6b254201cafdc5389580d77139398a298f63ce3b139cfbcceade961ac0d721cb"
+  },
+  "shared_runtime_lock": "/home/birdetta/.cache/hyprstream-clef-oracle/20261018/runtime-model.lock",
+  "disk_free_bytes": 27059830784,
+  "tests_listed_only": true,
+  "inference_executed": false,
+  "receipt_review_required": true
+}

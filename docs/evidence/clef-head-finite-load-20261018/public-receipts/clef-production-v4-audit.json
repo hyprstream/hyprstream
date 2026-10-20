@@ -1,0 +1,140 @@
+{
+  "schema": "clef-production-from-env-cpu-audit/1",
+  "verdict": "PASS_SCOPED_PRODUCTION_FROM_ENV_AUTHENTICATED_NATIVE_CPU_SERVICE",
+  "executable_sha256": "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5",
+  "composition_identity": "f2a82911ea8b6344db43ee1587760376a795832d74728edca0341ae3deb42a0b",
+  "source_files_verified": 1553,
+  "service_receipt_sha256": "c0c855ff0229fdd83cfaf4684f909f74d15c6f7a78dda239db2d9819369ee72a",
+  "artifact_commit": "7b43c2d799e7b5e9fef96b6137840088d75af0d6",
+  "artifact_tree": "6684c66f43cf413bccd48025380a69ebe2e428a9",
+  "startup_profile": "clef-flash-fp8-cpu-v1",
+  "hydration_mapping_canonical_json_sha256": "5698f88b26670fb434b5be62b550004057922cfe7199105435cb6214e970b868",
+  "records": 5,
+  "questions": 11,
+  "probability_components": 36,
+  "matching_labels": 11,
+  "maximum_service_vs_corrected_fp8_probability_error": 5.681067705154419e-08,
+  "frozen_probability_atol": 1e-05,
+  "frozen_probability_rtol": 0,
+  "repeat_vector_atol": 1e-06,
+  "repeat_vector_rtol": 1e-06,
+  "observed_recovery_max_abs": {
+    "isolation_max_abs": 0.0,
+    "cancel_recovery_max_abs": 0.0,
+    "deadline_recovery_max_abs": 0.0,
+    "drain_recovery_max_abs": 0.0
+  },
+  "repeat_vector_evidence": "Exact source/build/executed fixture t6_close percomponent checks; vectors are not emitted independently in public receipt. Historical809 zero is an observation, not a stricter acceptance criterion.",
+  "auth_negative_evidence": "Exact reviewed fixture + clean terminal0 bind wrong-holder/eve/foreign/absent-tenant/expired denials before model admission; public service receipt does not persist individual denial responses.",
+  "midforward_deadline_and_signed_drain": true,
+  "actual_exit": 0,
+  "elapsed_seconds": 250.2182599779917,
+  "peak_rss_kib": 31202696,
+  "swaps": 0,
+  "vectors": [
+    {
+      "record_id": "text-joint-three",
+      "question_id": "a:color",
+      "kind": "choice",
+      "max_abs_probability_error": 9.313225746154785e-09,
+      "argmax_label": "a-blue"
+    },
+    {
+      "record_id": "text-joint-three",
+      "question_id": "score/quality",
+      "kind": "score",
+      "max_abs_probability_error": 0.0,
+      "argmax_label": "2"
+    },
+    {
+      "record_id": "text-joint-three",
+      "question_id": "z proposition",
+      "kind": "noul",
+      "max_abs_probability_error": 3.3527612686157227e-08,
+      "argmax_label": "true"
+    },
+    {
+      "record_id": "json-numeric-unicode",
+      "question_id": "11-level-score",
+      "kind": "score",
+      "max_abs_probability_error": 1.30385160446167e-08,
+      "argmax_label": "1"
+    },
+    {
+      "record_id": "json-numeric-unicode",
+      "question_id": "2 / choice",
+      "kind": "choice",
+      "max_abs_probability_error": 0.0,
+      "argmax_label": "10"
+    },
+    {
+      "record_id": "json-numeric-unicode",
+      "question_id": "κ?",
+      "kind": "noul",
+      "max_abs_probability_error": 0.0,
+      "argmax_label": "true"
+    },
+    {
+      "record_id": "question-order-a-z",
+      "question_id": "a",
+      "kind": "choice",
+      "max_abs_probability_error": 2.60770320892334e-08,
+      "argmax_label": "gamma"
+    },
+    {
+      "record_id": "question-order-a-z",
+      "question_id": "z",
+      "kind": "noul",
+      "max_abs_probability_error": 3.073364496231079e-08,
+      "argmax_label": "false"
+    },
+    {
+      "record_id": "question-order-z-a",
+      "question_id": "a",
+      "kind": "choice",
+      "max_abs_probability_error": 5.587935447692871e-09,
+      "argmax_label": "gamma"
+    },
+    {
+      "record_id": "question-order-z-a",
+      "question_id": "z",
+      "kind": "noul",
+      "max_abs_probability_error": 4.330649971961975e-08,
+      "argmax_label": "false"
+    },
+    {
+      "record_id": "explicit-state-truncation",
+      "question_id": "truncated?",
+      "kind": "noul",
+      "max_abs_probability_error": 5.681067705154419e-08,
+      "argmax_label": "false"
+    }
+  ],
+  "input_sha256": {
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-profile-native-build-manifest.json": "5a43593f1334e51f4c83330a1fae8c11882eee98c72579e9cea7f7b05a5234e9",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-profile-root-build-review.json": "b01b2a0bdd1288fc595229a837ce080d806fc6da3d06e9d772bce5f0a12556b1",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-full-native-source-manifest.json": "15174f668985e29a7875df297e5034680c0a336f9698061a7bc537d4c4e8f49f",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-activation-root-combined-source-freeze.json": "9c43a07b646555a6a0e339343cfd8a5c0aa01d045e07b53349a53226517f2f0f",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-combined-root-gate-receipt.json": "b81b9b01312441e54914e11de311ed28fde15095cfd4f4988852c28ac4437472",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/setup-receipt.json": "4020d118a35f00e59d3da39d29ed8f20807b4712d0f94e985ae0f611409bbcb9",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/run-start.json": "86d19a734c011672941adc8a874a3e3a52168ba4732f856cd518f4be48f7039d",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/run-result.json": "ca78f4ebfacf10eab640f23c30e5e512ff163fea90c3a332c035c27105a66e2a",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/service-receipt.json": "c0c855ff0229fdd83cfaf4684f909f74d15c6f7a78dda239db2d9819369ee72a",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/reference-oracle/full-f32-cpu-v1/records.json": "8ea59075e4fe69703375277d3180f92929744f0f43d8a25c925742d394120c0b",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/reference-oracle/t6-corrected-fp8-expected-v1.json": "75e4a24353ec1a71b19b4cf5689bf87b2e4677d0e77a569b921343dd9946b33f",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/resources.txt": "01ed61d090fb9de1ac424ef5432e6047234319345b9e14b65f872d0d6354a87c",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/artifacts/clef-production-profile-service-20261018T154931697553Z/hyprstream-clef-t6-tests": "e90affaa7a958b9b1528eae99a6a8882ff02314010cc378491c6195865bdadb5",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/progress-oversized-after.json": "cb416f404863eeeb1f446916188f626fdca1dd0174dd0cc031b5ac0cc7884f57",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/progress-timeout-zero-after.json": "4ce826b53ec8c46a89dd9c6d89f2af61063a90d0b28f9ea0b7efc77f7d4b7d84",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/progress-partial-deadline-after.json": "590c644162c49466447f4c4f46a78514b2602fe0aeb722e3a6c41f2de94e30d0",
+    "/home/birdetta/fleet-coord/execution/clef-flash-20261018/clef-production-v4-receipts/progress-signed-drain-after.json": "ed98a2f69ea3581dd07807f7387c51fd3cc257e4286b8fd23133118055ddda68"
+  },
+  "limitations": [
+    "R7 per-request client-disconnect cancellation/stock ADBC remains open; t6_complete false.",
+    "Five synthetic development records only; no task-quality/calibration/SLA/GPU/training-lab deployment or protected redeployment acceptance.",
+    "Authorization negatives and original holder/tenant checks are source+terminal-bound; no private JWT/order/credential material is read.",
+    "Eleven persisted order summaries; additional midforward order assertions are source-bound, not separate persisted order receipts.",
+    "Question schema presence/version checked; auditor does not reimplement native schema hashing.",
+    "Scalar recovery maxima do not replace vector comparisons; no invented scalar2e-6 bound."
+  ]
+}
