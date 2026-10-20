@@ -200,10 +200,10 @@ pub struct TuiService {
     vfs_proxy_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>>,
     /// Configured Federate TUI client-class id for the W1.3 consumer gate.
     /// `None` = the class is unconfigured: any credential carrying TUI
-    /// federate markers is denied (default-deny, the W1.1 invariant). Read
-    /// only by the postgres-gated gate; other builds deny TUI-markered
-    /// credentials unconditionally.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    /// federate markers is denied (default-deny, the W1.1 invariant). Also
+    /// serves as the marker-independent class pin: a credential whose
+    /// (iss, client_id) names the configured class is gated even with every
+    /// TUI marker stripped.
     federate_tui_client: Option<String>,
 }
 
@@ -261,6 +261,20 @@ impl TuiService {
     pub fn with_federate_tui_client(mut self, client: Option<String>) -> Self {
         self.federate_tui_client = client;
         self
+    }
+
+    /// Whether a credential is TUI-CLASSIFIED at this service: it carries
+    /// any TUI federate marker, or its (iss, client_id) equals this
+    /// service's audience and the configured TUI client id — the
+    /// marker-independent class pin, mirroring the www reserved
+    /// (iss, client_id) predicate, so a class-shaped credential with every
+    /// marker stripped still cannot fall through to generic handling.
+    fn is_federate_tui_classified(&self, claims: &hyprstream_rpc::auth::Claims) -> bool {
+        claims.has_federate_tui_profile_marker()
+            || self.federate_tui_client.as_deref().is_some_and(|client| {
+                claims.client_id.as_deref() == Some(client)
+                    && self.expected_audience.as_deref() == Some(claims.iss.as_str())
+            })
     }
 
     /// W1.3 consumer gate: admit a TUI-class federate credential for exactly
@@ -2105,15 +2119,16 @@ impl RequestService for TuiService {
         let request = body.root::<tui_capnp::tui_request::Reader<'_>>()?;
         let request_id = request.get_id();
 
-        // W1.3 consumer gate: a credential carrying TUI-class federate
-        // markers is admitted only after full class verification plus the
-        // scope this operation needs. Marker-less credentials take the
-        // pre-existing path unchanged; www-class credentials never reach
+        // W1.3 consumer gate: a TUI-classified credential (markers OR the
+        // class pin — see is_federate_tui_classified) is admitted only after
+        // full class verification, which REQUIRES the complete marker set,
+        // plus the scope this operation needs. Unclassified credentials take
+        // the pre-existing path unchanged; www-class credentials never reach
         // this service (the svc.rs deferred branch denies them here). The
         // mint path exists only in postgres builds, so other builds deny
-        // TUI-markered credentials unconditionally (fail-closed).
+        // classified credentials unconditionally (fail-closed).
         if let Some(claims) = _ctx.claims() {
-            if claims.has_federate_tui_profile_marker() {
+            if self.is_federate_tui_classified(claims) {
                 #[cfg(feature = "postgres")]
                 {
                     let required = federate_tui_required_scope(&request)?;
@@ -2963,6 +2978,42 @@ mod tests {
         assert!(service
             .admit_federate_tui(&wrong_client, "connect:tui:session")
             .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_class_pin_holds_with_all_markers_stripped() {
+        let service = gate_service(true);
+        // Every TUI marker stripped; the class pin (iss + configured
+        // client_id) still classifies the credential, and the gate denies
+        // it for the incomplete marker set.
+        let mut stripped = gate_claims("connect:tui:session");
+        stripped.hs_tui_profile = None;
+        stripped.hs_tui_signer_pq_key_v1 = None;
+        stripped.hs_tui_source_issuer_v1 = None;
+        stripped.hs_tui_source_subject_v1 = None;
+        assert!(!stripped.has_federate_tui_profile_marker());
+        assert!(service.is_federate_tui_classified(&stripped));
+        assert!(service
+            .admit_federate_tui(&stripped, "connect:tui:session")
+            .is_err());
+        // A credential naming a different client with no markers is NOT
+        // classified and keeps the legacy path (gate never applies).
+        let mut ordinary = gate_claims("connect:tui:session");
+        ordinary.hs_tui_profile = None;
+        ordinary.hs_tui_signer_pq_key_v1 = None;
+        ordinary.hs_tui_source_issuer_v1 = None;
+        ordinary.hs_tui_source_subject_v1 = None;
+        ordinary.client_id = Some("ordinary-local-client".into());
+        assert!(!service.is_federate_tui_classified(&ordinary));
+        // The pin requires the issuer to equal the service audience.
+        let mut wrong_iss = stripped.clone();
+        wrong_iss.iss = "https://other-cell.example".into();
+        assert!(!service.is_federate_tui_classified(&wrong_iss));
+        // Unconfigured service: the pin never fires; markers still classify.
+        let unconfigured = gate_service(false);
+        assert!(!unconfigured.is_federate_tui_classified(&stripped));
+        assert!(unconfigured.is_federate_tui_classified(&gate_claims("connect:tui:session")));
     }
 
     #[cfg(feature = "postgres")]

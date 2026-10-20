@@ -424,9 +424,20 @@ async fn w14_tui_credential_dispatch_intended_and_forbidden_services() -> Result
         );
     }
 
-    // Forbidden service: the same TUI credential cannot drive the Model
-    // service. It carries no registry|model consumer authority (no scopes,
-    // no MAC clearance), so the real Model authorization denies it.
+    // Forbidden services: a production-shaped TUI credential — carrying the
+    // subject's enrolled MAC clearance, as the production mint attaches — can
+    // never reach Registry/Model dispatch. The svc.rs class fence (any TUI
+    // marker + service name != "tui") denies BEFORE the handler, so the
+    // denial is attributable to the credential class alone: never to missing
+    // clearance, missing Policy grants, or an unavailable Policy.
+    let mut forbidden_claims = claims.clone();
+    forbidden_claims.clearance = Some(hyprstream_rpc::auth::mac::CredentialClearance::from_label(
+        hyprstream_rpc::auth::mac::SecurityLabel::new(
+            hyprstream_rpc::auth::mac::Level::Internal,
+            hyprstream_rpc::auth::mac::Assurance::PqHybrid,
+            hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
+        ),
+    ));
     let policy = hyprstream_rpc_std::policy_client::PolicyClient::for_local_transport_bootstrap(
         &transport,
         server.clone(),
@@ -449,58 +460,64 @@ async fn w14_tui_credential_dispatch_intended_and_forbidden_services() -> Result
         transport.clone(),
     )
     .await?;
-    let model_boundary = ModelForbiddenBoundary {
-        host: host.clone(),
-        model,
-        server: server.clone(),
-        transport: transport.clone(),
-        keys: Arc::new(
-            ClusterKeySource::new(*pair.ed25519(), host.as_str().into())
-                .with_ca_composite_key(pair.ml_dsa().clone()),
-        ),
-        revocations: hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
-        attempts: AtomicUsize::new(0),
-        calls: AtomicUsize::new(0),
-        authorization_errors: Mutex::new(Vec::new()),
-    };
-    let token = signer.sign(&claims).await?;
-    // The envelope must name the model service domain, or dispatch denies
-    // pre-handler on the domain mismatch and never exercises the real Model
-    // authorization this phase exists to test.
-    let bytes = signed_tui_request_bytes(
-        token.as_bytes(),
-        &body,
-        &holder,
-        &holder_pq,
-        &server,
-        "model",
-    )
-    .await?;
-    process_request(
-        &bytes,
-        &model_boundary,
-        hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
-        &model_boundary.server,
-        &envelope::InMemoryNonceCache::new(),
-        CarrierContext::iroh(),
-    )
-    .await?;
-    assert_eq!(model_boundary.attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(model_boundary.calls.load(Ordering::SeqCst), 0);
-    let errors = model_boundary.authorization_errors.lock();
-    assert_eq!(
-        errors.len(),
-        1,
-        "the TUI credential must be denied by real Model authorization"
-    );
+    let model = Arc::new(model);
+    for service_name in ["model", "registry"] {
+        let boundary = ModelForbiddenBoundary {
+            name: service_name,
+            host: host.clone(),
+            model: Arc::clone(&model),
+            server: server.clone(),
+            transport: transport.clone(),
+            keys: Arc::new(
+                ClusterKeySource::new(*pair.ed25519(), host.as_str().into())
+                    .with_ca_composite_key(pair.ml_dsa().clone()),
+            ),
+            revocations: hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            attempts: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            authorization_errors: Mutex::new(Vec::new()),
+        };
+        let token = signer.sign(&forbidden_claims).await?;
+        // The envelope names the forbidden service domain, so only the class
+        // fence stands between the credential and that service's handler.
+        let bytes = signed_tui_request_bytes(
+            token.as_bytes(),
+            &body,
+            &holder,
+            &holder_pq,
+            &server,
+            service_name,
+        )
+        .await?;
+        process_request(
+            &bytes,
+            &boundary,
+            hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+            &boundary.server,
+            &envelope::InMemoryNonceCache::new(),
+            CarrierContext::iroh(),
+        )
+        .await?;
+        assert_eq!(
+            boundary.attempts.load(Ordering::SeqCst),
+            0,
+            "the class fence must deny the TUI credential before the {service_name} handler"
+        );
+        assert_eq!(boundary.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            boundary.authorization_errors.lock().is_empty(),
+            "the {service_name} authorization path must never run"
+        );
+    }
     Ok(())
 }
 
 /// The Model service boundary for the forbidden-service negative: the real
 /// Model authorization path runs; the outer dispatch PEP stays a fixture.
 struct ModelForbiddenBoundary {
+    name: &'static str,
     host: FederateHost,
-    model: ModelService,
+    model: Arc<ModelService>,
     server: SigningKey,
     transport: TransportConfig,
     keys: Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
@@ -513,7 +530,7 @@ struct ModelForbiddenBoundary {
 #[async_trait(?Send)]
 impl RequestService for ModelForbiddenBoundary {
     fn name(&self) -> &str {
-        "model"
+        self.name
     }
     fn transport(&self) -> &TransportConfig {
         &self.transport
@@ -550,7 +567,7 @@ impl RequestService for ModelForbiddenBoundary {
         _: &DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        if let Err(error) = ModelHandler::authorize(&self.model, ctx, RESOURCE, "infer").await {
+        if let Err(error) = ModelHandler::authorize(&*self.model, ctx, RESOURCE, "infer").await {
             self.authorization_errors.lock().push(error.to_string());
             return Err(error);
         }
@@ -613,16 +630,16 @@ fn install_real_service_fixture_globals(
     Ok(())
 }
 
-/// Mint and sign a TUI-class credential for `scopes`, publishing its session
-/// exactly as the production mint path does (federate_host exchange).
-async fn signed_real_service_credential(
-    signer: &super::HybridFederateSigner,
+/// Mint TUI-class claims for `scopes`, publishing the session exactly as
+/// the production mint path does (federate_host exchange). Returns the
+/// unsigned claims so fixtures can mutate and re-sign them.
+async fn mint_real_service_claims(
     host: &FederateHost,
     holder: &SigningKey,
     holder_pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
     sid: &str,
     scopes: &[&str],
-) -> Result<String> {
+) -> Result<hyprstream_rpc::auth::Claims> {
     let now = chrono::Utc::now().timestamp();
     let session = hyprstream_session_store::Session {
         host: host.as_str().into(),
@@ -644,28 +661,43 @@ async fn signed_real_service_credential(
     let registry = hyprstream_rpc::auth::credential::global_session_registry()
         .expect("session registry installed")
         .clone();
-    hyprstream_rpc::auth::SessionRegistry::register_session(
-        registry.as_ref(),
-        hyprstream_rpc::auth::SessionKey::oidc(host.as_str(), sid),
-        hyprstream_rpc::auth::SessionState {
-            subject: DID.into(),
-            tenant: "tenant-a".into(),
-            kind: hyprstream_rpc::auth::SessionKind::Interactive,
-            created_at: now,
-            expires_at: session.expires_at,
-            status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
-            clearance_epoch: 0,
-        },
-    )
-    .await?;
-    let claims = federate_exchange::committed_claims_for_class(
+    let key = hyprstream_rpc::auth::SessionKey::oidc(host.as_str(), sid);
+    if registry.session_state(&key).await.is_none() {
+        hyprstream_rpc::auth::SessionRegistry::register_session(
+            registry.as_ref(),
+            key,
+            hyprstream_rpc::auth::SessionState {
+                subject: DID.into(),
+                tenant: "tenant-a".into(),
+                kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                created_at: now,
+                expires_at: session.expires_at,
+                status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .await?;
+    }
+    Ok(federate_exchange::committed_claims_for_class(
         &session,
         now,
         ISSUER,
         "opaque-sub",
         host,
         Some(TUI_CLIENT),
-    )?;
+    )?)
+}
+
+/// Mint and sign a TUI-class credential for `scopes`.
+async fn signed_real_service_credential(
+    signer: &super::HybridFederateSigner,
+    host: &FederateHost,
+    holder: &SigningKey,
+    holder_pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    sid: &str,
+    scopes: &[&str],
+) -> Result<String> {
+    let claims = mint_real_service_claims(host, holder, holder_pq, sid, scopes).await?;
     signer.sign(&claims).await
 }
 
@@ -807,6 +839,76 @@ async fn w13_tui_credential_drives_the_real_tui_service() -> Result<()> {
                 0,
                 "unconfigured TUI class must default-deny at the consumer"
             );
+
+            // Negatives through the REAL service: re-signed malformed
+            // fixtures (the class pin and gate deny each; no session is
+            // ever created). The session for this sid is registered, so the
+            // denial is attributable to the class gate, not the session
+            // check.
+            let base_claims = mint_real_service_claims(
+                &host,
+                &holder,
+                &holder_pq,
+                "tui-real-sid",
+                &["connect:tui:session"],
+            )
+            .await?;
+            let mut variants: Vec<hyprstream_rpc::auth::Claims> = Vec::new();
+            // All TUI markers stripped: the class pin (iss + configured
+            // client_id) still classifies the credential, and the gate
+            // denies the incomplete marker set.
+            let mut all_stripped = base_claims.clone();
+            all_stripped.hs_tui_profile = None;
+            all_stripped.hs_tui_signer_pq_key_v1 = None;
+            all_stripped.hs_tui_source_issuer_v1 = None;
+            all_stripped.hs_tui_source_subject_v1 = None;
+            variants.push(all_stripped);
+            // Each single-marker omission.
+            for omit in 0..4 {
+                let mut bad = base_claims.clone();
+                match omit {
+                    0 => bad.hs_tui_profile = None,
+                    1 => bad.hs_tui_signer_pq_key_v1 = None,
+                    2 => bad.hs_tui_source_issuer_v1 = None,
+                    _ => bad.hs_tui_source_subject_v1 = None,
+                }
+                variants.push(bad);
+            }
+            // Mixed: a www marker on a TUI-shaped credential (denied at the
+            // svc.rs deferred branch before the handler).
+            let mut mixed = base_claims.clone();
+            mixed.hs_profile = Some("federate-session-v1".into());
+            variants.push(mixed);
+            // Wrong client id with the complete marker set.
+            let mut wrong_client = base_claims.clone();
+            wrong_client.client_id = Some("other-client".into());
+            variants.push(wrong_client);
+            for (index, bad) in variants.iter().enumerate() {
+                let token = signer.sign(bad).await?;
+                let bytes = signed_tui_request_bytes(
+                    token.as_bytes(),
+                    &body,
+                    &holder,
+                    &holder_pq,
+                    &server,
+                    "tui",
+                )
+                .await?;
+                process_request(
+                    &bytes,
+                    &tui,
+                    hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                    &server,
+                    &envelope::InMemoryNonceCache::new(),
+                    CarrierContext::iroh(),
+                )
+                .await?;
+                assert_eq!(
+                    tui.test_session_count().await,
+                    0,
+                    "malformed TUI credential variant {index} attached a viewer"
+                );
+            }
 
             // Positive: the full-scope TUI credential attaches a viewer to a
             // real session on the real TuiService.

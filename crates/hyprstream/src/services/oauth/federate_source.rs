@@ -304,7 +304,7 @@ impl Commitment {
             ],
         )
     }
-    fn nonce(&self) -> String {
+    pub(crate) fn nonce(&self) -> String {
         format!("hsn1.{}", B64.encode(sha(&self.preimage())))
     }
     fn kids(&self) -> [[u8; 32]; 2] {
@@ -384,6 +384,14 @@ pub(crate) struct Verifier {
     keys: Mutex<Option<Keys>>,
     #[cfg(test)]
     responses: Option<parking_lot::Mutex<Vec<Result<Vec<u8>>>>>,
+}
+
+#[cfg(test)]
+impl Verifier {
+    /// Queue canned JWKS fetch responses (offline issuer-level fixtures).
+    pub(crate) fn set_test_responses(&mut self, responses: Vec<Result<Vec<u8>>>) {
+        self.responses = Some(parking_lot::Mutex::new(responses));
+    }
 }
 impl Verifier {
     #[cfg(test)]

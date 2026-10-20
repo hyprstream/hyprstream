@@ -25,7 +25,7 @@ const MAX_CODE: usize = 2048;
 /// fails closed before any signature or claim work. Callers that hold a
 /// [`Verifier`] must prefer `Verifier::resolve_client_class`, which applies
 /// the same rule against the verifier's own configured class.
-fn resolve_wire_class(
+pub(crate) fn resolve_wire_class(
     client_id: &str,
     tui_client: Option<&ClientClass>,
 ) -> Result<ClientClass, federate_source::Error> {
@@ -317,8 +317,7 @@ fn committed_session_shape(
     if session.host != host.as_str()
         || session.resource != host.as_str()
         || session.sid.is_empty()
-        || session.tenant.is_empty()
-        || session.tenant == "*"
+        || !crate::auth::valid_tenant_component(&session.tenant)
         || session.scopes.is_empty()
         || session.ed_public.iter().all(|byte| *byte == 0)
         || session.pq_public.len() != 1952
@@ -644,6 +643,43 @@ mod tests {
             collision_inventory_id: [3; 32],
             proof_epoch: 1,
             expires_at: 1_800_000_120,
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn malformed_tenant_is_rejected_at_mint_for_both_classes() {
+        // D4: the mint enforces the same tenant-component syntax as the HTTP
+        // authorization-domain middleware — for both client classes.
+        for bad_tenant in ["bad/tenant", "..", "a b", "*", ""] {
+            let mut session = committed_session();
+            session.tenant = bad_tenant.into();
+            assert!(
+                committed_claims_for_host(
+                    &session,
+                    1_800_000_000,
+                    federate_source::ISSUER,
+                    "subject",
+                    &federate_source::FederateHost::new(federate_source::HOST).unwrap(),
+                )
+                .is_err(),
+                "www mint accepted tenant {bad_tenant:?}"
+            );
+            let mut tui_session =
+                tui_session(&federate_source::FederateHost::new("https://vm-tui.example").unwrap());
+            tui_session.tenant = bad_tenant.into();
+            assert!(
+                committed_tui_claims_for_host(
+                    &tui_session,
+                    1_800_000_000,
+                    federate_source::ISSUER,
+                    "subject",
+                    &federate_source::FederateHost::new("https://vm-tui.example").unwrap(),
+                    TUI_CLIENT_ID,
+                )
+                .is_err(),
+                "TUI mint accepted tenant {bad_tenant:?}"
+            );
         }
     }
 

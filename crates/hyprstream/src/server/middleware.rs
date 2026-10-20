@@ -53,15 +53,9 @@ impl AuthenticatedUser {
     /// including for services.
     pub fn authorization_domain(&self) -> Result<String, &'static str> {
         if let Some(tenant) = self.verified_tenant.as_deref() {
-            let valid_component = !tenant.is_empty()
-                && tenant.len() <= 253
-                && tenant != "."
-                && tenant != ".."
-                && tenant != "*"
-                && tenant.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
-                });
-            if !valid_component {
+            // The canonical tenant-component rule (crate::auth); every
+            // tenant-carrying plane enforces the same syntax.
+            if !crate::auth::valid_tenant_component(tenant) {
                 return Err("invalid verified tenant");
             }
             return Ok(tenant.to_owned());

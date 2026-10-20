@@ -153,7 +153,13 @@ impl FederateIssuer {
         let challenge = source.challenge(prepared.binding, id, now)?;
         let response = ChallengeResponse {
             challenge_id: B64.encode(challenge.challenge_id()),
-            profile: "federate-session-v1",
+            // The class's own profile string: a TUI-class challenge must
+            // answer federate-tui-v1, not the www v1 pin.
+            profile: super::federate_exchange::resolve_wire_class(
+                request.client_id(),
+                self.verifier.tui_client(),
+            )?
+            .profile(),
             expires_in: challenge.expires_at() - now,
             granted_scope: challenge.granted_scope().to_owned(),
             transcript_b64u: B64.encode(challenge.transcript()),
@@ -197,7 +203,15 @@ impl FederateIssuer {
             .await
             .remove(&id)
             .ok_or(federate_source::Error::Invalid)?;
-        if pending.request.requested_scope() != request.requested_scope()
+        // The exchange must stay in the class the challenge was prepared
+        // under: a submitted client_id/hs_profile pair naming the OTHER
+        // class is cross-class substitution — it would apply the wrong
+        // Origin context pin (already checked above for the submitted
+        // class) while the proof, Policy commit, and mint all bind the
+        // challenge's original class. The one-use handle is already
+        // consumed above, so a mismatch denies the attempt entirely.
+        if pending.request.client_id() != request.client_id()
+            || pending.request.requested_scope() != request.requested_scope()
             || pending.request.subject_token() != request.subject_token()
         {
             return Err(federate_source::Error::Invalid);
@@ -512,5 +526,289 @@ mod tests {
             register_tui_session(&registry, &session, now).await,
             Err(federate_source::Error::Unavailable)
         ));
+    }
+    // ── Finding-3 fixtures: the exchange stays in the challenge's class ────
+
+    #[cfg(feature = "postgres")]
+    mod exchange_class_binding {
+        //! End-to-end through the real FederateIssuer: challenge in one
+        //! class, exchange submitted as the other. Both directions must
+        //! deny before source re-verification, possession, or Policy
+        //! commit. Offline RSA/JWKS fixtures only (disposable test key).
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+        use super::*;
+        use ed25519_dalek::Signer as _;
+        use hyprstream_rpc::crypto::pq::{ml_dsa_sign, ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes};
+        use serde_json::{json, Value};
+        use sha2::Digest as _;
+
+        const NOW: u64 = 1_800_000_000;
+        const CODE: &str = "TEST-CODE-NOT-LIVE";
+        const TUI_AUD: &str = "hyprstream-tui-aud";
+        const SCOPE: &str = "connect:tui:session";
+        const MODULUS: &str = "C97781230C20F14C2EB47FDD3AFBB4821EAC87003FF1A8240D1E840EE743E3EAF7A5F204503E15CFB42751AEDB97D76BE41DF559834957D283E4AC097283D18D19A12DCE56434FCA31BFC9635E721798A3D6AACC55FC8CAD559F74D66549EFC160AAD48DA9A2F860CCEA515DFEEEFA930E10B8BA5414CB26034B7352E53C7AAD5C4CE24528615705C737B7D4B554B1B4CE1A52F2D3439B42F67324B4F007691E46BE826EC6DC7CC65DD58FBF183B86DF537889EDBA5866BFD911A2AA27181C9EBD14C6DBACA28E3A37153BCD0018071101E6EA5A900812D194E6220A672EDB9FCA2C24C5486DCF981C3A2C9DC20B95E3D14875F9AF20993751BB8CBB6020678D";
+
+        fn encoding_key() -> jsonwebtoken::EncodingKey {
+            let pem: String = include_str!("federate_source/test-rsa.pem")
+                .lines()
+                .filter(|s| !s.starts_with('-'))
+                .collect();
+            jsonwebtoken::EncodingKey::from_rsa_der(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(pem)
+                    .unwrap(),
+            )
+        }
+
+        fn jwks() -> Value {
+            json!({"keys":[{"kty":"RSA","kid":"fixture","alg":"RS256","use":"sig","n":B64.encode(hex::decode(MODULUS).unwrap()),"e":"AQAB"}]})
+        }
+
+        fn token(claims: &Value) -> String {
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+            header.kid = Some("fixture".into());
+            jsonwebtoken::encode(&header, claims, &encoding_key()).unwrap()
+        }
+
+        struct StubAdmission {
+            commits: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl FederateAdmission for StubAdmission {
+            async fn prepare(
+                &self,
+                _source: &Source,
+                _requested: &str,
+                _challenge_id: [u8; 32],
+                _created_at: u64,
+            ) -> anyhow::Result<PreparedDecision> {
+                Ok(PreparedDecision {
+                    binding: AuthorityBinding {
+                        account: "account".into(),
+                        subject: "did:plc:abcdefghijklmnopqrstuvwx".into(),
+                        tenant: "tenant-a".into(),
+                        requested: SCOPE.into(),
+                        granted: SCOPE.into(),
+                        revision: "rev-1".into(),
+                    },
+                    policy_handle: vec![1; 32],
+                })
+            }
+            async fn commit(
+                &self,
+                _evidence: VerifiedPossession,
+                _policy_handle: Vec<u8>,
+            ) -> anyhow::Result<Session> {
+                self.commits
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("sentinel: reached Policy commit")
+            }
+        }
+
+        struct StubSigner;
+        #[async_trait::async_trait]
+        impl FederateSigner for StubSigner {
+            async fn sign(&self, _claims: &Claims) -> anyhow::Result<String> {
+                anyhow::bail!("sentinel: reached mint")
+            }
+        }
+
+        fn class_parts(tui: bool) -> (federate_source::ClientClass, &'static str, &'static str) {
+            if tui {
+                (
+                    federate_source::ClientClass::new(TUI_CLIENT, TUI_AUD, None).unwrap(),
+                    federate_source::TUI_PROFILE,
+                    TUI_AUD,
+                )
+            } else {
+                (
+                    federate_source::ClientClass::staging(),
+                    "federate-session-v1",
+                    federate_source::CLIENT,
+                )
+            }
+        }
+
+        struct Prepared {
+            issuer: FederateIssuer,
+            commits: Arc<std::sync::atomic::AtomicUsize>,
+            challenge_id: String,
+            transcript: Vec<u8>,
+            subject_token: String,
+        }
+
+        /// Run a full challenge in the given class against a real issuer
+        /// (real Verifier + offline JWKS, stub admission/signer).
+        async fn prepare_challenge(tui: bool) -> Prepared {
+            let (class, profile, aud) = class_parts(tui);
+            let host = federate_source::FederateHost::new(federate_source::HOST).unwrap();
+            let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let admission = Arc::new(StubAdmission {
+                commits: Arc::clone(&commits),
+            });
+            let mut issuer = FederateIssuer::new(
+                admission,
+                Arc::new(StubSigner),
+                host.clone(),
+                Some(federate_source::ClientClass::new(TUI_CLIENT, TUI_AUD, None).unwrap()),
+            )
+            .unwrap();
+            issuer.verifier.set_test_responses(
+                (0..4)
+                    .map(|_| Ok(serde_json::to_vec(&jwks()).unwrap()))
+                    .collect(),
+            );
+
+            let login_random = B64.encode([11; 32]);
+            let state = B64.encode([12; 32]);
+            let pkce = B64.encode([13; 32]);
+            let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let pq = ml_dsa_sk_from_seed(&[8; 32]);
+            let ed_public = B64.encode(ed.verifying_key().as_bytes());
+            let pq_public = B64.encode(ml_dsa_sk_to_vk_bytes(&pq));
+            let commitment = federate_source::Commitment::for_class(
+                host.clone(),
+                &class,
+                &login_random,
+                &state,
+                &pkce,
+                &ed_public,
+                &pq_public,
+            )
+            .unwrap();
+            let claims = json!({
+                "iss": federate_source::ISSUER,
+                "aud": aud,
+                "azp": class.client_id(),
+                "sub": "opaque-sub",
+                "jti": "source-id",
+                "iat": NOW,
+                "exp": NOW + 300,
+                "nonce": commitment.nonce(),
+                "c_hash": B64.encode(&sha2::Sha256::digest(CODE.as_bytes())[..16]),
+                "federated_claims": {"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"},
+            });
+            let subject_token = token(&claims);
+            let body = serde_json::to_vec(&json!({
+                "profile": profile,
+                "client_id": class.client_id(),
+                "subject_token": subject_token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                "authorization_code": CODE,
+                "resource": federate_source::HOST,
+                "scope": SCOPE,
+                "login_random": login_random,
+                "state": state,
+                "pkce_challenge": pkce,
+                "ed25519_public": ed_public,
+                "ml_dsa65_public": pq_public,
+            }))
+            .unwrap();
+            let mut headers = HeaderMap::new();
+            if !tui {
+                headers.insert(
+                    header::ORIGIN,
+                    axum::http::HeaderValue::from_static(federate_source::WEBSITE),
+                );
+            }
+            let response = issuer.challenge(&headers, &body, NOW).await.unwrap();
+            Prepared {
+                issuer,
+                commits,
+                challenge_id: response.challenge_id,
+                transcript: B64.decode(response.transcript_b64u).unwrap(),
+                subject_token,
+            }
+        }
+
+        fn exchange_form(prepared: &Prepared, tui: bool, transcript: &[u8]) -> String {
+            let (_class, profile, _aud) = class_parts(tui);
+            let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let pq = ml_dsa_sk_from_seed(&[8; 32]);
+            let ed_sig = ed.sign(transcript);
+            let pq_sig = ml_dsa_sign(&pq, transcript);
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair(
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                )
+                .append_pair("hs_profile", profile)
+                .append_pair(
+                    "client_id",
+                    if tui {
+                        TUI_CLIENT
+                    } else {
+                        federate_source::CLIENT
+                    },
+                )
+                .append_pair(
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:id_token",
+                )
+                .append_pair("subject_token", &prepared.subject_token)
+                .append_pair(
+                    "requested_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                )
+                .append_pair("resource", federate_source::HOST)
+                .append_pair("scope", SCOPE)
+                .append_pair("challenge_id", &prepared.challenge_id)
+                .append_pair("ed25519_signature", &B64.encode(ed_sig.to_bytes()))
+                .append_pair("ml_dsa65_signature", &B64.encode(pq_sig))
+                .finish()
+        }
+
+        #[tokio::test]
+        async fn exchange_stays_in_the_challenge_class_both_directions() {
+            // www challenge redeemed as TUI (native, no Origin): denied
+            // before Policy commit.
+            let prepared = prepare_challenge(false).await;
+            let form = exchange_form(&prepared, true, &prepared.transcript);
+            let result = prepared
+                .issuer
+                .exchange(&HeaderMap::new(), form.as_bytes(), NOW)
+                .await;
+            assert!(matches!(result, Err(federate_source::Error::Invalid)));
+            assert_eq!(
+                prepared.commits.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+
+            // TUI challenge redeemed as www (website Origin): denied before
+            // Policy commit.
+            let prepared = prepare_challenge(true).await;
+            let form = exchange_form(&prepared, false, &prepared.transcript);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ORIGIN,
+                axum::http::HeaderValue::from_static(federate_source::WEBSITE),
+            );
+            let result = prepared
+                .issuer
+                .exchange(&headers, form.as_bytes(), NOW)
+                .await;
+            assert!(matches!(result, Err(federate_source::Error::Invalid)));
+            assert_eq!(
+                prepared.commits.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+
+            // Control: a same-class exchange passes the class binding and
+            // reaches Policy commit (the stub's sentinel error).
+            let prepared = prepare_challenge(true).await;
+            let form = exchange_form(&prepared, true, &prepared.transcript);
+            let result = prepared
+                .issuer
+                .exchange(&HeaderMap::new(), form.as_bytes(), NOW)
+                .await;
+            let reached = prepared.commits.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                reached,
+                1,
+                "matched-class exchange must reach Policy commit: {:?}",
+                result.as_ref().err()
+            );
+            assert!(matches!(result, Err(federate_source::Error::Unavailable)));
+        }
     }
 }

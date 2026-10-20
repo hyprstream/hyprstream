@@ -1009,6 +1009,27 @@ fn w14_cross_class_substitution_is_denied_in_both_directions() {
 }
 
 #[test]
+fn w14_malformed_tenants_are_denied_by_both_consumers() {
+    // D4: the consumer enforces the same tenant-component syntax as the
+    // HTTP authorization-domain middleware.
+    let host = FederateHost::new(HOST).unwrap();
+    for bad_tenant in ["bad/tenant", "..", "a b", "*", ""] {
+        let mut tui = tui_claims();
+        tui.tenant = Some(bad_tenant.into());
+        assert!(
+            verify_tui_credential_claims(&tui, &host, TUI_CLIENT_ID).is_err(),
+            "TUI consumer accepted tenant {bad_tenant:?}"
+        );
+        let mut www = host_claims();
+        www.tenant = Some(bad_tenant.into());
+        assert!(
+            CredentialHandle::from_claims_snapshot(&www, "fixture-token").is_err(),
+            "www consumer accepted tenant {bad_tenant:?}"
+        );
+    }
+}
+
+#[test]
 fn w14_wrong_proof_keys_and_forbidden_services_are_denied() {
     let host = FederateHost::new(HOST).unwrap();
     // Wrong holder binding: the cnf.jwk does not decode to the claimed PQ

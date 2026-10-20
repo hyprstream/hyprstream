@@ -447,6 +447,14 @@ impl AdmissionService {
     }
 }
 
+/// D2 replay identity: derived ONLY from immutable authenticated fields —
+/// (issuer, client class) for the namespace and (jti, token_hash) for the
+/// credential identity. The commitment nonce (and any login_random/code/key
+/// material) is deliberately NOT part of the key: exactly one consumption of
+/// a signed source token must succeed regardless of client-supplied
+/// commitment inputs, and the device-flow variant (W1b) does not pin the
+/// nonce claim at all. The commitment/possession check remains a separate
+/// gate.
 fn source_credential_replay_key(source: &Source, client_id: &str) -> CredentialReplayKey {
     fn digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         let mut digest = Sha256::new();
@@ -465,11 +473,7 @@ fn source_credential_replay_key(source: &Source, client_id: &str) -> CredentialR
         ),
         credential_identity: digest(
             b"hyprstream-source-credential-identity-v1\0",
-            &[
-                source.jti.as_bytes(),
-                source.nonce.as_bytes(),
-                &source.token_hash,
-            ],
+            &[source.jti.as_bytes(), &source.token_hash],
         ),
     }
 }
@@ -579,6 +583,13 @@ fn candidate_tenants(
                     .get(tenant_index)
                     .filter(|tenant| !tenant.is_empty() && *tenant != "*")
                 {
+                    // D4: a malformed Policy tenant rejects the decision
+                    // outright — the same canonical syntax the HTTP
+                    // authorization-domain middleware enforces.
+                    ensure!(
+                        crate::auth::valid_tenant_component(tenant),
+                        "malformed Policy tenant in a federate grant"
+                    );
                     tenants.insert(tenant.clone());
                     ensure!(
                         tenants.len() <= MAX_FEDERATE_TENANT_MEMBERSHIPS,

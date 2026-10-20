@@ -195,8 +195,7 @@ impl CredentialHandle {
             || !bounded(subject, 256)
             || subject == "anonymous"
             || subject.starts_with("service:")
-            || !bounded(tenant, 256)
-            || tenant == "*"
+            || !crate::auth::valid_tenant_component(tenant)
             || !bounded(jti, 256)
             || generation == [0; 32]
             || claims.iat < 0
@@ -322,8 +321,7 @@ pub(crate) fn verify_tui_credential_claims(
         || !bounded(subject, 256)
         || subject == "anonymous"
         || subject.starts_with("service:")
-        || !bounded(tenant, 256)
-        || tenant == "*"
+        || !crate::auth::valid_tenant_component(tenant)
         || !bounded(jti, 256)
         || claims.iat < 0
         || claims.exp <= claims.iat

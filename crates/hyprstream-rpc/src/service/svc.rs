@@ -1713,6 +1713,19 @@ pub trait RequestService: 'static {
             return Ok(());
         }
 
+        // Federate TUI-class fence (W1.3): a credential carrying TUI markers
+        // authenticates through this normal path but dispatches ONLY on the
+        // tui service. The class carries no registry|model consumer
+        // authority, and the per-service Casbin layer does not intersect
+        // credential scopes — without this fence a TUI credential would act
+        // as a generic identity credential for its DID wherever that DID has
+        // independent grants and clearance. Marker-stripped class-shaped
+        // credentials (unmintable; the mint stamps the markers
+        // unconditionally) are the consumer's class pin to reject.
+        if verified.has_federate_tui_profile_marker() && self.name() != "tui" {
+            anyhow::bail!("Federate TUI credentials dispatch only on the tui service");
+        }
+
         // Credential/session checks. The local-issuer set is resolved first:
         // the credential profile makes `jti` REQUIRED on locally issued
         // tokens, and the session registry is a local authority — both

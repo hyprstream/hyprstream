@@ -571,6 +571,71 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
     );
 }
 
+// ── D2/D4: replay identity and tenant syntax ─────────────────────────────
+
+#[test]
+fn replay_identity_ignores_commitment_nonce_and_pins_the_client_class() {
+    // D2: consumption identity derives only from immutable authenticated
+    // fields — (issuer, client) namespace plus (jti, token_hash). The
+    // commitment nonce/login_random never enters the key, so exactly one
+    // consumption of a signed source token succeeds regardless of
+    // client-supplied commitment inputs.
+    let a = source();
+    let mut b = source();
+    b.nonce = "another-commitment-nonce".into();
+    assert_eq!(
+        super::source_credential_replay_key(&a, "client"),
+        super::source_credential_replay_key(&b, "client")
+    );
+    let mut other_jti = source();
+    other_jti.jti = "other-jti".into();
+    assert_ne!(
+        super::source_credential_replay_key(&a, "client"),
+        super::source_credential_replay_key(&other_jti, "client")
+    );
+    assert_ne!(
+        super::source_credential_replay_key(&a, "client"),
+        super::source_credential_replay_key(&a, TUI_CLIENT_ID)
+    );
+}
+
+#[tokio::test]
+async fn malformed_policy_tenant_rejects_the_federate_decision() {
+    // D4: a Policy grant carrying a tenant the HTTP middleware syntax would
+    // reject must fail the admission decision outright, for both classes.
+    for bad_tenant in ["bad/tenant", "..", "a b"] {
+        let (service, ctx) = fixture().await;
+        let authority = service.authority.as_ref().unwrap();
+        authority
+            .policy
+            .add_policy_with_domain(
+                ATPROTO_DID,
+                bad_tenant,
+                "model:qwen2.5-0.5b-instruct:main",
+                "infer",
+                "allow",
+            )
+            .await
+            .unwrap();
+        assert!(
+            service
+                .prepare_rpc(
+                    &ctx,
+                    "client",
+                    source(),
+                    vec![STAGING_SCOPE.to_owned()],
+                    [31; 32],
+                    chrono::Utc::now().timestamp(),
+                    [51; 32],
+                    vec![52; 1952],
+                )
+                .await
+                .is_err(),
+            "malformed Policy tenant {bad_tenant} was admitted"
+        );
+    }
+}
+
 // ── W1.2: the per-client grant/profile table beside the fixed www pin ─────
 
 const TUI_CLIENT_ID: &str = "hyprstream-tui-staging";
