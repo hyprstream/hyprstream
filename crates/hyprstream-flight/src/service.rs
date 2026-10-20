@@ -44,18 +44,55 @@ impl FlightAuthError {
     }
 }
 
+/// Caller identity returned by [`FlightAuthorizer::authorize_verified`] after
+/// the boundary verified the request against real credentials.
+///
+/// `tenant` is the tenant domain **copied from verified claims only** (never
+/// from request data); `None` means the authorizer does not expose tenants.
+/// Callers that require tenant isolation (the native decide operator) must
+/// treat `None` as fail-closed, and must reject empty or wildcard (`*`)
+/// domains at their own boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFlightContext {
+    pub tenant: Option<String>,
+    pub subject: String,
+    pub exp: Option<i64>,
+}
+
 /// Authentication and tenant-policy boundary for the Flight data plane.
 ///
 /// The implementation lives in the embedding binary so this leaf crate does
 /// not depend on Hyprstream's JWT or PolicyClient types.
 #[tonic::async_trait]
 pub trait FlightAuthorizer: Send + Sync {
+    /// Authorize the request. REQUIRED and behaviorally unchanged: this is the
+    /// boundary every existing Flight route already goes through.
     async fn authorize(
         &self,
         authorization: Option<&str>,
         resource: &str,
         operation: &str,
     ) -> Result<(), FlightAuthError>;
+
+    /// Authorize and return the verified caller context.
+    ///
+    /// Default: runs [`FlightAuthorizer::authorize`] exactly once and returns
+    /// a context with `tenant: None` — the conservative shape. Authorizers
+    /// that can copy the tenant domain from verified claims override this
+    /// method; they must not change their `authorize` semantics when doing so.
+    async fn authorize_verified(
+        &self,
+        authorization: Option<&str>,
+        resource: &str,
+        operation: &str,
+    ) -> Result<VerifiedFlightContext, FlightAuthError> {
+        self.authorize(authorization, resource, operation).await?;
+        Ok(VerifiedFlightContext {
+            tenant: None,
+            subject: String::new(),
+            exp: None,
+        })
+    }
 }
 
 /// Fail-closed default used by standalone constructors.
@@ -506,6 +543,52 @@ mod authorization_tests {
             authorizer
                 .authorize(Some("Bearer attacker"), "flight:*", "query")
                 .await,
+            Err(FlightAuthError::Unauthenticated(
+                "Flight authorization is not configured".to_owned()
+            ))
+        );
+    }
+
+    /// A minimal authorizer implementing ONLY the required `authorize` method:
+    /// the default `authorize_verified` must run it exactly once and must
+    /// NEVER invent a tenant/subject/exp.
+    struct AllowAllBareAuthorizer;
+
+    #[tonic::async_trait]
+    impl FlightAuthorizer for AllowAllBareAuthorizer {
+        async fn authorize(
+            &self,
+            _authorization: Option<&str>,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<(), FlightAuthError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_verified_context_never_invents_tenant() {
+        let authorizer = AllowAllBareAuthorizer;
+        assert_eq!(
+            authorizer
+                .authorize_verified(Some("Bearer whatever"), "flight:*", "decide")
+                .await,
+            Ok(VerifiedFlightContext {
+                tenant: None,
+                subject: String::new(),
+                exp: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_all_denies_through_verified_extension_too() {
+        let authorizer = DenyAllFlightAuthorizer;
+        assert_eq!(
+            authorizer
+                .authorize_verified(Some("Bearer attacker"), "flight:*", "decide")
+                .await
+                .map(|_| ()),
             Err(FlightAuthError::Unauthenticated(
                 "Flight authorization is not configured".to_owned()
             ))

@@ -7244,6 +7244,7 @@ dependencies = [
  "daemonize",
  "futures",
  "git2db",
+ "hyprstream-decision",
  "hyprstream-metrics",
  "nix 0.27.1",
  "num_cpus",
@@ -7264,6 +7265,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "users",
+ "uuid 1.18.1",
 ]
 
 [[package]]

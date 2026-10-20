@@ -68,6 +68,35 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
         resource: &str,
         operation: &str,
     ) -> Result<(), hyprstream_flight::FlightAuthError> {
+        self.verify_identity(authorization, resource, operation)
+            .await
+            .map(|_| ())
+    }
+
+    async fn authorize_verified(
+        &self,
+        authorization: Option<&str>,
+        resource: &str,
+        operation: &str,
+    ) -> Result<hyprstream_flight::VerifiedFlightContext, hyprstream_flight::FlightAuthError> {
+        self.verify_identity(authorization, resource, operation)
+            .await
+    }
+}
+
+impl TenantFlightAuthorizer {
+    /// The single verification path behind `authorize` and
+    /// `authorize_verified`: identical steps, identical order, identical
+    /// errors. Returns the verified identity copied from the validated JWT
+    /// claims (`verified_tenant` is never inferred or taken from request
+    /// data). The tenant-policy decision is unchanged: unreachable or
+    /// denying policy fails closed.
+    async fn verify_identity(
+        &self,
+        authorization: Option<&str>,
+        resource: &str,
+        operation: &str,
+    ) -> Result<hyprstream_flight::VerifiedFlightContext, hyprstream_flight::FlightAuthError> {
         let authorization = authorization.ok_or_else(|| {
             hyprstream_flight::FlightAuthError::Unauthenticated("Bearer token required".to_owned())
         })?;
@@ -109,6 +138,13 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
             token: Some(token.to_owned()),
             exp: Some(claims.exp),
         };
+        // Capture the verified context before `identity.user` moves into the
+        // policy check below.
+        let verified = hyprstream_flight::VerifiedFlightContext {
+            tenant: identity.verified_tenant.clone(),
+            subject: identity.user.clone(),
+            exp: identity.exp,
+        };
         let domain = identity.authorization_domain().map_err(|_| {
             hyprstream_flight::FlightAuthError::Forbidden(
                 "Verified hosted-account tenant binding required".to_owned(),
@@ -130,7 +166,7 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
         .await
         .unwrap_or(false);
         if allowed {
-            Ok(())
+            Ok(verified)
         } else {
             Err(hyprstream_flight::FlightAuthError::Forbidden(
                 "Flight request denied by tenant policy".to_owned(),
@@ -281,3 +317,6 @@ mod tests {
         assert_eq!(SERVICE_NAME, "flight");
     }
 }
+
+#[cfg(test)]
+mod flight_authorizer_tests;

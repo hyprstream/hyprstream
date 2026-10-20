@@ -17,11 +17,15 @@
 
 pub mod cli;
 pub mod client;
+pub mod decision;
 pub mod service;
 
 // Re-export main types
 pub use client::FlightClient;
-pub use service::{DenyAllFlightAuthorizer, FlightAuthError, FlightAuthorizer, FlightSqlServer};
+pub use service::{
+    DenyAllFlightAuthorizer, FlightAuthError, FlightAuthorizer, FlightSqlServer,
+    VerifiedFlightContext,
+};
 
 use hyprstream_metrics::storage::{duckdb::DuckDbBackend, StorageBackendType};
 use hyprstream_metrics::RegistryClient;
