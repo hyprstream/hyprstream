@@ -993,7 +993,7 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
     for shape in ["root", "nested"] {
         assert_eq!(
             output[shape]["valid"],
-            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]]})
+            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]],"zero-word-object":[[]]})
         );
         assert_eq!(
             output[shape]["rejected"],
