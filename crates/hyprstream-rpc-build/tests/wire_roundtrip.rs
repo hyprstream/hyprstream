@@ -78,6 +78,14 @@ mod wire_roundtrip_fixture_capnp {
 
 use wire_roundtrip_fixture_capnp::{wire_choice, wire_roundtrip};
 
+mod wire_data_evolution_capnp {
+    #![allow(clippy::all, clippy::pedantic, warnings)]
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/tests/wire_data_evolution_capnp.rs"
+    ));
+}
+
 /// Resolve the path to the `hyprstream-ts-codegen` binary of this package.
 ///
 /// cargo injects `CARGO_BIN_EXE_<name>` (hyphens → underscores) as a *runtime*
@@ -696,6 +704,7 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
         "valid": {
             "pointer": [[1, 2, 3]],
             "composite": [[1, 2, 3]],
+            "composite-padding": [[1, 2, 3]],
             "far": [[1, 2, 3]],
             "empty": [[]],
             "legacy-constructor": [[1, 2, 3]],
@@ -709,6 +718,9 @@ fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
             "composite-shape",
             "composite-body",
             "composite-kind",
+            "composite-stride",
+            "composite-body-overrun",
+            "composite-count-overflow",
             "segment-list-overrun",
             "segment-payload-overrun",
             "segment-payload-before-start",
@@ -735,6 +747,7 @@ fn root_data_lists_validate_wire_shape_and_segment_bounds() {
         "valid": {
             "pointer": [[1, 2, 3]],
             "composite": [[1, 2, 3]],
+            "composite-padding": [[1, 2, 3]],
             "far-outer-child": [[1, 2, 3]],
             "null-child": [[]],
             "empty": [],
@@ -751,6 +764,9 @@ fn root_data_lists_validate_wire_shape_and_segment_bounds() {
             "composite-body",
             "composite-tag-kind",
             "composite-tag-overrun",
+            "composite-stride",
+            "composite-body-overrun",
+            "composite-count-overflow",
             "far-child-payload-overrun",
         ],
     });
@@ -758,4 +774,118 @@ fn root_data_lists_validate_wire_shape_and_segment_bounds() {
         actual, expected,
         "generated CapnpReader accepted a malformed root List(Data) encoding"
     );
+}
+
+#[test]
+fn evolved_struct_lists_remain_readable_as_root_and_nested_data_lists() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    use wire_data_evolution_capnp::{item, new_outer, new_root, old_outer, old_root};
+    fn fill(mut items: capnp::struct_list::Builder<'_, item::Owned>) {
+        for (index, bytes) in [(0, &[1, 2, 3][..]), (1, &[4, 5][..])] {
+            let mut value = items.reborrow().get(index);
+            value.set_value(bytes);
+            value.set_extra(42 + u64::from(index));
+            value.set_extra_pointer("added pointer field");
+        }
+    }
+    for nested in [false, true] {
+        let mut message = capnp::message::Builder::new_default();
+        if nested {
+            let root = message.init_root::<new_outer::Builder<'_>>();
+            fill(root.init_nested().init_values(2));
+        } else {
+            let root = message.init_root::<new_root::Builder<'_>>();
+            fill(root.init_values(2));
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        let reader = capnp::serialize::read_message(
+            &mut bytes.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read evolved producer message");
+        let values = if nested {
+            reader
+                .get_root::<old_outer::Reader<'_>>()
+                .expect("old outer")
+                .get_nested()
+                .expect("old nested")
+                .get_values()
+                .expect("old values")
+        } else {
+            reader
+                .get_root::<old_root::Reader<'_>>()
+                .expect("old root")
+                .get_values()
+                .expect("old values")
+        };
+        let expected = json!([[1, 2, 3], [4, 5]]);
+        assert_eq!(
+            data_list_json(values),
+            expected,
+            "old Rust reader must accept evolved structs"
+        );
+        let file = wd.dir.join(if nested {
+            "evolved-nested.bin"
+        } else {
+            "evolved-root.bin"
+        });
+        fs::write(&file, bytes).expect("write evolved message");
+        let mode = if nested {
+            "evolved-nested-data-rust2ts"
+        } else {
+            "evolved-root-data-rust2ts"
+        };
+        assert_eq!(
+            wd.run(mode, &[file.to_str().expect("fixture path")]),
+            expected
+        );
+        // This independent capnp CLI fixture includes legal unused body words.
+        let padding: Value = serde_json::from_str(include_str!("wire_data_evolution_padding.json"))
+            .expect("padded evolution fixture");
+        let hex = padding[if nested {
+            "nested_wire_hex"
+        } else {
+            "root_wire_hex"
+        }]
+        .as_str()
+        .expect("wire hex");
+        let padded: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex byte"))
+            .collect();
+        let reader = capnp::serialize::read_message(
+            &mut padded.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read padded producer message");
+        let values = if nested {
+            reader
+                .get_root::<old_outer::Reader<'_>>()
+                .expect("old padded outer")
+                .get_nested()
+                .expect("old padded nested")
+                .get_values()
+                .expect("old padded values")
+        } else {
+            reader
+                .get_root::<old_root::Reader<'_>>()
+                .expect("old padded root")
+                .get_values()
+                .expect("old padded values")
+        };
+        let expected = json!([[1, 2, 3]]);
+        assert_eq!(
+            data_list_json(values),
+            expected,
+            "old Rust accepts padded evolved structs"
+        );
+        fs::write(&file, padded).expect("write padded message");
+        assert_eq!(
+            wd.run(mode, &[file.to_str().expect("fixture path")]),
+            expected
+        );
+    }
 }

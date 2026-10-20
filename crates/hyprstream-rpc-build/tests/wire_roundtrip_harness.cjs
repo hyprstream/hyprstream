@@ -67,7 +67,14 @@ function nestedDataReader(kind) {
     word(1, kind === 'composite-kind' ? 5 : (1 << 2) >>> 0, kind === 'composite-shape' ? 0 : 1 << 16);
     word(2, 5, (3 << 3) | 2);
     raw.set([1, 2, 3], 32);
-    if (kind === 'composite-body') word(0, 1, (2 << 3) | 7);
+    if (kind === 'composite-body') word(0, 1, 7); // insufficient body
+    if (kind === 'composite-padding') word(0, 1, (2 << 3) | 7);
+    if (kind === 'composite-stride') word(1, 1 << 2, (2 << 16) | 1);
+    if (kind === 'composite-body-overrun') {
+      word(0, 1, (8 << 3) | 7);
+      word(1, 1 << 2, (2 << 16) | 1);
+    }
+    if (kind === 'composite-count-overflow') word(1, 0x80000000, 1 << 16);
   } else if (segmented) {
     if (kind === 'segment-payload-before-start') {
       word(3, 1, (1 << 3) | 6);
@@ -159,12 +166,14 @@ function rootDataReader(kind) {
     word(16, 0, 1); // non-null struct pointer in a List(Data) slot
   } else if (kind === 'empty') {
     word(16, 0, 0);
-  } else if (kind === 'composite' || kind === 'composite-shape' || kind === 'composite-body' || kind === 'composite-tag-kind' || kind === 'composite-tag-overrun') {
-    const bodyWords = kind === 'composite-body' ? 2 : 1;
+  } else if (kind.startsWith('composite')) {
+    const bodyWords = kind === 'composite-body' ? 0 : kind === 'composite-padding' ? 2 : kind === 'composite-body-overrun' ? 8 : 1;
     word(16, 1, (bodyWords << 3) | 7);
     word(24, kind === 'composite-tag-kind' ? 5 : 1 << 2, kind === 'composite-shape' ? 0 : 1 << 16);
     word(32, 5, (3 << 3) | 2);
     raw.set([1, 2, 3], 48);
+    if (kind === 'composite-stride' || kind === 'composite-body-overrun') word(24, 1 << 2, (2 << 16) | 1);
+    if (kind === 'composite-count-overflow') word(24, 0x80000000, 1 << 16);
   } else if (kind === 'list-before-start') {
     word(16, ((-3 << 2) | 1) >>> 0, (1 << 3) | 6);
   } else if (kind === 'null-child') {
@@ -252,14 +261,20 @@ function main() {
     out(parseWireChoice(readBytes(arg1)));
     return;
   }
+  if (mode === 'evolved-root-data-rust2ts' || mode === 'evolved-nested-data-rust2ts') {
+    const reader = new CapnpReader(readBytes(arg1), 0, 1);
+    const oldReader = mode === 'evolved-root-data-rust2ts' ? reader : reader.getStruct(0, 0, 1);
+    out(oldReader.getDataList(0));
+    return;
+  }
   if (mode === 'struct-data-lists') {
     const valid = {};
-    for (const kind of ['pointer', 'composite', 'far', 'empty', 'wrong-element-kind']) {
+    for (const kind of ['pointer', 'composite', 'composite-padding', 'far', 'empty', 'wrong-element-kind']) {
       valid[kind] = nestedDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
     valid['legacy-constructor'] = legacyStructReader().getDataList(0).map((bytes) => Array.from(bytes));
     const rejected = [];
-    for (const kind of ['truncated', 'invalid', 'double-far', 'invalid-far-segment', 'composite-shape', 'composite-body', 'composite-kind', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end', 'segment-pointer-slot-overrun']) {
+    for (const kind of ['truncated', 'invalid', 'double-far', 'invalid-far-segment', 'composite-shape', 'composite-body', 'composite-kind', 'composite-stride', 'composite-body-overrun', 'composite-count-overflow', 'segment-list-overrun', 'segment-payload-overrun', 'segment-payload-before-start', 'far-pad-overrun', 'segment-declared-end', 'segment-pointer-slot-overrun']) {
       try { nestedDataReader(kind).getDataList(0); }
       catch { rejected.push(kind); }
     }
@@ -268,11 +283,11 @@ function main() {
   }
   if (mode === 'root-data-lists') {
     const valid = {};
-    for (const kind of ['pointer', 'composite', 'far-outer-child', 'null-child', 'empty']) {
+    for (const kind of ['pointer', 'composite', 'composite-padding', 'far-outer-child', 'null-child', 'empty']) {
       valid[kind] = rootDataReader(kind).getDataList(0).map((bytes) => Array.from(bytes));
     }
     const rejected = [];
-    for (const kind of ['invalid-far-pad', 'invalid-outer-kind', 'invalid-child-kind', 'segment-list-overrun', 'segment-payload-overrun', 'payload-before-start', 'list-before-start', 'composite-shape', 'composite-body', 'composite-tag-kind', 'composite-tag-overrun', 'far-child-payload-overrun']) {
+    for (const kind of ['invalid-far-pad', 'invalid-outer-kind', 'invalid-child-kind', 'segment-list-overrun', 'segment-payload-overrun', 'payload-before-start', 'list-before-start', 'composite-shape', 'composite-body', 'composite-tag-kind', 'composite-tag-overrun', 'composite-stride', 'composite-body-overrun', 'composite-count-overflow', 'far-child-payload-overrun']) {
       try { rootDataReader(kind).getDataList(0); }
       catch { rejected.push(kind); }
     }

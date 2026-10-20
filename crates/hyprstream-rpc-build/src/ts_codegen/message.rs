@@ -1476,37 +1476,46 @@ export class CapnpReader {
 
     // Pointer list (element_size=6, the canonical List(Data) encoding — what
     // the Rust side emits) or composite list (element_size=7): both carry one
-    // pointer per element, differing only in where the count lives and where
-    // the elements start.
+    // pointer per logical element. A composite element can also carry added
+    // data and pointer fields after schema evolution.
     let elementCount: number;
     let elemBase: number;
+    let strideWords = 1;
+    let firstPointerWords = 0;
+    let bodyWords: number;
     const bounds = this.segmentBounds(offset);
     if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
+      bodyWords = elementCount;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
       if (targetOffset < bounds.start || targetOffset + WORD_SIZE > bounds.end) throw new Error('Truncated List(Data) composite tag');
       const tagLo = this.buf.getUint32(targetOffset, true);
       const tagHi = this.buf.getUint32(targetOffset + 4, true);
       if ((tagLo & 3) !== 0) throw new Error('Invalid List(Data) composite tag');
-      elementCount = (tagLo >> 2) | 0;
+      elementCount = tagLo >>> 2;
       const dataWords = tagHi & 0xFFFF;
       const ptrWords = tagHi >>> 16;
-      const bodyWords = hi >>> 3;
-      if (dataWords !== 0 || ptrWords !== 1 || bodyWords !== elementCount) throw new Error('Invalid List(Data) composite element shape');
+      bodyWords = hi >>> 3;
+      strideWords = dataWords + ptrWords;
+      firstPointerWords = dataWords;
+      // Schema evolution can widen each element with data or more pointers.
+      // The old List(Data) view reads its first pointer and skips the full
+      // element stride. Like capnp-rust, allow unused declared body words.
+      if (ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
     if (targetOffset < bounds.start || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > bounds.end ||
-        elemBase < bounds.start || elemBase > bounds.end || elementCount > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {
+        elemBase < bounds.start || elemBase > bounds.end || bodyWords > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {
       throw new Error('Truncated List(Data) pointer list');
     }
 
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = elemBase + i * WORD_SIZE;
+      const elemOffset = elemBase + (i * strideWords + firstPointerWords) * WORD_SIZE;
       const elemLo = this.buf.getUint32(elemOffset, true);
       const elemHi = this.buf.getUint32(elemOffset + 4, true);
 
@@ -1959,33 +1968,42 @@ export class StructReader {
     // accept both just like CapnpReader.getDataList does.
     let elementCount: number;
     let elemBase: number;
+    let strideWords = 1;
+    let firstPointerWords = 0;
+    let bodyWords: number;
     const bounds = this.segmentBounds(offset);
     if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
+      bodyWords = elementCount;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
       if (targetOffset < bounds.start || targetOffset + WORD_SIZE > bounds.end) throw new Error('Truncated List(Data) composite tag');
       const tagLo = this.buf.getUint32(targetOffset, true);
       const tagHi = this.buf.getUint32(targetOffset + 4, true);
       if ((tagLo & 3) !== 0) throw new Error('Invalid List(Data) composite tag');
-      elementCount = (tagLo >> 2) | 0;
+      elementCount = tagLo >>> 2;
       const dataWords = tagHi & 0xFFFF;
       const ptrWords = tagHi >>> 16;
-      const bodyWords = hi >>> 3;
-      if (dataWords !== 0 || ptrWords !== 1 || bodyWords !== elementCount) throw new Error('Invalid List(Data) composite element shape');
+      bodyWords = hi >>> 3;
+      strideWords = dataWords + ptrWords;
+      firstPointerWords = dataWords;
+      // Schema evolution can widen each element with data or more pointers.
+      // The old List(Data) view reads its first pointer and skips the full
+      // element stride. Like capnp-rust, allow unused declared body words.
+      if (ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
     if (targetOffset < bounds.start || targetOffset + (elementSize === 7 ? WORD_SIZE : 0) > bounds.end ||
-        elemBase < bounds.start || elemBase > bounds.end || elementCount > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {
+        elemBase < bounds.start || elemBase > bounds.end || bodyWords > Math.floor((bounds.end - elemBase) / WORD_SIZE)) {
       throw new Error('Truncated List(Data) pointer list');
     }
 
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = elemBase + i * WORD_SIZE;
+      const elemOffset = elemBase + (i * strideWords + firstPointerWords) * WORD_SIZE;
       const rawLo = this.buf.getUint32(elemOffset, true);
       const rawHi = this.buf.getUint32(elemOffset + 4, true);
       if (rawLo === 0 && rawHi === 0) { results.push(new Uint8Array(0)); continue; }
@@ -2212,54 +2230,4 @@ export class StructReader {
 /** Backwards-compatible alias — prefer CapnpArena for new code. */
 export const CapnpMessageBuilder = CapnpArena;
 "##.to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::generate_capnp_runtime;
-
-    #[test]
-    fn struct_data_list_decoder_resolves_and_bounds_pointer_list_children() {
-        let runtime = generate_capnp_runtime();
-        let struct_reader = runtime
-            .split("export class StructReader")
-            .nth(1)
-            .expect("StructReader runtime");
-        let decoder = struct_reader
-            .split("  getDataList(ptrIndex: number): Uint8Array[] {")
-            .nth(1)
-            .expect("StructReader.getDataList runtime");
-        for required in [
-            "if (elementSize === 6)",
-            "if (elementSize === 7)",
-            "this.resolvePtr(elemOffset)",
-            "this.segmentBounds(offset)",
-            "bodyWords !== elementCount",
-            "this.segmentBounds(child.offset)",
-            "(tagLo & 3) !== 0",
-            "(child.hi & 7) !== 2",
-            "byteCount > childBounds.end - dataOffset",
-            "Invalid List(Data) element pointer",
-            "Invalid List(Data) composite element shape",
-        ] {
-            assert!(
-                decoder.contains(required),
-                "missing `{required}` in generated decoder"
-            );
-        }
-        for required in [
-            "this.segmentBoundsForIndex(segmentId)",
-            "targetOffset + WORD_SIZE > targetBounds.end",
-            "this.segmentOffsets, this.segmentEnds",
-        ] {
-            assert!(
-                struct_reader.contains(required),
-                "missing `{required}` in generated StructReader"
-            );
-        }
-        assert!(
-            runtime.contains("this.segmentEnds.push(offset)"),
-            "segment end tracking missing from generated CapnpReader"
-        );
-    }
 }
