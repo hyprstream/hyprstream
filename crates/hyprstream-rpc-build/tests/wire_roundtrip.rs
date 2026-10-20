@@ -78,6 +78,14 @@ mod wire_roundtrip_fixture_capnp {
 
 use wire_roundtrip_fixture_capnp::{wire_choice, wire_roundtrip};
 
+mod wire_data_evolution_capnp {
+    #![allow(clippy::all, clippy::pedantic, warnings)]
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/tests/wire_data_evolution_capnp.rs"
+    ));
+}
+
 /// Resolve the path to the `hyprstream-ts-codegen` binary of this package.
 ///
 /// cargo injects `CARGO_BIN_EXE_<name>` (hyphens → underscores) as a *runtime*
@@ -680,6 +688,325 @@ fn choice_roundtrip_both_directions() {
         assert!(
             values_equal(&ts_parse, &rust_read),
             "Rust→TS WireChoice ({arm}) mismatch: ts_parse={ts_parse:#} rust_read={rust_read:#}"
+        );
+    }
+}
+
+#[test]
+fn nested_struct_data_lists_validate_wire_shape_and_segment_bounds() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+
+    let actual = wd.run("struct-data-lists", &[]);
+    let expected = json!({
+        "valid": {
+            "pointer": [[1, 2, 3]],
+            "composite": [[1, 2, 3]],
+            "composite-padding": [[1, 2, 3]],
+            "far": [[1, 2, 3]],
+            "empty": [[]],
+            "legacy-constructor": [[1, 2, 3]],
+            "wrong-element-kind": [],
+        },
+        "rejected": [
+            "truncated",
+            "invalid",
+            "malformed-double-far",
+            "invalid-far-segment",
+            "composite-shape",
+            "composite-body",
+            "composite-kind",
+            "composite-stride",
+            "composite-body-overrun",
+            "composite-count-overflow",
+            "segment-list-overrun",
+            "segment-payload-overrun",
+            "segment-payload-before-start",
+            "far-pad-overrun",
+            "segment-declared-end",
+            "segment-pointer-slot-overrun",
+        ],
+    });
+    assert_eq!(
+        actual, expected,
+        "generated StructReader accepted a malformed nested List(Data) encoding"
+    );
+}
+
+#[test]
+fn root_data_lists_validate_wire_shape_and_segment_bounds() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+
+    let actual = wd.run("root-data-lists", &[]);
+    let expected = json!({
+        "valid": {
+            "pointer": [[1, 2, 3]],
+            "composite": [[1, 2, 3]],
+            "composite-padding": [[1, 2, 3]],
+            "far-outer-child": [[1, 2, 3]],
+            "null-child": [[]],
+            "empty": [],
+        },
+        "rejected": [
+            "invalid-far-pad",
+            "invalid-outer-kind",
+            "invalid-child-kind",
+            "segment-list-overrun",
+            "segment-payload-overrun",
+            "payload-before-start",
+            "list-before-start",
+            "composite-shape",
+            "composite-body",
+            "composite-tag-kind",
+            "composite-tag-overrun",
+            "composite-stride",
+            "composite-body-overrun",
+            "composite-count-overflow",
+            "far-child-payload-overrun",
+        ],
+    });
+    assert_eq!(
+        actual, expected,
+        "generated CapnpReader accepted a malformed root List(Data) encoding"
+    );
+}
+
+#[test]
+fn evolved_struct_lists_remain_readable_as_root_and_nested_data_lists() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    use wire_data_evolution_capnp::{item, new_outer, new_root, old_outer, old_root};
+    fn fill(mut items: capnp::struct_list::Builder<'_, item::Owned>) {
+        for (index, bytes) in [(0, &[1, 2, 3][..]), (1, &[4, 5][..])] {
+            let mut value = items.reborrow().get(index);
+            value.set_value(bytes);
+            value.set_extra(42 + u64::from(index));
+            value.set_extra_pointer("added pointer field");
+        }
+    }
+    for nested in [false, true] {
+        let mut message = capnp::message::Builder::new_default();
+        if nested {
+            let root = message.init_root::<new_outer::Builder<'_>>();
+            fill(root.init_nested().init_values(2));
+        } else {
+            let root = message.init_root::<new_root::Builder<'_>>();
+            fill(root.init_values(2));
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        let reader = capnp::serialize::read_message(
+            &mut bytes.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read evolved producer message");
+        let values = if nested {
+            reader
+                .get_root::<old_outer::Reader<'_>>()
+                .expect("old outer")
+                .get_nested()
+                .expect("old nested")
+                .get_values()
+                .expect("old values")
+        } else {
+            reader
+                .get_root::<old_root::Reader<'_>>()
+                .expect("old root")
+                .get_values()
+                .expect("old values")
+        };
+        let expected = json!([[1, 2, 3], [4, 5]]);
+        assert_eq!(
+            data_list_json(values),
+            expected,
+            "old Rust reader must accept evolved structs"
+        );
+        let file = wd.dir.join(if nested {
+            "evolved-nested.bin"
+        } else {
+            "evolved-root.bin"
+        });
+        fs::write(&file, bytes).expect("write evolved message");
+        let mode = if nested {
+            "evolved-nested-data-rust2ts"
+        } else {
+            "evolved-root-data-rust2ts"
+        };
+        assert_eq!(
+            wd.run(mode, &[file.to_str().expect("fixture path")]),
+            expected
+        );
+        // This independent capnp CLI fixture includes legal unused body words.
+        let padding: Value = serde_json::from_str(include_str!("wire_data_evolution_padding.json"))
+            .expect("padded evolution fixture");
+        let hex = padding[if nested {
+            "nested_wire_hex"
+        } else {
+            "root_wire_hex"
+        }]
+        .as_str()
+        .expect("wire hex");
+        let padded: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex byte"))
+            .collect();
+        let reader = capnp::serialize::read_message(
+            &mut padded.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read padded producer message");
+        let values = if nested {
+            reader
+                .get_root::<old_outer::Reader<'_>>()
+                .expect("old padded outer")
+                .get_nested()
+                .expect("old padded nested")
+                .get_values()
+                .expect("old padded values")
+        } else {
+            reader
+                .get_root::<old_root::Reader<'_>>()
+                .expect("old padded root")
+                .get_values()
+                .expect("old padded values")
+        };
+        let expected = json!([[1, 2, 3]]);
+        assert_eq!(
+            data_list_json(values),
+            expected,
+            "old Rust accepts padded evolved structs"
+        );
+        fs::write(&file, padded).expect("write padded message");
+        assert_eq!(
+            wd.run(mode, &[file.to_str().expect("fixture path")]),
+            expected
+        );
+    }
+}
+
+#[test]
+fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    use capnp::message::{AllocationStrategy, HeapAllocator};
+    use wire_data_evolution_capnp::{new_outer, new_root, old_outer, old_root};
+    for nested in [false, true] {
+        // Fill the first segment exactly. Widening List(Data) to List(Item)
+        // transfers its near Data pointers into a new segment. The full old
+        // segment cannot hold a one-word landing pad, forcing Rust's actual
+        // transfer_pointer_split double-far path for both values.
+        let allocator = HeapAllocator::new()
+            .first_segment_words(if nested { 7 } else { 6 })
+            .allocation_strategy(AllocationStrategy::FixedSize);
+        let mut message = capnp::message::Builder::new(allocator);
+        {
+            let mut values = if nested {
+                message
+                    .init_root::<old_outer::Builder<'_>>()
+                    .init_nested()
+                    .init_values(2)
+            } else {
+                message.init_root::<old_root::Builder<'_>>().init_values(2)
+            };
+            values.set(0, &[1, 2, 3]);
+            values.set(1, &[4, 5]);
+        }
+        if nested {
+            let _ = message
+                .get_root::<new_outer::Builder<'_>>()
+                .expect("new outer")
+                .get_nested()
+                .expect("new nested")
+                .get_values()
+                .expect("upgrade nested values");
+        } else {
+            let _ = message
+                .get_root::<new_root::Builder<'_>>()
+                .expect("new root")
+                .get_values()
+                .expect("upgrade root values");
+        }
+        let segments = message.get_segments_for_output();
+        let double_far_count = segments
+            .iter()
+            .flat_map(|segment| segment.chunks_exact(8))
+            .filter(|word| word[0] & 7 == 6)
+            .count();
+        assert!(
+            segments.len() >= 3 && double_far_count >= 2,
+            "actual Rust upgrade must emit double-far child pointers"
+        );
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        let reader = capnp::serialize::read_message(
+            &mut bytes.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read Rust double-far message");
+        let values = if nested {
+            reader
+                .get_root::<old_outer::Reader<'_>>()
+                .expect("old outer")
+                .get_nested()
+                .expect("old nested")
+                .get_values()
+                .expect("old values")
+        } else {
+            reader
+                .get_root::<old_root::Reader<'_>>()
+                .expect("old root")
+                .get_values()
+                .expect("old values")
+        };
+        let expected = json!([[1, 2, 3], [4, 5]]);
+        assert_eq!(
+            data_list_json(values),
+            expected,
+            "reference Rust reader accepts its actual transfer output"
+        );
+        let file = wd.dir.join(if nested {
+            "double-far-nested.bin"
+        } else {
+            "double-far-root.bin"
+        });
+        fs::write(&file, bytes).expect("write actual Rust transfer output");
+        assert_eq!(
+            wd.run(
+                if nested {
+                    "evolved-nested-data-rust2ts"
+                } else {
+                    "evolved-root-data-rust2ts"
+                },
+                &[file.to_str().expect("fixture path")]
+            ),
+            expected
+        );
+    }
+    let output = wd.run("double-far-data-lists", &[]);
+    for shape in ["root", "nested"] {
+        assert_eq!(
+            output[shape]["valid"],
+            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]]})
+        );
+        assert_eq!(
+            output[shape]["rejected"],
+            json!([
+                "pad-overrun",
+                "pad-kind",
+                "pad-double",
+                "object-segment",
+                "tag-kind",
+                "object-overrun",
+                "payload-overrun",
+                "object-declared-end"
+            ])
         );
     }
 }

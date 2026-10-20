@@ -15,11 +15,14 @@
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let schema = format!("{manifest}/tests/wire_roundtrip_fixture.capnp");
+    let evolution = format!("{manifest}/tests/wire_data_evolution.capnp");
 
     capnpc::CompilerCommand::new()
         .file(&schema)
+        .file(&evolution)
         .run()
         .expect("compile tests/wire_roundtrip_fixture.capnp (capnp-rust codegen for #807)");
 
     println!("cargo::rerun-if-changed={schema}");
+    println!("cargo::rerun-if-changed={evolution}");
 }
