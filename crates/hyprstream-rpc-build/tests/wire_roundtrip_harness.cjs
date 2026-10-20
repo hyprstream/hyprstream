@@ -492,6 +492,80 @@ function main() {
     });
     return;
   }
+  if (mode === 'text-list-materialization-budget') {
+    const textBytes = 9 * 1024 * 1024;
+    const listPointer = (view, offset, targetOffset, byteCount) => {
+      const offsetWords = (targetOffset - offset - 8) / 8;
+      view.setUint32(offset, (offsetWords << 2) | 1, true);
+      view.setUint32(offset + 4, (byteCount << 3) | 2, true);
+    };
+    const setPayload = (bytes, offset) => {
+      bytes.fill(0x61, offset, offset + textBytes - 1);
+      bytes[offset + textBytes - 1] = 0;
+    };
+    const rootReader = (composite) => {
+      const payloadOffset = composite ? 64 : 40;
+      const bytes = new Uint8Array(payloadOffset + textBytes + 8);
+      const view = new DataView(bytes.buffer);
+      const segmentWords = Math.ceil((bytes.length - 8) / 8);
+      view.setUint32(0, 0, true);
+      view.setUint32(4, segmentWords, true);
+      view.setUint32(8, 0, true);
+      view.setUint32(12, 1 << 16, true);
+      if (composite) {
+        view.setUint32(16, 1, true);
+        view.setUint32(20, (4 << 3) | 7, true);
+        view.setUint32(24, 2 << 2, true);
+        view.setUint32(28, (1 << 16) | 1, true);
+        listPointer(view, 40, payloadOffset, textBytes);
+        view.setUint32(48, 0x12345678, true);
+        view.setUint32(52, 0, true);
+        listPointer(view, 56, payloadOffset, textBytes);
+      } else {
+        view.setUint32(16, 1, true);
+        view.setUint32(20, (2 << 3) | 6, true);
+        listPointer(view, 24, payloadOffset, textBytes);
+        listPointer(view, 32, payloadOffset, textBytes);
+      }
+      setPayload(bytes, payloadOffset);
+      return new CapnpReader(bytes, 0, 1);
+    };
+    const structReader = (composite) => {
+      const payloadOffset = composite ? 56 : 32;
+      const bytes = new Uint8Array(payloadOffset + textBytes + 8);
+      const view = new DataView(bytes.buffer);
+      if (composite) {
+        view.setUint32(8, 1, true);
+        view.setUint32(12, (4 << 3) | 7, true);
+        view.setUint32(16, 2 << 2, true);
+        view.setUint32(20, (1 << 16) | 1, true);
+        view.setUint32(24, 0x12345678, true);
+        view.setUint32(28, 0, true);
+        listPointer(view, 32, payloadOffset, textBytes);
+        view.setUint32(40, 0x87654321, true);
+        view.setUint32(44, 0, true);
+        listPointer(view, 48, payloadOffset, textBytes);
+      } else {
+        view.setUint32(8, 1, true);
+        view.setUint32(12, (2 << 3) | 6, true);
+        listPointer(view, 16, payloadOffset, textBytes);
+        listPointer(view, 24, payloadOffset, textBytes);
+      }
+      setPayload(bytes, payloadOffset);
+      return new StructReader(bytes, view, 0, 1, 1);
+    };
+    const rejected = (reader) => {
+      try { reader.getTextList(0); return false; }
+      catch (error) { return error instanceof Error && error.message.includes('budget exceeded'); }
+    };
+    out({
+      rootPointerList: rejected(rootReader(false)),
+      rootComposite: rejected(rootReader(true)),
+      structPointerList: rejected(structReader(false)),
+      structComposite: rejected(structReader(true)),
+    });
+    return;
+  }
   if (mode === 'strided-composite-readers') {
     const makeRoot = (text) => {
       const bytes = new Uint8Array(96);

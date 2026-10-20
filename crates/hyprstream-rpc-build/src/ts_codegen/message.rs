@@ -19,6 +19,8 @@ const WORD_SIZE = 8;
 // Decoding lists materializes JS arrays. Bound counts even when the wire body
 // is empty or shorter than the declared element count.
 const MAX_LIST_ELEMENTS = 65_536;
+// Text lists may repeat pointers to one payload; bound aggregate decoded bytes.
+const MAX_TEXT_LIST_BYTES = 16 * 1024 * 1024;
 
 function listBodyFitsSegment(
   targetOffset: number,
@@ -1510,16 +1512,12 @@ export class CapnpReader {
         throw new Error('Invalid List(Text) pointer-list shape');
       }
       const results: string[] = [];
+      let totalTextBytes = 0;
       for (let i = 0; i < elementCount; i++) {
         const elemOffset = targetOffset + i * WORD_SIZE;
-        const elemLo = this.buf.getUint32(elemOffset, true);
-        const elemHi = this.buf.getUint32(elemOffset + 4, true);
-        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
-        const elemOffsetWords = (elemLo >> 2) | 0;
-        const byteCount = elemHi >>> 3;
-        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-        const strLen = byteCount > 0 ? byteCount - 1 : 0;
-        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+        const decoded = this.decodeTextListElement(elemOffset, totalTextBytes);
+        totalTextBytes += decoded.byteCount;
+        results.push(decoded.text);
       }
       return results;
     }
@@ -1541,24 +1539,44 @@ export class CapnpReader {
     }
 
     const results: string[] = [];
+    let totalTextBytes = 0;
     for (let i = 0; i < elementCount; i++) {
       const elemOffset = targetOffset + WORD_SIZE + (i * strideWords + dataWords) * WORD_SIZE;
-      const elemLo = this.buf.getUint32(elemOffset, true);
-      const elemHi = this.buf.getUint32(elemOffset + 4, true);
-
-      if (elemLo === 0 && elemHi === 0) {
-        results.push('');
-        continue;
-      }
-
-      const elemOffsetWords = (elemLo >> 2) | 0;
-      const byteCount = elemHi >>> 3;
-      const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      const strLen = byteCount > 0 ? byteCount - 1 : 0;
-      results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      const decoded = this.decodeTextListElement(elemOffset, totalTextBytes);
+      totalTextBytes += decoded.byteCount;
+      results.push(decoded.text);
     }
 
     return results;
+  }
+
+  private decodeTextListElement(ptrOffset: number, totalTextBytes: number): { text: string; byteCount: number } {
+    const pointerBounds = this.segmentBounds(ptrOffset);
+    if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) {
+      throw new Error('List(Text) element pointer is outside a segment');
+    }
+    const pointerLo = this.buf.getUint32(ptrOffset, true);
+    const pointerHi = this.buf.getUint32(ptrOffset + 4, true);
+    if (pointerLo === 0 && pointerHi === 0) return { text: '', byteCount: 0 };
+    const child = this.resolvePtr(ptrOffset);
+    if (!child || (child.lo & 3) !== 1 || (child.hi & 7) !== 2) {
+      throw new Error('Invalid List(Text) element pointer');
+    }
+    const offsetWords = (child.lo >> 2) | 0;
+    const byteCount = child.hi >>> 3;
+    const textOffset = child.targetOffset ?? (child.offset + WORD_SIZE + offsetWords * WORD_SIZE);
+    const bounds = child.targetBounds ?? this.segmentBounds(child.offset);
+    if (!bounds || textOffset < bounds.start || textOffset > bounds.end || byteCount > bounds.end - textOffset) {
+      throw new Error('Truncated List(Text) element');
+    }
+    if (byteCount > MAX_TEXT_LIST_BYTES - totalTextBytes) {
+      throw new Error('List(Text) decoded byte budget exceeded');
+    }
+    const textLength = byteCount > 0 ? byteCount - 1 : 0;
+    return {
+      text: decoder.decode(this.raw.subarray(textOffset, textOffset + textLength)),
+      byteCount,
+    };
   }
 
   /** Read a List(Data) pointer (supports both pointer-list and composite encodings). */
@@ -2113,16 +2131,12 @@ export class StructReader {
         throw new Error('Invalid List(Text) pointer-list shape');
       }
       const results: string[] = [];
+      let totalTextBytes = 0;
       for (let i = 0; i < elementCount; i++) {
         const elemOffset = targetOffset + i * WORD_SIZE;
-        const elemLo = this.buf.getUint32(elemOffset, true);
-        const elemHi = this.buf.getUint32(elemOffset + 4, true);
-        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
-        const elemOffsetWords = (elemLo >> 2) | 0;
-        const byteCount = elemHi >>> 3;
-        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-        const strLen = byteCount > 0 ? byteCount - 1 : 0;
-        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+        const decoded = this.decodeTextListElement(elemOffset, totalTextBytes);
+        totalTextBytes += decoded.byteCount;
+        results.push(decoded.text);
       }
       return results;
     }
@@ -2143,18 +2157,43 @@ export class StructReader {
     }
 
     const results: string[] = [];
+    let totalTextBytes = 0;
     for (let i = 0; i < elementCount; i++) {
       const elemOffset = targetOffset + WORD_SIZE + (i * strideWords + dataWords) * WORD_SIZE;
-      const elemLo = this.buf.getUint32(elemOffset, true);
-      const elemHi = this.buf.getUint32(elemOffset + 4, true);
-      if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
-      const elemOffsetWords = (elemLo >> 2) | 0;
-      const byteCount = elemHi >>> 3;
-      const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      const strLen = byteCount > 0 ? byteCount - 1 : 0;
-      results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      const decoded = this.decodeTextListElement(elemOffset, totalTextBytes);
+      totalTextBytes += decoded.byteCount;
+      results.push(decoded.text);
     }
     return results;
+  }
+
+  private decodeTextListElement(ptrOffset: number, totalTextBytes: number): { text: string; byteCount: number } {
+    const pointerBounds = this.segmentBounds(ptrOffset);
+    if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) {
+      throw new Error('List(Text) element pointer is outside a segment');
+    }
+    const pointerLo = this.buf.getUint32(ptrOffset, true);
+    const pointerHi = this.buf.getUint32(ptrOffset + 4, true);
+    if (pointerLo === 0 && pointerHi === 0) return { text: '', byteCount: 0 };
+    const child = this.resolvePtr(ptrOffset);
+    if (!child || (child.lo & 3) !== 1 || (child.hi & 7) !== 2) {
+      throw new Error('Invalid List(Text) element pointer');
+    }
+    const offsetWords = (child.lo >> 2) | 0;
+    const byteCount = child.hi >>> 3;
+    const textOffset = child.targetOffset ?? (child.offset + WORD_SIZE + offsetWords * WORD_SIZE);
+    const bounds = child.targetBounds ?? this.segmentBounds(child.offset);
+    if (!bounds || textOffset < bounds.start || textOffset > bounds.end || byteCount > bounds.end - textOffset) {
+      throw new Error('Truncated List(Text) element');
+    }
+    if (byteCount > MAX_TEXT_LIST_BYTES - totalTextBytes) {
+      throw new Error('List(Text) decoded byte budget exceeded');
+    }
+    const textLength = byteCount > 0 ? byteCount - 1 : 0;
+    return {
+      text: decoder.decode(this.raw.subarray(textOffset, textOffset + textLength)),
+      byteCount,
+    };
   }
 
   getDataList(ptrIndex: number): Uint8Array[] {

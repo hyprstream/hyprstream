@@ -1063,6 +1063,16 @@ fn zero_word_composite_lists_bound_materialized_elements() {
         "all composite readers must reject oversized zero-word lists before iterating"
     );
     assert_eq!(
+        wd.run("text-list-materialization-budget", &[]),
+        json!({
+            "rootPointerList": true,
+            "rootComposite": true,
+            "structPointerList": true,
+            "structComposite": true
+        }),
+        "Text readers must bound repeated payload materialization and validate child pointers"
+    );
+    assert_eq!(
         wd.run("strided-composite-readers", &[]),
         json!({
             "rootText": ["one", "two"],
