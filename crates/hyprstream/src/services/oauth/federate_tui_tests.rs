@@ -1033,7 +1033,9 @@ impl RequestService for PolicyBoundary {
         self.server.clone()
     }
     fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
-        Some(hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&self.server))
+        Some(hyprstream_rpc::node_identity::derive_mesh_mldsa_key(
+            &self.server,
+        ))
     }
     fn jwt_key_source(&self) -> Option<Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
         Some(self.keys.clone())
@@ -1065,7 +1067,8 @@ impl RequestService for PolicyBoundary {
             &mut Cursor::new(&bytes),
             hyprstream_rpc::service::body::bounded_reader_options(),
         )?;
-        let response = message.get_root::<hyprstream_rpc_std::policy_capnp::policy_response::Reader<'_>>()?;
+        let response =
+            message.get_root::<hyprstream_rpc_std::policy_capnp::policy_response::Reader<'_>>()?;
         if let Ok(hyprstream_rpc_std::policy_capnp::policy_response::Which::CheckResult(allowed)) =
             response.which()
         {
@@ -1125,8 +1128,7 @@ async fn signed_policy_request_bytes(
     )?;
     let mut message = capnp::message::Builder::new_default();
     signed.write_to(
-        &mut message
-            .init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+        &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
     );
     let mut bytes = vec![];
     capnp::serialize::write_message(&mut bytes, &message)?;
@@ -1162,7 +1164,11 @@ async fn w13_tui_credential_reaches_policy_check_only_delegated() -> Result<()> 
     // envelope.
     let stranger = SigningKey::from_bytes(&[90; 32]);
     let stranger_pq = ml_dsa_sk_from_seed(&[91; 32]);
-    install_real_service_fixture_globals(&[(&mediator, &mediator_pq), (&stranger, &stranger_pq)])?;
+    install_real_service_fixture_globals(&[
+        (&holder, &holder_pq),
+        (&mediator, &mediator_pq),
+        (&stranger, &stranger_pq),
+    ])?;
     let pair = super::tests::oauth_signing_pair(71);
     let (_dir, key_set) = super::tests::composite_signer_fixture(1, vec![pair.clone()]);
     let signer = super::HybridFederateSigner::new(key_set)?;
@@ -1259,10 +1265,11 @@ async fn w13_tui_credential_reaches_policy_check_only_delegated() -> Result<()> 
     assert_eq!(boundary.check_results.lock().as_slice(), &[true, false]);
 
     // Negative: the same credential as a DIRECT (non-delegated) bearer is
-    // fenced out of policy.check.
+    // fenced out of policy.check. Signed by the credential HOLDER (anchored,
+    // cnf-bound), so the denial is the class fence — not envelope admission.
     let body = policy_request_body(true, "tui:session", "write")?;
     let bytes =
-        signed_policy_request_bytes(&token, &body, &mediator, &mediator_pq, &server, true).await?;
+        signed_policy_request_bytes(&token, &body, &holder, &holder_pq, &server, true).await?;
     process_request(
         &bytes,
         &boundary,

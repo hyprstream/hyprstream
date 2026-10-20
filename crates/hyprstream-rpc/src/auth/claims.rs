@@ -310,8 +310,7 @@ pub const FEDERATE_STAGING_CLIENT: &str = "cyberdione-www-staging";
 /// every TUI marker stripped, so the stripped shape can never fall through
 /// to generic handling. `None` (unconfigured deployment) leaves only the
 /// marker-set classification; nothing can mint the class then.
-static FEDERATE_TUI_CLASS_CLIENT: std::sync::OnceLock<Option<String>> =
-    std::sync::OnceLock::new();
+static FEDERATE_TUI_CLASS_CLIENT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Install the TUI class reservation. Idempotent when the value matches a
 /// previous install (startup paths may run more than once); a conflicting

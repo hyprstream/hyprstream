@@ -618,6 +618,31 @@ fn legacy_replay_key_differs_by_nonce_for_mixed_version_consumption() {
 }
 
 #[tokio::test]
+async fn pre_d2_consumption_record_is_recognized_by_the_dual_key_consume() {
+    let (service, _ctx) = fixture().await;
+    let consumed = source();
+    let expiry = u64::try_from(consumed.expires_at).unwrap();
+    let replay = service.source_replay.as_ref().unwrap();
+    // Simulate a pre-upgrade (nonce-bearing) consumption record.
+    let legacy = super::legacy_source_credential_replay_key(&consumed, "client");
+    assert!(matches!(
+        replay.admit_source_credential(&legacy, expiry),
+        hyprstream_rpc::proof::admission::ProofAdmissionResult::Admitted
+    ));
+    // The post-upgrade consume recognizes the token as consumed even though
+    // its current-derivation key was never recorded.
+    assert!(service
+        .consume_source_credential(&consumed, "client")
+        .is_err());
+    // A fresh token still consumes exactly once (under both keys).
+    let mut fresh = source();
+    fresh.jti = "fresh-jti".into();
+    fresh.token_hash = [9; 32];
+    service.consume_source_credential(&fresh, "client").unwrap();
+    assert!(service.consume_source_credential(&fresh, "client").is_err());
+}
+
+#[tokio::test]
 async fn malformed_policy_tenant_rejects_the_federate_decision() {
     // D4: a Policy grant carrying a tenant the HTTP middleware syntax would
     // reject must fail the admission decision outright, for both classes.
