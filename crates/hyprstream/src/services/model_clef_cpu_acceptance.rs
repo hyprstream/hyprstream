@@ -1344,17 +1344,54 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             .iter()
             .find(|r| r["id"] == record["id"])
             .context("missing oracle record")?;
+        let parsed_request = crate::services::decision::preflight_parsed(request)?;
+        let authored_choice_orders: BTreeMap<String, Vec<String>> = parsed_request
+            .record
+            .questions
+            .into_iter()
+            .map(|(id, question)| (id, question.authored_choice_order))
+            .collect();
         let mut expected = BTreeMap::new();
         for q in oracle["questions"].as_array().context("oracle questions")? {
-            expected.insert(
-                q["question_id"].as_str().context("oracle ID")?.to_owned(),
-                q["probabilities"]
-                    .as_array()
-                    .context("oracle vector")?
+            let id = q["question_id"].as_str().context("oracle ID")?;
+            let probabilities = q["probabilities"]
+                .as_array()
+                .context("oracle vector")?
+                .iter()
+                .map(|p| p.as_f64().context("oracle component"))
+                .collect::<Result<Vec<_>>>()?;
+            let authored_order = authored_choice_orders
+                .get(id)
+                .with_context(|| format!("missing authored question {id}"))?;
+            let probabilities = if q["kind"].as_str() == Some("choice") {
+                let labels = q["labels"].as_array().context("oracle labels")?;
+                anyhow::ensure!(
+                    !authored_order.is_empty()
+                        && labels.len() == probabilities.len()
+                        && authored_order.len() == labels.len(),
+                    "choice oracle labels/probabilities differ from authored question {id}"
+                );
+                let mut by_label = BTreeMap::new();
+                for (label, probability) in labels.iter().zip(probabilities) {
+                    let label = label.as_str().context("oracle choice label")?;
+                    anyhow::ensure!(
+                        by_label.insert(label.to_owned(), probability).is_none(),
+                        "duplicate oracle choice label {label}"
+                    );
+                }
+                authored_order
                     .iter()
-                    .map(|p| p.as_f64().context("oracle component"))
-                    .collect::<Result<Vec<_>>>()?,
-            );
+                    .map(|label| {
+                        by_label
+                            .get(label)
+                            .copied()
+                            .with_context(|| format!("missing oracle choice label {label}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                probabilities
+            };
+            expected.insert(id.to_owned(), probabilities);
         }
         // Proposed service parity profile: root must freeze BEFORE first run;
         // matches existing head F32 probability bound, not a claimed pre-existing service gate.

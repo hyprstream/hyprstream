@@ -128,6 +128,9 @@ async fn provision_policy_templates_with_selection(
     let manager = PolicyManager::new(&staged_policies_dir)
         .await
         .context("open staged policy store")?;
+    if let Some(selected) = selected {
+        migrate_legacy_clef_inference_grants(&manager, selected).await?;
+    }
     for template in &templates {
         manager
             .apply_template(template)
@@ -150,6 +153,9 @@ async fn provision_policy_templates_with_selection(
     let requested: BTreeSet<&str> = templates.iter().map(|template| template.name).collect();
     let public_staging: BTreeSet<&str> = ["public-inference", "public-read"].into_iter().collect();
     verify_requested_templates(&manager, &templates).await?;
+    if let Some(selected) = selected {
+        verify_legacy_clef_inference_grants_removed(&manager, selected).await?;
+    }
     if requested == public_staging {
         verify_public_staging_policy(&manager).await?;
     }
@@ -207,6 +213,9 @@ async fn provision_policy_templates_with_selection(
     verify_requested_templates(&published, &templates).await?;
     if let Some(selected) = selected {
         verify_selected_owner_rules(&published, selected).await?;
+    }
+    if let Some(selected) = selected {
+        verify_legacy_clef_inference_grants_removed(&published, selected).await?;
     }
     if requested == public_staging {
         verify_public_staging_policy(&published).await?;
@@ -346,6 +355,69 @@ async fn verify_selected_owner_rules(
             .chain(manager.get_domain_grouping_policy().await)
         {
             anyhow::ensure!(!row.first().is_some_and(|subject|key_match(owner,subject)), "configured owner has retained role memberships; reconcile retained policy before qualification");
+        }
+    }
+    Ok(())
+}
+
+/// Exact legacy owner grants written before the Clef staging templates were
+/// removed from the built-in template set. Migration is limited to an owner
+/// explicitly selected for this exact model; provisioning any other model or
+/// template cannot alter these rows.
+const LEGACY_CLEF_STAGING_INFER_SUBJECTS: [&str; 2] = [
+    "did:plc:3f7ldey5bivhfjapwqi2sljy",
+    "did:plc:rjqczurevrpoz4mcnax2kgw4",
+];
+
+async fn migrate_legacy_clef_inference_grants(
+    manager: &crate::auth::PolicyManager,
+    selected: &crate::config::model_admission::ValidatedModelAdmission,
+) -> Result<()> {
+    if selected.model_ref != "clef-flash-fp8:main"
+        || selected.operation != crate::config::model_admission::ModelOperation::Decisions
+    {
+        return Ok(());
+    }
+    for subject in LEGACY_CLEF_STAGING_INFER_SUBJECTS {
+        if selected.owner_subjects.iter().any(|owner| owner == subject) {
+            manager
+                .remove_policy_with_domain(
+                    subject,
+                    "local",
+                    "model:clef-flash-fp8:main",
+                    "infer",
+                    "allow",
+                )
+                .await
+                .context("remove selected owner's legacy Clef infer grant")?;
+        }
+    }
+    Ok(())
+}
+
+async fn verify_legacy_clef_inference_grants_removed(
+    manager: &crate::auth::PolicyManager,
+    selected: &crate::config::model_admission::ValidatedModelAdmission,
+) -> Result<()> {
+    use anyhow::ensure;
+
+    let policies = manager.get_policy().await;
+    if selected.model_ref == "clef-flash-fp8:main"
+        && selected.operation == crate::config::model_admission::ModelOperation::Decisions
+    {
+        for subject in LEGACY_CLEF_STAGING_INFER_SUBJECTS {
+            if selected.owner_subjects.iter().any(|owner| owner == subject) {
+                ensure!(
+                    !policies.contains(&vec![
+                        subject.to_owned(),
+                        "local".to_owned(),
+                        "model:clef-flash-fp8:main".to_owned(),
+                        "infer".to_owned(),
+                        "allow".to_owned(),
+                    ]),
+                    "selected Clef owner retains a legacy infer grant"
+                );
+            }
         }
     }
     Ok(())
@@ -2775,6 +2847,204 @@ mod offline_policy_provision_tests {
                     .await
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_clef_owner_migration_is_narrow_staged_and_idempotent() -> Result<()> {
+        use crate::config::model_admission::{tiny_fixture, ModelOperation};
+
+        let owners = [
+            "did:plc:3f7ldey5bivhfjapwqi2sljy",
+            "did:plc:rjqczurevrpoz4mcnax2kgw4",
+        ];
+        for (selected_owner, retained_owner) in [(owners[0], owners[1]), (owners[1], owners[0])] {
+            let root = tempfile::tempdir()?;
+            let policies_dir = root.path().join(".registry/policies");
+            let legacy = PolicyManager::new(&policies_dir).await?;
+            for owner in owners {
+                legacy
+                    .add_policy_with_domain(
+                        owner,
+                        "local",
+                        "model:clef-flash-fp8:main",
+                        "infer",
+                        "allow",
+                    )
+                    .await?;
+            }
+            let unrelated = vec![
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "local".to_owned(),
+                "model:unrelated:main".to_owned(),
+                "infer".to_owned(),
+                "allow".to_owned(),
+            ];
+            legacy
+                .add_policy_with_domain(
+                    &unrelated[0],
+                    &unrelated[1],
+                    &unrelated[2],
+                    &unrelated[3],
+                    &unrelated[4],
+                )
+                .await?;
+            legacy.save().await?;
+            let original_policy = std::fs::read(policies_dir.join("policy.csv"))?;
+            drop(legacy);
+
+            let (_inputs, config) = tiny_fixture(
+                ModelOperation::Decisions,
+                "clef-flash-fp8:main",
+                selected_owner,
+            )?;
+            let selected = config
+                .selected_model_admission()?
+                .context("selected Clef model")?;
+            let mut fault_reached = false;
+            assert!(
+                provision_policy_templates_with_selection(
+                    root.path(),
+                    &[],
+                    Some(selected),
+                    |_| {
+                        fault_reached = true;
+                        anyhow::bail!("injected failure after staged selected-owner migration")
+                    },
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .is_err(),
+                "prepublication failure must abort staged migration"
+            );
+            assert!(fault_reached);
+            assert_eq!(
+                std::fs::read(policies_dir.join("policy.csv"))?,
+                original_policy,
+                "failed staged migration must leave published policy byte-identical"
+            );
+
+            provision_policy_templates_with_selection(
+                root.path(),
+                &[],
+                Some(selected),
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .await?;
+            let upgraded = PolicyManager::new(&policies_dir).await?;
+            assert!(
+                upgraded
+                    .check_with_domain(
+                        selected_owner,
+                        "local",
+                        "model:clef-flash-fp8:main",
+                        "decide"
+                    )
+                    .await
+            );
+            for action in ["infer", "infer.generate", "infer.embed"] {
+                assert!(
+                    !upgraded
+                        .check_with_domain(
+                            selected_owner,
+                            "local",
+                            "model:clef-flash-fp8:main",
+                            action
+                        )
+                        .await,
+                    "selected owner must not retain legacy action {action}"
+                );
+            }
+            assert!(
+                upgraded
+                    .check_with_domain(
+                        retained_owner,
+                        "local",
+                        "model:clef-flash-fp8:main",
+                        "infer"
+                    )
+                    .await,
+                "unselected legacy owner must remain unchanged"
+            );
+            assert!(upgraded.get_policy().await.contains(&unrelated));
+            let selected_rows: Vec<Vec<String>> = upgraded
+                .get_policy()
+                .await
+                .into_iter()
+                .filter(|row| row.first().map(String::as_str) == Some(selected_owner))
+                .collect();
+            assert_eq!(
+                selected_rows.len(),
+                4,
+                "selected owner has exactly four direct rows"
+            );
+            let published = std::fs::read(policies_dir.join("policy.csv"))?;
+            drop(upgraded);
+
+            provision_policy_templates_with_selection(
+                root.path(),
+                &[],
+                Some(selected),
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .await?;
+            assert_eq!(published, std::fs::read(policies_dir.join("policy.csv"))?);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_clef_generation_keeps_legacy_infer_grant() -> Result<()> {
+        use crate::config::model_admission::{tiny_fixture, ModelOperation};
+
+        let owner = "did:plc:3f7ldey5bivhfjapwqi2sljy";
+        let root = tempfile::tempdir()?;
+        let policies_dir = root.path().join(".registry/policies");
+        let legacy = PolicyManager::new(&policies_dir).await?;
+        legacy
+            .add_policy_with_domain(
+                owner,
+                "local",
+                "model:clef-flash-fp8:main",
+                "infer",
+                "allow",
+            )
+            .await?;
+        legacy.save().await?;
+        drop(legacy);
+
+        let (_inputs, config) =
+            tiny_fixture(ModelOperation::Generation, "clef-flash-fp8:main", owner)?;
+        let selected = config
+            .selected_model_admission()?
+            .context("selected Clef generation model")?;
+        provision_policy_templates_with_selection(
+            root.path(),
+            &[],
+            Some(selected),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await?;
+
+        let provisioned = PolicyManager::new(&policies_dir).await?;
+        assert!(
+            provisioned
+                .check_with_domain(owner, "local", "model:clef-flash-fp8:main", "infer")
+                .await,
+            "generation admission must retain its authorized infer action"
+        );
+        assert!(
+            !provisioned
+                .check_with_domain(owner, "local", "model:clef-flash-fp8:main", "decide")
+                .await
+        );
         Ok(())
     }
 
