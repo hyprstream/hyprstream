@@ -1013,8 +1013,8 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
     assert_eq!(
         wd.run("double-far-zero-word-structs", &[]),
         json!({
-            "root": {"validEmpty": true, "rejectsNonempty": true},
-            "nested": {"validEmpty": true, "rejectsNonempty": true}
+            "root": {"validEmpty": true, "absentDataDefaults": true, "absentPointerDefaults": true, "undersizedDataDefaults": true, "rejectsNonempty": true},
+            "nested": {"validEmpty": true, "absentDataDefaults": true, "absentPointerDefaults": true, "undersizedDataDefaults": true, "rejectsNonempty": true}
         })
     );
     assert_eq!(

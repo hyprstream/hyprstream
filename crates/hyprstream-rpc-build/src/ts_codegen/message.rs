@@ -1335,7 +1335,7 @@ export class CapnpReader {
    * Resolve a pointer, following far pointers (type=2) to the target segment.
    * Returns the resolved pointer words and their byte offset, or null if null pointer.
    */
-  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number } } | null {
+  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number }; targetDataWords?: number; targetPtrWords?: number } | null {
     const sourceBounds = this.segmentBounds(ptrOffset);
     if (!sourceBounds || ptrOffset + WORD_SIZE > sourceBounds.end) return null;
     let lo = this.buf.getUint32(ptrOffset, true);
@@ -1367,7 +1367,9 @@ export class CapnpReader {
         if ((tagLo & 3) > 1) return null;
         if (!doubleFarObjectFits(this.buf, objectOffset, objectBounds, tagLo, tagHi)) return null;
         return { lo: tagLo, hi: tagHi, offset: targetOffset + WORD_SIZE,
-                 targetOffset: objectOffset, targetBounds: objectBounds };
+                 targetOffset: objectOffset, targetBounds: objectBounds,
+                 targetDataWords: (tagLo & 3) === 0 ? tagHi & 0xFFFF : undefined,
+                 targetPtrWords: (tagLo & 3) === 0 ? tagHi >>> 16 : undefined };
       }
       lo = this.buf.getUint32(targetOffset, true);
       hi = this.buf.getUint32(targetOffset + 4, true);
@@ -1460,7 +1462,15 @@ export class CapnpReader {
     if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets, this.segmentEnds);
+    return new StructReader(
+      this.raw,
+      this.buf,
+      targetOffset,
+      resolved.targetDataWords ?? dataWords,
+      resolved.targetPtrWords ?? ptrWords,
+      this.segmentOffsets,
+      this.segmentEnds,
+    );
   }
 
   /** Read a List(Text) pointer (supports both pointer-list and composite encodings). */
@@ -1835,7 +1845,7 @@ export class StructReader {
   ) {}
 
   /** Resolve a pointer, following far pointers (type=2) to the target segment. */
-  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number } } | null {
+  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number }; targetDataWords?: number; targetPtrWords?: number } | null {
     const sourceBounds = this.segmentBounds(ptrOffset);
     if (!sourceBounds || ptrOffset + WORD_SIZE > sourceBounds.end) return null;
     let lo = this.buf.getUint32(ptrOffset, true);
@@ -1866,7 +1876,9 @@ export class StructReader {
         if ((tagLo & 3) > 1) return null;
         if (!doubleFarObjectFits(this.buf, objectOffset, objectBounds, tagLo, tagHi)) return null;
         return { lo: tagLo, hi: tagHi, offset: targetOffset + WORD_SIZE,
-                 targetOffset: objectOffset, targetBounds: objectBounds };
+                 targetOffset: objectOffset, targetBounds: objectBounds,
+                 targetDataWords: (tagLo & 3) === 0 ? tagHi & 0xFFFF : undefined,
+                 targetPtrWords: (tagLo & 3) === 0 ? tagHi >>> 16 : undefined };
       }
       lo = this.buf.getUint32(targetOffset, true);
       hi = this.buf.getUint32(targetOffset + 4, true);
@@ -1899,51 +1911,71 @@ export class StructReader {
     return null;
   }
 
+  private hasDataField(byteOffset: number, width: number): boolean {
+    return Number.isInteger(byteOffset) && byteOffset >= 0 && byteOffset + width <= this.dataWords * WORD_SIZE;
+  }
+
+  private hasPointerField(ptrIndex: number): boolean {
+    return Number.isInteger(ptrIndex) && ptrIndex >= 0 && ptrIndex < this.ptrWords;
+  }
+
   getBool(byteOffset: number, bitIndex: number): boolean {
+    if (!this.hasDataField(byteOffset, 1) || bitIndex < 0 || bitIndex > 7) return false;
     return (this.raw[this.dataOffset + byteOffset] & (1 << bitIndex)) !== 0;
   }
 
   getUint8(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 1)) return 0;
     return this.buf.getUint8(this.dataOffset + byteOffset);
   }
 
   getUint16(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 2)) return 0;
     return this.buf.getUint16(this.dataOffset + byteOffset, true);
   }
 
   getUint32(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 4)) return 0;
     return this.buf.getUint32(this.dataOffset + byteOffset, true);
   }
 
   getUint64(byteOffset: number): bigint {
+    if (!this.hasDataField(byteOffset, 8)) return 0n;
     return this.buf.getBigUint64(this.dataOffset + byteOffset, true);
   }
 
   getInt8(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 1)) return 0;
     return this.buf.getInt8(this.dataOffset + byteOffset);
   }
 
   getInt16(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 2)) return 0;
     return this.buf.getInt16(this.dataOffset + byteOffset, true);
   }
 
   getInt32(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 4)) return 0;
     return this.buf.getInt32(this.dataOffset + byteOffset, true);
   }
 
   getInt64(byteOffset: number): bigint {
+    if (!this.hasDataField(byteOffset, 8)) return 0n;
     return this.buf.getBigInt64(this.dataOffset + byteOffset, true);
   }
 
   getFloat32(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 4)) return 0;
     return this.buf.getFloat32(this.dataOffset + byteOffset, true);
   }
 
   getFloat64(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 8)) return 0;
     return this.buf.getFloat64(this.dataOffset + byteOffset, true);
   }
 
   getText(ptrIndex: number): string {
+    if (!this.hasPointerField(ptrIndex)) return '';
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return '';
@@ -1957,6 +1989,7 @@ export class StructReader {
   }
 
   getData(ptrIndex: number): Uint8Array {
+    if (!this.hasPointerField(ptrIndex)) return new Uint8Array(0);
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return new Uint8Array(0);
@@ -1969,6 +2002,7 @@ export class StructReader {
   }
 
   getStruct(ptrIndex: number, dataWords: number, ptrWords: number): StructReader | null {
+    if (!this.hasPointerField(ptrIndex)) return null;
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return null;
@@ -1976,10 +2010,19 @@ export class StructReader {
     if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets, this.segmentEnds);
+    return new StructReader(
+      this.raw,
+      this.buf,
+      targetOffset,
+      resolved.targetDataWords ?? dataWords,
+      resolved.targetPtrWords ?? ptrWords,
+      this.segmentOffsets,
+      this.segmentEnds,
+    );
   }
 
   getTextList(ptrIndex: number): string[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -2028,6 +2071,7 @@ export class StructReader {
   }
 
   getDataList(ptrIndex: number): Uint8Array[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const pointerBounds = this.segmentBounds(ptrOffset);
     if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) throw new Error('List(Data) pointer is outside a segment');
@@ -2113,6 +2157,7 @@ export class StructReader {
     byteWidth: number,
     read: (byteOffset: number, bitIndex: number) => T,
   ): T[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -2190,6 +2235,7 @@ export class StructReader {
     innerByteWidth: number,
     readInner: (byteOffset: number, bitIndex: number) => T,
   ): T[][] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -2281,6 +2327,7 @@ export class StructReader {
   }
 
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
