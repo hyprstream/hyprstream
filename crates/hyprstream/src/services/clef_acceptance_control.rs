@@ -87,9 +87,19 @@ impl WorkerBinding {
             return cancel;
         };
         let digest = request_digest(request);
+        let forwarded_timeout_is_bounded = request.timeout_ms.is_some_and(|forwarded| {
+            forwarded > 0
+                && match expected.timeout_ms {
+                    Some(caller_limit) => forwarded <= caller_limit,
+                    None => {
+                        u64::from(forwarded) <= crate::services::decision::MAX_DECISION_TIMEOUT_MS
+                    }
+                }
+        });
         if expected.subject != ctx.subject().to_string()
             || Some(expected.tenant.as_str()) != ctx.verified_tenant()
             || expected.digest != digest
+            || !forwarded_timeout_is_bounded
             || expected.ticket.worker.incarnation != self.witness.incarnation
             || expected.ticket.worker.generation != self.witness.generation
             || expected.ticket.worker.model != self.witness.model
@@ -145,14 +155,12 @@ fn request_digest(request: &DecisionRequest) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update((request.clef_json.len() as u64).to_le_bytes());
     digest.update(request.clef_json.as_bytes());
-    for value in [request.max_state_tokens, request.timeout_ms] {
-        match value {
-            Some(value) => {
-                digest.update([1]);
-                digest.update(value.to_le_bytes());
-            }
-            None => digest.update([0]),
+    match request.max_state_tokens {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_le_bytes());
         }
+        None => digest.update([0]),
     }
     digest.finalize().into()
 }
@@ -161,6 +169,7 @@ struct ArmedRequest {
     subject: String,
     tenant: String,
     digest: [u8; 32],
+    timeout_ms: Option<u32>,
     ticket: Arc<RequestTicket>,
 }
 
@@ -208,6 +217,7 @@ impl TestDecisionControl {
             subject: subject.to_owned(),
             tenant: tenant.to_owned(),
             digest: request_digest(request),
+            timeout_ms: request.timeout_ms,
             ticket: Arc::clone(&ticket),
         });
         Ok(ticket)

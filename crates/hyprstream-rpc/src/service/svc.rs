@@ -1053,6 +1053,18 @@ impl EnvelopeContext {
 /// 2. Are automatically spawnable (blanket `impl Spawnable for S: RequestService`)
 #[async_trait(?Send)]
 pub trait RequestService: 'static {
+    /// Run service-owned lifecycle cleanup after the transport has stopped
+    /// admitting requests and the bridge has drained (or aborted and joined)
+    /// every accepted request.
+    ///
+    /// This hook runs on the service's local runtime, after the bounded request
+    /// drain phase and before the `LocalSet`, service, or runtime are destroyed.
+    /// It is intentionally a separate phase and is not covered by the request
+    /// drain timeout.
+    async fn on_drained(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Process a request and return a response with optional continuation.
     ///
     /// # Arguments

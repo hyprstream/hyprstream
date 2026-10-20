@@ -2283,30 +2283,6 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 // Flight Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for `At9pVerifyService` — the credential-free HTTPS face that lets
-/// an external web app verify a `did:at9p` login assertion over plain HTTPS
-/// (#1114).
-///
-/// **No `depends_on`, no service key, no `register_service_key`, no Rep
-/// socket.** This face sits outside the RPC mesh by construction: it holds no
-/// mesh credentials (the better to serve a credential-free public origin), so
-/// it registers nothing and depends on nothing. `SocketKind` has no `Http`
-/// variant and this face is not announceable — that is the #1135 design
-/// statement made concrete. See `services::at9p_verify` for the full rationale.
-#[service_factory("at9p-verify")]
-fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    use crate::services::At9pVerifyService;
-
-    let config = load_config()?;
-    Ok(Box::new(At9pVerifyService::new(
-        config.at9p_verify.clone(),
-        config.tls.clone(),
-        config.account.clone(),
-    )))
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Factory for FlightService (Arrow Flight SQL server)
 ///
 /// This service provides Flight SQL protocol for dataset queries.
@@ -3668,18 +3644,6 @@ mod tests {
             !standalone_worker.contains("block_identity_widening_for_unverified_attach_transport"),
             "the standalone Worker constructor must preserve identity-aware RPC activation"
         );
-    }
-
-    #[test]
-    fn at9p_verify_factory_uses_canonical_service_name() {
-        let factory = hyprstream_service::get_factory(crate::services::at9p_verify::SERVICE_NAME)
-            .expect("at9p-verify factory must be registered");
-        assert_eq!(factory.name, "at9p-verify");
-        assert!(factory
-            .name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),);
-        assert!(hyprstream_service::get_factory("at9p_verify").is_none());
     }
 
     /// #989: the workflow factory is in the service inventory (the daemon can

@@ -49,6 +49,7 @@ enum ScopeAction {
   meshInvoke @11; # umbrella mesh invoke right         (UCAN cmd: /mesh/rpc)
   meshStage  @12; # submit activation/stage to peer    (UCAN cmd: /mesh/infer/stage)
   meshDelta  @13; # submit TTT delta to peer/aggregator(UCAN cmd: /mesh/delta/submit)
+  decide     @14; # decision-only inference authority  (UCAN cmd: /decide)
 }
 
 # MCP tool description - used for method-level documentation

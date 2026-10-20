@@ -31,8 +31,12 @@ impl FederateModelProfile {
         }
     }
     pub(crate) fn scopes(self) -> BTreeSet<String> {
+        let inference_action = match self {
+            Self::Qwen => "infer",
+            Self::Clef => "decide",
+        };
         BTreeSet::from([
-            format!("infer:model:{}", self.model_ref()),
+            format!("{inference_action}:model:{}", self.model_ref()),
             "query:model:Status".to_owned(),
             format!("query:registry:{}", self.repo_name()),
             "write:model:Load".to_owned(),
@@ -93,6 +97,8 @@ mod tests {
         let clef = FederateModelProfile::from_settings(clef_profile::PROFILE, None, None)?;
         assert_eq!(clef, FederateModelProfile::Clef);
         assert_eq!(clef.scopes().len(), 4);
+        assert!(clef.scopes().contains("decide:model:clef-flash-fp8:main"));
+        assert!(!clef.scopes().contains("infer:model:clef-flash-fp8:main"));
         assert!(!clef.scopes().contains("query:registry:List"));
         assert!(!clef
             .scopes()

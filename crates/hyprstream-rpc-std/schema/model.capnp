@@ -199,7 +199,7 @@ struct InferRequest {
       $mcpDescription("Get detailed status information about a model including online training configuration");
     embed @4 :EmbedImagesRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
       $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
-    decide @5 :DecisionRequest $scope(infer) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
+    decide @5 :DecisionRequest $scope(decide) $dispatchMac("internal:pq-hybrid") $mutationSemantics("naturally-idempotent")
       $mcpDescription("Run native Clef joint-schema decision inference on one text/JSON record for this model. Returns typed per-question probability distributions with encoding/compute provenance and calibration=null. Pure function of the admitted weights and request body.");
   }
 }
