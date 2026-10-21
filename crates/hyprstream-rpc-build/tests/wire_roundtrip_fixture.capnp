@@ -1,13 +1,9 @@
 # Fixture schema for the ts_codegen cross-implementation round-trip test (#807).
 #
-# Every field here is a shape the generated `capnp.ts` runtime + codegen
-# *support* — primitives, Text/Data, all flat primitive lists, Text/Data lists,
-# doubly-nested primitive lists (`List(List(Float32))` / `List(List(Float64))`),
-# and a union with a Void / scalar / Text / list / group arm. Wire shapes the
-# codegen deliberately rejects (struct lists, nested `List(List(Text))`) are
-# intentionally absent — #725's hard-fail-at-generation invariant covers those;
-# this fixture covers the *supported* half (#807): that supported shapes are
-# encoded correctly across the Rust `capnp` reference and the generated TS.
+# This fixture exercises primitives, Text/Data, flat and nested primitive
+# lists, struct lists, and unions across the Rust `capnp` reference and the
+# generated TS parser. The budget rows below let the harness construct valid
+# adversarial aliased pointers that a normal builder would not emit.
 #
 # `bigF32s` / `bigEmbeds` exist to push the TS arena past its ~1KB initial slack
 # so growth/reallocation paths (the stale-buffer-capture + pointer-offset bug
@@ -58,4 +54,17 @@ struct WireChoice {
       hi @5 :Float32;
     }
   }
+}
+
+struct BudgetRow {
+  texts @0 :List(Text);
+  text @1 :Text;
+}
+
+struct BudgetRows {
+  rows @0 :List(BudgetRow);
+}
+
+struct BudgetWrapper {
+  child @0 :BudgetRows;
 }

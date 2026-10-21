@@ -16,6 +16,93 @@ pub fn generate_capnp_runtime() -> String {
 // Text/Data:      List(UInt8) with NUL terminator for Text
 
 const WORD_SIZE = 8;
+// Decoding lists materializes JS arrays. Bound counts even when the wire body
+// is empty or shorter than the declared element count.
+const MAX_LIST_ELEMENTS = 65_536;
+// Parsing can materialize aliases across otherwise-small wire lists. Bound the
+// total decoded output for one message, not just each individual list call.
+const MAX_DECODED_ARRAY_ELEMENTS = 1_048_576;
+// This bounds encoded UTF-8 input bytes, not exact JS heap size (strings may
+// use up to roughly twice as many UTF-16 bytes).
+const MAX_DECODED_TEXT_BYTES = 16 * 1024 * 1024;
+
+class DecodeBudget {
+  private arrayElements = 0;
+  private textBytes = 0;
+
+  consumeArrayElements(count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_DECODED_ARRAY_ELEMENTS - this.arrayElements) {
+      throw new Error('Message decoded array-element budget exceeded');
+    }
+    this.arrayElements += count;
+  }
+
+  consumeTextBytes(count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_DECODED_TEXT_BYTES - this.textBytes) {
+      throw new Error('Message decoded text-byte budget exceeded');
+    }
+    this.textBytes += count;
+  }
+}
+
+function listBodyFitsSegment(
+  targetOffset: number,
+  bounds: { start: number; end: number } | null,
+  bodyWords: number,
+  tagWords = 0,
+): boolean {
+  return bounds !== null
+    && targetOffset >= bounds.start
+    && targetOffset <= bounds.end
+    && Number.isSafeInteger(bodyWords)
+    && bodyWords + tagWords <= Math.floor((bounds.end - targetOffset) / WORD_SIZE);
+}
+
+/** Check that the shape declared by a double-far tag fits its target segment. */
+function doubleFarObjectFits(
+  buf: DataView,
+  objectOffset: number,
+  bounds: { start: number; end: number },
+  tagLo: number,
+  tagHi: number,
+): boolean {
+  if (objectOffset < bounds.start || objectOffset > bounds.end) return false;
+  const availableWords = Math.floor((bounds.end - objectOffset) / WORD_SIZE);
+  const kind = tagLo & 3;
+  if (kind === 0) {
+    const dataWords = tagHi & 0xFFFF;
+    const pointerWords = tagHi >>> 16;
+    return dataWords + pointerWords <= availableWords;
+  }
+  if (kind !== 1) return false;
+
+  const elementSize = tagHi & 7;
+  const elementCount = tagHi >>> 3;
+  let listWords: number;
+  switch (elementSize) {
+    case 0: listWords = 0; break;
+    case 1: listWords = Math.ceil(elementCount / 64); break;
+    case 2: listWords = Math.ceil(elementCount / 8); break;
+    case 3: listWords = Math.ceil(elementCount / 4); break;
+    case 4: listWords = Math.ceil(elementCount / 2); break;
+    case 5:
+    case 6: listWords = elementCount; break;
+    case 7: listWords = elementCount; break;
+    default: return false;
+  }
+  if (listWords > availableWords) return false;
+  if (elementSize !== 7) return true;
+
+  // A composite list begins with a struct tag, followed by its declared body.
+  if (listWords + 1 > availableWords) return false;
+  const compositeTagLo = buf.getUint32(objectOffset, true);
+  const compositeTagHi = buf.getUint32(objectOffset + 4, true);
+  if ((compositeTagLo & 3) !== 0) return false;
+  const structCount = compositeTagLo >>> 2;
+  if (structCount > MAX_LIST_ELEMENTS) return false;
+  const structWords = (compositeTagHi & 0xFFFF) + (compositeTagHi >>> 16);
+  return structCount * structWords <= listWords;
+}
 
 // Module-level singletons — avoid per-call allocation
 const encoder = new TextEncoder();
@@ -1220,6 +1307,8 @@ export class CapnpReader {
   private readonly segmentOffsets: number[];
   /** Byte offsets immediately after each declared segment. */
   private readonly segmentEnds: number[];
+  /** Shared across all readers derived from this message. */
+  private readonly decodeBudget: DecodeBudget;
 
   /**
    * Parse a Cap'n Proto message from wire-format bytes.
@@ -1233,6 +1322,7 @@ export class CapnpReader {
     this.dataWords = dataWords;
     this.segmentOffsets = [];
     this.segmentEnds = [];
+    this.decodeBudget = new DecodeBudget();
 
     // Standard Cap'n Proto format:
     //   Segment table: [num_segments-1 (u32), seg0_size (u32), seg1_size (u32), ...]
@@ -1290,7 +1380,7 @@ export class CapnpReader {
    * Resolve a pointer, following far pointers (type=2) to the target segment.
    * Returns the resolved pointer words and their byte offset, or null if null pointer.
    */
-  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number } } | null {
+  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number }; targetDataWords?: number; targetPtrWords?: number } | null {
     const sourceBounds = this.segmentBounds(ptrOffset);
     if (!sourceBounds || ptrOffset + WORD_SIZE > sourceBounds.end) return null;
     let lo = this.buf.getUint32(ptrOffset, true);
@@ -1314,14 +1404,17 @@ export class CapnpReader {
         const objectSegment = this.buf.getUint32(targetOffset + 4, true);
         if ((objectLo & 7) !== 2) return null;
         const objectBounds = this.segmentBoundsForIndex(objectSegment);
-        if (!objectBounds || objectBounds.start === objectBounds.end) return null;
+        if (!objectBounds) return null;
         const objectOffset = objectBounds.start + (objectLo >>> 3) * WORD_SIZE;
         if (objectOffset < objectBounds.start || objectOffset > objectBounds.end) return null;
         const tagLo = this.buf.getUint32(targetOffset + WORD_SIZE, true);
         const tagHi = this.buf.getUint32(targetOffset + WORD_SIZE + 4, true);
         if ((tagLo & 3) > 1) return null;
+        if (!doubleFarObjectFits(this.buf, objectOffset, objectBounds, tagLo, tagHi)) return null;
         return { lo: tagLo, hi: tagHi, offset: targetOffset + WORD_SIZE,
-                 targetOffset: objectOffset, targetBounds: objectBounds };
+                 targetOffset: objectOffset, targetBounds: objectBounds,
+                 targetDataWords: (tagLo & 3) === 0 ? tagHi & 0xFFFF : undefined,
+                 targetPtrWords: (tagLo & 3) === 0 ? tagHi >>> 16 : undefined };
       }
       lo = this.buf.getUint32(targetOffset, true);
       hi = this.buf.getUint32(targetOffset + 4, true);
@@ -1384,11 +1477,16 @@ export class CapnpReader {
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return '';
     const { lo, hi, offset } = resolved;
-    if ((lo & 3) !== 1) return '';
+    if ((lo & 3) !== 1 || (hi & 7) !== 2) return '';
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
     const strLen = byteCount > 0 ? byteCount - 1 : 0;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!bounds || targetOffset < bounds.start || targetOffset > bounds.end || byteCount > bounds.end - targetOffset) {
+      throw new Error('Truncated Text payload');
+    }
+    this.decodeBudget.consumeTextBytes(byteCount);
     return decoder.decode(this.raw.subarray(targetOffset, targetOffset + strLen));
   }
 
@@ -1402,6 +1500,10 @@ export class CapnpReader {
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!bounds || targetOffset < bounds.start || targetOffset > bounds.end || byteCount > bounds.end - targetOffset) {
+      throw new Error('Truncated Data payload');
+    }
     return this.raw.subarray(targetOffset, targetOffset + byteCount);
   }
 
@@ -1414,7 +1516,16 @@ export class CapnpReader {
     if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets, this.segmentEnds);
+    return new StructReader(
+      this.raw,
+      this.buf,
+      targetOffset,
+      resolved.targetDataWords ?? dataWords,
+      resolved.targetPtrWords ?? ptrWords,
+      this.segmentOffsets,
+      this.segmentEnds,
+      this.decodeBudget,
+    );
   }
 
   /** Read a List(Text) pointer (supports both pointer-list and composite encodings). */
@@ -1432,17 +1543,15 @@ export class CapnpReader {
     if (elementSize === 6) {
       // Pointer list: each element is a pointer to a text blob
       const elementCount = hi >>> 3;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (elementCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, elementCount)) {
+        throw new Error('Invalid List(Text) pointer-list shape');
+      }
+      this.decodeBudget.consumeArrayElements(elementCount);
       const results: string[] = [];
       for (let i = 0; i < elementCount; i++) {
         const elemOffset = targetOffset + i * WORD_SIZE;
-        const elemLo = this.buf.getUint32(elemOffset, true);
-        const elemHi = this.buf.getUint32(elemOffset + 4, true);
-        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
-        const elemOffsetWords = (elemLo >> 2) | 0;
-        const byteCount = elemHi >>> 3;
-        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-        const strLen = byteCount > 0 ? byteCount - 1 : 0;
-        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+        results.push(this.decodeTextListElement(elemOffset));
       }
       return results;
     }
@@ -1450,28 +1559,54 @@ export class CapnpReader {
     if (elementSize !== 7) return []; // unsupported element size
 
     // Composite list: tag word + elements
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid List(Text) composite element shape');
+    }
     const tagLo = this.buf.getUint32(targetOffset, true);
-    const elementCount = (tagLo >> 2) | 0;
+    const tagHi = this.buf.getUint32(targetOffset + 4, true);
+    if ((tagLo & 3) !== 0) throw new Error('Invalid List(Text) composite tag');
+    const elementCount = tagLo >>> 2;
+    const dataWords = tagHi & 0xFFFF;
+    const pointerWords = tagHi >>> 16;
+    const strideWords = dataWords + pointerWords;
+    if (elementCount > MAX_LIST_ELEMENTS || pointerWords < 1 || elementCount > Math.floor((hi >>> 3) / strideWords)
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid List(Text) composite element shape');
+    }
 
+    this.decodeBudget.consumeArrayElements(elementCount);
     const results: string[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
-      const elemLo = this.buf.getUint32(elemOffset, true);
-      const elemHi = this.buf.getUint32(elemOffset + 4, true);
-
-      if (elemLo === 0 && elemHi === 0) {
-        results.push('');
-        continue;
-      }
-
-      const elemOffsetWords = (elemLo >> 2) | 0;
-      const byteCount = elemHi >>> 3;
-      const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      const strLen = byteCount > 0 ? byteCount - 1 : 0;
-      results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      const elemOffset = targetOffset + WORD_SIZE + (i * strideWords + dataWords) * WORD_SIZE;
+      results.push(this.decodeTextListElement(elemOffset));
     }
 
     return results;
+  }
+
+  private decodeTextListElement(ptrOffset: number): string {
+    const pointerBounds = this.segmentBounds(ptrOffset);
+    if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) {
+      throw new Error('List(Text) element pointer is outside a segment');
+    }
+    const pointerLo = this.buf.getUint32(ptrOffset, true);
+    const pointerHi = this.buf.getUint32(ptrOffset + 4, true);
+    if (pointerLo === 0 && pointerHi === 0) return '';
+    const child = this.resolvePtr(ptrOffset);
+    if (!child || (child.lo & 3) !== 1 || (child.hi & 7) !== 2) {
+      throw new Error('Invalid List(Text) element pointer');
+    }
+    const offsetWords = (child.lo >> 2) | 0;
+    const byteCount = child.hi >>> 3;
+    const textOffset = child.targetOffset ?? (child.offset + WORD_SIZE + offsetWords * WORD_SIZE);
+    const bounds = child.targetBounds ?? this.segmentBounds(child.offset);
+    if (!bounds || textOffset < bounds.start || textOffset > bounds.end || byteCount > bounds.end - textOffset) {
+      throw new Error('Truncated List(Text) element');
+    }
+    const textLength = byteCount > 0 ? byteCount - 1 : 0;
+    this.decodeBudget.consumeTextBytes(byteCount);
+    return decoder.decode(this.raw.subarray(textOffset, textOffset + textLength));
   }
 
   /** Read a List(Data) pointer (supports both pointer-list and composite encodings). */
@@ -1504,6 +1639,7 @@ export class CapnpReader {
     if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
+      if (elementCount > MAX_LIST_ELEMENTS) throw new Error('List(Data) element count exceeds limit');
       bodyWords = elementCount;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
@@ -1520,7 +1656,7 @@ export class CapnpReader {
       // Schema evolution can widen each element with data or more pointers.
       // The old List(Data) view reads its first pointer and skips the full
       // element stride. Like capnp-rust, allow unused declared body words.
-      if (ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
+      if (elementCount > MAX_LIST_ELEMENTS || ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
@@ -1530,6 +1666,7 @@ export class CapnpReader {
       throw new Error('Truncated List(Data) pointer list');
     }
 
+    this.decodeBudget.consumeArrayElements(elementCount);
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemOffset = elemBase + (i * strideWords + firstPointerWords) * WORD_SIZE;
@@ -1580,7 +1717,17 @@ export class CapnpReader {
     if (elementSize !== expectedElemSize) return [];
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
     const count = hi >>> 3;
+    const bodyWords = elementSize === 1 ? Math.ceil(count / 64)
+      : elementSize === 2 ? Math.ceil(count / 8)
+      : elementSize === 3 ? Math.ceil(count / 4)
+      : elementSize === 4 ? Math.ceil(count / 2)
+      : count;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (count > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, bodyWords)) {
+      throw new Error('Invalid primitive-list shape');
+    }
 
+    this.decodeBudget.consumeArrayElements(count);
     const results: T[] = [];
     for (let i = 0; i < count; i++) {
       results.push(
@@ -1664,20 +1811,43 @@ export class CapnpReader {
 
     let outerCount: number;
     let outerBase: number;
+    let outerStrideWords = 1;
+    let outerFirstPointerWords = 0;
     if (outerElementSize === 6) {
       outerCount = hi >>> 3;
       outerBase = targetOffset;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (outerCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, outerCount)) {
+        throw new Error('Invalid nested-list pointer-list shape');
+      }
     } else if (outerElementSize === 7) {
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (!listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+        throw new Error('Invalid nested-list composite element shape');
+      }
       const tagLo = this.buf.getUint32(targetOffset, true);
-      outerCount = (tagLo >> 2) | 0;
+      const tagHi = this.buf.getUint32(targetOffset + 4, true);
+      if ((tagLo & 3) !== 0) throw new Error('Invalid nested-list composite tag');
+      outerCount = tagLo >>> 2;
+      const dataWords = tagHi & 0xFFFF;
+      const pointerWords = tagHi >>> 16;
+      const strideWords = dataWords + pointerWords;
+      if (outerCount > MAX_LIST_ELEMENTS || pointerWords < 1 || outerCount > Math.floor((hi >>> 3) / strideWords)
+        || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+        throw new Error('Invalid nested-list composite element shape');
+      }
+      outerStrideWords = strideWords;
+      outerFirstPointerWords = dataWords;
       outerBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
 
+    this.decodeBudget.consumeArrayElements(outerCount);
     const results: T[][] = [];
+    let totalCount = outerCount;
     for (let i = 0; i < outerCount; i++) {
-      const elemPtrOffset = outerBase + i * WORD_SIZE;
+      const elemPtrOffset = outerBase + (i * outerStrideWords + outerFirstPointerWords) * WORD_SIZE;
       const elemResolved = this.resolvePtr(elemPtrOffset);
       if (!elemResolved) { results.push([]); continue; }
       const { lo: iLo, hi: iHi, offset: iOffset } = elemResolved;
@@ -1685,6 +1855,14 @@ export class CapnpReader {
       const iOffsetWords = (iLo >> 2) | 0;
       const innerTarget = elemResolved.targetOffset ?? (iOffset + WORD_SIZE + iOffsetWords * WORD_SIZE);
       const innerCount = iHi >>> 3;
+      const innerBodyWords = innerElemSize === 1 ? Math.ceil(innerCount / 64) : Math.ceil(innerCount * innerByteWidth / WORD_SIZE);
+      const innerBounds = elemResolved.targetBounds ?? this.segmentBounds(iOffset);
+      if (innerCount > MAX_LIST_ELEMENTS || totalCount + innerCount > MAX_LIST_ELEMENTS
+        || !listBodyFitsSegment(innerTarget, innerBounds, innerBodyWords)) {
+        throw new Error('Nested primitive-list total count exceeds limit');
+      }
+      totalCount += innerCount;
+      this.decodeBudget.consumeArrayElements(innerCount);
       const inner: T[] = [];
       for (let j = 0; j < innerCount; j++) {
         inner.push(
@@ -1756,18 +1934,30 @@ export class CapnpReader {
 
     if (elementSize !== 7) return []; // not composite
 
+    // Validate the tag and declared body before reading the tag word.
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid composite list element shape');
+    }
     // Read tag word — struct pointer encoding element shape
     const tagLo = this.buf.getUint32(targetOffset, true);
     const tagHi = this.buf.getUint32(targetOffset + 4, true);
-    const elementCount = (tagLo >> 2) | 0;
+    if ((tagLo & 3) !== 0) throw new Error('Invalid composite list tag');
+    const elementCount = tagLo >>> 2;
     const tagDataWords = tagHi & 0xFFFF;
-    const tagPtrWords = (tagHi >> 16) & 0xFFFF;
+    const tagPtrWords = (tagHi >>> 16) & 0xFFFF;
     const elementWords = tagDataWords + tagPtrWords;
+    if (elementCount > MAX_LIST_ELEMENTS || (elementWords > 0 && elementCount > Math.floor((hi >>> 3) / elementWords))
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid composite list element shape');
+    }
 
+    // Generated parsers map this reader array into a second result array.
+    this.decodeBudget.consumeArrayElements(elementCount * 2);
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets, this.segmentEnds));
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets, this.segmentEnds, this.decodeBudget));
     }
     return results;
   }
@@ -1786,10 +1976,11 @@ export class StructReader {
     private ptrWords: number,
     private segmentOffsets: readonly number[] = [],
     private segmentEnds: readonly number[] = [],
+    private readonly decodeBudget: DecodeBudget = new DecodeBudget(),
   ) {}
 
   /** Resolve a pointer, following far pointers (type=2) to the target segment. */
-  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number } } | null {
+  private resolvePtr(ptrOffset: number): { lo: number; hi: number; offset: number; targetOffset?: number; targetBounds?: { start: number; end: number }; targetDataWords?: number; targetPtrWords?: number } | null {
     const sourceBounds = this.segmentBounds(ptrOffset);
     if (!sourceBounds || ptrOffset + WORD_SIZE > sourceBounds.end) return null;
     let lo = this.buf.getUint32(ptrOffset, true);
@@ -1812,14 +2003,17 @@ export class StructReader {
         const objectSegment = this.buf.getUint32(targetOffset + 4, true);
         if ((objectLo & 7) !== 2) return null;
         const objectBounds = this.segmentBoundsForIndex(objectSegment);
-        if (!objectBounds || objectBounds.start === objectBounds.end) return null;
+        if (!objectBounds) return null;
         const objectOffset = objectBounds.start + (objectLo >>> 3) * WORD_SIZE;
         if (objectOffset < objectBounds.start || objectOffset > objectBounds.end) return null;
         const tagLo = this.buf.getUint32(targetOffset + WORD_SIZE, true);
         const tagHi = this.buf.getUint32(targetOffset + WORD_SIZE + 4, true);
         if ((tagLo & 3) > 1) return null;
+        if (!doubleFarObjectFits(this.buf, objectOffset, objectBounds, tagLo, tagHi)) return null;
         return { lo: tagLo, hi: tagHi, offset: targetOffset + WORD_SIZE,
-                 targetOffset: objectOffset, targetBounds: objectBounds };
+                 targetOffset: objectOffset, targetBounds: objectBounds,
+                 targetDataWords: (tagLo & 3) === 0 ? tagHi & 0xFFFF : undefined,
+                 targetPtrWords: (tagLo & 3) === 0 ? tagHi >>> 16 : undefined };
       }
       lo = this.buf.getUint32(targetOffset, true);
       hi = this.buf.getUint32(targetOffset + 4, true);
@@ -1852,64 +2046,90 @@ export class StructReader {
     return null;
   }
 
+  private hasDataField(byteOffset: number, width: number): boolean {
+    return Number.isInteger(byteOffset) && byteOffset >= 0 && byteOffset + width <= this.dataWords * WORD_SIZE;
+  }
+
+  private hasPointerField(ptrIndex: number): boolean {
+    return Number.isInteger(ptrIndex) && ptrIndex >= 0 && ptrIndex < this.ptrWords;
+  }
+
   getBool(byteOffset: number, bitIndex: number): boolean {
+    if (!this.hasDataField(byteOffset, 1) || bitIndex < 0 || bitIndex > 7) return false;
     return (this.raw[this.dataOffset + byteOffset] & (1 << bitIndex)) !== 0;
   }
 
   getUint8(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 1)) return 0;
     return this.buf.getUint8(this.dataOffset + byteOffset);
   }
 
   getUint16(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 2)) return 0;
     return this.buf.getUint16(this.dataOffset + byteOffset, true);
   }
 
   getUint32(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 4)) return 0;
     return this.buf.getUint32(this.dataOffset + byteOffset, true);
   }
 
   getUint64(byteOffset: number): bigint {
+    if (!this.hasDataField(byteOffset, 8)) return 0n;
     return this.buf.getBigUint64(this.dataOffset + byteOffset, true);
   }
 
   getInt8(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 1)) return 0;
     return this.buf.getInt8(this.dataOffset + byteOffset);
   }
 
   getInt16(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 2)) return 0;
     return this.buf.getInt16(this.dataOffset + byteOffset, true);
   }
 
   getInt32(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 4)) return 0;
     return this.buf.getInt32(this.dataOffset + byteOffset, true);
   }
 
   getInt64(byteOffset: number): bigint {
+    if (!this.hasDataField(byteOffset, 8)) return 0n;
     return this.buf.getBigInt64(this.dataOffset + byteOffset, true);
   }
 
   getFloat32(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 4)) return 0;
     return this.buf.getFloat32(this.dataOffset + byteOffset, true);
   }
 
   getFloat64(byteOffset: number): number {
+    if (!this.hasDataField(byteOffset, 8)) return 0;
     return this.buf.getFloat64(this.dataOffset + byteOffset, true);
   }
 
   getText(ptrIndex: number): string {
+    if (!this.hasPointerField(ptrIndex)) return '';
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return '';
     const { lo, hi, offset } = resolved;
-    if ((lo & 3) !== 1) return '';
+    if ((lo & 3) !== 1 || (hi & 7) !== 2) return '';
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
     const strLen = byteCount > 0 ? byteCount - 1 : 0;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!bounds || targetOffset < bounds.start || targetOffset > bounds.end || byteCount > bounds.end - targetOffset) {
+      throw new Error('Truncated Text payload');
+    }
+    this.decodeBudget.consumeTextBytes(byteCount);
     return decoder.decode(this.raw.subarray(targetOffset, targetOffset + strLen));
   }
 
   getData(ptrIndex: number): Uint8Array {
+    if (!this.hasPointerField(ptrIndex)) return new Uint8Array(0);
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return new Uint8Array(0);
@@ -1918,10 +2138,15 @@ export class StructReader {
     const offsetWords = (lo >> 2) | 0;
     const byteCount = hi >>> 3;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!bounds || targetOffset < bounds.start || targetOffset > bounds.end || byteCount > bounds.end - targetOffset) {
+      throw new Error('Truncated Data payload');
+    }
     return this.raw.subarray(targetOffset, targetOffset + byteCount);
   }
 
   getStruct(ptrIndex: number, dataWords: number, ptrWords: number): StructReader | null {
+    if (!this.hasPointerField(ptrIndex)) return null;
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return null;
@@ -1929,10 +2154,20 @@ export class StructReader {
     if ((lo & 3) !== 0) return null;
     const offsetWords = (lo >> 2) | 0;
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
-    return new StructReader(this.raw, this.buf, targetOffset, dataWords, ptrWords, this.segmentOffsets, this.segmentEnds);
+    return new StructReader(
+      this.raw,
+      this.buf,
+      targetOffset,
+      resolved.targetDataWords ?? dataWords,
+      resolved.targetPtrWords ?? ptrWords,
+      this.segmentOffsets,
+      this.segmentEnds,
+      this.decodeBudget,
+    );
   }
 
   getTextList(ptrIndex: number): string[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -1945,42 +2180,72 @@ export class StructReader {
 
     if (elementSize === 6) {
       const elementCount = hi >>> 3;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (elementCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, elementCount)) {
+        throw new Error('Invalid List(Text) pointer-list shape');
+      }
+      this.decodeBudget.consumeArrayElements(elementCount);
       const results: string[] = [];
       for (let i = 0; i < elementCount; i++) {
         const elemOffset = targetOffset + i * WORD_SIZE;
-        const elemLo = this.buf.getUint32(elemOffset, true);
-        const elemHi = this.buf.getUint32(elemOffset + 4, true);
-        if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
-        const elemOffsetWords = (elemLo >> 2) | 0;
-        const byteCount = elemHi >>> 3;
-        const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-        const strLen = byteCount > 0 ? byteCount - 1 : 0;
-        results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+        results.push(this.decodeTextListElement(elemOffset));
       }
       return results;
     }
 
     if (elementSize !== 7) return [];
 
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid List(Text) composite element shape');
+    }
     const tagLo = this.buf.getUint32(targetOffset, true);
-    const elementCount = (tagLo >> 2) | 0;
+    const tagHi = this.buf.getUint32(targetOffset + 4, true);
+    if ((tagLo & 3) !== 0) throw new Error('Invalid List(Text) composite tag');
+    const elementCount = tagLo >>> 2;
+    const dataWords = tagHi & 0xFFFF;
+    const pointerWords = tagHi >>> 16;
+    const strideWords = dataWords + pointerWords;
+    if (elementCount > MAX_LIST_ELEMENTS || pointerWords < 1 || elementCount > Math.floor((hi >>> 3) / strideWords)
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid List(Text) composite element shape');
+    }
 
+    this.decodeBudget.consumeArrayElements(elementCount);
     const results: string[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
-      const elemLo = this.buf.getUint32(elemOffset, true);
-      const elemHi = this.buf.getUint32(elemOffset + 4, true);
-      if (elemLo === 0 && elemHi === 0) { results.push(''); continue; }
-      const elemOffsetWords = (elemLo >> 2) | 0;
-      const byteCount = elemHi >>> 3;
-      const textOffset = elemOffset + WORD_SIZE + elemOffsetWords * WORD_SIZE;
-      const strLen = byteCount > 0 ? byteCount - 1 : 0;
-      results.push(decoder.decode(this.raw.subarray(textOffset, textOffset + strLen)));
+      const elemOffset = targetOffset + WORD_SIZE + (i * strideWords + dataWords) * WORD_SIZE;
+      results.push(this.decodeTextListElement(elemOffset));
     }
     return results;
   }
 
+  private decodeTextListElement(ptrOffset: number): string {
+    const pointerBounds = this.segmentBounds(ptrOffset);
+    if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) {
+      throw new Error('List(Text) element pointer is outside a segment');
+    }
+    const pointerLo = this.buf.getUint32(ptrOffset, true);
+    const pointerHi = this.buf.getUint32(ptrOffset + 4, true);
+    if (pointerLo === 0 && pointerHi === 0) return '';
+    const child = this.resolvePtr(ptrOffset);
+    if (!child || (child.lo & 3) !== 1 || (child.hi & 7) !== 2) {
+      throw new Error('Invalid List(Text) element pointer');
+    }
+    const offsetWords = (child.lo >> 2) | 0;
+    const byteCount = child.hi >>> 3;
+    const textOffset = child.targetOffset ?? (child.offset + WORD_SIZE + offsetWords * WORD_SIZE);
+    const bounds = child.targetBounds ?? this.segmentBounds(child.offset);
+    if (!bounds || textOffset < bounds.start || textOffset > bounds.end || byteCount > bounds.end - textOffset) {
+      throw new Error('Truncated List(Text) element');
+    }
+    const textLength = byteCount > 0 ? byteCount - 1 : 0;
+    this.decodeBudget.consumeTextBytes(byteCount);
+    return decoder.decode(this.raw.subarray(textOffset, textOffset + textLength));
+  }
+
   getDataList(ptrIndex: number): Uint8Array[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const pointerBounds = this.segmentBounds(ptrOffset);
     if (!pointerBounds || ptrOffset + WORD_SIZE > pointerBounds.end) throw new Error('List(Data) pointer is outside a segment');
@@ -2009,6 +2274,7 @@ export class StructReader {
     if (!bounds) throw new Error('List(Data) pointer is outside a segment');
     if (elementSize === 6) {
       elementCount = hi >>> 3;
+      if (elementCount > MAX_LIST_ELEMENTS) throw new Error('List(Data) element count exceeds limit');
       bodyWords = elementCount;
       elemBase = targetOffset;
     } else if (elementSize === 7) {
@@ -2025,7 +2291,7 @@ export class StructReader {
       // Schema evolution can widen each element with data or more pointers.
       // The old List(Data) view reads its first pointer and skips the full
       // element stride. Like capnp-rust, allow unused declared body words.
-      if (ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
+      if (elementCount > MAX_LIST_ELEMENTS || ptrWords < 1 || elementCount > Math.floor(bodyWords / strideWords)) throw new Error('Invalid List(Data) composite element shape');
       elemBase = targetOffset + WORD_SIZE;
     } else {
       return [];
@@ -2035,6 +2301,7 @@ export class StructReader {
       throw new Error('Truncated List(Data) pointer list');
     }
 
+    this.decodeBudget.consumeArrayElements(elementCount);
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemOffset = elemBase + (i * strideWords + firstPointerWords) * WORD_SIZE;
@@ -2066,6 +2333,7 @@ export class StructReader {
     byteWidth: number,
     read: (byteOffset: number, bitIndex: number) => T,
   ): T[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -2077,7 +2345,17 @@ export class StructReader {
     if (elementSize !== expectedElemSize) return [];
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
     const count = hi >>> 3;
+    const bodyWords = elementSize === 1 ? Math.ceil(count / 64)
+      : elementSize === 2 ? Math.ceil(count / 8)
+      : elementSize === 3 ? Math.ceil(count / 4)
+      : elementSize === 4 ? Math.ceil(count / 2)
+      : count;
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (count > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, bodyWords)) {
+      throw new Error('Invalid primitive-list shape');
+    }
 
+    this.decodeBudget.consumeArrayElements(count);
     const results: T[] = [];
     for (let i = 0; i < count; i++) {
       results.push(
@@ -2143,6 +2421,7 @@ export class StructReader {
     innerByteWidth: number,
     readInner: (byteOffset: number, bitIndex: number) => T,
   ): T[][] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -2155,20 +2434,43 @@ export class StructReader {
 
     let outerCount: number;
     let outerBase: number;
+    let outerStrideWords = 1;
+    let outerFirstPointerWords = 0;
     if (outerElementSize === 6) {
       outerCount = hi >>> 3;
       outerBase = targetOffset;
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (outerCount > MAX_LIST_ELEMENTS || !listBodyFitsSegment(targetOffset, bounds, outerCount)) {
+        throw new Error('Invalid nested-list pointer-list shape');
+      }
     } else if (outerElementSize === 7) {
+      const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+      if (!listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+        throw new Error('Invalid nested-list composite element shape');
+      }
       const tagLo = this.buf.getUint32(targetOffset, true);
-      outerCount = (tagLo >> 2) | 0;
+      const tagHi = this.buf.getUint32(targetOffset + 4, true);
+      if ((tagLo & 3) !== 0) throw new Error('Invalid nested-list composite tag');
+      outerCount = tagLo >>> 2;
+      const dataWords = tagHi & 0xFFFF;
+      const pointerWords = tagHi >>> 16;
+      const strideWords = dataWords + pointerWords;
+      if (outerCount > MAX_LIST_ELEMENTS || pointerWords < 1 || outerCount > Math.floor((hi >>> 3) / strideWords)
+        || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+        throw new Error('Invalid nested-list composite element shape');
+      }
+      outerStrideWords = strideWords;
+      outerFirstPointerWords = dataWords;
       outerBase = targetOffset + WORD_SIZE;
     } else {
       return [];
     }
 
+    this.decodeBudget.consumeArrayElements(outerCount);
     const results: T[][] = [];
+    let totalCount = outerCount;
     for (let i = 0; i < outerCount; i++) {
-      const elemPtrOffset = outerBase + i * WORD_SIZE;
+      const elemPtrOffset = outerBase + (i * outerStrideWords + outerFirstPointerWords) * WORD_SIZE;
       const elemResolved = this.resolvePtr(elemPtrOffset);
       if (!elemResolved) { results.push([]); continue; }
       const { lo: iLo, hi: iHi, offset: iOffset } = elemResolved;
@@ -2176,6 +2478,14 @@ export class StructReader {
       const iOffsetWords = (iLo >> 2) | 0;
       const innerTarget = elemResolved.targetOffset ?? (iOffset + WORD_SIZE + iOffsetWords * WORD_SIZE);
       const innerCount = iHi >>> 3;
+      const innerBodyWords = innerElemSize === 1 ? Math.ceil(innerCount / 64) : Math.ceil(innerCount * innerByteWidth / WORD_SIZE);
+      const innerBounds = elemResolved.targetBounds ?? this.segmentBounds(iOffset);
+      if (innerCount > MAX_LIST_ELEMENTS || totalCount + innerCount > MAX_LIST_ELEMENTS
+        || !listBodyFitsSegment(innerTarget, innerBounds, innerBodyWords)) {
+        throw new Error('Nested primitive-list total count exceeds limit');
+      }
+      totalCount += innerCount;
+      this.decodeBudget.consumeArrayElements(innerCount);
       const inner: T[] = [];
       for (let j = 0; j < innerCount; j++) {
         inner.push(
@@ -2234,6 +2544,7 @@ export class StructReader {
   }
 
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
+    if (!this.hasPointerField(ptrIndex)) return [];
     const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
     if (!resolved) return [];
@@ -2245,17 +2556,28 @@ export class StructReader {
     const targetOffset = resolved.targetOffset ?? (offset + WORD_SIZE + offsetWords * WORD_SIZE);
 
     if (elementSize !== 7) return [];
+    const bounds = resolved.targetBounds ?? this.segmentBounds(offset);
+    if (!listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid composite list element shape');
+    }
     const tagLo = this.buf.getUint32(targetOffset, true);
     const tagHi = this.buf.getUint32(targetOffset + 4, true);
-    const elementCount = (tagLo >> 2) | 0;
+    if ((tagLo & 3) !== 0) throw new Error('Invalid composite list tag');
+    const elementCount = tagLo >>> 2;
     const tagDataWords = tagHi & 0xFFFF;
-    const tagPtrWords = (tagHi >> 16) & 0xFFFF;
+    const tagPtrWords = (tagHi >>> 16) & 0xFFFF;
     const elementWords = tagDataWords + tagPtrWords;
+    if (elementCount > MAX_LIST_ELEMENTS || (elementWords > 0 && elementCount > Math.floor((hi >>> 3) / elementWords))
+      || !listBodyFitsSegment(targetOffset, bounds, hi >>> 3, 1)) {
+      throw new Error('Invalid composite list element shape');
+    }
 
+    // Generated parsers map this reader array into a second result array.
+    this.decodeBudget.consumeArrayElements(elementCount * 2);
     const results: StructReader[] = [];
     for (let i = 0; i < elementCount; i++) {
       const elemDataOffset = targetOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
-      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets, this.segmentEnds));
+      results.push(new StructReader(this.raw, this.buf, elemDataOffset, tagDataWords, tagPtrWords, this.segmentOffsets, this.segmentEnds, this.decodeBudget));
     }
     return results;
   }

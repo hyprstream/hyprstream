@@ -2403,6 +2403,25 @@ mod offline_policy_provision_tests {
     }
 
     #[tokio::test]
+    async fn empty_template_list_without_selected_model_fails_before_registry_creation(
+    ) -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let result = provision_policy_templates_with_selection(
+            root.path(),
+            &[],
+            None,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!root.path().join(".registry").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn selected_owner_rules_persist_for_generation_and_decisions_without_did_templates(
     ) -> Result<()> {
         use crate::config::model_admission::{tiny_fixture, ModelOperation};

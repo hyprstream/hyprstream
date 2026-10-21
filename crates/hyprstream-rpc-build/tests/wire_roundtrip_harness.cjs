@@ -34,6 +34,8 @@ const {
   buildWireChoice_values,
   buildWireChoice_ranged,
   parseWireChoice,
+  parseBudgetRows,
+  parseBudgetWrapper,
 } = require('./wire_roundtrip_fixture.js');
 
 const BIG_F32 = 2048; // 8 KB of Float32 — well past the ~1 KB arena slack (#725/#772 growth path)
@@ -118,7 +120,8 @@ function nestedDataReader(kind) {
 function doubleFarDataReader(kind, nested) {
   const container = kind === 'container';
   const rootWords = nested ? 4 : 3;
-  const objectWords = container ? 2 : 1;
+  const zeroWordObject = kind === 'zero-word-object' || kind === 'zero-word-nonempty-list';
+  const objectWords = zeroWordObject ? 0 : container ? 2 : 1;
   const bytes = new Uint8Array(16 + (rootWords + 2 + objectWords) * 8);
   const view = new DataView(bytes.buffer);
   const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
@@ -134,9 +137,65 @@ function doubleFarDataReader(kind, nested) {
   const pad = 16 + rootWords * 8;
   const object = pad + 16;
   word(pad, kind === 'pad-kind' ? 0 : kind === 'pad-double' ? 6 : (kind === 'object-overrun' || kind === 'empty-object') ? 10 : 2, kind === 'object-segment' ? 99 : 2);
-  word(pad + 8, kind === 'tag-kind' ? 2 : 1, container ? (1 << 3) | 6 : ((kind === 'empty-object' ? 0 : kind === 'payload-overrun' ? 9 : 3) << 3) | 2);
+  word(pad + 8, kind === 'tag-kind' ? 2 : 1, container ? (1 << 3) | 6 : ((kind === 'empty-object' || kind === 'zero-word-object' ? 0 : kind === 'zero-word-nonempty-list' ? 1 : kind === 'payload-overrun' ? 9 : 3) << 3) | 2);
   if (container) { word(object, 1, (3 << 3) | 2); bytes.set([1, 2, 3], object + 8); }
-  else bytes.set([1, 2, 3], object);
+  else if (!zeroWordObject) bytes.set([1, 2, 3], object);
+  const root = new CapnpReader(bytes, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
+function doubleFarStructReader(nested, nonempty, overrun = false, undersized = false) {
+  const rootWords = nested ? 3 : 2;
+  const objectWords = overrun || undersized ? 1 : 0;
+  const bytes = new Uint8Array(16 + (rootWords + objectWords + 2) * 8);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
+  view.setUint32(0, 2, true);
+  view.setUint32(4, rootWords, true);
+  view.setUint32(8, objectWords, true);
+  view.setUint32(12, 2, true);
+  word(16, 0, 1 << 16);
+  if (nested) {
+    word(24, 0, 1 << 16);
+    word(32, 6, 2);
+  } else {
+    word(24, 6, 2);
+  }
+  const pad = 16 + (rootWords + objectWords) * 8;
+  word(pad, 2, 1);
+  word(pad + 8, 0, overrun ? 2 : undersized || nonempty ? 1 : 0);
+  const root = new CapnpReader(bytes, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
+function doubleFarCompositeReader(kind, nested) {
+  const rootWords = nested ? 3 : 2;
+  const objectWords = kind === 'tag-overrun' ? 1 : 2;
+  const bytes = new Uint8Array(16 + (rootWords + objectWords + 2) * 8);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
+  view.setUint32(0, 2, true);
+  view.setUint32(4, rootWords, true);
+  view.setUint32(8, objectWords, true);
+  view.setUint32(12, 2, true);
+  word(16, 0, 1 << 16);
+  if (nested) {
+    word(24, 0, 1 << 16);
+    word(32, 6, 2);
+  } else {
+    word(24, 6, 2);
+  }
+  const object = 16 + rootWords * 8;
+  const pad = object + objectWords * 8;
+  word(pad, 2, 1);
+  word(pad + 8, 1, kind === 'oversized-zero-word-count' ? 7 : (1 << 3) | 7); // composite list body words
+  const structCount = kind === 'body-mismatch' ? 2 : 1;
+  word(object, structCount << 2, 1); // one data word per element
+  if (kind === 'oversized-zero-word-count') {
+    // A zero-word struct body can otherwise claim an enormous logical count
+    // while consuming no segment words.
+    word(object, (65_537 << 2) >>> 0, 0);
+  }
   const root = new CapnpReader(bytes, 0, 1);
   return nested ? root.getStruct(0, 0, 1) : root;
 }
@@ -151,6 +210,39 @@ function legacyStructReader() {
   raw.set([1, 2, 3], 24);
   // segmentOffsets and segmentEnds are optional constructor arguments.
   return new StructReader(raw, view, 0, 0, 1);
+}
+
+function truncatedScalarDataReader(nested) {
+  const raw = new Uint8Array(40);
+  const view = new DataView(raw.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, 4, true);
+  word(8, 0, 1 << 16); // root struct points to byte 16
+  if (nested) word(16, 0, 1 << 16); // nested struct points to byte 24
+  word(nested ? 24 : 16, 1, (64 << 3) | 2); // Data payload exceeds segment
+  const root = new CapnpReader(raw, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
+function malformedCompositeReader(nested) {
+  const raw = new Uint8Array(32);
+  const view = new DataView(raw.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, 3, true);
+  word(8, 0, 1 << 16); // root struct points to byte 16
+  if (nested) word(16, 0, 1 << 16); // nested struct points to byte 24
+  // A composite-list pointer whose tag starts beyond the segment end.
+  word(nested ? 24 : 16, 5, 7);
+  const root = new CapnpReader(raw, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
 }
 
 function rootDataReader(kind) {
@@ -213,6 +305,74 @@ function rootDataReader(kind) {
     raw.set([1, 2, 3], 40);
   }
   return new CapnpReader(raw, 0, 1);
+}
+
+function budgetRowsMessage(rowCount, textCount, { wrapper = false, listTextBytes = 0, scalarTextBytes = 0 } = {}) {
+  const rootPointerOffset = 8;
+  const rootBodyOffset = 16;
+  const rowsPointerOffset = wrapper ? rootBodyOffset + 8 : rootBodyOffset;
+  const listTargetOffset = rowsPointerOffset + 8;
+  const listBodyOffset = listTargetOffset + 8;
+  const sharedTextListOffset = listBodyOffset + rowCount * 2 * 8;
+  const listTextOffset = sharedTextListOffset + textCount * 8;
+  const scalarTextOffset = listTextOffset + listTextBytes;
+  const totalBytes = scalarTextOffset + scalarTextBytes;
+  const bytes = new Uint8Array(totalBytes);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, (bytes.length - 8) / 8, true);
+  word(rootPointerOffset, 0, 1 << 16); // root struct: zero data words, one pointer
+  if (wrapper) word(rootBodyOffset, 0, 1 << 16); // child BudgetRows struct
+  const rowsOffsetWords = (listTargetOffset - rowsPointerOffset - 8) / 8;
+  word(rowsPointerOffset, (rowsOffsetWords << 2) | 1, (rowCount * 2 << 3) | 7);
+  word(listTargetOffset, rowCount << 2, 2 << 16); // two pointer fields per BudgetRow
+  if (listTextBytes > 0) {
+    const textOffsetWords = (listTextOffset - sharedTextListOffset - 8) / 8;
+    word(sharedTextListOffset, (textOffsetWords << 2) | 1, (listTextBytes << 3) | 2);
+  }
+  for (let i = 0; i < rowCount; i++) {
+    const textsPointerOffset = listBodyOffset + i * 16;
+    const textListOffsetWords = (sharedTextListOffset - textsPointerOffset - 8) / 8;
+    word(textsPointerOffset, (textListOffsetWords << 2) | 1, (textCount << 3) | 6);
+    if (scalarTextBytes > 0) {
+      const scalarPointerOffset = textsPointerOffset + 8;
+      const payloadOffsetWords = (scalarTextOffset - scalarPointerOffset - 8) / 8;
+      word(scalarPointerOffset, (payloadOffsetWords << 2) | 1, (scalarTextBytes << 3) | 2);
+    }
+  }
+  if (listTextBytes > 0) {
+    bytes.fill(0x61, listTextOffset, listTextOffset + listTextBytes - 1);
+    bytes[listTextOffset + listTextBytes - 1] = 0;
+  }
+  if (scalarTextBytes > 0) {
+    bytes.fill(0x61, scalarTextOffset, scalarTextOffset + scalarTextBytes - 1);
+    bytes[scalarTextOffset + scalarTextBytes - 1] = 0;
+  }
+  return bytes;
+}
+
+function repeatedRootTextReader(byteCount) {
+  const payloadOffset = 32;
+  const bytes = new Uint8Array(payloadOffset + byteCount);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, (bytes.length - 8) / 8, true);
+  word(8, 0, 2 << 16); // root struct with two Text pointers
+  for (const pointerOffset of [16, 24]) {
+    const offsetWords = (payloadOffset - pointerOffset - 8) / 8;
+    word(pointerOffset, (offsetWords << 2) | 1, (byteCount << 3) | 2);
+  }
+  bytes.fill(0x61, payloadOffset, payloadOffset + byteCount - 1);
+  bytes[payloadOffset + byteCount - 1] = 0;
+  return new CapnpReader(bytes, 0, 2);
 }
 
 function out(obj) {
@@ -297,14 +457,299 @@ function main() {
     const output = {};
     for (const nested of [false, true]) {
       const valid = {};
-      for (const kind of ['child', 'container', 'empty-object']) valid[kind] = canon(doubleFarDataReader(kind, nested).getDataList(0));
+      for (const kind of ['child', 'container', 'empty-object', 'zero-word-object']) valid[kind] = canon(doubleFarDataReader(kind, nested).getDataList(0));
       const rejected = [];
-      for (const kind of ['pad-overrun', 'pad-kind', 'pad-double', 'object-segment', 'tag-kind', 'object-overrun', 'payload-overrun', 'object-declared-end']) {
+      for (const kind of ['pad-overrun', 'pad-kind', 'pad-double', 'object-segment', 'tag-kind', 'object-overrun', 'payload-overrun', 'object-declared-end', 'zero-word-nonempty-list']) {
         try { doubleFarDataReader(kind, nested).getDataList(0); } catch { rejected.push(kind); }
       }
       output[nested ? 'nested' : 'root'] = { valid, rejected };
     }
     out(output);
+    return;
+  }
+  if (mode === 'double-far-zero-word-structs') {
+    const output = {};
+    for (const nested of [false, true]) {
+      const empty = doubleFarStructReader(nested, false).getStruct(0, 1, 1);
+      const nonempty = doubleFarStructReader(nested, true).getStruct(0, 1, 0);
+      const undersized = doubleFarStructReader(nested, false, false, true).getStruct(0, 2, 0);
+      output[nested ? 'nested' : 'root'] = {
+        validEmpty: empty !== null,
+        absentDataDefaults: empty?.getUint32(0) === 0,
+        absentPointerDefaults: empty?.getDataList(0).length === 0,
+        undersizedDataDefaults: undersized?.getUint32(8) === 0,
+        rejectsNonempty: nonempty === null,
+      };
+    }
+    out(output);
+    return;
+  }
+  if (mode === 'double-far-object-shape') {
+    const output = {};
+    for (const nested of [false, true]) {
+      const reader = doubleFarStructReader(nested, false, true);
+      output[nested ? 'nested' : 'root'] = reader.getStruct(0, 2, 0) === null;
+    }
+    out(output);
+    return;
+  }
+  if (mode === 'double-far-composite-lists') {
+    const output = {};
+    for (const nested of [false, true]) {
+      output[nested ? 'nested' : 'root'] = {
+        valid: doubleFarCompositeReader('valid', nested).getStructList(0, 1, 0).length,
+        tagOverrun: doubleFarCompositeReader('tag-overrun', nested).getStructList(0, 1, 0).length,
+        bodyMismatch: doubleFarCompositeReader('body-mismatch', nested).getStructList(0, 1, 0).length,
+        oversizedZeroWordCount: doubleFarCompositeReader('oversized-zero-word-count', nested).getStructList(0, 1, 0).length,
+      };
+    }
+    out(output);
+    return;
+  }
+  if (mode === 'malformed-composite-bounds') {
+    const rejectedWithoutRangeError = (reader, method) => {
+      try { reader[method](0, 0, 0); } catch (error) { return error instanceof Error && !(error instanceof RangeError); }
+      return false;
+    };
+    const output = {};
+    for (const nested of [false, true]) {
+      const prefix = nested ? 'nested' : 'root';
+      const reader = malformedCompositeReader(nested);
+      output[`${prefix}StructList`] = rejectedWithoutRangeError(reader, 'getStructList');
+      output[`${prefix}TextList`] = rejectedWithoutRangeError(reader, 'getTextList');
+      output[`${prefix}NestedPrimitive`] = rejectedWithoutRangeError(reader, 'getUint8ListList');
+    }
+    const rootData = truncatedScalarDataReader(false);
+    const nestedData = truncatedScalarDataReader(true);
+    output.rootScalarData = rejectedWithoutRangeError(rootData, 'getData');
+    output.nestedScalarData = rejectedWithoutRangeError(nestedData, 'getData');
+    out(output);
+    return;
+  }
+  if (mode === 'zero-word-struct-list-limit') {
+    const bytes = new Uint8Array(32);
+    const view = new DataView(bytes.buffer);
+    view.setUint32(0, 0, true); // one segment
+    view.setUint32(4, 3, true); // root struct, list pointer, composite tag
+    view.setUint32(8, 0, true);
+    view.setUint32(12, 1 << 16, true);
+    view.setUint32(16, 1, true); // list pointer, zero body words
+    view.setUint32(20, 7, true);
+    view.setUint32(24, (65_537 << 2) >>> 0, true); // oversized zero-word count
+    view.setUint32(28, 0, true);
+    let rejected = false;
+    try { new CapnpReader(bytes, 0, 1).getStructList(0, 0, 0); } catch { rejected = true; }
+    out({ rejected });
+    return;
+  }
+  if (mode === 'far-zero-word-struct-list-limit') {
+    // Two segments: root struct + far pointer in segment 0, landing pointer +
+    // oversized zero-word composite tag in segment 1.
+    const bytes = new Uint8Array(48);
+    const view = new DataView(bytes.buffer);
+    view.setUint32(0, 1, true); // two segments
+    view.setUint32(4, 2, true); // segment 0 words
+    view.setUint32(8, 2, true); // segment 1 words
+    view.setUint32(12, 0, true); // table padding
+    view.setUint32(16, 0, true); // root struct, one pointer
+    view.setUint32(20, 1 << 16, true);
+    view.setUint32(24, 2, true); // single-far pointer to segment 1 word 0
+    view.setUint32(28, 1, true);
+    view.setUint32(32, 1, true); // landing pointer to composite tag at word 1
+    view.setUint32(36, 7, true); // zero body words
+    view.setUint32(40, (65_537 << 2) >>> 0, true);
+    view.setUint32(44, 0, true);
+    let rejected = false;
+    try { new CapnpReader(bytes, 0, 1).getStructList(0, 0, 0); } catch { rejected = true; }
+    out({ rejected });
+    return;
+  }
+  if (mode === 'zero-word-composite-reader-limits') {
+    const rootBytes = new Uint8Array(40);
+    const rootView = new DataView(rootBytes.buffer);
+    rootView.setUint32(0, 0, true);
+    rootView.setUint32(4, 4, true);
+    rootView.setUint32(8, 0, true);
+    rootView.setUint32(12, 1 << 16, true);
+    rootView.setUint32(16, 1, true);
+    rootView.setUint32(20, 7, true);
+    rootView.setUint32(24, (65_537 << 2) >>> 0, true);
+    rootView.setUint32(28, 0, true);
+    const structBytes = new Uint8Array(16);
+    const structView = new DataView(structBytes.buffer);
+    structView.setUint32(0, 1, true);
+    structView.setUint32(4, 7, true);
+    structView.setUint32(8, (65_537 << 2) >>> 0, true);
+    const root = new CapnpReader(rootBytes, 0, 1);
+    const nested = new StructReader(structBytes, structView, 0, 0, 1);
+    const makeRootListReader = (elementSize) => {
+      const bytes = new Uint8Array(24);
+      const view = new DataView(bytes.buffer);
+      view.setUint32(0, 0, true);
+      view.setUint32(4, 2, true);
+      view.setUint32(8, 0, true);
+      view.setUint32(12, 1 << 16, true);
+      view.setUint32(16, 1, true);
+      view.setUint32(20, (65_537 << 3) | elementSize, true);
+      return new CapnpReader(bytes, 0, 1);
+    };
+    const makeStructListReader = (elementSize) => {
+      const bytes = new Uint8Array(16);
+      const view = new DataView(bytes.buffer);
+      view.setUint32(0, 1, true);
+      view.setUint32(4, (65_537 << 3) | elementSize, true);
+      return new StructReader(bytes, view, 0, 0, 1);
+    };
+    const rejected = (reader, method) => {
+      try { reader[method](0); return false; } catch { return true; }
+    };
+    out({
+      rootNestedPrimitive: rejected(root, 'getUint8ListList'),
+      structNestedPrimitive: rejected(nested, 'getUint8ListList'),
+      rootText: rejected(root, 'getTextList'),
+      structText: rejected(nested, 'getTextList'),
+      rootNestedPointer: rejected(makeRootListReader(6), 'getUint8ListList'),
+      structNestedPointer: rejected(makeStructListReader(6), 'getUint8ListList'),
+      rootBoolean: rejected(makeRootListReader(1), 'getBoolList'),
+      structBoolean: rejected(makeStructListReader(1), 'getBoolList'),
+    });
+    return;
+  }
+  if (mode === 'text-list-materialization-budget') {
+    const textBytes = 9 * 1024 * 1024;
+    const listPointer = (view, offset, targetOffset, byteCount) => {
+      const offsetWords = (targetOffset - offset - 8) / 8;
+      view.setUint32(offset, (offsetWords << 2) | 1, true);
+      view.setUint32(offset + 4, (byteCount << 3) | 2, true);
+    };
+    const setPayload = (bytes, offset) => {
+      bytes.fill(0x61, offset, offset + textBytes - 1);
+      bytes[offset + textBytes - 1] = 0;
+    };
+    const rootReader = (composite) => {
+      const payloadOffset = composite ? 64 : 40;
+      const bytes = new Uint8Array(payloadOffset + textBytes + 8);
+      const view = new DataView(bytes.buffer);
+      const segmentWords = Math.ceil((bytes.length - 8) / 8);
+      view.setUint32(0, 0, true);
+      view.setUint32(4, segmentWords, true);
+      view.setUint32(8, 0, true);
+      view.setUint32(12, 1 << 16, true);
+      if (composite) {
+        view.setUint32(16, 1, true);
+        view.setUint32(20, (4 << 3) | 7, true);
+        view.setUint32(24, 2 << 2, true);
+        view.setUint32(28, (1 << 16) | 1, true);
+        listPointer(view, 40, payloadOffset, textBytes);
+        view.setUint32(48, 0x12345678, true);
+        view.setUint32(52, 0, true);
+        listPointer(view, 56, payloadOffset, textBytes);
+      } else {
+        view.setUint32(16, 1, true);
+        view.setUint32(20, (2 << 3) | 6, true);
+        listPointer(view, 24, payloadOffset, textBytes);
+        listPointer(view, 32, payloadOffset, textBytes);
+      }
+      setPayload(bytes, payloadOffset);
+      return new CapnpReader(bytes, 0, 1);
+    };
+    const structReader = (composite) => {
+      const payloadOffset = composite ? 56 : 32;
+      const bytes = new Uint8Array(payloadOffset + textBytes + 8);
+      const view = new DataView(bytes.buffer);
+      if (composite) {
+        view.setUint32(8, 1, true);
+        view.setUint32(12, (4 << 3) | 7, true);
+        view.setUint32(16, 2 << 2, true);
+        view.setUint32(20, (1 << 16) | 1, true);
+        view.setUint32(24, 0x12345678, true);
+        view.setUint32(28, 0, true);
+        listPointer(view, 32, payloadOffset, textBytes);
+        view.setUint32(40, 0x87654321, true);
+        view.setUint32(44, 0, true);
+        listPointer(view, 48, payloadOffset, textBytes);
+      } else {
+        view.setUint32(8, 1, true);
+        view.setUint32(12, (2 << 3) | 6, true);
+        listPointer(view, 16, payloadOffset, textBytes);
+        listPointer(view, 24, payloadOffset, textBytes);
+      }
+      setPayload(bytes, payloadOffset);
+      return new StructReader(bytes, view, 0, 1, 1);
+    };
+    const rejected = (reader) => {
+      try { reader.getTextList(0); return false; }
+      catch (error) { return error instanceof Error && error.message.includes('budget exceeded'); }
+    };
+    out({
+      rootPointerList: rejected(rootReader(false)),
+      rootComposite: rejected(rootReader(true)),
+      structPointerList: rejected(structReader(false)),
+      structComposite: rejected(structReader(true)),
+    });
+    return;
+  }
+  if (mode === 'aggregate-decoded-budget') {
+    const rejectsWith = (run, message) => {
+      try { run(); return false; }
+      catch (error) { return error instanceof Error && error.message.includes(message); }
+    };
+    const oversized = budgetRowsMessage(1024, 1024);
+    const nestedOversized = budgetRowsMessage(1024, 1024, { wrapper: true });
+    const bounded = budgetRowsMessage(512, 1024);
+    const parseBounded = () => parseBudgetRows(bounded).rows.length;
+    const listText = budgetRowsMessage(2, 1, { listTextBytes: 9 * 1024 * 1024 });
+    const scalarText = budgetRowsMessage(2, 0, { scalarTextBytes: 9 * 1024 * 1024 });
+    const rootTextReader = repeatedRootTextReader(9 * 1024 * 1024);
+    out({
+      rootArrayBudget: rejectsWith(() => parseBudgetRows(oversized), 'decoded array-element budget exceeded'),
+      nestedArrayBudget: rejectsWith(() => parseBudgetWrapper(nestedOversized), 'decoded array-element budget exceeded'),
+      boundedRows: parseBounded(),
+      boundedRowsSecondDecode: parseBounded(),
+      listTextBudget: rejectsWith(() => parseBudgetRows(listText), 'decoded text-byte budget exceeded'),
+      scalarTextBudget: rejectsWith(() => parseBudgetRows(scalarText), 'decoded text-byte budget exceeded'),
+      rootScalarTextBudget: rejectsWith(() => { rootTextReader.getText(0); rootTextReader.getText(1); }, 'decoded text-byte budget exceeded'),
+    });
+    return;
+  }
+  if (mode === 'strided-composite-readers') {
+    const makeRoot = (text) => {
+      const bytes = new Uint8Array(96);
+      const view = new DataView(bytes.buffer);
+      const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
+      view.setUint32(0, 0, true);
+      view.setUint32(4, 10, true);
+      word(8, 0, 1 << 16);
+      word(16, 1, (4 << 3) | 7);
+      word(24, 2 << 2, (1 << 16) | 1);
+      word(32, 0x12345678, 0);
+      word(40, (2 << 2) | 1, ((text ? 4 : 3) << 3) | 2);
+      word(48, 0x87654321, 0);
+      word(56, (1 << 2) | 1, ((text ? 4 : 3) << 3) | 2);
+      bytes.set(text ? Uint8Array.from(Buffer.from('one\0')) : Uint8Array.from([7, 8, 9]), 64);
+      bytes.set(text ? Uint8Array.from(Buffer.from('two\0')) : Uint8Array.from([4, 5, 6]), 72);
+      return new CapnpReader(bytes, 0, 1);
+    };
+    const makeStruct = (text) => {
+      const bytes = new Uint8Array(88);
+      const view = new DataView(bytes.buffer);
+      const word = (offset, lo, hi) => { view.setUint32(offset, lo >>> 0, true); view.setUint32(offset + 4, hi >>> 0, true); };
+      word(0, 0x12345678, 0);
+      word(8, 1, (4 << 3) | 7);
+      word(16, 2 << 2, (1 << 16) | 1);
+      word(24, 0x12345678, 0);
+      word(32, (2 << 2) | 1, ((text ? 4 : 3) << 3) | 2);
+      word(40, 0x87654321, 0);
+      word(48, (1 << 2) | 1, ((text ? 4 : 3) << 3) | 2);
+      bytes.set(text ? Uint8Array.from(Buffer.from('one\0')) : Uint8Array.from([7, 8, 9]), 56);
+      bytes.set(text ? Uint8Array.from(Buffer.from('two\0')) : Uint8Array.from([4, 5, 6]), 64);
+      return new StructReader(bytes, view, 0, 1, 1);
+    };
+    const rootText = makeRoot(true).getTextList(0);
+    const structText = makeStruct(true).getTextList(0);
+    const rootNested = makeRoot(false).getUint8ListList(0);
+    const structNested = makeStruct(false).getUint8ListList(0);
+    out({ rootText, structText, rootNested, structNested });
     return;
   }
   if (mode === 'struct-data-lists') {

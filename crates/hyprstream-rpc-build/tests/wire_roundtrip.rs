@@ -993,7 +993,7 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
     for shape in ["root", "nested"] {
         assert_eq!(
             output[shape]["valid"],
-            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]]})
+            json!({"child":[[1,2,3]],"container":[[1,2,3]],"empty-object":[[]],"zero-word-object":[[]]})
         );
         assert_eq!(
             output[shape]["rejected"],
@@ -1005,8 +1005,116 @@ fn rust_list_upgrade_emits_legal_double_far_data_pointers() {
                 "tag-kind",
                 "object-overrun",
                 "payload-overrun",
-                "object-declared-end"
+                "object-declared-end",
+                "zero-word-nonempty-list"
             ])
         );
     }
+    assert_eq!(
+        wd.run("double-far-zero-word-structs", &[]),
+        json!({
+            "root": {"validEmpty": true, "absentDataDefaults": true, "absentPointerDefaults": true, "undersizedDataDefaults": true, "rejectsNonempty": true},
+            "nested": {"validEmpty": true, "absentDataDefaults": true, "absentPointerDefaults": true, "undersizedDataDefaults": true, "rejectsNonempty": true}
+        })
+    );
+    assert_eq!(
+        wd.run("double-far-object-shape", &[]),
+        json!({"root": true, "nested": true}),
+        "a nonempty target segment must reject a struct shape that overruns it"
+    );
+    assert_eq!(
+        wd.run("double-far-composite-lists", &[]),
+        json!({
+            "root": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0, "oversizedZeroWordCount": 0},
+            "nested": {"valid": 1, "tagOverrun": 0, "bodyMismatch": 0, "oversizedZeroWordCount": 0}
+        }),
+        "double-far composite tags must validate tag-word and body bounds"
+    );
+}
+
+#[test]
+fn zero_word_composite_lists_bound_materialized_elements() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    assert_eq!(
+        wd.run("zero-word-struct-list-limit", &[]),
+        json!({"rejected": true}),
+        "zero-word structs must not allocate an attacker-sized JS object array"
+    );
+    assert_eq!(
+        wd.run("far-zero-word-struct-list-limit", &[]),
+        json!({"rejected": true}),
+        "single-far pointers must preserve zero-word composite count limits"
+    );
+    assert_eq!(
+        wd.run("zero-word-composite-reader-limits", &[]),
+        json!({
+            "rootNestedPrimitive": true,
+            "structNestedPrimitive": true,
+            "rootText": true,
+            "structText": true,
+            "rootNestedPointer": true,
+            "structNestedPointer": true,
+            "rootBoolean": true,
+            "structBoolean": true
+        }),
+        "all composite readers must reject oversized zero-word lists before iterating"
+    );
+    assert_eq!(
+        wd.run("text-list-materialization-budget", &[]),
+        json!({
+            "rootPointerList": true,
+            "rootComposite": true,
+            "structPointerList": true,
+            "structComposite": true
+        }),
+        "Text readers must bound repeated payload materialization and validate child pointers"
+    );
+    assert_eq!(
+        wd.run("aggregate-decoded-budget", &[]),
+        json!({
+            "rootArrayBudget": true,
+            "nestedArrayBudget": true,
+            "boundedRows": 512,
+            "boundedRowsSecondDecode": 512,
+            "listTextBudget": true,
+            "scalarTextBudget": true,
+            "rootScalarTextBudget": true
+        }),
+        "generated root and nested parsers must share per-message aggregate allocation budgets"
+    );
+    assert_eq!(
+        wd.run("strided-composite-readers", &[]),
+        json!({
+            "rootText": ["one", "two"],
+            "structText": ["one", "two"],
+            "rootNested": [[7, 8, 9], [4, 5, 6]],
+            "structNested": [[7, 8, 9], [4, 5, 6]]
+        }),
+        "Text and nested-list readers must honor data words before pointer fields"
+    );
+}
+
+#[test]
+fn malformed_composite_tags_and_scalar_data_are_rejected_without_range_panics() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    assert_eq!(
+        wd.run("malformed-composite-bounds", &[]),
+        json!({
+            "rootStructList": true,
+            "rootTextList": true,
+            "rootNestedPrimitive": true,
+            "nestedStructList": true,
+            "nestedTextList": true,
+            "nestedNestedPrimitive": true,
+            "rootScalarData": true,
+            "nestedScalarData": true
+        }),
+        "malformed composite tag offsets and scalar Data extents must fail with bounded parser errors"
+    );
 }
