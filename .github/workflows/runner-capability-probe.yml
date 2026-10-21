@@ -2,11 +2,11 @@ name: Runner capability probe
 
 # Dispatch-only capability probe for the self-hosted runner classes (native
 # CI plan N0.2). The self-hosted AMD64 classes (`hyprstream-release`,
-# `hyprstream-canary`) are defined in metal stacks/aws-runners but no
-# hyprstream job has ever consumed them, so their liveness is UNPROVEN until
-# this probe runs green on the class. Wave 2 x86 migrations are gated on that
-# evidence: an indefinitely-queued job is the failure mode of migrating onto
-# a dead pool.
+# `hyprstream-canary`) are defined in metal stacks/aws-runners. The release
+# class has completed native OCI validation; the canary class remains unproven.
+# Probe each class before its Wave 2 migrations so a dead pool cannot leave
+# jobs queued indefinitely. Evidence is recorded in
+# .github/runner-capability-evidence-20261020.md.
 #
 # The probe records the concrete host identity — architecture, cores, memory,
 # disk, podman, dedicated cache mount, GPU presence, registry reachability —

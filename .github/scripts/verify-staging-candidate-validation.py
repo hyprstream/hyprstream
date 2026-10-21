@@ -60,9 +60,18 @@ def validate(
     )
     _require_job(
         oci_jobs,
-        name="build-runtime-and-smoke-test",
+        name="build-runtime-and-smoke-test (arm64)",
         required_steps={
             "Build runtime image (cpu-arm64)",
+            "Qualify the OCI PostgreSQL profile against a live database",
+            "Assert smoke container runs as uid 65532",
+        },
+    )
+    _require_job(
+        oci_jobs,
+        name="build-runtime-and-smoke-test (amd64)",
+        required_steps={
+            "Build runtime image (cpu)",
             "Qualify the OCI PostgreSQL profile against a live database",
             "Assert smoke container runs as uid 65532",
         },

@@ -42,9 +42,9 @@ run_live_module() {
   # race schema creation and turn a valid profile into a false failure.
   # Capture the program statuses explicitly. `if ! pipeline` normalizes the
   # failure to one, which otherwise hides an OOM/signal or a cache-permission
-  # failure on the native ARM builder. Neither status can contain the URL.
+  # failure on the native architecture builder. Neither status can contain the URL.
   set +e
-  HYPRSTREAM_REPLAY_TEST_URL_FILE="${replay_url_file}" cargo test -p "${package}" --locked --lib --no-default-features \
+  HYPRSTREAM_REPLAY_TEST_URL_FILE="${replay_url_file}" cargo test --release -p "${package}" --locked --lib --no-default-features \
       --features "${features}" -- "${filter}" "${extra_test_args[@]}" \
       --test-threads=1 --show-output 2>&1 | tee "${log}"
   pipeline_status=("${PIPESTATUS[@]}")

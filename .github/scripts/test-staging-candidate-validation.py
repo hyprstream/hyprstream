@@ -38,8 +38,31 @@ def jobs(name, steps):
     }
 
 
-OCI_STEPS = {
+def matrix_jobs():
+    return {
+        "jobs": [
+            {
+                "name": name,
+                "conclusion": "success",
+                "steps": [
+                    {"name": step, "conclusion": "success"} for step in steps
+                ],
+            }
+            for name, steps in (
+                ("build-runtime-and-smoke-test (arm64)", OCI_ARM64_STEPS),
+                ("build-runtime-and-smoke-test (amd64)", OCI_AMD64_STEPS),
+            )
+        ]
+    }
+
+
+OCI_ARM64_STEPS = {
     "Build runtime image (cpu-arm64)",
+    "Qualify the OCI PostgreSQL profile against a live database",
+    "Assert smoke container runs as uid 65532",
+}
+OCI_AMD64_STEPS = {
+    "Build runtime image (cpu)",
     "Qualify the OCI PostgreSQL profile against a live database",
     "Assert smoke container runs as uid 65532",
 }
@@ -54,7 +77,7 @@ class CandidateValidationTests(unittest.TestCase):
     def valid(self):
         return (
             run("OCI Runtime Image Validation", ".github/workflows/oci-runtime-validate.yml"),
-            jobs("build-runtime-and-smoke-test", OCI_STEPS),
+            matrix_jobs(),
             run("Merge-gate preflight", ".github/workflows/merge-gate-preflight.yml"),
             jobs("Build + test (arm64 preflight)", PREFLIGHT_STEPS),
         )
@@ -83,6 +106,12 @@ class CandidateValidationTests(unittest.TestCase):
     def test_rejects_missing_real_oci_step(self):
         oci_run, oci_jobs, preflight_run, preflight_jobs = self.valid()
         oci_jobs["jobs"][0]["steps"] = []
+        with self.assertRaises(candidate_validation.ValidationError):
+            candidate_validation.validate(SOURCE, oci_run, oci_jobs, preflight_run, preflight_jobs)
+
+    def test_rejects_missing_amd64_gate(self):
+        oci_run, oci_jobs, preflight_run, preflight_jobs = self.valid()
+        oci_jobs["jobs"].pop()
         with self.assertRaises(candidate_validation.ValidationError):
             candidate_validation.validate(SOURCE, oci_run, oci_jobs, preflight_run, preflight_jobs)
 

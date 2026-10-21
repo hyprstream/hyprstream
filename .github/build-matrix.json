@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Versioned architecture/backend build contract for hyprstream CI (native self-hosted CI/CD + ARM64 plan, 2026-09-13). scripts/check_build_matrix.py validates this file and enforces the hosted-runner allowlist against .github/workflows/*.yml on every Rust `deny` run. Truthful about current state: rows describe what executes TODAY; each Wave-2 migration PR moves a row's runner_class and removes its hosted_allowlist entry together. Capability evidence: metal/.fleet-coord/ci-native-arm64-capability-evidence-20260913.md.",
+  "description": "Versioned architecture/backend build contract for hyprstream CI (native self-hosted CI/CD + ARM64 plan, 2026-09-13). scripts/check_build_matrix.py validates this file and enforces the hosted-runner allowlist against .github/workflows/*.yml on every Rust `deny` run. Truthful about current state: rows describe what executes TODAY; each Wave-2 migration PR moves a row's runner_class and removes its hosted_allowlist entry together. Capability evidence: metal/.fleet-coord/ci-native-arm64-capability-evidence-20260913.md and .github/runner-capability-evidence-20261020.md.",
   "runner_classes": {
     "arm64-merge-gate": {
       "labels": ["self-hosted", "linux", "arm64", "graviton", "hyprstream-merge-gate"],
@@ -17,8 +17,8 @@
     "amd64-release": {
       "labels": ["self-hosted", "linux", "amd64", "hyprstream-release"],
       "architecture": "x86_64",
-      "status": "unproven",
-      "substrate": "AWS x86_64 ephemeral JIT runners, x86_64 golden AMI (hyprstream-runner.pkr.hcl -var architecture=amd64), on-demand. Defined in metal stacks/aws-runners since commit ecf9de7 (ingest#98) but NO hyprstream job has ever consumed it. Liveness must be proven with .github/workflows/runner-capability-probe.yml before any row moves here."
+      "status": "live",
+      "substrate": "AWS x86_64 ephemeral JIT runners, x86_64 golden AMI (hyprstream-runner.pkr.hcl -var architecture=amd64), on-demand. Dedicated release-class capability probe passed on PR #1759 head f76b477426d20f8755dee88e615a0ea0817daafe: https://github.com/hyprstream/hyprstream/actions/runs/39519303291. Exact-head native OCI validation also passed: https://github.com/hyprstream/hyprstream/actions/runs/39443276226. See .github/runner-capability-evidence-20261020.md."
     },
     "amd64-canary": {
       "labels": ["self-hosted", "linux", "amd64", "hyprstream-canary"],
@@ -293,9 +293,9 @@
       }
     },
     "oci-runtime-validate.yml": {
-      "build-runtime-and-smoke-test-deferred": {
+      "build-runtime-and-smoke-test": {
         "target_class": "amd64-canary",
-        "reason": "seconds-long required-check placeholder (echo only: no build, no checkout, no credentials); arch-neutral, migrates trivially with any pinned container"
+        "reason": "PR source checks and a short merge-group result assertion stay on GitHub-hosted runners to keep untrusted code off persistent self-hosted hosts; the assertion requires native amd64 and arm64 OCI jobs to pass"
       }
     },
     "pr-affected.yml": {
