@@ -646,8 +646,13 @@ fn validate_claims(
     require(v.get("aud").is_some_and(|a| {
         a.as_str() == Some(class.aud.as_str()) || *a == serde_json::json!([class.aud.as_str()])
     }))?;
-    if let Some(azp) = v.get("azp") {
-        require(azp.as_str() == Some(class.client_id.as_str()))?;
+    // azp is the only signed client binding when the class's audience does
+    // not itself name the client: require it there. When aud == client_id
+    // (the staging www shape), the aud check above already pins the client
+    // and azp stays optional, exactly as before.
+    match v.get("azp") {
+        Some(azp) => require(azp.as_str() == Some(class.client_id.as_str()))?,
+        None => require(class.aud == class.client_id)?,
     }
     text(v, "sub")?;
     atproto_account_did(v, &class.connector)?;
