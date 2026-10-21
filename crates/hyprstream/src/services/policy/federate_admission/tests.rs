@@ -334,6 +334,7 @@ async fn oauth_runtime_client_authenticates_real_prepare_and_commit() -> Result<
         token_hash: source.token_hash.to_vec(),
         issued_at: source.issued_at,
         expires_at: source.expires_at,
+        device_flow: false,
     };
     let request = PrepareFederateSession {
         source: verified.clone(),
@@ -497,11 +498,12 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
                 &ctx,
                 "client",
                 source.clone(),
+                false,
                 requested.clone(),
                 [11; 32],
                 now,
                 model_ed,
-                vec![31; 1952],
+                vec![31; 1952]
             )
             .await
             .is_err(),
@@ -513,11 +515,12 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
                 &ctx,
                 "client",
                 source.clone(),
+                false,
                 requested.clone(),
                 [12; 32],
                 now,
                 [31; 32],
-                vec![27; 1952],
+                vec![27; 1952]
             )
             .await
             .is_err(),
@@ -532,6 +535,7 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
             &ctx,
             "client",
             source.clone(),
+            false,
             requested,
             challenge_id,
             now,
@@ -559,11 +563,12 @@ async fn stateless_issuance_rejects_either_proof_component_if_in_trusted_invento
                 prepared.handle,
                 "client",
                 source,
+                false,
                 challenge_id,
                 now,
                 expires_at,
                 model_ed,
-                pq_public,
+                pq_public
             )
             .await
             .is_err(),
@@ -632,14 +637,183 @@ async fn pre_d2_consumption_record_is_recognized_by_the_dual_key_consume() {
     // The post-upgrade consume recognizes the token as consumed even though
     // its current-derivation key was never recorded.
     assert!(service
-        .consume_source_credential(&consumed, "client")
+        .consume_source_credential(&consumed, "client", false)
         .is_err());
     // A fresh token still consumes exactly once (under both keys).
     let mut fresh = source();
     fresh.jti = "fresh-jti".into();
     fresh.token_hash = [9; 32];
-    service.consume_source_credential(&fresh, "client").unwrap();
-    assert!(service.consume_source_credential(&fresh, "client").is_err());
+    service
+        .consume_source_credential(&fresh, "client", false)
+        .unwrap();
+    assert!(service
+        .consume_source_credential(&fresh, "client", false)
+        .is_err());
+}
+
+// ── W1b/D2: device-flow replay consumption ────────────────────────────────
+
+/// Credential-insert fault injection over the in-memory store: the Nth
+/// credential insert (1-based) returns Failed; 0 never fails.
+struct FaultInjectingReplayStore {
+    inner: hyprstream_rpc::proof::admission::InMemoryProofReplayStore,
+    fail_on: std::sync::atomic::AtomicUsize,
+    inserts: std::sync::atomic::AtomicUsize,
+}
+
+impl FaultInjectingReplayStore {
+    fn new(fail_on: usize) -> Self {
+        Self {
+            inner:
+                hyprstream_rpc::proof::admission::InMemoryProofReplayStore::single_verifier_instance(
+                    128,
+                ),
+            fail_on: std::sync::atomic::AtomicUsize::new(fail_on),
+            inserts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn credential_inserts(&self) -> usize {
+        self.inserts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl hyprstream_rpc::proof::admission::ProofReplayStore for FaultInjectingReplayStore {
+    fn domain_guarantee(&self) -> hyprstream_rpc::proof::admission::ReplayDomainGuarantee {
+        hyprstream_rpc::proof::admission::ReplayDomainGuarantee::LinearizableSharedStore
+    }
+
+    fn check_and_insert(
+        &self,
+        partition: hyprstream_rpc::proof::ProofDisposition,
+        key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.inner.check_and_insert(partition, key, expires_at)
+    }
+
+    fn check_and_insert_mediated(
+        &self,
+        key: &hyprstream_rpc::proof::admission::MediatedQueryReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        self.inner.check_and_insert_mediated(key, expires_at)
+    }
+
+    fn check_and_insert_credential(
+        &self,
+        key: &hyprstream_rpc::proof::admission::CredentialReplayKey,
+        expires_at: u64,
+    ) -> hyprstream_rpc::proof::admission::ProofAdmissionResult {
+        let n = self
+            .inserts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if n == self.fail_on.load(std::sync::atomic::Ordering::SeqCst) {
+            return hyprstream_rpc::proof::admission::ProofAdmissionResult::Failed;
+        }
+        self.inner.check_and_insert_credential(key, expires_at)
+    }
+}
+
+fn install_replay(
+    service: &mut AdmissionService,
+    fail_on: usize,
+) -> Arc<FaultInjectingReplayStore> {
+    let store = Arc::new(FaultInjectingReplayStore::new(fail_on));
+    service.source_replay = Some(store.clone());
+    store
+}
+
+#[tokio::test]
+async fn device_flow_consumes_only_the_nonce_free_identity() {
+    // W1b: a device-flow source consumes under the CURRENT identity only.
+    // The legacy key is never recorded, so no fresh-legacy-key replay
+    // window exists even for a token re-presented under a different
+    // (client-chosen) device commitment nonce.
+    let (mut service, _ctx) = fixture().await;
+    install_replay(&mut service, 0);
+    let device = source();
+    let expiry = u64::try_from(device.expires_at).unwrap();
+    service
+        .consume_source_credential(&device, "client", true)
+        .unwrap();
+    // Same token under a DIFFERENT device commitment nonce (same
+    // jti/token_hash): the current key is recorded -> Replayed.
+    let mut varied = source();
+    varied.nonce = "another-device-commitment".into();
+    assert!(service
+        .consume_source_credential(&varied, "client", true)
+        .is_err());
+    // The legacy (nonce-bearing) key was never written: it still admits
+    // standalone, proving the device consume performed a single write.
+    let replay = service.source_replay.as_ref().unwrap();
+    let legacy = super::legacy_source_credential_replay_key(&device, "client");
+    assert!(matches!(
+        replay.admit_source_credential(&legacy, expiry),
+        hyprstream_rpc::proof::admission::ProofAdmissionResult::Admitted
+    ));
+    // Code-flow control, same service: the dual write still applies, and a
+    // pre-recorded legacy record denies a later code-flow consume.
+    let mut code = source();
+    code.jti = "code-jti".into();
+    code.token_hash = [2; 32];
+    let legacy_code = super::legacy_source_credential_replay_key(&code, "client");
+    assert!(matches!(
+        replay.admit_source_credential(&legacy_code, expiry),
+        hyprstream_rpc::proof::admission::ProofAdmissionResult::Admitted
+    ));
+    assert!(service
+        .consume_source_credential(&code, "client", false)
+        .is_err());
+}
+
+#[tokio::test]
+async fn device_flow_write_failure_cannot_enable_double_consume() {
+    // Fault injection: the single (current-key) write FAILS on the first
+    // attempt -> consumption aborts fail-closed, nothing recorded. A retry
+    // under a DIFFERENT device commitment re-attempts the SAME current key:
+    // it admits exactly once; every later attempt is Replayed. No pair of
+    // attempts can both consume (the W1b fix invariant).
+    let (mut service, _ctx) = fixture().await;
+    let store = install_replay(&mut service, 1);
+    let device = source();
+    assert!(service
+        .consume_source_credential(&device, "client", true)
+        .is_err());
+    assert_eq!(store.credential_inserts(), 1);
+    let mut varied = source();
+    varied.nonce = "different-device-commitment".into();
+    service
+        .consume_source_credential(&varied, "client", true)
+        .unwrap();
+    assert!(service
+        .consume_source_credential(&device, "client", true)
+        .is_err());
+    assert!(service
+        .consume_source_credential(&varied, "client", true)
+        .is_err());
+    assert_eq!(store.credential_inserts(), 4);
+}
+
+#[tokio::test]
+async fn code_flow_failure_between_legacy_and_current_writes_denies_replay() {
+    // Fault injection on the CODE path (dual write retained): legacy
+    // admitted, current write FAILS -> consumption aborts. Retrying the
+    // SAME token hits the already-recorded legacy key: Replayed. The
+    // nonce is issuer-signed on this flow, so no different-commitment
+    // variant of the same token can exist.
+    let (mut service, _ctx) = fixture().await;
+    let store = install_replay(&mut service, 2);
+    let code = source();
+    assert!(service
+        .consume_source_credential(&code, "client", false)
+        .is_err());
+    assert_eq!(store.credential_inserts(), 2);
+    assert!(service
+        .consume_source_credential(&code, "client", false)
+        .is_err());
+    assert_eq!(store.credential_inserts(), 3);
 }
 
 #[tokio::test]
@@ -666,11 +840,12 @@ async fn malformed_policy_tenant_rejects_the_federate_decision() {
                     &ctx,
                     "client",
                     source(),
+                    false,
                     vec![STAGING_SCOPE.to_owned()],
                     [31; 32],
                     chrono::Utc::now().timestamp(),
                     [51; 32],
-                    vec![52; 1952],
+                    vec![52; 1952]
                 )
                 .await
                 .is_err(),
@@ -722,6 +897,7 @@ async fn w12_tui_class_prepares_and_commits_under_its_own_profile_table_entry() 
             &ctx,
             TUI_CLIENT_ID,
             source(),
+            false,
             vec![TUI_CONNECT_SCOPE.into()],
             [21; 32],
             now,
@@ -738,6 +914,7 @@ async fn w12_tui_class_prepares_and_commits_under_its_own_profile_table_entry() 
             prepared.handle,
             TUI_CLIENT_ID,
             source(),
+            false,
             [21; 32],
             now,
             now + 60,
@@ -754,6 +931,7 @@ async fn w12_tui_class_prepares_and_commits_under_its_own_profile_table_entry() 
             &ctx,
             TUI_CLIENT_ID,
             source(),
+            false,
             vec![TUI_CONNECT_SCOPE.into()],
             [22; 32],
             now,
@@ -769,6 +947,7 @@ async fn w12_tui_class_prepares_and_commits_under_its_own_profile_table_entry() 
                 prepared.handle,
                 "client",
                 source(),
+                false,
                 [22; 32],
                 now,
                 now + 60,
@@ -794,6 +973,7 @@ async fn w12_per_client_scope_ceilings_do_not_intersect() {
                     &ctx,
                     TUI_CLIENT_ID,
                     source(),
+                    false,
                     vec![www_scope.into()],
                     [23; 32],
                     chrono::Utc::now().timestamp(),
@@ -813,6 +993,7 @@ async fn w12_per_client_scope_ceilings_do_not_intersect() {
                 &ctx,
                 "client",
                 source(),
+                false,
                 vec![TUI_CONNECT_SCOPE.into()],
                 [24; 32],
                 chrono::Utc::now().timestamp(),
@@ -836,6 +1017,7 @@ async fn w12_unconfigured_tui_class_default_denies_at_admission() {
                 &ctx,
                 TUI_CLIENT_ID,
                 source(),
+                false,
                 vec![TUI_CONNECT_SCOPE.into()],
                 [25; 32],
                 chrono::Utc::now().timestamp(),
@@ -910,6 +1092,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             &ctx,
             "client",
             verified_source.clone(),
+            false,
             requested,
             [9; 32],
             now,
@@ -926,6 +1109,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             prepared.handle,
             "client",
             verified_source.clone(),
+            false,
             [9; 32],
             now,
             now + 60,
@@ -941,6 +1125,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             prepared.handle,
             "client",
             verified_source,
+            false,
             [9; 32],
             now,
             now + 60,
@@ -955,6 +1140,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             &ctx,
             "client",
             source(),
+            false,
             vec![STAGING_SCOPE.into()],
             [10; 32],
             now,
@@ -971,6 +1157,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             prepared.handle,
             "client",
             substituted_source,
+            false,
             [10; 32],
             now,
             now + 60,
@@ -986,6 +1173,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             &ctx,
             "client",
             source(),
+            false,
             vec![STAGING_SCOPE.into()],
             [11; 32],
             now,
@@ -1000,6 +1188,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             prepared.handle,
             "client",
             source(),
+            false,
             [12; 32],
             now,
             now + 60,
@@ -1015,6 +1204,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             &ctx,
             "client",
             source(),
+            false,
             vec![STAGING_SCOPE.into()],
             [13; 32],
             now,
@@ -1029,6 +1219,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             prepared.handle,
             "client",
             source(),
+            false,
             [13; 32],
             now,
             now + 60,
@@ -1047,6 +1238,7 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
             &ctx,
             "client",
             replayed.clone(),
+            false,
             vec![STAGING_SCOPE.into()],
             [14; 32],
             now,
@@ -1062,11 +1254,12 @@ async fn rpc_prepare_and_commit_are_stateless_and_consume_mismatched_handles() {
                 prepared_again.handle,
                 "client",
                 replayed,
+                false,
                 [14; 32],
                 now,
                 now + 60,
                 [1; 32],
-                vec![2; 1952],
+                vec![2; 1952]
             )
             .await
             .is_err(),
@@ -1463,6 +1656,7 @@ fn evidence(challenge: Decision, id: &str) -> PossessionEvidence {
     let source = source();
     PossessionEvidence {
         client: "client".into(),
+        device_flow: false,
         created_at: source.issued_at,
         expires_at: source.issued_at + 60,
         session_expires_at: source.expires_at,
@@ -1725,6 +1919,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
             &ctx,
             "client",
             rpc_source.clone(),
+            false,
             requested.clone(),
             [10; 32],
             created_at,
@@ -1738,6 +1933,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
             &ctx,
             "client",
             rpc_source.clone(),
+            false,
             requested.clone(),
             [11; 32],
             created_at,
@@ -1752,6 +1948,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
             prepared.handle,
             "client",
             rpc_source.clone(),
+            false,
             [10; 32],
             created_at,
             created_at + 60,
@@ -1777,6 +1974,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
                 prepared.handle,
                 "client",
                 rpc_source.clone(),
+                false,
                 [10; 32],
                 created_at,
                 created_at + 60,
@@ -1794,6 +1992,7 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
                 parallel.handle,
                 "client",
                 rpc_source,
+                false,
                 [11; 32],
                 created_at,
                 created_at + 60,

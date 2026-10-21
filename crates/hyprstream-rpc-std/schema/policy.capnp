@@ -195,6 +195,12 @@ struct FederateVerifiedSource {
   expiresAt @6 :Int64;
   # Server-verified Dex federated_claims.user_id from the pinned ATProto connector.
   atprotoDid @7 :Text $maxLen(255);
+  # True when OAuth verified this source through the W1b device flow. The
+  # device flow does not pin an issuer-signed nonce, so Policy must NOT
+  # consume it under the legacy nonce-bearing replay key (D2/W1b). Derived
+  # by the enrolled OAuth service from the verified commitment; defaults to
+  # false (code flow) for older senders.
+  deviceFlow @8 :Bool;
 }
 
 struct PrepareFederateSession {

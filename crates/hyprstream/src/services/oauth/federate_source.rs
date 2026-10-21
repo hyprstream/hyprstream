@@ -792,6 +792,16 @@ impl Source {
         self.commitment.client.client_id.as_str()
     }
 
+    /// True when this source was verified through the W1b device flow: the
+    /// commitment binds `device_code` and the issuer-signed `binding_key`
+    /// claim — not a signed nonce — authenticated the holder key. Replay
+    /// admission must use only the nonce-free identity for such sources
+    /// (D2): their commitment nonce is client-controlled.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn is_device_flow(&self) -> bool {
+        matches!(self.commitment.flow, Flow::Device { .. })
+    }
+
     #[cfg(feature = "postgres")]
     pub(crate) fn store_source(&self) -> hyprstream_session_store::Source {
         hyprstream_session_store::Source {
@@ -1003,6 +1013,8 @@ impl VerifiedPossession {
 
     /// Consumed only by the authenticated Policy admission adapter. The
     /// verified keys/source are never reconstructed from the exchange form.
+    /// The trailing flag reports the W1b device flow so Policy replay
+    /// admission can skip the nonce-bearing legacy key (D2/W1b).
     #[cfg(feature = "postgres")]
     pub(crate) fn into_admission_parts(
         self,
@@ -1014,7 +1026,9 @@ impl VerifiedPossession {
         [u8; 32],
         u64,
         u64,
+        bool,
     ) {
+        let device_flow = self.source.is_device_flow();
         let source = self.source.store_source();
         (
             source,
@@ -1024,6 +1038,7 @@ impl VerifiedPossession {
             self.challenge_id,
             self.created_at,
             self.expires_at,
+            device_flow,
         )
     }
 }
