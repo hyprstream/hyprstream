@@ -7043,9 +7043,18 @@ mod tests {
             let mut config = ModelServiceConfig::default();
             config.inference_deployment.compute = InferenceCompute::Cpu;
             if std::env::var_os("HYPRSTREAM_MODEL_ADMISSION_PROFILE").is_some() {
-                config.staging_model_pin = Some(StagingModelPin::from_env()?.context(
+                let mut pin = StagingModelPin::from_env()?.context(
                     "restart acceptance fixture requires the reviewed Clef admission profile",
-                )?);
+                )?;
+                #[cfg(test)]
+                {
+                    pin.projection_parent = Some(
+                        std::env::var_os("XDG_CACHE_HOME")
+                            .map(std::path::PathBuf::from)
+                            .context("restart acceptance fixture requires XDG_CACHE_HOME")?,
+                    );
+                }
+                config.staging_model_pin = Some(pin);
                 anyhow::ensure!(
                     config.staging_model_pin.is_some(),
                     "restart acceptance fixture must resolve a staging model pin"
