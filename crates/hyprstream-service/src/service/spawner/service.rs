@@ -796,14 +796,9 @@ impl ServiceSpawner {
                 hyprstream_rpc::error::RpcError::SpawnFailed(format!("thread spawn: {e}"))
             })?;
 
-        // Wait for ready signal (sent by service after socket binds)
-        if ready_rx.await.is_err() {
-            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                "service thread exited before ready".to_owned(),
-            ));
-        }
-
-        Ok(SpawnedService {
+        // Own shutdown and join even if the caller drops this future before
+        // READY. A bare JoinHandle would detach the initializing worker.
+        let startup = ThreadStartupGuard(Some(SpawnedService {
             id: format!("{name}-thread"),
             kind: ServiceKind::Thread {
                 handle: Some(thread_handle),
@@ -811,7 +806,25 @@ impl ServiceSpawner {
                 completion: None,
             },
             _registration: registration,
-        })
+        }));
+
+        // Wait for ready signal (sent by service after socket binds)
+        if ready_rx.await.is_err() {
+            // A closed READY channel only means the worker dropped its sender;
+            // it may still be tearing down its runtime and transports. Keep the
+            // caller's admission fence until its native thread has joined.
+            let teardown = startup.stop().await;
+            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                match teardown {
+                    Ok(()) => "service thread exited before ready".to_owned(),
+                    Err(error) => {
+                        format!("service thread exited before ready; teardown failed: {error}")
+                    }
+                },
+            ));
+        }
+
+        startup.publish()
     }
 
     /// Spawn a Spawnable as a subprocess with PID file tracking.
@@ -1003,6 +1016,39 @@ pub struct SpawnedService {
     _registration: Option<ServiceRegistration>,
 }
 
+/// Owns a threaded service until its READY handshake has completed. Cleanup
+/// must survive destruction of the caller's LocalSet and Tokio runtime.
+struct ThreadStartupGuard(Option<SpawnedService>);
+
+impl ThreadStartupGuard {
+    fn publish(mut self) -> Result<SpawnedService> {
+        self.0.take().ok_or_else(|| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(
+                "thread startup guard was already published".to_owned(),
+            )
+        })
+    }
+
+    async fn stop(mut self) -> Result<()> {
+        if let Some(mut service) = self.0.take() {
+            service.stop().await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ThreadStartupGuard {
+    fn drop(&mut self) {
+        if let Some(mut service) = self.0.take() {
+            if let Err(error) = service.stop_detached() {
+                tracing::error!(service = %service.id, %error, "thread startup cleanup failed");
+                // SpawnedService::drop retains the completion owner if its
+                // native join supervisor cannot be started.
+            }
+        }
+    }
+}
+
 impl SpawnedService {
     /// Create a dummy handle for services that manage their own lifecycle
     /// (e.g., systemd-managed services)
@@ -1085,6 +1131,40 @@ impl SpawnedService {
     fn request_thread_shutdown(shutdown: &Notify) {
         shutdown.notify_waiters();
         shutdown.notify_one();
+    }
+
+    /// Request threaded shutdown and transfer join ownership synchronously.
+    ///
+    /// This method needs no Tokio runtime and does not wait for termination.
+    /// The native join owner retains the registration until the worker exits;
+    /// `stop().await` subsequently observes the same terminal result. Callers
+    /// must retain their own load/unload admission fence until that completion.
+    /// Tokio-task and subprocess handles are unsupported and return an error
+    /// without changing their state. Use their normal async `stop` path.
+    pub fn stop_detached(&mut self) -> Result<()> {
+        let ServiceKind::Thread {
+            handle,
+            shutdown,
+            completion,
+        } = &mut self.kind
+        else {
+            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                "synchronous detached stop requires a threaded service".to_owned(),
+            ));
+        };
+        Self::request_thread_shutdown(shutdown);
+        if completion.is_none() {
+            if let Some(thread) = handle.take() {
+                *completion = Some(Arc::new(ThreadStopCompletion::new(
+                    self._registration.take(),
+                    thread,
+                )));
+            }
+        }
+        if let Some(completion) = completion {
+            completion.ensure_join_started(&self.id)?;
+        }
+        Ok(())
     }
 
     /// Stop the service.
@@ -1942,6 +2022,192 @@ mod tests {
             },
             completion,
         )
+    }
+
+    struct BeforeReadyService {
+        entered: tokio::sync::oneshot::Sender<()>,
+        arm_shutdown: std::sync::mpsc::Receiver<()>,
+        observed_shutdown: tokio::sync::oneshot::Sender<()>,
+    }
+
+    impl Spawnable for BeforeReadyService {
+        fn name(&self) -> &str {
+            "cancel-before-ready"
+        }
+
+        fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
+            Vec::new()
+        }
+
+        fn run(
+            self: Box<Self>,
+            shutdown: Arc<Notify>,
+            on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ) -> Result<()> {
+            let Self {
+                entered,
+                arm_shutdown,
+                observed_shutdown,
+            } = *self;
+            let _ = entered.send(());
+            arm_shutdown
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string()))?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string()))?;
+            runtime.block_on(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), shutdown.notified())
+                    .await
+                    .map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
+                    })?;
+                let _ = observed_shutdown.send(());
+                // Keep READY outstanding until after shutdown is observed.
+                drop(on_ready);
+                Ok(())
+            })
+        }
+    }
+
+    struct ReadyFailureService {
+        teardown_blocked: tokio::sync::oneshot::Sender<()>,
+        release_teardown: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Spawnable for ReadyFailureService {
+        fn name(&self) -> &str {
+            "ready-failure-teardown"
+        }
+
+        fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
+            Vec::new()
+        }
+
+        fn run(
+            self: Box<Self>,
+            _shutdown: Arc<Notify>,
+            on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ) -> Result<()> {
+            let Self {
+                teardown_blocked,
+                release_teardown,
+            } = *self;
+            drop(on_ready);
+            let _ = teardown_blocked.send(());
+            release_teardown
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string()))?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_thread_spawn_before_ready_retains_shutdown() -> AnyhowResult<()> {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (arm_tx, arm_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let spawner = ServiceSpawner::threaded();
+        let mut startup = Box::pin(spawner.spawn(BeforeReadyService {
+            entered: entered_tx,
+            arm_shutdown: arm_rx,
+            observed_shutdown: observed_tx,
+        }));
+        tokio::select! {
+            result = &mut startup => {
+                anyhow::bail!("startup returned before READY: {}", result.is_ok());
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx) => {
+                result??;
+            }
+        }
+        // Drop the real spawn future while READY is outstanding. The worker
+        // installs its waiter only afterwards, requiring a retained permit.
+        drop(startup);
+        arm_tx.send(())?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_thread_startup_awaits_native_teardown_before_returning() -> AnyhowResult<()> {
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let spawner = ServiceSpawner::threaded();
+        let mut startup = Box::pin(spawner.spawn(ReadyFailureService {
+            teardown_blocked: blocked_tx,
+            release_teardown: release_rx,
+        }));
+
+        tokio::select! {
+            result = &mut startup => {
+                anyhow::bail!("spawn returned before teardown was released: {}", result.is_ok());
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), blocked_rx) => {
+                result??;
+            }
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut startup)
+                .await
+                .is_err(),
+            "spawn returned while the failed worker was still tearing down"
+        );
+
+        release_tx.send(())?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut startup).await?;
+        let error = result
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("startup without READY unexpectedly succeeded"))?;
+        assert!(error.to_string().contains("exited before ready"));
+        Ok(())
+    }
+
+    #[test]
+    fn detached_thread_stop_owns_join_without_a_tokio_runtime() -> AnyhowResult<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|error| panic!("join fixture not released: {error}"));
+        });
+        let mut service = SpawnedService::thread(
+            "detached-native-join".to_owned(),
+            Some(thread),
+            Arc::new(Notify::new()),
+            None,
+        );
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        service.stop_detached()?;
+        let completion = match &service.kind {
+            ServiceKind::Thread {
+                handle: None,
+                completion: Some(completion),
+                ..
+            } => Arc::clone(completion),
+            _ => anyhow::bail!("detached stop did not transfer join ownership"),
+        };
+        assert!(completion
+            .join_started
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(completion.terminal.borrow().is_none());
+        drop(service);
+        release_tx.send(())?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let terminal =
+                tokio::time::timeout(std::time::Duration::from_secs(5), completion.wait())
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("timed out joining detached native service: {error}")
+                    })?;
+            terminal?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
     }
 
     #[tokio::test]

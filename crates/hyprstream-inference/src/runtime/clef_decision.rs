@@ -214,6 +214,7 @@ impl DecisionLoadObserver {
 pub struct DecisionCancel {
     flag: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    request_disconnect: Option<tokio_util::sync::CancellationToken>,
     #[cfg(any(test, feature = "test-fixtures"))]
     observer: Option<DecisionBackboneObserver>,
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -227,11 +228,23 @@ impl DecisionCancel {
         Self {
             flag,
             deadline,
+            request_disconnect: None,
             #[cfg(any(test, feature = "test-fixtures"))]
             observer: None,
             #[cfg(any(test, feature = "test-fixtures"))]
             load_observer: None,
         }
+    }
+
+    /// Attach the server-owned lifetime of the accepted RPC request. The
+    /// transport can trip this from its independent runtime while a native
+    /// forward is synchronously running on the service thread.
+    pub fn with_request_disconnect(
+        mut self,
+        disconnect: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        self.request_disconnect = disconnect;
+        self
     }
 
     /// A never-firing checker for tooling/tests on the default path.
@@ -274,6 +287,13 @@ impl DecisionCancel {
     pub fn check(&self) -> Result<()> {
         if self.flag.load(Ordering::Acquire) {
             return Err(ClefDecisionError::Cancelled("cancel flag set".into()).into());
+        }
+        if self
+            .request_disconnect
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return Err(ClefDecisionError::Cancelled("request disconnected".into()).into());
         }
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
@@ -2342,20 +2362,22 @@ mod tests {
             [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]
         );
 
-        for deadline_case in [false, true] {
+        for cancel_case in [0, 1, 2] {
             let flag = Arc::new(AtomicBool::new(false));
             let deadline =
-                deadline_case.then(|| Instant::now() + std::time::Duration::from_secs(1));
+                (cancel_case == 1).then(|| Instant::now() + std::time::Duration::from_secs(1));
+            let request_disconnect =
+                (cancel_case == 2).then(tokio_util::sync::CancellationToken::new);
             let gate = Arc::new(BoundaryGate::default());
             let counts = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let hook_gate = Arc::clone(&gate);
             let hook_counts = Arc::clone(&counts);
-            let cancel = DecisionCancel::new(Arc::clone(&flag), deadline).with_backbone_observer(
-                DecisionBackboneObserver::new(Arc::new(move |n, d| {
+            let cancel = DecisionCancel::new(Arc::clone(&flag), deadline)
+                .with_request_disconnect(request_disconnect.clone())
+                .with_backbone_observer(DecisionBackboneObserver::new(Arc::new(move |n, d| {
                     hook_counts.lock().push(n);
                     hook_gate.observe(n, d);
-                })),
-            );
+                })));
             let controlled_gate = Arc::clone(&gate);
             let controller = std::thread::spawn(move || {
                 let _release_on_drop = BoundaryReleaseOnDrop(Arc::clone(&controlled_gate));
@@ -2364,7 +2386,8 @@ mod tests {
                 // beforelayer0=4, beforelayer1=5: real layer0 completed.
                 assert_eq!(count, 5);
                 assert_eq!(actual_deadline, deadline);
-                if let Some(deadline) = actual_deadline {
+                if cancel_case == 1 {
+                    let deadline = actual_deadline.expect("deadline case has absolute deadline");
                     assert!(
                         Instant::now() < deadline,
                         "deadline expired before boundary witness"
@@ -2372,8 +2395,12 @@ mod tests {
                     while Instant::now() < deadline {
                         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
                     }
+                } else if cancel_case == 0 {
+                    flag.store(true, Ordering::Release); // existing real cancel flag
                 } else {
-                    flag.store(true, Ordering::Release); // REAL passed cancel flag
+                    request_disconnect
+                        .expect("request-disconnect case has signal")
+                        .cancel(); // real server-owned request lifetime signal
                 }
             });
             let result = decide_encoded(&runtime, &engine, &request, &encoded, &cancel);
@@ -2391,11 +2418,13 @@ mod tests {
                 ),
                 "{error:#}"
             );
-            assert!(error.to_string().contains(if deadline_case {
-                "deadline exceeded"
-            } else {
-                "cancel flag set"
-            }));
+            let expected_reason = match cancel_case {
+                0 => "cancel flag set",
+                1 => "deadline exceeded",
+                2 => "request disconnected",
+                _ => unreachable!("fixed cancellation case"),
+            };
+            assert!(error.to_string().contains(expected_reason));
             let (recovered, _) = decide_encoded(
                 &runtime,
                 &engine,

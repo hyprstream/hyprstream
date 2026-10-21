@@ -87,9 +87,19 @@ impl WorkerBinding {
             return cancel;
         };
         let digest = request_digest(request);
+        let forwarded_timeout_is_bounded = request.timeout_ms.is_some_and(|forwarded| {
+            forwarded > 0
+                && match expected.timeout_ms {
+                    Some(caller_limit) => forwarded <= caller_limit,
+                    None => {
+                        u64::from(forwarded) <= crate::services::decision::MAX_DECISION_TIMEOUT_MS
+                    }
+                }
+        });
         if expected.subject != ctx.subject().to_string()
             || Some(expected.tenant.as_str()) != ctx.verified_tenant()
             || expected.digest != digest
+            || !forwarded_timeout_is_bounded
             || expected.ticket.worker.incarnation != self.witness.incarnation
             || expected.ticket.worker.generation != self.witness.generation
             || expected.ticket.worker.model != self.witness.model
@@ -103,6 +113,12 @@ impl WorkerBinding {
         drop(armed);
         expected.ticket.request_id.lock().replace(request_id);
         let ticket = expected.ticket;
+        if let Some(request_cancel) = ctx.request_cancellation() {
+            ticket
+                .worker_request_cancellation
+                .lock()
+                .replace(request_cancel.clone());
+        }
         cancel.with_backbone_observer(DecisionBackboneObserver::new(Arc::new(
             move |phase, deadline| {
                 // Never hold an observer-control lock while waiting. Bounded,
@@ -156,6 +172,7 @@ struct ArmedRequest {
     subject: String,
     tenant: String,
     digest: [u8; 32],
+    timeout_ms: Option<u32>,
     ticket: Arc<RequestTicket>,
 }
 
@@ -195,6 +212,7 @@ impl TestDecisionControl {
             released: Mutex::new(false),
             wake: Condvar::new(),
             request_id: Mutex::new(None),
+            worker_request_cancellation: Mutex::new(None),
         });
         let mut armed = self.armed.lock();
         ensure!(armed.is_none(), "T6 request arm already occupied");
@@ -202,6 +220,7 @@ impl TestDecisionControl {
             subject: subject.to_owned(),
             tenant: tenant.to_owned(),
             digest: request_digest(request),
+            timeout_ms: request.timeout_ms,
             ticket: Arc::clone(&ticket),
         });
         Ok(ticket)
@@ -234,6 +253,7 @@ pub(crate) struct RequestTicket {
     released: Mutex<bool>,
     wake: Condvar,
     request_id: Mutex<Option<u64>>,
+    worker_request_cancellation: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 impl RequestTicket {
     pub(crate) fn wait_partial_forward(&self) -> Result<Checkpoint> {
@@ -270,9 +290,40 @@ impl RequestTicket {
         );
         self.check()
     }
+    pub(crate) fn assert_no_checkpoint_after(&self, last_phase: usize) -> Result<()> {
+        let receiver = self.receiver.lock();
+        let mut extra = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            extra.push(event.phase);
+        }
+        ensure!(
+            extra.is_empty(),
+            "T6 native inference continued beyond cancellation phase {last_phase}: {extra:?}"
+        );
+        self.check()
+    }
     pub(crate) fn release(&self) {
         *self.released.lock() = true;
         self.wake.notify_all();
+    }
+
+    pub(crate) fn wait_worker_request_disconnect(&self) -> Result<()> {
+        let end = Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .worker_request_cancellation
+                .lock()
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < end,
+                "T6 worker request did not observe transport cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     pub(crate) fn check(&self) -> Result<()> {
         ensure!(

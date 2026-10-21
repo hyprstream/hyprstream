@@ -795,7 +795,8 @@ impl InferenceService {
         let cancel = crate::services::decision::worker_cancel(
             Arc::clone(&self.draining),
             crate::services::decision::resolve_deadline(data, Instant::now()),
-        );
+        )
+        .with_request_disconnect(_ctx.request_cancellation().cloned());
         #[cfg(test)]
         let cancel = match self.test_decision_binding.lock().as_ref() {
             Some(binding) => binding.attach(_ctx, _request_id, data, cancel),

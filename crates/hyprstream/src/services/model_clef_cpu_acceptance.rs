@@ -284,6 +284,231 @@ fn t6_env_path(name: &str) -> Result<PathBuf> {
 fn t6_sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+fn t6_executable_sha256() -> Result<String> {
+    use std::io::Read as _;
+    let mut executable = std::fs::File::open("/proc/self/exe")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = executable.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+fn t6_runtime_library_identity() -> Result<serde_json::Value> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let mut libraries = BTreeMap::<String, serde_json::Value>::new();
+    let mut cpu_mapped = false;
+    let mut c10_mapped = false;
+    for line in maps.lines() {
+        // The first five /proc/self/maps columns are whitespace-delimited;
+        // the remainder is the pathname and may itself contain spaces/tabs.
+        let mut fields = line.splitn(6, ' ');
+        let Some(_range) = fields.next() else {
+            continue;
+        };
+        let (Some(_permissions), Some(_offset), Some(device), Some(inode), Some(raw_path)) =
+            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let raw_path = raw_path.trim_start_matches(' ');
+        let mapped_path = raw_path.to_owned();
+        if !mapped_path.starts_with('/') {
+            continue;
+        }
+        let (mapped_major, mapped_minor) = device
+            .split_once(':')
+            .context("runtime library mapping has an invalid device")?;
+        let mapped_major = u64::from_str_radix(mapped_major, 16)?;
+        let mapped_minor = u64::from_str_radix(mapped_minor, 16)?;
+        let mapped_inode = inode.parse::<u64>()?;
+
+        // Linux only octal-escapes newlines in map pathnames. Preserve literal
+        // backslashes and octal-looking names by trying the raw path first;
+        // if that does not identify the mapped inode, try the kernel's \012
+        // newline encoding. The descriptor identity below disambiguates both.
+        let path_candidates = t6_maps_path_candidates(&mapped_path);
+        let mut mapped_file = None;
+        let mut path = None;
+        for candidate in path_candidates {
+            let Ok(canonical) = PathBuf::from(candidate).canonicalize() else {
+                continue;
+            };
+            let Ok(file) = std::fs::File::open(&canonical) else {
+                continue;
+            };
+            let metadata = file.metadata()?;
+            let (major, minor) = t6_linux_device_numbers(metadata.dev());
+            if major == mapped_major && minor == mapped_minor && metadata.ino() == mapped_inode {
+                path = Some(canonical);
+                mapped_file = Some(file);
+                break;
+            }
+        }
+        let Some(path) = path else {
+            // Ignore unrelated file-backed mappings. For the libraries in
+            // scope, however, fail closed if the path cannot identify its map.
+            let raw_name = Path::new(&mapped_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if raw_name.starts_with("libtorch")
+                || raw_name.starts_with("libc10")
+                || raw_name.starts_with("libgomp")
+            {
+                anyhow::bail!("runtime library mapping no longer identifies its file: {raw_name}");
+            }
+            continue;
+        };
+        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        if !name.starts_with("libtorch")
+            && !name.starts_with("libc10")
+            && !name.starts_with("libgomp")
+        {
+            continue;
+        }
+        cpu_mapped |= name.starts_with("libtorch_cpu.so");
+        c10_mapped |= name.starts_with("libc10.so");
+        let path_key = path.to_string_lossy().into_owned();
+        if let Some(previous) = libraries.get(&path_key) {
+            anyhow::ensure!(
+                previous["device"] == device && previous["inode"] == mapped_inode,
+                "runtime process mapped multiple identities for {}",
+                path.display()
+            );
+            continue;
+        }
+        let sha256 = t6_runtime_file_sha256(
+            mapped_file.context("mapped runtime library descriptor missing")?,
+            mapped_major,
+            mapped_minor,
+            mapped_inode,
+        )
+        .with_context(|| format!("capturing runtime library {name}"))?;
+        let identity = json!({
+            "sha256":sha256,
+            "device":device,
+            "inode":mapped_inode
+        });
+        libraries.insert(path_key, identity);
+    }
+    anyhow::ensure!(
+        cpu_mapped && c10_mapped,
+        "runtime process did not map the required CPU libtorch libraries"
+    );
+    Ok(serde_json::to_value(libraries)?)
+}
+
+fn t6_maps_path_candidates(mapped_path: &str) -> Vec<String> {
+    let mut candidates = vec![mapped_path.to_owned()];
+    if mapped_path.contains("\\012") {
+        candidates.push(mapped_path.replace("\\012", "\n"));
+    }
+    candidates
+}
+
+fn t6_runtime_file_sha256(
+    mut file: std::fs::File,
+    mapped_major: u64,
+    mapped_minor: u64,
+    mapped_inode: u64,
+) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata_before = file.metadata()?;
+    let (major, minor) = t6_linux_device_numbers(metadata_before.dev());
+    anyhow::ensure!(
+        major == mapped_major && minor == mapped_minor && metadata_before.ino() == mapped_inode,
+        "opened runtime library descriptor differs from the mapped file"
+    );
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let metadata_after = file.metadata()?;
+    anyhow::ensure!(
+        metadata_before.dev() == metadata_after.dev()
+            && metadata_before.ino() == metadata_after.ino()
+            && metadata_before.len() == metadata_after.len()
+            && metadata_before.modified()? == metadata_after.modified()?,
+        "runtime library changed while its identity was captured"
+    );
+    Ok(hex::encode(digest.finalize()))
+}
+
+// Linux encodes dev_t using the glibc-compatible major/minor bit layout.
+// Keep this local instead of libc::major/minor, whose argument types differ
+// across Unix targets and prevent the test module from compiling on macOS.
+fn t6_linux_device_numbers(device: u64) -> (u64, u64) {
+    let major = ((device >> 8) & 0x0fff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0x00ff) | ((device >> 12) & 0xffff_ff00);
+    (major, minor)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod runtime_library_identity_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt as _;
+
+    #[test]
+    fn maps_path_candidates_preserve_literal_backslashes_and_whitespace() {
+        let path = "/opt/release\\cpu dir/libtorch_cpu.so";
+        assert_eq!(t6_maps_path_candidates(path), [path]);
+
+        let escaped_newline = "/opt/line\\012break/libtorch_cpu.so";
+        assert_eq!(
+            t6_maps_path_candidates(escaped_newline),
+            [escaped_newline, "/opt/line\nbreak/libtorch_cpu.so"]
+        );
+    }
+
+    #[test]
+    fn runtime_hash_uses_the_descriptor_for_mapping_identity_and_bytes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("libtorch_cpu.so");
+        std::fs::write(&path, b"runtime library bytes")?;
+        let metadata = std::fs::metadata(&path)?;
+        let (major, minor) = t6_linux_device_numbers(metadata.dev());
+
+        let hash = t6_runtime_file_sha256(
+            std::fs::File::open(&path)?,
+            major,
+            minor,
+            metadata.ino(),
+        )?;
+        assert_eq!(hash, hex::encode(Sha256::digest(b"runtime library bytes")));
+
+        let mismatch = t6_runtime_file_sha256(
+            std::fs::File::open(&path)?,
+            major,
+            minor,
+            metadata.ino().wrapping_add(1),
+        );
+        assert!(mismatch.is_err());
+
+        // The test binary links CPU libtorch. Exercise the actual Linux maps
+        // parser and dev/inode correlation as well as the isolated helper.
+        let inventory = t6_runtime_library_identity()?;
+        let inventory = inventory
+            .as_object()
+            .context("runtime library inventory must be a JSON object")?;
+        assert!(inventory.keys().any(|path| path.ends_with("/libtorch_cpu.so")));
+        assert!(inventory.keys().any(|path| path.ends_with("/libc10.so")));
+        Ok(())
+    }
+}
 fn t6_git(repo: &Path, args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/git")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
@@ -951,6 +1176,7 @@ const T6_EXPECTED_JSON: &str = r###"{
 #[ignore = "Jensen-only authenticated full CPU checkpoint; isolated first-write verifier/XDG and resource admission required"]
 async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     use hyprstream_service::ServiceManager as _;
+    crate::services::restart_diag::enable();
     let started = Instant::now();
     // Refuse this 30 GiB development VM, before checkpoint admission.
     let memory = std::fs::read_to_string("/proc/meminfo")?;
@@ -1151,6 +1377,11 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     );
     // Actual signed generated load uses the production continuation path;
     // do not hide the normal30s RPC timeout with a fixture-only transport.
+    t6_progress(
+        "load-request-before",
+        started.elapsed().as_millis(),
+        json!({}),
+    )?;
     alice
         .load(&hyprstream_rpc_std::model_client::LoadModelRequest {
             model_ref: T6_MODEL.to_owned(),
@@ -1158,6 +1389,11 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             kv_quant: None,
         })
         .await?;
+    t6_progress(
+        "load-request-returned",
+        started.elapsed().as_millis(),
+        json!({}),
+    )?;
     let load_started = Instant::now();
     loop {
         let state = alice
@@ -1171,6 +1407,12 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         {
             break;
         }
+        anyhow::ensure!(
+            state
+                .iter()
+                .any(|s| s.status == "loading" && s.model_ref == T6_MODEL),
+            "signed model load disappeared before reaching loaded state: {state:?}"
+        );
         anyhow::ensure!(
             load_started.elapsed().as_secs() < 600,
             "signed model load did not complete in600s"
@@ -1335,9 +1577,12 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "DECISION_CANCELLED",
         "timeout_zero",
     )?;
+    // Model ingress rejects an already-expired request before lazy load or
+    // internal work-order minting; assert that the worker boundary was not
+    // crossed instead of trying to consume an order that must not exist.
     anyhow::ensure!(
         model.take_test_work_order().await.is_none(),
-        "zero-timeout decision must not mint an internal work order"
+        "expired request minted internal work before deadline admission"
     );
     let recovery = alice.infer(T6_MODEL).decide(&requests[0]).await?;
     let cancel_recovery_max_abs = t6_close(
@@ -1369,10 +1614,20 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     )
     .await?;
     t6_progress("midforward-after", started.elapsed().as_millis(), json!({}))?;
+    // A PASS receipt is published only after the fallible service stop joins.
+    handle.stop().await?;
     let receipt = json!({
         "schema":"clef-t6-authenticated-cpu-service/1", "result":"AUTHENTICATED_CPU_SERVICE_CASES_PASS",
-        "t6_complete":false, "remaining":["client-disconnect cancellation R7"],
+        "t6_complete":true, "model_service_stop_complete":true, "remaining":[],
         "artifact_commit":T6_PIN,"artifact_tree":T6_TREE,"model_ref":T6_MODEL,
+        "source_identity":{
+            "git_sha":env!("GIT_SHA"),
+            "git_dirty":env!("GIT_DIRTY"),
+            "build_version":env!("BUILD_VERSION"),
+            "executable_sha256":t6_executable_sha256()?,
+            "runtime_libraries":t6_runtime_library_identity()?,
+            "acceptance_source_sha256":t6_sha(include_bytes!("model_clef_cpu_acceptance.rs"))
+        },
         "model_checkout":checkout,"records_sha256":T6_RECORDS_SHA,
         "expected_fp8_json_sha256":t6_sha(T6_EXPECTED_JSON.as_bytes()),
         "hydration_mapping_canonical_json_sha256":t6_sha(&mapping_bytes),"threads":4,
@@ -1381,7 +1636,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "corpus_records":5,"corpus_questions":11,"max_oracle_probability_error":max_oracle_error,
         "oracle_atol":1e-5,"oracle_rtol":0.0,
         "isolation_max_abs":isolation_max_abs,"cancel_recovery_max_abs":cancel_recovery_max_abs,
-        "cancellation_scope":"real positive deadline after layer0 and actual signed unload drain; client-disconnect R7 remains open",
+        "cancellation_scope":"real positive deadline, client-disconnect cancellation, and actual signed unload drain after layer0",
         "midforward":midforward,
         "load_elapsed_ms":load_elapsed_ms,"elapsed_ms":started.elapsed().as_millis(),
         "proc_status":std::fs::read_to_string("/proc/self/status")?.lines().filter(|l| l.starts_with("VmHWM:") || l.starts_with("VmRSS:")).collect::<Vec<_>>(),
@@ -1390,7 +1645,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             "source":"production StagingModelPin::from_env and validate_deployment",
             "model_ref":T6_MODEL,"commit":T6_PIN,
             "hydration":"three fixed SHA256-named local objects; owned capture verifies full bytes"},
-        "build_identity":"coordinator must bind executable/source/library SHA256 externally; no self-verification via declared CLI metadata",
+        "build_identity":"native receipt binds the running executable and file-backed libtorch/libc10/libgomp mappings to their runtime paths, devices, inodes and SHA256 digests",
         "scope":"five synthetic development records; no task accuracy/calibration/SLA/GPU/lab deployment acceptance"
     });
     // All private work orders have been consumed; no bearer enters receipt.
@@ -1401,7 +1656,6 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     use std::io::Write as _;
     output.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
     output.write_all(b"\n")?;
-    handle.stop().await?;
     Ok(())
 }
 
@@ -1438,6 +1692,80 @@ async fn t6_midforward_cases(
     )?;
     t6_assert_order(model, alice_key, "alice").await?;
     let initial = control.current()?;
+
+    // Exercise the actual end-user Model.Decide path with a caller task that
+    // drops its response stream after the native worker reaches layer 0. The
+    // controller waits for the server-owned worker request signal before
+    // releasing the paused checkpoint, proving propagation through Model's
+    // generated InferenceClient call and the worker RPC transport.
+    let disconnect_ticket = control.arm("alice", T6_TENANT, request)?;
+    let controller_ticket = Arc::clone(&disconnect_ticket);
+    let (checkpoint_tx, checkpoint_rx) = tokio::sync::oneshot::channel();
+    let disconnect_controller = std::thread::Builder::new()
+        .name("t6-request-disconnect".into())
+        .spawn(move || -> Result<()> {
+            let _release = ReleaseOnDrop(Arc::clone(&controller_ticket));
+            let event = controller_ticket.wait_partial_forward()?;
+            anyhow::ensure!(event.phase == 5, "disconnect witness is not after layer 0");
+            checkpoint_tx
+                .send(())
+                .map_err(|_| anyhow!("T6 disconnect checkpoint receiver dropped"))?;
+            controller_ticket.wait_worker_request_disconnect()?;
+            controller_ticket.release();
+            Ok(())
+        })?;
+    let disconnect_client = alice.clone();
+    let disconnect_request = request.clone();
+    let disconnected_request = tokio::spawn(async move {
+        disconnect_client
+            .infer(T6_MODEL)
+            .decide(&disconnect_request)
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        checkpoint_rx
+            .blocking_recv()
+            .map_err(|_| anyhow!("T6 worker never reached disconnect checkpoint"))
+    })
+    .await??;
+    disconnected_request.abort();
+    anyhow::ensure!(
+        disconnected_request
+            .await
+            .is_err_and(|error| error.is_cancelled()),
+        "dropping the caller task did not close its response wait"
+    );
+    tokio::task::spawn_blocking(move || {
+        disconnect_controller
+            .join()
+            .map_err(|_| anyhow!("T6 disconnect controller panicked"))?
+    })
+    .await??;
+    disconnect_ticket.check()?;
+    control.assert_consumed()?;
+    // This successful request queues behind any still-unwinding native frame;
+    // its completion proves the worker released the execution locks and can
+    // serve again on the same loaded incarnation.
+    let disconnect_recovery = alice.infer(T6_MODEL).decide(request).await?;
+    // Recovery is serialized behind the abandoned attempt on the same loaded
+    // worker. Once it completes, any later native checkpoint from the
+    // abandoned request proves that its forward pass continued after the
+    // cancellation boundary even though the request token was set.
+    disconnect_ticket.assert_no_checkpoint_after(5)?;
+    t6_check_response(&disconnect_recovery, record, request)?;
+    let disconnect_recovery_error = t6_close(
+        &t6_distributions(&disconnect_recovery)?,
+        &t6_distributions(baseline)?,
+        1e-6,
+        1e-6,
+    )?;
+    let after_disconnect = control.current()?;
+    anyhow::ensure!(
+        after_disconnect.incarnation == initial.incarnation
+            && after_disconnect.generation == initial.generation,
+        "disconnect recovery replaced the worker instead of releasing its active attempt"
+    );
+    t6_assert_order(model, alice_key, "alice").await?;
 
     let mut deadline_request = request.clone();
     deadline_request.timeout_ms = Some(10_000);
@@ -1652,7 +1980,8 @@ async fn t6_midforward_cases(
         "decision_completion_sequence":decision_completion_sequence,"unload_completion_sequence":unload_completion_sequence,
         "old_worker_artifact_weak_released":true,"reload_new_incarnation":true,
         "deadline_recovery_max_abs":deadline_recovery_error,"drain_recovery_max_abs":drain_recovery_error,
-        "recovery_atol":1e-6,"recovery_rtol":1e-6,"disconnect_cancellation_proven":false}),
+        "recovery_atol":1e-6,"recovery_rtol":1e-6,
+        "disconnect":{"checkpoint":5,"worker_signal_observed":true,"worker_terminal_before_successful_recovery":true,"same_worker":true,"recovery_max_abs":disconnect_recovery_error}}),
     )
 }
 
