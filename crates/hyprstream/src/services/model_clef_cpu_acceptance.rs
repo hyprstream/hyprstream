@@ -298,6 +298,122 @@ fn t6_executable_sha256() -> Result<String> {
     }
     Ok(hex::encode(digest.finalize()))
 }
+fn t6_runtime_library_identity() -> Result<serde_json::Value> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let mut libraries = BTreeMap::<String, serde_json::Value>::new();
+    let mut cpu_mapped = false;
+    let mut c10_mapped = false;
+    for line in maps.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 6 {
+            continue;
+        }
+        let mapped_path = fields[5..].join(" ");
+        if !mapped_path.starts_with('/') {
+            continue;
+        }
+        let name = Path::new(&mapped_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("runtime library mapping has a non-UTF8 file name")?;
+        if !name.starts_with("libtorch")
+            && !name.starts_with("libc10")
+            && !name.starts_with("libgomp")
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            !mapped_path.ends_with(" (deleted)"),
+            "runtime library mapping refers to a deleted file: {name}"
+        );
+        cpu_mapped |= name.starts_with("libtorch_cpu.so");
+        c10_mapped |= name.starts_with("libc10.so");
+
+        let unescape_maps_path = |value: &str| -> Result<String> {
+            let bytes = value.as_bytes();
+            let mut decoded = Vec::with_capacity(bytes.len());
+            let mut index = 0;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    anyhow::ensure!(
+                        index + 3 < bytes.len()
+                            && bytes[index + 1..index + 4]
+                                .iter()
+                                .all(|digit| (b'0'..=b'7').contains(digit)),
+                        "invalid escaped path in /proc/self/maps"
+                    );
+                    let octal = std::str::from_utf8(&bytes[index + 1..index + 4])?;
+                    decoded.push(u8::from_str_radix(octal, 8)?);
+                    index += 4;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            String::from_utf8(decoded).context("runtime library path is not UTF-8")
+        };
+        let mapped_path = unescape_maps_path(&mapped_path)?;
+        let path = PathBuf::from(&mapped_path).canonicalize()?;
+        let metadata_before = std::fs::metadata(&path)?;
+        let (mapped_major, mapped_minor) = fields[3]
+            .split_once(':')
+            .context("runtime library mapping has an invalid device")?;
+        let mapped_major = u64::from_str_radix(mapped_major, 16)?;
+        let mapped_minor = u64::from_str_radix(mapped_minor, 16)?;
+        let mapped_inode = fields[4].parse::<u64>()?;
+        anyhow::ensure!(
+            libc::major(metadata_before.dev()) as u64 == mapped_major
+                && libc::minor(metadata_before.dev()) as u64 == mapped_minor
+                && metadata_before.ino() == mapped_inode,
+            "runtime library path no longer identifies the mapped file: {name}"
+        );
+        let path_key = path.to_string_lossy().into_owned();
+        if let Some(previous) = libraries.get(&path_key) {
+            anyhow::ensure!(
+                previous["device"] == fields[3]
+                    && previous["inode"] == mapped_inode,
+                "runtime process mapped multiple identities for {}",
+                path.display()
+            );
+            continue;
+        }
+        let sha256 = {
+            use std::io::Read as _;
+            let mut file = std::fs::File::open(&path)?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            hex::encode(digest.finalize())
+        };
+        let metadata_after = std::fs::metadata(&path)?;
+        anyhow::ensure!(
+            metadata_before.dev() == metadata_after.dev()
+                && metadata_before.ino() == metadata_after.ino()
+                && metadata_before.len() == metadata_after.len()
+                && metadata_before.modified()? == metadata_after.modified()?,
+            "runtime library changed while its identity was captured: {name}"
+        );
+        let identity = json!({
+            "sha256":sha256,
+            "device":fields[3],
+            "inode":mapped_inode
+        });
+        libraries.insert(path_key, identity);
+    }
+    anyhow::ensure!(
+        cpu_mapped && c10_mapped,
+        "runtime process did not map the required CPU libtorch libraries"
+    );
+    Ok(serde_json::to_value(libraries)?)
+}
 fn t6_git(repo: &Path, args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/git")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
@@ -1414,6 +1530,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             "git_dirty":env!("GIT_DIRTY"),
             "build_version":env!("BUILD_VERSION"),
             "executable_sha256":t6_executable_sha256()?,
+            "runtime_libraries":t6_runtime_library_identity()?,
             "acceptance_source_sha256":t6_sha(include_bytes!("model_clef_cpu_acceptance.rs"))
         },
         "model_checkout":checkout,"records_sha256":T6_RECORDS_SHA,
@@ -1433,7 +1550,7 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             "source":"production StagingModelPin::from_env and validate_deployment",
             "model_ref":T6_MODEL,"commit":T6_PIN,
             "hydration":"three fixed SHA256-named local objects; owned capture verifies full bytes"},
-        "build_identity":"coordinator must bind executable/source/library SHA256 externally; no self-verification via declared CLI metadata",
+        "build_identity":"native receipt binds the running executable and file-backed libtorch/libc10/libgomp mappings to their runtime paths, devices, inodes and SHA256 digests",
         "scope":"five synthetic development records; no task accuracy/calibration/SLA/GPU/lab deployment acceptance"
     });
     // All private work orders have been consumed; no bearer enters receipt.

@@ -61,6 +61,10 @@ class ReceiptProvenanceTests(unittest.TestCase):
         }
 
         self.receipt["source_identity"]["executable_sha256"] = self.build["executable_sha256"]
+        self.receipt["source_identity"]["runtime_libraries"] = {
+            entry["path"]: {"sha256": entry["sha256"], "device": "08:01", "inode": index}
+            for index, (name, entry) in enumerate(self.build["resolved_runtime_libraries"].items(), 1)
+        }
         self.run_result = {"candidate": COMMIT, "executable_sha256": self.build["executable_sha256"],
                            "exit": 0, "controller_exit": 0, "native_samples": 1,
                            "peak_native_swap_kib": 0, "peak_group_swap_kib": 0}
@@ -142,6 +146,52 @@ class ReceiptProvenanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "runtime library"):
                     self.run_validator()
                 self.build[field] = original
+
+    def test_runtime_loaded_library_inventory_is_required_and_matches_build(self):
+        runtime = self.receipt["source_identity"].pop("runtime_libraries")
+        with self.assertRaisesRegex(ValueError, "actual process runtime library identity is missing"):
+            self.run_validator()
+        self.receipt["source_identity"]["runtime_libraries"] = runtime
+
+        for path in runtime:
+            with self.subTest(path=path):
+                original = runtime[path]["sha256"]
+                runtime[path]["sha256"] = "0" * 64
+                with self.assertRaisesRegex(ValueError, "actual process loaded runtime library differs"):
+                    self.run_validator()
+                runtime[path]["sha256"] = original
+
+    def test_runtime_loaded_library_path_set_and_mapping_identity_are_checked(self):
+        runtime = self.receipt["source_identity"]["runtime_libraries"]
+        path = self.build["resolved_runtime_libraries"]["libgomp.so.1"]["path"]
+        runtime.pop(path)
+        alternate = str(self.root / "alternate-libgomp.so.1")
+        runtime[alternate] = {"sha256": "0" * 64, "device": "08:01", "inode": 4}
+        with self.assertRaisesRegex(ValueError, "runtime library set differs"):
+            self.run_validator()
+        runtime.pop(alternate)
+        runtime[path] = {"sha256": self.build["resolved_runtime_libraries"]["libgomp.so.1"]["sha256"],
+                         "device": "08:01", "inode": 3}
+
+        extra_path = str(self.root / "libtorch_unexpected.so")
+        extra = {extra_path: dict(next(iter(runtime.values())))}
+        runtime.update(extra)
+        with self.assertRaisesRegex(ValueError, "runtime library set differs"):
+            self.run_validator()
+        runtime.pop(extra_path)
+
+        c10_path = self.build["resolved_runtime_libraries"]["libc10.so"]["path"]
+        original_device = runtime[c10_path]["device"]
+        runtime[c10_path]["device"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "mapping identity is malformed"):
+            self.run_validator()
+        runtime[c10_path]["device"] = original_device
+
+        original_inode = runtime[c10_path]["inode"]
+        runtime[c10_path]["inode"] = True
+        with self.assertRaisesRegex(ValueError, "mapping identity is malformed"):
+            self.run_validator()
+        runtime[c10_path]["inode"] = original_inode
 
     def test_earlier_receipts_without_compiled_source_identity_are_rejected(self):
         del self.receipt["source_identity"]
