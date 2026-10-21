@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,13 +30,26 @@ class ReceiptProvenanceTests(unittest.TestCase):
         source.write_text("candidate source\n")
         executable = self.root / "captured-executable"
         executable.write_bytes(b"candidate executable")
+        libtorch = self.root / "libtorch"
+        library_dir = libtorch / "lib"
+        library_dir.mkdir(parents=True)
+        self.ldd_paths = {}
+        for name in ("libtorch_cpu.so", "libc10.so", "libgomp.so.1"):
+            library = library_dir / name
+            library.write_bytes(f"captured {name}".encode())
+            self.ldd_paths[name] = library
         identity = {"commit": COMMIT, "tree": TREE, "acceptance_source_sha256": VALIDATOR.sha(source)}
         self.build = {
             "schema": "clef-cpu-build/2", "source": identity, "source_after": copy.deepcopy(identity),
             "build_exit": 0, "command": ["cargo", "test", "--release", VALIDATOR.TEST],
             "compiler_artifact": {"profile": {"opt_level": "3", "test": True, "debug_assertions": False}},
-            "environment": {"HYPRSTREAM_LIBTORCH_VARIANT": "cpu"},
+            "environment": {"HYPRSTREAM_LIBTORCH_VARIANT": "cpu", "LIBTORCH": str(libtorch)},
             "executable": str(executable), "executable_sha256": VALIDATOR.sha(executable),
+            "cpu_libraries_sha256": {name: VALIDATOR.sha(self.ldd_paths[name])
+                                     for name in ("libtorch_cpu.so", "libc10.so")},
+            "resolved_runtime_libraries": {
+                name: {"path": str(path.resolve()), "sha256": VALIDATOR.sha(path)}
+                for name, path in self.ldd_paths.items()},
         }
         self.receipt = {
             "source_identity": {"git_sha": COMMIT[:7], "git_dirty": "false",
@@ -55,7 +69,13 @@ class ReceiptProvenanceTests(unittest.TestCase):
         def git(command, **kwargs):
             return {("status", "--porcelain"): "", ("rev-parse", "HEAD"): COMMIT,
                     ("rev-parse", "HEAD^{tree}"): TREE}[tuple(command[3:])]
-        with patch.object(VALIDATOR.subprocess, "check_output", side_effect=git):
+        def ldd(command, **kwargs):
+            self.assertEqual(command, ["ldd", self.build["executable"]])
+            output = "\n".join(f"{name} => {path} (0x0)"
+                               for name, path in self.ldd_paths.items())
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+        with (patch.object(VALIDATOR.subprocess, "check_output", side_effect=git),
+              patch.object(VALIDATOR.subprocess, "run", side_effect=ldd)):
             receipt_path = self.root / "receipt.json"
             receipt_path.write_text(json.dumps(self.receipt))
             digest = VALIDATOR.sha(receipt_path)
@@ -64,6 +84,45 @@ class ReceiptProvenanceTests(unittest.TestCase):
 
     def test_matching_runtime_source_and_binary_bind_candidate(self):
         self.assertEqual(self.run_validator()["candidate"], COMMIT)
+
+    def test_resolved_library_symlink_uses_canonical_path(self):
+        alias = self.root / "libtorch-cpu-alias.so"
+        alias.symlink_to(self.ldd_paths["libtorch_cpu.so"])
+        self.ldd_paths["libtorch_cpu.so"] = alias
+        self.assertEqual(self.run_validator()["candidate"], COMMIT)
+
+    def test_changed_or_missing_cpu_runtime_library_is_rejected(self):
+        library = self.ldd_paths["libtorch_cpu.so"]
+        library.write_bytes(b"different native code")
+        with self.assertRaisesRegex(ValueError, "CPU runtime library changed"):
+            self.run_validator()
+        library.unlink()
+        with self.assertRaisesRegex(ValueError, "CPU runtime library is unavailable"):
+            self.run_validator()
+
+    def test_changed_or_missing_resolved_runtime_library_is_rejected(self):
+        library = self.ldd_paths["libgomp.so.1"]
+        library.write_bytes(b"different OpenMP runtime")
+        with self.assertRaisesRegex(ValueError, "runtime library path or contents changed"):
+            self.run_validator()
+        library.unlink()
+        with self.assertRaisesRegex(ValueError, "runtime libraries cannot be resolved"):
+            self.run_validator()
+
+    def test_loader_switch_to_different_library_is_rejected(self):
+        replacement = self.root / "alternate-libgomp.so.1"
+        replacement.write_bytes(self.ldd_paths["libgomp.so.1"].read_bytes())
+        self.ldd_paths["libgomp.so.1"] = replacement
+        with self.assertRaisesRegex(ValueError, "runtime library path or contents changed"):
+            self.run_validator()
+
+    def test_missing_library_manifest_fields_are_rejected(self):
+        for field in ("cpu_libraries_sha256", "resolved_runtime_libraries"):
+            with self.subTest(field=field):
+                original = self.build.pop(field)
+                with self.assertRaisesRegex(ValueError, "runtime library"):
+                    self.run_validator()
+                self.build[field] = original
 
     def test_earlier_receipts_without_compiled_source_identity_are_rejected(self):
         del self.receipt["source_identity"]

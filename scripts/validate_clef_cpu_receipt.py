@@ -14,6 +14,39 @@ import subprocess
 from clef_cpu_build import SOURCE, TEST, sha
 
 
+def validate_runtime_libraries(build):
+    """Re-resolve and hash the CPU libraries that the captured executable loads."""
+    cpu_names = ("libtorch_cpu.so", "libc10.so")
+    libtorch = build.get("environment", {}).get("LIBTORCH")
+    if not libtorch:
+        raise ValueError("captured CPU libtorch directory is missing")
+    try:
+        cpu_hashes = {name: sha(Path(libtorch).resolve() / "lib" / name)
+                      for name in cpu_names}
+    except OSError as error:
+        raise ValueError("captured CPU runtime library is unavailable") from error
+    if build.get("cpu_libraries_sha256") != cpu_hashes:
+        raise ValueError("captured CPU runtime library changed")
+
+    try:
+        ldd = subprocess.run(["ldd", build["executable"]], capture_output=True,
+                             text=True, check=True)
+        if "not found" in ldd.stdout:
+            raise ValueError("captured runtime library is missing")
+        resolved = {}
+        for line in ldd.stdout.splitlines():
+            name, arrow, remainder = line.partition(" => ")
+            if arrow and name.strip().startswith(("libtorch", "libc10", "libgomp")):
+                path = Path(remainder.split()[0]).resolve()
+                resolved[name.strip()] = {"path": str(path), "sha256": sha(path)}
+    except (OSError, subprocess.CalledProcessError, IndexError) as error:
+        raise ValueError("captured runtime libraries cannot be resolved") from error
+    if not set(cpu_names).issubset(resolved):
+        raise ValueError("captured executable no longer resolves CPU libtorch")
+    if build.get("resolved_runtime_libraries") != resolved:
+        raise ValueError("captured runtime library path or contents changed")
+
+
 def validate(receipt, build, source, candidate, run_result, receipt_sha256):
     def git(*args):
         return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
@@ -35,6 +68,7 @@ def validate(receipt, build, source, candidate, run_result, receipt_sha256):
         raise ValueError("build was not CPU")
     if sha(build["executable"]) != build["executable_sha256"]:
         raise ValueError("captured executable changed")
+    validate_runtime_libraries(build)
     identity = receipt.get("source_identity", {})
     digest = sha(source / SOURCE)
     if digest != build["source"]["acceptance_source_sha256"] or digest != identity.get("acceptance_source_sha256"):
