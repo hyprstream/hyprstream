@@ -7042,6 +7042,15 @@ mod tests {
             let auth = RestartAuthServices::new(&repo, &model_name).await?;
             let mut config = ModelServiceConfig::default();
             config.inference_deployment.compute = InferenceCompute::Cpu;
+            if std::env::var_os("HYPRSTREAM_MODEL_ADMISSION_PROFILE").is_some() {
+                config.staging_model_pin = Some(StagingModelPin::from_env()?.context(
+                    "restart acceptance fixture requires the reviewed Clef admission profile",
+                )?);
+                anyhow::ensure!(
+                    config.staging_model_pin.is_some(),
+                    "restart acceptance fixture must resolve a staging model pin"
+                );
+            }
             let model = ModelService::new(
                 config,
                 auth.model_key.clone(),
