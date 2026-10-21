@@ -28,6 +28,12 @@ pub(crate) const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_C
 /// the www `federate-session-v1` suite/inventory markers: a credential of
 /// this class takes NORMAL JWT verification, not the deferred branch.
 pub(crate) const TUI_PROFILE: &str = "federate-tui-v1";
+/// Challenge profile of the W1b device variant: the commitment binds
+/// `device_code` instead of `state`/`pkce`, and the holder Ed25519 key is
+/// authenticated by the issuer-signed `binding_key` claim (W5f/D1) instead
+/// of the `nonce`/`c_hash` pair. Accepted only for a configured non-staging
+/// class; the www staging class keeps the authorization-code flow only.
+pub(crate) const TUI_DEVICE_PROFILE: &str = "federate-session-v2-device";
 pub(crate) const WEBSITE: &str = "https://www.staging.lab.hyprstream.com";
 pub(crate) const CALLBACK: &str = "https://www.staging.lab.hyprstream.com/federate/callback";
 #[cfg(test)]
@@ -223,7 +229,7 @@ fn json(bytes: &[u8]) -> Result<Value> {
         .map_err(|_| Error::Invalid)
 }
 
-/// Validated commitment inputs. The host cannot prove browser key freshness.
+/// Validated commitment inputs. The host cannot prove client key freshness.
 pub(crate) struct Commitment {
     host: FederateHost,
     /// The client class this commitment is bound to (W1). Binds the nonce
@@ -231,10 +237,22 @@ pub(crate) struct Commitment {
     /// nonce or transcript minted for one class is useless for another.
     client: ClientClass,
     random: [u8; 32],
-    state: String,
-    pkce: String,
+    /// The session-establishment flow this commitment binds (W1b).
+    flow: Flow,
     ed: [u8; 32],
     pq: Vec<u8>,
+}
+
+/// Flow-specific commitment fields (W1b). The authorization-code flow binds
+/// the browser `state` and the PKCE challenge and is pinned by the token's
+/// `nonce`/`c_hash` claims. The device flow binds the RFC 8628
+/// `device_code` instead; the token pins it through the issuer-signed
+/// `binding_key` claim that authenticates the holder Ed25519 key, exactly
+/// as `nonce` binds the code flow (D1). The two preimages are separated by
+/// distinct framing domains, so no value is valid under both flows.
+enum Flow {
+    Code { state: String, pkce: String },
+    Device { device_code: String },
 }
 impl Commitment {
     #[cfg(test)]
@@ -269,40 +287,89 @@ impl Commitment {
         ed: &str,
         pq: &str,
     ) -> Result<Self> {
-        let ed = fixed(ed)?;
-        let vk = VerifyingKey::from_bytes(&ed).map_err(|_| Error::Invalid)?;
-        require(!vk.is_weak())?;
-        let pq = decode(pq, 1952)?;
-        ml_dsa_vk_from_bytes(&pq).map_err(|_| Error::Invalid)?;
+        let (ed, pq) = Self::keys(ed, pq)?;
         fixed::<32>(state)?;
         fixed::<32>(pkce)?;
         Ok(Self {
             host,
             client: client.clone(),
             random: fixed(random)?,
-            state: state.into(),
-            pkce: pkce.into(),
+            flow: Flow::Code {
+                state: state.into(),
+                pkce: pkce.into(),
+            },
             ed,
             pq,
         })
     }
+    /// Device-flow commitment for one accepted client class (W1b). The
+    /// caller (the exchange wire) restricts this variant to a configured
+    /// non-staging class; the constructor itself only validates inputs.
+    pub(crate) fn for_class_device(
+        host: FederateHost,
+        client: &ClientClass,
+        random: &str,
+        device_code: &str,
+        ed: &str,
+        pq: &str,
+    ) -> Result<Self> {
+        let (ed, pq) = Self::keys(ed, pq)?;
+        require(
+            !device_code.is_empty()
+                && device_code.len() <= MAX_AUTHORITY_TEXT
+                && device_code.is_ascii(),
+        )?;
+        Ok(Self {
+            host,
+            client: client.clone(),
+            random: fixed(random)?,
+            flow: Flow::Device {
+                device_code: device_code.into(),
+            },
+            ed,
+            pq,
+        })
+    }
+    fn keys(ed: &str, pq: &str) -> Result<([u8; 32], Vec<u8>)> {
+        let ed = fixed(ed)?;
+        let vk = VerifyingKey::from_bytes(&ed).map_err(|_| Error::Invalid)?;
+        require(!vk.is_weak())?;
+        let pq = decode(pq, 1952)?;
+        ml_dsa_vk_from_bytes(&pq).map_err(|_| Error::Invalid)?;
+        Ok((ed, pq))
+    }
     fn preimage(&self) -> Vec<u8> {
-        frame(
-            "hyprstream.federate.session-primary.nonce.v1",
-            &[
-                ISSUER.as_bytes(),
-                self.client.client_id.as_bytes(),
-                WEBSITE.as_bytes(),
-                CALLBACK.as_bytes(),
-                self.host.as_str().as_bytes(),
-                self.host.as_str().as_bytes(),
-                &self.random,
-                &self.ed,
-                &self.pq,
-                &sha(self.state.as_bytes()),
-                self.pkce.as_bytes(),
-            ],
-        )
+        match &self.flow {
+            Flow::Code { state, pkce } => frame(
+                "hyprstream.federate.session-primary.nonce.v1",
+                &[
+                    ISSUER.as_bytes(),
+                    self.client.client_id.as_bytes(),
+                    WEBSITE.as_bytes(),
+                    CALLBACK.as_bytes(),
+                    self.host.as_str().as_bytes(),
+                    self.host.as_str().as_bytes(),
+                    &self.random,
+                    &self.ed,
+                    &self.pq,
+                    &sha(state.as_bytes()),
+                    pkce.as_bytes(),
+                ],
+            ),
+            // W1b/D6: exactly (login_random, device_code, client_id, holder
+            // ed/pq keys). The holder key is authenticated by the signed
+            // `binding_key` claim, not by this preimage.
+            Flow::Device { device_code } => frame(
+                "hyprstream.federate.session-primary.device-nonce.v1",
+                &[
+                    &self.random,
+                    device_code.as_bytes(),
+                    self.client.client_id.as_bytes(),
+                    &self.ed,
+                    &self.pq,
+                ],
+            ),
+        }
     }
     pub(crate) fn nonce(&self) -> String {
         format!("hsn1.{}", B64.encode(sha(&self.preimage())))
@@ -664,8 +731,22 @@ fn validate_claims(
         let n = number(v, "nbf")?;
         require(n <= now.saturating_add(30) && n <= exp)?;
     }
-    require(equal(text(v, "nonce")?.as_bytes(), c.nonce().as_bytes()))?;
-    hash_claim(text(v, "c_hash")?, code)?;
+    match &c.flow {
+        Flow::Code { .. } => {
+            require(equal(text(v, "nonce")?.as_bytes(), c.nonce().as_bytes()))?;
+            hash_claim(text(v, "c_hash")?, code)?;
+        }
+        // W1b/D1: the device flow carries no nonce/c_hash binding. The
+        // issuer-signed `binding_key` claim (W5f) must be exactly the
+        // canonical base64url encoding of the committed holder Ed25519 key;
+        // the comparison target is canonical by construction, so any
+        // noncanonical or foreign key fails closed. This binds the signed
+        // token to the possession key exactly as `nonce` binds the code
+        // flow, and a code-flow token (no binding_key) fails here.
+        Flow::Device { .. } => {
+            require(text(v, "binding_key")? == B64.encode(c.ed))?;
+        }
+    }
     if v.get("at_hash").is_some() {
         let claim = text(v, "at_hash")?;
         fixed::<16>(claim)?;

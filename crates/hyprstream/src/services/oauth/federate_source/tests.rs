@@ -267,10 +267,14 @@ async fn claims_fail_closed() {
         .await
         .is_err());
     let mut c = commitment();
-    c.pkce = B64.encode([5; 32]);
+    if let Flow::Code { pkce, .. } = &mut c.flow {
+        *pkce = B64.encode([5; 32]);
+    }
     assert!(v.source(&t, CODE, c, NOW, None).await.is_err());
     let mut c = commitment();
-    c.state = B64.encode([5; 32]);
+    if let Flow::Code { state, .. } = &mut c.flow {
+        *state = B64.encode([5; 32]);
+    }
     assert!(v.source(&t, CODE, c, NOW, None).await.is_err());
     let mut c = commitment();
     c.pq = ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[5; 32]));
@@ -582,8 +586,10 @@ fn published_cross_language_framing_vectors() {
         host: FederateHost::new(HOST).unwrap(),
         client: ClientClass::staging(),
         random: fields[6].clone().try_into().unwrap(),
-        state: B64.encode((32..64).collect::<Vec<u8>>()),
-        pkce: String::from_utf8(fields[10].clone()).unwrap(),
+        flow: Flow::Code {
+            state: B64.encode((32..64).collect::<Vec<u8>>()),
+            pkce: String::from_utf8(fields[10].clone()).unwrap(),
+        },
         ed: fields[7].clone().try_into().unwrap(),
         pq: fields[8].clone(),
     };
@@ -950,4 +956,252 @@ fn tui_class_credential_falls_through_the_staging_reservation() {
     marked.hs_profile = Some("federate-session-v1".into());
     assert!(marked.has_federate_profile_marker());
     assert!(!marked.is_reserved_federate_credential(HOST));
+}
+
+// ── W1b: the device-flow commitment variant ────────────────────────────────
+
+const DEVICE_CODE: &str = "TEST-DEVICE-CODE-NOT-LIVE";
+
+fn device_ed_public() -> String {
+    B64.encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes())
+}
+
+fn device_commitment() -> Commitment {
+    let pq = ml_dsa_sk_from_seed(&[8; 32]);
+    Commitment::for_class_device(
+        FederateHost::new(HOST).unwrap(),
+        &tui_class(),
+        &B64.encode([1; 32]),
+        DEVICE_CODE,
+        &device_ed_public(),
+        &B64.encode(ml_dsa_sk_to_vk_bytes(&pq)),
+    )
+    .unwrap()
+}
+
+/// The device token pins the holder through the issuer-signed `binding_key`
+/// claim (W5f/D1) instead of the `nonce`/`c_hash` pair.
+fn device_claims() -> Value {
+    json!({"iss":ISSUER,"aud":TUI_AUD,"azp":TUI_CLIENT,"sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"binding_key":device_ed_public(),"federated_claims":{"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"}})
+}
+
+#[test]
+fn device_commitment_is_domain_separated_and_input_bound() {
+    let base = device_commitment();
+    assert_eq!(base.nonce(), device_commitment().nonce());
+    // No overlap with a code-flow commitment built from the same random and
+    // holder keys: the framing domain and bound code inputs differ.
+    assert_ne!(base.nonce(), tui_commitment().nonce());
+    let host = FederateHost::new(HOST).unwrap();
+    let pq = ml_dsa_sk_from_seed(&[8; 32]);
+    let other_ed = B64.encode(SigningKey::from_bytes(&[77; 32]).verifying_key().as_bytes());
+    let other_pq = B64.encode(ml_dsa_sk_to_vk_bytes(&ml_dsa_sk_from_seed(&[88; 32])));
+    let rebuilt = |random: &str, code: &str, class: &ClientClass, ed: &str, pq: &str| {
+        Commitment::for_class_device(host.clone(), class, random, code, ed, pq).unwrap()
+    };
+    let reference = rebuilt(
+        &B64.encode([1; 32]),
+        DEVICE_CODE,
+        &tui_class(),
+        &device_ed_public(),
+        &B64.encode(ml_dsa_sk_to_vk_bytes(&pq)),
+    );
+    // Every preimage input binds the nonce: login_random, device_code,
+    // client class, and both holder keys.
+    assert_ne!(
+        reference.nonce(),
+        rebuilt(
+            &B64.encode([42; 32]),
+            DEVICE_CODE,
+            &tui_class(),
+            &device_ed_public(),
+            &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))
+        )
+        .nonce()
+    );
+    assert_ne!(
+        reference.nonce(),
+        rebuilt(
+            &B64.encode([1; 32]),
+            "other-device-code",
+            &tui_class(),
+            &device_ed_public(),
+            &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))
+        )
+        .nonce()
+    );
+    assert_ne!(
+        reference.nonce(),
+        rebuilt(
+            &B64.encode([1; 32]),
+            DEVICE_CODE,
+            &ClientClass::new("other-tui-client", TUI_AUD, None).unwrap(),
+            &device_ed_public(),
+            &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))
+        )
+        .nonce()
+    );
+    assert_ne!(
+        reference.nonce(),
+        rebuilt(
+            &B64.encode([1; 32]),
+            DEVICE_CODE,
+            &tui_class(),
+            &other_ed,
+            &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))
+        )
+        .nonce()
+    );
+    assert_ne!(
+        reference.nonce(),
+        rebuilt(
+            &B64.encode([1; 32]),
+            DEVICE_CODE,
+            &tui_class(),
+            &device_ed_public(),
+            &other_pq
+        )
+        .nonce()
+    );
+}
+
+#[test]
+fn device_commitment_validation_is_fail_closed() {
+    let host = FederateHost::new(HOST).unwrap();
+    let pq = ml_dsa_sk_from_seed(&[8; 32]);
+    let build = |code: &str, ed: &str, pq: &str| {
+        Commitment::for_class_device(
+            host.clone(),
+            &tui_class(),
+            &B64.encode([1; 32]),
+            code,
+            ed,
+            pq,
+        )
+    };
+    assert!(build(
+        DEVICE_CODE,
+        &device_ed_public(),
+        &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))
+    )
+    .is_ok());
+    for bad_code in ["", "nonascii-é", &"x".repeat(257)] {
+        assert!(build(
+            bad_code,
+            &device_ed_public(),
+            &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))
+        )
+        .is_err());
+    }
+    // Key validation is the shared code-flow rule set (fixed ed length,
+    // decodable pq) — malformed keys never form a device commitment.
+    assert!(build(DEVICE_CODE, "", &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))).is_err());
+    assert!(build(DEVICE_CODE, "d", &B64.encode(ml_dsa_sk_to_vk_bytes(&pq))).is_err());
+    assert!(build(DEVICE_CODE, &device_ed_public(), "").is_err());
+}
+
+#[tokio::test]
+async fn device_flow_binds_the_signed_binding_key_claim() {
+    let v = tui_verifier();
+    // Positive: the canonical 43-char base64url binding_key is exactly the
+    // committed holder key, and the token carries no nonce/c_hash at all.
+    let t = token(&device_claims());
+    let verified = v
+        .source(&t, DEVICE_CODE, device_commitment(), NOW, None)
+        .await
+        .unwrap();
+    assert_eq!(verified.subject, "opaque-sub");
+    // A stray nonce is not consulted on the device path.
+    let mut with_nonce = device_claims();
+    with_nonce["nonce"] = "hsn1.not-the-commitment".into();
+    assert!(v
+        .source(
+            &token(&with_nonce),
+            DEVICE_CODE,
+            device_commitment(),
+            NOW,
+            None
+        )
+        .await
+        .is_ok());
+    // A code-flow token (nonce/c_hash, no binding_key) cannot ride a device
+    // commitment: the required issuer-signed binding is absent.
+    assert!(v
+        .source(
+            &token(&tui_claims()),
+            DEVICE_CODE,
+            device_commitment(),
+            NOW,
+            None
+        )
+        .await
+        .is_err());
+    // Wrong holder: the claim names a different Ed25519 key.
+    let mut wrong_key = device_claims();
+    wrong_key["binding_key"] = B64
+        .encode(SigningKey::from_bytes(&[77; 32]).verifying_key().as_bytes())
+        .into();
+    assert!(v
+        .source(
+            &token(&wrong_key),
+            DEVICE_CODE,
+            device_commitment(),
+            NOW,
+            None
+        )
+        .await
+        .is_err());
+    // Noncanonical encodings never equal the canonical comparison target:
+    // padded, truncated, and CR/LF-carried variants all fail closed.
+    for variant in [
+        format!("{}=", device_ed_public()),
+        device_ed_public()[..42].to_owned(),
+        format!("{}\r\n", device_ed_public()),
+        format!("\n{}", device_ed_public()),
+    ] {
+        let mut noncanonical = device_claims();
+        noncanonical["binding_key"] = variant.into();
+        assert!(v
+            .source(
+                &token(&noncanonical),
+                DEVICE_CODE,
+                device_commitment(),
+                NOW,
+                None
+            )
+            .await
+            .is_err());
+    }
+    // The claim must be text: a numeric binding_key fails closed.
+    let mut numeric = device_claims();
+    numeric["binding_key"] = 43.into();
+    assert!(v
+        .source(
+            &token(&numeric),
+            DEVICE_CODE,
+            device_commitment(),
+            NOW,
+            None
+        )
+        .await
+        .is_err());
+    // The possession proof is unchanged by the flow: the commitment nonce
+    // still derives the transcript and both holder signatures verify.
+    let ed = SigningKey::from_bytes(&[7; 32]);
+    let pq = ml_dsa_sk_from_seed(&[8; 32]);
+    let source = v
+        .source(&t, DEVICE_CODE, device_commitment(), NOW, None)
+        .await
+        .unwrap();
+    let challenge = source.challenge(binding(), [9; 32], NOW).unwrap();
+    let transcript = challenge.transcript();
+    let es = ed.sign(transcript);
+    let ps = ml_dsa_sign(&pq, transcript);
+    let verified_source = v
+        .source(&t, DEVICE_CODE, device_commitment(), NOW, None)
+        .await
+        .unwrap();
+    challenge
+        .verify(verified_source, &[9; 32], &es.to_bytes(), &ps, NOW)
+        .unwrap();
 }
