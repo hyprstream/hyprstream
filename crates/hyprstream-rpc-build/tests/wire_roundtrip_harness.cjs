@@ -34,6 +34,8 @@ const {
   buildWireChoice_values,
   buildWireChoice_ranged,
   parseWireChoice,
+  parseBudgetRows,
+  parseBudgetWrapper,
 } = require('./wire_roundtrip_fixture.js');
 
 const BIG_F32 = 2048; // 8 KB of Float32 — well past the ~1 KB arena slack (#725/#772 growth path)
@@ -270,6 +272,74 @@ function rootDataReader(kind) {
     raw.set([1, 2, 3], 40);
   }
   return new CapnpReader(raw, 0, 1);
+}
+
+function budgetRowsMessage(rowCount, textCount, { wrapper = false, listTextBytes = 0, scalarTextBytes = 0 } = {}) {
+  const rootPointerOffset = 8;
+  const rootBodyOffset = 16;
+  const rowsPointerOffset = wrapper ? rootBodyOffset + 8 : rootBodyOffset;
+  const listTargetOffset = rowsPointerOffset + 8;
+  const listBodyOffset = listTargetOffset + 8;
+  const sharedTextListOffset = listBodyOffset + rowCount * 2 * 8;
+  const listTextOffset = sharedTextListOffset + textCount * 8;
+  const scalarTextOffset = listTextOffset + listTextBytes;
+  const totalBytes = scalarTextOffset + scalarTextBytes;
+  const bytes = new Uint8Array(totalBytes);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, (bytes.length - 8) / 8, true);
+  word(rootPointerOffset, 0, 1 << 16); // root struct: zero data words, one pointer
+  if (wrapper) word(rootBodyOffset, 0, 1 << 16); // child BudgetRows struct
+  const rowsOffsetWords = (listTargetOffset - rowsPointerOffset - 8) / 8;
+  word(rowsPointerOffset, (rowsOffsetWords << 2) | 1, (rowCount * 2 << 3) | 7);
+  word(listTargetOffset, rowCount << 2, 2 << 16); // two pointer fields per BudgetRow
+  if (listTextBytes > 0) {
+    const textOffsetWords = (listTextOffset - sharedTextListOffset - 8) / 8;
+    word(sharedTextListOffset, (textOffsetWords << 2) | 1, (listTextBytes << 3) | 2);
+  }
+  for (let i = 0; i < rowCount; i++) {
+    const textsPointerOffset = listBodyOffset + i * 16;
+    const textListOffsetWords = (sharedTextListOffset - textsPointerOffset - 8) / 8;
+    word(textsPointerOffset, (textListOffsetWords << 2) | 1, (textCount << 3) | 6);
+    if (scalarTextBytes > 0) {
+      const scalarPointerOffset = textsPointerOffset + 8;
+      const payloadOffsetWords = (scalarTextOffset - scalarPointerOffset - 8) / 8;
+      word(scalarPointerOffset, (payloadOffsetWords << 2) | 1, (scalarTextBytes << 3) | 2);
+    }
+  }
+  if (listTextBytes > 0) {
+    bytes.fill(0x61, listTextOffset, listTextOffset + listTextBytes - 1);
+    bytes[listTextOffset + listTextBytes - 1] = 0;
+  }
+  if (scalarTextBytes > 0) {
+    bytes.fill(0x61, scalarTextOffset, scalarTextOffset + scalarTextBytes - 1);
+    bytes[scalarTextOffset + scalarTextBytes - 1] = 0;
+  }
+  return bytes;
+}
+
+function repeatedRootTextReader(byteCount) {
+  const payloadOffset = 32;
+  const bytes = new Uint8Array(payloadOffset + byteCount);
+  const view = new DataView(bytes.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, (bytes.length - 8) / 8, true);
+  word(8, 0, 2 << 16); // root struct with two Text pointers
+  for (const pointerOffset of [16, 24]) {
+    const offsetWords = (payloadOffset - pointerOffset - 8) / 8;
+    word(pointerOffset, (offsetWords << 2) | 1, (byteCount << 3) | 2);
+  }
+  bytes.fill(0x61, payloadOffset, payloadOffset + byteCount - 1);
+  bytes[payloadOffset + byteCount - 1] = 0;
+  return new CapnpReader(bytes, 0, 2);
 }
 
 function out(obj) {
@@ -563,6 +633,29 @@ function main() {
       rootComposite: rejected(rootReader(true)),
       structPointerList: rejected(structReader(false)),
       structComposite: rejected(structReader(true)),
+    });
+    return;
+  }
+  if (mode === 'aggregate-decoded-budget') {
+    const rejectsWith = (run, message) => {
+      try { run(); return false; }
+      catch (error) { return error instanceof Error && error.message.includes(message); }
+    };
+    const oversized = budgetRowsMessage(1024, 1024);
+    const nestedOversized = budgetRowsMessage(1024, 1024, { wrapper: true });
+    const bounded = budgetRowsMessage(512, 1024);
+    const parseBounded = () => parseBudgetRows(bounded).rows.length;
+    const listText = budgetRowsMessage(2, 1, { listTextBytes: 9 * 1024 * 1024 });
+    const scalarText = budgetRowsMessage(2, 0, { scalarTextBytes: 9 * 1024 * 1024 });
+    const rootTextReader = repeatedRootTextReader(9 * 1024 * 1024);
+    out({
+      rootArrayBudget: rejectsWith(() => parseBudgetRows(oversized), 'decoded array-element budget exceeded'),
+      nestedArrayBudget: rejectsWith(() => parseBudgetWrapper(nestedOversized), 'decoded array-element budget exceeded'),
+      boundedRows: parseBounded(),
+      boundedRowsSecondDecode: parseBounded(),
+      listTextBudget: rejectsWith(() => parseBudgetRows(listText), 'decoded text-byte budget exceeded'),
+      scalarTextBudget: rejectsWith(() => parseBudgetRows(scalarText), 'decoded text-byte budget exceeded'),
+      rootScalarTextBudget: rejectsWith(() => { rootTextReader.getText(0); rootTextReader.getText(1); }, 'decoded text-byte budget exceeded'),
     });
     return;
   }

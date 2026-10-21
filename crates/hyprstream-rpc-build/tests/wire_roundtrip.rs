@@ -1073,6 +1073,19 @@ fn zero_word_composite_lists_bound_materialized_elements() {
         "Text readers must bound repeated payload materialization and validate child pointers"
     );
     assert_eq!(
+        wd.run("aggregate-decoded-budget", &[]),
+        json!({
+            "rootArrayBudget": true,
+            "nestedArrayBudget": true,
+            "boundedRows": 512,
+            "boundedRowsSecondDecode": 512,
+            "listTextBudget": true,
+            "scalarTextBudget": true,
+            "rootScalarTextBudget": true
+        }),
+        "generated root and nested parsers must share per-message aggregate allocation budgets"
+    );
+    assert_eq!(
         wd.run("strided-composite-readers", &[]),
         json!({
             "rootText": ["one", "two"],
