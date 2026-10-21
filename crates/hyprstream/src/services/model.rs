@@ -7285,18 +7285,14 @@ mod tests {
             &caller_key,
             "restart-acceptance-tenant",
         );
-        let pinned_ref = format!(
-            "clef-flash-fp8:{}",
-            "7b43c2d799e7b5e9fef96b6137840088d75af0d6"
-        );
-        let pinned_instance =
-            InferenceInstanceId::new("restart-acceptance-tenant", &pinned_ref, 0)?;
+        let pinned_ref = "clef-flash-fp8:main";
+        let pinned_instance = InferenceInstanceId::new("restart-acceptance-tenant", pinned_ref, 0)?;
         let mut request = wire_decide_request(&format!(
             r#"{{"model":"{}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#,
             pinned_ref
         ));
         request.timeout_ms = Some(100);
-        let first_future = fixture.model.handle_decide(&ctx, 0, &pinned_ref, &request);
+        let first_future = fixture.model.handle_decide(&ctx, 0, pinned_ref, &request);
         tokio::pin!(first_future);
         let pending_wait = async {
             loop {
@@ -7350,7 +7346,7 @@ mod tests {
             std::time::Duration::from_secs(180),
             fixture
                 .model
-                .handle_decide(&ctx, 0, &pinned_ref, &second_request),
+                .handle_decide(&ctx, 0, pinned_ref, &second_request),
         )
         .await
         .map_err(|_| anyhow!("second ingress caller did not complete"))??;
