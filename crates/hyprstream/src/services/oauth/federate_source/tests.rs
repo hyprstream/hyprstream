@@ -688,7 +688,9 @@ fn tui_commitment() -> Commitment {
 }
 
 fn tui_claims() -> Value {
-    json!({"iss":ISSUER,"aud":TUI_AUD,"sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":tui_commitment().nonce(),"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"}})
+    // azp is REQUIRED for this class: its audience does not itself name the
+    // client, so azp is the only signed client binding.
+    json!({"iss":ISSUER,"aud":TUI_AUD,"azp":TUI_CLIENT,"sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":tui_commitment().nonce(),"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"}})
 }
 
 #[test]
@@ -755,6 +757,21 @@ async fn configured_tui_client_class_verifies_with_identical_invariants() {
     // Negative: identical invariants, class-pinned identifiers. A www-aud
     // token, a foreign azp, the other class's nonce, a non-atproto
     // connector, or a token outside the freshness window all fail closed.
+    // azp omitted while aud does not name the client: nothing binds the
+    // token to the TUI client — deny. (The www class is unchanged: its aud
+    // IS the client id, so azp stays optional there.)
+    let mut no_azp = tui_claims();
+    no_azp.as_object_mut().unwrap().remove("azp");
+    assert!(v
+        .source(&token(&no_azp), CODE, tui_commitment(), NOW, None)
+        .await
+        .is_err());
+    let mut www_no_azp = claims();
+    www_no_azp.as_object_mut().unwrap().remove("azp");
+    assert!(v
+        .source(&token(&www_no_azp), CODE, commitment(), NOW, None)
+        .await
+        .is_ok());
     for (k, value) in [
         ("aud", json!(CLIENT)),
         ("aud", json!([TUI_AUD, CLIENT])),
@@ -876,7 +893,8 @@ async fn tui_connector_pin_defaults_to_atproto_and_is_configurable() {
         .unwrap()
     };
     let nonce = commitment().nonce();
-    let claims_for = |connector: &str| json!({"iss":ISSUER,"aud":"ldap-class-aud","sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":nonce,"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":connector,"user_id":"did:plc:abcdefghijklmnopqrstuvwx"}});
+    // azp is required for this class: its audience does not name the client.
+    let claims_for = |connector: &str| json!({"iss":ISSUER,"aud":"ldap-class-aud","azp":"ldap-class-client","sub":"opaque-sub","jti":"source-id","iat":NOW,"exp":NOW+300,"nonce":nonce,"c_hash":B64.encode(&sha(CODE.as_bytes())[..16]),"federated_claims":{"connector_id":connector,"user_id":"did:plc:abcdefghijklmnopqrstuvwx"}});
     assert!(v
         .source(&token(&claims_for("ldap")), CODE, commitment(), NOW, None)
         .await

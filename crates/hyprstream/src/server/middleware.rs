@@ -488,6 +488,22 @@ fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
     claims.iss == expected
 }
 
+/// W1.3: the Federate TUI class is never an HTTP resource credential. Its
+/// only surface is the tui RPC service (and Policy's delegated read-only
+/// check); over HTTP it would otherwise act as a generic bearer credential
+/// for its DID (HTTP sender binding covers cnf.jkt, while this class
+/// carries cnf.jwk). Classify by marker set OR the deployment's class pin,
+/// so the all-stripped shape denies too.
+fn reject_federate_tui_http(
+    claims: &jwt::Claims,
+    local_issuers: &[&str],
+) -> Result<(), &'static str> {
+    if claims.is_federate_tui_class(local_issuers) {
+        return Err("federate TUI credentials are not HTTP resource credentials");
+    }
+    Ok(())
+}
+
 pub(crate) async fn verify_resource_token_claims(
     state: &ResourceAuthState,
     token: &str,
@@ -561,6 +577,9 @@ pub(crate) async fn verify_resource_token_claims(
             Ok(_) | Err(_) => return Err("federation key resolution failed"),
         }
     };
+
+    // W1.3: the Federate TUI class is never an HTTP resource credential.
+    reject_federate_tui_http(&claims, local_issuers)?;
 
     // Credential revocation check (RFC 7009) — fail-closed on store absence.
     // The credential profile makes `jti` REQUIRED on locally issued tokens:
@@ -1318,6 +1337,31 @@ mod rotation_aware_tests {
             "{input}.{}",
             URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).to_bytes())
         )
+    }
+
+    #[test]
+    fn federate_tui_credentials_are_never_http_resource_credentials() {
+        // Marker path: any TUI marker classifies, no reservation needed.
+        let mut claims = jwt::Claims::new("did:plc:abc".into(), 1, 2);
+        claims.iss = "https://cell.test".into();
+        let issuers = ["https://cell.test"];
+        assert!(reject_federate_tui_http(&claims, &issuers).is_ok());
+        claims.hs_tui_profile = Some("federate-tui-v1".into());
+        assert!(reject_federate_tui_http(&claims, &issuers).is_err());
+        // Pin path: the deployment reservation classifies by (local iss,
+        // configured client id) with every marker stripped. Install-once is
+        // idempotent for the same value (another test may have installed it).
+        if hyprstream_rpc::auth::federate_tui_class_client().is_none() {
+            hyprstream_rpc::auth::install_federate_tui_class_client(Some("hyprstream-tui-staging"))
+                .expect("install class reservation");
+        }
+        let mut pinned = jwt::Claims::new("did:plc:abc".into(), 1, 2);
+        pinned.iss = "https://cell.test".into();
+        pinned.client_id = Some("hyprstream-tui-staging".into());
+        assert!(reject_federate_tui_http(&pinned, &issuers).is_err());
+        // A different local client id stays a generic HTTP credential.
+        pinned.client_id = Some("ordinary-local-client".into());
+        assert!(reject_federate_tui_http(&pinned, &issuers).is_ok());
     }
 
     #[test]
