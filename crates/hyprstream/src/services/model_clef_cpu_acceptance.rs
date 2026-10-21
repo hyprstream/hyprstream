@@ -306,104 +306,94 @@ fn t6_runtime_library_identity() -> Result<serde_json::Value> {
     let mut cpu_mapped = false;
     let mut c10_mapped = false;
     for line in maps.lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 6 {
+        // The first five /proc/self/maps columns are whitespace-delimited;
+        // the remainder is the pathname and may itself contain spaces/tabs.
+        let mut fields = line.splitn(6, ' ');
+        let Some(_range) = fields.next() else {
             continue;
-        }
-        let mapped_path = fields[5..].join(" ");
+        };
+        let (Some(_permissions), Some(_offset), Some(device), Some(inode), Some(raw_path)) =
+            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let raw_path = raw_path.trim_start_matches(' ');
+        let mapped_path = raw_path.to_owned();
         if !mapped_path.starts_with('/') {
             continue;
         }
-        let name = Path::new(&mapped_path)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("runtime library mapping has a non-UTF8 file name")?;
+        let (mapped_major, mapped_minor) = device
+            .split_once(':')
+            .context("runtime library mapping has an invalid device")?;
+        let mapped_major = u64::from_str_radix(mapped_major, 16)?;
+        let mapped_minor = u64::from_str_radix(mapped_minor, 16)?;
+        let mapped_inode = inode.parse::<u64>()?;
+
+        // Linux only octal-escapes newlines in map pathnames. Preserve literal
+        // backslashes and octal-looking names by trying the raw path first;
+        // if that does not identify the mapped inode, try the kernel's \012
+        // newline encoding. The descriptor identity below disambiguates both.
+        let path_candidates = t6_maps_path_candidates(&mapped_path);
+        let mut mapped_file = None;
+        let mut path = None;
+        for candidate in path_candidates {
+            let Ok(canonical) = PathBuf::from(candidate).canonicalize() else {
+                continue;
+            };
+            let Ok(file) = std::fs::File::open(&canonical) else {
+                continue;
+            };
+            let metadata = file.metadata()?;
+            let (major, minor) = t6_linux_device_numbers(metadata.dev());
+            if major == mapped_major && minor == mapped_minor && metadata.ino() == mapped_inode {
+                path = Some(canonical);
+                mapped_file = Some(file);
+                break;
+            }
+        }
+        let Some(path) = path else {
+            // Ignore unrelated file-backed mappings. For the libraries in
+            // scope, however, fail closed if the path cannot identify its map.
+            let raw_name = Path::new(&mapped_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if raw_name.starts_with("libtorch")
+                || raw_name.starts_with("libc10")
+                || raw_name.starts_with("libgomp")
+            {
+                anyhow::bail!("runtime library mapping no longer identifies its file: {raw_name}");
+            }
+            continue;
+        };
+        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
         if !name.starts_with("libtorch")
             && !name.starts_with("libc10")
             && !name.starts_with("libgomp")
         {
             continue;
         }
-        anyhow::ensure!(
-            !mapped_path.ends_with(" (deleted)"),
-            "runtime library mapping refers to a deleted file: {name}"
-        );
         cpu_mapped |= name.starts_with("libtorch_cpu.so");
         c10_mapped |= name.starts_with("libc10.so");
-
-        let unescape_maps_path = |value: &str| -> Result<String> {
-            let bytes = value.as_bytes();
-            let mut decoded = Vec::with_capacity(bytes.len());
-            let mut index = 0;
-            while index < bytes.len() {
-                if bytes[index] == b'\\' {
-                    anyhow::ensure!(
-                        index + 3 < bytes.len()
-                            && bytes[index + 1..index + 4]
-                                .iter()
-                                .all(|digit| (b'0'..=b'7').contains(digit)),
-                        "invalid escaped path in /proc/self/maps"
-                    );
-                    let octal = std::str::from_utf8(&bytes[index + 1..index + 4])?;
-                    decoded.push(u8::from_str_radix(octal, 8)?);
-                    index += 4;
-                } else {
-                    decoded.push(bytes[index]);
-                    index += 1;
-                }
-            }
-            String::from_utf8(decoded).context("runtime library path is not UTF-8")
-        };
-        let mapped_path = unescape_maps_path(&mapped_path)?;
-        let path = PathBuf::from(&mapped_path).canonicalize()?;
-        let metadata_before = std::fs::metadata(&path)?;
-        let (mapped_major, mapped_minor) = fields[3]
-            .split_once(':')
-            .context("runtime library mapping has an invalid device")?;
-        let mapped_major = u64::from_str_radix(mapped_major, 16)?;
-        let mapped_minor = u64::from_str_radix(mapped_minor, 16)?;
-        let mapped_inode = fields[4].parse::<u64>()?;
-        anyhow::ensure!(
-            libc::major(metadata_before.dev()) as u64 == mapped_major
-                && libc::minor(metadata_before.dev()) as u64 == mapped_minor
-                && metadata_before.ino() == mapped_inode,
-            "runtime library path no longer identifies the mapped file: {name}"
-        );
         let path_key = path.to_string_lossy().into_owned();
         if let Some(previous) = libraries.get(&path_key) {
             anyhow::ensure!(
-                previous["device"] == fields[3]
-                    && previous["inode"] == mapped_inode,
+                previous["device"] == device && previous["inode"] == mapped_inode,
                 "runtime process mapped multiple identities for {}",
                 path.display()
             );
             continue;
         }
-        let sha256 = {
-            use std::io::Read as _;
-            let mut file = std::fs::File::open(&path)?;
-            let mut digest = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let count = file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                digest.update(&buffer[..count]);
-            }
-            hex::encode(digest.finalize())
-        };
-        let metadata_after = std::fs::metadata(&path)?;
-        anyhow::ensure!(
-            metadata_before.dev() == metadata_after.dev()
-                && metadata_before.ino() == metadata_after.ino()
-                && metadata_before.len() == metadata_after.len()
-                && metadata_before.modified()? == metadata_after.modified()?,
-            "runtime library changed while its identity was captured: {name}"
-        );
+        let sha256 = t6_runtime_file_sha256(
+            mapped_file.context("mapped runtime library descriptor missing")?,
+            mapped_major,
+            mapped_minor,
+            mapped_inode,
+        )
+        .with_context(|| format!("capturing runtime library {name}"))?;
         let identity = json!({
             "sha256":sha256,
-            "device":fields[3],
+            "device":device,
             "inode":mapped_inode
         });
         libraries.insert(path_key, identity);
@@ -413,6 +403,111 @@ fn t6_runtime_library_identity() -> Result<serde_json::Value> {
         "runtime process did not map the required CPU libtorch libraries"
     );
     Ok(serde_json::to_value(libraries)?)
+}
+
+fn t6_maps_path_candidates(mapped_path: &str) -> Vec<String> {
+    let mut candidates = vec![mapped_path.to_owned()];
+    if mapped_path.contains("\\012") {
+        candidates.push(mapped_path.replace("\\012", "\n"));
+    }
+    candidates
+}
+
+fn t6_runtime_file_sha256(
+    mut file: std::fs::File,
+    mapped_major: u64,
+    mapped_minor: u64,
+    mapped_inode: u64,
+) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata_before = file.metadata()?;
+    let (major, minor) = t6_linux_device_numbers(metadata_before.dev());
+    anyhow::ensure!(
+        major == mapped_major && minor == mapped_minor && metadata_before.ino() == mapped_inode,
+        "opened runtime library descriptor differs from the mapped file"
+    );
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let metadata_after = file.metadata()?;
+    anyhow::ensure!(
+        metadata_before.dev() == metadata_after.dev()
+            && metadata_before.ino() == metadata_after.ino()
+            && metadata_before.len() == metadata_after.len()
+            && metadata_before.modified()? == metadata_after.modified()?,
+        "runtime library changed while its identity was captured"
+    );
+    Ok(hex::encode(digest.finalize()))
+}
+
+// Linux encodes dev_t using the glibc-compatible major/minor bit layout.
+// Keep this local instead of libc::major/minor, whose argument types differ
+// across Unix targets and prevent the test module from compiling on macOS.
+fn t6_linux_device_numbers(device: u64) -> (u64, u64) {
+    let major = ((device >> 8) & 0x0fff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0x00ff) | ((device >> 12) & 0xffff_ff00);
+    (major, minor)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod runtime_library_identity_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt as _;
+
+    #[test]
+    fn maps_path_candidates_preserve_literal_backslashes_and_whitespace() {
+        let path = "/opt/release\\cpu dir/libtorch_cpu.so";
+        assert_eq!(t6_maps_path_candidates(path), [path]);
+
+        let escaped_newline = "/opt/line\\012break/libtorch_cpu.so";
+        assert_eq!(
+            t6_maps_path_candidates(escaped_newline),
+            [escaped_newline, "/opt/line\nbreak/libtorch_cpu.so"]
+        );
+    }
+
+    #[test]
+    fn runtime_hash_uses_the_descriptor_for_mapping_identity_and_bytes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("libtorch_cpu.so");
+        std::fs::write(&path, b"runtime library bytes")?;
+        let metadata = std::fs::metadata(&path)?;
+        let (major, minor) = t6_linux_device_numbers(metadata.dev());
+
+        let hash = t6_runtime_file_sha256(
+            std::fs::File::open(&path)?,
+            major,
+            minor,
+            metadata.ino(),
+        )?;
+        assert_eq!(hash, hex::encode(Sha256::digest(b"runtime library bytes")));
+
+        let mismatch = t6_runtime_file_sha256(
+            std::fs::File::open(&path)?,
+            major,
+            minor,
+            metadata.ino().wrapping_add(1),
+        );
+        assert!(mismatch.is_err());
+
+        // The test binary links CPU libtorch. Exercise the actual Linux maps
+        // parser and dev/inode correlation as well as the isolated helper.
+        let inventory = t6_runtime_library_identity()?;
+        let inventory = inventory
+            .as_object()
+            .context("runtime library inventory must be a JSON object")?;
+        assert!(inventory.keys().any(|path| path.ends_with("/libtorch_cpu.so")));
+        assert!(inventory.keys().any(|path| path.ends_with("/libc10.so")));
+        Ok(())
+    }
 }
 fn t6_git(repo: &Path, args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/git")
