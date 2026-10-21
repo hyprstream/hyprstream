@@ -47,6 +47,43 @@ def validate_runtime_libraries(build):
         raise ValueError("captured runtime library path or contents changed")
 
 
+def validate_runtime_library_identity(identity, build):
+    """Bind file-backed DSOs observed in the executing process to the build."""
+    expected = build.get("resolved_runtime_libraries")
+    runtime = identity.get("runtime_libraries")
+    if not isinstance(expected, dict) or not isinstance(runtime, dict):
+        raise ValueError("actual process runtime library identity is missing")
+    expected_by_path = {}
+    for name, entry in expected.items():
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not isinstance(path, str) or not path:
+            raise ValueError("captured runtime library manifest is malformed")
+        if (path in expected_by_path
+                and expected_by_path[path].get("sha256") != entry.get("sha256")):
+            raise ValueError("captured runtime library manifest has conflicting identities")
+        expected_by_path[path] = entry
+    if set(runtime) != set(expected_by_path):
+        raise ValueError("actual process runtime library set differs from the captured build")
+    required = {expected[name]["path"] for name in ("libtorch_cpu.so", "libc10.so")
+                if name in expected}
+    if len(required) != 2 or not required.issubset(runtime):
+        raise ValueError("actual process did not attest required CPU libtorch libraries")
+    for path, captured in expected_by_path.items():
+        observed = runtime[path]
+        if not isinstance(observed, dict):
+            raise ValueError("actual process runtime library identity is malformed")
+        if observed.get("sha256") != captured.get("sha256"):
+            raise ValueError("actual process loaded runtime library differs from the captured build")
+        device = observed.get("device")
+        inode = observed.get("inode")
+        if (not isinstance(device, str)
+                or len(device.split(":")) != 2
+                or any(not part or any(char not in "0123456789abcdefABCDEF" for char in part)
+                       for part in device.split(":"))
+                or not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0):
+            raise ValueError("actual process runtime library mapping identity is malformed")
+
+
 def validate(receipt, build, source, candidate, run_result, receipt_sha256):
     def git(*args):
         return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
@@ -79,6 +116,7 @@ def validate(receipt, build, source, candidate, run_result, receipt_sha256):
         raise ValueError("runtime build identity does not match the clean candidate")
     if identity.get("executable_sha256") != build["executable_sha256"]:
         raise ValueError("runtime executable does not match the captured Release artifact")
+    validate_runtime_library_identity(identity, build)
     if (run_result.get("candidate") != candidate
             or run_result.get("executable_sha256") != build["executable_sha256"]
             or run_result.get("service_receipt_sha256") != receipt_sha256):
