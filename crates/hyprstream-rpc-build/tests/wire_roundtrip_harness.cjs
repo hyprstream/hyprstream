@@ -212,6 +212,39 @@ function legacyStructReader() {
   return new StructReader(raw, view, 0, 0, 1);
 }
 
+function truncatedScalarDataReader(nested) {
+  const raw = new Uint8Array(40);
+  const view = new DataView(raw.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, 4, true);
+  word(8, 0, 1 << 16); // root struct points to byte 16
+  if (nested) word(16, 0, 1 << 16); // nested struct points to byte 24
+  word(nested ? 24 : 16, 1, (64 << 3) | 2); // Data payload exceeds segment
+  const root = new CapnpReader(raw, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
+function malformedCompositeReader(nested) {
+  const raw = new Uint8Array(32);
+  const view = new DataView(raw.buffer);
+  const word = (offset, lo, hi) => {
+    view.setUint32(offset, lo >>> 0, true);
+    view.setUint32(offset + 4, hi >>> 0, true);
+  };
+  view.setUint32(0, 0, true);
+  view.setUint32(4, 3, true);
+  word(8, 0, 1 << 16); // root struct points to byte 16
+  if (nested) word(16, 0, 1 << 16); // nested struct points to byte 24
+  // A composite-list pointer whose tag starts beyond the segment end.
+  word(nested ? 24 : 16, 5, 7);
+  const root = new CapnpReader(raw, 0, 1);
+  return nested ? root.getStruct(0, 0, 1) : root;
+}
+
 function rootDataReader(kind) {
   if (kind === 'far-outer-child' || kind === 'far-child-payload-overrun') {
     const raw = new Uint8Array(64);
@@ -470,6 +503,26 @@ function main() {
         oversizedZeroWordCount: doubleFarCompositeReader('oversized-zero-word-count', nested).getStructList(0, 1, 0).length,
       };
     }
+    out(output);
+    return;
+  }
+  if (mode === 'malformed-composite-bounds') {
+    const rejectedWithoutRangeError = (reader, method) => {
+      try { reader[method](0, 0, 0); } catch (error) { return error instanceof Error && !(error instanceof RangeError); }
+      return false;
+    };
+    const output = {};
+    for (const nested of [false, true]) {
+      const prefix = nested ? 'nested' : 'root';
+      const reader = malformedCompositeReader(nested);
+      output[`${prefix}StructList`] = rejectedWithoutRangeError(reader, 'getStructList');
+      output[`${prefix}TextList`] = rejectedWithoutRangeError(reader, 'getTextList');
+      output[`${prefix}NestedPrimitive`] = rejectedWithoutRangeError(reader, 'getUint8ListList');
+    }
+    const rootData = truncatedScalarDataReader(false);
+    const nestedData = truncatedScalarDataReader(true);
+    output.rootScalarData = rejectedWithoutRangeError(rootData, 'getData');
+    output.nestedScalarData = rejectedWithoutRangeError(nestedData, 'getData');
     out(output);
     return;
   }

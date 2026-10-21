@@ -1096,3 +1096,25 @@ fn zero_word_composite_lists_bound_materialized_elements() {
         "Text and nested-list readers must honor data words before pointer fields"
     );
 }
+
+#[test]
+fn malformed_composite_tags_and_scalar_data_are_rejected_without_range_panics() {
+    let wd = Workdir::prepare();
+    if wd.is_skipped() {
+        return;
+    }
+    assert_eq!(
+        wd.run("malformed-composite-bounds", &[]),
+        json!({
+            "rootStructList": true,
+            "rootTextList": true,
+            "rootNestedPrimitive": true,
+            "nestedStructList": true,
+            "nestedTextList": true,
+            "nestedNestedPrimitive": true,
+            "rootScalarData": true,
+            "nestedScalarData": true
+        }),
+        "malformed composite tag offsets and scalar Data extents must fail with bounded parser errors"
+    );
+}
