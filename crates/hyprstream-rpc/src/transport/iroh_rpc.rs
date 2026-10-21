@@ -272,6 +272,10 @@ struct BridgeMessage {
     respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
 }
 
+fn bridge_message_has_no_live_caller(msg: &BridgeMessage) -> bool {
+    msg.request_cancel.is_cancelled() || msg.respond.is_closed()
+}
+
 /// Shared dispatch loop body: relay `BridgeMessage`s from `rx` to `service`,
 /// each in its own `spawn_local` task so a slow handler never head-of-lines
 /// the queue.
@@ -308,7 +312,17 @@ where
         };
         let service = std::rc::Rc::clone(&service);
         let nonce_cache = Arc::clone(&nonce_cache);
+        // A request can expire or disconnect while it waits in the accepted
+        // queue. Do not start authentication/dispatch for work whose caller
+        // can no longer receive a response. The task repeats the cancellation
+        // check to cover the race between this dequeue and its first poll.
+        if bridge_message_has_no_live_caller(&msg) {
+            continue;
+        }
         requests.spawn_local(async move {
+            if bridge_message_has_no_live_caller(&msg) {
+                return;
+            }
             let signing_key = service.signing_key();
             let result = crate::service::dispatch::process_request_with_cancel(
                 msg.request.as_ref(),
@@ -707,6 +721,100 @@ mod tests {
 
     fn fresh_signing_key() -> SigningKey {
         SigningKey::from_bytes(&fresh_key())
+    }
+
+    #[test]
+    fn bridge_message_is_unavailable_after_cancel_or_response_drop() {
+        let (respond, response) = tokio::sync::oneshot::channel();
+        let mut msg = BridgeMessage {
+            request: Bytes::new(),
+            carrier: crate::transport::carrier::CarrierContext::inproc(),
+            request_cancel: CancellationToken::new(),
+            respond,
+        };
+        assert!(!bridge_message_has_no_live_caller(&msg));
+
+        msg.request_cancel.cancel();
+        assert!(bridge_message_has_no_live_caller(&msg));
+        drop(response);
+        msg.request_cancel = CancellationToken::new();
+        assert!(bridge_message_has_no_live_caller(&msg));
+    }
+
+    #[tokio::test]
+    async fn bridge_skips_cancelled_accepted_request_before_processing() -> Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (cancelled_respond, cancelled_response) = tokio::sync::oneshot::channel();
+        tx.send(BridgeMessage {
+            request: Bytes::from_static(b"must not be processed"),
+            carrier: crate::transport::carrier::CarrierContext::inproc(),
+            request_cancel: cancelled,
+            respond: cancelled_respond,
+        })
+        .await?;
+
+        let (active_respond, active_response) = tokio::sync::oneshot::channel();
+        tx.send(BridgeMessage {
+            request: Bytes::from_static(b"invalid envelope, but still dispatched"),
+            carrier: crate::transport::carrier::CarrierContext::inproc(),
+            request_cancel: CancellationToken::new(),
+            respond: active_respond,
+        })
+        .await?;
+        drop(tx);
+
+        let service = std::rc::Rc::new(BridgeEcho::new(fresh_signing_key()));
+        let local = tokio::task::LocalSet::new();
+        let dispatch = local.spawn_local(run_bridge_dispatch_loop(
+            service,
+            rx,
+            Arc::new(crate::envelope::InMemoryNonceCache::new()),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        ));
+        local.run_until(dispatch).await??;
+
+        assert!(
+            cancelled_response.await.is_err(),
+            "cancelled accepted request reached response dispatch"
+        );
+        assert!(
+            active_response.await?.is_err(),
+            "active control request did not reach normal request processing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_request_with_cancel_rejects_expired_work_before_envelope_decode() -> Result<()>
+    {
+        let service = BridgeEcho::new(fresh_signing_key());
+        let key = service.signing_key.clone();
+        let nonce_cache = crate::envelope::InMemoryNonceCache::new();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        let result = crate::service::dispatch::process_request_with_cancel(
+            b"not an envelope",
+            &service,
+            crate::envelope::EnvelopeVerification::AnySigner,
+            &key,
+            &nonce_cache,
+            crate::transport::carrier::CarrierContext::inproc(),
+            cancelled,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => anyhow::bail!("cancelled request entered envelope verification"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("request cancelled before envelope verification"));
+        Ok(())
     }
 
     fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {

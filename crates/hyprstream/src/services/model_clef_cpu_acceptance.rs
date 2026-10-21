@@ -312,9 +312,13 @@ fn t6_runtime_library_identity() -> Result<serde_json::Value> {
         let Some(_range) = fields.next() else {
             continue;
         };
-        let (Some(_permissions), Some(_offset), Some(device), Some(inode), Some(raw_path)) =
-            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
-        else {
+        let (Some(_permissions), Some(_offset), Some(device), Some(inode), Some(raw_path)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             continue;
         };
         let raw_path = raw_path.trim_start_matches(' ');
@@ -322,6 +326,15 @@ fn t6_runtime_library_identity() -> Result<serde_json::Value> {
         if !mapped_path.starts_with('/') {
             continue;
         }
+        // Classify the mapping by the pathname from the maps snapshot. The
+        // canonical backing path may acquire a different basename during a
+        // concurrent rename/symlink swap; that must not make an in-scope
+        // mapping disappear from the receipt.
+        let name = Path::new(&mapped_path)
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let in_scope = t6_runtime_library_in_scope(&name, None);
         let (mapped_major, mapped_minor) = device
             .split_once(':')
             .context("runtime library mapping has an invalid device")?;
@@ -354,23 +367,13 @@ fn t6_runtime_library_identity() -> Result<serde_json::Value> {
         let Some(path) = path else {
             // Ignore unrelated file-backed mappings. For the libraries in
             // scope, however, fail closed if the path cannot identify its map.
-            let raw_name = Path::new(&mapped_path)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            if raw_name.starts_with("libtorch")
-                || raw_name.starts_with("libc10")
-                || raw_name.starts_with("libgomp")
-            {
-                anyhow::bail!("runtime library mapping no longer identifies its file: {raw_name}");
+            if in_scope {
+                anyhow::bail!("runtime library mapping no longer identifies its file: {name}");
             }
             continue;
         };
-        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-        if !name.starts_with("libtorch")
-            && !name.starts_with("libc10")
-            && !name.starts_with("libgomp")
-        {
+        let resolved_name = path.file_name().and_then(|value| value.to_str());
+        if !t6_runtime_library_in_scope(&name, resolved_name) {
             continue;
         }
         cpu_mapped |= name.starts_with("libtorch_cpu.so");
@@ -411,6 +414,15 @@ fn t6_maps_path_candidates(mapped_path: &str) -> Vec<String> {
         candidates.push(mapped_path.replace("\\012", "\n"));
     }
     candidates
+}
+
+fn t6_runtime_library_in_scope(mapped_name: &str, resolved_name: Option<&str>) -> bool {
+    t6_runtime_library_name_in_scope(mapped_name)
+        || resolved_name.is_some_and(t6_runtime_library_name_in_scope)
+}
+
+fn t6_runtime_library_name_in_scope(name: &str) -> bool {
+    name.starts_with("libtorch") || name.starts_with("libc10") || name.starts_with("libgomp")
 }
 
 fn t6_runtime_file_sha256(
@@ -475,6 +487,37 @@ mod runtime_library_identity_tests {
     }
 
     #[test]
+    fn runtime_library_scope_survives_maps_path_rename_and_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let mapped_path = directory.path().join("libgomp.so.1");
+        let renamed_path = directory.path().join("object-123");
+        std::fs::write(&mapped_path, b"runtime library bytes")?;
+        let maps_snapshot_name = mapped_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("test maps path missing filename")?;
+
+        std::fs::rename(&mapped_path, &renamed_path)?;
+        symlink(&renamed_path, &mapped_path)?;
+        let resolved_path = mapped_path.canonicalize()?;
+        let canonical_name = resolved_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("test canonical path missing filename")?;
+
+        assert_eq!(maps_snapshot_name, "libgomp.so.1");
+        assert_eq!(canonical_name, "object-123");
+        assert!(!t6_runtime_library_name_in_scope(canonical_name));
+        assert!(t6_runtime_library_in_scope(
+            maps_snapshot_name,
+            Some(canonical_name)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn runtime_hash_uses_the_descriptor_for_mapping_identity_and_bytes() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("libtorch_cpu.so");
@@ -482,12 +525,8 @@ mod runtime_library_identity_tests {
         let metadata = std::fs::metadata(&path)?;
         let (major, minor) = t6_linux_device_numbers(metadata.dev());
 
-        let hash = t6_runtime_file_sha256(
-            std::fs::File::open(&path)?,
-            major,
-            minor,
-            metadata.ino(),
-        )?;
+        let hash =
+            t6_runtime_file_sha256(std::fs::File::open(&path)?, major, minor, metadata.ino())?;
         assert_eq!(hash, hex::encode(Sha256::digest(b"runtime library bytes")));
 
         let mismatch = t6_runtime_file_sha256(
@@ -504,7 +543,9 @@ mod runtime_library_identity_tests {
         let inventory = inventory
             .as_object()
             .context("runtime library inventory must be a JSON object")?;
-        assert!(inventory.keys().any(|path| path.ends_with("/libtorch_cpu.so")));
+        assert!(inventory
+            .keys()
+            .any(|path| path.ends_with("/libtorch_cpu.so")));
         assert!(inventory.keys().any(|path| path.ends_with("/libc10.so")));
         Ok(())
     }

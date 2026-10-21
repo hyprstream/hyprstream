@@ -99,6 +99,10 @@ pub async fn process_request_with_cancel<S>(
 where
     S: crate::service::RequestService,
 {
+    if request_cancel.is_cancelled() {
+        anyhow::bail!("request cancelled before envelope verification");
+    }
+
     // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
     //    The verify policy + kid-anchored PQ trust store come from the
     //    process-global verify configuration installed at startup (Hybrid
@@ -934,6 +938,9 @@ where
     //    gates consumed (v16 §5.1: signed == decoded == handler body).
     // Only the authenticated dispatch path can attach this server-created
     // signal. Caller-controlled envelope fields never populate it.
+    if request_cancel.is_cancelled() {
+        anyhow::bail!("request cancelled before application dispatch");
+    }
     ctx.install_request_cancellation(request_cancel);
     let (response_payload, continuation) = match service.handle_request(&ctx, &decoded_body).await {
         Ok((resp, cont)) => (resp, cont),
