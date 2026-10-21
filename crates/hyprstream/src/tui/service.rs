@@ -198,6 +198,13 @@ pub struct TuiService {
     /// Lazily-spawned VFS proxy sender (shared across all ChatApps).
     /// Initialized on first ChatApp spawn within the service's async context.
     vfs_proxy_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>>,
+    /// Configured Federate TUI client-class id for the W1.3 consumer gate.
+    /// `None` = the class is unconfigured: any credential carrying TUI
+    /// federate markers is denied (default-deny, the W1.1 invariant). Also
+    /// serves as the marker-independent class pin: a credential whose
+    /// (iss, client_id) names the configured class is gated even with every
+    /// TUI marker stripped.
+    federate_tui_client: Option<String>,
 }
 
 impl TuiService {
@@ -224,6 +231,7 @@ impl TuiService {
             vfs_ns: None,
             vfs_subject: None,
             vfs_proxy_tx: std::sync::OnceLock::new(),
+            federate_tui_client: None,
         }
     }
 
@@ -248,6 +256,64 @@ impl TuiService {
         self
     }
 
+    /// Configure the Federate TUI client class this service consumes (W1.3).
+    /// `None` keeps the gate fail-closed for TUI-markered credentials.
+    pub fn with_federate_tui_client(mut self, client: Option<String>) -> Self {
+        self.federate_tui_client = client;
+        self
+    }
+
+    /// Whether a credential is TUI-CLASSIFIED at this service: it carries
+    /// any TUI federate marker, or its (iss, client_id) equals this
+    /// service's audience and the authority-owned class pin — the configured
+    /// TUI client id from this service's wiring OR the process-global
+    /// reservation installed from the deployment config at startup. The pin
+    /// mirrors the www reserved (iss, client_id) predicate, so a
+    /// class-shaped credential with every marker stripped still cannot fall
+    /// through to generic handling — including on a TuiService instance the
+    /// class was not wired into (the gate then denies: no configured class
+    /// to verify against).
+    fn is_federate_tui_classified(&self, claims: &hyprstream_rpc::auth::Claims) -> bool {
+        claims.has_federate_tui_profile_marker()
+            || (self.expected_audience.as_deref() == Some(claims.iss.as_str())
+                && claims.client_id.as_deref().is_some_and(|id| {
+                    Some(id) == self.federate_tui_client.as_deref()
+                        || Some(id) == hyprstream_rpc::auth::federate_tui_class_client()
+                }))
+    }
+
+    /// W1.3 consumer gate: admit a TUI-class federate credential for exactly
+    /// the operation class requested. The credential must verify against the
+    /// exact configured class — complete TUI marker set, no www markers,
+    /// `tui`-resource scopes only, holder-binding shape — and carry the
+    /// scope this operation needs. Fail-closed when the class is not
+    /// configured on this service. The holder's cnf.jwk binding to the
+    /// envelope signer was already enforced by the RPC layer (svc.rs R2).
+    #[cfg(feature = "postgres")]
+    fn admit_federate_tui(
+        &self,
+        claims: &hyprstream_rpc::auth::Claims,
+        required_scope: &str,
+    ) -> Result<()> {
+        let client = self.federate_tui_client.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Federate TUI client class is not configured on this service")
+        })?;
+        let audience = self.expected_audience.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("no expected audience for Federate TUI credential verification")
+        })?;
+        let host = crate::services::oauth::federate_source::FederateHost::new(audience)
+            .map_err(|_| anyhow::anyhow!("service audience is not a Federate host"))?;
+        let facts = crate::services::oauth::federate_proof::verify_tui_credential_claims(
+            claims, &host, client,
+        )
+        .map_err(|_| anyhow::anyhow!("Federate TUI credential profile rejected"))?;
+        anyhow::ensure!(
+            facts.scopes.iter().any(|scope| scope == required_scope),
+            "Federate TUI credential lacks the scope this operation requires"
+        );
+        Ok(())
+    }
+
     /// Attach a VFS namespace so ChatApps spawned via RPC have VFS access.
     ///
     /// The VFS proxy task is spawned lazily on the first ChatApp spawn,
@@ -260,6 +326,13 @@ impl TuiService {
         self.vfs_ns = Some(ns);
         self.vfs_subject = Some(subject);
         self
+    }
+
+    /// Test-only observation point for the W1.3 consumer dispatch fixture
+    /// (the fixture itself is postgres-gated, so this accessor is too).
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) async fn test_session_count(&self) -> usize {
+        self.state.read().await.sessions.len()
     }
 
     /// Get the VFS proxy sender, spawning a dedicated proxy thread on first call.
@@ -2004,6 +2077,23 @@ impl TuiService {
     }
 }
 
+/// The TUI-class scope a federate credential must carry for a request (W1.3).
+/// Maps the service's operation vocabulary onto the TUI session ceiling:
+/// `connect` to attach a viewer, `query` for read-only views, `write` for
+/// everything that mutates state, feeds input, or spawns.
+#[cfg(feature = "postgres")]
+fn federate_tui_required_scope(
+    request: &tui_capnp::tui_request::Reader<'_>,
+) -> Result<&'static str> {
+    Ok(match request.which()? {
+        tui_capnp::tui_request::Which::Connect(_) => "connect:tui:session",
+        tui_capnp::tui_request::Which::Snapshot(_)
+        | tui_capnp::tui_request::Which::ListWindows(_)
+        | tui_capnp::tui_request::Which::PollStdin(_) => "query:tui:session",
+        _ => "write:tui:session",
+    })
+}
+
 #[async_trait(?Send)]
 impl RequestService for TuiService {
     fn producer_reach_config_handle(
@@ -2033,6 +2123,26 @@ impl RequestService for TuiService {
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         let request = body.root::<tui_capnp::tui_request::Reader<'_>>()?;
         let request_id = request.get_id();
+
+        // W1.3 consumer gate: a TUI-classified credential (markers OR the
+        // class pin — see is_federate_tui_classified) is admitted only after
+        // full class verification, which REQUIRES the complete marker set,
+        // plus the scope this operation needs. Unclassified credentials take
+        // the pre-existing path unchanged; www-class credentials never reach
+        // this service (the svc.rs deferred branch denies them here). The
+        // mint path exists only in postgres builds, so other builds deny
+        // classified credentials unconditionally (fail-closed).
+        if let Some(claims) = _ctx.claims() {
+            if self.is_federate_tui_classified(claims) {
+                #[cfg(feature = "postgres")]
+                {
+                    let required = federate_tui_required_scope(&request)?;
+                    self.admit_federate_tui(claims, required)?;
+                }
+                #[cfg(not(feature = "postgres"))]
+                anyhow::bail!("Federate TUI credentials require the postgres build profile");
+            }
+        }
 
         match request.which()? {
             tui_capnp::tui_request::Which::Connect(connect_reader) => {
@@ -2762,8 +2872,190 @@ pub(crate) async fn run_frame_loop(
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── W1.3: the Federate TUI client-class consumer gate ─────────────────
+
+    #[cfg(feature = "postgres")]
+    const GATE_HOST: &str = "https://tui-gate.test";
+    #[cfg(feature = "postgres")]
+    const GATE_TUI_CLIENT: &str = "hyprstream-tui-staging";
+
+    #[cfg(feature = "postgres")]
+    fn gate_service(configured: bool) -> TuiService {
+        TuiService::new(
+            Arc::new(RwLock::new(TuiState::new(80, 24, 1000))),
+            TransportConfig::ipc(std::path::PathBuf::from(
+                "/tmp/hyprstream-tui-gate-test.sock",
+            )),
+            SigningKey::from_bytes(&[9; 32]),
+        )
+        .with_expected_audience(GATE_HOST.into())
+        .with_federate_tui_client(configured.then(|| GATE_TUI_CLIENT.to_owned()))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn gate_claims(scopes: &str) -> hyprstream_rpc::auth::Claims {
+        use base64::Engine as _;
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[61; 32])
+            .verifying_key()
+            .to_bytes();
+        let pq = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[62; 32]),
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = hyprstream_rpc::auth::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".into(),
+            now,
+            now + 60,
+        )
+        .with_issuer(GATE_HOST.into())
+        .with_audience(Some(GATE_HOST.into()))
+        .with_client_id(GATE_TUI_CLIENT)
+        .with_tenant("tenant-a".into())
+        .with_sid("tui-sid")
+        .with_scope(Some(scopes.to_owned()))
+        .with_cnf_jwk(&ed)
+        .with_federate_tui_markers(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pq),
+            crate::services::oauth::federate_source::ISSUER.into(),
+            "opaque-oidc-subject".into(),
+        );
+        claims.jti = Some("tui-jti".into());
+        claims
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_admits_the_configured_class_with_the_required_scope() {
+        let service = gate_service(true);
+        let claims = gate_claims("connect:tui:session query:tui:session write:tui:session");
+        for required in [
+            "connect:tui:session",
+            "query:tui:session",
+            "write:tui:session",
+        ] {
+            service
+                .admit_federate_tui(&claims, required)
+                .expect(required);
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_default_denies_when_unconfigured() {
+        let service = gate_service(false);
+        let claims = gate_claims("connect:tui:session");
+        assert!(service
+            .admit_federate_tui(&claims, "connect:tui:session")
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_denies_a_missing_required_scope() {
+        let service = gate_service(true);
+        let claims = gate_claims("connect:tui:session");
+        assert!(service
+            .admit_federate_tui(&claims, "connect:tui:session")
+            .is_ok());
+        assert!(service
+            .admit_federate_tui(&claims, "write:tui:session")
+            .is_err());
+        assert!(service
+            .admit_federate_tui(&claims, "query:tui:session")
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_denies_mixed_markers_and_class_substitution() {
+        let service = gate_service(true);
+        let mut mixed = gate_claims("connect:tui:session");
+        mixed.hs_profile = Some("federate-session-v1".into());
+        assert!(service
+            .admit_federate_tui(&mixed, "connect:tui:session")
+            .is_err());
+        let mut wrong_client = gate_claims("connect:tui:session");
+        wrong_client.client_id = Some("other-client".into());
+        assert!(service
+            .admit_federate_tui(&wrong_client, "connect:tui:session")
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_class_pin_holds_with_all_markers_stripped() {
+        let service = gate_service(true);
+        // Every TUI marker stripped; the class pin (iss + configured
+        // client_id) still classifies the credential, and the gate denies
+        // it for the incomplete marker set.
+        let mut stripped = gate_claims("connect:tui:session");
+        stripped.hs_tui_profile = None;
+        stripped.hs_tui_signer_pq_key_v1 = None;
+        stripped.hs_tui_source_issuer_v1 = None;
+        stripped.hs_tui_source_subject_v1 = None;
+        assert!(!stripped.has_federate_tui_profile_marker());
+        assert!(service.is_federate_tui_classified(&stripped));
+        assert!(service
+            .admit_federate_tui(&stripped, "connect:tui:session")
+            .is_err());
+        // A credential naming a different client with no markers is NOT
+        // classified and keeps the legacy path (gate never applies).
+        let mut ordinary = gate_claims("connect:tui:session");
+        ordinary.hs_tui_profile = None;
+        ordinary.hs_tui_signer_pq_key_v1 = None;
+        ordinary.hs_tui_source_issuer_v1 = None;
+        ordinary.hs_tui_source_subject_v1 = None;
+        ordinary.client_id = Some("ordinary-local-client".into());
+        assert!(!service.is_federate_tui_classified(&ordinary));
+        // The pin requires the issuer to equal the service audience.
+        let mut wrong_iss = stripped.clone();
+        wrong_iss.iss = "https://other-cell.example".into();
+        assert!(!service.is_federate_tui_classified(&wrong_iss));
+        // Unconfigured service: the marker set still classifies. (The
+        // stripped-shape behavior without the per-service wiring depends on
+        // the process-global class reservation, which the dispatch fixture
+        // w13 covers with the reservation installed.)
+        let unconfigured = gate_service(false);
+        assert!(unconfigured.is_federate_tui_classified(&gate_claims("connect:tui:session")));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_scope_map_covers_the_operation_vocabulary() {
+        fn required(build: impl Fn(&mut tui_capnp::tui_request::Builder<'_>)) -> &'static str {
+            let mut msg = Builder::new_default();
+            let mut req = msg.init_root::<tui_capnp::tui_request::Builder<'_>>();
+            req.set_id(1);
+            build(&mut req);
+            federate_tui_required_scope(&req.reborrow_as_reader()).unwrap()
+        }
+        assert_eq!(
+            required(|r| {
+                r.reborrow().init_connect();
+            }),
+            "connect:tui:session"
+        );
+        assert_eq!(required(|r| r.set_snapshot(0)), "query:tui:session");
+        assert_eq!(required(|r| r.set_list_windows(0)), "query:tui:session");
+        assert_eq!(required(|r| r.set_poll_stdin(1)), "query:tui:session");
+        assert_eq!(
+            required(|r| {
+                r.reborrow().init_send_input();
+            }),
+            "write:tui:session"
+        );
+        assert_eq!(
+            required(|r| {
+                r.reborrow().init_spawn_shell();
+            }),
+            "write:tui:session"
+        );
+        assert_eq!(required(|r| r.set_disconnect(1)), "write:tui:session");
+    }
 
     #[test]
     fn service_clients_fail_closed_without_a_nonempty_service_token() {

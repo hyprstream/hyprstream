@@ -24,6 +24,10 @@ use tokio::sync::Mutex;
 
 pub(crate) const ISSUER: &str = "https://login.federate.to";
 pub(crate) const CLIENT: &str = hyprstream_rpc::auth::claims::FEDERATE_STAGING_CLIENT;
+/// Session profile string of the second (TUI) client class. Distinct from
+/// the www `federate-session-v1` suite/inventory markers: a credential of
+/// this class takes NORMAL JWT verification, not the deferred branch.
+pub(crate) const TUI_PROFILE: &str = "federate-tui-v1";
 pub(crate) const WEBSITE: &str = "https://www.staging.lab.hyprstream.com";
 pub(crate) const CALLBACK: &str = "https://www.staging.lab.hyprstream.com/federate/callback";
 #[cfg(test)]
@@ -37,6 +41,76 @@ const MAX_TRANSCRIPT: usize = 8 * 1024;
 const MAX_AUTHORITY_TEXT: usize = 256;
 const MAX_SCOPE_BYTES: usize = 1024;
 const KEY_TTL: Duration = Duration::from_secs(60);
+const MAX_CLIENT_TEXT: usize = 256;
+const MAX_CONNECTOR_TEXT: usize = 64;
+
+/// One accepted Federate client class (W1).
+///
+/// The staging class is the hardcoded www pin. A second class (the TUI
+/// harness) may be configured per issuer; it carries IDENTICAL source
+/// verification invariants — pinned RS256, kid-keyed JWKS, `exp - iat <=
+/// 300s`, nonce/c_hash binding (at_hash is value-checked only when an
+/// access token is supplied, otherwise encoding-only, per D8), the
+/// connector pin, and did:plc / host-form did:web validation. The class
+/// only selects the pinned identifiers, and every commitment binds its
+/// exact `client_id` in both the nonce preimage and the possession
+/// transcript. This is source-verification acceptance only: the output
+/// credential profile and its dispatch treatment are owned by W1.3/W1.4.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientClass {
+    client_id: String,
+    aud: String,
+    connector: String,
+}
+
+impl ClientClass {
+    /// The hardcoded staging www class (`aud` == `client_id`, `atproto`).
+    pub(crate) fn staging() -> Self {
+        Self {
+            client_id: CLIENT.into(),
+            aud: CLIENT.into(),
+            connector: "atproto".into(),
+        }
+    }
+
+    /// Fail-closed construction of the configured second class. The class
+    /// must stay disjoint from the reserved staging pin so the
+    /// reserved-credential predicate (`iss`, `client_id`) can never match
+    /// this class — predicate-level behavior only; the minted-profile path
+    /// and dispatch treatment are decided by later slices, not here.
+    pub(crate) fn new(client_id: &str, aud: &str, connector: Option<&str>) -> Result<Self> {
+        let text = |value: &str, max: usize| {
+            require(!value.is_empty() && value.len() <= max)?;
+            require(value.bytes().all(|b| (0x21..=0x7e).contains(&b)))?;
+            Ok(())
+        };
+        text(client_id, MAX_CLIENT_TEXT)?;
+        text(aud, MAX_CLIENT_TEXT)?;
+        let connector = connector.unwrap_or("atproto");
+        text(connector, MAX_CONNECTOR_TEXT)?;
+        require(client_id != CLIENT && aud != CLIENT)?;
+        Ok(Self {
+            client_id: client_id.into(),
+            aud: aud.into(),
+            connector: connector.into(),
+        })
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// The session profile string this class mints and accepts on the wire.
+    /// The staging class keeps `federate-session-v1` byte-for-byte; the
+    /// configured second class uses its own distinct TUI profile string.
+    pub(crate) fn profile(&self) -> &'static str {
+        if self.client_id == CLIENT {
+            "federate-session-v1"
+        } else {
+            TUI_PROFILE
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Error {
@@ -152,6 +226,10 @@ fn json(bytes: &[u8]) -> Result<Value> {
 /// Validated commitment inputs. The host cannot prove browser key freshness.
 pub(crate) struct Commitment {
     host: FederateHost,
+    /// The client class this commitment is bound to (W1). Binds the nonce
+    /// preimage and the possession transcript to the exact class, so a
+    /// nonce or transcript minted for one class is useless for another.
+    client: ClientClass,
     random: [u8; 32],
     state: String,
     pkce: String,
@@ -170,8 +248,21 @@ impl Commitment {
             pq,
         )
     }
+    /// Commitment for the hardcoded staging www class.
     pub(crate) fn for_host(
         host: FederateHost,
+        random: &str,
+        state: &str,
+        pkce: &str,
+        ed: &str,
+        pq: &str,
+    ) -> Result<Self> {
+        Self::for_class(host, &ClientClass::staging(), random, state, pkce, ed, pq)
+    }
+    /// Commitment for one accepted client class (staging or configured).
+    pub(crate) fn for_class(
+        host: FederateHost,
+        client: &ClientClass,
         random: &str,
         state: &str,
         pkce: &str,
@@ -187,6 +278,7 @@ impl Commitment {
         fixed::<32>(pkce)?;
         Ok(Self {
             host,
+            client: client.clone(),
             random: fixed(random)?,
             state: state.into(),
             pkce: pkce.into(),
@@ -199,7 +291,7 @@ impl Commitment {
             "hyprstream.federate.session-primary.nonce.v1",
             &[
                 ISSUER.as_bytes(),
-                CLIENT.as_bytes(),
+                self.client.client_id.as_bytes(),
                 WEBSITE.as_bytes(),
                 CALLBACK.as_bytes(),
                 self.host.as_str().as_bytes(),
@@ -212,7 +304,7 @@ impl Commitment {
             ],
         )
     }
-    fn nonce(&self) -> String {
+    pub(crate) fn nonce(&self) -> String {
         format!("hsn1.{}", B64.encode(sha(&self.preimage())))
     }
     fn kids(&self) -> [[u8; 32]; 2] {
@@ -284,10 +376,22 @@ fn parse_keys(bytes: &[u8]) -> Result<BTreeMap<String, DecodingKey>> {
 #[derive(Default)]
 pub(crate) struct Verifier {
     host: Option<FederateHost>,
+    /// Optional configured second client class beside the hardcoded staging
+    /// pin (W1: the TUI harness). `None` = staging-only, exactly the
+    /// previous behavior.
+    tui_client: Option<ClientClass>,
     client: Option<reqwest::Client>,
     keys: Mutex<Option<Keys>>,
     #[cfg(test)]
     responses: Option<parking_lot::Mutex<Vec<Result<Vec<u8>>>>>,
+}
+
+#[cfg(test)]
+impl Verifier {
+    /// Queue canned JWKS fetch responses (offline issuer-level fixtures).
+    pub(crate) fn set_test_responses(&mut self, responses: Vec<Result<Vec<u8>>>) {
+        self.responses = Some(parking_lot::Mutex::new(responses));
+    }
 }
 impl Verifier {
     #[cfg(test)]
@@ -305,11 +409,44 @@ impl Verifier {
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
             host: Some(host),
+            tui_client: None,
             client: Some(client),
             keys: Mutex::new(None),
             #[cfg(test)]
             responses: None,
         })
+    }
+    /// Accept an additional configured client class (W1). Both classes
+    /// verify under identical invariants.
+    pub(crate) fn with_client_class(mut self, class: ClientClass) -> Self {
+        self.tui_client = Some(class);
+        self
+    }
+    /// Resolve a wire `client_id` to the one accepted class it names.
+    /// Anything but the staging pin or the configured class fails closed
+    /// before any signature or claim work.
+    pub(crate) fn resolve_client_class(&self, client_id: &str) -> Result<ClientClass> {
+        if client_id == CLIENT {
+            return Ok(ClientClass::staging());
+        }
+        match &self.tui_client {
+            Some(class) if class.client_id == client_id => Ok(class.clone()),
+            _ => Err(Error::Invalid),
+        }
+    }
+
+    /// The configured second client class, if any. `None` means
+    /// staging-only: the exact previous behavior (W1.1 default-deny).
+    pub(crate) fn tui_client(&self) -> Option<&ClientClass> {
+        self.tui_client.as_ref()
+    }
+
+    /// The configured second client class's `client_id`, if any. `None`
+    /// means staging-only: the exact previous behavior (W1.1 default-deny).
+    pub(crate) fn tui_client_id(&self) -> Option<&str> {
+        self.tui_client
+            .as_ref()
+            .map(|class| class.client_id.as_str())
     }
     async fn fetch(&self, client: &reqwest::Client) -> Result<Vec<u8>> {
         #[cfg(test)]
@@ -374,6 +511,15 @@ impl Verifier {
         access_token: Option<&str>,
     ) -> Result<Source> {
         require(self.host()? == &commitment.host)?;
+        // The commitment must carry EXACTLY this verifier's canonical class
+        // for its client_id: client_id, aud and connector are all compared.
+        // A caller-built class that reuses a configured client_id with a
+        // different aud or connector is rejected here, before any claim is
+        // validated against the commitment's pins. Default-deny: an
+        // unconfigured client_id resolves to an error.
+        require(
+            self.resolve_client_class(commitment.client.client_id.as_str())? == commitment.client,
+        )?;
         require(token.len() <= MAX_JWS && !token.is_empty())?;
         let parts: Vec<_> = token.split('.').collect();
         require(parts.len() == 3)?;
@@ -401,7 +547,7 @@ impl Verifier {
         validate_claims(&claims, code, &commitment, now, access_token)?;
         Ok(Source {
             subject: text(&claims, "sub")?.into(),
-            atproto_did: atproto_account_did(&claims)?,
+            atproto_did: atproto_account_did(&claims, &commitment.client.connector)?,
             jti: text(&claims, "jti")?.into(),
             issued_at: number(&claims, "iat")?,
             expires_at: number(&claims, "exp")?,
@@ -429,12 +575,12 @@ fn hash_claim(claim: &str, input: &str) -> Result<()> {
     require(equal(&fixed::<16>(claim)?, &sha(input.as_bytes())[..16]))
 }
 
-fn atproto_account_did(v: &Value) -> Result<String> {
+fn atproto_account_did(v: &Value, connector: &str) -> Result<String> {
     let claims = v
         .get("federated_claims")
         .and_then(Value::as_object)
         .ok_or(Error::Invalid)?;
-    require(claims.get("connector_id").and_then(Value::as_str) == Some("atproto"))?;
+    require(claims.get("connector_id").and_then(Value::as_str) == Some(connector))?;
     let did = claims
         .get("user_id")
         .and_then(Value::as_str)
@@ -493,16 +639,18 @@ fn validate_claims(
     now: u64,
     access: Option<&str>,
 ) -> Result<()> {
+    // The pinned identifiers come from the commitment's client class, so a
+    // token minted for one class cannot be replayed against another.
+    let class = &c.client;
     require(text(v, "iss")? == ISSUER)?;
-    require(
-        v.get("aud")
-            .is_some_and(|a| a.as_str() == Some(CLIENT) || *a == serde_json::json!([CLIENT])),
-    )?;
+    require(v.get("aud").is_some_and(|a| {
+        a.as_str() == Some(class.aud.as_str()) || *a == serde_json::json!([class.aud.as_str()])
+    }))?;
     if let Some(azp) = v.get("azp") {
-        require(azp.as_str() == Some(CLIENT))?;
+        require(azp.as_str() == Some(class.client_id.as_str()))?;
     }
     text(v, "sub")?;
-    atproto_account_did(v)?;
+    atproto_account_did(v, &class.connector)?;
     text(v, "jti")?;
     let iat = number(v, "iat")?;
     let exp = number(v, "exp")?;
@@ -547,6 +695,15 @@ impl Source {
     #[allow(dead_code)] // Consumed by the B1b Policy adapter, not the disabled issuer.
     pub(crate) fn proof_public_keys(&self) -> (&[u8; 32], &[u8]) {
         (&self.commitment.ed, &self.commitment.pq)
+    }
+
+    /// The verified client class's exact `client_id`. This is authenticated
+    /// data: the verifier resolved the wire `client_id` to an accepted class
+    /// and the signed `aud`/`azp` claims were checked against that class
+    /// before this `Source` existed. Policy uses it as the per-client
+    /// grant/profile table selector (W1.2); it is never browser-chosen.
+    pub(crate) fn client_id(&self) -> &str {
+        self.commitment.client.client_id.as_str()
     }
 
     #[cfg(feature = "postgres")]
@@ -642,7 +799,7 @@ impl Source {
                 self.commitment.host.as_str().as_bytes(),
                 self.commitment.host.token_endpoint().as_bytes(),
                 ISSUER.as_bytes(),
-                CLIENT.as_bytes(),
+                self.commitment.client.client_id.as_bytes(),
                 WEBSITE.as_bytes(),
                 &id,
                 &self.token_hash,
@@ -750,6 +907,14 @@ impl Challenge {
 }
 
 impl VerifiedPossession {
+    /// The verified client class's exact `client_id` (authenticated data —
+    /// see [`Source::client_id`]). Used by the Policy adapter as the wire
+    /// client selector for the per-client grant/profile table (W1.2).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn client_id(&self) -> &str {
+        self.source.commitment.client.client_id.as_str()
+    }
+
     /// Consumed only by the authenticated Policy admission adapter. The
     /// verified keys/source are never reconstructed from the exchange form.
     #[cfg(feature = "postgres")]

@@ -50,7 +50,7 @@ use hyprstream_rpc_std::registry_client::RegistryClient;
 /// configured RDS binding would flip an RDS-bound node back to the local
 /// RocksDB backend while its AZ peers run Postgres. A missing config file is
 /// not an error (the loader treats it as optional); parse/IO failures are.
-fn load_config() -> anyhow::Result<HyprConfig> {
+pub(crate) fn load_config() -> anyhow::Result<HyprConfig> {
     HyprConfig::load().map_err(|e| anyhow::anyhow!("failed to load hyprstream configuration: {e}"))
 }
 
@@ -1267,8 +1267,37 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     ctx.signing_key(),
                     &required_services,
                 )?;
-            policy_service =
-                policy_service.with_federate_runtime(enrollment, collision_inventory, host);
+            // W1.2: the optional second (TUI) client class from the
+            // trusted-issuer config joins Policy's per-client grant/profile
+            // table. A configured-but-invalid class disables the TUI entry
+            // (fail closed) rather than widening the staging pin.
+            let federate_tui_client = config
+                .oauth
+                .trusted_issuers
+                .get(crate::services::oauth::federate_source::ISSUER)
+                .and_then(|issuer| issuer.federate_tui_client.as_ref())
+                .and_then(|class| {
+                    match crate::services::oauth::federate_source::ClientClass::new(
+                        &class.client_id,
+                        &class.aud,
+                        class.connector_id.as_deref(),
+                    ) {
+                        Ok(class) => Some(class.client_id().to_owned()),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "Federate TUI client class disabled: invalid trusted-issuer configuration"
+                            );
+                            None
+                        }
+                    }
+                });
+            policy_service = policy_service.with_federate_runtime(
+                enrollment,
+                collision_inventory,
+                host,
+                federate_tui_client.as_deref(),
+            );
             info!("Federate stateless Policy and request-use authorities installed");
         } else {
             tracing::warn!("Federate Policy runtime disabled: service enrollment or canonical HTTPS OAuth origin is unavailable");
@@ -3004,6 +3033,32 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         tui_service = tui_service.with_expected_audience(issuer.to_owned());
     }
     tui_service = tui_service.with_jwt_key_source(ctx.cluster_key_source());
+
+    // W1.3: the configured Federate TUI client class for the consumer gate.
+    // A configured-but-invalid class leaves the gate fail-closed (never
+    // widening), mirroring the oauth/policy factory wiring.
+    let federate_tui_client = config
+        .oauth
+        .trusted_issuers
+        .get(crate::services::oauth::federate_source::ISSUER)
+        .and_then(|issuer| issuer.federate_tui_client.as_ref())
+        .and_then(|class| {
+            match crate::services::oauth::federate_source::ClientClass::new(
+                &class.client_id,
+                &class.aud,
+                class.connector_id.as_deref(),
+            ) {
+                Ok(class) => Some(class.client_id().to_owned()),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Federate TUI consumer gate disabled: invalid trusted-issuer configuration"
+                    );
+                    None
+                }
+            }
+        });
+    tui_service = tui_service.with_federate_tui_client(federate_tui_client);
 
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }

@@ -1127,6 +1127,35 @@ pub struct TrustedIssuerConfig {
     /// Only use for internal networks or local development. Never enable in production.
     #[serde(default)]
     pub allow_http: bool,
+    /// Additional accepted Federate client class beside the hardcoded staging
+    /// www pin (the TUI harness). Issuer-scoped: only consulted when this
+    /// entry's key is the Federate issuer origin (`https://login.federate.to`).
+    /// Absent = current behavior: the hardcoded staging client is the only
+    /// accepted class (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federate_tui_client: Option<FederateClientClassConfig>,
+}
+
+/// A second accepted Federate client class (W1: the client-side TUI harness).
+///
+/// Carries the same source-verification invariants as the hardcoded staging
+/// www pin; it only selects the pinned `client_id`/`aud` and the Dex
+/// connector pin. The `client_id` MUST NOT equal the reserved staging client
+/// (`cyberdione-www-staging`) so the reserved-credential predicate — which
+/// matches that exact `(iss, client_id)` pair — can never fire for this
+/// class. This states predicate-level reservation behavior only; the output
+/// credential profile and dispatch are owned by W1.3/W1.4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederateClientClassConfig {
+    /// OAuth `client_id` of the public client registered at the issuer.
+    pub client_id: String,
+    /// Expected `aud` (single string or single-element array) of the source
+    /// ID token for this class. Usually equal to `client_id` for a public
+    /// OIDC client; `azp` must always equal `client_id`.
+    pub aud: String,
+    /// Pinned Dex `connector_id` for this class. Defaults to `atproto`.
+    #[serde(default)]
+    pub connector_id: Option<String>,
 }
 
 fn default_jwks_cache_ttl() -> u64 {

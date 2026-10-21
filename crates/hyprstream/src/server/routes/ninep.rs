@@ -841,6 +841,7 @@ mod tests {
                 jwks_uri: Some(format!("{federation_issuer}/jwks")),
                 jwks_cache_ttl_secs: 300,
                 allow_http: false,
+                federate_tui_client: None,
             },
         );
         let federation_fetcher = Arc::new(

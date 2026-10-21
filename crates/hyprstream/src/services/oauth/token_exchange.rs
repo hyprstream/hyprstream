@@ -657,12 +657,35 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
     })
 }
 
+/// The Federate TUI class is never a generic exchange subject (W1.3): the
+/// generic IssueToken path drops the class markers and the session binding
+/// and substitutes the request's client_id, laundering the class away. Deny
+/// the class by marker set OR the deployment's class pin at the local
+/// issuer.
+fn reject_federate_tui_exchange_subject(
+    claims: &hyprstream_rpc::auth::Claims,
+    local_issuer: &str,
+) -> Result<(), String> {
+    if claims.is_federate_tui_class(&[local_issuer]) {
+        return Err("federate TUI credentials are not exchangeable".to_owned());
+    }
+    Ok(())
+}
+
 /// Verify an existing hyprstream at+jwt through the same algorithm, audience,
 /// issuer, and revocation checks used by protected OAuth routes.
 async fn verify_access_token(state: &OAuthState, token: &str) -> Result<VerifiedSubject, String> {
     let claims = super::auth::validate_oauth_access_token(state, token)
         .await
         .map_err(|e| format!("access_token verification failed: {e}"))?;
+
+    // The Federate TUI class is never a generic exchange subject (W1.3): the
+    // generic IssueToken path drops the class markers and the session
+    // binding and substitutes the request's client_id, which would launder
+    // the credential's class away. Deny the class here — by marker set or
+    // the deployment's class pin — so its only exchange surface remains the
+    // dedicated federate rail.
+    reject_federate_tui_exchange_subject(&claims, &state.issuer_url)?;
 
     let granted_scopes = claims
         .scope
@@ -2001,6 +2024,35 @@ mod tests {
             &URL_SAFE_NO_PAD.encode(k256_signature.to_bytes()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn federate_tui_class_is_never_a_generic_exchange_subject() {
+        let issuer = "https://cell.test";
+        // Marker path: any TUI marker classifies, regardless of the global
+        // reservation.
+        let mut claims = hyprstream_rpc::auth::Claims::new("did:plc:abc".into(), 1, 2);
+        claims.iss = issuer.into();
+        claims.client_id = Some("anything".into());
+        assert!(reject_federate_tui_exchange_subject(&claims, issuer).is_ok());
+        claims.hs_tui_profile = Some("federate-tui-v1".into());
+        assert!(reject_federate_tui_exchange_subject(&claims, issuer).is_err());
+
+        // Pin path: the deployment reservation classifies by
+        // (local iss, configured client id) even with markers stripped.
+        // The reservation is process-global and install-once; no other test
+        // in this process installs it, and no other test uses this client id.
+        if hyprstream_rpc::auth::federate_tui_class_client().is_none() {
+            hyprstream_rpc::auth::install_federate_tui_class_client(Some("hyprstream-tui-staging"))
+                .expect("install class reservation");
+        }
+        let mut pinned = hyprstream_rpc::auth::Claims::new("did:plc:abc".into(), 1, 2);
+        pinned.iss = issuer.into();
+        pinned.client_id = Some("hyprstream-tui-staging".into());
+        assert!(reject_federate_tui_exchange_subject(&pinned, issuer).is_err());
+        // A foreign issuer with the reserved client id is NOT classified.
+        pinned.iss = "https://other.example".into();
+        assert!(reject_federate_tui_exchange_subject(&pinned, issuer).is_ok());
     }
 
     #[test]

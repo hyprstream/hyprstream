@@ -280,6 +280,7 @@ impl PolicyService {
         enrollment: Arc<crate::auth::service_enrollment::ServiceEnrollmentManifest>,
         collision_inventory: hyprstream_session_store::primary::CollisionInventory,
         host: crate::services::oauth::federate_source::FederateHost,
+        tui_client: Option<&str>,
     ) -> Self {
         let admission = Arc::new(federate_admission::AdmissionService::configured(
             Arc::clone(&self.policy_manager),
@@ -287,6 +288,7 @@ impl PolicyService {
             collision_inventory,
             None,
             host,
+            tui_client,
         ));
         self.federate_request_use = Some(federate_admission::RequestUseReader::new(
             Arc::clone(&admission),
@@ -1295,9 +1297,14 @@ impl PolicyHandler for PolicyService {
         #[cfg(feature = "postgres")]
         if let Some(reader) = &self.federate_admission {
             let result = async {
+                anyhow::ensure!(
+                    !data.client.is_empty() && data.client.len() <= 256,
+                    "invalid Federate client selector"
+                );
                 let prepared = reader
                     .prepare_rpc(
                         ctx,
+                        &data.client,
                         federate_verified_source(&data.source)?,
                         data.requested.clone(),
                         data.challenge_id.as_slice().try_into()?,
@@ -1340,10 +1347,15 @@ impl PolicyHandler for PolicyService {
         #[cfg(feature = "postgres")]
         if let Some(reader) = &self.federate_admission {
             let result = async {
+                anyhow::ensure!(
+                    !data.client.is_empty() && data.client.len() <= 256,
+                    "invalid Federate client selector"
+                );
                 reader
                     .commit_rpc(
                         ctx,
                         data.policy_handle.as_slice().try_into()?,
+                        &data.client,
                         federate_verified_source(&data.source)?,
                         data.challenge_id.as_slice().try_into()?,
                         data.challenge_created_at,
@@ -4833,6 +4845,7 @@ mod tests {
             challenge_created_at: 1,
             ed_public: vec![1; 32],
             pq_public: vec![2; 1952],
+            client: "unconfigured-client".into(),
         };
         assert!(matches!(
             service.handle_prepare_federate_session(&ctx, 1, &prepare).await,
@@ -4846,6 +4859,7 @@ mod tests {
             challenge_expires_at: 2,
             ed_public: vec![1; 32],
             pq_public: vec![2; 1952],
+            client: "unconfigured-client".into(),
         };
         assert!(matches!(
             service.handle_commit_federate_session(&ctx, 1, &commit).await,

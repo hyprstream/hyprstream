@@ -1237,8 +1237,33 @@ impl Spawnable for OAuthService {
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
                         format!("FederateSigner construction failed: {e:#}"),
                     ))?;
+                // W1.3: the optional second (TUI) client class from the
+                // trusted-issuer config joins the issuer's accepted classes.
+                // A configured-but-invalid class disables it (fail closed)
+                // rather than widening the staging pin.
+                let federate_tui_client = self
+                    .config
+                    .trusted_issuers
+                    .get(federate_source::ISSUER)
+                    .and_then(|issuer| issuer.federate_tui_client.as_ref())
+                    .and_then(|class| {
+                        match federate_source::ClientClass::new(
+                            &class.client_id,
+                            &class.aud,
+                            class.connector_id.as_deref(),
+                        ) {
+                            Ok(class) => Some(class),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "Federate TUI client class disabled: invalid trusted-issuer configuration"
+                                );
+                                None
+                            }
+                        }
+                    });
                 oauth_state
-                    .install_federate_issuer(admission, signer)
+                    .install_federate_issuer(admission, signer, federate_tui_client)
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
                         format!("FederateIssuer installation failed: {e:#}"),
                     ))?;
