@@ -109,6 +109,25 @@ class ReceiptProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "runtime libraries cannot be resolved"):
             self.run_validator()
 
+    def test_resolved_runtime_manifest_rejects_each_changed_library(self):
+        for name in ("libtorch_cpu.so", "libc10.so", "libgomp.so.1"):
+            with self.subTest(name=name):
+                library = self.ldd_paths[name]
+                original = library.read_bytes()
+                cpu_hash = self.build["cpu_libraries_sha256"].get(name)
+                try:
+                    library.write_bytes(original + b" changed after build")
+                    # Let the separate LIBTORCH-directory check pass so this
+                    # assertion exercises the exact ldd-resolved build snapshot.
+                    if cpu_hash is not None:
+                        self.build["cpu_libraries_sha256"][name] = VALIDATOR.sha(library)
+                    with self.assertRaisesRegex(ValueError, "runtime library path or contents changed"):
+                        self.run_validator()
+                finally:
+                    library.write_bytes(original)
+                    if cpu_hash is not None:
+                        self.build["cpu_libraries_sha256"][name] = cpu_hash
+
     def test_loader_switch_to_different_library_is_rejected(self):
         replacement = self.root / "alternate-libgomp.so.1"
         replacement.write_bytes(self.ldd_paths["libgomp.so.1"].read_bytes())
