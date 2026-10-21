@@ -1096,6 +1096,7 @@ impl TuiService {
                         let rmd = registry_models_dir.clone();
                         r.worktrees
                             .into_iter()
+                            .filter(|wt| wt.unavailable_reason.is_empty())
                             .map(|wt| {
                                 let branch = if wt.branch_name.is_empty() {
                                     "main".to_owned()
@@ -1537,6 +1538,7 @@ impl TuiService {
                                             let rmd = rmd.clone();
                                             r.worktrees
                                                 .into_iter()
+                                                .filter(|wt| wt.unavailable_reason.is_empty())
                                                 .map(|wt| {
                                                     let branch = if wt.branch_name.is_empty() {
                                                         "main".to_owned()

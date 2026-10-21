@@ -1938,6 +1938,7 @@ async fn fetch_models(signing_key: &SigningKey, models_dir: &std::path::Path) ->
                 let rmd = registry_models_dir.clone();
                 r.worktrees
                     .into_iter()
+                    .filter(|wt| wt.unavailable_reason.is_empty())
                     .map(move |wt| {
                         let branch = if wt.branch_name.is_empty() {
                             "main".to_owned()

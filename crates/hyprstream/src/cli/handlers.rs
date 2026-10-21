@@ -297,7 +297,11 @@ pub async fn handle_write_checkpoint(
         None => repo_client.get_head().await?,
     };
     let worktrees = repo_client.list_worktrees().await?;
-    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+    if !worktrees.iter().any(|wt| {
+        wt.unavailable_reason.is_empty()
+            && wt.unavailable_reason.is_empty()
+            && wt.branch_name == branch_name
+    }) {
         return Err(format!(
             "worktree for {}:{} not found",
             model_ref.name(),

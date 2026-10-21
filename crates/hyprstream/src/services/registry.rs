@@ -1258,20 +1258,34 @@ impl RegistryService {
         let archetype_registry = crate::archetypes::global_registry();
         let mut result = Vec::with_capacity(worktrees.len());
         for wt in &mut worktrees {
-            // Extract branch name from worktree path (last component)
-            let branch_name = wt
+            // Use WorktreeHandle::status() as the source of truth for branch,
+            // HEAD, and dirty state. Path basenames lose hierarchical branch names.
+            let storage_key = wt
                 .path()
                 .file_name()
-                .and_then(|s| s.to_str())
-                .map(std::borrow::ToOwned::to_owned)
-                .unwrap_or_default();
-
-            // Use WorktreeHandle::status() - single source of truth for dirty status
-            let status = wt.status().await.ok();
-            let is_dirty = status.as_ref().map(|s| !s.is_clean).unwrap_or(false);
-            let head_oid = status
-                .and_then(|s| s.head.map(|h| h.to_string()))
-                .unwrap_or_default();
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            anyhow::ensure!(
+                !storage_key.is_empty(),
+                "registered worktree has no storage identity"
+            );
+            let (branch_name, is_detached, is_dirty, head_oid, unavailable_reason) = match wt
+                .status()
+                .await
+            {
+                Ok(status) => (
+                    status.branch.clone().unwrap_or_else(|| storage_key.clone()),
+                    status.branch.is_none(),
+                    !status.is_clean,
+                    status.head.map(|h| h.to_string()).unwrap_or_default(),
+                    String::new(),
+                ),
+                Err(error) => {
+                    tracing::warn!(path = %wt.path().display(), %error, "worktree status unavailable");
+                    (storage_key, true, false, String::new(), error.to_string())
+                }
+            };
 
             // Detect capabilities from worktree path (server-side, same machine as files)
             let capabilities: Vec<String> = archetype_registry
@@ -1290,6 +1304,8 @@ impl RegistryService {
                 is_locked: false,
                 is_dirty,
                 capabilities,
+                is_detached,
+                unavailable_reason,
             });
         }
         Ok(result)
@@ -1717,16 +1733,28 @@ impl RegistryService {
         let handle = registry
             .repo(&id)
             .map_err(|e| FsError::NotFound(e.to_string()))?;
-        let worktrees = handle
+        let mut worktrees = handle
             .get_worktrees()
             .await
             .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
-        // Find the worktree matching the requested name
+        // Match the same canonical identity exposed by list_worktrees:
+        // symbolic worktrees use status.branch; detached worktrees use the
+        // stable storage key. Never compare only a path basename for branches.
         let mut worktree_path = None;
-        for wt in &worktrees {
-            let wt_name = wt.path().file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if wt_name == worktree {
+        for wt in &mut worktrees {
+            let status = wt
+                .status()
+                .await
+                .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
+            let identity = status.branch.clone().unwrap_or_else(|| {
+                wt.path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned()
+            });
+            if identity == worktree {
                 worktree_path = Some(wt.path().to_path_buf());
                 break;
             }

@@ -445,11 +445,13 @@ struct RemoveWorktreeRequest {
 
 struct WorktreeInfo {
   pathRemoved @0 :Void;  # was: path — use branchName with 9P worktree tools
-  branchName @1 :Text;
+  branchName @1 :Text;  # branch identity; detached worktrees use their stable path key
   headOid @2 :Text;
   isLocked @3 :Bool;
   isDirty @4 :Bool;
-  capabilities @5 :List(Text);  # archetype-detected capabilities (e.g. "infer", "train")
+  capabilities @5 :List(Text);
+  isDetached @6 :Bool;
+  unavailableReason @7 :Text;  # non-empty when status inspection failed
 }
 
 # Branch Request (repoId removed — curried)

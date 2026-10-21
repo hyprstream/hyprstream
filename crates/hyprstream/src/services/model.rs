@@ -528,6 +528,11 @@ pub struct ModelServiceInner {
     #[cfg(test)]
     test_decision_control:
         parking_lot::Mutex<Option<Arc<super::clef_acceptance_control::TestDecisionControl>>>,
+    /// Test-only gate immediately before native worker startup. It is used by
+    /// the ingress deadline regression to make the shared cold-load job
+    /// observable without changing production behavior.
+    #[cfg(test)]
+    test_cold_load_gate: parking_lot::Mutex<Option<Arc<tokio::sync::watch::Sender<bool>>>>,
     /// Test-only ordering witness: successful unload clears admission before
     /// making its `model.unloaded` event visible.
     #[cfg(test)]
@@ -810,6 +815,32 @@ where
     )
 }
 
+/// Select a worktree only when the registry reports one unambiguous branch at
+/// the requested commit. Equal OIDs on multiple branches are valid Git state,
+/// but are intentionally rejected here: a pinned model ref has no branch
+/// identity, and silently choosing one would make the storage path ambiguous.
+fn select_unique_worktree_for_head(
+    worktrees: &[hyprstream_rpc_std::registry_client::WorktreeInfo],
+    head_oid: &str,
+) -> Result<String> {
+    let matches: Vec<_> = worktrees
+        .iter()
+        .filter(|worktree| worktree.unavailable_reason.is_empty() && worktree.head_oid == head_oid)
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "commit {} must select exactly one registered worktree (found {}: {})",
+        head_oid,
+        matches.len(),
+        matches
+            .iter()
+            .map(|worktree| worktree.branch_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(matches[0].branch_name.clone())
+}
+
 impl ModelService {
     /// Create a new model service with infrastructure
     pub async fn new(
@@ -867,6 +898,8 @@ impl ModelService {
                 #[cfg(test)]
                 test_decision_control: parking_lot::Mutex::new(None),
                 #[cfg(test)]
+                test_cold_load_gate: parking_lot::Mutex::new(None),
+                #[cfg(test)]
                 before_unloaded_event: Mutex::new(None),
             }),
         })
@@ -887,6 +920,11 @@ impl ModelService {
     #[cfg(test)]
     async fn take_test_work_order(&self) -> Option<Zeroizing<String>> {
         self.test_work_order_capture.lock().await.take()
+    }
+
+    #[cfg(test)]
+    fn set_test_cold_load_gate(&self, gate: Option<Arc<tokio::sync::watch::Sender<bool>>>) {
+        *self.test_cold_load_gate.lock() = gate;
     }
 
     /// Set the expected JWT audience for token validation.
@@ -1059,9 +1097,11 @@ impl ModelService {
             _ => anyhow::bail!("staging modelRef must select its configured local branch"),
         };
         anyhow::ensure!(
-            worktrees
-                .iter()
-                .any(|worktree| worktree.branch_name == branch.as_str()),
+            worktrees.iter().any(|worktree| {
+                worktree.unavailable_reason.is_empty()
+                    && !worktree.is_detached
+                    && worktree.branch_name == branch.as_str()
+            }),
             "staging worktree for {}:{} not found",
             model_ref.name(),
             branch
@@ -1501,6 +1541,19 @@ impl ModelService {
         kv_quant: Option<KVQuantType>,
     ) -> Result<String> {
         let model_ref_str = instance.model_ref();
+        #[cfg(test)]
+        {
+            let gate = { self.test_cold_load_gate.lock().clone() };
+            if let Some(gate) = gate {
+                let mut released = gate.subscribe();
+                while !*released.borrow() {
+                    released
+                        .changed()
+                        .await
+                        .map_err(|_| anyhow!("test cold-load gate closed"))?;
+                }
+            }
+        }
         self.validate_model_load_ref(model_ref_str)?;
         // Parse/resolve model reference
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
@@ -1517,32 +1570,56 @@ impl ModelService {
         crate::services::restart_diag::phase("registry.get_by_name.done");
         let repo_client = self.registry.repo(&tracked.id);
 
-        let branch_name = match &model_ref.git_ref {
-            crate::storage::GitRef::Branch(name) => name.clone(),
-            crate::storage::GitRef::Commit(_) => repo_client
-                .get_head()
-                .await
-                .context("resolve selected worktree branch for pinned commit")?,
-            crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
-                anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
-            }
-            crate::storage::GitRef::DefaultBranch => repo_client
-                .get_head()
-                .await
-                .unwrap_or_else(|_| "main".to_owned()),
-        };
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.enter");
         let worktrees = repo_client.list_worktrees().await?;
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.done");
-        if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-            return Err(anyhow!(
-                "worktree for {}:{} not found",
-                model_ref.name(),
-                branch_name
-            ));
-        }
+        let branch_name = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => {
+                anyhow::ensure!(
+                    worktrees
+                        .iter()
+                        .any(|worktree| worktree.unavailable_reason.is_empty()
+                            && !worktree.is_detached
+                            && worktree.branch_name == *name),
+                    "branch worktree for {}:{} not found",
+                    model_ref.name(),
+                    name
+                );
+                name.clone()
+            }
+            crate::storage::GitRef::Commit(commit) => {
+                select_unique_worktree_for_head(&worktrees, &commit.to_string())?
+            }
+            crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
+                anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
+            }
+            crate::storage::GitRef::DefaultBranch => {
+                let branch = if tracked.tracking_ref.is_empty() {
+                    "main".to_owned()
+                } else {
+                    tracked.tracking_ref.clone()
+                };
+                anyhow::ensure!(
+                    worktrees.iter().any(|worktree| {
+                        worktree.unavailable_reason.is_empty()
+                            && !worktree.is_detached
+                            && worktree.branch_name == branch
+                    }),
+                    "default worktree for {}:{} not found",
+                    model_ref.name(),
+                    branch
+                );
+                branch
+            }
+        };
+        anyhow::ensure!(
+            worktrees.iter().any(|wt| wt.branch_name == branch_name),
+            "worktree for {}:{} not found",
+            model_ref.name(),
+            branch_name
+        );
         // Derive worktree path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
         let model_path = storage_paths.worktree_path(model_ref.name(), &branch_name)?;
@@ -3818,6 +3895,52 @@ impl crate::services::RequestService for ModelService {
 
 #[cfg(test)]
 mod tests {
+    fn worktree(branch: &str, oid: &str) -> hyprstream_rpc_std::registry_client::WorktreeInfo {
+        hyprstream_rpc_std::registry_client::WorktreeInfo {
+            path_removed: (),
+            branch_name: branch.to_owned(),
+            head_oid: oid.to_owned(),
+            is_locked: false,
+            is_dirty: false,
+            capabilities: Vec::new(),
+            is_detached: false,
+            unavailable_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn commit_ref_selects_registered_worktree_by_fresh_head_oid() -> anyhow::Result<()> {
+        let worktrees = vec![worktree("main", "abc"), worktree("feature/clef", "def")];
+        assert_eq!(
+            super::select_unique_worktree_for_head(&worktrees, "def")?,
+            "feature/clef"
+        );
+        assert!(super::select_unique_worktree_for_head(&worktrees, "missing").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn commit_ref_skips_unavailable_worktree_entries() -> anyhow::Result<()> {
+        let mut unavailable = worktree("broken", "abc");
+        unavailable.unavailable_reason = "status unavailable".to_owned();
+        let worktrees = vec![unavailable, worktree("healthy", "abc")];
+        assert_eq!(
+            super::select_unique_worktree_for_head(&worktrees, "abc")?,
+            "healthy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_ref_rejects_ambiguous_worktree_heads() {
+        let worktrees = vec![worktree("main", "abc"), worktree("copy", "abc")];
+        let result = super::select_unique_worktree_for_head(&worktrees, "abc");
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .is_some_and(|error| error.to_string().contains("exactly one")));
+    }
+
     #[test]
     fn clef_projection_contract_keeps_a0_default_and_rejects_rebinding() -> anyhow::Result<()> {
         let a0 = super::StagingModelPin::reviewed()?;
@@ -7130,6 +7253,109 @@ mod tests {
                 event.record(&mut RestartAudienceDenialVisitor { seen: &self.seen });
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the sealed local CPU-model repository and isolated XDG guest fixture"]
+    async fn decide_ingress_deadline_does_not_cancel_service_owned_cold_load() -> Result<()> {
+        crate::services::restart_diag::enable();
+        let fixture = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            RestartAcceptanceFixture::from_guest_env(),
+        )
+        .await
+        .map_err(|_| anyhow!("cold-load fixture timed out"))??;
+        let (gate_tx, _gate_rx) = tokio::sync::watch::channel(false);
+        let gate = Arc::new(gate_tx);
+        fixture
+            .model
+            .set_test_cold_load_gate(Some(Arc::clone(&gate)));
+        let caller_key = SigningKey::from_bytes(&[0xC1; 32]);
+        let ctx = restart_acceptance_caller_ctx(
+            "cold-load-caller",
+            &caller_key,
+            "restart-acceptance-tenant",
+        );
+        let pinned_ref = format!(
+            "clef-flash-fp8:{}",
+            "7b43c2d799e7b5e9fef96b6137840088d75af0d6"
+        );
+        let pinned_instance =
+            InferenceInstanceId::new("restart-acceptance-tenant", &pinned_ref, 0)?;
+        let mut request = wire_decide_request(&format!(
+            r#"{{"model":"{}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#,
+            pinned_ref
+        ));
+        request.timeout_ms = Some(100);
+        let first_future = fixture.model.handle_decide(&ctx, 0, &pinned_ref, &request);
+        tokio::pin!(first_future);
+        let pending_wait = async {
+            loop {
+                if fixture
+                    .model
+                    .pending_loads
+                    .lock()
+                    .contains_key(&pinned_instance)
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut first_future => {
+                    anyhow::bail!("ingress caller returned before admitting cold load: {result:?}");
+                }
+                _ = pending_wait => Ok(()),
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("ingress caller never admitted a pending cold load"))??;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), &mut first_future)
+            .await
+            .map_err(|_| anyhow!("first ingress caller did not expire"))?;
+        let first_error = match first {
+            Ok(_) => anyhow::bail!("cold-load caller completed while the owned load was gated"),
+            Err(error) => error,
+        };
+        let first_text = first_error.to_string();
+        assert!(
+            first_text.contains("clef-decision-cancelled"),
+            "deadline ingress error must be typed cancellation: {first_text}"
+        );
+        assert!(
+            fixture
+                .model
+                .pending_loads
+                .lock()
+                .contains_key(&pinned_instance),
+            "caller deadline must not cancel the service-owned load reservation"
+        );
+        gate.send(true)
+            .map_err(|_| anyhow!("cold-load gate receiver disappeared"))?;
+        fixture.model.set_test_cold_load_gate(None);
+        let mut second_request = request.clone();
+        second_request.timeout_ms = Some(30_000);
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            fixture
+                .model
+                .handle_decide(&ctx, 0, &pinned_ref, &second_request),
+        )
+        .await
+        .map_err(|_| anyhow!("second ingress caller did not complete"))??;
+        let _ = second.batch;
+        assert!(
+            fixture
+                .model
+                .loaded_models
+                .read()
+                .await
+                .contains(&pinned_instance),
+            "released shared cold load must publish the loaded model"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
