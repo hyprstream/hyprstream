@@ -317,13 +317,14 @@ static FEDERATE_TUI_CLASS_CLIENT: std::sync::OnceLock<Option<String>> = std::syn
 /// re-install is an error (the class is an authority pin, never reseated).
 pub fn install_federate_tui_class_client(client_id: Option<&str>) -> anyhow::Result<()> {
     let value = client_id.map(str::to_owned);
-    match FEDERATE_TUI_CLASS_CLIENT.get() {
-        Some(existing) if *existing == value => Ok(()),
-        Some(_) => anyhow::bail!("federate TUI class client already installed with a different id"),
-        None => FEDERATE_TUI_CLASS_CLIENT
-            .set(value)
-            .map_err(|_| anyhow::anyhow!("federate TUI class client install raced")),
-    }
+    // get_or_init is race-safe; a conflicting re-install is still an error
+    // (the class is an authority pin, never reseated).
+    let existing = FEDERATE_TUI_CLASS_CLIENT.get_or_init(|| value.clone());
+    anyhow::ensure!(
+        *existing == value,
+        "federate TUI class client already installed with a different id"
+    );
+    Ok(())
 }
 
 /// The configured TUI class client id, or `None` when the class is
