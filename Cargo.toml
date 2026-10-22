@@ -152,9 +152,10 @@ urlencoding = "2.1"
 # QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
 quinn = { version = "0.11", features = ["rustls-ring", "futures-io"] }
 rcgen = "0.13"
-h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-h3-quinn = { version = "0.0.10", features = ["datagram"] }
-h3-webtransport = "0.1.2"
+# h3 / h3-quinn / h3-webtransport removed 2026-10-21: replaced by
+# web_transport_quinn in #274, zero source references since, and h3 0.0.8
+# ships an unlimited default max_field_section_size (header accordion CVE
+# class). Dead vulnerable deps stay out of the lockfile.
 http = "1"
 
 # Iroh + Media-over-QUIC (Epic #131 — Phase 1 substrate)
@@ -284,6 +285,20 @@ criterion = "0.5.1"
 # (not a branch) keeps the build reproducible even if main advances further. Drop
 # this patch entirely once a moq-net release containing #2085 is published.
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "07f558fea819c9b4c9a68617383146449f5edc87" }
+# h3 QPACK decoded-header budget hardening (CVE class: header accordions /
+# >32768-entry HeaderMap panic + unbounded decoded amplification).
+# web-transport-proto 0.6.0 — the mini-QPACK every hyprstream WebTransport
+# server site (web-transport-quinn 0.11.9, incl. web-transport-iroh) decodes
+# CONNECT headers with — had NO decoded-size or field-count cap: a 64 KiB
+# wire frame could decode unbounded header data and >32768 unique names
+# panic http::HeaderMap::append. The vendored copy enforces RFC 9114 4.2.2
+# accounting (name + value bytes + 32B overhead per field, 256 KiB / 4096
+# fields) incrementally during decode, rejecting cleanly at the first
+# violation. Source is the pristine crates.io 0.6.0 release (sha256
+# 0225d295c8ac00a2e9a498aefeaf3f3c6186da12a251c938189b15b82ea22808) plus the
+# budget patch; provenance in the h3-qpack-hardening checkpoint. Drop this
+# entry when an upstream release carries equivalent limits.
+web-transport-proto = { path = "third_party/web-transport-proto" }
 
 # Build dependencies
 [workspace.dependencies.cc]
