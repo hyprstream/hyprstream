@@ -333,6 +333,154 @@ mod server_codegen_smoke {
     }
 }
 
+/// Regression tests for the Codex deadline findings on PR #1767: a generated
+/// portable client's `request()` must carry the client-configured deadline
+/// (and its auth fields) into `CallOptions` instead of silently dropping the
+/// deadline. Native-only like the rest of the crate's lib unit tests: the
+/// wasm32 lib test unit is not compilable (see wasm_browser_fetch.rs).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod generated_client_deadline_tests {
+    use std::sync::Arc;
+
+    use hyprstream_rpc::{CallOptions, RpcClient};
+
+    /// Captures the options each request arrives with; every other entry
+    /// point fails closed so the test only observes option propagation.
+    #[derive(Default)]
+    struct OptionsCapturingClient {
+        seen: parking_lot::Mutex<Vec<CallOptions>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcClient for OptionsCapturingClient {
+        async fn call(&self, _payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected unbound call")
+        }
+        async fn call_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected service call")
+        }
+        async fn call_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected method-bound call")
+        }
+        async fn call_with_options(
+            &self,
+            _payload: Vec<u8>,
+            _options: CallOptions,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected optionless-target call")
+        }
+        async fn call_with_options_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            options: CallOptions,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.seen.lock().push(options);
+            Ok(Vec::new())
+        }
+        async fn call_streaming(
+            &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected streaming call")
+        }
+        async fn call_streaming_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected service streaming call")
+        }
+        async fn call_streaming_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected method-bound streaming call")
+        }
+        async fn open_stream(
+            &self,
+            _payload: Vec<u8>,
+        ) -> anyhow::Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("unexpected open_stream")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _stream_info: hyprstream_rpc::stream_info::StreamInfo,
+            _client_secret: [u8; 32],
+            _client_pubkey: [u8; 32],
+        ) -> anyhow::Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("unexpected open_stream_from_info")
+        }
+        fn next_id(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_request_propagates_the_client_deadline_and_keeps_auth_empty(
+    ) -> anyhow::Result<()> {
+        let client = Arc::new(OptionsCapturingClient::default());
+        let policy = crate::policy_client::PolicyClient::new(client.clone()).with_timeout_ms(4_321);
+        policy.request().call(b"payload".to_vec()).await?;
+        let seen = client.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].timeout_ms,
+            Some(4_321),
+            "with_timeout_ms must survive request() into the CallOptions"
+        );
+        assert_eq!(seen[0].jwt, None);
+        assert_eq!(seen[0].delegated_bearer, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generated_request_still_propagates_auth_fields_alongside_the_deadline(
+    ) -> anyhow::Result<()> {
+        let client = Arc::new(OptionsCapturingClient::default());
+        let policy = crate::policy_client::PolicyClient::new(client.clone())
+            .with_bearer("direct-jwt".to_owned())
+            .with_timeout_ms(250);
+        policy.request().call(b"payload".to_vec()).await?;
+        let seen = client.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].jwt.as_deref(), Some("direct-jwt"));
+        assert_eq!(seen[0].delegated_bearer, None);
+        assert_eq!(seen[0].timeout_ms, Some(250));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generated_request_propagates_delegated_bearer_with_the_deadline() -> anyhow::Result<()>
+    {
+        let client = Arc::new(OptionsCapturingClient::default());
+        let policy = crate::policy_client::PolicyClient::new(client.clone())
+            .with_delegated_bearer("delegated".to_owned())
+            .with_timeout_ms(900);
+        policy.request().call(b"payload".to_vec()).await?;
+        let seen = client.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].jwt, None);
+        assert_eq!(seen[0].delegated_bearer.as_deref(), Some("delegated"));
+        assert_eq!(seen[0].timeout_ms, Some(900));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod contract_compat_tests {
     /// Schema IDs are wire identities. Keeping these assertions next to the

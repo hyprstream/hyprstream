@@ -7645,6 +7645,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+ "web-async",
  "web-sys",
  "web-time",
  "web-transport-iroh",

@@ -1080,8 +1080,12 @@ pub fn generate_client(
                     Some(token) => builder.jwt(token.clone()),
                     None => builder,
                 };
-                match &self.call_options.delegated_bearer {
+                let builder = match &self.call_options.delegated_bearer {
                     Some(token) => builder.delegated_bearer(token.clone()),
+                    None => builder,
+                };
+                match self.call_options.timeout_ms {
+                    Some(timeout_ms) => builder.timeout_ms(timeout_ms),
                     None => builder,
                 }
             }
