@@ -31,6 +31,15 @@ use crate::decision_capnp;
 /// Errors decoding a `decision.capnp` message into the IR.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DecodeError {
+    /// Every batch must identify the resolved model that produced it.
+    #[error("empty resolved model id on the wire")]
+    EmptyModelId,
+    /// Every batch must identify its question-set schema version.
+    #[error("empty question-set schema version on the wire")]
+    EmptySchemaVersion,
+    /// A present calibration identifier must reference a nonempty version.
+    #[error("empty calibration version id")]
+    EmptyCalibrationVersion,
     /// capnp-level structural failure (truncated message, bad pointer).
     #[error("capnp decode failed: {0}")]
     Capnp(String),
@@ -55,6 +64,15 @@ pub enum DecodeError {
     /// An empty question id (authoring rejects these; the wire must too).
     #[error("empty question id on the wire")]
     EmptyQuestionId,
+    /// Repeated question ids cannot bind answers unambiguously.
+    #[error("duplicate question id {0} on the wire")]
+    DuplicateQuestionId(String),
+    /// Repeated answer ids must not overwrite an earlier answer.
+    #[error("duplicate answer question id {0} on the wire")]
+    DuplicateAnswerQuestionId(String),
+    /// Non-finite numbers cannot be represented by canonical JSON.
+    #[error("non-finite Entry::Number on the wire")]
+    NonFiniteEntryNumber,
     /// An empty choice option name (authoring rejects these).
     #[error("empty choice option name in question {0}")]
     EmptyChoiceOptionName(String),
@@ -96,7 +114,9 @@ pub enum DecodeError {
     /// An answer distribution whose cardinality cannot match any valid
     /// question spec (choice: 2-255 options per D2, score: >= 2 levels per
     /// D1) — malformed wire data must not enter the IR.
-    #[error("answer distribution of {len} components cannot match a {kind} question ({question_id})")]
+    #[error(
+        "answer distribution of {len} components cannot match a {kind} question ({question_id})"
+    )]
     AnswerCardinalityOutOfRange {
         /// The answer's question id.
         question_id: String,
@@ -121,6 +141,15 @@ pub enum DecodeError {
 /// Errors encoding IR into a `decision.capnp` message.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum EncodeError {
+    /// Empty model provenance cannot be persisted as a decision batch.
+    #[error("empty resolved model id cannot be encoded")]
+    EmptyModelId,
+    /// Empty schema provenance cannot be encoded as a decision batch.
+    #[error("empty question-set schema version cannot be encoded")]
+    EmptySchemaVersion,
+    /// A present calibration identifier must reference a nonempty version.
+    #[error("empty calibration version id")]
+    EmptyCalibrationVersion,
     /// An abstained answer carried a conformal set — the wire contract forbids
     /// it (abstention already says "no commitment") and this module's own
     /// decoder rejects such messages.
@@ -187,7 +216,9 @@ pub enum EncodeError {
     /// An answer distribution whose length cannot match any valid question
     /// spec (choice: 2-255 options per D2, score: >= 2 levels per D1) —
     /// the decoder rejects the same messages, so encode mirrors the rule.
-    #[error("answer distribution of {len} components cannot match a {kind} question ({question_id})")]
+    #[error(
+        "answer distribution of {len} components cannot match a {kind} question ({question_id})"
+    )]
     AnswerCardinalityOutOfRange {
         /// The answer's question id.
         question_id: String,
@@ -259,7 +290,12 @@ fn get_entry(reader: decision_capnp::entry::Reader<'_>) -> Result<Entry, DecodeE
     Ok(match reader.which()? {
         decision_capnp::entry::Null(()) => Entry::Null,
         decision_capnp::entry::Bool(value) => Entry::Bool(value),
-        decision_capnp::entry::Number(value) => Entry::Number(value),
+        decision_capnp::entry::Number(value) => {
+            if !value.is_finite() {
+                return Err(DecodeError::NonFiniteEntryNumber);
+            }
+            Entry::Number(value)
+        }
         decision_capnp::entry::Str(text) => Entry::Str(text?.to_str()?.to_owned()),
         decision_capnp::entry::Seq(items) => {
             let items = items?;
@@ -290,7 +326,9 @@ fn set_opt_entry(mut builder: decision_capnp::opt_entry::Builder<'_>, entry: Opt
     }
 }
 
-fn get_opt_entry(reader: decision_capnp::opt_entry::Reader<'_>) -> Result<Option<Entry>, DecodeError> {
+fn get_opt_entry(
+    reader: decision_capnp::opt_entry::Reader<'_>,
+) -> Result<Option<Entry>, DecodeError> {
     Ok(match reader.which()? {
         decision_capnp::opt_entry::None(()) => None,
         decision_capnp::opt_entry::Some(entry) => Some(get_entry(entry?)?),
@@ -319,7 +357,10 @@ fn set_noul_criteria(
     set_opt_entry(builder.init_on_false(), criteria.on_false.as_ref());
 }
 
-fn set_question_spec(builder: &mut decision_capnp::question_spec::Builder<'_>, spec: &QuestionSpec) {
+fn set_question_spec(
+    builder: &mut decision_capnp::question_spec::Builder<'_>,
+    spec: &QuestionSpec,
+) {
     builder.set_id(&spec.id);
     // The wire tag is derived from the body, never from the denormalized
     // `kind` field: a directly-constructed IR value could carry a conflicting
@@ -329,7 +370,10 @@ fn set_question_spec(builder: &mut decision_capnp::question_spec::Builder<'_>, s
         QuestionBody::Choice { .. } => QuestionKind::Choice,
         QuestionBody::Score { .. } => QuestionKind::Score,
     }));
-    set_opt_entry(builder.reborrow().init_instructions(), spec.instructions.as_ref());
+    set_opt_entry(
+        builder.reborrow().init_instructions(),
+        spec.instructions.as_ref(),
+    );
     match &spec.body {
         QuestionBody::Noul { criteria } => {
             let mut body = builder.reborrow().init_body();
@@ -410,7 +454,10 @@ fn get_question_spec(
                 if name.is_empty() {
                     return Err(DecodeError::EmptyChoiceOptionName(id));
                 }
-                if out.iter().any(|existing: &ChoiceOption| existing.name == name) {
+                if out
+                    .iter()
+                    .any(|existing: &ChoiceOption| existing.name == name)
+                {
                     return Err(DecodeError::DuplicateChoiceOptionName(id, name));
                 }
                 out.push(ChoiceOption {
@@ -474,11 +521,9 @@ fn validate_entry_finite(
         None => return Ok(()),
     };
     match entry {
-        Entry::Number(value) if !value.is_finite() => {
-            Err(EncodeError::NonFiniteEntryNumber {
-                question: question_id.map(str::to_owned),
-            })
-        }
+        Entry::Number(value) if !value.is_finite() => Err(EncodeError::NonFiniteEntryNumber {
+            question: question_id.map(str::to_owned),
+        }),
         Entry::Seq(items) => {
             for item in items {
                 validate_entry_finite(Some(item), question_id)?;
@@ -592,8 +637,13 @@ pub fn question_set_from_reader(
     let state = get_opt_entry(reader.get_state()?)?;
     let questions_reader = reader.get_questions()?;
     let mut questions = Vec::with_capacity(questions_reader.len() as usize);
+    let mut question_ids = std::collections::HashSet::new();
     for spec in questions_reader.iter() {
-        questions.push(get_question_spec(spec)?);
+        let spec = get_question_spec(spec)?;
+        if !question_ids.insert(spec.id.clone()) {
+            return Err(DecodeError::DuplicateQuestionId(spec.id));
+        }
+        questions.push(spec);
     }
     if questions.is_empty() {
         return Err(DecodeError::EmptyQuestionSet);
@@ -605,11 +655,15 @@ pub fn question_set_from_reader(
 // Answers
 // ============================================================================
 
-fn set_answer_value(mut builder: decision_capnp::answer_value::Builder<'_>, value: Option<&AnswerValue>) {
+fn set_answer_value(
+    mut builder: decision_capnp::answer_value::Builder<'_>,
+    value: Option<&AnswerValue>,
+) {
     match value {
         None => builder.set_abstained(()),
         Some(AnswerValue::Noul { p_true }) => builder.set_noul(*p_true),
-        Some(AnswerValue::Choice { probabilities }) | Some(AnswerValue::Score { probabilities }) => {
+        Some(AnswerValue::Choice { probabilities })
+        | Some(AnswerValue::Score { probabilities }) => {
             let mut list = if matches!(value, Some(AnswerValue::Choice { .. })) {
                 builder.init_choice(probabilities.len() as u32)
             } else {
@@ -653,6 +707,15 @@ pub fn batch_to_message(
     version: &VersionTriple,
     rows: &[AnswerRow],
 ) -> Result<capnp::message::Builder<capnp::message::HeapAllocator>, EncodeError> {
+    if version.model.is_empty() {
+        return Err(EncodeError::EmptyModelId);
+    }
+    if version.schema.is_empty() {
+        return Err(EncodeError::EmptySchemaVersion);
+    }
+    if version.calib.as_ref().is_some_and(String::is_empty) {
+        return Err(EncodeError::EmptyCalibrationVersion);
+    }
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<decision_capnp::decision_batch::Builder<'_>>();
     {
@@ -732,8 +795,9 @@ pub fn batch_to_message(
             match &answer.conformal_set {
                 None => answer_builder.init_conformal_set().set_none(()),
                 Some(set) => {
-                    let mut members =
-                        answer_builder.init_conformal_set().init_some(set.len() as u32);
+                    let mut members = answer_builder
+                        .init_conformal_set()
+                        .init_some(set.len() as u32);
                     for (member_index, member) in set.iter().enumerate() {
                         members.set(member_index as u32, member.as_str());
                     }
@@ -750,13 +814,25 @@ pub fn batch_from_reader(
     reader: decision_capnp::decision_batch::Reader<'_>,
 ) -> Result<(VersionTriple, Vec<AnswerRow>), DecodeError> {
     let triple = reader.get_version()?;
+    let model = triple.get_model()?.to_str()?;
+    if model.is_empty() {
+        return Err(DecodeError::EmptyModelId);
+    }
+    let schema = triple.get_schema()?.to_str()?;
+    if schema.is_empty() {
+        return Err(DecodeError::EmptySchemaVersion);
+    }
     let version = VersionTriple {
-        schema: triple.get_schema()?.to_str()?.to_owned(),
-        model: triple.get_model()?.to_str()?.to_owned(),
+        schema: schema.to_owned(),
+        model: model.to_owned(),
         calib: match triple.get_calib()?.which()? {
             crate::optional_capnp::option_text::None(()) => None,
             crate::optional_capnp::option_text::Some(calib) => {
-                Some(calib?.to_str()?.to_owned())
+                let calib = calib?.to_str()?;
+                if calib.is_empty() {
+                    return Err(DecodeError::EmptyCalibrationVersion);
+                }
+                Some(calib.to_owned())
             }
         },
     };
@@ -771,6 +847,9 @@ pub fn batch_from_reader(
             let question_id = answer.get_question_id()?.to_str()?.to_owned();
             if question_id.is_empty() {
                 return Err(DecodeError::EmptyAnswerQuestionId);
+            }
+            if answers.contains_key(&question_id) {
+                return Err(DecodeError::DuplicateAnswerQuestionId(question_id));
             }
             let conformal_set = match answer.get_conformal_set()?.which()? {
                 decision_capnp::opt_conformal_set::None(()) => None,
@@ -835,7 +914,13 @@ pub fn batch_from_reader(
                     return Err(DecodeError::ConformalLabelImpossible(question_id));
                 }
             }
-            answers.insert(question_id, QuestionAnswer { value, conformal_set });
+            answers.insert(
+                question_id,
+                QuestionAnswer {
+                    value,
+                    conformal_set,
+                },
+            );
         }
         rows.push(AnswerRow { answers });
     }

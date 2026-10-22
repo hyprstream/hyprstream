@@ -1217,6 +1217,7 @@ const T6_EXPECTED_JSON: &str = r###"{
 #[ignore = "Jensen-only authenticated full CPU checkpoint; isolated first-write verifier/XDG and resource admission required"]
 async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     use hyprstream_service::ServiceManager as _;
+    crate::services::restart_diag::enable();
     let started = Instant::now();
     // Refuse this 30 GiB development VM, before checkpoint admission.
     let memory = std::fs::read_to_string("/proc/meminfo")?;
@@ -1417,6 +1418,11 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
     );
     // Actual signed generated load uses the production continuation path;
     // do not hide the normal30s RPC timeout with a fixture-only transport.
+    t6_progress(
+        "load-request-before",
+        started.elapsed().as_millis(),
+        json!({}),
+    )?;
     alice
         .load(&hyprstream_rpc_std::model_client::LoadModelRequest {
             model_ref: T6_MODEL.to_owned(),
@@ -1424,6 +1430,11 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
             kv_quant: None,
         })
         .await?;
+    t6_progress(
+        "load-request-returned",
+        started.elapsed().as_millis(),
+        json!({}),
+    )?;
     let load_started = Instant::now();
     loop {
         let state = alice
@@ -1437,6 +1448,12 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         {
             break;
         }
+        anyhow::ensure!(
+            state
+                .iter()
+                .any(|s| s.status == "loading" && s.model_ref == T6_MODEL),
+            "signed model load disappeared before reaching loaded state: {state:?}"
+        );
         anyhow::ensure!(
             load_started.elapsed().as_secs() < 600,
             "signed model load did not complete in600s"
@@ -1601,9 +1618,12 @@ async fn real_clef_cpu_authenticated_decide_acceptance() -> Result<()> {
         "DECISION_CANCELLED",
         "timeout_zero",
     )?;
+    // Model ingress rejects an already-expired request before lazy load or
+    // internal work-order minting; assert that the worker boundary was not
+    // crossed instead of trying to consume an order that must not exist.
     anyhow::ensure!(
         model.take_test_work_order().await.is_none(),
-        "zero-timeout decision must not mint an internal work order"
+        "expired request minted internal work before deadline admission"
     );
     let recovery = alice.infer(T6_MODEL).decide(&requests[0]).await?;
     let cancel_recovery_max_abs = t6_close(
@@ -1751,7 +1771,9 @@ async fn t6_midforward_cases(
     .await??;
     disconnected_request.abort();
     anyhow::ensure!(
-        disconnected_request.await.is_err_and(|error| error.is_cancelled()),
+        disconnected_request
+            .await
+            .is_err_and(|error| error.is_cancelled()),
         "dropping the caller task did not close its response wait"
     );
     tokio::task::spawn_blocking(move || {

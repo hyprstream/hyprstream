@@ -21,8 +21,8 @@ questions:
   tone:
     type: choice
     criteria:
-      angry: "Hostile message"
       calm: ~
+      angry: "Hostile message"
   severity:
     type: score
     criteria: ["cosmetic", "usable", "unusable"]
@@ -216,8 +216,8 @@ questions:
   tone:
     type: choice
     criteria:
-      calm: ~
       angry: "Hostile message"
+      calm: ~
   severity:
     type: score
     criteria: ["unusable", "usable", "cosmetic"]
