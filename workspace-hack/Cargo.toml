@@ -77,7 +77,7 @@ hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hmac = { version = "0.12", default-features = false, features = ["reset"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes"] }
-hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", features = ["client", "http1", "http2", "server"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 indexmap = { version = "2", features = ["serde"] }
 inout = { version = "0.1", default-features = false, features = ["std"] }
@@ -135,8 +135,7 @@ ratatui-widgets = { version = "0.3", features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots", "socks", "stream"] }
-reqwest-a6292c17cd707f01 = { package = "reqwest", version = "0.11", features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots", "socks", "stream"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", features = ["fs", "net"] }
 rustls = { version = "0.23", features = ["ring"] }
@@ -250,7 +249,7 @@ hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hmac = { version = "0.12", default-features = false, features = ["reset"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes"] }
-hyper-dff4ba8e3ae991db = { package = "hyper", version = "1", features = ["client", "http1", "http2", "server"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 indexmap = { version = "2", features = ["serde"] }
 inout = { version = "0.1", default-features = false, features = ["std"] }
@@ -308,8 +307,7 @@ ratatui-widgets = { version = "0.3", features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots", "socks", "stream"] }
-reqwest-a6292c17cd707f01 = { package = "reqwest", version = "0.11", features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots", "socks", "stream"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", features = ["fs", "net"] }
 rustls = { version = "0.23", features = ["ring"] }
@@ -378,8 +376,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
-hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 ipnet = { version = "2", features = ["serde"] }
 libz-sys = { version = "1", default-features = false, features = ["static", "zlib-ng"] }
@@ -399,6 +396,7 @@ rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", features = ["ne
 rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", default-features = false, features = ["event", "mm", "mount", "param", "pipe", "process", "stdio", "system", "termios", "thread", "time"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", default-features = false, features = ["asm"] }
 simd-adler32 = { version = "0.3" }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 tiny-keccak = { version = "2", features = ["kmac", "shake"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["early-data"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
@@ -426,8 +424,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
-hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 ipnet = { version = "2", features = ["serde"] }
 libz-sys = { version = "1", default-features = false, features = ["static", "zlib-ng"] }
@@ -447,6 +444,7 @@ rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", features = ["ne
 rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", default-features = false, features = ["event", "mm", "mount", "param", "pipe", "process", "stdio", "system", "termios", "thread", "time"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", default-features = false, features = ["asm"] }
 simd-adler32 = { version = "0.3" }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 tiny-keccak = { version = "2", features = ["kmac", "shake"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["early-data"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
@@ -473,8 +471,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
-hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 ipnet = { version = "2", features = ["serde"] }
 libz-sys = { version = "1", default-features = false, features = ["static", "zlib-ng"] }
@@ -494,6 +491,7 @@ rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", features = ["ne
 rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", default-features = false, features = ["event", "mm", "mount", "param", "pipe", "process", "stdio", "system", "termios", "thread", "time"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", default-features = false, features = ["asm"] }
 simd-adler32 = { version = "0.3" }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 tiny-keccak = { version = "2", features = ["kmac", "shake"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["early-data"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
@@ -521,8 +519,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-ng-compat"
 fuse-backend-rs = { version = "0.13", features = ["persist", "virtiofs"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 h2 = { version = "0.4", default-features = false, features = ["stream"] }
-hyper-582f2526e08bb6a0 = { package = "hyper", version = "0.14", features = ["client", "http1", "http2", "runtime", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 ipnet = { version = "2", features = ["serde"] }
 libz-sys = { version = "1", default-features = false, features = ["static", "zlib-ng"] }
@@ -542,6 +539,7 @@ rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", features = ["ne
 rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", default-features = false, features = ["event", "mm", "mount", "param", "pipe", "process", "stdio", "system", "termios", "thread", "time"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", default-features = false, features = ["asm"] }
 simd-adler32 = { version = "0.3" }
+socket2 = { version = "0.5", default-features = false, features = ["all"] }
 tiny-keccak = { version = "2", features = ["kmac", "shake"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["early-data"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
