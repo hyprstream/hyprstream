@@ -1890,14 +1890,12 @@ impl ModelService {
                 );
                 name.clone()
             }
-            crate::storage::GitRef::Commit(commit) => {
-                commit_selector_load_branch(
-                    self.config.staging_model_pin.as_ref(),
-                    &model_ref,
-                    commit,
-                    &worktrees,
-                )?
-            }
+            crate::storage::GitRef::Commit(commit) => commit_selector_load_branch(
+                self.config.staging_model_pin.as_ref(),
+                &model_ref,
+                commit,
+                &worktrees,
+            )?,
             crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
                 anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
             }
