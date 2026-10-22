@@ -2441,7 +2441,8 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
     let decision = service
         .prepare(
             &ctx,
-            TUI_CLIENT_ID,
+            // The www staging pin selects the Clef-ceiling table entry.
+            "client",
             &source_record,
             std::slice::from_ref(&scope),
         )
@@ -2456,7 +2457,7 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
         "decide:model:clef-flash-fp8:other",
     ] {
         assert!(service
-            .prepare(&ctx, TUI_CLIENT_ID, &source_record, &[scope.into()])
+            .prepare(&ctx, "client", &source_record, &[scope.into()])
             .await
             .is_err());
     }
